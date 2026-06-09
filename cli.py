@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 import httpx
 
@@ -97,12 +98,88 @@ def cmd_show(args):
             print()
 
 
+EVENT_ICONS = {
+    "agent_started": "+",
+    "agent_finished": "-",
+    "agent_error": "!",
+    "llm_request": ">",
+    "llm_response": "<",
+    "tool_called": "~",
+    "tool_result": "=",
+    "tool_skipped": "x",
+    "transition": "->",
+    "comment": "#",
+}
+
+
+def _read_events(ticket_id, last_seq):
+    log_path = Path.home() / ".agentic-perf" / "logs" / f"{ticket_id}.jsonl"
+    if not log_path.exists():
+        return [], last_seq
+    events = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("seq", 0) > last_seq:
+                events.append(evt)
+    new_seq = events[-1]["seq"] if events else last_seq
+    return events, new_seq
+
+
+def _format_event(evt):
+    etype = evt["event_type"]
+    icon = EVENT_ICONS.get(etype, "?")
+    agent = evt.get("agent", "")
+    data = evt.get("data", {})
+    ts = evt.get("timestamp", "")
+    if "T" in ts:
+        ts = ts.split("T")[1][:8]
+
+    if etype == "agent_started":
+        return f"  [{ts}] {icon} {agent} started"
+    elif etype == "agent_finished":
+        return f"  [{ts}] {icon} {agent} finished"
+    elif etype == "agent_error":
+        return f"  [{ts}] {icon} {agent} ERROR: {data.get('reason', '?')}"
+    elif etype == "llm_request":
+        return f"  [{ts}] {icon} {agent} LLM request (iteration {data.get('iteration', '?')})"
+    elif etype == "llm_response":
+        tools = data.get("tool_calls", [])
+        stop = data.get("stop_reason", "?")
+        if tools:
+            return f"  [{ts}] {icon} {agent} LLM -> {stop}, tools: {', '.join(tools)}"
+        return f"  [{ts}] {icon} {agent} LLM -> {stop} (text: {data.get('text_length', 0)} chars)"
+    elif etype == "tool_called":
+        return f"  [{ts}] {icon} {agent} calling {data.get('tool', '?')}"
+    elif etype == "tool_result":
+        err = " ERROR" if data.get("is_error") else ""
+        return f"  [{ts}] {icon} {agent} {data.get('tool', '?')}{err} ({data.get('content_length', 0)} bytes)"
+    elif etype == "tool_skipped":
+        return f"  [{ts}] {icon} {agent} skipped {data.get('tool', '?')}: {data.get('reason', '')}"
+    elif etype == "transition":
+        return f"  [{ts}] {icon} {agent} -> {data.get('to', '?')}"
+    elif etype == "comment":
+        body = data.get("body", "")[:80]
+        return f"  [{ts}] {icon} {agent}: {body}"
+    return f"  [{ts}] {icon} {agent} {etype}: {data}"
+
+
 def cmd_watch(args):
     client, url = get_client(args)
     last_comment_count = 0
     last_status = None
+    last_event_seq = 0
+    verbose = getattr(args, "verbose", False)
 
     print(f"Watching ticket {args.ticket_id} (Ctrl+C to stop)")
+    if verbose:
+        print(f"  Verbose mode: reading events from ~/.agentic-perf/logs/")
     print()
 
     try:
@@ -114,15 +191,20 @@ def cmd_watch(args):
             status = t["status"]
             comments = t.get("comments", [])
 
-            if status != last_status:
-                print(f"  [{time.strftime('%H:%M:%S')}] Status: {status}")
-                last_status = status
+            if verbose:
+                events, last_event_seq = _read_events(args.ticket_id, last_event_seq)
+                for evt in events:
+                    print(_format_event(evt))
+            else:
+                if status != last_status:
+                    print(f"  [{time.strftime('%H:%M:%S')}] Status: {status}")
+                    last_status = status
 
-            while last_comment_count < len(comments):
-                c = comments[last_comment_count]
-                first_line = c["body"].split("\n")[0][:80]
-                print(f"  [{time.strftime('%H:%M:%S')}] {c['author']}: {first_line}")
-                last_comment_count += 1
+                while last_comment_count < len(comments):
+                    c = comments[last_comment_count]
+                    first_line = c["body"].split("\n")[0][:80]
+                    print(f"  [{time.strftime('%H:%M:%S')}] {c['author']}: {first_line}")
+                    last_comment_count += 1
 
             if status in ("closed",):
                 print()
@@ -210,6 +292,7 @@ def main():
     p_watch.add_argument("ticket_id", help="Ticket ID")
     p_watch.add_argument("-i", "--interval", type=float, default=3.0, help="Poll interval (seconds)")
     p_watch.add_argument("-f", "--follow", action="store_true", help="Keep watching after HITL pause")
+    p_watch.add_argument("-v", "--verbose", action="store_true", help="Show agent events (tool calls, LLM interactions)")
 
     p_reply = sub.add_parser("reply", help="Reply to an agent's question")
     p_reply.add_argument("ticket_id", help="Ticket ID")

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from providers.llm.base import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 def get_resource_tools() -> list[ToolDefinition]:
@@ -52,20 +55,74 @@ def get_resource_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
-            name="request_clarification",
+            name="quads_check_available",
             description=(
-                "Ask the user for clarification when host information is missing or invalid. "
-                "This pauses the ticket for human input."
+                "List bare-metal hosts available for self-service reservation "
+                "from the Scale Lab QUADS system. Returns host details including "
+                "CPU, memory, disks (type and size), and NICs. Optionally filter "
+                "by host model, NIC vendor, NIC speed, or disk type."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "question": {
+                    "model_filter": {
                         "type": "string",
-                        "description": "The specific question to ask the user",
-                    }
+                        "description": "Filter by host model substring (e.g. 'r660', 'r650', 'r6625')",
+                    },
+                    "vendor_filter": {
+                        "type": "string",
+                        "description": "Filter by NIC vendor substring (e.g. 'Intel', 'Mellanox', 'Broadcom')",
+                    },
+                    "speed_filter": {
+                        "type": "integer",
+                        "description": "Filter by NIC speed in Gbps (e.g. 25, 100)",
+                    },
+                    "disk_type_filter": {
+                        "type": "string",
+                        "description": "Filter by disk type (e.g. 'nvme', 'sata', 'scsi')",
+                    },
                 },
-                "required": ["question"],
+            },
+        ),
+        ToolDefinition(
+            name="quads_reserve_hosts",
+            description=(
+                "Reserve bare-metal hosts from QUADS. Creates an assignment, schedules "
+                "the specified hosts, waits for validation (~30-45 min), and sets up "
+                "SSH key access. Returns assigned host details, SSH credentials, and "
+                "lease expiration. Use quads_check_available first to find hosts."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "hostnames": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "FQDNs of hosts to reserve (from quads_check_available)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description for the QUADS assignment",
+                    },
+                },
+                "required": ["hostnames", "description"],
+            },
+        ),
+        ToolDefinition(
+            name="quads_get_assignment_status",
+            description=(
+                "Check the status of an existing QUADS assignment. "
+                "Returns validated/provisioned state."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "assignment_id": {
+                        "type": "integer",
+                        "description": "QUADS assignment ID",
+                    },
+                },
+                "required": ["assignment_id"],
             },
         ),
         ToolDefinition(
@@ -85,6 +142,8 @@ def get_resource_tools() -> list[ToolDefinition]:
                     "ssh_user": {"type": "string"},
                     "ssh_key_path": {"type": "string"},
                     "lease_expiration": {"type": ["string", "null"]},
+                    "quads_assignment_id": {"type": ["integer", "null"]},
+                    "quads_cloud_name": {"type": ["string", "null"]},
                     "notes": {"type": "string"},
                 },
                 "required": ["assigned_hardware_ips", "ssh_user"],
@@ -98,8 +157,19 @@ FQDN_RE = re.compile(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA
 
 
 def create_resource_tool_handlers(
-    request_clarification_fn,
+    secrets_provider=None,
 ) -> dict[str, Any]:
+
+    _quads_client = None
+
+    async def _get_quads_client():
+        nonlocal _quads_client
+        if _quads_client is None:
+            if secrets_provider is None:
+                raise ValueError("No secrets provider configured for QUADS")
+            from providers.quads import QuadsClient
+            _quads_client = await QuadsClient.from_secrets(secrets_provider)
+        return _quads_client
 
     async def parse_host_config(text: str) -> dict:
         result: dict[str, Any] = {
@@ -156,12 +226,74 @@ def create_resource_tool_handlers(
             "message": f"Host {host} validated (simulated)",
         }
 
-    async def request_clarification(question: str) -> str:
-        await request_clarification_fn(question)
-        return "Clarification requested. Ticket paused for human input."
+    async def quads_check_available(
+        model_filter: str | None = None,
+        vendor_filter: str | None = None,
+        speed_filter: int | None = None,
+        disk_type_filter: str | None = None,
+    ) -> dict:
+        client = await _get_quads_client()
+        hosts = await client.get_available(
+            model_filter=model_filter,
+            vendor_filter=vendor_filter,
+            speed_filter=speed_filter,
+            disk_type_filter=disk_type_filter,
+        )
+        return {
+            "available_count": len(hosts),
+            "hosts": hosts,
+        }
+
+    async def quads_reserve_hosts(
+        hostnames: list[str], description: str
+    ) -> dict:
+        client = await _get_quads_client()
+
+        if len(hostnames) > 10:
+            return {"status": "failed", "message": "Max 10 hosts per assignment"}
+
+        logger.info(f"[resource] Creating QUADS assignment: {description}")
+        assignment = await client.create_assignment(description)
+        logger.info(
+            f"[resource] Assignment created: id={assignment['id']} "
+            f"cloud={assignment['cloud_name']}"
+        )
+
+        scheduled = []
+        for hostname in hostnames:
+            logger.info(f"[resource] Scheduling {hostname} -> {assignment['cloud_name']}")
+            sched = await client.schedule_host(assignment["cloud_name"], hostname)
+            scheduled.append(sched)
+
+        logger.info(
+            f"[resource] Waiting for QUADS validation of assignment {assignment['id']}..."
+        )
+        status = await client.poll_until_validated(assignment["id"])
+        logger.info(f"[resource] Assignment {assignment['id']} validated")
+
+        logger.info(f"[resource] Setting up SSH access to {len(hostnames)} hosts")
+        ssh_result = await client.setup_ssh(hostnames)
+
+        return {
+            "status": "success",
+            "assignment_id": assignment["id"],
+            "cloud_name": assignment["cloud_name"],
+            "ticket": assignment.get("ticket"),
+            "hosts": hostnames,
+            "ssh_user": "root",
+            "ssh_key_path": client.ssh_key_path,
+            "ssh_setup": ssh_result,
+            "lease_expiration": scheduled[0].get("end") if scheduled else None,
+        }
+
+    async def quads_get_assignment_status(assignment_id: int) -> dict:
+        client = await _get_quads_client()
+        return await client.get_assignment_status(assignment_id)
 
     return {
         "parse_host_config": parse_host_config,
         "validate_host": validate_host,
-        "request_clarification": request_clarification,
+        "quads_check_available": quads_check_available,
+        "quads_reserve_hosts": quads_reserve_hosts,
+        "quads_get_assignment_status": quads_get_assignment_status,
     }

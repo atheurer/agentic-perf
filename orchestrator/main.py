@@ -8,8 +8,10 @@ from .config import OrchestratorConfig
 from .dispatcher import Dispatcher, STATUS_AGENT_MAP, TERMINAL_STATUSES
 from .poller import fetch_tickets_by_status
 
+from providers.events import EventBus
 from providers.llm.mock import MockLLMProvider
 from providers.llm.claude import ClaudeLLMProvider
+from providers.secrets.local import LocalSecretsProvider
 from providers.skills.crucible import CrucibleSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
 from providers.skills.private import PrivateSkillProvider
@@ -51,7 +53,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
-    dispatcher = Dispatcher(config.state_store_url, llm, skills)
+    secrets = LocalSecretsProvider()
+    events = EventBus()
+    dispatcher = Dispatcher(config.state_store_url, llm, skills, secrets, events)
 
     logger.info(
         f"Orchestrator started (store={config.state_store_url}, "

@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from agents.base import AgentBase
+from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
 from .mcp_server import create_review_tool_handlers, get_review_tools
@@ -18,6 +19,7 @@ class ReviewAgent(AgentBase):
         self,
         llm_provider: LLMProvider,
         state_store_url: str,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
@@ -33,6 +35,7 @@ class ReviewAgent(AgentBase):
             state_store_url=state_store_url,
             tools=tools,
             tool_handlers=tool_handlers,
+            event_bus=event_bus,
         )
 
     async def _do_request_clarification(self, question: str) -> None:

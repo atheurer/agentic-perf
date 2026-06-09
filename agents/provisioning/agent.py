@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from agents.base import AgentBase
+from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
 from .mcp_server import create_provisioning_tool_handlers, get_provisioning_tools
@@ -19,13 +20,14 @@ class ProvisioningAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         skill_provider=None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._skill_provider = skill_provider
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
         tools = get_provisioning_tools()
-        tool_handlers = create_provisioning_tool_handlers(
+        tool_handlers, self._ssh = create_provisioning_tool_handlers(
             skill_provider=skill_provider,
             request_clarification_fn=self._do_request_clarification,
         )
@@ -36,6 +38,7 @@ class ProvisioningAgent(AgentBase):
             state_store_url=state_store_url,
             tools=tools,
             tool_handlers=tool_handlers,
+            event_bus=event_bus,
         )
 
     async def _do_request_clarification(self, question: str) -> None:
@@ -46,6 +49,10 @@ class ProvisioningAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
+        ticket = await self._get_ticket(ticket_id)
+        ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
+        if ssh_key:
+            self._ssh.key_path = ssh_key
         await super().run(ticket_id)
 
     def _system_prompt(self) -> str:

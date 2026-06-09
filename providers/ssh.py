@@ -25,22 +25,23 @@ class SSHExecutor:
         self.key_path = key_path
         self.connect_timeout = connect_timeout
 
-    def _ssh_args(self, host: str) -> list[str]:
+    def _ssh_args(self, host: str, key_path: str | None = None) -> list[str]:
         args = [
             "ssh",
             "-o", f"ConnectTimeout={self.connect_timeout}",
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
         ]
-        if self.key_path:
-            args.extend(["-i", self.key_path])
+        effective_key = key_path or self.key_path
+        if effective_key:
+            args.extend(["-i", effective_key])
         args.append(f"{self.user}@{host}")
         return args
 
     async def run(
-        self, host: str, command: str, timeout: int = 300
+        self, host: str, command: str, timeout: int = 300, key_path: str | None = None,
     ) -> SSHResult:
-        args = self._ssh_args(host) + [command]
+        args = self._ssh_args(host, key_path=key_path) + [command]
         logger.info(f"[ssh] {self.user}@{host}: {command[:120]}")
 
         proc = await asyncio.create_subprocess_exec(
@@ -81,6 +82,7 @@ class SSHExecutor:
         local_path: str,
         remote_path: str,
         timeout: int = 120,
+        key_path: str | None = None,
     ) -> SSHResult:
         args = [
             "scp", "-r",
@@ -88,8 +90,9 @@ class SSHExecutor:
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
         ]
-        if self.key_path:
-            args.extend(["-i", self.key_path])
+        effective_key = key_path or self.key_path
+        if effective_key:
+            args.extend(["-i", effective_key])
         args.extend([local_path, f"{self.user}@{host}:{remote_path}"])
 
         logger.info(f"[scp] {local_path} -> {self.user}@{host}:{remote_path}")

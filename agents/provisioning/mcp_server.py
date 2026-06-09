@@ -56,7 +56,7 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "host": {"type": "string", "description": "Target host"},
                     "harness_name": {"type": "string", "description": "Harness name (e.g., 'crucible', 'zathras')"},
                     "user": {"type": "string", "description": "SSH user (default: root)"},
-                    "branch": {"type": "string", "description": "Git branch or release tag (default: latest)"},
+                    "branch": {"type": "string", "description": "Specific git branch or release tag. Omit to install the default/latest version."},
                 },
                 "required": ["host", "harness_name"],
             },
@@ -188,7 +188,7 @@ def get_provisioning_tools() -> list[ToolDefinition]:
 def create_provisioning_tool_handlers(
     skill_provider,
     request_clarification_fn,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], SSHExecutor]:
 
     ssh = SSHExecutor(user="root")
 
@@ -308,7 +308,9 @@ def create_provisioning_tool_handlers(
                 "message": f"Failed to copy {harness_name} repo to {host}: {scp_result.stderr}",
             }
 
-        env = f"RELEASE={branch}" if branch else ""
+        effective_branch = branch if branch and branch.lower() not in ("latest", "default", "main") else ""
+        release_var = private_config.get("release_env_var", "RELEASE")
+        env = f"{release_var}={effective_branch}" if effective_branch else ""
         install_script = provisioning.get("install_script", private_config.get("install_script", "install.sh"))
         cmd = f"cd {target_path} && {env} ./{install_script}"
         logger.info(f"[provision] Running install on {host}: {cmd}")
@@ -422,7 +424,7 @@ def create_provisioning_tool_handlers(
         await request_clarification_fn(question)
         return "Clarification requested. Ticket paused for human input."
 
-    return {
+    handlers = {
         "check_host_prerequisites": check_host_prerequisites,
         "install_packages": install_packages,
         "check_existing_install": check_existing_install,
@@ -433,3 +435,4 @@ def create_provisioning_tool_handlers(
         "get_private_config": get_private_config,
         "request_clarification": request_clarification,
     }
+    return handlers, ssh

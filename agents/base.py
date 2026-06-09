@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import httpx
 
+from providers.events import EventBus
 from providers.llm.base import (
     LLMProvider,
     LLMResponse,
@@ -26,6 +27,7 @@ class AgentBase(ABC):
         state_store_url: str,
         tools: list[ToolDefinition] | None = None,
         tool_handlers: dict[str, Callable] | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.llm = llm_provider
@@ -33,61 +35,116 @@ class AgentBase(ABC):
         self.tools = tools or []
         self._tool_handlers = tool_handlers or {}
         self._client = httpx.AsyncClient(timeout=30.0)
+        self._events = event_bus
 
     async def close(self) -> None:
         await self._client.aclose()
 
+    def _emit(self, ticket_id: str, event_type: str, data: dict[str, Any] | None = None) -> None:
+        if self._events:
+            self._events.emit(ticket_id, self.agent_name, event_type, data)
+
     async def run(self, ticket_id: str) -> None:
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
+        self._emit(ticket_id, "agent_started")
         ticket = await self._get_ticket(ticket_id)
         messages = self._build_messages(ticket)
         max_iterations = 20
 
-        for i in range(max_iterations):
-            response = await self.llm.complete(
-                system_prompt=self._system_prompt(),
-                messages=messages,
-                tools=self.tools if self.tools else None,
-            )
-
-            if response.stop_reason == "end_turn" or not response.tool_calls:
-                await self._handle_completion(ticket_id, response)
-                break
-
-            submit_call = next(
-                (tc for tc in response.tool_calls if tc.name.startswith("submit_")),
-                None,
-            )
-            if submit_call:
-                submit_response = LLMResponse(
-                    text=None,
-                    tool_calls=[submit_call],
-                    stop_reason="tool_use",
-                    raw_content=response.raw_content,
+        try:
+            for i in range(max_iterations):
+                self._emit(ticket_id, "llm_request", {"iteration": i})
+                response = await self.llm.complete(
+                    system_prompt=self._system_prompt(),
+                    messages=messages,
+                    tools=self.tools if self.tools else None,
                 )
-                await self._handle_completion(ticket_id, submit_response)
-                break
-
-            messages.append({"role": "assistant", "content": response.raw_content})
-
-            tool_results_content = []
-            for tc in response.tool_calls:
-                result = await self._execute_tool(tc)
-                tool_results_content.append({
-                    "type": "tool_result",
-                    "tool_use_id": tc.id,
-                    "content": result.content,
-                    "is_error": result.is_error,
+                self._emit(ticket_id, "llm_response", {
+                    "iteration": i,
+                    "stop_reason": response.stop_reason,
+                    "tool_calls": [tc.name for tc in response.tool_calls],
+                    "text_length": len(response.text) if response.text else 0,
                 })
 
-            messages.append({"role": "user", "content": tool_results_content})
-        else:
-            logger.warning(f"[{self.agent_name}] Hit max iterations on {ticket_id}")
-            await self._add_comment(
-                ticket_id,
-                f"Agent {self.agent_name} reached maximum iteration limit.",
-            )
+                if response.stop_reason == "end_turn" or not response.tool_calls:
+                    await self._handle_completion(ticket_id, response)
+                    break
 
+                submit_call = next(
+                    (tc for tc in response.tool_calls if tc.name.startswith("submit_")),
+                    None,
+                )
+                if submit_call:
+                    self._emit(ticket_id, "tool_called", {
+                        "tool": submit_call.name,
+                        "input_keys": list(submit_call.input.keys()),
+                    })
+                    submit_response = LLMResponse(
+                        text=None,
+                        tool_calls=[submit_call],
+                        stop_reason="tool_use",
+                        raw_content=response.raw_content,
+                    )
+                    await self._handle_completion(ticket_id, submit_response)
+                    break
+
+                messages.append({"role": "assistant", "content": response.raw_content})
+
+                calls_to_run = response.tool_calls
+                if len(calls_to_run) > 1:
+                    non_clarify = [
+                        tc for tc in calls_to_run
+                        if tc.name != "request_clarification"
+                    ]
+                    if non_clarify:
+                        skipped = [tc for tc in calls_to_run if tc not in non_clarify]
+                        for tc in skipped:
+                            self._emit(ticket_id, "tool_skipped", {
+                                "tool": tc.name,
+                                "reason": "other tools executed first",
+                            })
+                        calls_to_run = non_clarify
+
+                tool_results_content = []
+                for tc in calls_to_run:
+                    self._emit(ticket_id, "tool_called", {
+                        "tool": tc.name,
+                        "input_keys": list(tc.input.keys()),
+                    })
+                    result = await self._execute_tool(tc)
+                    self._emit(ticket_id, "tool_result", {
+                        "tool": tc.name,
+                        "is_error": result.is_error,
+                        "content_length": len(result.content),
+                    })
+                    tool_results_content.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    })
+                for tc in response.tool_calls:
+                    if tc not in calls_to_run:
+                        tool_results_content.append({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": "Skipped: other tools executed first",
+                            "is_error": False,
+                        })
+
+                messages.append({"role": "user", "content": tool_results_content})
+            else:
+                self._emit(ticket_id, "agent_error", {"reason": "max_iterations"})
+                logger.warning(f"[{self.agent_name}] Hit max iterations on {ticket_id}")
+                await self._add_comment(
+                    ticket_id,
+                    f"Agent {self.agent_name} reached maximum iteration limit.",
+                )
+        except Exception as e:
+            self._emit(ticket_id, "agent_error", {"reason": str(e)})
+            raise
+
+        self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
 
     @abstractmethod
@@ -181,6 +238,7 @@ class AgentBase(ABC):
     async def _transition_ticket(
         self, ticket_id: str, new_status: str, comment: str | None = None
     ) -> dict[str, Any]:
+        self._emit(ticket_id, "transition", {"to": new_status, "comment": comment})
         body: dict[str, Any] = {"status": new_status}
         if comment:
             body["comment"] = comment
@@ -202,6 +260,7 @@ class AgentBase(ABC):
         return r.json()
 
     async def _add_comment(self, ticket_id: str, body: str) -> dict[str, Any]:
+        self._emit(ticket_id, "comment", {"body": body[:200]})
         r = await self._client.post(
             f"{self.store_url}/api/v1/tickets/{ticket_id}/comments",
             json={"author": self.agent_name, "body": body},

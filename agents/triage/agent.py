@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from agents.base import AgentBase
+from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
 from .mcp_server import create_triage_tool_handlers, get_triage_tools
@@ -18,6 +19,7 @@ class TriageAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         skill_provider,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._skill_provider = skill_provider
         self._hitl_triggered = False
@@ -35,6 +37,7 @@ class TriageAgent(AgentBase):
             state_store_url=state_store_url,
             tools=tools,
             tool_handlers=tool_handlers,
+            event_bus=event_bus,
         )
 
     async def _do_request_clarification(self, question: str) -> None:

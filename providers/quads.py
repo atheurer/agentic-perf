@@ -11,6 +11,14 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class QuadsAPIError(Exception):
+    def __init__(self, status_code: int, message: str, path: str) -> None:
+        self.status_code = status_code
+        self.message = message
+        self.path = path
+        super().__init__(f"QUADS API error {status_code} on {path}: {message}")
+
+
 class QuadsClient:
     """Async client for the QUADS self-service REST API."""
 
@@ -20,8 +28,8 @@ class QuadsClient:
         email: str,
         password: str,
         owner: str,
-        ssh_key_path: str = "~/.ssh/id_ed25519_quads",
-        default_root_password: str = "100yard-",
+        ssh_key_path: str,
+        default_root_password: str,
     ) -> None:
         self.api_host = api_host
         self.email = email
@@ -37,13 +45,17 @@ class QuadsClient:
         if not raw:
             raise ValueError("QUADS config not found at secrets/quads/config.json")
         config = json.loads(raw)
+        required = ["api_host", "email", "password", "owner", "ssh_key_path", "default_root_password"]
+        missing = [k for k in required if k not in config]
+        if missing:
+            raise ValueError(f"QUADS secrets missing required fields: {missing}")
         return cls(
             api_host=config["api_host"],
             email=config["email"],
             password=config["password"],
             owner=config["owner"],
-            ssh_key_path=config.get("ssh_key_path", "~/.ssh/id_ed25519_quads"),
-            default_root_password=config.get("default_root_password", "100yard-"),
+            ssh_key_path=config["ssh_key_path"],
+            default_root_password=config["default_root_password"],
         )
 
     async def close(self) -> None:
@@ -71,7 +83,13 @@ class QuadsClient:
             headers=headers,
             **kwargs,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+                msg = body.get("message", body.get("error", r.text))
+            except Exception:
+                msg = r.text
+            raise QuadsAPIError(r.status_code, msg, path)
         return r
 
     async def get_available(
@@ -79,6 +97,7 @@ class QuadsClient:
         model_filter: str | None = None,
         vendor_filter: str | None = None,
         speed_filter: int | None = None,
+        disk_type_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         r = await self._client.get(
             f"http://{self.api_host}/api/v3/available",
@@ -89,9 +108,6 @@ class QuadsClient:
 
         if model_filter:
             hostnames = [h for h in hostnames if model_filter.lower() in h.lower()]
-
-        if not (vendor_filter or speed_filter):
-            return [{"hostname": h} for h in hostnames]
 
         results = []
         for hostname in hostnames:
@@ -106,38 +122,58 @@ class QuadsClient:
                 continue
 
             ifaces = details.get("interfaces", [])
-            matched = ifaces
-
             if vendor_filter:
-                matched = [
-                    i for i in matched
+                ifaces = [
+                    i for i in ifaces
                     if vendor_filter.lower() in i.get("vendor", "").lower()
                 ]
             if speed_filter:
-                matched = [
-                    i for i in matched if i.get("speed") == speed_filter
+                ifaces = [
+                    i for i in ifaces if i.get("speed") == speed_filter
                 ]
 
-            if matched:
-                proc = (details.get("processors") or [{}])[0]
-                results.append({
-                    "hostname": hostname,
-                    "model": details.get("model", "unknown"),
-                    "cpu": proc.get("product", "unknown"),
-                    "cores": proc.get("cores", "unknown"),
-                    "memory_gb": sum(
-                        m.get("size_gb", 0) for m in details.get("memory", [])
-                    ),
-                    "matching_nics": [
-                        {
-                            "name": i.get("name"),
-                            "vendor": i.get("vendor"),
-                            "speed": i.get("speed"),
-                            "mac": i.get("mac_address"),
-                        }
-                        for i in matched
-                    ],
-                })
+            disks = details.get("disks", [])
+            if disk_type_filter:
+                matching_disks = [
+                    d for d in disks
+                    if disk_type_filter.lower() in d.get("disk_type", "").lower()
+                ]
+                if not matching_disks:
+                    continue
+            else:
+                matching_disks = disks
+
+            if vendor_filter or speed_filter:
+                if not ifaces:
+                    continue
+
+            proc = (details.get("processors") or [{}])[0]
+            results.append({
+                "hostname": hostname,
+                "model": details.get("model", "unknown"),
+                "cpu": proc.get("product", "unknown"),
+                "cores": proc.get("cores", "unknown"),
+                "memory_gb": sum(
+                    m.get("size_gb", 0) for m in details.get("memory", [])
+                ),
+                "disks": [
+                    {
+                        "disk_type": d.get("disk_type"),
+                        "size_gb": d.get("size_gb"),
+                        "count": d.get("count"),
+                    }
+                    for d in disks
+                ],
+                "nics": [
+                    {
+                        "name": i.get("name"),
+                        "vendor": i.get("vendor"),
+                        "speed": i.get("speed"),
+                        "mac": i.get("mac_address"),
+                    }
+                    for i in details.get("interfaces", [])
+                ],
+            })
 
         return results
 

@@ -8,7 +8,9 @@ from agents.provisioning.agent import ProvisioningAgent
 from agents.resource.agent import ResourceAgent
 from agents.review.agent import ReviewAgent
 from agents.triage.agent import TriageAgent
+from providers.events import EventBus
 from providers.llm.base import LLMProvider
+from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
 
 logger = logging.getLogger(__name__)
@@ -31,10 +33,14 @@ class Dispatcher:
         state_store_url: str,
         llm_provider: LLMProvider,
         skill_provider: SkillProvider,
+        secrets_provider: SecretsProvider | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
         self.skills = skill_provider
+        self.secrets = secrets_provider
+        self.events = event_bus
         self._active: set[str] = set()
 
     def is_active(self, ticket_id: str) -> bool:
@@ -56,35 +62,43 @@ class Dispatcher:
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
+                event_bus=self.events,
             )
         elif agent_type == "resource_create":
             return ResourceAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 mode="create",
+                secrets_provider=self.secrets,
+                event_bus=self.events,
             )
         elif agent_type == "provisioning":
             return ProvisioningAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
+                event_bus=self.events,
             )
         elif agent_type == "benchmark":
             return BenchmarkAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
+                event_bus=self.events,
             )
         elif agent_type == "review":
             return ReviewAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
+                event_bus=self.events,
             )
         elif agent_type == "resource_teardown":
             return ResourceAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 mode="teardown",
+                secrets_provider=self.secrets,
+                event_bus=self.events,
             )
 
         return None
