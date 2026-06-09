@@ -1,0 +1,29 @@
+{
+    "execution": {
+        "controller_required": true,
+        "run_command": "burden",
+        "endpoint_type": "local",
+        "endpoint_user": "root",
+        "pre_run": ["ssh_key_setup"],
+        "run_file_format": "cli_args",
+        "results_dir_pattern": "/tmp/results_*"
+    },
+    "provisioning": {
+        "install_method": "git_clone",
+        "git_url": "https://github.com/redhat-performance/zathras.git",
+        "install_script": "install.sh",
+        "install_target_path": "/opt/zathras",
+        "verify_command": "/opt/zathras/bin/burden --usage",
+        "update_command": "cd /opt/zathras && git pull && ./install.sh",
+        "on_existing_install": "skip",
+        "prerequisites": [
+            "ansible-core",
+            "git",
+            "jq",
+            "python3",
+            "python3-pip",
+            "wget",
+            "unzip"
+        ]
+    }
+}
