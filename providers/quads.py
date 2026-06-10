@@ -98,10 +98,16 @@ class QuadsClient:
         vendor_filter: str | None = None,
         speed_filter: int | None = None,
         disk_type_filter: str | None = None,
+        duration_hours: int = 36,
     ) -> list[dict[str, Any]]:
+        from datetime import datetime, timedelta, timezone
+        end = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
         r = await self._client.get(
             f"http://{self.api_host}/api/v3/available",
-            params={"can_self_schedule": "true"},
+            params={
+                "can_self_schedule": "true",
+                "end": end.strftime("%Y-%m-%dT%H:%M"),
+            },
         )
         r.raise_for_status()
         hostnames: list[str] = r.json()

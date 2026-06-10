@@ -81,6 +81,10 @@ def get_resource_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Filter by disk type (e.g. 'nvme', 'sata', 'scsi')",
                     },
+                    "duration_hours": {
+                        "type": "integer",
+                        "description": "Only show hosts available for at least this many hours (default: 36)",
+                    },
                 },
             },
         ),
@@ -239,6 +243,7 @@ def create_resource_tool_handlers(
         vendor_filter: str | None = None,
         speed_filter: int | None = None,
         disk_type_filter: str | None = None,
+        duration_hours: int = 36,
     ) -> dict:
         client = await _get_quads_client()
         hosts = await client.get_available(
@@ -246,6 +251,7 @@ def create_resource_tool_handlers(
             vendor_filter=vendor_filter,
             speed_filter=speed_filter,
             disk_type_filter=disk_type_filter,
+            duration_hours=duration_hours,
         )
         return {
             "available_count": len(hosts),
