@@ -104,6 +104,10 @@ def get_resource_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Short description for the QUADS assignment",
                     },
+                    "duration_hours": {
+                        "type": "integer",
+                        "description": "Lease duration in hours (default: 36)",
+                    },
                 },
                 "required": ["hostnames", "description"],
             },
@@ -249,7 +253,7 @@ def create_resource_tool_handlers(
         }
 
     async def quads_reserve_hosts(
-        hostnames: list[str], description: str
+        hostnames: list[str], description: str, duration_hours: int = 36
     ) -> dict:
         client = await _get_quads_client()
 
@@ -266,7 +270,7 @@ def create_resource_tool_handlers(
         scheduled = []
         for hostname in hostnames:
             logger.info(f"[resource] Scheduling {hostname} -> {assignment['cloud_name']}")
-            sched = await client.schedule_host(assignment["cloud_name"], hostname)
+            sched = await client.schedule_host(assignment["cloud_name"], hostname, duration_hours=duration_hours)
             scheduled.append(sched)
 
         logger.info(

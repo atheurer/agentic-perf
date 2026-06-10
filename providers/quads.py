@@ -198,18 +198,22 @@ class QuadsClient:
         }
 
     async def schedule_host(
-        self, cloud_name: str, hostname: str
+        self, cloud_name: str, hostname: str, duration_hours: int = 36
     ) -> dict[str, Any]:
+        from datetime import datetime, timedelta, timezone
+        end = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+        end_str = end.strftime("%Y-%m-%dT%H:%M")
+
         r = await self._authed_request(
             "POST",
             "/api/v3/schedules",
-            json={"cloud": cloud_name, "hostname": hostname},
+            json={"cloud": cloud_name, "hostname": hostname, "end": end_str},
         )
         data = r.json()
         return {
             "hostname": hostname,
             "cloud": cloud_name,
-            "end": data.get("end", "unknown"),
+            "end": data.get("end", end_str),
         }
 
     async def get_assignment_status(
