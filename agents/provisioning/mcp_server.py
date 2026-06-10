@@ -47,8 +47,10 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             name="install_harness",
             description=(
                 "Install the benchmark harness on a host. Uses private skill config to "
-                "determine the install method: 'internal_repo' copies a local repo and runs "
-                "its install script; 'git_clone' clones from a URL and runs install.sh."
+                "determine the install method: 'public_install' downloads and runs the "
+                "upstream installer with skill-driven flags; 'git_clone' clones from a "
+                "URL and runs install.sh. Validates and deploys required secrets from "
+                "the install_contract before running the installer."
             ),
             input_schema={
                 "type": "object",
@@ -107,6 +109,23 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "host": {"type": "string", "description": "Target host"},
                     "harness_name": {"type": "string", "description": "Harness name (e.g., 'crucible', 'zathras')"},
                     "install_path": {"type": "string", "description": "Install path override"},
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                },
+                "required": ["host", "harness_name"],
+            },
+        ),
+        ToolDefinition(
+            name="uninstall_harness",
+            description=(
+                "Remove an existing benchmark harness installation from a host. "
+                "Must be called BEFORE install_harness when reinstalling. "
+                "Removes the install directory and cleans up any moved/backup copies."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Target host"},
+                    "harness_name": {"type": "string", "description": "Harness name (e.g., 'crucible', 'zathras')"},
                     "user": {"type": "string", "description": "SSH user (default: root)"},
                 },
                 "required": ["host", "harness_name"],
@@ -187,10 +206,92 @@ def get_provisioning_tools() -> list[ToolDefinition]:
 
 def create_provisioning_tool_handlers(
     skill_provider,
-    request_clarification_fn,
+    secrets_provider=None,
+    request_clarification_fn=None,
 ) -> tuple[dict[str, Any], SSHExecutor]:
 
     ssh = SSHExecutor(user="root")
+
+    async def _validate_and_deploy_contract(
+        host: str, private_config: dict
+    ) -> dict:
+        contract = private_config.get("install_contract")
+        if not contract:
+            return {"status": "ok", "deployed_files": [], "message": "No install contract"}
+
+        secrets_map = private_config.get("secrets", {})
+        secret_files = contract.get("secret_files", [])
+        missing = []
+        resolved = []
+
+        for entry in secret_files:
+            secret_key = entry["secret_key"]
+            secret_path = secrets_map.get(secret_key)
+            required = entry.get("required", True)
+            description = entry.get("description", secret_key)
+
+            if not secret_path:
+                if required:
+                    missing.append(f"{secret_key}: no path in secrets config")
+                continue
+
+            if secrets_provider is None:
+                if required:
+                    missing.append(f"{secret_key}: no secrets provider configured")
+                continue
+
+            local_path = await secrets_provider.get_secret_file(secret_path)
+            if local_path is None:
+                if required:
+                    missing.append(f"{description} ({secret_path}): not found in secrets store")
+                continue
+
+            resolved.append({
+                "secret_key": secret_key,
+                "local_path": str(local_path),
+                "remote_path": entry["remote_path"],
+                "description": description,
+            })
+
+        if missing:
+            return {
+                "status": "failed",
+                "message": (
+                    f"Install contract validation failed. "
+                    f"Missing {len(missing)} required input(s):\n"
+                    + "\n".join(f"  - {m}" for m in missing)
+                ),
+                "missing": missing,
+            }
+
+        deployed = []
+        for item in resolved:
+            scp_result = await ssh.copy_to(
+                host, item["local_path"], item["remote_path"]
+            )
+            if scp_result.exit_code != 0:
+                return {
+                    "status": "failed",
+                    "message": (
+                        f"Failed to deploy {item['description']} to "
+                        f"{host}:{item['remote_path']}: {scp_result.stderr}"
+                    ),
+                }
+            deployed.append(f"{item['secret_key']} -> {item['remote_path']}")
+            logger.info(
+                f"[provision] Deployed {item['secret_key']} to "
+                f"{host}:{item['remote_path']}"
+            )
+
+        for cmd in contract.get("pre_install_commands", []):
+            logger.info(f"[provision] Contract pre-install on {host}: {cmd}")
+            await ssh.run(host, cmd, timeout=60)
+
+        return {
+            "status": "ok",
+            "deployed_files": deployed,
+            "message": f"Contract satisfied: {len(deployed)} file(s) deployed",
+        }
 
     async def check_host_prerequisites(host: str, user: str = "root") -> dict:
         prereqs = {}
@@ -232,10 +333,91 @@ def create_provisioning_tool_handlers(
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
-        install_method = provisioning.get("install_method", "internal_repo")
+        install_method = provisioning.get("install_method", "git_clone")
         target_path = provisioning.get("install_target_path", f"/opt/{harness_name}")
-
         constraints = private_config.get("constraints", {})
+
+        contract_result = await _validate_and_deploy_contract(host, private_config)
+        if contract_result["status"] == "failed":
+            return {
+                "host": host,
+                "harness": harness_name,
+                "status": "contract_failed",
+                "message": contract_result["message"],
+                "missing": contract_result.get("missing", []),
+            }
+
+        if install_method == "public_install":
+            installer_url = provisioning.get("installer_url")
+            if not installer_url:
+                return {
+                    "host": host,
+                    "status": "failed",
+                    "message": f"No installer_url in private config for {harness_name}",
+                }
+
+            installer_path = "/tmp/harness-install.sh"
+            logger.info(f"[provision] Downloading installer from {installer_url}")
+            dl_result = await ssh.run(
+                host,
+                f"curl --fail --silent --output {installer_path} {installer_url} && chmod +x {installer_path}",
+                timeout=60,
+            )
+            if dl_result.exit_code != 0:
+                return {
+                    "host": host,
+                    "status": "failed",
+                    "message": f"Failed to download installer: {dl_result.stderr}",
+                }
+
+            flags = provisioning.get("install_flags", {})
+            flag_parts = []
+            for flag, value in flags.items():
+                if value is None:
+                    flag_parts.append(f"--{flag}")
+                else:
+                    flag_parts.append(f"--{flag} {value}")
+            if branch and branch.lower() not in ("latest", "default"):
+                flag_parts.append(f"--release {branch}")
+            flags_str = " ".join(flag_parts)
+
+            cmd = f"{installer_path} {flags_str}"
+            logger.info(f"[provision] Running installer on {host}: {cmd}")
+            result = await ssh.run(host, cmd, timeout=1800)
+
+            if result.exit_code != 0:
+                return {
+                    "host": host,
+                    "harness": harness_name,
+                    "status": "failed",
+                    "exit_code": result.exit_code,
+                    "install_path": target_path,
+                    "output": result.stdout[-1000:] if result.stdout else "",
+                    "error": result.stderr[-1000:] if result.stderr else "",
+                    "message": f"Install failed (exit {result.exit_code})",
+                }
+
+            for post_cmd in provisioning.get("post_install_commands", []):
+                logger.info(f"[provision] Post-install on {host}: {post_cmd}")
+                post_result = await ssh.run(host, post_cmd, timeout=120)
+                if post_result.exit_code != 0:
+                    logger.warning(
+                        f"[provision] Post-install command failed: {post_result.stderr}"
+                    )
+
+            await ssh.run(host, f"rm -f {installer_path}")
+
+            return {
+                "host": host,
+                "harness": harness_name,
+                "status": "success",
+                "exit_code": 0,
+                "install_path": target_path,
+                "constraints": constraints,
+                "contract": contract_result.get("deployed_files", []),
+                "output": result.stdout[-1000:] if result.stdout else "",
+                "message": f"{harness_name} installed via public installer",
+            }
 
         if install_method == "git_clone":
             git_url = provisioning.get("git_url")
@@ -285,46 +467,16 @@ def create_provisioning_tool_handlers(
                 "exit_code": result.exit_code,
                 "install_path": target_path,
                 "constraints": constraints,
+                "contract": contract_result.get("deployed_files", []),
                 "output": result.stdout[-1000:] if result.stdout else "",
                 "error": result.stderr[-1000:] if result.stderr else "",
                 "message": f"{harness_name} installed" if result.exit_code == 0 else f"Install failed (exit {result.exit_code})",
             }
 
-        local_repo = private_config.get("internal_repo_local_path")
-        if not local_repo:
-            return {
-                "host": host,
-                "status": "failed",
-                "message": f"No internal_repo_local_path in private config for {harness_name}",
-            }
-
-        logger.info(f"[provision] Copying {local_repo} to {host}:{target_path}")
-        await ssh.run(host, f"rm -rf {target_path}")
-        scp_result = await ssh.copy_to(host, local_repo, target_path, timeout=120)
-        if scp_result.exit_code != 0:
-            return {
-                "host": host,
-                "status": "failed",
-                "message": f"Failed to copy {harness_name} repo to {host}: {scp_result.stderr}",
-            }
-
-        effective_branch = branch if branch and branch.lower() not in ("latest", "default", "main") else ""
-        release_var = private_config.get("release_env_var", "RELEASE")
-        env = f"{release_var}={effective_branch}" if effective_branch else ""
-        install_script = provisioning.get("install_script", private_config.get("install_script", "install.sh"))
-        cmd = f"cd {target_path} && {env} ./{install_script}"
-        logger.info(f"[provision] Running install on {host}: {cmd}")
-        result = await ssh.run(host, cmd, timeout=900)
-
         return {
             "host": host,
-            "harness": harness_name,
-            "status": "success" if result.exit_code == 0 else "failed",
-            "exit_code": result.exit_code,
-            "install_path": target_path,
-            "output": result.stdout[-1000:] if result.stdout else "",
-            "error": result.stderr[-1000:] if result.stderr else "",
-            "message": f"{harness_name} installed" if result.exit_code == 0 else f"Install failed (exit {result.exit_code})",
+            "status": "failed",
+            "message": f"Unknown install_method '{install_method}' for {harness_name}",
         }
 
     async def verify_harness_install(
@@ -402,6 +554,38 @@ def create_provisioning_tool_handlers(
             "message": "Update completed" if result.exit_code == 0 else f"Update failed (exit {result.exit_code})",
         }
 
+    async def uninstall_harness(
+        host: str,
+        harness_name: str,
+        user: str = "root",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        path = provisioning.get("install_target_path", f"/opt/{harness_name}")
+
+        for cmd in provisioning.get("pre_uninstall_commands", []):
+            logger.info(f"[provision] Pre-uninstall on {host}: {cmd}")
+            await ssh.run(host, cmd, timeout=120)
+
+        logger.info(f"[provision] Uninstalling {harness_name} from {host}:{path}")
+        result = await ssh.run(host, f"rm -rf {path}", timeout=120)
+        if result.exit_code != 0:
+            return {
+                "host": host,
+                "harness": harness_name,
+                "status": "failed",
+                "message": f"Failed to remove {path}: {result.stderr}",
+            }
+
+        await ssh.run(host, f"rm -rf {path}-moved-on-*", timeout=60)
+
+        return {
+            "host": host,
+            "harness": harness_name,
+            "status": "success",
+            "message": f"{harness_name} uninstalled from {path}",
+        }
+
     async def configure_host(
         host: str, config: dict, user: str = "root"
     ) -> dict:
@@ -429,6 +613,7 @@ def create_provisioning_tool_handlers(
         "install_packages": install_packages,
         "check_existing_install": check_existing_install,
         "update_install": update_install,
+        "uninstall_harness": uninstall_harness,
         "install_harness": install_harness,
         "verify_harness_install": verify_harness_install,
         "configure_host": configure_host,

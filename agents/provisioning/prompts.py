@@ -17,28 +17,38 @@ Your tasks:
 
 3. If any prerequisites are missing, install them using install_packages.
 
-4. Check for an existing installation using check_existing_install with the harness_name.
-   Then read the provisioning config's "on_existing_install" field:
+4. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
+   freshly provisioned (e.g., via QUADS) and has no harness installed. Skip
+   check_existing_install entirely and proceed directly to install_harness.
+
+5. If fresh_host is NOT set, check for an existing installation using
+   check_existing_install with the harness_name. Then read the provisioning
+   config's "on_existing_install" field:
    - If "skip": do NOT ask the user. Skip installation and proceed directly
      to submit_provisioning_result with provisioning_complete=true.
    - If "update": run update_install without asking.
-   - If "reinstall": run install_harness without asking.
+   - If "reinstall": first call uninstall_harness to remove the existing install,
+     WAIT for it to complete, then call install_harness for a clean install.
    - If "ask_user": use request_clarification to present the options.
    - If no existing install is found: proceed with fresh installation.
 
-5. If a fresh install is needed, install using install_harness with the harness_name.
+6. Install using install_harness with the harness_name.
 
-6. Verify the installation using verify_harness_install with the harness_name.
+7. Verify the installation using verify_harness_install with the harness_name.
 
-7. If any step fails, report the error details.
+8. If any step fails, report the error details.
 
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.
-- Installation can take several minutes.
+- Installation can take several minutes — be patient.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly — do not ask the user
   if the config says "skip".
 - Always pass the harness_name to install, verify, and check tools.
+- Do NOT retry install_harness if it fails. Report the failure and let the
+  user investigate. Retrying install on top of a partial install causes conflicts.
+- For reinstall: always uninstall_harness FIRST, wait for completion, then
+  install_harness. Never call install_harness on top of an existing install.
 
 When done, call the submit_provisioning_result tool with your findings,
 including the harness_name.

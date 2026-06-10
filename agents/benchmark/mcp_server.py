@@ -81,6 +81,7 @@ def get_benchmark_tools() -> list[ToolDefinition]:
                             "required": ["host", "roles"],
                         },
                     },
+                    "controller": {"type": "string", "description": "Controller hostname or IP. Required so the run-file can set controller-ip-address when controller is also an endpoint."},
                     "tags": {"type": "object", "description": "Run tags", "additionalProperties": {"type": "string"}},
                     "userenv": {"type": "string", "description": "User environment / container image (crucible)"},
                     "osruntime": {"type": "string", "description": "OS runtime (crucible: 'podman', 'chroot')"},
@@ -153,8 +154,8 @@ def get_benchmark_tools() -> list[ToolDefinition]:
 
 def create_benchmark_tool_handlers(
     skill_provider,
-    request_clarification_fn,
-) -> dict[str, Any]:
+    request_clarification_fn=None,
+) -> tuple[dict[str, Any], SSHExecutor]:
 
     ssh = SSHExecutor(user="root")
 
@@ -188,18 +189,27 @@ def create_benchmark_tool_handlers(
     ) -> dict:
         logger.info(f"[benchmark] Setting up SSH keys: {controller} -> {endpoints}")
 
-        keygen_result = await ssh.run(
-            controller,
-            'test -f /root/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""',
-        )
-        if keygen_result.exit_code != 0:
-            return {"status": "failed", "message": f"Key generation failed: {keygen_result.stderr}"}
+        KEY_COMMENT = "agentic-perf-controller-key"
 
-        pubkey_result = await ssh.run(controller, "cat /root/.ssh/id_rsa.pub")
-        if pubkey_result.exit_code != 0:
-            return {"status": "failed", "message": f"Could not read public key: {pubkey_result.stderr}"}
+        pubkey_result = await ssh.run(controller, "cat /root/.ssh/id_rsa.pub 2>/dev/null")
+        if pubkey_result.exit_code != 0 or not pubkey_result.stdout.strip():
+            keygen_result = await ssh.run(
+                controller,
+                f'ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{KEY_COMMENT}" -N ""',
+            )
+            if keygen_result.exit_code != 0:
+                return {"status": "failed", "message": f"Key generation failed: {keygen_result.stderr}"}
+            pubkey_result = await ssh.run(controller, "cat /root/.ssh/id_rsa.pub")
 
         pubkey = pubkey_result.stdout.strip()
+        if KEY_COMMENT not in pubkey:
+            await ssh.run(
+                controller,
+                f'rm -f /root/.ssh/id_rsa /root/.ssh/id_rsa.pub && ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{KEY_COMMENT}" -N ""',
+            )
+            pubkey_result = await ssh.run(controller, "cat /root/.ssh/id_rsa.pub")
+            pubkey = pubkey_result.stdout.strip()
+
         results = {}
 
         for endpoint in endpoints:
@@ -213,7 +223,7 @@ def create_benchmark_tool_handlers(
 
             inject = await ssh.run(
                 endpoint,
-                f'mkdir -p /root/.ssh && echo "{pubkey}" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys',
+                f'mkdir -p /root/.ssh && grep -qF "{KEY_COMMENT}" /root/.ssh/authorized_keys 2>/dev/null || echo "{pubkey}" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys',
             )
             if inject.exit_code != 0:
                 results[endpoint] = {"status": "failed", "message": inject.stderr}
@@ -240,6 +250,7 @@ def create_benchmark_tool_handlers(
         benchmark: str,
         endpoints: list[dict],
         harness: str | None = None,
+        controller: str | None = None,
         tags: dict | None = None,
         userenv: str | None = None,
         osruntime: str | None = None,
@@ -249,11 +260,40 @@ def create_benchmark_tool_handlers(
         exec_config = await skill_provider.get_all_private_config(harness_name)
         execution = exec_config.get("execution", {})
 
+        resolved_endpoints = []
+        resolve_host = controller or endpoints[0]["host"]
+        for ep in endpoints:
+            host = ep["host"]
+            result = await ssh.run(
+                resolve_host,
+                f"python3 -c \"import socket; print(socket.gethostbyname('{host}'))\"",
+            )
+            ip = result.stdout.strip() if result.exit_code == 0 and result.stdout.strip() else host
+            if ip != host:
+                logger.info(f"[benchmark] Resolved {host} -> {ip}")
+            resolved_endpoints.append({**ep, "host": ip})
+
         params: dict[str, Any] = {
-            "endpoints": endpoints,
+            "endpoints": resolved_endpoints,
             "harness": harness_name,
             "endpoint_user": execution.get("endpoint_user", "root"),
         }
+
+        if controller:
+            ctrl_result = await ssh.run(
+                controller,
+                f"python3 -c \"import socket; print(socket.gethostbyname('{controller}'))\"",
+            )
+            controller_ip = ctrl_result.stdout.strip() if ctrl_result.exit_code == 0 else controller
+            params["controller"] = controller_ip
+            ep_ips = {ep["host"] for ep in resolved_endpoints}
+            if controller_ip in ep_ips:
+                params["controller_ip"] = controller_ip
+                logger.info(
+                    f"[benchmark] Controller is also an endpoint — "
+                    f"setting controller-ip-address={controller_ip}"
+                )
+
         if tags:
             params["tags"] = tags
         if userenv:
@@ -279,7 +319,19 @@ def create_benchmark_tool_handlers(
         import re
 
         run_uuid = uuid.uuid4().hex[:8]
-        harness_name = harness or run_file.get("harness", "crucible")
+        harness_name = harness or "crucible"
+
+        validation = await skill_provider.validate_runfile(run_file, harness_name)
+        if not validation.get("valid", True):
+            return {
+                "status": "rejected",
+                "message": (
+                    "Run-file failed schema validation and was NOT sent to the controller. "
+                    "Fix the run-file and try again. Errors:\n"
+                    + "\n".join(f"  - {e}" for e in validation["errors"])
+                ),
+                "errors": validation["errors"],
+            }
 
         if harness_name == "zathras":
             scenario = run_file.get("scenario", {})
@@ -429,4 +481,4 @@ def create_benchmark_tool_handlers(
         "execute_benchmark": execute_benchmark,
         "get_run_logs": get_run_logs,
         "request_clarification": request_clarification,
-    }
+    }, ssh

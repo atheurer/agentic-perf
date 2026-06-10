@@ -44,10 +44,11 @@ def mock_provider() -> MockSkillProvider:
 @pytest.fixture
 def handlers(mock_provider):
     async def noop_clarification(q): pass
-    return create_benchmark_tool_handlers(
+    h, ssh = create_benchmark_tool_handlers(
         skill_provider=mock_provider,
         request_clarification_fn=noop_clarification,
     )
+    return h
 
 
 @pytest.mark.asyncio

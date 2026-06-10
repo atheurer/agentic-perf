@@ -42,12 +42,19 @@ class Dispatcher:
         self.secrets = secrets_provider
         self.events = event_bus
         self._active: set[str] = set()
+        self._dispatched: set[tuple[str, str]] = set()
 
     def is_active(self, ticket_id: str) -> bool:
         return ticket_id in self._active
 
+    def was_dispatched(self, ticket_id: str, status: str) -> bool:
+        return (ticket_id, status) in self._dispatched
+
     def mark_active(self, ticket_id: str) -> None:
         self._active.add(ticket_id)
+
+    def mark_dispatched(self, ticket_id: str, status: str) -> None:
+        self._dispatched.add((ticket_id, status))
 
     def mark_done(self, ticket_id: str) -> None:
         self._active.discard(ticket_id)
@@ -77,6 +84,7 @@ class Dispatcher:
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
+                secrets_provider=self.secrets,
                 event_bus=self.events,
             )
         elif agent_type == "benchmark":
@@ -84,6 +92,7 @@ class Dispatcher:
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
+                secrets_provider=self.secrets,
                 event_bus=self.events,
             )
         elif agent_type == "review":

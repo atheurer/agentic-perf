@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
@@ -165,16 +168,23 @@ class CrucibleSkillProvider(SkillProvider):
             userenv = params.get("userenv", "default")
             osruntime = params.get("osruntime", "podman")
             ep_user = params.get("endpoint_user", "root")
+            controller = params.get("controller")
+
+            controller = params.get("controller")
+            controller_ip = params.get("controller_ip")
 
             remotes = []
             for ep in endpoints:
                 roles = ep.get("roles", ["client"])
                 engines = [{"role": r, "ids": [1]} for r in roles]
+                settings: dict[str, Any] = {"osruntime": osruntime}
+                if controller_ip and controller and ep["host"] == controller:
+                    settings["controller-ip-address"] = controller_ip
                 remotes.append({
                     "engines": engines,
                     "config": {
                         "host": ep["host"],
-                        "settings": {"osruntime": osruntime},
+                        "settings": settings,
                     },
                 })
 
@@ -189,6 +199,35 @@ class CrucibleSkillProvider(SkillProvider):
         if params.get("tags"):
             template["tags"] = params["tags"]
 
-        template["harness"] = "crucible"
-
         return RunfileTemplate(benchmark=benchmark, template=template)
+
+    def _load_schema(self) -> dict[str, Any] | None:
+        schema_path = (
+            self._home / "subprojects" / "core" / "rickshaw" / "schema" / "run-file.json"
+        )
+        if not schema_path.exists():
+            return None
+        try:
+            return json.loads(schema_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    async def validate_runfile(
+        self, run_file: dict[str, Any]
+    ) -> dict[str, Any]:
+        schema = self._load_schema()
+        if schema is None:
+            return {"valid": True, "errors": [], "warning": "Schema not found, skipping validation"}
+
+        try:
+            from jsonschema import validate, ValidationError
+        except ImportError:
+            return {"valid": True, "errors": [], "warning": "jsonschema not installed, skipping validation"}
+
+        errors = []
+        try:
+            validate(instance=run_file, schema=schema)
+        except ValidationError as e:
+            errors.append(e.message)
+
+        return {"valid": len(errors) == 0, "errors": errors}

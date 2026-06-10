@@ -144,6 +144,10 @@ def get_resource_tools() -> list[ToolDefinition]:
                     "lease_expiration": {"type": ["string", "null"]},
                     "quads_assignment_id": {"type": ["integer", "null"]},
                     "quads_cloud_name": {"type": ["string", "null"]},
+                    "fresh_host": {
+                        "type": "boolean",
+                        "description": "True if hosts were freshly provisioned (e.g., via QUADS) and need a full harness install. Set this when QUADS was used to provision hosts.",
+                    },
                     "notes": {"type": "string"},
                 },
                 "required": ["assigned_hardware_ips", "ssh_user"],

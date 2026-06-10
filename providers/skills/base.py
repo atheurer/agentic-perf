@@ -46,3 +46,8 @@ class SkillProvider(ABC):
         self, suite_name: str, key: str
     ) -> Any | None:
         return None
+
+    async def validate_runfile(
+        self, run_file: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {"valid": True, "errors": []}

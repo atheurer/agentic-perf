@@ -139,6 +139,8 @@ class ResourceAgent(AgentBase):
             fields["quads_assignment_id"] = result["quads_assignment_id"]
         if result.get("quads_cloud_name"):
             fields["quads_cloud_name"] = result["quads_cloud_name"]
+        if result.get("fresh_host"):
+            fields["fresh_host"] = True
         await self._update_fields(ticket_id, fields)
 
         hw = fields["assigned_hardware_ips"]

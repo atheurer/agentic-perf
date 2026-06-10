@@ -109,6 +109,15 @@ class MultiHarnessSkillProvider(SkillProvider):
     ) -> dict[str, Any]:
         return await self._private.get_all_private_config(suite_name)
 
+    async def validate_runfile(
+        self, run_file: dict[str, Any], harness: str | None = None
+    ) -> dict[str, Any]:
+        harness_name = harness or self._default
+        provider = self._harnesses.get(harness_name)
+        if provider:
+            return await provider.validate_runfile(run_file)
+        return {"valid": True, "errors": [], "warning": f"No provider for harness '{harness_name}'"}
+
     async def find_capable_harnesses(
         self, benchmark_name: str, requirements: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:

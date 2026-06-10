@@ -33,7 +33,7 @@ async def test_generate_runfile_with_endpoints(provider: CrucibleSkillProvider):
         "osruntime": "podman",
     })
     template = result.template
-    assert template["harness"] == "crucible"
+    assert "harness" not in template
     assert "endpoints" in template
     ep = template["endpoints"][0]
     assert ep["type"] == "remotehosts"
@@ -59,8 +59,48 @@ async def test_generate_runfile_no_endpoints(provider: CrucibleSkillProvider):
     assert "endpoints" not in result.template
 
 
+ALLOWED_RUNFILE_KEYS = {"benchmarks", "endpoints", "run-params", "schema", "tags", "tool-params"}
+
+
 @pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
 @pytest.mark.asyncio
-async def test_generate_runfile_harness_field(provider: CrucibleSkillProvider):
+async def test_generate_runfile_only_valid_keys(provider: CrucibleSkillProvider):
+    """Run-file template must only contain keys that crucible's blockbreaker schema allows."""
+    result = await provider.generate_runfile("fio", {
+        "endpoints": [{"host": "10.0.0.1", "roles": ["client"]}],
+        "tags": {"env": "test"},
+    })
+    extra = set(result.template.keys()) - ALLOWED_RUNFILE_KEYS
+    assert not extra, f"Run-file contains keys rejected by crucible schema: {extra}"
+
+
+@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
+@pytest.mark.asyncio
+async def test_generate_runfile_minimal_only_valid_keys(provider: CrucibleSkillProvider):
+    """Even a minimal run-file (no endpoints/tags) must not have extra keys."""
     result = await provider.generate_runfile("fio", {})
-    assert result.template["harness"] == "crucible"
+    extra = set(result.template.keys()) - ALLOWED_RUNFILE_KEYS
+    assert not extra, f"Run-file contains keys rejected by crucible schema: {extra}"
+
+
+@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
+@pytest.mark.asyncio
+async def test_validate_runfile_passes_for_generated(provider: CrucibleSkillProvider):
+    """A run-file from generate_runfile must pass schema validation."""
+    result = await provider.generate_runfile("fio", {
+        "endpoints": [{"host": "10.0.0.1", "roles": ["client"]}],
+        "userenv": "default",
+        "osruntime": "podman",
+    })
+    validation = await provider.validate_runfile(result.template)
+    assert validation["valid"], f"Generated run-file failed validation: {validation['errors']}"
+
+
+@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
+@pytest.mark.asyncio
+async def test_validate_runfile_rejects_extra_keys(provider: CrucibleSkillProvider):
+    """Run-file with extra top-level keys must fail validation."""
+    bad_runfile = {"benchmarks": [], "harness": "crucible"}
+    validation = await provider.validate_runfile(bad_runfile)
+    assert not validation["valid"]
+    assert any("harness" in e for e in validation["errors"])

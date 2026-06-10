@@ -20,15 +20,18 @@ class ProvisioningAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         skill_provider=None,
+        secrets_provider=None,
         event_bus: EventBus | None = None,
     ) -> None:
         self._skill_provider = skill_provider
+        self._secrets_provider = secrets_provider
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
         tools = get_provisioning_tools()
         tool_handlers, self._ssh = create_provisioning_tool_handlers(
             skill_provider=skill_provider,
+            secrets_provider=secrets_provider,
             request_clarification_fn=self._do_request_clarification,
         )
 
@@ -72,6 +75,8 @@ class ProvisioningAgent(AgentBase):
             content += f"\n**SSH User:** {cf['ssh_user']}\n"
         if cf.get("ssh_key_path"):
             content += f"**SSH Key:** {cf['ssh_key_path']}\n"
+        if cf.get("fresh_host"):
+            content += f"\n**Fresh Host:** true (freshly provisioned, no existing harness)\n"
         if cf.get("parsed_specs"):
             content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("benchmark_suite"):

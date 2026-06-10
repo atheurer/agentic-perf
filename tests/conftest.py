@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from providers.secrets.base import SecretsProvider
 from providers.skills.base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
 
@@ -57,6 +58,23 @@ def tmp_zathras_repo(tmp_path: Path) -> Path:
     config_dir.mkdir()
     (config_dir / "test_defs.yml").write_text(TEST_DEFS_YAML)
     return tmp_path
+
+
+class MockSecretsProvider(SecretsProvider):
+    def __init__(self, files: dict[str, str] | None = None) -> None:
+        self._files = files or {}
+
+    async def get_secret(self, path: str) -> str | None:
+        if path in self._files:
+            return "mock-secret-content"
+        return None
+
+    async def get_secret_file(self, path: str) -> Path | None:
+        local = self._files.get(path)
+        return Path(local) if local else None
+
+    async def list_secrets(self, prefix: str = "") -> list[str]:
+        return [k for k in self._files if k.startswith(prefix)]
 
 
 class MockSkillProvider(SkillProvider):

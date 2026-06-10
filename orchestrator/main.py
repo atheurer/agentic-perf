@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import os
+import signal
 import sys
+from pathlib import Path
 
 from .config import OrchestratorConfig
 from .dispatcher import Dispatcher, STATUS_AGENT_MAP, TERMINAL_STATUSES
@@ -76,7 +80,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 tid = ticket["id"]
                 if dispatcher.is_active(tid):
                     continue
+                if dispatcher.was_dispatched(tid, status):
+                    continue
                 dispatcher.mark_active(tid)
+                dispatcher.mark_dispatched(tid, status)
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
                 asyncio.create_task(
                     run_agent_task(dispatcher, status, tid)
@@ -85,11 +92,41 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         await asyncio.sleep(config.poll_interval)
 
 
+LOCK_FILE = Path.home() / ".agentic-perf" / "orchestrator.pid"
+
+
+def _acquire_lock() -> None:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if LOCK_FILE.exists():
+        old_pid = LOCK_FILE.read_text().strip()
+        try:
+            os.kill(int(old_pid), 0)
+            print(
+                f"ERROR: Orchestrator already running (PID {old_pid}). "
+                f"Kill it first or remove {LOCK_FILE}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass
+    LOCK_FILE.write_text(str(os.getpid()))
+    atexit.register(_release_lock)
+
+
+def _release_lock() -> None:
+    try:
+        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+            LOCK_FILE.unlink()
+    except OSError:
+        pass
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _acquire_lock()
     config = OrchestratorConfig()
     try:
         asyncio.run(poll_loop(config))
