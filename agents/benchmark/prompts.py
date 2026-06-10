@@ -28,9 +28,10 @@ Your tasks in order:
    - The endpoint hosts from assigned_hardware_ips
    - Any parameters from parsed_specs
 
-5. Call execute_benchmark with the generated config. Pass the harness name and run_command
-   from the execution config. This sends the config to the controller and runs the
-   benchmark. It may take several minutes.
+5. Call execute_benchmark with the run-file from generate_run_file. Pass it through
+   unmodified — do not add, remove, or change any fields. The system uses the original
+   generated run-file internally. Pass the harness name and run_command from the
+   execution config. This may take several minutes.
 
 6. When execution completes, call the submit_benchmark_result tool with the results.
 

@@ -18,13 +18,6 @@ Currently CrucibleSkillProvider and ZathrasSkillProvider need local repo clones.
 
 This decouples the orchestrator machine from needing harness repos locally.
 
-## Run-File Integrity (Priority: Medium)
-
-The LLM modifies the run-file between `generate_run_file` and `execute_benchmark`. The schema guardrail catches invalid modifications, but the LLM shouldn't need to modify it at all. Options:
-- Have `execute_benchmark` use the run-file directly from `generate_run_file` internally
-- Tell the benchmark agent via prompt to pass the run-file through unmodified
-- Make `generate_run_file` produce a complete, valid run-file every time (it mostly does, but the LLM adds extra fields like `endpoint_user`)
-
 ## Checkpoint/Restart on Tickets
 
 Instead of resubmitting from scratch when a phase fails, support rewinding a ticket to a previous state. The ticket has all accumulated context (hardware IPs, SSH key, harness version). A `rewind` CLI command would transition the ticket back and let the dispatcher re-run just the failed phase. Need to define which custom_fields to clear on rewind.

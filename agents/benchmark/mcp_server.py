@@ -125,10 +125,10 @@ def get_benchmark_tools() -> list[ToolDefinition]:
         ToolDefinition(
             name="execute_benchmark",
             description=(
-                "Execute the benchmark on the controller host. For crucible, sends a JSON "
-                "run-file via SCP and runs 'crucible run'. For zathras, constructs a burden "
-                "command from the run config. This may take several minutes. Returns the "
-                "run ID and status."
+                "Execute the benchmark on the controller host. Uses the run-file from the "
+                "most recent generate_run_file call — pass it through unmodified. For "
+                "crucible, sends a JSON run-file via SCP and runs 'crucible run'. For "
+                "zathras, constructs a burden command. This may take several minutes."
             ),
             input_schema={
                 "type": "object",
@@ -190,6 +190,7 @@ def create_benchmark_tool_handlers(
 ) -> tuple[dict[str, Any], SSHExecutor]:
 
     ssh = SSHExecutor(user="root")
+    _last_generated_runfile: dict[str, Any] = {}
 
     async def get_execution_config(harness_name: str) -> dict:
         config = await skill_provider.get_all_private_config(harness_name)
@@ -338,6 +339,8 @@ def create_benchmark_tool_handlers(
             params["os_vendor"] = os_vendor
 
         runfile_template = await skill_provider.generate_runfile(benchmark, params)
+        _last_generated_runfile["run_file"] = runfile_template.template
+        _last_generated_runfile["harness"] = harness_name
         return {"run_file": runfile_template.template, "status": "generated", "harness": harness_name}
 
     async def execute_benchmark(
@@ -350,6 +353,15 @@ def create_benchmark_tool_handlers(
 
         run_uuid = uuid.uuid4().hex[:8]
         harness_name = harness or "crucible"
+
+        if _last_generated_runfile.get("run_file"):
+            if run_file != _last_generated_runfile["run_file"]:
+                logger.warning(
+                    "[benchmark] LLM modified run-file after generation — "
+                    "using original from generate_run_file"
+                )
+            run_file = _last_generated_runfile["run_file"]
+            harness_name = _last_generated_runfile.get("harness", harness_name)
 
         validation = await skill_provider.validate_runfile(run_file, harness_name)
         if not validation.get("valid", True):
