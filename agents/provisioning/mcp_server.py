@@ -512,7 +512,7 @@ def create_provisioning_tool_handlers(
         path = install_path or provisioning.get("install_target_path", f"/opt/{harness_name}")
         verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
 
-        result = await ssh.run(host, f"{verify_cmd} 2>&1 | head -3")
+        result = await ssh.run(host, f"set -o pipefail; {verify_cmd} 2>&1 | head -3")
         if result.exit_code == 0:
             version_result = await ssh.run(host, f"cd {path} && git log --oneline -1 2>/dev/null")
             return {

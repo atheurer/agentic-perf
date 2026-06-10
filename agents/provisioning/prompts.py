@@ -22,15 +22,17 @@ Your tasks:
    check_existing_install entirely and proceed directly to install_harness.
 
 5. If fresh_host is NOT set, check for an existing installation using
-   check_existing_install with the harness_name. Then read the provisioning
-   config's "on_existing_install" field:
-   - If "skip": do NOT ask the user. Skip installation and proceed directly
-     to submit_provisioning_result with provisioning_complete=true.
-   - If "update": run update_install without asking.
-   - If "reinstall": first call uninstall_harness to remove the existing install,
-     WAIT for it to complete, then call install_harness for a clean install.
-   - If "ask_user": use request_clarification to present the options.
-   - If no existing install is found: proceed with fresh installation.
+   check_existing_install with the harness_name. Look at the "installed"
+   field in the result:
+   - If installed is FALSE: the harness is NOT installed. You MUST proceed
+     to install_harness. Ignore on_existing_install — it does not apply.
+   - If installed is TRUE: read the provisioning config's "on_existing_install":
+     - "skip": proceed directly to submit_provisioning_result with
+       provisioning_complete=true. Do NOT ask the user.
+     - "update": run update_install without asking.
+     - "reinstall": call uninstall_harness FIRST, wait for completion,
+       then call install_harness for a clean install.
+     - "ask_user": use request_clarification to present the options.
 
 6. Install using install_harness with the harness_name.
 
