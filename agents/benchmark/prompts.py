@@ -95,9 +95,12 @@ Endpoint structure (kube type — flat, no remotes/settings):
   "controller-ip-address": "<controller private IP>",
   "host": "<kube host IP (same as controller for single-node K3s)>",
   "user": "root",
-  "engines": {"client": "1-2", "server": "1-2"},
-  "config": {"targets": "default", "userenv": "default"}
+  "engines": {"client": "1", "server": "1"}
 }
+```
+Optional config (only when userenv is not "default"):
+```json
+"config": [{"targets": "default", "settings": {"userenv": "alma8"}}]
 ```
 
 When `endpoint_type` is "kube", pass it to `generate_run_file`. The generator builds the

@@ -255,7 +255,7 @@ class CrucibleSkillProvider(SkillProvider):
 
         engines: dict[str, str] = {}
         for role in unique_roles:
-            engines[role] = "1-2"
+            engines[role] = "1"
 
         kube_ep: dict[str, Any] = {
             "type": "kube",
@@ -265,8 +265,13 @@ class CrucibleSkillProvider(SkillProvider):
             "engines": engines,
         }
 
-        if userenv:
-            kube_ep["config"] = {"targets": "default", "userenv": userenv}
+        if userenv and userenv != "default":
+            kube_ep["config"] = [
+                {
+                    "targets": "default",
+                    "settings": {"userenv": userenv},
+                }
+            ]
 
         template["endpoints"] = [kube_ep]
 

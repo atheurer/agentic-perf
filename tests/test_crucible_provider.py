@@ -143,7 +143,7 @@ async def test_generate_runfile_kube_single_role(provider: CrucibleSkillProvider
         "kube_host": "10.0.0.1",
     })
     ep = result.template["endpoints"][0]
-    assert ep["engines"] == {"client": "1-2"}
+    assert ep["engines"] == {"client": "1"}
     assert "server" not in ep["engines"]
 
 
@@ -165,7 +165,7 @@ async def test_generate_runfile_remotehosts_unchanged(provider: CrucibleSkillPro
 @pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
 @pytest.mark.asyncio
 async def test_generate_runfile_kube_has_config(provider: CrucibleSkillProvider):
-    """Kube endpoint includes config block with userenv when specified."""
+    """Kube endpoint includes config array with userenv when non-default."""
     result = await provider.generate_runfile("fio", {
         "endpoint_type": "kube",
         "endpoints": [{"host": "10.0.0.1", "roles": ["client"]}],
@@ -174,7 +174,22 @@ async def test_generate_runfile_kube_has_config(provider: CrucibleSkillProvider)
         "userenv": "alma8",
     })
     ep = result.template["endpoints"][0]
-    assert ep["config"] == {"targets": "default", "userenv": "alma8"}
+    assert ep["config"] == [{"targets": "default", "settings": {"userenv": "alma8"}}]
+
+
+@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
+@pytest.mark.asyncio
+async def test_generate_runfile_kube_default_userenv_no_config(provider: CrucibleSkillProvider):
+    """Kube endpoint omits config when userenv is 'default'."""
+    result = await provider.generate_runfile("fio", {
+        "endpoint_type": "kube",
+        "endpoints": [{"host": "10.0.0.1", "roles": ["client"]}],
+        "controller_ip": "10.0.0.1",
+        "kube_host": "10.0.0.1",
+        "userenv": "default",
+    })
+    ep = result.template["endpoints"][0]
+    assert "config" not in ep
 
 
 ALLOWED_RUNFILE_KEYS = {"benchmarks", "endpoints", "run-params", "schema", "tags", "tool-params"}
