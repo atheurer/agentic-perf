@@ -55,82 +55,103 @@ def get_resource_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
-            name="quads_check_available",
+            name="list_resource_providers",
             description=(
-                "List bare-metal hosts available for self-service reservation "
-                "from the Scale Lab QUADS system. Returns host details including "
-                "CPU, memory, disks (type and size), and NICs. Optionally filter "
-                "by host model, NIC vendor, NIC speed, or disk type."
+                "List resource providers that are configured and available. "
+                "Returns provider names and types (bare_metal, cloud). "
+                "Call this first if no resource_provider directive is set."
             ),
             input_schema={
                 "type": "object",
-                "properties": {
-                    "model_filter": {
-                        "type": "string",
-                        "description": "Filter by host model substring (e.g. 'r660', 'r650', 'r6625')",
-                    },
-                    "vendor_filter": {
-                        "type": "string",
-                        "description": "Filter by NIC vendor substring (e.g. 'Intel', 'Mellanox', 'Broadcom')",
-                    },
-                    "speed_filter": {
-                        "type": "integer",
-                        "description": "Filter by NIC speed in Gbps (e.g. 25, 100)",
-                    },
-                    "disk_type_filter": {
-                        "type": "string",
-                        "description": "Filter by disk type (e.g. 'nvme', 'sata', 'scsi')",
-                    },
-                    "duration_hours": {
-                        "type": "integer",
-                        "description": "Only show hosts available for at least this many hours (default: 36)",
-                    },
-                },
+                "properties": {},
             },
         ),
         ToolDefinition(
-            name="quads_reserve_hosts",
+            name="check_available_resources",
             description=(
-                "Reserve bare-metal hosts from QUADS. Creates an assignment, schedules "
-                "the specified hosts, waits for validation (~30-45 min), and sets up "
-                "SSH key access. Returns assigned host details, SSH credentials, and "
-                "lease expiration. Use quads_check_available first to find hosts."
+                "Check what resources are available from a specific provider. "
+                "For bare-metal providers (quads), returns available hosts with "
+                "CPU, memory, disk, and NIC details. For cloud providers (aws), "
+                "returns recommended instance types. Use filters to narrow results."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "hostnames": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "FQDNs of hosts to reserve (from quads_check_available)",
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name (e.g., 'quads', 'aws')",
+                    },
+                    "requirements": {
+                        "type": "object",
+                        "description": (
+                            "Resource requirements. Common keys: "
+                            "min_cores (int), min_memory_gb (int), "
+                            "nic_speed (int, Gbps), nic_vendor (str), "
+                            "disk_type (str), count (int, hosts needed), "
+                            "duration_hours (int). "
+                            "Provider-specific: model_filter (quads), "
+                            "instance_type (aws)."
+                        ),
+                    },
+                },
+                "required": ["provider"],
+            },
+        ),
+        ToolDefinition(
+            name="reserve_resources",
+            description=(
+                "Reserve resources from a provider. For bare-metal (quads), "
+                "this creates an assignment, schedules hosts, waits for "
+                "validation (~30-45 min), and sets up SSH access. For cloud "
+                "(aws), this launches instances, waits until running, and "
+                "verifies SSH connectivity. Returns host IPs, SSH credentials, "
+                "and a reservation ID for teardown."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name (e.g., 'quads', 'aws')",
+                    },
+                    "selection": {
+                        "type": "object",
+                        "description": (
+                            "What to reserve, based on check_available_resources results. "
+                            "For quads: {hostnames: ['host1.example.com', ...]}. "
+                            "For aws: {instance_type: 'm5.xlarge', count: 2}."
+                        ),
                     },
                     "description": {
                         "type": "string",
-                        "description": "Short description for the QUADS assignment",
+                        "description": "Short description for the reservation",
                     },
                     "duration_hours": {
                         "type": "integer",
-                        "description": "Lease duration in hours (default: 36)",
+                        "description": "Lease duration in hours (default: 36, ignored by cloud providers)",
                     },
                 },
-                "required": ["hostnames", "description"],
+                "required": ["provider", "selection", "description"],
             },
         ),
         ToolDefinition(
-            name="quads_get_assignment_status",
+            name="get_reservation_status",
             description=(
-                "Check the status of an existing QUADS assignment. "
-                "Returns validated/provisioned state."
+                "Check the status of an existing resource reservation."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "assignment_id": {
-                        "type": "integer",
-                        "description": "QUADS assignment ID",
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name",
+                    },
+                    "reservation_id": {
+                        "type": "string",
+                        "description": "Reservation ID from reserve_resources result",
                     },
                 },
-                "required": ["assignment_id"],
+                "required": ["provider", "reservation_id"],
             },
         ),
         ToolDefinition(
@@ -149,14 +170,40 @@ def get_resource_tools() -> list[ToolDefinition]:
                     },
                     "ssh_user": {"type": "string"},
                     "ssh_key_path": {"type": "string"},
+                    "resource_provider": {
+                        "type": "string",
+                        "description": "Provider used: 'quads', 'aws', 'user_provided', etc.",
+                    },
+                    "resource_reservation_id": {
+                        "type": ["string", "null"],
+                        "description": "Reservation ID for teardown (from reserve_resources result)",
+                    },
+                    "resource_provider_metadata": {
+                        "type": ["object", "null"],
+                        "description": (
+                            "Provider-specific metadata for teardown. "
+                            "QUADS: {assignment_id, cloud_name}. "
+                            "AWS: {instance_ids, region, instance_type}."
+                        ),
+                    },
                     "lease_expiration": {"type": ["string", "null"]},
-                    "quads_assignment_id": {"type": ["integer", "null"]},
-                    "quads_cloud_name": {"type": ["string", "null"]},
                     "fresh_host": {
                         "type": "boolean",
-                        "description": "True if hosts were freshly provisioned (e.g., via QUADS) and need a full harness install. Set this when QUADS was used to provision hosts.",
+                        "description": (
+                            "True if hosts were freshly provisioned and need a full "
+                            "harness install. Set true for QUADS and cloud providers."
+                        ),
                     },
                     "notes": {"type": "string"},
+                    # Backward-compatible fields
+                    "quads_assignment_id": {
+                        "type": ["integer", "null"],
+                        "description": "Deprecated: use resource_reservation_id instead",
+                    },
+                    "quads_cloud_name": {
+                        "type": ["string", "null"],
+                        "description": "Deprecated: use resource_provider_metadata instead",
+                    },
                 },
                 "required": ["assigned_hardware_ips", "ssh_user"],
             },
@@ -169,19 +216,20 @@ FQDN_RE = re.compile(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA
 
 
 def create_resource_tool_handlers(
+    registry=None,
     secrets_provider=None,
 ) -> dict[str, Any]:
 
-    _quads_client = None
+    _registry = registry
 
-    async def _get_quads_client():
-        nonlocal _quads_client
-        if _quads_client is None:
+    def _get_registry():
+        nonlocal _registry
+        if _registry is None:
             if secrets_provider is None:
-                raise ValueError("No secrets provider configured for QUADS")
-            from providers.quads import QuadsClient
-            _quads_client = await QuadsClient.from_secrets(secrets_provider)
-        return _quads_client
+                raise ValueError("No secrets provider or registry configured")
+            from providers.resource.registry import ResourceProviderRegistry
+            _registry = ResourceProviderRegistry(secrets_provider)
+        return _registry
 
     async def parse_host_config(text: str) -> dict:
         result: dict[str, Any] = {
@@ -228,7 +276,6 @@ def create_resource_tool_handlers(
     async def validate_host(
         host: str, user: str = "root", ssh_key_path: str = "~/.ssh/id_rsa"
     ) -> dict:
-        # Simulated — returns success. Replace body with real SSH check.
         return {
             "host": host,
             "reachable": True,
@@ -238,76 +285,43 @@ def create_resource_tool_handlers(
             "message": f"Host {host} validated (simulated)",
         }
 
-    async def quads_check_available(
-        model_filter: str | None = None,
-        vendor_filter: str | None = None,
-        speed_filter: int | None = None,
-        disk_type_filter: str | None = None,
+    async def list_resource_providers() -> dict:
+        reg = _get_registry()
+        providers = await reg.list_configured_providers()
+        return {
+            "configured_providers": providers,
+            "count": len(providers),
+        }
+
+    async def check_available_resources(
+        provider: str, requirements: dict | None = None
+    ) -> dict:
+        reg = _get_registry()
+        prov = await reg.get_provider(provider)
+        return await prov.check_available(requirements or {})
+
+    async def reserve_resources(
+        provider: str,
+        selection: dict,
+        description: str,
         duration_hours: int = 36,
     ) -> dict:
-        client = await _get_quads_client()
-        hosts = await client.get_available(
-            model_filter=model_filter,
-            vendor_filter=vendor_filter,
-            speed_filter=speed_filter,
-            disk_type_filter=disk_type_filter,
-            duration_hours=duration_hours,
-        )
-        return {
-            "available_count": len(hosts),
-            "hosts": hosts,
-        }
+        reg = _get_registry()
+        prov = await reg.get_provider(provider)
+        return await prov.reserve(selection, description, duration_hours)
 
-    async def quads_reserve_hosts(
-        hostnames: list[str], description: str, duration_hours: int = 36
+    async def get_reservation_status(
+        provider: str, reservation_id: str
     ) -> dict:
-        client = await _get_quads_client()
-
-        if len(hostnames) > 10:
-            return {"status": "failed", "message": "Max 10 hosts per assignment"}
-
-        logger.info(f"[resource] Creating QUADS assignment: {description}")
-        assignment = await client.create_assignment(description)
-        logger.info(
-            f"[resource] Assignment created: id={assignment['id']} "
-            f"cloud={assignment['cloud_name']}"
-        )
-
-        scheduled = []
-        for hostname in hostnames:
-            logger.info(f"[resource] Scheduling {hostname} -> {assignment['cloud_name']}")
-            sched = await client.schedule_host(assignment["cloud_name"], hostname, duration_hours=duration_hours)
-            scheduled.append(sched)
-
-        logger.info(
-            f"[resource] Waiting for QUADS validation of assignment {assignment['id']}..."
-        )
-        status = await client.poll_until_validated(assignment["id"])
-        logger.info(f"[resource] Assignment {assignment['id']} validated")
-
-        logger.info(f"[resource] Setting up SSH access to {len(hostnames)} hosts")
-        ssh_result = await client.setup_ssh(hostnames)
-
-        return {
-            "status": "success",
-            "assignment_id": assignment["id"],
-            "cloud_name": assignment["cloud_name"],
-            "ticket": assignment.get("ticket"),
-            "hosts": hostnames,
-            "ssh_user": "root",
-            "ssh_key_path": client.ssh_key_path,
-            "ssh_setup": ssh_result,
-            "lease_expiration": scheduled[0].get("end") if scheduled else None,
-        }
-
-    async def quads_get_assignment_status(assignment_id: int) -> dict:
-        client = await _get_quads_client()
-        return await client.get_assignment_status(assignment_id)
+        reg = _get_registry()
+        prov = await reg.get_provider(provider)
+        return await prov.get_reservation_status(reservation_id)
 
     return {
         "parse_host_config": parse_host_config,
         "validate_host": validate_host,
-        "quads_check_available": quads_check_available,
-        "quads_reserve_hosts": quads_reserve_hosts,
-        "quads_get_assignment_status": quads_get_assignment_status,
+        "list_resource_providers": list_resource_providers,
+        "check_available_resources": check_available_resources,
+        "reserve_resources": reserve_resources,
+        "get_reservation_status": get_reservation_status,
     }

@@ -28,12 +28,25 @@ Your job is to analyze a performance test request ticket and:
    the user asked to test "performance" with no indication of what kind. Do NOT ask
    for benchmark parameters — the suite has defaults.
 
-6. Determine HOST CLEANUP policy. Default to "required" — this ensures SSH keys and
-   harness installations are removed from hosts during teardown. Set to "skip" only
-   if the user indicates the infrastructure will wipe hosts automatically (e.g., cloud
-   instances that are terminated, or bare-metal hosts that are fully reprovisioned).
-   When in doubt, use "required" — it's the safe default.
+6. Extract OPERATIONAL DIRECTIVES — instructions the user gives about how to run the
+   test, not what to test. Include these in the "directives" field. Only include
+   directives the user explicitly states or clearly implies. Examples:
+
+   - "reinstall crucible before running" → on_existing_install: "reinstall"
+   - "use the existing installation" → on_existing_install: "skip"
+   - "use zathras, not crucible" → harness: "zathras"
+   - "don't ask me for approval" / "just run it" → user_pre_run_approval: false
+   - "these are cloud instances, no cleanup needed" → host_cleanup: "skip"
+   - "use AWS" / "deploy on EC2" / "use cloud instances" → resource_provider: "aws"
+   - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"
+
+   If the user does not mention a directive, omit it — downstream agents will use
+   their own defaults. Do NOT invent directives the user didn't ask for.
+
+   The directives object also accepts arbitrary keys for future extensibility. If the
+   user gives an operational instruction that doesn't fit the known fields, include it
+   as a descriptive key-value pair (e.g., "run_count": 3 for "run it three times").
 
 When you have completed your analysis, call the submit_triage_result tool with your
-findings, including the min_hosts, roles, and host_cleanup from the benchmark details.
+findings, including the min_hosts and roles from the benchmark details.
 """
