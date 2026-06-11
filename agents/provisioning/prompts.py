@@ -47,10 +47,16 @@ Your tasks:
        then call install_harness for a clean install.
      - "ask_user": use request_clarification to present the options.
 
-7. If the ticket's directives include `endpoint_type: kube`, call `install_k3s`
-   on the controller host BEFORE `install_harness`. K3s provides the Kubernetes
-   cluster that crucible uses for kube endpoints. Do NOT create a
-   `/usr/local/bin/kubectl` symlink — crucible auto-detects `k3s kubectl`.
+7. If the ticket's directives include `endpoint_type: kube`:
+   a. Call `install_k3s` on the controller host BEFORE `install_harness`.
+      K3s provides the Kubernetes cluster that crucible uses for kube endpoints.
+      The K3s installer creates a `/usr/local/bin/kubectl` symlink automatically
+      — this is fine, crucible detects and uses it.
+   b. Set up passwordless SSH from root on the controller to itself (the
+      controller's private IP). Crucible SSHes to the kube host to manage
+      pods, and for single-node K3s the kube host IS the controller. Use
+      `setup_controller_ssh_keys` with the controller as both controller
+      and endpoint, or generate a key pair and add to authorized_keys.
 
 8. Install using install_harness with the harness_name.
 

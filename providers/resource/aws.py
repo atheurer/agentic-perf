@@ -30,6 +30,7 @@ class AWSResourceProvider(ResourceProvider):
         default_instance_type: str,
         instance_type_map: dict[str, str] | None = None,
         session_token: str | None = None,
+        root_volume_gb: int = 50,
     ) -> None:
         self._region = region
         self._access_key_id = access_key_id
@@ -43,6 +44,7 @@ class AWSResourceProvider(ResourceProvider):
         self._default_ami = default_ami
         self._default_instance_type = default_instance_type
         self._instance_type_map = instance_type_map or {}
+        self._default_root_volume_gb = root_volume_gb
         self._ec2_client = None
 
     @classmethod
@@ -79,6 +81,7 @@ class AWSResourceProvider(ResourceProvider):
             default_instance_type=config["default_instance_type"],
             instance_type_map=config.get("instance_type_map"),
             session_token=config.get("session_token"),
+            root_volume_gb=config.get("root_volume_gb", 50),
         )
 
     def _get_ec2_client(self):
@@ -149,22 +152,36 @@ class AWSResourceProvider(ResourceProvider):
         instance_type = selection.get("instance_type", self._default_instance_type)
         ami = selection.get("ami", self._default_ami)
         count = selection.get("count", 1)
+        root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
 
         logger.info(
             f"[aws-provider] Launching {count}x {instance_type} "
-            f"(AMI: {ami}, region: {self._region})"
+            f"(AMI: {ami}, root_volume: {root_volume_gb}GB, region: {self._region})"
         )
 
-        response = await asyncio.to_thread(
-            ec2.run_instances,
-            ImageId=ami,
-            InstanceType=instance_type,
-            KeyName=self._ssh_key_name,
-            MinCount=count,
-            MaxCount=count,
-            SecurityGroupIds=[self._security_group_id],
-            SubnetId=self._subnet_id,
-            TagSpecifications=[
+        ami_info = await asyncio.to_thread(
+            ec2.describe_images, ImageIds=[ami]
+        )
+        root_device = ami_info["Images"][0].get("RootDeviceName", "/dev/sda1")
+
+        run_kwargs: dict[str, Any] = {
+            "ImageId": ami,
+            "InstanceType": instance_type,
+            "KeyName": self._ssh_key_name,
+            "MinCount": count,
+            "MaxCount": count,
+            "SecurityGroupIds": [self._security_group_id],
+            "SubnetId": self._subnet_id,
+            "BlockDeviceMappings": [
+                {
+                    "DeviceName": root_device,
+                    "Ebs": {
+                        "VolumeSize": root_volume_gb,
+                        "VolumeType": "gp3",
+                    },
+                }
+            ],
+            "TagSpecifications": [
                 {
                     "ResourceType": "instance",
                     "Tags": [
@@ -177,7 +194,9 @@ class AWSResourceProvider(ResourceProvider):
                     ],
                 }
             ],
-        )
+        }
+
+        response = await asyncio.to_thread(ec2.run_instances, **run_kwargs)
 
         instance_ids = [i["InstanceId"] for i in response["Instances"]]
         logger.info(f"[aws-provider] Launched instances: {instance_ids}")

@@ -192,6 +192,12 @@ class CrucibleSkillProvider(SkillProvider):
         if params.get("tags"):
             template["tags"] = params["tags"]
 
+        if "tool-params" not in template:
+            template["tool-params"] = [
+                {"tool": "sysstat"},
+                {"tool": "procstat"},
+            ]
+
         return RunfileTemplate(benchmark=benchmark, template=template)
 
     def _build_remotehosts_endpoints(
