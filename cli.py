@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -254,6 +255,97 @@ def cmd_reply(args):
     print(f"Reply added and ticket resumed to: {previous}")
 
 
+def _load_aws_config() -> dict:
+    config_path = Path.home() / ".agentic-perf" / "secrets" / "aws" / "config.json"
+    if not config_path.exists():
+        print(f"AWS config not found: {config_path}")
+        sys.exit(1)
+    return json.loads(config_path.read_text())
+
+
+def _get_tag(inst: dict, key: str) -> str:
+    for tag in inst.get("Tags", []):
+        if tag["Key"] == key:
+            return tag["Value"]
+    return ""
+
+
+def _format_age(launch_time) -> str:
+    delta = datetime.now(timezone.utc) - launch_time
+    hours = delta.total_seconds() / 3600
+    if hours < 1:
+        return f"{int(delta.total_seconds() / 60)}m"
+    if hours < 48:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def cmd_cleanup(args):
+    import boto3
+
+    config = _load_aws_config()
+    kwargs = {
+        "region_name": config["region"],
+        "aws_access_key_id": config["access_key_id"],
+        "aws_secret_access_key": config["secret_access_key"],
+    }
+    if config.get("session_token"):
+        kwargs["aws_session_token"] = config["session_token"]
+
+    ec2 = boto3.client("ec2", **kwargs)
+
+    response = ec2.describe_instances(
+        Filters=[
+            {"Name": "tag:agentic-perf", "Values": ["true"]},
+            {"Name": "instance-state-name", "Values": ["running", "stopped"]},
+        ]
+    )
+
+    instances = []
+    for reservation in response["Reservations"]:
+        for inst in reservation["Instances"]:
+            instances.append(inst)
+
+    if args.older_than:
+        cutoff = datetime.now(timezone.utc).timestamp() - (args.older_than * 3600)
+        instances = [
+            i for i in instances
+            if i["LaunchTime"].timestamp() < cutoff
+        ]
+
+    if not instances:
+        print("No matching agentic-perf instances found.")
+        return
+
+    print(f"Found {len(instances)} agentic-perf instance(s) in {config['region']}:\n")
+    print(f"  {'Instance ID':<20} {'State':<10} {'Age':>6}  {'Ticket':<16} {'Name'}")
+    print(f"  {'─' * 20} {'─' * 10} {'─' * 6}  {'─' * 16} {'─' * 30}")
+    for inst in instances:
+        print(
+            f"  {inst['InstanceId']:<20} "
+            f"{inst['State']['Name']:<10} "
+            f"{_format_age(inst['LaunchTime']):>6}  "
+            f"{_get_tag(inst, 'ticket-id') or '—':<16} "
+            f"{_get_tag(inst, 'Name')}"
+        )
+
+    if not args.terminate:
+        return
+
+    if not args.yes:
+        ids = [i["InstanceId"] for i in instances]
+        answer = input(f"\nTerminate {len(instances)} instance(s)? [y/N] ")
+        if answer.lower() not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    instance_ids = [i["InstanceId"] for i in instances]
+    result = ec2.terminate_instances(InstanceIds=instance_ids)
+    for i in result.get("TerminatingInstances", []):
+        print(f"  {i['InstanceId']}: {i['PreviousState']['Name']} → {i['CurrentState']['Name']}")
+    print(f"\nTerminated {len(instance_ids)} instance(s).")
+
+
 def cmd_health(args):
     client, url = get_client(args)
     r = client.get("/api/v1/health")
@@ -300,6 +392,11 @@ def main():
 
     p_health = sub.add_parser("health", help="Check state store health")
 
+    p_cleanup = sub.add_parser("cleanup", help="Find/terminate orphaned AWS instances")
+    p_cleanup.add_argument("--older-than", type=float, metavar="HOURS", help="Only instances older than N hours")
+    p_cleanup.add_argument("--terminate", action="store_true", help="Terminate matched instances")
+    p_cleanup.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -312,6 +409,7 @@ def main():
         "watch": cmd_watch,
         "reply": cmd_reply,
         "health": cmd_health,
+        "cleanup": cmd_cleanup,
     }
     commands[args.command](args)
 
