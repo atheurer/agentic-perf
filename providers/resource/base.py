@@ -54,6 +54,7 @@ class ResourceProvider(ABC):
         selection: dict[str, Any],
         description: str,
         duration_hours: int = 36,
+        ticket_id: str | None = None,
     ) -> dict[str, Any]:
         """Reserve the selected resources.
 
@@ -62,6 +63,7 @@ class ResourceProvider(ABC):
                 (e.g., {"hostnames": [...]} for QUADS, {"instance_type": "...", "count": N} for AWS).
             description: Human-readable description for the reservation.
             duration_hours: Requested lease duration (providers may ignore if N/A).
+            ticket_id: Jira ticket ID for tagging/traceability (optional).
 
         Returns:
             {

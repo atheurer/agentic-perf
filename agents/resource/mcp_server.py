@@ -126,6 +126,10 @@ def get_resource_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Short description for the reservation",
                     },
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "Jira ticket ID (e.g., 'PERF-123') for instance naming and traceability",
+                    },
                     "duration_hours": {
                         "type": "integer",
                         "description": "Lease duration in hours (default: 36, ignored by cloud providers)",
@@ -304,11 +308,12 @@ def create_resource_tool_handlers(
         provider: str,
         selection: dict,
         description: str,
+        ticket_id: str | None = None,
         duration_hours: int = 36,
     ) -> dict:
         reg = _get_registry()
         prov = await reg.get_provider(provider)
-        return await prov.reserve(selection, description, duration_hours)
+        return await prov.reserve(selection, description, duration_hours, ticket_id=ticket_id)
 
     async def get_reservation_status(
         provider: str, reservation_id: str

@@ -48,6 +48,7 @@ class QuadsResourceProvider(ResourceProvider):
         selection: dict[str, Any],
         description: str,
         duration_hours: int = 36,
+        ticket_id: str | None = None,
     ) -> dict[str, Any]:
         hostnames = selection["hostnames"]
         if len(hostnames) > 10:

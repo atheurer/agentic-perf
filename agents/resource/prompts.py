@@ -29,7 +29,8 @@ If the directives include resource_provider (e.g., "quads" or "aws"):
 1. Call check_available_resources with the specified provider and requirements
    from the ticket (cores, memory, NIC speed, disk type, host count).
 2. Select resources from the available options.
-3. Call reserve_resources with the selected options.
+3. Call reserve_resources with the selected options. Always include the
+   ticket_id (the Jira ticket key, e.g. "PERF-123") for instance traceability.
 4. Call submit_resource_result with the reservation details.
 
 ### Path 3: Auto-Select Provider (no hosts, no directive)
@@ -39,7 +40,8 @@ If the directives include resource_provider (e.g., "quads" or "aws"):
    dedicated hardware without virtualization overhead.
 3. If bare-metal is unavailable or cannot satisfy requirements, try cloud
    providers (aws).
-4. Call check_available_resources, then reserve_resources as in Path 2.
+4. Call check_available_resources, then reserve_resources as in Path 2
+   (always include ticket_id).
 
 ## Submitting the Result
 
