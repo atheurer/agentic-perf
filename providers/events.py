@@ -85,8 +85,38 @@ class EventBus:
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         events = self._events.get(ticket_id, [])
-        filtered = [e for e in events if e.seq > since]
-        return [e.to_dict() for e in filtered[:limit]]
+        if events:
+            filtered = [e for e in events if e.seq > since]
+            return [e.to_dict() for e in filtered[:limit]]
+        return self._read_from_file(ticket_id, since=since, limit=limit)
+
+    def _read_from_file(
+        self,
+        ticket_id: str,
+        since: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        path = self._log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return []
+        results = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("seq", 0) > since:
+                        results.append(evt)
+                        if len(results) >= limit:
+                            break
+        except Exception:
+            logger.exception(f"Failed to read events from file for {ticket_id}")
+        return results
 
     def _write_to_file(self, ticket_id: str, event: Event) -> None:
         try:
