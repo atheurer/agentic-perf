@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from providers.llm.base import ToolDefinition
+from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,9 @@ def get_resource_tools() -> list[ToolDefinition]:
             name="validate_host",
             description=(
                 "Validate that a host is reachable via SSH. "
-                "Returns connectivity status and basic system info."
+                "Returns connectivity status, FQDN, and basic system info "
+                "(OS, CPU count, RAM). Use the returned fqdn for "
+                "submit_resource_result to ensure consistent hostname resolution."
             ),
             input_schema={
                 "type": "object",
@@ -228,9 +231,10 @@ FQDN_RE = re.compile(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA
 def create_resource_tool_handlers(
     registry=None,
     secrets_provider=None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any], SSHExecutor]:
 
     _registry = registry
+    ssh = SSHExecutor(user="root")
 
     def _get_registry():
         nonlocal _registry
@@ -286,13 +290,46 @@ def create_resource_tool_handlers(
     async def validate_host(
         host: str, user: str = "root", ssh_key_path: str = "~/.ssh/id_rsa"
     ) -> dict:
+        effective_key = ssh_key_path if ssh_key_path != "~/.ssh/id_rsa" else None
+        result = await ssh.run(
+            host, "echo SSH_OK", timeout=15, key_path=effective_key,
+        )
+
+        if result.exit_code != 0 or "SSH_OK" not in result.stdout:
+            return {
+                "host": host,
+                "reachable": False,
+                "message": f"SSH failed: {result.stderr.strip() or 'no response'}",
+            }
+
+        info_cmd = (
+            "hostname -f 2>/dev/null || hostname; "
+            "cat /etc/redhat-release 2>/dev/null || head -1 /etc/os-release; "
+            "nproc; "
+            "awk '/MemTotal/{printf \"%.0f\", $2/1024/1024}' /proc/meminfo"
+        )
+        info = await ssh.run(host, info_cmd, timeout=15, key_path=effective_key)
+        lines = info.stdout.strip().splitlines()
+
+        fqdn = lines[0].strip() if len(lines) > 0 else host
+        os_info = lines[1].strip() if len(lines) > 1 else "unknown"
+        try:
+            cpu_count = int(lines[2].strip()) if len(lines) > 2 else 0
+        except ValueError:
+            cpu_count = 0
+        try:
+            ram_gb = int(lines[3].strip()) if len(lines) > 3 else 0
+        except ValueError:
+            ram_gb = 0
+
         return {
             "host": host,
+            "fqdn": fqdn,
             "reachable": True,
-            "os": "RHEL 9.4",
-            "cpu_count": 16,
-            "ram_gb": 64,
-            "message": f"Host {host} validated (simulated)",
+            "os": os_info,
+            "cpu_count": cpu_count,
+            "ram_gb": ram_gb,
+            "message": f"Host {host} validated via SSH",
         }
 
     async def list_resource_providers() -> dict:
@@ -341,4 +378,4 @@ def create_resource_tool_handlers(
         "reserve_resources": reserve_resources,
         "get_reservation_status": get_reservation_status,
     }
-    return handlers, last_reservation
+    return handlers, last_reservation, ssh

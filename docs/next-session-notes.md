@@ -1,8 +1,8 @@
 # Next Session Notes
 
-## LLM-Driven Run-File Generation (Priority: High)
+## ~~LLM-Driven Run-File Generation~~ (Done)
 
-Redesign the benchmark agent to construct run.json directly from natural language instead of going through the `generate_run_file` template layer. Full design doc: [design-llm-runfile-generation.md](design-llm-runfile-generation.md).
+Implemented: benchmark agent constructs run.json directly from natural language via LLM instead of `generate_run_file` templates. Commit `bb77ac2` on main. Design doc: [design-llm-runfile-generation.md](design-llm-runfile-generation.md).
 
 ## ~~Triage Directives~~ (Done)
 
@@ -11,7 +11,11 @@ Implemented: `directives` field in triage submit schema with `on_existing_instal
 Provisioning and benchmark agents check directives before falling back to skill config defaults.
 Benchmark agent now asks for user approval before executing (unless `user_pre_run_approval: false`).
 
-## Remote Skills Loading (Priority: Medium)
+## Harness Update Directive (Priority: Medium)
+
+Allow a triage directive like `update_harness: true` that tells the provisioning agent to update the harness after install check (e.g., `crucible update`). The execution config already has `update_command` for crucible and `on_existing_install` for zathras — wire these into the provisioning flow so the agent respects them. Triggered by: the PERF-B51A2E61 test showed crucible was 19 commits behind, which could cause failures.
+
+## ~~Remote Skills Loading~~ (Phase 1 Done)
 
 Currently CrucibleSkillProvider and ZathrasSkillProvider need local repo clones. The architecture should be:
 - **Before install**: lightweight benchmark catalog in private skill config (names, roles, min_hosts)

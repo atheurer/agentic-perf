@@ -79,6 +79,19 @@ class OrchestratorConfig:
             or os.environ.get("ZATHRAS_HOME")
             or cfg.get("zathras_home", "")
         )
+        default_repos = {
+            "crucible": "https://github.com/perftool-incubator/crucible.git",
+            "crucible-examples": "https://github.com/perftool-incubator/crucible-examples.git",
+            "zathras": "https://github.com/redhat-performance/zathras.git",
+        }
+        env_repos = os.environ.get("HARNESS_REPOS")
+        if env_repos:
+            try:
+                default_repos.update(json.loads(env_repos))
+            except json.JSONDecodeError:
+                pass
+        default_repos.update(cfg.get("harness_repos", {}))
+        self.harness_repos: dict[str, str] = default_repos
         self.ssh_key = (
             os.environ.get("SSH_KEY")
             or cfg.get("ssh_key")

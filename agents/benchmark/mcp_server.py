@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from providers.llm.base import ToolDefinition
+from providers.skills.repo_cache import RepoCache
 from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,56 @@ async def cleanup_controller_ssh_keys(
     }
 
 
-def get_benchmark_tools() -> list[ToolDefinition]:
-    return [
+def get_benchmark_tools(
+    repo_cache: RepoCache | None = None,
+) -> list[ToolDefinition]:
+    doc_tools = []
+    if repo_cache:
+        doc_tools = [
+            ToolDefinition(
+                name="list_harness_docs",
+                description=(
+                    "List documentation files available for a benchmark harness. "
+                    "Returns file paths and sizes. Use this to discover what "
+                    "reference material is available before constructing a run file."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "harness": {
+                            "type": "string",
+                            "description": "Harness name (e.g., 'crucible', 'zathras')",
+                        },
+                    },
+                    "required": ["harness"],
+                },
+            ),
+            ToolDefinition(
+                name="read_harness_doc",
+                description=(
+                    "Read a documentation file from a benchmark harness repository. "
+                    "Use this to learn about run-file format, endpoint structure, "
+                    "benchmark parameters, or any other harness-specific details. "
+                    "Call list_harness_docs first to see available files."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "harness": {
+                            "type": "string",
+                            "description": "Harness name (e.g., 'crucible')",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the doc file (e.g., 'docs/how-run-files-work.md')",
+                        },
+                    },
+                    "required": ["harness", "path"],
+                },
+            ),
+        ]
+
+    return doc_tools + [
         ToolDefinition(
             name="get_execution_config",
             description=(
@@ -304,10 +353,27 @@ def get_benchmark_tools() -> list[ToolDefinition]:
 def create_benchmark_tool_handlers(
     skill_provider,
     request_clarification_fn=None,
+    repo_cache: RepoCache | None = None,
 ) -> tuple[dict[str, Any], SSHExecutor]:
 
     ssh = SSHExecutor(user="root")
     _last_generated_runfile: dict[str, Any] = {}
+
+    async def list_harness_docs(harness: str) -> dict:
+        if not repo_cache:
+            return {"docs": [], "message": "No repo cache configured"}
+        docs = repo_cache.list_docs(harness, subdirs=["docs", "config"])
+        if not docs:
+            return {"docs": [], "message": f"No docs found for harness '{harness}'"}
+        return {"docs": docs, "count": len(docs)}
+
+    async def read_harness_doc(harness: str, path: str) -> dict:
+        if not repo_cache:
+            return {"found": False, "message": "No repo cache configured"}
+        content = repo_cache.read_file(harness, path)
+        if content is None:
+            return {"found": False, "message": f"File not found: {harness}/{path}"}
+        return {"found": True, "path": path, "content": content}
 
     async def get_execution_config(harness_name: str) -> dict:
         config = await skill_provider.get_all_private_config(harness_name)
@@ -723,7 +789,7 @@ def create_benchmark_tool_handlers(
         await request_clarification_fn(question)
         return "Clarification requested. Ticket paused for human input."
 
-    return {
+    handlers = {
         "get_execution_config": get_execution_config,
         "setup_controller_ssh_keys": setup_controller_ssh_keys,
         "generate_run_file": generate_run_file,
@@ -735,4 +801,8 @@ def create_benchmark_tool_handlers(
         "get_example_runfile": handle_get_example_runfile,
         "validate_run_file": handle_validate_run_file,
         "present_runfile_for_approval": handle_present_runfile_for_approval,
-    }, ssh
+    }
+    if repo_cache:
+        handlers["list_harness_docs"] = list_harness_docs
+        handlers["read_harness_doc"] = read_harness_doc
+    return handlers, ssh

@@ -6,41 +6,61 @@ from typing import Any
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
 KEYWORD_MAP = {
-    "memory": ["streams", "numa_streams"],
+    "memory": ["streams"],
+    "stream": ["streams"],
     "bandwidth": ["streams", "uperf"],
-    "cpu": ["coremark", "coremark_pro", "linpack", "passmark"],
+    "cpu": ["coremark", "coremark_pro", "linpack", "passmark", "speccpu2017"],
     "compute": ["coremark", "coremark_pro", "linpack"],
-    "hpc": ["linpack"],
+    "hpc": ["linpack", "auto_hpl"],
+    "linpack": ["linpack", "auto_hpl"],
     "storage": ["fio", "iozone"],
     "disk": ["fio", "iozone"],
     "io": ["fio", "iozone"],
     "network": ["uperf"],
     "throughput": ["uperf"],
     "latency": ["uperf"],
-    "database": ["hammerdb"],
+    "database": ["hammerdb", "phoronix_cassandra", "phoronix_cockroach", "phoronix_sqlite"],
     "java": ["specjbb"],
-    "python": ["pyperformance"],
+    "python": ["pyperf"],
     "scheduler": ["pig"],
     "boot": ["reboot_measure"],
     "reboot": ["reboot_measure"],
-    "php": ["phpbench"],
-    "crypto": ["openssl"],
-    "ssl": ["openssl"],
-    "web": ["nginx"],
-    "cache": ["redis"],
-    "stress": ["stress_ng"],
+    "php": ["phoronix_phpbench"],
+    "crypto": ["phoronix_openssl"],
+    "ssl": ["phoronix_openssl"],
+    "web": ["phoronix_nginx"],
+    "cache": ["phoronix_redis"],
+    "redis": ["phoronix_redis"],
+    "stress": ["phoronix_stress-ng"],
+    "cassandra": ["phoronix_cassandra"],
+    "cockroach": ["phoronix_cockroach"],
+    "sqlite": ["phoronix_sqlite"],
+    "nginx": ["phoronix_nginx"],
+    "openssl": ["phoronix_openssl"],
+    "spec": ["speccpu2017", "specjbb"],
 }
 
 
 class ZathrasSkillProvider(SkillProvider):
-    def __init__(self, zathras_home: str | Path) -> None:
-        self._home = Path(zathras_home)
-        self._test_defs_path = self._home / "config" / "test_defs.yml"
+    def __init__(
+        self,
+        zathras_home: str | Path | None = None,
+        fallback_tests: dict[str, Any] | None = None,
+    ) -> None:
+        self._home = Path(zathras_home) if zathras_home else None
+        self._test_defs_path = (
+            self._home / "config" / "test_defs.yml" if self._home else None
+        )
+        self._fallback_tests = fallback_tests
 
     def _parse_test_defs(self) -> list[dict[str, Any]]:
-        if not self._test_defs_path.exists():
-            return []
+        if self._test_defs_path and self._test_defs_path.exists():
+            return self._parse_test_defs_yaml()
+        if self._fallback_tests:
+            return self._parse_fallback_tests()
+        return []
 
+    def _parse_test_defs_yaml(self) -> list[dict[str, Any]]:
         try:
             import yaml
         except ImportError:
@@ -68,6 +88,27 @@ class ZathrasSkillProvider(SkillProvider):
                 continue
             tests.append(entry)
 
+        return tests
+
+    def _parse_fallback_tests(self) -> list[dict[str, Any]]:
+        tests = []
+        for name, info in sorted(self._fallback_tests.items()):
+            if not isinstance(info, dict):
+                continue
+            reqs = info.get("requirements", {})
+            entry = {
+                "test_name": name,
+                "test_description": info.get("description", f"Zathras test: {name}"),
+            }
+            if reqs.get("network"):
+                entry["network_required"] = "yes"
+            if reqs.get("storage"):
+                entry["storage_required"] = "yes"
+            if reqs.get("java"):
+                entry["java_required"] = "yes"
+            if info.get("parameters"):
+                entry["test_specific"] = info["parameters"]
+            tests.append(entry)
         return tests
 
     async def list_benchmarks(self) -> list[BenchmarkSuite]:

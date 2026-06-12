@@ -12,6 +12,7 @@ from providers.events import EventBus
 from providers.llm.base import LLMProvider
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
+from providers.skills.repo_cache import RepoCache
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,14 @@ class Dispatcher:
         skill_provider: SkillProvider,
         secrets_provider: SecretsProvider | None = None,
         event_bus: EventBus | None = None,
+        repo_cache: RepoCache | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
         self.skills = skill_provider
         self.secrets = secrets_provider
         self.events = event_bus
+        self.repo_cache = repo_cache
         self._active: set[str] = set()
         self._dispatched: set[tuple[str, str]] = set()
 
@@ -97,6 +100,7 @@ class Dispatcher:
                 skill_provider=self.skills,
                 secrets_provider=self.secrets,
                 event_bus=self.events,
+                repo_cache=self.repo_cache,
             )
         elif agent_type == "review":
             return ReviewAgent(

@@ -37,8 +37,9 @@ class ResourceAgent(AgentBase):
 
         tools = get_resource_tools() if mode == "create" else []
         self._last_reservation: dict[str, Any] = {}
+        self._ssh: SSHExecutor | None = None
         if mode == "create":
-            tool_handlers, self._last_reservation = (
+            tool_handlers, self._last_reservation, self._ssh = (
                 create_resource_tool_handlers(registry=self._registry)
             )
         else:
@@ -64,6 +65,11 @@ class ResourceAgent(AgentBase):
             return
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
+        if self._ssh:
+            ticket = await self._get_ticket(ticket_id)
+            ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
+            if ssh_key:
+                self._ssh.key_path = ssh_key
         await super().run(ticket_id)
 
     async def _run_teardown(self, ticket_id: str) -> None:

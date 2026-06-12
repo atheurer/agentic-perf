@@ -7,6 +7,7 @@ from typing import Any
 from agents.base import AgentBase
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
+from providers.skills.repo_cache import RepoCache
 
 from .mcp_server import create_benchmark_tool_handlers, get_benchmark_tools
 from .prompts import BENCHMARK_SYSTEM_PROMPT
@@ -22,16 +23,19 @@ class BenchmarkAgent(AgentBase):
         skill_provider=None,
         secrets_provider=None,
         event_bus: EventBus | None = None,
+        repo_cache: RepoCache | None = None,
     ) -> None:
         self._skill_provider = skill_provider
         self._secrets_provider = secrets_provider
+        self._repo_cache = repo_cache
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
-        tools = get_benchmark_tools()
+        tools = get_benchmark_tools(repo_cache=repo_cache)
         tool_handlers, self._ssh = create_benchmark_tool_handlers(
             skill_provider=skill_provider,
             request_clarification_fn=self._do_request_clarification,
+            repo_cache=repo_cache,
         )
 
         super().__init__(
@@ -85,6 +89,18 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**SSH User:** {cf['ssh_user']}\n"
         if cf.get("directives"):
             content += f"\n## User Directives\n```json\n{json.dumps(cf['directives'], indent=2)}\n```\n"
+
+        harness = cf.get("directives", {}).get("harness", "crucible")
+        if self._repo_cache:
+            docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
+            if docs:
+                content += f"\n## Available {harness} Documentation\n"
+                content += (
+                    "Use `read_harness_doc` to read any of these before "
+                    "constructing the run file:\n\n"
+                )
+                for doc in docs:
+                    content += f"- `{doc['path']}`\n"
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"

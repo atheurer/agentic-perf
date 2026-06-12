@@ -19,6 +19,7 @@ from providers.secrets.local import LocalSecretsProvider
 from providers.skills.crucible import CrucibleSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
 from providers.skills.private import PrivateSkillProvider
+from providers.skills.repo_cache import RepoCache
 from providers.skills.zathras import ZathrasSkillProvider
 
 logger = logging.getLogger(__name__)
@@ -85,15 +86,32 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
 
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = create_llm_provider(config)
+
+    repo_cache = RepoCache()
+    for name, url in config.harness_repos.items():
+        try:
+            repo_cache.ensure_repo(name, url)
+        except Exception:
+            logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
+
     harnesses = {"crucible": CrucibleSkillProvider(config.crucible_home)}
     if config.zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(config.zathras_home)
+    else:
+        private = PrivateSkillProvider()
+        zathras_tests = private._load_config("zathras").get("tests")
+        if zathras_tests:
+            logger.info("No zathras_home set — using private-skills benchmark catalog")
+            harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
     secrets = LocalSecretsProvider()
     events = EventBus()
-    dispatcher = Dispatcher(config.state_store_url, llm, skills, secrets, events)
+    dispatcher = Dispatcher(
+        config.state_store_url, llm, skills, secrets, events,
+        repo_cache=repo_cache,
+    )
 
     logger.info(
         f"Orchestrator started (store={config.state_store_url}, "

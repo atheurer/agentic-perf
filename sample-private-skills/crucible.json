@@ -1,0 +1,47 @@
+{
+    "constraints": {
+        "supported_os": ["rhel8", "rhel9", "rhel10", "fedora", "centos", "alma"],
+        "controller_os_must_match": false,
+        "notes": "Crucible runs workloads in containers (podman/chroot), so the host OS matters less. The controller needs podman and git."
+    },
+    "execution": {
+        "controller_required": true,
+        "run_command": "crucible run",
+        "endpoint_type": "remotehosts",
+        "endpoint_user": "root",
+        "default_userenv": "default",
+        "default_osruntime": "podman",
+        "pre_run": ["ssh_key_setup"],
+        "run_file_format": "json",
+        "results_dir_pattern": "/var/lib/crucible/run/*",
+        "notes": "Crucible requires a dedicated controller host that orchestrates the run. The controller SSHes into endpoints to deploy containers. Run files are JSON validated against rickshaw/schema/run-file.json."
+    },
+    "provisioning": {
+        "install_method": "git_clone",
+        "git_url": "https://github.com/perftool-incubator/crucible.git",
+        "install_script": "./install.sh",
+        "install_target_path": "/opt/crucible",
+        "verify_command": "crucible help",
+        "update_command": "crucible update",
+        "on_existing_install": "update",
+        "pre_install_steps": [
+            "dnf install -y git podman"
+        ]
+    },
+    "platform_contract": {
+        "supported_os": ["rhel8", "rhel9", "rhel10", "fedora", "centos", "alma"],
+        "required_packages": ["git", "podman"]
+    },
+    "install_contract": {
+        "secret_files": [
+            {
+                "key": "crucible_registry_auth",
+                "remote_path": "/root/.docker/config.json",
+                "description": "Container registry auth for pulling crucible images"
+            }
+        ],
+        "pre_install_commands": [
+            "dnf install -y git podman"
+        ]
+    }
+}
