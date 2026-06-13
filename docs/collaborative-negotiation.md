@@ -103,14 +103,14 @@ The dispatcher needs to support:
 ### Resource Providers
 | Provider | Description | Example |
 |----------|-------------|---------|
-| **Null** | User provides hosts + SSH keys directly | "Use nfv-amd-5, root SSH" |
+| **Null** | User provides hosts + SSH keys directly | "Use host-1, root SSH" |
 | **QUADS** | Reserve from Scale Lab via self-service API | "I need 2 hosts with 25G NICs for 48 hours" |
 
 ### Test Scenarios (2x2 + edge cases)
 
-1. **Crucible + Null** (current working case): "Run fio on nfv-amd-5"
+1. **Crucible + Null** (current working case): "Run fio on host-1"
 2. **Crucible + QUADS**: "Run uperf network test, reserve 2 hosts from Scale Lab"
-3. **Agent-automated + Null**: "Run sysbench CPU benchmark on nfv-amd-5" (absent suite)
+3. **Agent-automated + Null**: "Run sysbench CPU benchmark on host-1" (absent suite)
 4. **Agent-automated + QUADS**: "Run a custom memory benchmark, reserve a host from Scale Lab"
 5. **Conflict case**: "Run trafficgen on OpenShift" — Benchmark: "trafficgen needs bare metal," Resource: "user asked for OpenShift" → negotiation needed
 6. **Multi-environment**: "Test forwarding between a bare metal RHEL 10 host and an OpenShift pod" — Resource needs to source from two providers

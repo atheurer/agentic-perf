@@ -19,7 +19,7 @@ Crucible does NOT need to be pre-installed on the controller host. The provision
     "llm": {
         "provider": "claude",
         "backend": "vertex",
-        "project_id": "itpc-gcp-pnd-pe-eng-claude",
+        "project_id": "your-gcp-project-id",
         "region": "global",
         "model": "claude-sonnet-4-6"
     },
@@ -29,7 +29,7 @@ Crucible does NOT need to be pre-installed on the controller host. The provision
         "port": 8090
     },
     "poll_interval": 3.0,
-    "ssh_key": "~/.ssh/id_ed25519_quads"
+    "ssh_key": "~/.ssh/id_ed25519"
 }
 ```
 
@@ -38,7 +38,7 @@ Crucible does NOT need to be pre-installed on the controller host. The provision
 ### 1. Start the system
 
 ```bash
-cd ~/swdev/agentic-perf
+cd path/to/agentic-perf
 ./start.sh
 ```
 
@@ -49,11 +49,11 @@ This launches the state store (background, port 8090) and orchestrator (foregrou
 For a fast E2E test, use a narrow fio request — it runs quickly and validates the full pipeline:
 
 ```bash
-cd ~/swdev/agentic-perf
+cd path/to/agentic-perf
 
 python3 cli.py submit \
-  "I need to know the performance of ioengine=sync on 4k block size on nfv-amd-5" \
-  -d "Controller: nfv-amd-1.perf.eng.bos2.dc.redhat.com (10.26.9.99). Endpoint: nfv-amd-5.perf.eng.bos2.dc.redhat.com (10.26.9.10). SSH key: ~/.ssh/id_ed25519_quads. Use crucible."
+  "I need to know the performance of ioengine=sync on 4k block size on endpoint-1" \
+  -d "Controller: controller.example.com (198.51.100.1). Endpoint: endpoint-1.example.com (198.51.100.2). SSH key: ~/.ssh/id_ed25519. Use crucible."
 ```
 
 This creates a ticket in `triage_pending` and goes through the full pipeline: triage → resource → provisioning → benchmark → review.
@@ -86,8 +86,8 @@ client = httpx.Client(base_url='http://localhost:8090', timeout=10.0)
 
 # Create ticket
 r = client.post('/api/v1/tickets', json={
-    'summary': 'Run fio sync 4k on nfv-amd-5',
-    'description': 'Test fio with ioengine=sync, bs=4k on nfv-amd-5 (10.26.9.10). Controller: nfv-amd-1 (10.26.9.99).',
+    'summary': 'Run fio sync 4k on endpoint-1',
+    'description': 'Test fio with ioengine=sync, bs=4k on endpoint-1 (198.51.100.2). Controller: controller (198.51.100.1).',
 })
 tid = r.json()['id']
 
@@ -95,18 +95,18 @@ tid = r.json()['id']
 client.patch(f'/api/v1/tickets/{tid}/fields', json={
     'fields': {
         'parsed_specs': {
-            'controller': '10.26.9.99',
-            'sut': '10.26.9.10',
+            'controller': '198.51.100.1',
+            'sut': '198.51.100.2',
             'harness': 'crucible',
             'benchmark': 'fio',
         },
         'benchmark_suite': 'fio',
         'assigned_hardware_ips': {
-            'controller': '10.26.9.99',
-            'targets': ['10.26.9.10'],
+            'controller': '198.51.100.1',
+            'targets': ['198.51.100.2'],
         },
         'ssh_user': 'root',
-        'ssh_key_path': '~/.ssh/id_ed25519_quads',
+        'ssh_key_path': '~/.ssh/id_ed25519',
         'directives': {
             'harness': 'crucible',
             'user_pre_run_approval': True,
@@ -154,7 +154,7 @@ print(f'Ticket {tid} ready in executing_benchmark')
 Currently manual:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_quads root@<controller> "crucible stop all"
+ssh -i ~/.ssh/id_ed25519 root@<controller> "crucible stop all"
 ```
 
 Then stop the orchestrator (Ctrl+C or kill the process).
@@ -164,6 +164,6 @@ Then stop the orchestrator (Ctrl+C or kill the process).
 Run the unit test suite (no SSH or LLM required):
 
 ```bash
-cd ~/swdev/agentic-perf
+cd path/to/agentic-perf
 python3 -m pytest tests/ -v
 ```

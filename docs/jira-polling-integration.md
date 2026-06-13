@@ -6,18 +6,18 @@ The agentic-perf prototype currently uses a local FastAPI state store (`state_st
 
 ### Why polling instead of webhooks
 
-- We don't have Jira global admin (only PERFNFV project admin)
+- We don't have Jira global admin (only YOUR_PROJECT project admin)
 - Jira Cloud can't reach private IPs inside Red Hat's network
 - Webhooks would require a public relay endpoint + message queue
 - Polling is zero-infrastructure and works today with existing API credentials
 
 ### Jira instance details
 
-- **URL**: `https://redhat.atlassian.net`
-- **Project**: `PERFNFV` (ID: 11092)
-- **Auth**: Basic auth — `atheurer@redhat.com` + API token
+- **URL**: `https://your-org.atlassian.net`
+- **Project**: `YOUR_PROJECT` (ID: XXXXX)
+- **Auth**: Basic auth — `user@example.com` + API token
 - **API token**: stored in env var `JIRA_API_TOKEN`
-- **API base**: `https://redhat.atlassian.net/rest/api/2`
+- **API base**: `https://your-org.atlassian.net/rest/api/2`
 
 ---
 
@@ -46,7 +46,7 @@ A simpler alternative is to skip the adapter and have `orchestrator/poller.py` a
 
 ### Workflow statuses
 
-Create a custom workflow for PERFNFV with these statuses (matching `state_store/models.py`):
+Create a custom workflow for YOUR_PROJECT with these statuses (matching `state_store/models.py`):
 
 | Internal status | Jira status name | Category |
 |---|---|---|
@@ -108,7 +108,7 @@ Custom field IDs in Jira Cloud are like `customfield_12345`. You need to discove
 ```bash
 # List all fields, find your custom ones
 curl -s -u "$JIRA_USER:$JIRA_TOKEN" \
-  "https://redhat.atlassian.net/rest/api/2/field" | \
+  "https://your-org.atlassian.net/rest/api/2/field" | \
   jq '.[] | select(.custom == true) | {id, name}'
 ```
 
@@ -127,14 +127,14 @@ JIRA_FIELD_MAP = {
 import httpx
 from datetime import datetime, timedelta
 
-JIRA_BASE = "https://redhat.atlassian.net/rest/api/2"
-JIRA_AUTH = ("atheurer@redhat.com", os.environ["JIRA_API_TOKEN"])
+JIRA_BASE = "https://your-org.atlassian.net/rest/api/2"
+JIRA_AUTH = ("user@example.com", os.environ["JIRA_API_TOKEN"])
 AGENT_STATUS_FIELD = "customfield_XXXXX"  # discovered above
 AGENT_DATA_FIELD = "customfield_YYYYY"
 
 async def fetch_tickets_by_status(status: str) -> list[dict]:
-    """Poll Jira for PERFNFV tickets in a given agent status."""
-    jql = f'project = PERFNFV AND cf[{AGENT_STATUS_FIELD_NUM}] = "{status}"'
+    """Poll Jira for YOUR_PROJECT tickets in a given agent status."""
+    jql = f'project = YOUR_PROJECT AND cf[{AGENT_STATUS_FIELD_NUM}] = "{status}"'
     
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
@@ -171,7 +171,7 @@ def _jira_to_internal(issue: dict) -> dict:
         })
 
     return {
-        "id": issue["key"],                          # e.g. "PERFNFV-42"
+        "id": issue["key"],                          # e.g. "YOUR_PROJECT-42"
         "summary": fields.get("summary", ""),
         "description": fields.get("description", ""),
         "status": fields.get(AGENT_STATUS_FIELD, "new"),
@@ -188,8 +188,8 @@ def _jira_to_internal(issue: dict) -> dict:
 
 ```python
 async def fetch_changed_tickets(since_minutes: int = 5) -> list[dict]:
-    """Poll for recently updated PERFNFV tickets."""
-    jql = f'project = PERFNFV AND updated >= "-{since_minutes}m" ORDER BY updated DESC'
+    """Poll for recently updated YOUR_PROJECT tickets."""
+    jql = f'project = YOUR_PROJECT AND updated >= "-{since_minutes}m" ORDER BY updated DESC'
     
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
@@ -209,7 +209,7 @@ async def fetch_changed_tickets(since_minutes: int = 5) -> list[dict]:
 
 ```python
 async def get_ticket(ticket_id: str) -> dict:
-    """Fetch a single Jira issue by key (e.g., PERFNFV-42)."""
+    """Fetch a single Jira issue by key (e.g., YOUR_PROJECT-42)."""
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
             f"{JIRA_BASE}/issue/{ticket_id}",
@@ -281,7 +281,7 @@ async def update_fields(ticket_id: str, fields: dict) -> dict:
 ### Add comment (replaces `POST /api/v1/tickets/{id}/comments`)
 
 ```python
-BOT_DISPLAY_NAME = "Andrew Theurer"  # or a service account name
+BOT_DISPLAY_NAME = "perf-agent"  # or a service account name
 
 async def add_comment(ticket_id: str, author: str, body: str) -> dict:
     """Add a comment to a Jira issue. Author is prepended to the body
@@ -353,7 +353,7 @@ Jira Cloud rate limits are generous but real. With 7 statuses polled every 3 sec
 
 **Mitigations:**
 1. Increase poll interval to 5-10 seconds (still responsive enough)
-2. Batch into one JQL query: `project = PERFNFV AND cf[XXXXX] IN ("triage_pending", "awaiting_hardware", ...)` — one call instead of 7
+2. Batch into one JQL query: `project = YOUR_PROJECT AND cf[XXXXX] IN ("triage_pending", "awaiting_hardware", ...)` — one call instead of 7
 3. Use the `updated >= "-Nm"` approach to only fetch recently changed tickets
 
 **Recommended: single-query approach**
@@ -363,7 +363,7 @@ async def poll_all_actionable_tickets() -> dict[str, list[dict]]:
     """Single JQL query for all actionable tickets, grouped by status."""
     actionable = list(STATUS_AGENT_MAP.keys())
     status_list = ", ".join(f'"{s}"' for s in actionable)
-    jql = f'project = PERFNFV AND cf[{FIELD_NUM}] IN ({status_list})'
+    jql = f'project = YOUR_PROJECT AND cf[{FIELD_NUM}] IN ({status_list})'
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
@@ -474,13 +474,13 @@ class OrchestratorConfig:
     poll_interval: float = 3.0
     llm_provider: str = "mock"
     anthropic_api_key: str | None = None
-    crucible_home: str = "/home/atheurer/swdev/repos/crucible"
+    crucible_home: str = "/opt/crucible"
 
     # New Jira fields
     backend: str = "local"                          # "local" or "jira"
-    jira_url: str = "https://redhat.atlassian.net"
-    jira_user: str = "atheurer@redhat.com"
-    jira_project: str = "PERFNFV"
+    jira_url: str = "https://your-org.atlassian.net"
+    jira_user: str = "user@example.com"
+    jira_project: str = "YOUR_PROJECT"
     jira_agent_status_field: str = ""               # customfield_XXXXX
     jira_agent_data_field: str = ""                  # customfield_YYYYY
     jira_bot_name: str = "perf-agent"               # prefix for bot comments
@@ -498,20 +498,20 @@ export JIRA_AGENT_DATA_FIELD="customfield_YYYYY"
 
 ## Implementation Order
 
-1. **Create custom fields in PERFNFV** — Just `Agent Status` (text) and `Agent Data` (paragraph). Note down the field IDs.
+1. **Create custom fields in YOUR_PROJECT** — Just `Agent Status` (text) and `Agent Data` (paragraph). Note down the field IDs.
 2. **Create `orchestrator/jira_client.py`** — The functions above: `fetch_tickets_by_status`, `get_ticket`, `transition_ticket`, `update_fields`, `add_comment`.
 3. **Modify `agents/base.py`** — Add a backend switch so `_get_ticket`, `_transition_ticket`, `_update_fields`, `_add_comment` route to either the local store or Jira client.
 4. **Modify `orchestrator/main.py`** — Use the single-query poller when backend is Jira.
 5. **Add HITL resume logic** — The `check_hitl_resume` function in the poll loop.
-6. **Test with a real PERFNFV ticket** — Create a test issue, set Agent Status manually, verify the orchestrator picks it up.
+6. **Test with a real YOUR_PROJECT ticket** — Create a test issue, set Agent Status manually, verify the orchestrator picks it up.
 
 ---
 
 ## Service Account (Future)
 
-Right now everything runs under `atheurer@redhat.com`. For production:
-- Request a Jira service account (e.g., `perfagent-bot@redhat.com`)
-- Give it project access to PERFNFV
+Right now everything runs under `user@example.com`. For production:
+- Request a Jira service account (e.g., `perfagent-bot@example.com`)
+- Give it project access to YOUR_PROJECT
 - Use its API token
 - This makes bot comments visually distinct from human comments (different author)
 - Eliminates the need for the `**[agent-name]**` prefix hack
@@ -520,10 +520,10 @@ Right now everything runs under `atheurer@redhat.com`. For production:
 
 ## Jira Automation Rules (Optional Enhancement)
 
-As a PERFNFV project admin, you can create automation rules that enhance the polling approach:
+As a YOUR_PROJECT project admin, you can create automation rules that enhance the polling approach:
 
 1. **Auto-resume on human comment**: When a non-bot user comments on a ticket in `Awaiting Customer Guidance`, automatically copy `Previous Status` back to `Agent Status`. This eliminates the need for the human to manually change the status field.
 
-2. **New ticket auto-triage**: When a new ticket is created in PERFNFV, automatically set `Agent Status` = `triage_pending`.
+2. **New ticket auto-triage**: When a new ticket is created in YOUR_PROJECT, automatically set `Agent Status` = `triage_pending`.
 
 These are optional — the polling approach works without them — but they improve the human experience.

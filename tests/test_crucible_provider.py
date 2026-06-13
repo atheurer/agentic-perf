@@ -6,7 +6,7 @@ import pytest
 
 from providers.skills.crucible import CrucibleSkillProvider
 
-CRUCIBLE_HOME = os.environ.get("CRUCIBLE_HOME", "/home/atheurer/swdev/repos/crucible")
+CRUCIBLE_HOME = os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
 HAS_CRUCIBLE = os.path.isdir(os.path.join(CRUCIBLE_HOME, "subprojects", "benchmarks"))
 
 
