@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from agents.base import AgentBase
@@ -304,18 +305,48 @@ class ResourceAgent(AgentBase):
         hw = fields["assigned_hardware_ips"]
 
         if ip_mapping and hw:
+            # Build a lookup from private IP → public IP, and reverse.
+            # The LLM may submit public IPs, private IPs, or AWS internal
+            # hostnames (ip-W-X-Y-Z.region.compute.internal). Normalize
+            # hostnames to private IPs before lookup.
             reverse_map = {v: k for k, v in ip_mapping.items()}
+
+            def _normalize(addr: str) -> str:
+                m = re.match(r"ip-(\d+)-(\d+)-(\d+)-(\d+)", addr)
+                return ".".join(m.groups()) if m else addr
+
             ssh_hw: dict[str, Any] = {}
             private_hw: dict[str, Any] = {}
 
-            ctrl = hw.get("controller", "")
+            ctrl = _normalize(hw.get("controller", ""))
             if ctrl:
-                ssh_hw["controller"] = ip_mapping.get(ctrl, ctrl)
-                private_hw["controller"] = reverse_map.get(ctrl, ctrl)
+                ssh_hw["controller"] = reverse_map.get(ctrl, ip_mapping.get(ctrl, ctrl))
+                private_hw["controller"] = ip_mapping.get(ctrl, reverse_map.get(ctrl, ctrl))
+                # ctrl could be public or private — resolve to the right one
+                if ctrl in ip_mapping:
+                    # ctrl is a public IP
+                    ssh_hw["controller"] = ctrl
+                    private_hw["controller"] = ip_mapping[ctrl]
+                elif ctrl in reverse_map:
+                    # ctrl is a private IP
+                    ssh_hw["controller"] = reverse_map[ctrl]
+                    private_hw["controller"] = ctrl
 
-            targets = hw.get("targets", [])
-            ssh_hw["targets"] = [ip_mapping.get(t, t) for t in targets]
-            private_hw["targets"] = [reverse_map.get(t, t) for t in targets]
+            targets = [_normalize(t) for t in hw.get("targets", [])]
+            ssh_targets = []
+            private_targets = []
+            for t in targets:
+                if t in ip_mapping:
+                    ssh_targets.append(t)
+                    private_targets.append(ip_mapping[t])
+                elif t in reverse_map:
+                    ssh_targets.append(reverse_map[t])
+                    private_targets.append(t)
+                else:
+                    ssh_targets.append(t)
+                    private_targets.append(t)
+            ssh_hw["targets"] = ssh_targets
+            private_hw["targets"] = private_targets
 
             fields["ssh_hardware_ips"] = ssh_hw
             fields["assigned_hardware_ips"] = private_hw
