@@ -19,6 +19,10 @@ When the benchmark agent validates a run-file, save it to `custom_fields.validat
 
 Implemented as a pre-flight check in `execute_benchmark` (benchmark agent) right before `crucible run`. Stops `crucible-valkey` if running with no active `crucible-rickshaw-run`. Placed here instead of provisioning to also catch stale state from failed retries within the same ticket.
 
+## Migrate Crucible Cleanup to Crucible Project (Priority: Low)
+
+The `cleanup_harness` function in `agents/provisioning/mcp_server.py` has crucible-specific uninstall logic (stop containers, discover and remove auth tokens from registries.json, remove system artifacts). This should eventually become a `crucible uninstall` command upstream so any consumer can use it. For now it lives here.
+
 ## Harness Update Directive (Priority: Medium)
 
 Allow a triage directive like `update_harness: true` that tells the provisioning agent to update the harness after install check (e.g., `crucible update`). The execution config already has `update_command` for crucible and `on_existing_install` for zathras — wire these into the provisioning flow so the agent respects them. Triggered by: the PERF-B51A2E61 test showed crucible was 19 commits behind, which could cause failures.

@@ -115,6 +115,45 @@ async def validate_platform_contract(
     return result
 
 
+async def _discover_crucible_token_files(ssh: SSHExecutor, host: str, install_path: str) -> list[str]:
+    """Read registries.json on the host and extract all referenced token file paths."""
+    result = await ssh.run(host, f"cat {install_path}/config/registries.json 2>/dev/null")
+    if result.exit_code != 0 or not result.stdout.strip():
+        return []
+
+    try:
+        import json as _json
+        reg = _json.loads(result.stdout)
+    except Exception:
+        logger.warning(f"[provision] Could not parse registries.json on {host}")
+        return []
+
+    paths = []
+    # controller.pull-token
+    if reg.get("controller", {}).get("pull-token"):
+        paths.append(reg["controller"]["pull-token"])
+    # engines.public
+    pub = reg.get("engines", {}).get("public", {})
+    if pub.get("push-token"):
+        paths.append(pub["push-token"])
+    if pub.get("quay", {}).get("refresh-expiration", {}).get("token-file"):
+        paths.append(pub["quay"]["refresh-expiration"]["token-file"])
+    # engines.private
+    priv = reg.get("engines", {}).get("private", {})
+    if priv.get("tokens", {}).get("push"):
+        paths.append(priv["tokens"]["push"])
+    if priv.get("tokens", {}).get("pull"):
+        paths.append(priv["tokens"]["pull"])
+    if priv.get("quay", {}).get("refresh-expiration", {}).get("token-file"):
+        paths.append(priv["quay"]["refresh-expiration"]["token-file"])
+    # userenvs[].pull-token
+    for ue in reg.get("userenvs", []):
+        if ue.get("pull-token"):
+            paths.append(ue["pull-token"])
+
+    return paths
+
+
 async def cleanup_harness(
     ssh: SSHExecutor,
     host: str,
@@ -124,18 +163,64 @@ async def cleanup_harness(
 ) -> dict:
     """Remove a harness installation from a host."""
     path = install_path or f"/opt/{harness_name}"
+    cleanup_details = []
 
     for cmd in (pre_uninstall_commands or []):
         logger.info(f"[provision] Pre-uninstall on {host}: {cmd}")
         await ssh.run(host, cmd, timeout=120)
 
-    logger.info(f"[provision] Uninstalling {harness_name} from {host}:{path}")
+    # --- crucible-specific cleanup (TODO: migrate to crucible project) ---
+    if harness_name == "crucible":
+        # 1. Discover auth token files from registries.json before removing anything
+        token_files = await _discover_crucible_token_files(ssh, host, path)
+        if token_files:
+            logger.info(f"[provision] Found {len(token_files)} token files in registries.json on {host}")
+
+        # 2. Stop and remove all crucible containers
+        stop_result = await ssh.run(
+            host,
+            "podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^crucible-'"
+            " | xargs -r podman stop 2>/dev/null"
+            " && podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^crucible-'"
+            " | xargs -r podman rm 2>/dev/null"
+            " ; echo done",
+            timeout=120,
+        )
+        cleanup_details.append(f"containers: stopped and removed")
+        logger.info(f"[provision] Stopped crucible containers on {host}")
+
+        # 3. Remove auth token files discovered from registries.json
+        for token_path in token_files:
+            await ssh.run(host, f"rm -f {token_path}")
+            cleanup_details.append(f"token: {token_path}")
+        logger.info(f"[provision] Removed {len(token_files)} token files on {host}")
+
+        # 4. Remove system artifacts
+        for artifact in [
+            "/usr/bin/crucible",
+            "/etc/sysconfig/crucible",
+            "/etc/profile.d/crucible_completions.sh",
+        ]:
+            await ssh.run(host, f"rm -f {artifact}")
+        cleanup_details.append("system: symlinks, sysconfig, profile.d")
+
+        # 5. Remove user config
+        await ssh.run(host, "rm -rf /root/.crucible", timeout=60)
+        cleanup_details.append("config: /root/.crucible")
+
+        # 6. Remove run data
+        await ssh.run(host, "rm -rf /var/lib/crucible", timeout=120)
+        cleanup_details.append("data: /var/lib/crucible")
+
+    # Remove the install directory
+    logger.info(f"[provision] Removing {harness_name} install dir {path} on {host}")
     result = await ssh.run(host, f"rm -rf {path}", timeout=120)
     if result.exit_code != 0:
         return {
             "host": host,
             "harness": harness_name,
             "status": "failed",
+            "cleanup_details": cleanup_details,
             "message": f"Failed to remove {path}: {result.stderr}",
         }
 
@@ -145,7 +230,8 @@ async def cleanup_harness(
         "host": host,
         "harness": harness_name,
         "status": "success",
-        "message": f"{harness_name} uninstalled from {path}",
+        "cleanup_details": cleanup_details,
+        "message": f"{harness_name} fully uninstalled from {host}",
     }
 
 
