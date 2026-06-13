@@ -187,6 +187,128 @@ tr.ticket-row:hover { background: var(--bg-hover); }
 .detail-header .ticket-id { font-size: 16px; }
 .detail-header .summary { font-size: 16px; color: var(--text-bright); flex: 1; }
 
+/* Detail layout: main content + sidebar */
+.detail-layout {
+  display: flex;
+  gap: 16px;
+  margin-top: 16px;
+  align-items: flex-start;
+}
+
+.detail-main { flex: 1; min-width: 0; }
+
+.detail-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 56px;
+  max-height: calc(100vh - 68px);
+  overflow-y: auto;
+}
+
+.sidebar-section {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.sidebar-section h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.sidebar-btn {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+  margin-bottom: 4px;
+}
+
+.sidebar-btn:hover { background: var(--bg-hover); }
+.sidebar-btn.active { border-color: var(--accent); color: var(--accent); }
+
+.sidebar-btn-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.sidebar-btn-row .sidebar-btn { flex: 1; text-align: center; margin-bottom: 0; }
+
+/* Phase nav items */
+.phase-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  transition: background 0.15s;
+  margin-bottom: 2px;
+}
+
+.phase-item:hover { background: var(--bg-hover); color: var(--text); }
+.phase-item.phase-active { color: var(--accent); font-weight: 600; }
+.phase-item.phase-done { color: var(--green); }
+.phase-item.phase-error { color: var(--red); }
+
+.phase-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.phase-dot-pending { background: var(--text-muted); }
+.phase-dot-active { background: var(--accent); animation: pulse 2s infinite; }
+.phase-dot-done { background: var(--green); }
+.phase-dot-error { background: var(--red); }
+
+.sidebar-event-count {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-bright);
+  text-align: center;
+  margin: 4px 0;
+}
+
+.sidebar-event-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+@media (max-width: 1100px) {
+  .detail-sidebar { width: 180px; }
+}
+
+@media (max-width: 900px) {
+  .detail-layout { flex-direction: column; }
+  .detail-sidebar {
+    width: 100%;
+    position: static;
+    max-height: none;
+    order: -1;
+  }
+}
+
 details {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -304,32 +426,6 @@ details > .content { padding: 12px 16px; }
 .tool-result-ok { border-left-color: var(--green); }
 .tool-result-err { border-left-color: var(--red); }
 
-.poll-controls {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  padding: 8px 0;
-  font-size: 13px;
-}
-
-.poll-controls button {
-  background: var(--bg-surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 12px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: background 0.15s;
-}
-
-.poll-controls button:hover { background: var(--bg-hover); }
-.poll-controls button.active { border-color: var(--accent); color: var(--accent); }
-
-.poll-status {
-  color: var(--text-muted);
-  font-size: 12px;
-}
 
 .poll-dot {
   display: inline-block;
@@ -423,6 +519,7 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
+let agentPhases = [];
 
 async function api(path) {
   const r = await fetch(API + path);
@@ -605,6 +702,7 @@ async function renderDetail(ticketId) {
     const ticket = await api('/tickets/' + ticketId);
     lastSeq = 0;
     renderedEvents = [];
+    agentPhases = [];
 
     app.innerHTML =
       '<div class="breadcrumb">' +
@@ -613,23 +711,36 @@ async function renderDetail(ticketId) {
       '<div class="detail-header">' +
         '<span class="ticket-id">' + escHtml(ticket.id) + '</span>' +
         '<span class="summary">' + escHtml(ticket.summary) + '</span>' +
-        statusBadge(ticket.status) +
+        '<span id="detail-status-badge">' + statusBadge(ticket.status) + '</span>' +
       '</div>' +
-      renderDescription(ticket) +
-      renderCustomFields(ticket) +
-      '<div class="poll-controls" style="margin-top: 16px;">' +
-        '<h3 style="font-size: 15px; color: var(--text-bright);">Transaction Log</h3>' +
-        '<span style="flex:1"></span>' +
-        '<span class="poll-status" id="poll-status">' +
-          '<span class="poll-dot live"></span> Live' +
-        '</span>' +
-        '<button id="btn-poll-toggle">Pause</button>' +
-        '<button id="btn-auto-scroll" class="active">Auto-scroll</button>' +
-      '</div>' +
-      '<div id="event-stream"></div>';
+      '<div class="detail-layout">' +
+        '<div class="detail-main">' +
+          renderDescription(ticket) +
+          renderCustomFields(ticket) +
+          '<div id="event-stream"></div>' +
+        '</div>' +
+        '<div class="detail-sidebar" id="sidebar">' +
+          renderSidebar(ticket) +
+        '</div>' +
+      '</div>';
 
     document.getElementById('btn-poll-toggle').addEventListener('click', togglePoll);
     document.getElementById('btn-auto-scroll').addEventListener('click', toggleAutoScroll);
+    document.getElementById('btn-top').addEventListener('click', function() {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    document.getElementById('btn-bottom').addEventListener('click', function() {
+      var stream = document.getElementById('event-stream');
+      if (stream && stream.lastElementChild) {
+        stream.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+    });
+    document.getElementById('btn-collapse-all').addEventListener('click', function() {
+      document.querySelectorAll('#event-stream details[open]').forEach(function(d) { d.open = false; });
+    });
+    document.getElementById('btn-expand-all').addEventListener('click', function() {
+      document.querySelectorAll('#event-stream details.agent-section').forEach(function(d) { d.open = true; });
+    });
 
     await pollEvents(ticketId);
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
@@ -638,6 +749,43 @@ async function renderDetail(ticketId) {
       '<div class="breadcrumb"><a href="#/">Dashboard</a> / ' + escHtml(ticketId) + '</div>' +
       '<p style="color:var(--red); margin-top:20px;">Error: ' + escHtml(err.message) + '</p>';
   }
+}
+
+function renderSidebar(ticket) {
+  return '' +
+    '<div class="sidebar-section">' +
+      '<h4>Status</h4>' +
+      '<div style="text-align:center">' + statusBadge(ticket.status) + '</div>' +
+    '</div>' +
+
+    '<div class="sidebar-section">' +
+      '<h4>Controls</h4>' +
+      '<div class="sidebar-btn-row">' +
+        '<button class="sidebar-btn active" id="btn-poll-toggle">' +
+          '<span class="poll-dot live" id="poll-dot"></span> Live' +
+        '</button>' +
+        '<button class="sidebar-btn active" id="btn-auto-scroll">Scroll</button>' +
+      '</div>' +
+      '<div class="sidebar-btn-row">' +
+        '<button class="sidebar-btn" id="btn-top">&uarr; Top</button>' +
+        '<button class="sidebar-btn" id="btn-bottom">&darr; Bottom</button>' +
+      '</div>' +
+      '<div class="sidebar-btn-row">' +
+        '<button class="sidebar-btn" id="btn-collapse-all">Collapse</button>' +
+        '<button class="sidebar-btn" id="btn-expand-all">Expand</button>' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="sidebar-section">' +
+      '<h4>Agents</h4>' +
+      '<div id="phase-nav"><span style="color:var(--text-muted); font-size:12px;">Waiting for events...</span></div>' +
+    '</div>' +
+
+    '<div class="sidebar-section">' +
+      '<h4>Events</h4>' +
+      '<div class="sidebar-event-count" id="event-count">0</div>' +
+      '<div class="sidebar-event-label">events loaded</div>' +
+    '</div>';
 }
 
 function renderDescription(ticket) {
@@ -685,14 +833,77 @@ function renderNewEvents(events) {
     var evt = events[i];
     if (renderedEvents.indexOf(evt.seq) !== -1) continue;
     renderedEvents.push(evt.seq);
+    trackAgentPhase(evt);
     var html = renderEvent(evt);
     if (html) container.insertAdjacentHTML('beforeend', html);
   }
+
+  updateSidebarPhases();
+  var countEl = document.getElementById('event-count');
+  if (countEl) countEl.textContent = renderedEvents.length;
 
   if (autoScroll) {
     var last = container.lastElementChild;
     if (last) last.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }
+}
+
+function trackAgentPhase(evt) {
+  var agent = evt.agent || '';
+  if (!agent) return;
+  var existing = null;
+  for (var i = 0; i < agentPhases.length; i++) {
+    if (agentPhases[i].name === agent) { existing = agentPhases[i]; break; }
+  }
+  if (evt.event_type === 'agent_started') {
+    if (!existing) {
+      agentPhases.push({ name: agent, status: 'active', domId: 'agent-' + agentPhases.length });
+    } else {
+      existing.status = 'active';
+    }
+  } else if (evt.event_type === 'agent_finished') {
+    if (existing) existing.status = 'done';
+  } else if (evt.event_type === 'agent_error') {
+    if (existing) existing.status = 'error';
+  }
+  if (evt.event_type === 'transition') {
+    var statusEl = document.getElementById('detail-status-badge');
+    if (statusEl && evt.data && evt.data.to) {
+      statusEl.innerHTML = statusBadge(evt.data.to);
+      var sidebarStatus = document.querySelector('.detail-sidebar .sidebar-section:first-child div');
+      if (sidebarStatus) sidebarStatus.innerHTML = statusBadge(evt.data.to);
+    }
+  }
+}
+
+function updateSidebarPhases() {
+  var nav = document.getElementById('phase-nav');
+  if (!nav || agentPhases.length === 0) return;
+  var html = '';
+  for (var i = 0; i < agentPhases.length; i++) {
+    var p = agentPhases[i];
+    var dotCls = 'phase-dot-pending';
+    var itemCls = '';
+    if (p.status === 'active') { dotCls = 'phase-dot-active'; itemCls = 'phase-active'; }
+    else if (p.status === 'done') { dotCls = 'phase-dot-done'; itemCls = 'phase-done'; }
+    else if (p.status === 'error') { dotCls = 'phase-dot-error'; itemCls = 'phase-error'; }
+    html +=
+      '<div class="phase-item ' + itemCls + '" data-agent-idx="' + i + '">' +
+        '<span class="phase-dot ' + dotCls + '"></span>' +
+        '<span>' + escHtml(p.name) + '</span>' +
+      '</div>';
+  }
+  nav.innerHTML = html;
+  nav.querySelectorAll('.phase-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      var idx = parseInt(el.dataset.agentIdx);
+      var sections = document.querySelectorAll('#event-stream .agent-section');
+      if (sections[idx]) {
+        sections[idx].open = true;
+        sections[idx].scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+  });
 }
 
 function renderEvent(evt) {
@@ -924,12 +1135,12 @@ function renderToolResult(ts, data) {
 function togglePoll() {
   pollPaused = !pollPaused;
   var btn = document.getElementById('btn-poll-toggle');
-  var status = document.getElementById('poll-status');
-  if (btn) btn.textContent = pollPaused ? 'Resume' : 'Pause';
-  if (status) {
-    status.innerHTML = pollPaused
-      ? '<span class="poll-dot paused"></span> Paused'
-      : '<span class="poll-dot live"></span> Live';
+  var dot = document.getElementById('poll-dot');
+  if (btn) {
+    btn.classList.toggle('active', !pollPaused);
+    btn.innerHTML = pollPaused
+      ? '<span class="poll-dot paused" id="poll-dot"></span> Paused'
+      : '<span class="poll-dot live" id="poll-dot"></span> Live';
   }
 }
 
@@ -938,7 +1149,7 @@ function toggleAutoScroll() {
   var btn = document.getElementById('btn-auto-scroll');
   if (btn) {
     btn.classList.toggle('active', autoScroll);
-    btn.textContent = autoScroll ? 'Auto-scroll' : 'Auto-scroll off';
+    btn.textContent = autoScroll ? 'Scroll' : 'Scroll off';
   }
 }
 
@@ -950,6 +1161,7 @@ function stopPolling() {
   pollPaused = false;
   lastSeq = 0;
   renderedEvents = [];
+  agentPhases = [];
 }
 
 // ── Main render ──
