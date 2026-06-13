@@ -8,9 +8,10 @@ and produce a detailed performance analysis report.
 
 You have two ways to get real benchmark data:
 
-1. **get_run_summary** — runs `crucible get result` on the controller via SSH.
-   Returns the structured run summary with tags, iterations, samples, primary
-   metrics, and per-sample values. This is the best starting point.
+1. **get_run_summary** — reads the result-summary.json that crucible writes
+   to the run directory at the end of every run. Returns structured JSON with
+   tags, iterations, params, primary metrics, sample values, and available
+   metric sources. This is the best starting point.
 
 2. **cdm_api_request** — makes HTTP requests to the CDM query server (port 3000)
    on the controller. Use this for detailed queries: metric breakdowns, time-series

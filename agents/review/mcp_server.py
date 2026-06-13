@@ -15,10 +15,10 @@ def get_review_tools() -> list[ToolDefinition]:
         ToolDefinition(
             name="get_run_summary",
             description=(
-                "Get a structured summary of a benchmark run from crucible. "
-                "Runs 'crucible get result' on the controller host via SSH "
-                "and returns the full output including tags, iterations, "
-                "samples, primary metrics, and per-sample values. "
+                "Get a structured JSON summary of a benchmark run. Reads the "
+                "result-summary.json that crucible writes to the run directory "
+                "at the end of every run. Returns iterations, params, primary "
+                "metrics, sample values, tags, and available metric sources. "
                 "Pass the controller from ssh_hardware_ips."
             ),
             input_schema={
@@ -138,40 +138,43 @@ def create_review_tool_handlers(
     async def get_run_summary(
         run_id: str, controller: str, ssh_key_path: str | None = None,
     ) -> dict:
-        output_dir = f"/tmp/review-{run_id[:8]}"
-        cmd = (
-            f"mkdir -p {output_dir} && "
-            f"crucible get result --run {run_id} "
-            f"--output-dir {output_dir} "
-            f"--output-format json,txt"
+        # Find the run directory by UUID
+        find_result = await ssh.run(
+            controller,
+            f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
+            timeout=15,
+            key_path=ssh_key_path,
         )
-        result = await ssh.run(controller, cmd, timeout=120, key_path=ssh_key_path)
+        run_dir = find_result.stdout.strip() if find_result.exit_code == 0 else ""
+        if not run_dir:
+            return {
+                "run_id": run_id,
+                "status": "not_found",
+                "message": f"No run directory found matching {run_id}",
+            }
+
+        summary_path = f"{run_dir}/run/result-summary.json"
+        result = await ssh.run(
+            controller, f"cat {summary_path}", timeout=30, key_path=ssh_key_path,
+        )
         if result.exit_code != 0:
             return {
                 "run_id": run_id,
                 "status": "error",
-                "exit_code": result.exit_code,
-                "error": result.stderr[-1000:] if result.stderr else "",
-                "output": result.stdout[-1000:] if result.stdout else "",
+                "run_dir": run_dir,
+                "message": f"{summary_path} not found — run may still be indexing",
+                "stderr": result.stderr[:500] if result.stderr else "",
             }
 
-        json_result = await ssh.run(
-            controller,
-            f"cat {output_dir}/result-summary.json",
-            timeout=30,
-            key_path=ssh_key_path,
-        )
-        if json_result.exit_code == 0 and json_result.stdout.strip():
-            try:
-                return json.loads(json_result.stdout)
-            except json.JSONDecodeError:
-                pass
-
-        return {
-            "run_id": run_id,
-            "status": "completed",
-            "text_output": result.stdout[-3000:] if result.stdout else "",
-        }
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {
+                "run_id": run_id,
+                "status": "error",
+                "message": "result-summary.json exists but is not valid JSON",
+                "raw": result.stdout[:2000],
+            }
 
     async def cdm_api_request(
         controller: str,
