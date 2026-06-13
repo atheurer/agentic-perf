@@ -11,6 +11,14 @@ Implemented: `directives` field in triage submit schema with `on_existing_instal
 Provisioning and benchmark agents check directives before falling back to skill config defaults.
 Benchmark agent now asks for user approval before executing (unless `user_pre_run_approval: false`).
 
+## Persist Validated Run-File in Ticket (Priority: Medium)
+
+When the benchmark agent validates a run-file, save it to `custom_fields.validated_run_file`. On re-dispatch (e.g., after a transient failure like valkey), the agent checks for an existing validated run-file and skips straight to execution instead of rebuilding from scratch. Saves time and LLM iterations on retries.
+
+## Clean Up Stale Valkey on Install Check (Priority: Medium)
+
+During `check_existing_install` or `verify_harness_install`, if a `crucible-valkey` container is running but no `crucible-rickshaw-run` container is active, stop the valkey container. This prevents the valkey password file mismatch that causes "Could not find the valkey service password" failures on the next `crucible run`.
+
 ## Harness Update Directive (Priority: Medium)
 
 Allow a triage directive like `update_harness: true` that tells the provisioning agent to update the harness after install check (e.g., `crucible update`). The execution config already has `update_command` for crucible and `on_existing_install` for zathras — wire these into the provisioning flow so the agent respects them. Triggered by: the PERF-B51A2E61 test showed crucible was 19 commits behind, which could cause failures.
