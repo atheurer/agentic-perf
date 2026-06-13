@@ -359,8 +359,25 @@ def create_resource_tool_handlers(
         reg = _get_registry()
         prov = await reg.get_provider(provider)
         result = await prov.reserve(selection, description, duration_hours, ticket_id=ticket_id)
+
+        # Accumulate provider_metadata across multiple reserve calls
+        # (e.g., separate calls for controller and endpoints).
+        prev_meta = last_reservation.get("provider_metadata", {})
         last_reservation.clear()
         last_reservation.update(result)
+        if prev_meta:
+            new_meta = result.get("provider_metadata", {})
+            for key in ("public_ips", "private_ips"):
+                if key in prev_meta:
+                    merged = list(prev_meta[key])
+                    merged.extend(new_meta.get(key, []))
+                    new_meta[key] = merged
+            if "ip_mapping" in prev_meta:
+                merged_map = dict(prev_meta["ip_mapping"])
+                merged_map.update(new_meta.get("ip_mapping", {}))
+                new_meta["ip_mapping"] = merged_map
+            last_reservation["provider_metadata"] = new_meta
+
         return result
 
     async def get_reservation_status(
