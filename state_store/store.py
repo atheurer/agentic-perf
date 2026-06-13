@@ -78,15 +78,18 @@ class TicketStore:
             current = ticket.status
 
             if current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
-                if ticket.previous_status is None:
+                if new_status == TicketStatus.AWAITING_TEARDOWN:
+                    allowed = [TicketStatus.AWAITING_TEARDOWN]
+                elif ticket.previous_status is None:
                     raise InvalidTransition(
                         "Cannot resume from AWAITING_CUSTOMER_GUIDANCE: no previous status"
                     )
-                allowed = VALID_TRANSITIONS.get(ticket.previous_status, [])
-                allowed = list(allowed) + [
-                    TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
-                    ticket.previous_status,
-                ]
+                else:
+                    allowed = VALID_TRANSITIONS.get(ticket.previous_status, [])
+                    allowed = list(allowed) + [
+                        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+                        ticket.previous_status,
+                    ]
             else:
                 allowed = VALID_TRANSITIONS.get(current, [])
 

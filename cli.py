@@ -216,6 +216,7 @@ def cmd_watch(args):
                 print()
                 print("  >>> Agent is waiting for your input.")
                 print(f"  >>> Use: agentic-perf reply {args.ticket_id} \"your response\"")
+                print(f"  >>> Or:  agentic-perf abort {args.ticket_id} to skip to cleanup")
                 if not args.follow:
                     break
 
@@ -241,6 +242,15 @@ def cmd_reply(args):
     })
     r.raise_for_status()
 
+    if args.abort:
+        r = client.post(f"/api/v1/tickets/{args.ticket_id}/transition", json={
+            "status": "awaiting_teardown",
+            "comment": "User requested abort, skipping to cleanup",
+        })
+        r.raise_for_status()
+        print(f"Reply added and ticket aborted — moving to teardown.")
+        return
+
     previous = t.get("previous_status")
     if not previous:
         print("Warning: no previous_status recorded, cannot resume automatically.")
@@ -253,6 +263,34 @@ def cmd_reply(args):
     r.raise_for_status()
 
     print(f"Reply added and ticket resumed to: {previous}")
+
+
+def cmd_abort(args):
+    client, url = get_client(args)
+
+    r = client.get(f"/api/v1/tickets/{args.ticket_id}")
+    r.raise_for_status()
+    t = r.json()
+
+    if t["status"] != "awaiting_customer_guidance":
+        print(f"Ticket is not waiting for input (status: {t['status']})")
+        print("Abort is only available when the ticket is in awaiting_customer_guidance.")
+        return
+
+    reason = args.reason or "User requested abort"
+    r = client.post(f"/api/v1/tickets/{args.ticket_id}/comments", json={
+        "author": "user",
+        "body": f"**Abort requested:** {reason}",
+    })
+    r.raise_for_status()
+
+    r = client.post(f"/api/v1/tickets/{args.ticket_id}/transition", json={
+        "status": "awaiting_teardown",
+        "comment": "User requested abort, skipping to cleanup",
+    })
+    r.raise_for_status()
+
+    print(f"Ticket {args.ticket_id} aborted — moving to teardown.")
 
 
 def _load_aws_config() -> dict:
@@ -592,6 +630,11 @@ def main():
     p_reply = sub.add_parser("reply", help="Reply to an agent's question")
     p_reply.add_argument("ticket_id", help="Ticket ID")
     p_reply.add_argument("message", help="Your response")
+    p_reply.add_argument("--abort", action="store_true", help="Abort the ticket after replying (skip to cleanup)")
+
+    p_abort = sub.add_parser("abort", help="Abort a paused ticket and skip to cleanup")
+    p_abort.add_argument("ticket_id", help="Ticket ID")
+    p_abort.add_argument("reason", nargs="?", help="Reason for aborting (optional)")
 
     p_transcript = sub.add_parser("transcript", help="Show full agent conversation transcript")
     p_transcript.add_argument("ticket_id", help="Ticket ID")
@@ -616,6 +659,7 @@ def main():
         "show": cmd_show,
         "watch": cmd_watch,
         "reply": cmd_reply,
+        "abort": cmd_abort,
         "transcript": cmd_transcript,
         "health": cmd_health,
         "cleanup": cmd_cleanup,
