@@ -100,17 +100,32 @@ export ANTHROPIC_API_KEY="your-key-here"
 For Vertex AI backend, set `backend`, `project_id`, and `region` in the
 `llm` section and authenticate with `gcloud auth application-default login`.
 
-### Private Skills
+### Local Directory (`~/.agentic-perf/`)
 
-Benchmark harness installation details (internal registries, install flags)
-go in `~/.agentic-perf/private-skills/`. See `sample-private-skills/` for
-templates.
+All user-specific configuration, credentials, and runtime data lives outside
+the repository in `~/.agentic-perf/`:
 
-### Secrets
+```
+~/.agentic-perf/
+  config.json              # Main configuration (LLM, state store, SSH key, poll interval)
+  private-skills/          # Org-specific harness install configs (JSON)
+    crucible.json           #   e.g., internal registry URLs, install flags
+    zathras.json            #   See sample-private-skills/ for templates
+  secrets/                 # Credentials resolved at runtime by the secrets provider
+    crucible/               #   e.g., container registry auth tokens
+    aws/                    #   e.g., access keys and session tokens
+    quads/                  #   e.g., QUADS API credentials
+  logs/                    # Agent conversation transcripts (JSONL per ticket)
+```
 
-Credentials (registry auth tokens, provider API keys) are stored in
-`~/.agentic-perf/secrets/` and resolved at runtime by the secrets provider.
-Secrets are never stored in skill configs, agent prompts, or this repository.
+**Private skills** define how *your organization* installs a benchmark harness
+(internal registries, install flags, vault references). The public skill
+definitions in the repo define *what* a harness can do. See
+`sample-private-skills/` for templates you can copy and customize.
+
+**Secrets** are never stored in skill configs, agent prompts, or this
+repository. They are injected at runtime by the secrets provider, scoped to
+the agent that needs them.
 
 ## Usage
 
