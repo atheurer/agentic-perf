@@ -448,7 +448,7 @@ def create_review_tool_handlers(
                 "method": method,
                 "path": path,
                 "exit_code": result.exit_code,
-                "error": result.stderr[-500:] if result.stderr else "",
+                "error": result.stderr or "",
             }
 
         try:
@@ -458,7 +458,7 @@ def create_review_tool_handlers(
                 "status": "error",
                 "method": method,
                 "path": path,
-                "raw_output": result.stdout[-2000:] if result.stdout else "",
+                "raw_output": result.stdout or "",
                 "error": "Response is not valid JSON",
             }
 

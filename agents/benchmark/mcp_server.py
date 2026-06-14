@@ -491,8 +491,8 @@ def create_benchmark_tool_handlers(
                 "exit_code": result.exit_code,
                 "run_id": f"kube-burner-{run_uuid}",
                 "harness": "kube-burner",
-                "output": result.stdout[-3000:] if result.stdout else "",
-                "error": result.stderr[-1000:] if result.stderr else "",
+                "output": result.stdout or "" if result.stdout else "",
+                "error": result.stderr or "" if result.stderr else "",
                 "message": (
                     "Benchmark completed"
                     if result.exit_code == 0
@@ -565,8 +565,8 @@ def create_benchmark_tool_handlers(
                     "message": (
                         "Scenario failed zathras preflight_check and was NOT executed. "
                         "Fix the scenario and try again.\n"
-                        + (preflight.stdout[-2000:] if preflight.stdout else "")
-                        + (preflight.stderr[-1000:] if preflight.stderr else "")
+                        + (preflight.stdout or "")
+                        + (preflight.stderr or "")
                     ),
                 }
 
@@ -588,8 +588,8 @@ def create_benchmark_tool_handlers(
                 "run_dir": run_dir,
                 "run_id": run_dir.rstrip("/").split("/")[-1] if run_dir else f"zathras-{run_uuid}",
                 "harness": "zathras",
-                "output": result.stdout[-2000:] if result.stdout else "",
-                "error": result.stderr[-1000:] if result.stderr else "",
+                "output": result.stdout or "" if result.stdout else "",
+                "error": result.stderr or "" if result.stderr else "",
                 "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
             }
 
@@ -645,8 +645,8 @@ def create_benchmark_tool_handlers(
             "run_dir": run_dir,
             "run_id": run_id or f"unknown-{run_uuid}",
             "harness": "crucible",
-            "output": result.stdout[-2000:] if result.stdout else "",
-            "error": result.stderr[-1000:] if result.stderr else "",
+            "output": result.stdout or "" if result.stdout else "",
+            "error": result.stderr or "" if result.stderr else "",
             "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
         }
 
@@ -688,7 +688,7 @@ def create_benchmark_tool_handlers(
 
         return {
             "run_dir": run_dir,
-            "log_lines": log_result.stdout[-3000:] if log_result.stdout else "",
+            "log_lines": log_result.stdout or "" if log_result.stdout else "",
             "status": "ok" if log_result.exit_code == 0 else "error",
         }
 
