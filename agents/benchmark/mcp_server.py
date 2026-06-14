@@ -487,7 +487,7 @@ def create_benchmark_tool_handlers(
 
             cmd = f"cd /opt/zathras && {burden_cmd} --scenario {scenario_path}"
             logger.info(f"[benchmark] Executing zathras: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=3600)
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
 
             run_dir = ""
             run_dir_re = re.compile(r"Results stored in:\s*(\S+)")
@@ -538,7 +538,7 @@ def create_benchmark_tool_handlers(
 
         cmd = f"{run_command or 'crucible run'} {remote_path}"
         logger.info(f"[benchmark] Executing: {cmd}")
-        result = await ssh.run(controller, cmd, timeout=1800)
+        result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
 
         run_dir = ""
         run_dir_re = re.compile(r"(/var/lib/crucible/run/[^/\s]+)")
