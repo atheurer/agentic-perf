@@ -565,5 +565,11 @@
             "parameters": {"--sub_test": {"type": "string", "default": "redis"}},
             "min_hosts": 1, "roles": ["client"], "local_config_fields": []
         }
+    },
+    "review": {
+        "results_method": "ssh_file_read",
+        "results_base_dir": "/opt/zathras",
+        "results_path_hint": "Results are under the {results_prefix}/ directory on the controller. Look for subdirectories organized by OS/system_type/hostname. Within each, find ansible_log and benchmark wrapper output files.",
+        "notes": "Zathras stores results in its own directory structure, not CDM. SSH to the controller and use retrieve_results. Do NOT use cdm_api_request or get_run_summary — those are for crucible only."
     }
 }

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
+from providers.skills.repo_cache import RepoCache
 
 from .mcp_server import create_review_tool_handlers, get_review_tools
 from .prompts import REVIEW_SYSTEM_PROMPT
@@ -19,14 +21,20 @@ class ReviewAgent(AgentBase):
         self,
         llm_provider: LLMProvider,
         state_store_url: str,
+        skill_provider=None,
         event_bus: EventBus | None = None,
+        repo_cache: RepoCache | None = None,
     ) -> None:
+        self._skill_provider = skill_provider
+        self._repo_cache = repo_cache
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
-        tools = get_review_tools()
+        tools = get_review_tools(repo_cache=repo_cache)
         tool_handlers = create_review_tool_handlers(
             request_clarification_fn=self._do_request_clarification,
+            skill_provider=skill_provider,
+            repo_cache=repo_cache,
         )
 
         super().__init__(
@@ -67,6 +75,10 @@ class ReviewAgent(AgentBase):
             content += f"**Benchmark Status:** {cf['benchmark_status']}\n"
         if cf.get("benchmark_suite"):
             content += f"**Benchmark Suite:** {cf['benchmark_suite']}\n"
+
+        harness = cf.get("harness_name") or cf.get("directives", {}).get("harness", "crucible")
+        content += f"**Harness:** {harness}\n"
+
         if cf.get("benchmark_duration"):
             content += f"**Duration:** {cf['benchmark_duration']}s\n"
         if cf.get("parsed_specs"):
@@ -80,12 +92,25 @@ class ReviewAgent(AgentBase):
             content += f"**Controller (SSH):** {ssh_ips['controller']}\n"
             if cf.get("ssh_key_path"):
                 content += f"**SSH Key:** {cf['ssh_key_path']}\n"
-            content += (
-                f"\nUse these for get_run_summary and cdm_api_request tools. "
-                f"The CDM server runs on port 3000 on the controller.\n"
-            )
+
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
+
+        skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
+        if skills_dir.is_dir():
+            content += f"\n## {harness} Skills\n"
+            content += "These contain lessons from prior runs that may help interpret results:\n\n"
+            for f in sorted(skills_dir.glob("*.md")):
+                content += f"- `{f.name}`\n"
+            content += "\nUse `read_skill` to read any of these.\n"
+
+        if self._repo_cache:
+            docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
+            if docs:
+                content += f"\n## Available {harness} Documentation\n"
+                content += "Use `read_harness_doc` to read any of these:\n\n"
+                for doc in docs:
+                    content += f"- `{doc['path']}`\n"
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"

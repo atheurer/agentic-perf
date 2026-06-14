@@ -106,7 +106,9 @@ class Dispatcher:
             return ReviewAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
+                skill_provider=self.skills,
                 event_bus=self.events,
+                repo_cache=self.repo_cache,
             )
         elif agent_type == "resource_teardown":
             return ResourceAgent(

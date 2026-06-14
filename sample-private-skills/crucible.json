@@ -32,6 +32,12 @@
         "supported_os": ["rhel8", "rhel9", "rhel10", "fedora", "centos", "alma"],
         "required_packages": ["git", "podman"]
     },
+    "review": {
+        "results_method": "cdm_api",
+        "cdm_port": 3000,
+        "result_summary_path": "/var/lib/crucible/run/*{run_id}*/run/result-summary.json",
+        "notes": "Use get_run_summary for a structured overview, then cdm_api_request for detailed metrics. CDM data model: run → iterations → samples → periods → metric data. Primary metric format: source::type (e.g., fio::iops, uperf::Gbps). Key CDM endpoints: GET /api/v1/run/<id>/iterations, POST /api/v1/iterations/metric-values (body: {runIds: [<id>]})."
+    },
     "install_contract": {
         "secret_files": [
             {
