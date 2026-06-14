@@ -293,8 +293,10 @@ class CrucibleSkillProvider(SkillProvider):
         meta = self._load_benchmark_meta(benchmark)
         return meta.get("multiplex")
 
-    async def get_example_runfile(self, benchmark: str) -> dict[str, Any] | None:
-        return self._load_example_runfile(benchmark)
+    async def get_example_runfile(
+        self, benchmark: str, endpoint_type: str = "remotehosts"
+    ) -> dict[str, Any] | None:
+        return self._load_example_runfile(benchmark, endpoint_type)
 
     async def validate_runfile(
         self, run_file: dict[str, Any], harness: str | None = None

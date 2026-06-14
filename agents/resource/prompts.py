@@ -67,16 +67,22 @@ The IPs from reserve_resources are the canonical identifiers.
 
 ## Host Count
 
-The ticket's min_hosts field counts ENDPOINT hosts only. For managed
-providers (quads, aws), always provision min_hosts + 1:
+The ticket's min_hosts field counts ENDPOINT hosts only.
+
+**For remotehosts endpoints** (default) with managed providers:
+Always provision min_hosts + 1:
 - 1 dedicated controller host (runs the benchmark framework)
 - min_hosts endpoint hosts (where workloads actually run)
+The controller must NOT also serve as an endpoint.
 
-The controller must NOT also serve as an endpoint. This is a hard
-requirement — do not combine them to save resources.
+**For kube endpoints** with managed providers:
+Provision 1 host only — it serves as both controller and K8s cluster node.
+Workloads run as pods on the cluster, not on separate hosts. Submit
+assigned_hardware_ips with the controller set and targets as an empty
+array [].
 
 The "Total hosts to provision" in the Resource Requirements section
-already includes the controller — use that number directly.
+already accounts for endpoint type — use that number directly.
 
 ## Important Notes
 

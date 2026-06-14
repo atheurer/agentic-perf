@@ -268,6 +268,11 @@ def get_benchmark_tools(
                         "type": "string",
                         "description": "Benchmark harness (default: 'crucible')",
                     },
+                    "endpoint_type": {
+                        "type": "string",
+                        "enum": ["remotehosts", "kube"],
+                        "description": "Endpoint type to get an example for (default: 'remotehosts')",
+                    },
                 },
                 "required": ["benchmark"],
             },
@@ -632,17 +637,18 @@ def create_benchmark_tool_handlers(
         return {"found": True, "benchmark": benchmark, "harness": harness_name, "params": params}
 
     async def handle_get_example_runfile(
-        benchmark: str, harness: str | None = None
+        benchmark: str, harness: str | None = None, endpoint_type: str | None = None
     ) -> dict:
         harness_name = harness or "crucible"
+        ep_type = endpoint_type or "remotehosts"
         if hasattr(skill_provider, "get_provider"):
             provider = skill_provider.get_provider(harness_name)
-            example = await provider.get_example_runfile(benchmark) if provider else None
+            example = await provider.get_example_runfile(benchmark, endpoint_type=ep_type) if provider else None
         else:
-            example = await skill_provider.get_example_runfile(benchmark)
+            example = await skill_provider.get_example_runfile(benchmark, endpoint_type=ep_type)
         if example is None:
-            return {"found": False, "message": f"No example run-file for '{benchmark}' in '{harness_name}'"}
-        return {"found": True, "benchmark": benchmark, "harness": harness_name, "run_file": example}
+            return {"found": False, "message": f"No example run-file for '{benchmark}' ({ep_type}) in '{harness_name}'"}
+        return {"found": True, "benchmark": benchmark, "harness": harness_name, "endpoint_type": ep_type, "run_file": example}
 
     async def handle_present_runfile_for_approval(
         run_file: dict,
