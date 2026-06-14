@@ -122,7 +122,9 @@ class MockSkillProvider(SkillProvider):
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         return self._benchmark_params.get(benchmark)
 
-    async def get_example_runfile(self, benchmark: str) -> dict[str, Any] | None:
+    async def get_example_runfile(
+        self, benchmark: str, endpoint_type: str = "remotehosts"
+    ) -> dict[str, Any] | None:
         return self._example_runfiles.get(benchmark)
 
     async def get_private_config(self, suite_name: str, key: str) -> Any | None:

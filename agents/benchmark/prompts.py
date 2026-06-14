@@ -41,10 +41,16 @@ to construct a correct run file — getting the format right is critical.
 5. **Construct the run-file** — You are responsible for building a correct run-file:
    - Call `get_runfile_schema()` to understand required fields and structure
    - Call `get_benchmark_params(benchmark)` to see valid parameters and presets
-   - Call `get_example_runfile(benchmark)` for a structural reference (if available)
+   - Call `get_example_runfile(benchmark, endpoint_type=...)` for a structural reference
    - Read the harness's run-file documentation for format details
    - Use endpoint IPs from assigned_hardware_ips (always use IPs, never hostnames)
-   - For kube endpoints, read kube examples (e.g., oslat has one) and endpoint docs
+
+   **For kube endpoints** (endpoint_type: "kube"):
+   - Read the harness's kube endpoint skill doc (e.g., `kube-endpoints.md`)
+     for the correct endpoint format — it differs from remotehosts
+   - The controller serves as both the benchmark controller and the K8s
+     cluster host. Use the controller's private IP as the kube host address
+   - Targets may be empty — workloads run as pods, not on separate hosts
 
 6. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
@@ -67,8 +73,10 @@ to construct a correct run file — getting the format right is critical.
   `get_runfile_schema` to check all required fields before constructing a run-file.
 
 ### Important notes:
-- The controller host runs the benchmark framework. It is NOT an endpoint unless
-  the benchmark has only a "client" role (like fio).
+- The controller host runs the benchmark framework. For remotehosts, it is NOT
+  an endpoint unless the benchmark has only a "client" role (like fio). For kube
+  endpoints, workloads run as pods on the controller's K8s cluster — read the
+  harness skill docs for kube endpoint construction details.
 - Endpoints are the target hosts where the actual workload runs.
 - If the benchmark needs only 1 host (client role only), use the first target host
   as the endpoint. If no targets exist, the controller itself can be the endpoint.

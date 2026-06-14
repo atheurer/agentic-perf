@@ -53,7 +53,9 @@ class SkillProvider(ABC):
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         return None
 
-    async def get_example_runfile(self, benchmark: str) -> dict[str, Any] | None:
+    async def get_example_runfile(
+        self, benchmark: str, endpoint_type: str = "remotehosts"
+    ) -> dict[str, Any] | None:
         return None
 
     async def validate_runfile(

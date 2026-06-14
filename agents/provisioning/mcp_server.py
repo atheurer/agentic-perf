@@ -907,7 +907,37 @@ def create_provisioning_tool_handlers(
             timeout=150,
         )
 
-        node_result = await ssh.run(host, "k3s kubectl get nodes -o wide --no-headers")
+        await ssh.run(
+            host,
+            "mkdir -p /root/.kube && ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config",
+        )
+
+        kubectl_check = await ssh.run(host, "test -x /usr/local/bin/kubectl")
+        if kubectl_check.exit_code != 0:
+            await ssh.run(
+                host, "ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl"
+            )
+
+        self_ssh_ok = False
+        keygen = await ssh.run(
+            host,
+            'test -f /root/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "k3s-self-ssh" -N ""',
+        )
+        if keygen.exit_code == 0:
+            await ssh.run(
+                host,
+                "cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys && "
+                "chmod 600 /root/.ssh/authorized_keys && "
+                "sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys",
+            )
+            verify = await ssh.run(
+                host,
+                "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes localhost hostname",
+                timeout=15,
+            )
+            self_ssh_ok = verify.exit_code == 0
+
+        node_result = await ssh.run(host, "kubectl get nodes -o wide --no-headers")
         version_result = await ssh.run(host, "k3s --version 2>/dev/null | head -1")
 
         return {
@@ -915,6 +945,8 @@ def create_provisioning_tool_handlers(
             "status": "success",
             "k3s_version": version_result.stdout.strip() if version_result.exit_code == 0 else "unknown",
             "node_info": node_result.stdout.strip() if node_result.exit_code == 0 else "",
+            "kubeconfig_path": "/root/.kube/config",
+            "self_ssh": self_ssh_ok,
             "message": "K3s installed and cluster ready",
         }
 

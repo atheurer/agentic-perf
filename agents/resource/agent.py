@@ -260,14 +260,20 @@ class ResourceAgent(AgentBase):
 
         roles = fields.get("roles")
         min_hosts = fields.get("min_hosts")
+        endpoint_type = directives.get("endpoint_type", "remotehosts")
         if roles or min_hosts:
             content += "\n## Resource Requirements\n"
             if roles:
                 content += f"- **Roles:** {roles}\n"
             if min_hosts:
-                total = min_hosts + 1
-                content += f"- **Endpoint hosts needed:** {min_hosts}\n"
-                content += f"- **Total hosts to provision:** {total} (1 dedicated controller + {min_hosts} endpoints)\n"
+                if endpoint_type == "kube":
+                    total = 1
+                    content += f"- **Endpoint type:** kube (workloads run as pods)\n"
+                    content += f"- **Total hosts to provision:** {total} (single host: controller + K8s cluster)\n"
+                else:
+                    total = min_hosts + 1
+                    content += f"- **Endpoint hosts needed:** {min_hosts}\n"
+                    content += f"- **Total hosts to provision:** {total} (1 dedicated controller + {min_hosts} endpoints)\n"
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
