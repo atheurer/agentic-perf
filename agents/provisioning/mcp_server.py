@@ -600,8 +600,8 @@ def create_provisioning_tool_handlers(
             "packages": packages,
             "status": "success" if result.exit_code == 0 else "failed",
             "exit_code": result.exit_code,
-            "output": result.stdout[-500:] if result.stdout else "",
-            "error": result.stderr[-500:] if result.stderr else "",
+            "output": result.stdout or "" if result.stdout else "",
+            "error": result.stderr or "" if result.stderr else "",
         }
 
     async def install_harness(
@@ -681,8 +681,8 @@ def create_provisioning_tool_handlers(
                     "status": "failed",
                     "exit_code": result.exit_code,
                     "install_path": target_path,
-                    "output": result.stdout[-1000:] if result.stdout else "",
-                    "error": result.stderr[-1000:] if result.stderr else "",
+                    "output": result.stdout or "" if result.stdout else "",
+                    "error": result.stderr or "" if result.stderr else "",
                     "message": f"Install failed (exit {result.exit_code})",
                 }
 
@@ -704,7 +704,7 @@ def create_provisioning_tool_handlers(
                 "install_path": target_path,
                 "constraints": constraints,
                 "contract": contract_result.get("deployed_files", []),
-                "output": result.stdout[-1000:] if result.stdout else "",
+                "output": result.stdout or "" if result.stdout else "",
                 "message": f"{harness_name} installed via public installer",
             }
 
@@ -757,8 +757,8 @@ def create_provisioning_tool_handlers(
                 "install_path": target_path,
                 "constraints": constraints,
                 "contract": contract_result.get("deployed_files", []),
-                "output": result.stdout[-1000:] if result.stdout else "",
-                "error": result.stderr[-1000:] if result.stderr else "",
+                "output": result.stdout or "" if result.stdout else "",
+                "error": result.stderr or "" if result.stderr else "",
                 "message": f"{harness_name} installed" if result.exit_code == 0 else f"Install failed (exit {result.exit_code})",
             }
 
@@ -779,8 +779,8 @@ def create_provisioning_tool_handlers(
                 "status": "success" if result.exit_code == 0 else "failed",
                 "exit_code": result.exit_code,
                 "install_path": target_path,
-                "output": result.stdout[-1000:] if result.stdout else "",
-                "error": result.stderr[-1000:] if result.stderr else "",
+                "output": result.stdout or "" if result.stdout else "",
+                "error": result.stderr or "" if result.stderr else "",
                 "message": (
                     f"{harness_name} binary installed"
                     if result.exit_code == 0
@@ -874,8 +874,8 @@ def create_provisioning_tool_handlers(
             "harness": harness_name,
             "status": "success" if result.exit_code == 0 else "failed",
             "exit_code": result.exit_code,
-            "output": result.stdout[-1000:] if result.stdout else "",
-            "error": result.stderr[-500:] if result.stderr else "",
+            "output": result.stdout or "" if result.stdout else "",
+            "error": result.stderr or "" if result.stderr else "",
             "message": "Update completed" if result.exit_code == 0 else f"Update failed (exit {result.exit_code})",
         }
 
@@ -911,7 +911,7 @@ def create_provisioning_tool_handlers(
             return {
                 "host": host,
                 "status": "failed",
-                "message": f"K3s install failed: {result.stderr[-500:] if result.stderr else ''}",
+                "message": f"K3s install failed: {result.stderr or "" if result.stderr else ''}",
             }
 
         for attempt in range(12):
