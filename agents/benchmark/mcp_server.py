@@ -451,6 +451,11 @@ def create_benchmark_tool_handlers(
 
         if harness_name == "zathras":
             scenario = run_file.get("scenario", {})
+            if not scenario and ("global" in run_file or "systems" in run_file):
+                scenario = {
+                    k: v for k, v in run_file.items()
+                    if k not in ("harness", "local_config", "host_config_name", "tags")
+                }
             local_config = run_file.get("local_config")
             host_config_name = run_file.get("host_config_name", "")
 
@@ -460,6 +465,30 @@ def create_benchmark_tool_handlers(
                     controller,
                     f"mkdir -p /opt/zathras/local_configs && cat > /opt/zathras/local_configs/{host_config_name}.config << 'ZEOF'\n{config_content}\nZEOF",
                 )
+
+            ZATHRAS_NO_ARG_FLAGS = {
+                "no_clean_up", "no_packages", "no_pip_packages",
+                "no_system_packages", "no_spot_recover", "persistent_log",
+                "preflight_check", "run_chronicler", "run_chronicler_strict",
+                "skip_test_version_check", "ignore_repo_errors",
+                "create_only", "force_upload", "verbose",
+            }
+            for section in ("global", "systems"):
+                if section not in scenario:
+                    continue
+                if section == "global":
+                    items = scenario["global"]
+                    for key in list(items.keys()):
+                        if key in ZATHRAS_NO_ARG_FLAGS and items[key] in (True, "true", "True", "yes"):
+                            items[key] = ""
+                        if key == "ssh_key_file" and isinstance(items[key], str) and items[key].startswith("~"):
+                            items[key] = "/root" + items[key][1:]
+                else:
+                    for sys_name, sys_conf in scenario["systems"].items():
+                        if not isinstance(sys_conf, dict):
+                            continue
+                        if "ssh_key_file" in sys_conf and isinstance(sys_conf["ssh_key_file"], str) and sys_conf["ssh_key_file"].startswith("~"):
+                            sys_conf["ssh_key_file"] = "/root" + sys_conf["ssh_key_file"][1:]
 
             try:
                 import yaml

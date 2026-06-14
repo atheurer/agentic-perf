@@ -71,6 +71,13 @@
             "dnf install -y git"
         ]
     },
+    "scenario_rules": {
+        "notes": "Critical rules for constructing zathras scenario files. Violating these causes burden to silently exit 0 without running the benchmark.",
+        "valid_scenario_keys": "Scenario keys map 1:1 to burden CLI flags (minus the dashes). ONLY keys that correspond to a --flag are valid. If a key is not a burden CLI flag, burden treats it as an unrecognized argument and dumps usage.",
+        "test_specific_is_NOT_a_scenario_key": "test_specific is a test DEFINITION field (in config/test_defs.yml), not a scenario key. To override test-specific options from the scenario, use test_override in the global section: test_override: \"system1:test_specific=--iterations 3\"",
+        "boolean_flags": "Flag options like no_clean_up, no_packages, skip_test_version_check take NO argument value. Do not use true/false/yes/no. Use empty string or just include the key with no value. The execute_benchmark tool handles this automatically.",
+        "ssh_key_file_must_be_absolute": "Zathras does not expand ~ in paths. Use absolute paths like /root/.ssh/id_rsa. The execute_benchmark tool handles tilde expansion automatically."
+    },
     "scenario_template": {
         "notes": "Scenario files are YAML with 'global' and 'systems' sections. Options map directly to CLI flags without dashes. Each system block specifies tests, host_config, and optional overrides.",
         "bare_metal_example": {
