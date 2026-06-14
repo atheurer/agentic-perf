@@ -17,6 +17,7 @@ from providers.llm.mock import MockLLMProvider
 from providers.llm.claude import ClaudeLLMProvider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.crucible import CrucibleSkillProvider
+from providers.skills.k8s_netperf import K8sNetperfSkillProvider
 from providers.skills.kube_burner import KubeBurnerSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
 from providers.skills.private import PrivateSkillProvider
@@ -105,6 +106,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
             logger.info("No zathras_home set — using private-skills benchmark catalog")
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
     harnesses["kube-burner"] = KubeBurnerSkillProvider()
+    harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
