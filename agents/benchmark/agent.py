@@ -90,6 +90,8 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**SSH User:** {cf['ssh_user']}\n"
         if cf.get("directives"):
             content += f"\n## User Directives\n```json\n{json.dumps(cf['directives'], indent=2)}\n```\n"
+        if cf.get("resource_provider_metadata"):
+            content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
         harness = cf.get("directives", {}).get("harness", "crucible")
 

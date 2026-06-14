@@ -35,8 +35,9 @@ def get_resource_tools() -> list[ToolDefinition]:
             description=(
                 "Validate that a host is reachable via SSH. "
                 "Returns connectivity status, FQDN, and basic system info "
-                "(OS, CPU count, RAM). Use the returned fqdn for "
-                "submit_resource_result to ensure consistent hostname resolution."
+                "(OS, CPU count, RAM). This is for connectivity verification "
+                "only — for submit_resource_result, use the IPs from the "
+                "reserve_resources result, not the FQDN from this tool."
             ),
             input_schema={
                 "type": "object",

@@ -84,6 +84,8 @@ class ReviewAgent(AgentBase):
                 f"\nUse these for get_run_summary and cdm_api_request tools. "
                 f"The CDM server runs on port 3000 on the controller.\n"
             )
+        if cf.get("resource_provider_metadata"):
+            content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"

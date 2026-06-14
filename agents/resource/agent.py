@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from agents.base import AgentBase
@@ -16,6 +17,27 @@ from .mcp_server import create_resource_tool_handlers, get_resource_tools
 from .prompts import RESOURCE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+def _match_to_provider_ip(
+    host: str, ip_mapping: dict[str, str]
+) -> tuple[str, str] | None:
+    """Match a host identifier to its (public_ip, private_ip) pair.
+
+    Handles raw IPs and AWS-style hostnames (ip-W-X-Y-Z.*.compute.internal).
+    Returns None if no match is found.
+    """
+    if host in ip_mapping:
+        return host, ip_mapping[host]
+    reverse = {v: k for k, v in ip_mapping.items()}
+    if host in reverse:
+        return reverse[host], host
+    m = re.match(r"ip-(\d+)-(\d+)-(\d+)-(\d+)", host)
+    if m:
+        extracted = f"{m.group(1)}.{m.group(2)}.{m.group(3)}.{m.group(4)}"
+        if extracted in reverse:
+            return reverse[extracted], extracted
+    return None
 
 
 class ResourceAgent(AgentBase):
@@ -295,39 +317,39 @@ class ResourceAgent(AgentBase):
         if result.get("fresh_host"):
             fields["fresh_host"] = True
 
-        # For cloud providers, ensure assigned_hardware_ips has private IPs
-        # (for run-file endpoints) and ssh_hardware_ips has public IPs
-        # (for agent SSH access from outside the VPC).
         ip_mapping = reservation_metadata.get("ip_mapping", {})
-        private_ips_list = reservation_metadata.get("private_ips", [])
-        public_ips = provider_metadata.get("public_ips", [])
         hw = fields["assigned_hardware_ips"]
 
         if ip_mapping and hw:
-            reverse_map = {v: k for k, v in ip_mapping.items()}
             ssh_hw: dict[str, Any] = {}
             private_hw: dict[str, Any] = {}
 
             ctrl = hw.get("controller", "")
             if ctrl:
-                ssh_hw["controller"] = ip_mapping.get(ctrl, ctrl)
-                private_hw["controller"] = reverse_map.get(ctrl, ctrl)
+                match = _match_to_provider_ip(ctrl, ip_mapping)
+                if match:
+                    ssh_hw["controller"] = match[0]
+                    private_hw["controller"] = match[1]
+                else:
+                    ssh_hw["controller"] = ctrl
+                    private_hw["controller"] = ctrl
 
             targets = hw.get("targets", [])
-            ssh_hw["targets"] = [ip_mapping.get(t, t) for t in targets]
-            private_hw["targets"] = [reverse_map.get(t, t) for t in targets]
+            ssh_targets = []
+            private_targets = []
+            for t in targets:
+                match = _match_to_provider_ip(t, ip_mapping)
+                if match:
+                    ssh_targets.append(match[0])
+                    private_targets.append(match[1])
+                else:
+                    ssh_targets.append(t)
+                    private_targets.append(t)
+            ssh_hw["targets"] = ssh_targets
+            private_hw["targets"] = private_targets
 
             fields["ssh_hardware_ips"] = ssh_hw
             fields["assigned_hardware_ips"] = private_hw
-        elif public_ips and hw:
-            all_hw = ([hw.get("controller")] if hw.get("controller") else []) + hw.get("targets", [])
-            if len(public_ips) == len(all_hw):
-                fwd_map = dict(zip(all_hw, public_ips))
-                ssh_hw = {}
-                if hw.get("controller") and hw["controller"] in fwd_map:
-                    ssh_hw["controller"] = fwd_map[hw["controller"]]
-                ssh_hw["targets"] = [fwd_map.get(t, t) for t in hw.get("targets", [])]
-                fields["ssh_hardware_ips"] = ssh_hw
 
         # Backward compat: write legacy QUADS fields when provider is quads
         provider = fields.get("resource_provider")

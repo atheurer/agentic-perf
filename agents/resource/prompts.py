@@ -54,6 +54,17 @@ Always call submit_resource_result with:
 - fresh_host: true for managed providers (hosts need full harness install)
 - lease_expiration: from the reservation result (null if not applicable)
 
+### Cloud Provider IP Handling
+
+For cloud providers (AWS, etc.), reserve_resources returns both public and
+private IPs. In assigned_hardware_ips, use the IPs from the reserve_resources
+result — do NOT substitute hostnames from validate_host. The system
+automatically maps IPs to their public/private counterparts for SSH access
+vs run-file entries.
+
+validate_host is for verifying connectivity and gathering system info only.
+The IPs from reserve_resources are the canonical identifiers.
+
 ## Host Count
 
 The ticket's min_hosts field counts ENDPOINT hosts only. For managed

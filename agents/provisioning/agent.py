@@ -86,6 +86,8 @@ class ProvisioningAgent(AgentBase):
             content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
+        if cf.get("resource_provider_metadata"):
+            content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
