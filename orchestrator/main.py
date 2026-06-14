@@ -16,6 +16,7 @@ from providers.events import EventBus
 from providers.llm.mock import MockLLMProvider
 from providers.llm.claude import ClaudeLLMProvider
 from providers.secrets.local import LocalSecretsProvider
+from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
 from providers.skills.crucible import CrucibleSkillProvider
 from providers.skills.k8s_netperf import K8sNetperfSkillProvider
 from providers.skills.kube_burner import KubeBurnerSkillProvider
@@ -107,6 +108,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
     harnesses["kube-burner"] = KubeBurnerSkillProvider()
     harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
+    harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )

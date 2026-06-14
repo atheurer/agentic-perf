@@ -788,6 +788,32 @@ def create_provisioning_tool_handlers(
                 ),
             }
 
+        if install_method == "container_image":
+            image = provisioning.get("container_image")
+            if not image:
+                return {
+                    "host": host,
+                    "status": "failed",
+                    "message": f"No container_image in private config for {harness_name}",
+                }
+
+            logger.info(f"[provision] Pulling container image {image} on {host}")
+            result = await ssh.run(host, f"podman pull {image}", timeout=300)
+            return {
+                "host": host,
+                "harness": harness_name,
+                "status": "success" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "install_path": image,
+                "output": result.stdout[-1000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    f"{harness_name} container image pulled"
+                    if result.exit_code == 0
+                    else f"Image pull failed (exit {result.exit_code})"
+                ),
+            }
+
         return {
             "host": host,
             "status": "failed",

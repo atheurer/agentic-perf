@@ -500,6 +500,42 @@ def create_benchmark_tool_handlers(
                 ),
             }
 
+        if harness_name == "benchmark-runner":
+            env_vars = run_file.get("env_vars", {})
+            container_image = run_file.get("container_image", "quay.io/benchmark-runner/benchmark-runner:latest")
+            artifacts_dir = run_file.get("artifacts_dir", "/tmp/benchmark-runner-run-artifacts")
+
+            env_flags = " ".join(f'-e {k}="{v}"' for k, v in env_vars.items())
+
+            cmd = (
+                f"podman run --rm {env_flags} "
+                f"-v /root/.kube/config:/root/.kube/config "
+                f"-v {artifacts_dir}:{artifacts_dir} "
+                f"--privileged "
+                f"{container_image} 2>&1"
+            )
+            logger.info(f"[benchmark] Executing benchmark-runner: {cmd}")
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+
+            artifacts_cmd = f"ls {artifacts_dir}/ 2>/dev/null | tail -1"
+            artifacts_result = await ssh.run(controller, artifacts_cmd)
+            run_dir = artifacts_result.stdout.strip() if artifacts_result.exit_code == 0 else ""
+
+            return {
+                "status": "completed" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "run_id": f"benchmark-runner-{run_uuid}",
+                "run_dir": f"{artifacts_dir}/{run_dir}" if run_dir else "",
+                "harness": "benchmark-runner",
+                "output": result.stdout[-3000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    "Benchmark completed"
+                    if result.exit_code == 0
+                    else f"Benchmark failed (exit {result.exit_code})"
+                ),
+            }
+
         if harness_name == "zathras":
             scenario = run_file.get("scenario", {})
             if not scenario and ("global" in run_file or "systems" in run_file):
