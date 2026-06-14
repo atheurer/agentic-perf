@@ -52,8 +52,9 @@ Pod latencies:
            Ready: 2345ms
 ```
 
-With `--local-indexing`, JSON metrics files are written to
-the current directory.
+Local indexing is the default — JSON metrics files are written
+to `collected-metrics/` in the working directory automatically
+when no Elasticsearch endpoint is configured.
 
 ## Exit Codes
 

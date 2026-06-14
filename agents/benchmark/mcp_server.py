@@ -482,7 +482,7 @@ def create_benchmark_tool_handlers(
                 )
 
             kb_cmd = run_command or "kube-burner init"
-            cmd = f"cd {template_dir} && {kb_cmd} -c {config_path} --uuid {run_uuid} --local-indexing 2>&1"
+            cmd = f"cd {template_dir} && {kb_cmd} -c {config_path} --uuid {run_uuid} 2>&1"
             logger.info(f"[benchmark] Executing kube-burner: {cmd}")
             result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
 
