@@ -34,6 +34,7 @@ global:
 
 jobs:
 - name: node-density
+  namespace: node-density
   jobType: Create
   jobIterations: 50
   namespacedIterations: true
@@ -45,6 +46,10 @@ jobs:
     replicas: 1
     wait: true
 ```
+
+**IMPORTANT**: `jobType` values are case-sensitive and MUST be
+capitalized: `Create`, `Delete`, `Read`, `Patch`. Using
+lowercase (e.g., `create`) causes namespace naming failures.
 
 ### templates section
 

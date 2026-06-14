@@ -41,6 +41,15 @@ types across namespaces.
 | timeout | string | "30m" | Global timeout |
 | podWait | bool | true | Wait for pods to reach Running state |
 
+## Critical Config Rules
+
+- `jobType` MUST be capitalized: `Create`, `Delete`, `Read`,
+  `Patch`. Lowercase values (e.g., `create`) cause namespace
+  naming failures and silent errors.
+- Always set `namespace` in the job config (e.g.,
+  `namespace: node-density`). Without it, auto-generated
+  namespace names may be invalid.
+
 ## Output
 
 kube-burner prints pod latency summaries to stdout:

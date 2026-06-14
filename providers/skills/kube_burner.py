@@ -231,6 +231,7 @@ class KubeBurnerSkillProvider(SkillProvider):
 
         job: dict[str, Any] = {
             "name": benchmark,
+            "namespace": benchmark,
             "jobType": "Create",
             "jobIterations": merged.get("jobIterations", 50),
             "namespacedIterations": True,
