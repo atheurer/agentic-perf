@@ -629,6 +629,58 @@ def create_benchmark_tool_handlers(
                 "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
             }
 
+        if harness_name == "k8s-netperf":
+            try:
+                import yaml
+                yaml_dump = yaml.dump
+            except ImportError:
+                yaml_dump = None
+
+            config = run_file.get("config", {})
+            cli_flags = run_file.get("cli_flags", [])
+
+            template_dir = f"/tmp/k8s-netperf-{run_uuid}"
+            config_path = f"{template_dir}/netperf.yml"
+
+            await ssh.run(controller, f"mkdir -p {template_dir}")
+
+            if yaml_dump:
+                config_content = yaml_dump(config, default_flow_style=False)
+            else:
+                config_content = json.dumps(config, indent=2)
+
+            await ssh.run(
+                controller,
+                f"cat > {config_path} << 'NPEOF'\n{config_content}\nNPEOF",
+            )
+
+            setup_cmds = [
+                "kubectl create ns netperf --dry-run=client -o yaml | kubectl apply -f -",
+                "kubectl create sa netperf -n netperf --dry-run=client -o yaml | kubectl apply -f -",
+            ]
+            for setup_cmd in setup_cmds:
+                await ssh.run(controller, setup_cmd)
+
+            flags_str = " ".join(cli_flags)
+            np_cmd = run_command or "k8s-netperf"
+            cmd = f"{np_cmd} --config {config_path} {flags_str} --json 2>&1"
+            logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+
+            return {
+                "status": "completed" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "run_id": f"k8s-netperf-{run_uuid}",
+                "harness": "k8s-netperf",
+                "output": result.stdout[-3000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    "Benchmark completed"
+                    if result.exit_code == 0
+                    else f"Benchmark failed (exit {result.exit_code})"
+                ),
+            }
+
         remote_path = f"/tmp/run-file-{run_uuid}.json"
 
         with tempfile.NamedTemporaryFile(
