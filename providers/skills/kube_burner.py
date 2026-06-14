@@ -232,7 +232,7 @@ class KubeBurnerSkillProvider(SkillProvider):
         job: dict[str, Any] = {
             "name": benchmark,
             "namespace": benchmark,
-            "jobType": "Create",
+            "jobType": "create",
             "jobIterations": merged.get("jobIterations", 50),
             "namespacedIterations": True,
             "cleanup": True,
@@ -241,14 +241,12 @@ class KubeBurnerSkillProvider(SkillProvider):
             "objects": [],
         }
 
-        if merged.get("podWait", False):
-            job["podWait"] = True
+        if merged.get("podWait", True):
+            job["waitWhenFinished"] = True
 
         templates = dict(info.get("default_template", {}))
         for tpl_name in templates:
             obj = {"objectTemplate": tpl_name, "replicas": 1}
-            if tpl_name == "pod.yml":
-                obj["wait"] = merged.get("podWait", True)
             job["objects"].append(obj)
 
         config: dict[str, Any] = {
@@ -355,11 +353,11 @@ class KubeBurnerSkillProvider(SkillProvider):
                     continue
                 if "name" not in job:
                     errors.append(f"Job {i}: missing 'name' field")
-                jt = job.get("jobType", "Create")
-                if jt not in ("Create", "Delete", "Read", "Patch"):
+                jt = job.get("jobType", "create")
+                if jt not in ("create", "delete", "read", "patch"):
                     errors.append(f"Job {i}: invalid jobType '{jt}'")
-                if "objects" not in job and jt == "Create":
-                    errors.append(f"Job {i}: Create job missing 'objects' list")
+                if "objects" not in job and jt == "create":
+                    errors.append(f"Job {i}: create job missing 'objects' list")
 
         templates = run_file.get("templates")
         if not isinstance(templates, dict):

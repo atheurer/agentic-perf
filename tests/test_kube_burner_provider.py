@@ -95,7 +95,7 @@ async def test_generate_runfile_node_density(provider: KubeBurnerSkillProvider):
     assert len(config["jobs"]) == 1
     job = config["jobs"][0]
     assert job["name"] == "node-density"
-    assert job["jobType"] == "Create"
+    assert job["jobType"] == "create"
     assert job["jobIterations"] == 50
 
 
@@ -219,7 +219,7 @@ async def test_validate_runfile_missing_template_reference(provider: KubeBurnerS
             "global": {},
             "jobs": [{
                 "name": "test",
-                "jobType": "Create",
+                "jobType": "create",
                 "objects": [{"objectTemplate": "missing.yml"}],
             }],
         },

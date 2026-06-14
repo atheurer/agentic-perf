@@ -35,21 +35,23 @@ global:
 jobs:
 - name: node-density
   namespace: node-density
-  jobType: Create
+  jobType: create
   jobIterations: 50
   namespacedIterations: true
   cleanup: true
+  waitWhenFinished: true
   qps: 20
   burst: 20
   objects:
   - objectTemplate: pod.yml
     replicas: 1
-    wait: true
 ```
 
-**IMPORTANT**: `jobType` values are case-sensitive and MUST be
-capitalized: `Create`, `Delete`, `Read`, `Patch`. Using
-lowercase (e.g., `create`) causes namespace naming failures.
+**IMPORTANT**: `jobType` values must be lowercase in
+kube-burner v2.7.0+: `create`, `delete`, `read`, `patch`.
+Capitalized values (e.g., `Create`) cause fatal errors.
+Use `waitWhenFinished: true` (not `podWait`) to wait for
+pods to reach Running state.
 
 ### templates section
 

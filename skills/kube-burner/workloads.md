@@ -43,9 +43,9 @@ types across namespaces.
 
 ## Critical Config Rules
 
-- `jobType` MUST be capitalized: `Create`, `Delete`, `Read`,
-  `Patch`. Lowercase values (e.g., `create`) cause namespace
-  naming failures and silent errors.
+- `jobType` must be lowercase: `create`, `delete`, `read`,
+  `patch`. Capitalized values (e.g., `Create`) cause
+  "Unknown jobType" fatal errors in kube-burner v2.7.0+.
 - Always set `namespace` in the job config (e.g.,
   `namespace: node-density`). Without it, auto-generated
   namespace names may be invalid.
