@@ -101,6 +101,9 @@ Results are saved to `/tmp/benchmark-runner-run-artifacts/`.
 
 ## Important Notes
 
+- fio_pod and vdbench_pod default to ODF (OpenShift Data Foundation)
+  PVCs for storage. If ODF is not installed, set ODF_PVC=False in
+  env_vars to use ephemeral (node-local) storage instead
 - benchmark-runner REQUIRES OpenShift — set CLUSTER=openshift.
   The CLUSTER=kubernetes mode does not actually work (the code
   always calls `oc login` which requires KUBEADMIN_PASSWORD)
