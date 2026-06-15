@@ -632,12 +632,6 @@ def create_benchmark_tool_handlers(
             }
 
         if harness_name == "k8s-netperf":
-            try:
-                import yaml
-                yaml_dump = yaml.dump
-            except ImportError:
-                yaml_dump = None
-
             config = run_file.get("config", {})
             cli_flags = run_file.get("cli_flags", [])
 
@@ -646,10 +640,25 @@ def create_benchmark_tool_handlers(
 
             await ssh.run(controller, f"mkdir -p {template_dir}")
 
-            if yaml_dump:
-                config_content = yaml_dump(config, default_flow_style=False)
-            else:
-                config_content = json.dumps(config, indent=2)
+            # v1 flat-dict YAML: k8s-netperf's Go yaml.v3 parser
+            # expects {testName: Config} not {tests: [{testName: Config}]}
+            tests = config.get("tests", config)
+            lines = ["---"]
+            if isinstance(tests, list):
+                for test in tests:
+                    if isinstance(test, dict):
+                        for name, params in test.items():
+                            lines.append(f"{name}:")
+                            if isinstance(params, dict):
+                                for k, v in params.items():
+                                    lines.append(f"  {k}: {json.dumps(v)}")
+            elif isinstance(tests, dict):
+                for name, params in tests.items():
+                    lines.append(f"{name}:")
+                    if isinstance(params, dict):
+                        for k, v in params.items():
+                            lines.append(f"  {k}: {json.dumps(v)}")
+            config_content = "\n".join(lines)
 
             await ssh.run(
                 controller,
@@ -659,9 +668,13 @@ def create_benchmark_tool_handlers(
             setup_cmds = [
                 "kubectl create ns netperf --dry-run=client -o yaml | kubectl apply -f -",
                 "kubectl create sa netperf -n netperf --dry-run=client -o yaml | kubectl apply -f -",
+                "kubectl label node --all node-role.kubernetes.io/worker= --overwrite",
+                "kubectl delete ns netperf --wait=true --ignore-not-found",
+                "kubectl create ns netperf",
+                "kubectl create sa netperf -n netperf",
             ]
             for setup_cmd in setup_cmds:
-                await ssh.run(controller, setup_cmd)
+                await ssh.run(controller, setup_cmd, timeout=60)
 
             flags_str = " ".join(cli_flags)
             np_cmd = run_command or "k8s-netperf"
