@@ -75,7 +75,7 @@ in the run-file with the user's cluster paths.
 |----------|--------|-------------|
 | WORKLOAD | stressng_pod, fio_pod, etc. | Benchmark to run |
 | CLUSTER | kubernetes, openshift | Cluster type |
-| RUN_TYPE | func_ci, perf_ci | Quick functional or full perf |
+| RUN_TYPE | func_ci, perf_ci | func_ci for SNO/small clusters (low resources); perf_ci needs large clusters (60+ CPUs, 75+ GB RAM per pod) |
 | TIMEOUT | seconds | Override default timeout |
 | SCALE | integer | Parallel pod instances |
 | SAVE_ARTIFACTS_LOCAL | True/False | Save results locally |
@@ -104,7 +104,11 @@ Results are saved to `/tmp/benchmark-runner-run-artifacts/`.
 - benchmark-runner REQUIRES OpenShift — set CLUSTER=openshift.
   The CLUSTER=kubernetes mode does not actually work (the code
   always calls `oc login` which requires KUBEADMIN_PASSWORD)
-- func_ci is a quick functional test; perf_ci is longer
+- func_ci is for SNO and small clusters — pods request minimal
+  resources. perf_ci requests 60 CPUs and 75 GB RAM per pod,
+  which will fail to schedule on single-node clusters. Default
+  to func_ci unless the user explicitly asks for perf_ci on a
+  large cluster
 - The container needs --privileged and kubeconfig mounted
 - podman must be installed on the controller host
 - KUBEADMIN_PASSWORD is read from a file on the controller —
