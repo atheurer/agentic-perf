@@ -639,6 +639,40 @@ def create_benchmark_tool_handlers(
                 "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
             }
 
+        if harness_name == "vstorm":
+            cli_args = run_file.get("cli_args", [])
+            kubeconfig = run_file.get("kubeconfig", "/root/.kube/config")
+
+            args_str = " ".join(cli_args)
+            vs_cmd = run_command or "/opt/vstorm/vstorm"
+            cmd = f"KUBECONFIG={kubeconfig} {vs_cmd} {args_str} 2>&1"
+            logger.info(f"[benchmark] Executing vstorm: {cmd}")
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+
+            batch_id = ""
+            for line in (result.stdout or "").split("\n"):
+                if "batch" in line.lower():
+                    import re as _re
+                    m = _re.search(r"[0-9a-f]{6}", line)
+                    if m:
+                        batch_id = m.group(0)
+                        break
+
+            return {
+                "status": "completed" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "run_id": f"vstorm-{batch_id or run_uuid}",
+                "harness": "vstorm",
+                "batch_id": batch_id,
+                "output": result.stdout[-3000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    "Benchmark completed"
+                    if result.exit_code == 0
+                    else f"Benchmark failed (exit {result.exit_code})"
+                ),
+            }
+
         if harness_name == "clusterbuster":
             try:
                 import yaml

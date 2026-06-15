@@ -24,6 +24,7 @@ from providers.skills.kube_burner import KubeBurnerSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
 from providers.skills.private import PrivateSkillProvider
 from providers.skills.repo_cache import RepoCache
+from providers.skills.vstorm import VstormSkillProvider
 from providers.skills.zathras import ZathrasSkillProvider
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
     harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
     harnesses["clusterbuster"] = ClusterbusterSkillProvider()
+    harnesses["vstorm"] = VstormSkillProvider()
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
