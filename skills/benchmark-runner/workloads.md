@@ -47,13 +47,22 @@ The run-file bundle is:
   "container_image": "quay.io/benchmark-runner/benchmark-runner:latest",
   "env_vars": {
     "WORKLOAD": "stressng_pod",
-    "CLUSTER": "kubernetes",
+    "CLUSTER": "openshift",
     "RUN_TYPE": "func_ci",
     "SAVE_ARTIFACTS_LOCAL": "True",
     "DELETE_ALL": "True"
   },
-  "artifacts_dir": "/tmp/benchmark-runner-run-artifacts"
+  "artifacts_dir": "/tmp/benchmark-runner-run-artifacts",
+  "kubeconfig_path": "/root/.kube/config",
+  "kubeadmin_password_path": "/root/sno/sno-3c/kubeadmin-password"
 }
+```
+
+The `kubeconfig_path` and `kubeadmin_password_path` point to
+files on the controller host. The execute handler reads the
+password from the remote file and injects it as an env var.
+Get these paths from the execution config via
+`get_execution_config("benchmark-runner")`.
 ```
 
 ## Key Environment Variables
@@ -88,9 +97,14 @@ Results are saved to `/tmp/benchmark-runner-run-artifacts/`.
 
 ## Important Notes
 
-- Set CLUSTER=kubernetes for K3s (not openshift)
+- benchmark-runner REQUIRES OpenShift — set CLUSTER=openshift.
+  The CLUSTER=kubernetes mode does not actually work (the code
+  always calls `oc login` which requires KUBEADMIN_PASSWORD)
 - func_ci is a quick functional test; perf_ci is longer
 - The container needs --privileged and kubeconfig mounted
 - podman must be installed on the controller host
-- For K3s, kubeconfig is at ~/.kube/config (set up by
-  the K3s installer)
+- KUBEADMIN_PASSWORD is read from a file on the controller —
+  the path comes from get_execution_config. Do NOT put the
+  password in the run-file env_vars directly
+- The controller host must have network access to the OCP
+  API server (e.g., api.sno-3c.example.com:6443)

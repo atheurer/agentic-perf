@@ -250,9 +250,11 @@ class BenchmarkRunnerSkillProvider(SkillProvider):
         defaults = {k: v["default"] for k, v in info.get("params", {}).items()}
         merged = {**defaults, **{k: v for k, v in params.items() if k in defaults}}
 
+        cluster_type = params.get("cluster_type", "openshift")
+
         env_vars: dict[str, str] = {
             "WORKLOAD": benchmark,
-            "CLUSTER": "kubernetes",
+            "CLUSTER": cluster_type,
             "RUN_TYPE": str(merged.get("run_type", "func_ci")),
             "SAVE_ARTIFACTS_LOCAL": "True",
             "log_level": "INFO",
@@ -270,6 +272,11 @@ class BenchmarkRunnerSkillProvider(SkillProvider):
             "env_vars": env_vars,
             "artifacts_dir": "/tmp/benchmark-runner-run-artifacts",
         }
+
+        if params.get("kubeconfig_path"):
+            template["kubeconfig_path"] = params["kubeconfig_path"]
+        if params.get("kubeadmin_password_path"):
+            template["kubeadmin_password_path"] = params["kubeadmin_password_path"]
 
         return RunfileTemplate(benchmark=benchmark, template=template)
 

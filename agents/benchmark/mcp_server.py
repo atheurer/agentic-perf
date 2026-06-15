@@ -501,9 +501,17 @@ def create_benchmark_tool_handlers(
             }
 
         if harness_name == "benchmark-runner":
-            env_vars = run_file.get("env_vars", {})
+            env_vars = dict(run_file.get("env_vars", {}))
             container_image = run_file.get("container_image", "quay.io/benchmark-runner/benchmark-runner:latest")
             artifacts_dir = run_file.get("artifacts_dir", "/tmp/benchmark-runner-run-artifacts")
+            kubeconfig_path = run_file.get("kubeconfig_path", "/root/.kube/config")
+
+            if "KUBEADMIN_PASSWORD" not in env_vars:
+                password_path = run_file.get("kubeadmin_password_path", "")
+                if password_path:
+                    pw_result = await ssh.run(controller, f"cat {password_path} 2>/dev/null")
+                    if pw_result.exit_code == 0 and pw_result.stdout.strip():
+                        env_vars["KUBEADMIN_PASSWORD"] = pw_result.stdout.strip()
 
             env_flags = " ".join(f'-e {k}="{v}"' for k, v in env_vars.items())
 
@@ -511,7 +519,7 @@ def create_benchmark_tool_handlers(
 
             cmd = (
                 f"podman run --rm {env_flags} "
-                f"-v /root/.kube/config:/root/.kube/config "
+                f"-v {kubeconfig_path}:/root/.kube/config "
                 f"-v {artifacts_dir}:{artifacts_dir} "
                 f"--privileged "
                 f"{container_image} 2>&1"

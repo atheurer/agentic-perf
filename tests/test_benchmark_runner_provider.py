@@ -96,7 +96,7 @@ async def test_generate_runfile_stressng(provider: BenchmarkRunnerSkillProvider)
     assert t["harness"] == "benchmark-runner"
     assert "container_image" in t
     assert t["env_vars"]["WORKLOAD"] == "stressng_pod"
-    assert t["env_vars"]["CLUSTER"] == "kubernetes"
+    assert t["env_vars"]["CLUSTER"] == "openshift"
     assert t["env_vars"]["RUN_TYPE"] == "func_ci"
     assert t["env_vars"]["SAVE_ARTIFACTS_LOCAL"] == "True"
 
