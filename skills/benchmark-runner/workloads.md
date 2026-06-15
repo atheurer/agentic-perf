@@ -61,8 +61,12 @@ The run-file bundle is:
 The `kubeconfig_path` and `kubeadmin_password_path` point to
 files on the controller host. The execute handler reads the
 password from the remote file and injects it as an env var.
-Get these paths from the execution config via
-`get_execution_config("benchmark-runner")`.
+
+Get default paths from `get_execution_config("benchmark-runner")`.
+If the user specifies a cluster name (e.g., "use sno-3d"), the
+paths follow the pattern `/root/sno/<cluster>/kubeconfig` and
+`/root/sno/<cluster>/kubeadmin-password`. Override the defaults
+in the run-file with the user's cluster paths.
 ```
 
 ## Key Environment Variables
