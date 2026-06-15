@@ -507,6 +507,8 @@ def create_benchmark_tool_handlers(
 
             env_flags = " ".join(f'-e {k}="{v}"' for k, v in env_vars.items())
 
+            await ssh.run(controller, f"mkdir -p {artifacts_dir}")
+
             cmd = (
                 f"podman run --rm {env_flags} "
                 f"-v /root/.kube/config:/root/.kube/config "
