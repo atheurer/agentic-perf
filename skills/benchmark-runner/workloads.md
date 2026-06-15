@@ -101,10 +101,14 @@ Results are saved to `/tmp/benchmark-runner-run-artifacts/`.
 
 ## Important Notes
 
-- Most workloads (fio_pod, vdbench_pod, hammerdb_pod_*) default to
-  ODF (OpenShift Data Foundation) PVCs. If ODF is not installed,
-  ALWAYS set ODF_PVC=False in env_vars to use ephemeral storage.
-  Without this, benchmark-runner fails with ODFNotInstalled error
+- Storage workloads (fio_pod, vdbench_pod, hammerdb_pod_*) default
+  to ODF PVCs. On clusters without ODF, use the `_ephemeral`
+  variant of the workload name instead (e.g.,
+  `hammerdb_pod_postgres_ephemeral` instead of
+  `hammerdb_pod_postgres`). Alternatively set ODF_PVC=False.
+- HammerDB postgres name is `hammerdb_pod_postgres` (not
+  `postgresql`). Valid variants: `hammerdb_pod_postgres`,
+  `hammerdb_pod_postgres_lso`, `hammerdb_pod_postgres_ephemeral`
 - benchmark-runner REQUIRES OpenShift — set CLUSTER=openshift.
   The CLUSTER=kubernetes mode does not actually work (the code
   always calls `oc login` which requires KUBEADMIN_PASSWORD)

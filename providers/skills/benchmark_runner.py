@@ -18,8 +18,8 @@ KEYWORD_MAP = {
     "fio": ["fio_pod"],
     "database": ["hammerdb_pod_mariadb", "hammerdb_pod_postgresql"],
     "mariadb": ["hammerdb_pod_mariadb"],
-    "postgresql": ["hammerdb_pod_postgresql"],
-    "postgres": ["hammerdb_pod_postgresql"],
+    "postgresql": ["hammerdb_pod_postgres"],
+    "postgres": ["hammerdb_pod_postgres"],
     "sysbench": ["sysbench_pod"],
     "benchmark-runner": ["stressng_pod", "fio_pod", "uperf_pod"],
     "uperf": ["uperf_pod"],
@@ -148,7 +148,7 @@ _BENCHMARKS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "hammerdb_pod_postgresql": {
+    "hammerdb_pod_postgres": {
         "description": (
             "Database performance benchmark using HammerDB with PostgreSQL "
             "in Kubernetes pods. Measures transactions per second (TPS) "
