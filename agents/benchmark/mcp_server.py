@@ -639,6 +639,49 @@ def create_benchmark_tool_handlers(
                 "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
             }
 
+        if harness_name == "clusterbuster":
+            try:
+                import yaml
+                yaml_dump = yaml.dump
+            except ImportError:
+                yaml_dump = None
+
+            job_file = run_file.get("job_file", {})
+            template_dir = f"/tmp/clusterbuster-{run_uuid}"
+            job_path = f"{template_dir}/job.yaml"
+
+            await ssh.run(controller, f"mkdir -p {template_dir}")
+
+            if yaml_dump:
+                job_content = yaml_dump(job_file, default_flow_style=False)
+            else:
+                job_content = json.dumps(job_file, indent=2)
+
+            await ssh.run(
+                controller,
+                f"cat > {job_path} << 'CBEOF'\n{job_content}\nCBEOF",
+            )
+
+            kubeconfig = run_file.get("kubeconfig", "/root/.kube/config")
+            cb_cmd = run_command or "clusterbuster"
+            cmd = f"KUBECONFIG={kubeconfig} {cb_cmd} -f {job_path} 2>&1"
+            logger.info(f"[benchmark] Executing clusterbuster: {cmd}")
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+
+            return {
+                "status": "completed" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "run_id": f"clusterbuster-{run_uuid}",
+                "harness": "clusterbuster",
+                "output": result.stdout[-3000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    "Benchmark completed"
+                    if result.exit_code == 0
+                    else f"Benchmark failed (exit {result.exit_code})"
+                ),
+            }
+
         if harness_name == "k8s-netperf":
             config = run_file.get("config", {})
             cli_flags = run_file.get("cli_flags", [])

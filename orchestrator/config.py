@@ -86,6 +86,7 @@ class OrchestratorConfig:
             "kube-burner": "https://github.com/kube-burner/kube-burner.git",
             "k8s-netperf": "https://github.com/cloud-bulldozer/k8s-netperf.git",
             "benchmark-runner": "https://github.com/redhat-performance/benchmark-runner.git",
+            "clusterbuster": "https://github.com/redhat-performance/clusterbuster.git",
         }
         env_repos = os.environ.get("HARNESS_REPOS")
         if env_repos:

@@ -17,6 +17,7 @@ from providers.llm.mock import MockLLMProvider
 from providers.llm.claude import ClaudeLLMProvider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
+from providers.skills.clusterbuster import ClusterbusterSkillProvider
 from providers.skills.crucible import CrucibleSkillProvider
 from providers.skills.k8s_netperf import K8sNetperfSkillProvider
 from providers.skills.kube_burner import KubeBurnerSkillProvider
@@ -109,6 +110,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     harnesses["kube-burner"] = KubeBurnerSkillProvider()
     harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
     harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
+    harnesses["clusterbuster"] = ClusterbusterSkillProvider()
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
