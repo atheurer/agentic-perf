@@ -5,26 +5,32 @@ from typing import Any
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
 KEYWORD_MAP = {
-    "stress": ["stressng_pod"],
-    "cpu": ["stressng_pod", "sysbench_pod"],
-    "memory": ["stressng_pod"],
-    "kernel": ["stressng_pod"],
-    "network": ["uperf_pod"],
-    "throughput": ["uperf_pod"],
-    "latency": ["uperf_pod"],
-    "storage": ["fio_pod", "vdbench_pod"],
-    "disk": ["fio_pod", "vdbench_pod"],
-    "io": ["fio_pod", "vdbench_pod"],
-    "fio": ["fio_pod"],
-    "database": ["hammerdb_pod_mariadb", "hammerdb_pod_postgresql"],
+    "stress": ["stressng_pod", "stressng_vm"],
+    "cpu": ["stressng_pod", "sysbench_pod", "stressng_vm"],
+    "memory": ["stressng_pod", "stressng_vm"],
+    "kernel": ["stressng_pod", "stressng_vm"],
+    "network": ["uperf_pod", "uperf_vm"],
+    "throughput": ["uperf_pod", "uperf_vm"],
+    "latency": ["uperf_pod", "uperf_vm"],
+    "storage": ["fio_pod", "vdbench_pod", "fio_vm"],
+    "disk": ["fio_pod", "vdbench_pod", "fio_vm"],
+    "io": ["fio_pod", "vdbench_pod", "fio_vm"],
+    "fio": ["fio_pod", "fio_vm"],
+    "database": ["hammerdb_pod_mariadb", "hammerdb_pod_postgres"],
     "mariadb": ["hammerdb_pod_mariadb"],
     "postgresql": ["hammerdb_pod_postgres"],
     "postgres": ["hammerdb_pod_postgres"],
     "sysbench": ["sysbench_pod"],
     "benchmark-runner": ["stressng_pod", "fio_pod", "uperf_pod"],
-    "uperf": ["uperf_pod"],
+    "uperf": ["uperf_pod", "uperf_vm"],
     "vdbench": ["vdbench_pod"],
     "hammerdb": ["hammerdb_pod_mariadb"],
+    "vm": ["stressng_vm", "fio_vm", "uperf_vm", "bootstorm_vm"],
+    "virtual machine": ["stressng_vm", "fio_vm", "uperf_vm", "bootstorm_vm"],
+    "kubevirt": ["stressng_vm", "fio_vm", "uperf_vm", "bootstorm_vm"],
+    "cnv": ["stressng_vm", "fio_vm", "uperf_vm", "bootstorm_vm"],
+    "boot": ["bootstorm_vm"],
+    "bootstorm": ["bootstorm_vm"],
 }
 
 _BENCHMARKS: dict[str, dict[str, Any]] = {
@@ -187,6 +193,94 @@ _BENCHMARKS: dict[str, dict[str, Any]] = {
                 "type": "integer",
                 "description": "Timeout in seconds",
                 "default": 600,
+            },
+        },
+    },
+    "stressng_vm": {
+        "description": (
+            "CPU/memory kernel stress test using stress-ng inside a "
+            "KubeVirt virtual machine on OpenShift. Requires CNV "
+            "(OpenShift Virtualization) operator."
+        ),
+        "roles": ["client"],
+        "min_hosts": 1,
+        "requires_cnv": True,
+        "params": {
+            "run_type": {
+                "type": "string",
+                "description": "Test type: func_ci or perf_ci",
+                "default": "func_ci",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds",
+                "default": 900,
+            },
+        },
+    },
+    "fio_vm": {
+        "description": (
+            "Storage I/O benchmark using fio inside a KubeVirt virtual "
+            "machine on OpenShift. Tests read/write throughput, IOPS, "
+            "and latency. Requires CNV operator."
+        ),
+        "roles": ["client"],
+        "min_hosts": 1,
+        "requires_cnv": True,
+        "params": {
+            "run_type": {
+                "type": "string",
+                "description": "Test type: func_ci or perf_ci",
+                "default": "func_ci",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds",
+                "default": 900,
+            },
+        },
+    },
+    "uperf_vm": {
+        "description": (
+            "Network throughput and latency benchmark using uperf inside "
+            "KubeVirt virtual machines on OpenShift. Runs client-server "
+            "pair as VMs. Requires CNV operator."
+        ),
+        "roles": ["client", "server"],
+        "min_hosts": 1,
+        "requires_cnv": True,
+        "params": {
+            "run_type": {
+                "type": "string",
+                "description": "Test type: func_ci or perf_ci",
+                "default": "func_ci",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds",
+                "default": 900,
+            },
+        },
+    },
+    "bootstorm_vm": {
+        "description": (
+            "VM boot storm benchmark — rapidly provisions multiple VMs "
+            "to measure boot time and scheduling performance on OpenShift. "
+            "Requires CNV operator."
+        ),
+        "roles": ["client"],
+        "min_hosts": 1,
+        "requires_cnv": True,
+        "params": {
+            "run_type": {
+                "type": "string",
+                "description": "Test type: func_ci or perf_ci",
+                "default": "func_ci",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds",
+                "default": 900,
             },
         },
     },

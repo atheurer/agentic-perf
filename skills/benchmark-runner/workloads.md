@@ -36,6 +36,28 @@ Storage I/O using vdbench.
 - **Metrics**: IOPS, throughput, latency
 - **Use case**: "Storage performance with vdbench patterns"
 
+## VM-Based Workloads (require CNV/OpenShift Virtualization)
+
+These run benchmarks inside KubeVirt virtual machines instead
+of pods. Require the OpenShift Virtualization (CNV) operator.
+
+### stressng_vm
+Same stress-ng workload as stressng_pod but inside a VM.
+- **Requires**: CNV operator installed
+
+### fio_vm
+Same fio workload as fio_pod but inside a VM.
+- **Requires**: CNV operator installed
+
+### uperf_vm
+Same uperf workload as uperf_pod but inside VMs.
+- **Requires**: CNV operator installed
+
+### bootstorm_vm
+Rapidly provisions multiple VMs to measure boot time.
+- **Metrics**: VM boot time, scheduling latency
+- **Requires**: CNV operator installed
+
 ## Configuration
 
 benchmark-runner uses environment variables, not config files.

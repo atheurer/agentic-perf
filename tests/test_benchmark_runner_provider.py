@@ -18,7 +18,7 @@ async def test_list_benchmarks(provider: BenchmarkRunnerSkillProvider):
     assert "fio_pod" in names
     assert "uperf_pod" in names
     assert "sysbench_pod" in names
-    assert len(benchmarks) == 7
+    assert len(benchmarks) == 11
 
 
 @pytest.mark.asyncio
