@@ -73,7 +73,8 @@ CLI flags that control the driver and network scenario.
 **Always include the driver flag** (`--netperf`, `--iperf3`,
 or `--uperf`).
 
-- `--netperf` / `--iperf3` / `--uperf` — driver selection
+- `--netperf` / `--iperf` / `--uperf` — driver selection
+  (note: the flag is `--iperf`, not `--iperf3`)
 - `--local` — same-node placement (required for single-node)
 - `--hostNet` — host network mode
 - `--across` — cross-AZ placement
@@ -127,7 +128,7 @@ The execution handler performs these steps before running:
 {
   "harness": "k8s-netperf",
   "driver": "iperf3",
-  "cli_flags": ["--iperf3", "--hostNet"],
+  "cli_flags": ["--iperf", "--hostNet"],
   "config": {
     "tests": [
       {

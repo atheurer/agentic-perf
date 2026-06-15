@@ -195,7 +195,9 @@ class K8sNetperfSkillProvider(SkillProvider):
 
         cli_flags = []
         driver = merged.get("driver", "netperf")
-        cli_flags.append(f"--{driver}")
+        # k8s-netperf CLI flag is --iperf (not --iperf3)
+        driver_flag = "iperf" if driver == "iperf3" else driver
+        cli_flags.append(f"--{driver_flag}")
         if merged.get("hostNet"):
             cli_flags.append("--hostNet")
         if merged.get("local"):

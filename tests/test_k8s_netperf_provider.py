@@ -127,7 +127,8 @@ async def test_generate_runfile_iperf3(provider: K8sNetperfSkillProvider):
     )
     t = result.template
     assert t["driver"] == "iperf3"
-    assert "--iperf3" in t["cli_flags"]
+    assert "--iperf" in t["cli_flags"]
+    assert "--iperf3" not in t["cli_flags"]
 
 
 @pytest.mark.asyncio
