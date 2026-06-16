@@ -639,6 +639,195 @@ def create_benchmark_tool_handlers(
                 "message": "Benchmark completed" if result.exit_code == 0 else f"Benchmark failed (exit {result.exit_code})",
             }
 
+        if harness_name == "ioscale":
+            try:
+                import yaml
+                yaml_dump = yaml.dump
+            except ImportError:
+                yaml_dump = None
+
+            test_type = run_file.get("test_type", "fio")
+            vm_config = run_file.get("vm_config", {})
+            test_config = run_file.get("test_config", {})
+            kubeconfig = run_file.get("kubeconfig", "/root/.kube/config")
+
+            template_dir = f"/tmp/ioscale-{run_uuid}"
+            await ssh.run(controller, f"mkdir -p {template_dir}")
+
+            kc = f"KUBECONFIG={kubeconfig}"
+
+            storage_class = vm_config.get("storage_class", "")
+            if not storage_class:
+                sc_result = await ssh.run(
+                    controller,
+                    f"{kc} oc get sc -o jsonpath='{{.items[0].metadata.name}}'",
+                )
+                storage_class = sc_result.stdout.strip()
+                if not storage_class:
+                    return {
+                        "status": "failed",
+                        "harness": "ioscale",
+                        "message": "No StorageClass found on cluster",
+                    }
+
+            vm_name = f"ioscale-vm-{run_uuid}"
+            ns = "default"
+            cores = vm_config.get("cores", 4)
+            memory = vm_config.get("memory", "8Gi")
+            storage_size = vm_config.get("storage_size", "100Gi")
+            image_url = vm_config.get(
+                "image_url",
+                "https://dl.fedoraproject.org/pub/fedora/linux/releases/43/"
+                "Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2",
+            )
+
+            await ssh.run(
+                controller,
+                f"{kc} ssh-keygen -t rsa -f {template_dir}/vm-key -N '' -q 2>/dev/null;"
+                f" {kc} oc create secret generic vmkeyroot"
+                f" --from-file=key={template_dir}/vm-key.pub"
+                f" -n {ns} --dry-run=client -o yaml | {kc} oc apply -f -",
+            )
+
+            tpl = f"io-generic" if test_type == "fio" else "db"
+            tpl_file = "geniotest.yml" if test_type == "fio" else "vmdbtest.yml"
+            vm_yaml_cmd = (
+                f"sed"
+                f" -e 's/ocs-storagecluster-ceph-rbd/{storage_class}/g'"
+                f" -e 's/name: vm-test-io/name: {vm_name}/g'"
+                f" -e 's/name: vm-test-db/name: {vm_name}/g'"
+                f" -e 's/name: vm-test-io$/name: {vm_name}/g'"
+                f" -e 's/name: vm-test-db$/name: {vm_name}/g'"
+                f" -e 's/storage: 30Gi/storage: 30Gi/g'"
+                f" -e 's/storage: 100Gi/storage: {storage_size}/g'"
+                f" -e 's/cores: 4/cores: {cores}/g'"
+                f" -e 's/memory: 8Gi/memory: {memory}/g'"
+                f" /opt/ioscale/templates/{tpl_file}"
+                f" > {template_dir}/vm.yaml"
+            )
+            await ssh.run(controller, vm_yaml_cmd)
+
+            logger.info(f"[benchmark] Creating ioscale VM: {vm_name}")
+            await ssh.run(controller, f"{kc} oc apply -f {template_dir}/vm.yaml -n {ns}")
+
+            for i in range(60):
+                check = await ssh.run(
+                    controller,
+                    f"{kc} oc get vmi {vm_name} -n {ns}"
+                    f" -o jsonpath='{{.status.phase}}' 2>/dev/null",
+                )
+                if check.stdout.strip() == "Running":
+                    break
+                await ssh.run(controller, "sleep 10")
+            else:
+                return {
+                    "status": "failed",
+                    "harness": "ioscale",
+                    "message": f"VM {vm_name} did not reach Running in 10 minutes",
+                }
+
+            vm_ip_result = await ssh.run(
+                controller,
+                f"{kc} oc get vmi {vm_name} -n {ns}"
+                f" -o jsonpath='{{.status.interfaces[0].ipAddress}}'",
+            )
+            vm_ip = vm_ip_result.stdout.strip()
+
+            if test_type == "fio":
+                fio_cfg = test_config.get("fio", {})
+                config_dict = {
+                    "vm": {"hosts": vm_name, "namespace": ns},
+                    "storage": {
+                        "devices": {vm_name: "vdc"},
+                        "mount_point": "/root/tests/data",
+                        "filesystem": "xfs",
+                    },
+                    "fio": {
+                        "test_size": fio_cfg.get("test_size", "1G"),
+                        "runtime": fio_cfg.get("runtime", 300),
+                        "block_sizes": fio_cfg.get("block_sizes", "4k"),
+                        "io_patterns": fio_cfg.get("io_patterns", "randread"),
+                        "numjobs": fio_cfg.get("numjobs", 1),
+                        "iodepth": fio_cfg.get("iodepth", 16),
+                        "direct_io": fio_cfg.get("direct_io", 1),
+                    },
+                    "output": {
+                        "directory": f"/root/fio-results-{run_uuid}",
+                        "format": "json+",
+                    },
+                    "retry": {"interval": 30, "max_retries": 10},
+                    "monitoring": {"task_monitor_interval": 60},
+                    "migrate": {"workloads": "", "interval": 0},
+                }
+                config_path = f"{template_dir}/fio-config.yaml"
+                if yaml_dump:
+                    content = yaml_dump(config_dict, default_flow_style=False)
+                else:
+                    content = json.dumps(config_dict, indent=2)
+                await ssh.run(
+                    controller,
+                    f"cat > {config_path} << 'IOEOF'\n{content}\nIOEOF",
+                )
+                cmd = (
+                    f"cd /opt/ioscale/io-generic && "
+                    f"{kc} python3 fio-tests.py -c {config_path} 2>&1"
+                )
+            else:
+                db_cfg = test_config.get("database", {})
+                config_dict = {
+                    "description": f"ioscale {test_type} benchmark",
+                    "storage": {
+                        "mount_point": "/perf1",
+                        "disk_list": "/dev/vdc",
+                        "persistent": False,
+                    },
+                    "database": {
+                        "hosts": vm_name,
+                        "namespace": ns,
+                        "warehouse_count": db_cfg.get("warehouse_count", 50),
+                        "test_duration": db_cfg.get("test_duration", 15),
+                    },
+                    "test": {
+                        "user_count": db_cfg.get("user_count", "1 5 10"),
+                        "log_level": "INFO",
+                    },
+                    "retry": {"interval": 30, "max_retries": 10},
+                    "monitoring": {"task_monitor_interval": 60},
+                    "migrate": {"user_counts": "", "interval": 0},
+                }
+                config_path = f"{template_dir}/{test_type}-config.yaml"
+                if yaml_dump:
+                    content = yaml_dump(config_dict, default_flow_style=False)
+                else:
+                    content = json.dumps(config_dict, indent=2)
+                await ssh.run(
+                    controller,
+                    f"cat > {config_path} << 'IOEOF'\n{content}\nIOEOF",
+                )
+                cmd = (
+                    f"cd /opt/ioscale/db/{test_type} && "
+                    f"{kc} python3 {test_type}.py -c {config_path} 2>&1"
+                )
+
+            logger.info(f"[benchmark] Executing ioscale {test_type}: {cmd}")
+            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+
+            return {
+                "status": "completed" if result.exit_code == 0 else "failed",
+                "exit_code": result.exit_code,
+                "run_id": f"ioscale-{run_uuid}",
+                "harness": "ioscale",
+                "vm_name": vm_name,
+                "vm_ip": vm_ip,
+                "output": result.stdout[-3000:] if result.stdout else "",
+                "error": result.stderr[-1000:] if result.stderr else "",
+                "message": (
+                    "Benchmark completed"
+                    if result.exit_code == 0
+                    else f"Benchmark failed (exit {result.exit_code})"
+                ),
+            }
+
         if harness_name == "vstorm":
             cli_args = run_file.get("cli_args", [])
             kubeconfig = run_file.get("kubeconfig", "/root/.kube/config")

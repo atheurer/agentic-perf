@@ -19,6 +19,7 @@ from providers.secrets.local import LocalSecretsProvider
 from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
 from providers.skills.clusterbuster import ClusterbusterSkillProvider
 from providers.skills.crucible import CrucibleSkillProvider
+from providers.skills.ioscale import IoscaleSkillProvider
 from providers.skills.k8s_netperf import K8sNetperfSkillProvider
 from providers.skills.kube_burner import KubeBurnerSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
@@ -113,6 +114,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
     harnesses["clusterbuster"] = ClusterbusterSkillProvider()
     harnesses["vstorm"] = VstormSkillProvider()
+    harnesses["ioscale"] = IoscaleSkillProvider()
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
