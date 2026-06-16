@@ -1,56 +1,112 @@
 # Next Session Notes
 
-## ~~LLM-Driven Run-File Generation~~ (Done)
+## Recent Completions (Since April 2026)
 
-Implemented: benchmark agent constructs run.json directly from natural language via LLM instead of `generate_run_file` templates. Commit `bb77ac2` on main. Design doc: [design-llm-runfile-generation.md](design-llm-runfile-generation.md).
+### Harness Ecosystem Expansion
+Five new harnesses added, bringing the total to seven:
+- **Kube-Burner** — K8s cluster load generation (PRs #19-#22)
+- **k8s-netperf** — K8s network performance, iperf3/netperf/uperf (PRs #26, #28, #31-#33, #44-#45)
+- **Benchmark-Runner** — OpenShift + VM workloads, stressng/hammerdb/vdbench (PRs #27, #29-#30, #41-#48)
+- **Clusterbuster** — OpenShift cluster stress testing (PR #49)
+- **Vstorm** — VM storage/memory stress via KubeVirt (PRs #51-#52)
 
-## ~~Triage Directives~~ (Done)
+Each harness follows the established pattern: skill provider, keyword map,
+skill docs (workloads.md + config-guide.md), tests, and registration.
 
-Implemented: `directives` field in triage submit schema with `on_existing_install`,
-`harness`, `user_pre_run_approval`, `host_cleanup`, plus arbitrary keys for extensibility.
-Provisioning and benchmark agents check directives before falling back to skill config defaults.
-Benchmark agent now asks for user approval before executing (unless `user_pre_run_approval: false`).
+### LLM-Driven Run-File Generation (Done)
+Benchmark agent constructs run.json directly from natural language via LLM
+instead of `generate_run_file` templates. Design doc:
+[design-llm-runfile-generation.md](design-llm-runfile-generation.md).
 
-## Persist Validated Run-File in Ticket (Priority: Medium)
+### Triage Directives (Done)
+`directives` field with `on_existing_install`, `harness`,
+`user_pre_run_approval`, `host_cleanup`, `endpoint_type`, plus arbitrary keys.
 
-When the benchmark agent validates a run-file, save it to `custom_fields.validated_run_file`. On re-dispatch (e.g., after a transient failure like valkey), the agent checks for an existing validated run-file and skips straight to execution instead of rebuilding from scratch. Saves time and LLM iterations on retries.
+### Clean Up Stale Valkey (Done)
+Pre-flight check in `execute_benchmark` stops stale `crucible-valkey`
+containers before `crucible run`.
 
-## ~~Clean Up Stale Valkey~~ (Done)
+### Remote Skills Phase 1 (Done)
+Repo caching, doc tools, local skill docs. Orchestrator no longer needs
+local harness installs for benchmark discovery.
 
-Implemented as a pre-flight check in `execute_benchmark` (benchmark agent) right before `crucible run`. Stops `crucible-valkey` if running with no active `crucible-rickshaw-run`. Placed here instead of provisioning to also catch stale state from failed retries within the same ticket.
+### Review Agent Harness-Agnostic (Done, PR #13)
+Discovers result retrieval via skill providers instead of hardcoding CDM.
 
-## Migrate Crucible Cleanup to Crucible Project (Priority: Low)
+### Absent Suite Blocking (Done)
+Orchestrator blocks hardware allocation when no harness covers the
+requested benchmark. Ticket pauses at `awaiting_customer_guidance`.
 
-The `cleanup_harness` function in `agents/provisioning/mcp_server.py` has crucible-specific uninstall logic (stop containers, discover and remove auth tokens from registries.json, remove system artifacts). This should eventually become a `crucible uninstall` command upstream so any consumer can use it. For now it lives here.
+### Transcript CLI (Done)
+`agentic-perf transcript` command renders full agent conversations from
+JSONL event logs. Supports `--json` and `--agent` filtering.
 
-## Harness Update Directive (Priority: Medium)
+### Abort Command (Done)
+`agentic-perf abort` skips paused tickets to teardown.
 
-Allow a triage directive like `update_harness: true` that tells the provisioning agent to update the harness after install check (e.g., `crucible update`). The execution config already has `update_command` for crucible and `on_existing_install` for zathras — wire these into the provisioning flow so the agent respects them. Triggered by: the PERF-B51A2E61 test showed crucible was 19 commits behind, which could cause failures.
+### AWS Cleanup Command (Done)
+`agentic-perf cleanup` finds/terminates orphaned EC2 instances.
 
-## ~~Remote Skills Loading~~ (Phase 1 Done)
+### K3s/Kube Endpoint Support (Done, PR #12)
+Single-host K3s-on-AWS for kube endpoints.
 
-Currently CrucibleSkillProvider and ZathrasSkillProvider need local repo clones. The architecture should be:
-- **Before install**: lightweight benchmark catalog in private skill config (names, roles, min_hosts)
-- **After install**: benchmark agent loads detailed skills from the controller's harness installation (schemas, example run-files, test_defs.yml)
+### Stdout Truncation Removed (Done, PR #25)
+Tool results no longer truncated — agents see full command output.
 
-This decouples the orchestrator machine from needing harness repos locally.
+---
 
-## Checkpoint/Restart on Tickets
+## In Progress / Next Up
 
-Instead of resubmitting from scratch when a phase fails, support rewinding a ticket to a previous state. The ticket has all accumulated context (hardware IPs, SSH key, harness version). A `rewind` CLI command would transition the ticket back and let the dispatcher re-run just the failed phase. Need to define which custom_fields to clear on rewind.
+### Persist Validated Run-File (Priority: Medium)
+Save validated run-file to `custom_fields.validated_run_file`. On
+re-dispatch, skip run-file construction and go straight to execution.
+Saves LLM iterations on retries.
 
-## QUADS Orphaned Assignments
+### Harness Update Directive (Priority: Medium)
+`update_harness: true` directive → provisioning agent runs harness update
+command. Wire the execution config's `update_command` into the flow.
 
-The QUADS terminate API returns 500 for assignments with expired schedules (0 hosts). The teardown agent should:
-1. Try to delete host schedules first
-2. Then terminate the assignment
-3. Catch 500 and log as warning, not failure
+### Collaborative Negotiation (Priority: Medium)
+Replace linear pipeline with concurrent Benchmark ↔ Resource planning
+phase. Design doc: [collaborative-negotiation.md](collaborative-negotiation.md).
+Not yet started.
 
-Also file QUADS issue — RFE #605 mentions auto-cleanup of orphaned assignments.
+### Orchestrator Fork Architecture (Priority: Medium)
+Fork per-ticket processes so orchestrator restarts don't kill in-flight
+agent work. Currently a restart kills all active agents.
 
-## Zathras-Specific Issues
+### Checkpoint/Restart (Priority: Low)
+`rewind` CLI command to transition ticket back to a previous state and
+re-run a failed phase, preserving accumulated context (hardware IPs,
+SSH key, harness version).
 
-- `bin/install.sh` doesn't install `gh` (GitHub CLI) — needed for version checks
-- `--skip_test_version_check` is a workaround; upstream should make version checks optional or not require `gh`
-- `dnf config-manager --add-repo` doesn't work on dnf5 (Fedora 41+) — zathras is RHEL-only in practice
-- Install script should be more self-contained about its deps
+### Jira Backend (Priority: Low)
+Replace local FastAPI state store with Jira Cloud as backend. Design doc:
+[jira-polling-integration.md](jira-polling-integration.md). Not yet started.
+
+### Migrate Crucible Cleanup to Crucible Project (Priority: Low)
+Crucible-specific uninstall logic in provisioning agent should become
+`crucible uninstall` upstream.
+
+---
+
+## Known Issues
+
+### QUADS Orphaned Assignments
+Terminate API returns 500 for assignments with expired schedules.
+Teardown agent should handle this gracefully.
+
+### Zathras Install Dependencies
+- Install script doesn't install `gh` (GitHub CLI)
+- `dnf config-manager --add-repo` broken on dnf5 (Fedora 41+)
+- Should be more self-contained about deps
+
+---
+
+## Documentation (Updated June 2026)
+
+New docs added this session:
+- `docs/architecture.md` — system architecture, agents, providers, state machine
+- `docs/cli-reference.md` — complete CLI command reference
+- `docs/adding-a-harness.md` — step-by-step guide for adding a new harness
+- README.md refreshed with all 7 harnesses, full CLI, web dashboard
