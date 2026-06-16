@@ -214,7 +214,7 @@ class VstormSkillProvider(SkillProvider):
                     "echo 'export PATH=/opt/vstorm:$PATH'"
                     " >> /etc/profile.d/vstorm.sh"
                 ),
-                "verify_command": "/opt/vstorm/vstorm --help",
+                "verify_command": "/opt/vstorm/vstorm -h",
                 "on_existing_install": "skip",
                 "pre_install_commands": [
                     "dnf install -y vim-common 2>/dev/null; true",

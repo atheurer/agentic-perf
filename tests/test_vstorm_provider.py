@@ -240,7 +240,7 @@ async def test_get_default_config(provider: VstormSkillProvider):
     prov = config["provisioning"]
     assert prov["install_method"] == "git_clone"
     assert "vstorm" in prov["git_url"]
-    assert prov["verify_command"] == "/opt/vstorm/vstorm --help"
+    assert prov["verify_command"] == "/opt/vstorm/vstorm -h"
     exe = config["execution"]
     assert exe["controller_required"] is True
     assert exe["endpoint_type"] == "kube"
