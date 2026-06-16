@@ -20,11 +20,11 @@ document that serves as the single source of truth):
 
 | Agent | Role | Scoped Tools |
 |---|---|---|
-| **Triage** | Parse user intent, form hypothesis | Ticket read/write |
-| **Resource** | Find and reserve hardware | QUADS API, AWS EC2, PSAP Control Center |
-| **Provisioning** | Install benchmark harness on hosts via SSH | SSH, SCP, secrets vault |
-| **Benchmark** | Generate run configuration, execute, monitor | Harness CLI, schema validator |
-| **Review** | Analyze results, produce verdict | Metric query (CDM), result archive |
+| **Triage** | Parse user intent, form hypothesis, select benchmark | Benchmark discovery, resolution |
+| **Resource** | Find and reserve hardware from providers | QUADS API, AWS EC2, PSAP Control Center |
+| **Provisioning** | Install benchmark harness on hosts via SSH | SSH, platform contracts, K3s |
+| **Benchmark** | Construct run configuration, execute, monitor | Harness docs, schema validation, CLI |
+| **Review** | Analyze results, produce verdict | Metric query, result comparison |
 
 Each agent has its own MCP tool server with scoped capabilities — the review
 agent cannot SSH, and the provisioning agent cannot query metrics. Agents are
@@ -38,25 +38,33 @@ executing_benchmark → awaiting_review → awaiting_teardown → closed
 ```
 
 Any stage can pause at `awaiting_customer_guidance` for human input, and the
-user can reply to resume.
+user can reply to resume. Tickets can also be aborted to skip directly to
+teardown.
 
 ## Supported Benchmark Harnesses
 
 Harness knowledge is provided by **skill providers**, not hardcoded in agents.
 Adding a new harness means adding a skill provider — no agent code changes.
 
-Currently supported:
-- **[Crucible](https://github.com/perftool-incubator/crucible)** — fio, uperf,
-  trafficgen, and other benchmarks via remotehosts or Kubernetes endpoints
-- **[Zathras](https://github.com/RedHatPerf/zathras)** — STREAM, fio, iozone,
-  uperf, HammerDB, SPECjbb, CoreMark, Linpack, and more via local execution
+| Harness | Benchmarks | Endpoint Type |
+|---|---|---|
+| **[Crucible](https://github.com/perftool-incubator/crucible)** | fio, uperf, trafficgen, iperf, cyclictest, oslat | remotehosts, Kubernetes |
+| **[Zathras](https://github.com/redhat-performance/zathras)** | STREAM, fio, iozone, uperf, HammerDB, SPECjbb, CoreMark, Linpack | local execution |
+| **[Kube-Burner](https://github.com/kube-burner/kube-burner)** | Kubernetes cluster load generation (node-density, cluster-density, etc.) | Kubernetes |
+| **[k8s-netperf](https://github.com/cloud-bulldozer/k8s-netperf)** | Kubernetes network performance (iperf3, netperf, uperf) | Kubernetes |
+| **[Benchmark-Runner](https://github.com/redhat-performance/benchmark-runner)** | stressng, hammerdb, vdbench, fio, uperf on OpenShift/VMs | OpenShift, VMs |
+| **[Clusterbuster](https://github.com/redhat-performance/clusterbuster)** | OpenShift cluster stress testing (pod density, startup latency) | Kubernetes |
+| **[Vstorm](https://github.com/gqlo/vstorm)** | VM storage and memory stress testing | VMs |
 
 ## Resource Providers
 
-- **Null** — user provides hosts and SSH keys directly
+- **Null** — user provides hosts and SSH keys directly in the ticket
 - **QUADS** — automated bare-metal reservation from a self-service lab
-- **AWS EC2** — on-demand cloud instances
-- **PSAP Control Center** — GPU cluster reservations
+  (filters by model, NIC vendor/speed, disk type)
+- **AWS EC2** — on-demand cloud instances with configurable instance types,
+  AMIs, and root volume sizing
+- **PSAP Control Center** — GPU cluster reservations for AI/ML workloads
+  (returns cluster API URL, not SSH hosts)
 
 ## Prerequisites
 
@@ -80,25 +88,28 @@ Create `~/.agentic-perf/config.json`:
 {
     "llm": {
         "provider": "claude",
-        "model": "claude-sonnet-4-6"
+        "model": "claude-sonnet-4-6",
+        "backend": "vertex",
+        "project_id": "your-gcp-project",
+        "region": "us-east5"
     },
     "state_store": {
         "url": "http://localhost:8090",
         "port": 8090
     },
     "poll_interval": 3.0,
-    "ssh_key": "~/.ssh/id_ed25519"
+    "ssh_key": "~/.ssh/id_ed25519",
+    "harness_repos": {}
 }
 ```
 
-Set your API key:
+For direct Anthropic API, use `"backend": "direct"` and set:
 
 ```bash
 export ANTHROPIC_API_KEY="your-key-here"
 ```
 
-For Vertex AI backend, set `backend`, `project_id`, and `region` in the
-`llm` section and authenticate with `gcloud auth application-default login`.
+For Vertex AI backend, authenticate with `gcloud auth application-default login`.
 
 ### Local Directory (`~/.agentic-perf/`)
 
@@ -115,6 +126,7 @@ the repository in `~/.agentic-perf/`:
     crucible/               #   e.g., container registry auth tokens
     aws/                    #   e.g., access keys and session tokens
     quads/                  #   e.g., QUADS API credentials
+    psap-cc/                #   e.g., PSAP Control Center API tokens
   logs/                    # Agent conversation transcripts (JSONL per ticket)
 ```
 
@@ -136,11 +148,12 @@ the agent that needs them.
 ```
 
 This launches the state store (FastAPI on port 8090) and the orchestrator.
+The web dashboard is available at `http://localhost:8090`.
 
 ### Submit a request
 
 ```bash
-python3 cli.py submit \
+agentic-perf submit \
   "Run a 4K random read fio test on my storage server" \
   -d "Controller: 198.51.100.1. Endpoint: 198.51.100.2. SSH key: ~/.ssh/id_ed25519. Use crucible."
 ```
@@ -148,51 +161,89 @@ python3 cli.py submit \
 ### Watch progress
 
 ```bash
-python3 cli.py watch <TICKET_ID> -f -v
+agentic-perf watch <TICKET_ID> -f        # Follow mode
+agentic-perf watch <TICKET_ID> -f -v     # Verbose: show tool calls and LLM interactions
 ```
 
 ### Respond to agent questions
 
 ```bash
-python3 cli.py reply <TICKET_ID> "Approved"
+agentic-perf reply <TICKET_ID> "Approved"
+```
+
+### Abort a paused ticket
+
+```bash
+agentic-perf abort <TICKET_ID>                   # Skip to teardown
+agentic-perf abort <TICKET_ID> "wrong config"     # With reason
+```
+
+### View agent conversation transcript
+
+```bash
+agentic-perf transcript <TICKET_ID>               # Full conversation
+agentic-perf transcript <TICKET_ID> --agent triage-agent   # Single agent
+agentic-perf transcript <TICKET_ID> --json         # Raw events as JSON
 ```
 
 ### Other commands
 
 ```bash
-python3 cli.py list              # List all tickets
-python3 cli.py show <TICKET_ID>  # Show ticket details
-python3 cli.py transcript <ID>   # Show full agent conversation log
-python3 cli.py health            # Check state store health
-python3 cli.py cleanup           # Find orphaned cloud instances
+agentic-perf list                          # List all tickets
+agentic-perf list -s executing_benchmark   # Filter by status
+agentic-perf show <TICKET_ID>             # Show ticket details and custom fields
+agentic-perf health                        # Check state store (ticket counts)
+agentic-perf cleanup --older-than 24       # Find orphaned AWS instances
+agentic-perf cleanup --terminate -y        # Terminate orphaned instances
 ```
+
+## Web Dashboard
+
+The state store serves a web dashboard at `http://localhost:8090` with:
+
+- **Ticket list** — all tickets with status badges, filterable by status
+- **Ticket detail** — live event stream showing agent activity, tool calls,
+  LLM responses, and transitions in real time
+- **Agent navigator** — jump between agent phases in the event stream
+
+The dashboard requires no build step (vanilla HTML/JS/CSS) and auto-refreshes.
 
 ## Architecture
 
 ```
 agentic-perf/
-  cli.py                  # CLI entrypoint
+  cli.py                  # CLI entrypoint (submit, watch, reply, abort, transcript)
   start.sh                # Launch state store + orchestrator
 
   orchestrator/            # Async poll loop, config, dispatcher
   agents/                  # One agent per pipeline stage
-    triage/                #   Parse user intent
-    resource/              #   Acquire hardware
-    provisioning/          #   Install harness via SSH
-    benchmark/             #   Generate run-file, execute
-    review/                #   Analyze results, produce verdict
+    triage/                #   Parse user intent → hypothesis + benchmark
+    resource/              #   Acquire hardware (QUADS, AWS, PSAP, or user-provided)
+    provisioning/          #   Install harness via SSH, optional K3s for kube endpoints
+    benchmark/             #   Construct run-file from docs + schema, execute
+    review/                #   Retrieve results, analyze, compare to hypothesis
 
-  state_store/             # FastAPI REST API + ticket store
+  state_store/             # FastAPI REST API + ticket store + web dashboard
+    static/                #   Single-page web dashboard
   providers/
-    llm/                   #   Claude (direct + Vertex) and mock
-    resource/              #   QUADS, AWS EC2, PSAP Control Center
+    llm/                   #   Claude (direct + Vertex) and mock providers
+    resource/              #   QUADS, AWS EC2, PSAP Control Center, provider registry
     secrets/               #   File-based local secrets
-    skills/                #   Harness capability providers
+    skills/                #   7 harness skill providers + multi-provider aggregator
+    events.py              #   Event bus for audit trail (JSONL per ticket)
+    ssh.py                 #   Async SSH executor
 
   sample-private-skills/   # Example harness configs (templates)
-  skills/                  # Skill documentation
+  skills/                  # Skill documentation per harness
+    crucible/              #   CDM queries, run-file pitfalls, kube endpoints, userenvs
+    zathras/               #   Scenario construction, local config
+    kube-burner/           #   Config guide, workloads
+    k8s-netperf/           #   Config guide, workloads
+    benchmark-runner/      #   Workloads (OpenShift + VM)
+    clusterbuster/         #   Config guide, workloads
+    vstorm/                #   Config guide, workloads
   docs/                    # Design docs and guides
-  tests/                   # pytest test suite
+  tests/                   # pytest test suite (16 test files)
 ```
 
 ## Design Principles
@@ -232,11 +283,16 @@ For end-to-end testing with real infrastructure, see
 
 ## Documentation
 
+- [Architecture](docs/architecture.md) — system architecture, agents, providers, state machine
 - [Design Philosophy](docs/design-philosophy.md) — why the system is designed the way it is
-- [Collaborative Negotiation](docs/collaborative-negotiation.md) — how agents plan and resolve conflicts
+- [CLI Reference](docs/cli-reference.md) — complete command reference with examples
+- [Adding a Harness](docs/adding-a-harness.md) — how to add a new benchmark harness
 - [LLM Run-File Generation](docs/design-llm-runfile-generation.md) — how benchmark agents construct run configurations
-- [Jira Integration](docs/jira-polling-integration.md) — replacing the local state store with Jira Cloud
 - [E2E Testing Guide](docs/e2e-testing.md) — running the full pipeline against real hardware
+- [CDM API Reference](docs/cdm-api-reference.md) — querying Crucible's metric storage
+- [Collaborative Negotiation](docs/collaborative-negotiation.md) — future design for multi-agent planning
+- [Jira Integration](docs/jira-polling-integration.md) — replacing the local state store with Jira Cloud
+- [Web Dashboard](docs/web-ui.md) — dashboard architecture and event stream
 - [Presentation](docs/presentation-agentic-perf.md) — overview slides explaining the project's motivation and results
 
 ## License
