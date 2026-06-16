@@ -275,6 +275,17 @@ class IoscaleSkillProvider(SkillProvider):
                 "on_existing_install": "skip",
                 "pre_install_commands": [
                     "dnf install -y python3-pip python3-devel 2>/dev/null; true",
+                    (
+                        "which virtctl 2>/dev/null || ("
+                        " POD=$(oc get pods -n openshift-cnv"
+                        " -l app.kubernetes.io/component=hyperconverged-cluster-cli-download"
+                        " -o jsonpath='{.items[0].metadata.name}') &&"
+                        " oc cp openshift-cnv/$POD:/home/server/src/amd64/linux/virtctl.tar.gz"
+                        " /tmp/virtctl.tar.gz &&"
+                        " tar xzf /tmp/virtctl.tar.gz -C /usr/local/bin/ &&"
+                        " chmod +x /usr/local/bin/virtctl"
+                        ")"
+                    ),
                 ],
             },
             "execution": {

@@ -68,4 +68,5 @@ The execution handler manages the full lifecycle:
 - OpenShift 4 with OpenShift Virtualization (CNV)
 - Block-capable StorageClass (LVMS, ODF, etc.)
 - KUBECONFIG set to valid cluster kubeconfig
+- `virtctl` CLI installed (extracted from CNV operator pod)
 - Python 3.9+ with pyyaml and paramiko on controller
