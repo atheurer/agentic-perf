@@ -315,7 +315,7 @@ class TestResourceToolHandlers:
         from providers.resource.registry import ResourceProviderRegistry
 
         reg = ResourceProviderRegistry(both_secrets)
-        handlers, _ = create_resource_tool_handlers(registry=reg)
+        handlers, *_ = create_resource_tool_handlers(registry=reg)
 
         result = await handlers["list_resource_providers"]()
         names = [p["name"] for p in result["configured_providers"]]
@@ -326,7 +326,7 @@ class TestResourceToolHandlers:
     async def test_parse_host_config(self, no_secrets):
         from agents.resource.mcp_server import create_resource_tool_handlers
 
-        handlers, _ = create_resource_tool_handlers(secrets_provider=no_secrets)
+        handlers, *_ = create_resource_tool_handlers(secrets_provider=no_secrets)
         result = await handlers["parse_host_config"](
             text="controller: 10.1.2.3\ntarget: 10.1.2.4\nuser: testuser"
         )
@@ -338,7 +338,7 @@ class TestResourceToolHandlers:
     async def test_handler_creates_registry_from_secrets(self, no_secrets):
         from agents.resource.mcp_server import create_resource_tool_handlers
 
-        handlers, _ = create_resource_tool_handlers(secrets_provider=no_secrets)
+        handlers, *_ = create_resource_tool_handlers(secrets_provider=no_secrets)
         result = await handlers["list_resource_providers"]()
         assert result["count"] == 0
 
