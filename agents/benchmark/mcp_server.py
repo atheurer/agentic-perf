@@ -689,18 +689,21 @@ def create_benchmark_tool_handlers(
                 f" -n {ns} --dry-run=client -o yaml | {kc} oc apply -f -",
             )
 
-            tpl = f"io-generic" if test_type == "fio" else "db"
             tpl_file = "geniotest.yml" if test_type == "fio" else "vmdbtest.yml"
+            data_dv = f"data-{run_uuid}"
             vm_yaml_cmd = (
                 f"sed"
                 f" -e 's/ocs-storagecluster-ceph-rbd/{storage_class}/g'"
-                f" -e 's/name: vm-test-io/name: {vm_name}/g'"
-                f" -e 's/name: vm-test-db/name: {vm_name}/g'"
-                f" -e 's/name: vm-test-io$/name: {vm_name}/g'"
-                f" -e 's/name: vm-test-db$/name: {vm_name}/g'"
-                f" -e 's/storage: 30Gi/storage: 30Gi/g'"
+                f" -e 's/vm-test-io/{vm_name}/g'"
+                f" -e 's/vm-test-db/{vm_name}/g'"
+                f" -e 's/dataiotest/{data_dv}/g'"
+                f" -e 's/datavolumedb/{data_dv}/g'"
+                f" -e 's/vm-testvm/{vm_name}/g'"
+                f" -e 's/vm-dataiotest/vm-{data_dv}/g'"
+                f" -e 's/vm-datavolumedb/vm-{data_dv}/g'"
                 f" -e 's/storage: 100Gi/storage: {storage_size}/g'"
                 f" -e 's/cores: 4/cores: {cores}/g'"
+                f" -e 's/sockets: 2/sockets: 1/g'"
                 f" -e 's/memory: 8Gi/memory: {memory}/g'"
                 f" /opt/ioscale/templates/{tpl_file}"
                 f" > {template_dir}/vm.yaml"
@@ -708,7 +711,9 @@ def create_benchmark_tool_handlers(
             await ssh.run(controller, vm_yaml_cmd)
 
             logger.info(f"[benchmark] Creating ioscale VM: {vm_name}")
-            await ssh.run(controller, f"{kc} oc apply -f {template_dir}/vm.yaml -n {ns}")
+            await ssh.run(
+                controller, f"{kc} oc apply -f {template_dir}/vm.yaml -n {ns}",
+            )
 
             for i in range(60):
                 check = await ssh.run(
