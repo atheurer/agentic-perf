@@ -144,6 +144,10 @@ class ReviewAgent(AgentBase):
             "recommendations": result.get("recommendations", []),
             "follow_up_needed": result.get("follow_up_needed", False),
         }
+        if result.get("chart_data"):
+            fields["chart_data"] = result["chart_data"]
+        if result.get("results_url"):
+            fields["results_url"] = result["results_url"]
         await self._update_fields(ticket_id, fields)
 
         analysis = result.get("detailed_analysis", "")

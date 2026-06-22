@@ -504,6 +504,33 @@ details > .content { padding: 12px 16px; }
   white-space: pre-wrap;
 }
 
+.result-chart {
+  margin-top: 16px;
+  max-width: 600px;
+}
+
+.result-chart canvas {
+  max-height: 300px;
+}
+
+.results-link {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 6px;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.results-link:hover {
+  background: var(--accent-dim);
+  color: var(--text-bright);
+}
+
 .fields-grid {
   display: grid;
   grid-template-columns: minmax(180px, auto) 1fr;
@@ -527,6 +554,7 @@ details > .content { padding: 12px 16px; }
   .ticket-summary { max-width: 250px; }
 }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
@@ -829,7 +857,9 @@ function renderDescription(ticket) {
   '</details>';
 }
 
-function renderResultBanner(fields) {
+var CHART_COLORS = ['#7aa2f7', '#9ece6a', '#e0af68', '#ff9e64', '#bb9af7', '#7dcfff', '#f7768e'];
+
+function renderResultBanner(fields, containerId) {
   var verdict = fields.verdict;
   var summary = fields.review_summary;
   var detail = fields.detailed_analysis;
@@ -843,16 +873,46 @@ function renderResultBanner(fields) {
   var html = '<div class="result-banner">';
   if (verdict) html += '<div class="result-verdict ' + cls + '">' + escHtml(String(verdict)) + '</div>';
   if (summary) html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
+  if (fields.chart_data) html += '<div class="result-chart"><canvas id="' + containerId + '"></canvas></div>';
+  if (fields.results_url) html += '<a class="results-link" href="' + escHtml(String(fields.results_url)) + '" target="_blank">View detailed results &#8599;</a>';
   if (detail) html += '<div class="result-detail">' + escHtml(String(detail)) + '</div>';
   html += '</div>';
   return html;
 }
 
+function mountChart(containerId, chartData) {
+  var canvas = document.getElementById(containerId);
+  if (!canvas || !chartData) return;
+  var datasets = (chartData.datasets || []).map(function(ds, i) {
+    var color = CHART_COLORS[i % CHART_COLORS.length];
+    var cfg = { label: ds.label, data: ds.values, backgroundColor: color, borderColor: color };
+    if (chartData.type === 'line') { cfg.fill = false; cfg.tension = 0.3; }
+    if (chartData.type === 'doughnut') { cfg.backgroundColor = CHART_COLORS.slice(0, (ds.values || []).length); }
+    return cfg;
+  });
+  new Chart(canvas, {
+    type: chartData.type || 'bar',
+    data: { labels: chartData.labels || [], datasets: datasets },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: !!chartData.title, text: chartData.title || '', color: '#c0caf5' },
+        legend: { labels: { color: '#c0caf5' } },
+      },
+      scales: chartData.type === 'doughnut' ? {} : {
+        x: { ticks: { color: '#565f89' }, grid: { color: 'rgba(59,66,97,0.5)' } },
+        y: { ticks: { color: '#565f89' }, grid: { color: 'rgba(59,66,97,0.5)' } },
+      },
+    },
+  });
+}
+
 function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
-  var banner = renderResultBanner(fields);
-  var promoted = ['verdict', 'review_summary', 'detailed_analysis'];
+  var chartId = 'result-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
+  var banner = renderResultBanner(fields, chartId);
+  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url'];
   var items = '';
   for (var k in fields) {
     if (promoted.indexOf(k) !== -1) continue;
@@ -867,6 +927,9 @@ function renderCustomFields(ticket) {
       '<summary>Custom Fields</summary>' +
       '<div class="content"><div class="fields-grid">' + items + '</div></div>' +
     '</details>';
+  }
+  if (fields.chart_data) {
+    setTimeout(function() { mountChart(chartId, fields.chart_data); }, 0);
   }
   return banner + rest;
 }

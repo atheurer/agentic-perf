@@ -38,7 +38,23 @@ Once you have the benchmark data:
 4. Look for anomalies, regressions, or unexpected behavior.
 5. If a baseline run exists (check ticket comments/fields), use compare_results.
 
-## Step 5: Submit Review
+## Step 5: Prepare a Chart
+
+Include a chart_data object in your submission to visualize the single most
+informative finding from your analysis. Pick whichever chart type best fits:
+
+- **bar** — comparing values across categories (throughput by thread count,
+  IOPS by block size, latency by percentile)
+- **line** — showing trends over time or across a swept parameter
+- **doughnut** — showing proportions (CPU breakdown, time distribution)
+
+Use the actual metric values from your analysis. Labels should be short and
+readable. One dataset per measured quantity (e.g. "Gbps", "IOPS", "usec").
+
+If you have a URL to a harness-specific results viewer (e.g. CDM web UI),
+include it as results_url.
+
+## Step 6: Submit Review
 
 Call submit_review_result with:
 - A concise summary (1-2 sentences)
@@ -46,6 +62,8 @@ Call submit_review_result with:
 - A detailed markdown analysis with specific numbers
 - Key metrics with values and assessments
 - Recommendations for follow-up tests
+- chart_data with your visualization (see Step 5)
+- results_url if a harness-specific viewer is available
 
 If you cannot retrieve results through any available method, explain what you tried
 and why it failed. Do not guess at results — report inconclusive with actionable
