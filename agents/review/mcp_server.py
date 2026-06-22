@@ -230,6 +230,31 @@ def get_review_tools(
                     "key_metrics": {"type": "object", "description": "Key metric values and assessments"},
                     "recommendations": {"type": "array", "items": {"type": "string"}},
                     "follow_up_needed": {"type": "boolean"},
+                    "chart_data": {
+                        "type": "object",
+                        "description": "Optional chart for the web dashboard. Visualize the single most informative finding from your analysis.",
+                        "properties": {
+                            "title": {"type": "string", "description": "Chart title, e.g. 'Throughput by Thread Count'"},
+                            "type": {"type": "string", "enum": ["bar", "line", "doughnut"]},
+                            "labels": {"type": "array", "items": {"type": "string"}, "description": "X-axis labels or segment names"},
+                            "datasets": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Dataset label, e.g. 'Gbps' or 'IOPS'"},
+                                        "values": {"type": "array", "items": {"type": "number"}},
+                                    },
+                                    "required": ["label", "values"],
+                                },
+                            },
+                        },
+                        "required": ["title", "type", "labels", "datasets"],
+                    },
+                    "results_url": {
+                        "type": "string",
+                        "description": "Optional URL to a harness-specific results viewer for deeper analysis",
+                    },
                 },
                 "required": ["review_summary", "verdict", "detailed_analysis"],
             },
