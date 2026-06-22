@@ -55,6 +55,8 @@ Adding a new harness means adding a skill provider — no agent code changes.
 | **[Benchmark-Runner](https://github.com/redhat-performance/benchmark-runner)** | stressng, hammerdb, vdbench, fio, uperf on OpenShift/VMs | OpenShift, VMs |
 | **[Clusterbuster](https://github.com/redhat-performance/clusterbuster)** | OpenShift cluster stress testing (pod density, startup latency) | Kubernetes |
 | **[Vstorm](https://github.com/gqlo/vstorm)** | VM storage and memory stress testing | VMs |
+| **[Ioscale](https://github.com/ekuric/ioscale)** | VM storage I/O and database benchmarks (fio, HammerDB with MariaDB/PostgreSQL) | Kubernetes (KubeVirt VMs) |
+| **[Forge](https://github.com/openshift-psap/forge)** | LLM inference performance (RHAIIS/vLLM, LLM-D); 53+ model presets, FP8/W8A8/W4A16 quantization | Kubernetes (GPU) |
 
 ## Resource Providers
 
@@ -229,7 +231,7 @@ agentic-perf/
     llm/                   #   Claude (direct + Vertex) and mock providers
     resource/              #   QUADS, AWS EC2, PSAP Control Center, provider registry
     secrets/               #   File-based local secrets
-    skills/                #   7 harness skill providers + multi-provider aggregator
+    skills/                #   9 harness skill providers + multi-provider aggregator
     events.py              #   Event bus for audit trail (JSONL per ticket)
     ssh.py                 #   Async SSH executor
 
@@ -242,6 +244,8 @@ agentic-perf/
     benchmark-runner/      #   Workloads (OpenShift + VM)
     clusterbuster/         #   Config guide, workloads
     vstorm/                #   Config guide, workloads
+    ioscale/               #   VM storage + database workloads
+    forge/                 #   LLM inference models, workload profiles
   docs/                    # Design docs and guides
   tests/                   # pytest test suite (16 test files)
 ```
