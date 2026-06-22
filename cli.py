@@ -83,8 +83,13 @@ def cmd_show(args):
                 print(f"  {key}:")
                 for line in s.split("\n"):
                     print(f"    {line}")
-            elif isinstance(val, str) and len(val) > 120:
-                print(f"  {key}: {val[:120]}...")
+            elif isinstance(val, str):
+                if "\n" in val:
+                    print(f"  {key}:")
+                    for line in val.split("\n"):
+                        print(f"    {line}")
+                else:
+                    print(f"  {key}: {val}")
             else:
                 print(f"  {key}: {val}")
         print()
