@@ -777,7 +777,7 @@ async function renderDetail(ticketId) {
       '<div class="detail-layout">' +
         '<div class="detail-main">' +
           renderDescription(ticket) +
-          renderCustomFields(ticket) +
+          '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
           '<div id="event-stream"></div>' +
         '</div>' +
         '<div class="detail-sidebar" id="sidebar">' +
@@ -936,6 +936,17 @@ function renderCustomFields(ticket) {
 
 // ── Event Polling & Rendering ──
 
+async function refreshResultSection(ticketId) {
+  if (!ticketId) return;
+  try {
+    var ticket = await api('/tickets/' + ticketId);
+    var el = document.getElementById('result-section');
+    if (el) {
+      el.innerHTML = renderCustomFields(ticket);
+    }
+  } catch {}
+}
+
 async function pollEvents(ticketId) {
   if (pollPaused) return;
   try {
@@ -994,6 +1005,7 @@ function trackAgentPhase(evt) {
       statusEl.innerHTML = statusBadge(evt.data.to);
       var sidebarStatus = document.querySelector('.detail-sidebar .sidebar-section:first-child div');
       if (sidebarStatus) sidebarStatus.innerHTML = statusBadge(evt.data.to);
+      refreshResultSection(evt.data.ticket_id || currentTicketId);
     }
   }
 }
