@@ -103,6 +103,23 @@ class OrchestratorConfig:
             os.environ.get("SSH_KEY")
             or cfg.get("ssh_key")
         )
+        self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
+        self._openai_api_key = os.environ.get("OPENAI_API_KEY")
+        self._openai_base_url = (
+            os.environ.get("OPENAI_BASE_URL")
+            or llm_cfg.get("base_url")
+        )
+
+    def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
+        """Get LLM provider/model config for an agent type.
+
+        Resolution order: agent_models.<type> → agent_models.default → top-level llm config.
+        """
+        if agent_type in self._agent_models:
+            return dict(self._agent_models[agent_type])
+        if "default" in self._agent_models:
+            return dict(self._agent_models["default"])
+        return {"provider": self.llm_provider, "model": self.llm_model}
 
 
 def _env_float(key: str) -> float | None:

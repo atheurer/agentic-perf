@@ -13,8 +13,7 @@ from .dispatcher import Dispatcher, STATUS_AGENT_MAP, TERMINAL_STATUSES
 from .poller import fetch_tickets_by_status
 
 from providers.events import EventBus
-from providers.llm.mock import MockLLMProvider
-from providers.llm.claude import ClaudeLLMProvider
+from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
 from providers.skills.clusterbuster import ClusterbusterSkillProvider
@@ -32,16 +31,27 @@ from providers.skills.zathras import ZathrasSkillProvider
 logger = logging.getLogger(__name__)
 
 
-def create_llm_provider(config: OrchestratorConfig):
-    if config.llm_provider == "claude":
-        return ClaudeLLMProvider(
-            api_key=config.anthropic_api_key,
-            model=config.llm_model,
-            backend=config.llm_backend,
-            project_id=config.llm_project_id,
-            region=config.llm_region,
+def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: str = ""):
+    return create_llm_provider(
+        provider=provider or config.llm_provider,
+        model=model or config.llm_model,
+        api_key=config.anthropic_api_key,
+        backend=config.llm_backend,
+        project_id=config.llm_project_id,
+        region=config.llm_region,
+        base_url=config._openai_base_url,
+    )
+
+
+def _make_llm_factory(config: OrchestratorConfig):
+    def factory(agent_type: str):
+        agent_cfg = config.get_agent_llm_config(agent_type)
+        return _make_llm_provider(
+            config,
+            provider=agent_cfg.get("provider", ""),
+            model=agent_cfg.get("model", ""),
         )
-    return MockLLMProvider()
+    return factory
 
 
 async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
@@ -92,7 +102,8 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
-    llm = create_llm_provider(config)
+    llm = _make_llm_provider(config)
+    llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()
     for name, url in config.harness_repos.items():
@@ -125,6 +136,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     dispatcher = Dispatcher(
         config.state_store_url, llm, skills, secrets, events,
         repo_cache=repo_cache,
+        llm_factory=llm_factory,
     )
 
     logger.info(

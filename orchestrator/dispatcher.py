@@ -37,6 +37,7 @@ class Dispatcher:
         secrets_provider: SecretsProvider | None = None,
         event_bus: EventBus | None = None,
         repo_cache: RepoCache | None = None,
+        llm_factory: Any | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
@@ -44,6 +45,7 @@ class Dispatcher:
         self.secrets = secrets_provider
         self.events = event_bus
         self.repo_cache = repo_cache
+        self._llm_factory = llm_factory
         self._active: set[str] = set()
         self._dispatched: set[tuple[str, str]] = set()
 
@@ -65,21 +67,28 @@ class Dispatcher:
             (t, s) for t, s in self._dispatched if t != ticket_id
         }
 
+    def _get_llm(self, agent_type: str) -> LLMProvider:
+        if self._llm_factory:
+            return self._llm_factory(agent_type)
+        return self.llm
+
     def create_agent(self, status: str) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
             return None
 
+        llm = self._get_llm(agent_type)
+
         if agent_type == "triage":
             return TriageAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
                 event_bus=self.events,
             )
         elif agent_type == "resource_create":
             return ResourceAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="create",
                 secrets_provider=self.secrets,
@@ -87,7 +96,7 @@ class Dispatcher:
             )
         elif agent_type == "provisioning":
             return ProvisioningAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
                 secrets_provider=self.secrets,
@@ -95,7 +104,7 @@ class Dispatcher:
             )
         elif agent_type == "benchmark":
             return BenchmarkAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
                 secrets_provider=self.secrets,
@@ -104,7 +113,7 @@ class Dispatcher:
             )
         elif agent_type == "review":
             return ReviewAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
                 event_bus=self.events,
@@ -112,7 +121,7 @@ class Dispatcher:
             )
         elif agent_type == "resource_teardown":
             return ResourceAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="teardown",
                 secrets_provider=self.secrets,
