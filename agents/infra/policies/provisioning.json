@@ -1,0 +1,23 @@
+{
+    "allowed_binaries": [
+        "bash", "sh",
+        "cat", "grep", "sed", "awk", "head", "tail", "wc", "sort", "tee", "tr", "cut",
+        "echo", "printf", "test", "true", "false",
+        "ls", "find", "stat", "file", "readlink",
+        "mkdir", "chmod", "chown", "ln", "rm", "cp", "mv", "touch",
+        "dnf", "yum", "rpm", "which",
+        "curl", "wget",
+        "git",
+        "podman", "docker",
+        "systemctl", "setenforce", "getenforce",
+        "ssh-keygen", "ssh", "scp",
+        "k3s", "kubectl", "oc",
+        "crucible", "zathras", "burden",
+        "python3", "python",
+        "sleep", "xargs",
+        "hostname", "uname", "nproc", "free", "lscpu",
+        "cd"
+    ],
+    "blocked_patterns": [],
+    "max_timeout": 7200
+}

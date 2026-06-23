@@ -1,0 +1,12 @@
+{
+    "allowed_binaries": [
+        "cat", "head", "tail",
+        "ls", "find", "stat",
+        "grep", "wc", "sort",
+        "curl",
+        "test", "echo",
+        "xzcat"
+    ],
+    "blocked_patterns": [],
+    "max_timeout": 120
+}

@@ -1,0 +1,10 @@
+{
+    "allowed_binaries": [
+        "echo", "hostname", "uname",
+        "cat", "grep", "head",
+        "nproc", "free", "lscpu",
+        "test"
+    ],
+    "blocked_patterns": [],
+    "max_timeout": 60
+}

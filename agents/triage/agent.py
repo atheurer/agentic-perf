@@ -61,9 +61,14 @@ class TriageAgent(AgentBase):
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
 
-        server_path = str(Path(__file__).with_name("server.py"))
+        triage_server = str(Path(__file__).with_name("server.py"))
+        infra_server = str(
+            Path(__file__).parent.parent / "infra" / "server.py"
+        )
+
         mcp = AgentMCPClient()
-        await mcp.connect(server_path)
+        await mcp.connect(triage_server, name="triage")
+        await mcp.connect(infra_server, name="infra")
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
