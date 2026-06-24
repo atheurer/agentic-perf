@@ -187,10 +187,15 @@ async def get_reservation_status(
 
 
 @mcp.tool()
-async def validate_host(host: str) -> str:
-    """Validate that a host is reachable via SSH. Returns connectivity status, FQDN, and basic system info (OS, CPU count, RAM). Uses SSH credentials from the ticket context. This is for connectivity verification only -- for submit_resource_result, use the IPs from the reserve_resources result, not the FQDN from this tool."""
+async def validate_host(host: str, ssh_key_path: str = "", ssh_user: str = "root") -> str:
+    """Validate that a host is reachable via SSH. Returns connectivity status, FQDN, and basic system info (OS, CPU count, RAM). Pass ssh_key_path from the reserve_resources result to use the correct key."""
     await _ensure_init()
-    result = await _ssh.run(host, "echo SSH_OK", timeout=15)
+    from providers.ssh import SSHExecutor
+    if ssh_key_path:
+        ssh = SSHExecutor(user=ssh_user, key_path=ssh_key_path)
+    else:
+        ssh = _ssh
+    result = await ssh.run(host, "echo SSH_OK", timeout=15)
 
     if result.exit_code != 0 or "SSH_OK" not in result.stdout:
         return json.dumps({
@@ -205,7 +210,7 @@ async def validate_host(host: str) -> str:
         "nproc; "
         "awk '/MemTotal/{printf \"%.0f\", $2/1024/1024}' /proc/meminfo"
     )
-    info = await _ssh.run(host, info_cmd, timeout=15)
+    info = await ssh.run(host, info_cmd, timeout=15)
     lines = info.stdout.strip().splitlines()
 
     fqdn = lines[0].strip() if len(lines) > 0 else host

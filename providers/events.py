@@ -84,11 +84,15 @@ class EventBus:
         since: int = 0,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        events = self._events.get(ticket_id, [])
-        if events:
-            filtered = [e for e in events if e.seq > since]
-            return [e.to_dict() for e in filtered[:limit]]
-        return self._read_from_file(ticket_id, since=since, limit=limit)
+        in_memory = [
+            e.to_dict() for e in self._events.get(ticket_id, [])
+            if e.seq > since
+        ]
+        from_file = self._read_from_file(ticket_id, since=since, limit=limit)
+        seen_seqs = {e["seq"] for e in in_memory}
+        merged = in_memory + [e for e in from_file if e["seq"] not in seen_seqs]
+        merged.sort(key=lambda e: e["seq"])
+        return merged[:limit]
 
     def _read_from_file(
         self,

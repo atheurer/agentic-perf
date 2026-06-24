@@ -465,7 +465,12 @@ class AWSResourceProvider(ResourceProvider):
     async def _enable_root_ssh(self, host: str, pubkey: str) -> None:
         """Enable root SSH login and install our key."""
         bootstrap_cmds = [
+            # RHEL10 uses sshd_config.d/ drop-ins that override the main config.
+            # Remove any PermitRootLogin overrides from drop-ins first.
+            "sudo sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true",
             "sudo sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config",
+            # Ensure PermitRootLogin is set even if the sed didn't match
+            "grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' | sudo tee -a /etc/ssh/sshd_config > /dev/null",
             "sudo sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config",
             "sudo mkdir -p /root/.ssh",
             "sudo chmod 700 /root/.ssh",
@@ -473,6 +478,8 @@ class AWSResourceProvider(ResourceProvider):
             # that blocks login. Replace the file with just our key.
             f"echo '{pubkey}' | sudo tee /root/.ssh/authorized_keys > /dev/null",
             "sudo chmod 600 /root/.ssh/authorized_keys",
+            # Fix SELinux labels on root's .ssh directory
+            "sudo restorecon -Rv /root/.ssh 2>/dev/null || true",
             "sudo systemctl restart sshd",
             # EC2 cgroup v2 + systemd cgroup manager triggers eBPF device
             # filter errors in podman/crun. Use cgroupfs instead.
@@ -498,8 +505,8 @@ class AWSResourceProvider(ResourceProvider):
                     f"{stderr.decode().strip()}"
                 )
 
-        # Give sshd a moment to restart
-        await asyncio.sleep(3)
+        # Give sshd time to restart fully
+        await asyncio.sleep(5)
 
         # Verify root SSH works
         proc = await asyncio.create_subprocess_exec(
