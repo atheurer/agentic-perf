@@ -25,4 +25,37 @@ openai = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.11.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["agents", "orchestrator", "providers", "state_store"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+# Baseline is ~41%. Increase as coverage improves.
+fail_under = 40
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    # E402: module-level import not at top — some files need sys.path
+    # manipulation before imports (e.g., MCP servers adding project root).
+    "E402",
+    # E501: line too long — ruff format handles most cases; remaining are
+    # string literals in tool descriptions and test data. Tighten later.
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agents", "orchestrator", "providers", "state_store"]

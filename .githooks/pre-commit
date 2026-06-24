@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+validate_script="${repo_root}/scripts/validate.sh"
+
+if [[ ! -x "${validate_script}" ]]; then
+    echo "ERROR: Missing ${validate_script}. Run scripts/dev-setup.sh." >&2
+    exit 1
+fi
+
+echo "Running pre-commit validation..."
+"${validate_script}"
