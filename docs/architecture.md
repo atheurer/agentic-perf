@@ -222,6 +222,7 @@ without requiring the harness to be installed:
 | `BenchmarkRunnerSkillProvider` | Benchmark-Runner | Static workload catalog |
 | `ClusterbusterSkillProvider` | Clusterbuster | Static workload catalog |
 | `VstormSkillProvider` | Vstorm | Static workload catalog |
+| `ArcaflowPluginSkillProvider` | Arcaflow Plugins | Quay.io registry discovery + container schema introspection |
 
 `MultiHarnessSkillProvider` aggregates all configured harnesses into a
 single provider. When benchmarks overlap (e.g., both Crucible and Zathras
