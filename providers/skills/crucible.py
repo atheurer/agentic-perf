@@ -221,6 +221,13 @@ class CrucibleSkillProvider(SkillProvider):
         userenv = params.get("userenv", "default")
         osruntime = params.get("osruntime", "podman")
         ep_user = params.get("endpoint_user", "root")
+        if ep_user != "root":
+            logger.warning(
+                "Crucible requires root SSH access — overriding "
+                "endpoint_user=%r to 'root'",
+                ep_user,
+            )
+            ep_user = "root"
         controller = params.get("controller")
         controller_ip = params.get("controller_ip")
 
@@ -257,6 +264,13 @@ class CrucibleSkillProvider(SkillProvider):
         benchmark: str,
     ) -> None:
         ep_user = params.get("endpoint_user", "root")
+        if ep_user != "root":
+            logger.warning(
+                "Crucible requires root SSH access — overriding "
+                "endpoint_user=%r to 'root'",
+                ep_user,
+            )
+            ep_user = "root"
         userenv = params.get("userenv", "default")
         controller_ip = params.get("controller_ip", "")
         kube_host = params.get("kube_host", "")
