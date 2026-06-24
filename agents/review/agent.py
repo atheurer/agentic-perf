@@ -6,14 +6,24 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
+from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 from providers.skills.repo_cache import RepoCache
 
-from .mcp_server import create_review_tool_handlers, get_review_tools
+from .mcp_server import get_review_tools
 from .prompts import REVIEW_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_TOOL_NAMES = frozenset(
+    {"request_clarification", "submit_review_result"}
+)
+
+_MCP_TOOL_NAMES = frozenset(
+    t.name for t in get_review_tools()
+    if t.name not in _LOCAL_TOOL_NAMES
+) | {"list_harness_docs", "read_harness_doc"}
 
 
 class ReviewAgent(AgentBase):
@@ -30,19 +40,25 @@ class ReviewAgent(AgentBase):
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
-        tools = get_review_tools(repo_cache=repo_cache)
-        tool_handlers = create_review_tool_handlers(
-            request_clarification_fn=self._do_request_clarification,
-            skill_provider=skill_provider,
-            repo_cache=repo_cache,
-        )
+        local_tools = [
+            t for t in get_review_tools(repo_cache=repo_cache)
+            if t.name not in _MCP_TOOL_NAMES
+        ]
+
+        async def _request_clarification(question: str) -> str:
+            await self._do_request_clarification(question)
+            return "Clarification requested. Ticket paused for human input."
+
+        local_handlers = {
+            "request_clarification": _request_clarification,
+        }
 
         super().__init__(
             agent_name="review-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
-            tools=tools,
-            tool_handlers=tool_handlers,
+            tools=local_tools,
+            tool_handlers=local_handlers,
             event_bus=event_bus,
         )
 
@@ -54,7 +70,24 @@ class ReviewAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
-        await super().run(ticket_id)
+
+        review_server = str(Path(__file__).with_name("server.py"))
+
+        mcp = AgentMCPClient()
+        await mcp.connect(
+            review_server, name="review",
+            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+        )
+        self._mcp = mcp
+
+        mcp_tools = await mcp.list_tools()
+        self.tools = mcp_tools + self.tools
+
+        try:
+            await super().run(ticket_id)
+        finally:
+            await mcp.disconnect()
+            self._mcp = None
 
     def _system_prompt(self) -> str:
         return REVIEW_SYSTEM_PROMPT

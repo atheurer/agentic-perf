@@ -6,14 +6,25 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
+from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 from providers.skills.repo_cache import RepoCache
 
-from .mcp_server import create_benchmark_tool_handlers, get_benchmark_tools
+from .mcp_server import get_benchmark_tools
 from .prompts import BENCHMARK_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_TOOL_NAMES = frozenset(
+    {"request_clarification", "present_runfile_for_approval", "submit_benchmark_result"}
+)
+
+_MCP_TOOL_NAMES = frozenset(
+    t.name for t in get_benchmark_tools()
+    if t.name not in _LOCAL_TOOL_NAMES
+) | {"list_harness_docs", "read_harness_doc"}
+
 
 
 class BenchmarkAgent(AgentBase):
@@ -32,19 +43,41 @@ class BenchmarkAgent(AgentBase):
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
-        tools = get_benchmark_tools(repo_cache=repo_cache)
-        tool_handlers, self._ssh = create_benchmark_tool_handlers(
-            skill_provider=skill_provider,
-            request_clarification_fn=self._do_request_clarification,
-            repo_cache=repo_cache,
-        )
+        local_tools = [
+            t for t in get_benchmark_tools()
+            if t.name not in _MCP_TOOL_NAMES
+        ]
+
+        async def _request_clarification(question: str) -> str:
+            await self._do_request_clarification(question)
+            return "Clarification requested. Ticket paused for human input."
+
+        async def _present_runfile_for_approval(
+            run_file: dict,
+            benchmark: str | None = None,
+            summary: str | None = None,
+        ) -> str:
+            bench_label = f" for {benchmark}" if benchmark else ""
+            summary_line = f"\n\n{summary}" if summary else ""
+            question = (
+                f"Please review this run-file{bench_label}{summary_line}\n\n"
+                f"```json\n{json.dumps(run_file, indent=2)}\n```\n\n"
+                "Do you approve this configuration? (approve / request changes / reject)"
+            )
+            await self._do_request_clarification(question)
+            return "Clarification requested. Ticket paused for user approval of run-file."
+
+        local_handlers = {
+            "request_clarification": _request_clarification,
+            "present_runfile_for_approval": _present_runfile_for_approval,
+        }
 
         super().__init__(
             agent_name="benchmark-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
-            tools=tools,
-            tool_handlers=tool_handlers,
+            tools=local_tools,
+            tool_handlers=local_handlers,
             event_bus=event_bus,
         )
 
@@ -56,11 +89,29 @@ class BenchmarkAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
-        ticket = await self._get_ticket(ticket_id)
-        ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
-        if ssh_key:
-            self._ssh.key_path = ssh_key
-        await super().run(ticket_id)
+
+        bench_server = str(Path(__file__).with_name("server.py"))
+
+        mcp = AgentMCPClient()
+        await mcp.connect(
+            bench_server, name="benchmark",
+            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+        )
+        self._mcp = mcp
+
+        mcp_tools = await mcp.list_tools()
+        self.tools = mcp_tools + self.tools
+
+        try:
+            ticket = await self._get_ticket(ticket_id)
+            ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
+            if ssh_key:
+                # SSH key is now handled server-side via ticket data
+                pass
+            await super().run(ticket_id)
+        finally:
+            await mcp.disconnect()
+            self._mcp = None
 
     def _system_prompt(self) -> str:
         return BENCHMARK_SYSTEM_PROMPT

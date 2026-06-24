@@ -15,64 +15,23 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Ensure project root is importable when run as a subprocess.
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from fastmcp import FastMCP
 
-from providers.skills.base import SkillProvider
+from agents.server_utils import build_skill_provider
 
 mcp = FastMCP("triage-agent")
 
-_skill_provider: SkillProvider | None = None
+_skill_provider = None
 
 
-def _build_skill_provider() -> SkillProvider:
-    from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
-    from providers.skills.clusterbuster import ClusterbusterSkillProvider
-    from providers.skills.crucible import CrucibleSkillProvider
-    from providers.skills.forge import ForgeSkillProvider
-    from providers.skills.ioscale import IoscaleSkillProvider
-    from providers.skills.k8s_netperf import K8sNetperfSkillProvider
-    from providers.skills.kube_burner import KubeBurnerSkillProvider
-    from providers.skills.multi import MultiHarnessSkillProvider
-    from providers.skills.private import PrivateSkillProvider
-    from providers.skills.vstorm import VstormSkillProvider
-    from providers.skills.zathras import ZathrasSkillProvider
-
-    crucible_home = os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
-    zathras_home = os.environ.get("ZATHRAS_HOME", "")
-
-    harnesses: dict[str, SkillProvider] = {
-        "crucible": CrucibleSkillProvider(crucible_home),
-        "kube-burner": KubeBurnerSkillProvider(),
-        "k8s-netperf": K8sNetperfSkillProvider(),
-        "benchmark-runner": BenchmarkRunnerSkillProvider(),
-        "clusterbuster": ClusterbusterSkillProvider(),
-        "vstorm": VstormSkillProvider(),
-        "ioscale": IoscaleSkillProvider(),
-        "forge": ForgeSkillProvider(),
-    }
-
-    if zathras_home:
-        harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
-    else:
-        private = PrivateSkillProvider()
-        zathras_tests = private._load_config("zathras").get("tests")
-        if zathras_tests:
-            harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
-
-    return MultiHarnessSkillProvider(
-        harnesses, PrivateSkillProvider(), default_harness="crucible"
-    )
-
-
-def _get_provider() -> SkillProvider:
+def _get_provider():
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = _build_skill_provider()
+        _skill_provider = build_skill_provider()
     return _skill_provider
 
 

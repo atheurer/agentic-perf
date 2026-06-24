@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
+from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
-from .mcp_server import create_provisioning_tool_handlers, get_provisioning_tools
+from .mcp_server import get_provisioning_tools
 from .prompts import PROVISIONING_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_MCP_TOOL_NAMES = frozenset(
+    t.name for t in get_provisioning_tools()
+    if t.name not in ("request_clarification", "submit_provisioning_result")
+)
 
 
 class ProvisioningAgent(AgentBase):
@@ -28,19 +35,25 @@ class ProvisioningAgent(AgentBase):
         self._hitl_triggered = False
         self._hitl_ticket_id: str | None = None
 
-        tools = get_provisioning_tools()
-        tool_handlers, self._ssh = create_provisioning_tool_handlers(
-            skill_provider=skill_provider,
-            secrets_provider=secrets_provider,
-            request_clarification_fn=self._do_request_clarification,
-        )
+        local_tools = [
+            t for t in get_provisioning_tools()
+            if t.name not in _MCP_TOOL_NAMES
+        ]
+
+        async def _request_clarification(question: str) -> str:
+            await self._do_request_clarification(question)
+            return "Clarification requested. Ticket paused for human input."
+
+        local_handlers = {
+            "request_clarification": _request_clarification,
+        }
 
         super().__init__(
             agent_name="provisioning-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
-            tools=tools,
-            tool_handlers=tool_handlers,
+            tools=local_tools,
+            tool_handlers=local_handlers,
             event_bus=event_bus,
         )
 
@@ -52,11 +65,24 @@ class ProvisioningAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
-        ticket = await self._get_ticket(ticket_id)
-        ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
-        if ssh_key:
-            self._ssh.key_path = ssh_key
-        await super().run(ticket_id)
+
+        prov_server = str(Path(__file__).with_name("server.py"))
+
+        mcp = AgentMCPClient()
+        await mcp.connect(
+            prov_server, name="provisioning",
+            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+        )
+        self._mcp = mcp
+
+        mcp_tools = await mcp.list_tools()
+        self.tools = mcp_tools + self.tools
+
+        try:
+            await super().run(ticket_id)
+        finally:
+            await mcp.disconnect()
+            self._mcp = None
 
     def _system_prompt(self) -> str:
         return PROVISIONING_SYSTEM_PROMPT
