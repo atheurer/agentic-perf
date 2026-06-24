@@ -7,6 +7,7 @@ from agents.benchmark.agent import BenchmarkAgent
 from agents.provisioning.agent import ProvisioningAgent
 from agents.resource.agent import ResourceAgent
 from agents.review.agent import ReviewAgent
+from agents.stub import StubAgent
 from agents.triage.agent import TriageAgent
 from providers.events import EventBus
 from providers.llm.base import LLMProvider
@@ -17,12 +18,18 @@ from providers.skills.repo_cache import RepoCache
 logger = logging.getLogger(__name__)
 
 STATUS_AGENT_MAP = {
+    # Original linear pipeline
     "triage_pending": "triage",
     "awaiting_hardware": "resource_create",
     "awaiting_provision": "provisioning",
     "executing_benchmark": "benchmark",
     "awaiting_review": "review",
     "awaiting_teardown": "resource_teardown",
+    # Recursive investigation loop
+    "gathering_context": "gathering_context",
+    "planning_investigation": "planning_investigation",
+    "evaluating_convergence": "evaluating_convergence",
+    "synthesizing_results": "synthesizing_results",
 }
 
 TERMINAL_STATUSES = {"closed", "awaiting_customer_guidance"}
@@ -124,6 +131,21 @@ class Dispatcher:
                 mode="teardown",
                 secrets_provider=self.secrets,
                 event_bus=self.events,
+            )
+
+        # Recursive investigation loop agents (stubs until
+        # full implementations land in later issues)
+        stub_targets = {
+            "gathering_context": "planning_investigation",
+            "planning_investigation": "awaiting_provision",
+            "evaluating_convergence": "synthesizing_results",
+            "synthesizing_results": "awaiting_teardown",
+        }
+        if agent_type in stub_targets:
+            return StubAgent(
+                agent_name=f"{agent_type}-agent",
+                target_status=stub_targets[agent_type],
+                state_store_url=self.store_url,
             )
 
         return None

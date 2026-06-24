@@ -133,8 +133,26 @@ def _check_awaiting_review(ticket: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def _check_evaluating_convergence(
+    ticket: dict[str, Any],
+) -> tuple[bool, str]:
+    """Validate benchmark execution before convergence evaluation."""
+    cf = ticket.get("custom_fields", {})
+    benchmark_status = cf.get("benchmark_status")
+    run_id = cf.get("run_id")
+
+    if not run_id and benchmark_status != "completed":
+        return (
+            False,
+            f"No run_id and benchmark_status={benchmark_status!r} "
+            f"— benchmark may not have completed",
+        )
+    return True, ""
+
+
 _CHECKS: dict[str, Any] = {
     "awaiting_provision": _check_awaiting_provision,
     "executing_benchmark": _check_executing_benchmark,
     "awaiting_review": _check_awaiting_review,
+    "evaluating_convergence": _check_evaluating_convergence,
 }
