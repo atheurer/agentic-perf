@@ -99,7 +99,8 @@ class TicketStore:
                 )
 
             if new_status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
-                ticket.previous_status = current
+                if current != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
+                    ticket.previous_status = current
             else:
                 ticket.previous_status = None
 
