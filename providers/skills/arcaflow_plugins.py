@@ -766,7 +766,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         search_text = f"{description} {workload_type}"
         scores: dict[str, int] = {}
         for keyword, plugins in self._keyword_map.items():
-            if keyword in search_text:
+            if re.search(rf"\b{re.escape(keyword)}\b", search_text):
                 for plugin in plugins:
                     scores[plugin] = scores.get(plugin, 0) + 1
 

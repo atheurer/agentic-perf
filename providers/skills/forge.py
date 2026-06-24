@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
@@ -206,7 +207,7 @@ class ForgeSkillProvider(SkillProvider):
 
         scores: dict[str, int] = {}
         for keyword, benchmarks in KEYWORD_MAP.items():
-            if keyword in search_text:
+            if re.search(rf"\b{re.escape(keyword)}\b", search_text):
                 for bench in benchmarks:
                     scores[bench] = scores.get(bench, 0) + 1
 

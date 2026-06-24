@@ -47,6 +47,12 @@ TEST_DEFS_YAML = textwrap.dedent("""\
         test_description: SPECjbb Java benchmark
         java_required: "yes"
         test_specific: "--java_version {{ config_info.java_version }}"
+
+      test6:
+        test_template: pyperf_template.yml
+        test_name: pyperf
+        test_description: Python pyperformance benchmark suite
+        test_specific: "--benchmarks all"
 """)
 
 

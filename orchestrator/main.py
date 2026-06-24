@@ -105,9 +105,7 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
         )
 
 
-async def _block_handoff_failed(
-    store_url: str, ticket_id: str, reason: str
-) -> None:
+async def _block_handoff_failed(store_url: str, ticket_id: str, reason: str) -> None:
     import httpx
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -207,13 +205,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
                 ok, reason = check_handoff(status, ticket)
                 if not ok:
-                    logger.warning(
-                        f"Handoff blocked for {tid} at {status}: {reason}"
-                    )
+                    logger.warning(f"Handoff blocked for {tid} at {status}: {reason}")
                     dispatcher.mark_dispatched(tid, status)
-                    await _block_handoff_failed(
-                        config.state_store_url, tid, reason
-                    )
+                    await _block_handoff_failed(config.state_store_url, tid, reason)
                     continue
 
                 dispatcher.mark_active(tid)
