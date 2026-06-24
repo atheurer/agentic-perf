@@ -453,6 +453,37 @@ async def install_harness(
     target_path = provisioning.get("install_target_path", f"/opt/{harness_name}")
     constraints = private_config.get("constraints", {})
 
+    # Container-only harnesses (e.g., arcaflow-plugins) don't need
+    # installation — just verify the container runtime is available.
+    if provisioning.get("skip_install") or install_method == "none":
+        verify_cmd = provisioning.get("verify_command", "podman --version")
+        verify_result = await _ssh.run(host, verify_cmd, timeout=15)
+        if verify_result.exit_code == 0:
+            return json.dumps(
+                {
+                    "host": host,
+                    "harness": harness_name,
+                    "status": "ready",
+                    "message": (
+                        f"No installation needed for {harness_name}. "
+                        f"Runtime verified: {verify_result.stdout.strip()}"
+                    ),
+                }
+            )
+        else:
+            return json.dumps(
+                {
+                    "host": host,
+                    "harness": harness_name,
+                    "status": "missing_runtime",
+                    "message": (
+                        f"{harness_name} requires "
+                        f"{provisioning.get('prerequisites', ['podman'])} "
+                        f"but verification failed: {verify_result.stderr.strip()}"
+                    ),
+                }
+            )
+
     platform_result = await validate_platform_contract(_ssh, host, private_config)
     if platform_result["status"] == "failed":
         return json.dumps(
@@ -731,6 +762,26 @@ async def check_existing_install(
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
+
+    # Container-only harnesses have no install path — just check runtime
+    if provisioning.get("skip_install") or provisioning.get("install_method") == "none":
+        verify_cmd = provisioning.get("verify_command", "podman --version")
+        result = await _ssh.run(host, verify_cmd, timeout=15)
+        return json.dumps(
+            {
+                "host": host,
+                "harness": harness_name,
+                "installed": result.exit_code == 0,
+                "install_path": "(container-based, no install path)",
+                "output": result.stdout.strip() if result.stdout else "",
+                "message": (
+                    f"Runtime available: {result.stdout.strip()}"
+                    if result.exit_code == 0
+                    else "Runtime not found"
+                ),
+            }
+        )
+
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )

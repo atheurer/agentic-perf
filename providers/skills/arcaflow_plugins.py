@@ -844,6 +844,36 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             "input": info.get("example_input", {}),
         }
 
+    async def get_default_config(self) -> dict[str, Any]:
+        """Return provisioning config for arcaflow-plugins.
+
+        Arcaflow plugins are containers — no harness installation
+        is needed. Provisioning only needs to verify that podman
+        is available on the target host.
+        """
+        return {
+            "provisioning": {
+                "install_method": "none",
+                "install_target_path": "",
+                "verify_command": "podman --version",
+                "prerequisites": ["podman"],
+                "skip_install": True,
+                "note": (
+                    "Arcaflow plugins run as containers via "
+                    "podman. No harness installation is needed. "
+                    "Provisioning should only verify that podman "
+                    "is available on the target host."
+                ),
+            },
+            "constraints": {},
+            "execution": {
+                "controller_required": False,
+                "run_command": "podman run",
+                "endpoint_type": "remotehosts",
+                "run_file_format": "yaml",
+            },
+        }
+
     async def validate_runfile(
         self, run_file: dict[str, Any], harness: str | None = None
     ) -> dict[str, Any]:
