@@ -256,6 +256,33 @@ class TestAWSResourceProvider:
         assert provider._match_instance_type({"min_cores": 4}) == "m5.xlarge"
 
     @pytest.mark.asyncio
+    async def test_match_instance_type_by_ram(self):
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = AWSResourceProvider(
+            region="us-east-1",
+            access_key_id="AKIATEST",
+            secret_access_key="secret",
+            ssh_key_name="test-key",
+            ssh_key_path="/tmp/test.pem",
+            ssh_user="ec2-user",
+            security_group_id="sg-123",
+            subnet_id="subnet-456",
+            default_ami="ami-abc",
+            default_instance_type="m5.xlarge",
+            instance_type_map={
+                "small": "m5.xlarge",
+                "medium": "m5.4xlarge",
+                "large": "m5.8xlarge",
+                "network_25g": "m5n.4xlarge",
+            },
+        )
+        assert provider._match_instance_type({"min_memory_gb": 32}) == "m5.4xlarge"
+        assert provider._match_instance_type({"min_ram_gb": 32}) == "m5.4xlarge"
+        assert provider._match_instance_type({"min_memory_gb": 8}) == "m5.xlarge"
+        assert provider._match_instance_type({"min_memory_gb": 96}) == "m5.8xlarge"
+
+    @pytest.mark.asyncio
     async def test_terminate(self):
         provider = self._make_provider()
         mock_ec2 = MagicMock()

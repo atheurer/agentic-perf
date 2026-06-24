@@ -104,15 +104,16 @@ class AWSResourceProvider(ResourceProvider):
             return requirements["instance_type"]
 
         cores = requirements.get("min_cores", 0)
+        ram_gb = requirements.get("min_memory_gb", requirements.get("min_ram_gb", 0))
         nic_speed = requirements.get("nic_speed", 0)
 
         if nic_speed >= 100 and "network_100g" in self._instance_type_map:
             return self._instance_type_map["network_100g"]
         if nic_speed >= 25 and "network_25g" in self._instance_type_map:
             return self._instance_type_map["network_25g"]
-        if cores >= 32 and "large" in self._instance_type_map:
+        if (cores >= 32 or ram_gb > 64) and "large" in self._instance_type_map:
             return self._instance_type_map["large"]
-        if cores >= 16 and "medium" in self._instance_type_map:
+        if (cores >= 16 or ram_gb > 16) and "medium" in self._instance_type_map:
             return self._instance_type_map["medium"]
         if "small" in self._instance_type_map:
             return self._instance_type_map["small"]
