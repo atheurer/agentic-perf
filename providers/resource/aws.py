@@ -98,14 +98,28 @@ class AWSResourceProvider(ResourceProvider):
             self._ec2_client = boto3.client("ec2", **kwargs)
         return self._ec2_client
 
+    @staticmethod
+    def _parse_numeric(value: Any, default: int = 0) -> int:
+        """Coerce a value to int, stripping unit suffixes like '25Gb'."""
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            import re
+
+            m = re.match(r"(\d+)", value.strip())
+            return int(m.group(1)) if m else default
+        return default
+
     def _match_instance_type(self, requirements: dict[str, Any]) -> str:
         """Map resource requirements to an EC2 instance type."""
         if requirements.get("instance_type"):
             return requirements["instance_type"]
 
-        cores = requirements.get("min_cores", 0)
-        ram_gb = requirements.get("min_memory_gb", requirements.get("min_ram_gb", 0))
-        nic_speed = requirements.get("nic_speed", 0)
+        cores = self._parse_numeric(requirements.get("min_cores", 0))
+        ram_gb = self._parse_numeric(
+            requirements.get("min_memory_gb", requirements.get("min_ram_gb", 0))
+        )
+        nic_speed = self._parse_numeric(requirements.get("nic_speed", 0))
 
         if nic_speed >= 100 and "network_100g" in self._instance_type_map:
             return self._instance_type_map["network_100g"]

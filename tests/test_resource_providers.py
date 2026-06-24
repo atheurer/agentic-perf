@@ -282,6 +282,32 @@ class TestAWSResourceProvider:
         assert provider._match_instance_type({"min_memory_gb": 8}) == "m5.xlarge"
         assert provider._match_instance_type({"min_memory_gb": 96}) == "m5.8xlarge"
 
+    def test_parse_numeric(self):
+        from providers.resource.aws import AWSResourceProvider
+
+        assert AWSResourceProvider._parse_numeric(25) == 25
+        assert AWSResourceProvider._parse_numeric(25.9) == 25
+        assert AWSResourceProvider._parse_numeric("25") == 25
+        assert AWSResourceProvider._parse_numeric("25Gb") == 25
+        assert AWSResourceProvider._parse_numeric("100Gbps") == 100
+        assert AWSResourceProvider._parse_numeric("") == 0
+        assert AWSResourceProvider._parse_numeric("none") == 0
+        assert AWSResourceProvider._parse_numeric(None) == 0
+
+    @pytest.mark.asyncio
+    async def test_match_instance_type_string_values(self):
+        """LLM may pass numeric fields as strings — must not raise TypeError."""
+        provider = self._make_provider()
+        assert provider._match_instance_type(
+            {"nic_speed": "25Gb"}
+        ) == "m5n.4xlarge"
+        assert provider._match_instance_type(
+            {"min_cores": "16", "min_ram_gb": "32"}
+        ) == "m5.4xlarge"
+        assert provider._match_instance_type(
+            {"nic_speed": "10", "min_ram_gb": "8"}
+        ) == "m5.xlarge"
+
     @pytest.mark.asyncio
     async def test_terminate(self):
         provider = self._make_provider()
