@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
 from agents.benchmark.mcp_server import cleanup_controller_ssh_keys
+from agents.mcp_client import AgentMCPClient
 from agents.provisioning.mcp_server import cleanup_harness
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
@@ -13,10 +15,15 @@ from providers.resource.registry import ResourceProviderRegistry
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
-from .mcp_server import create_resource_tool_handlers, get_resource_tools
+from .mcp_server import get_resource_tools
 from .prompts import RESOURCE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_MCP_TOOL_NAMES = frozenset(
+    t.name for t in get_resource_tools()
+    if t.name != "submit_resource_result"
+)
 
 
 def _match_to_provider_ip(
@@ -57,22 +64,22 @@ class ResourceAgent(AgentBase):
             ResourceProviderRegistry(secrets_provider) if secrets_provider else None
         )
 
-        tools = get_resource_tools() if mode == "create" else []
         self._last_reservation: dict[str, Any] = {}
         self._ssh: SSHExecutor | None = None
-        if mode == "create":
-            tool_handlers, self._last_reservation, self._ssh = (
-                create_resource_tool_handlers(registry=self._registry)
-            )
-        else:
-            tool_handlers = {}
+
+        # Only keep local tools (submit_resource_result) -- MCP tools
+        # are added dynamically in run() for create mode.
+        local_tools = [
+            t for t in get_resource_tools()
+            if t.name not in _MCP_TOOL_NAMES
+        ] if mode == "create" else []
 
         super().__init__(
             agent_name="resource-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
-            tools=tools,
-            tool_handlers=tool_handlers,
+            tools=local_tools,
+            tool_handlers={},
             event_bus=event_bus,
         )
 
@@ -87,12 +94,24 @@ class ResourceAgent(AgentBase):
             return
         self._hitl_ticket_id = ticket_id
         self._hitl_triggered = False
-        if self._ssh:
-            ticket = await self._get_ticket(ticket_id)
-            ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
-            if ssh_key:
-                self._ssh.key_path = ssh_key
-        await super().run(ticket_id)
+
+        resource_server = str(Path(__file__).with_name("server.py"))
+
+        mcp = AgentMCPClient()
+        await mcp.connect(
+            resource_server, name="resource",
+            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+        )
+        self._mcp = mcp
+
+        mcp_tools = await mcp.list_tools()
+        self.tools = mcp_tools + self.tools
+
+        try:
+            await super().run(ticket_id)
+        finally:
+            await mcp.disconnect()
+            self._mcp = None
 
     async def _run_teardown(self, ticket_id: str) -> None:
         logger.info(f"[resource-agent] Teardown for ticket {ticket_id}")

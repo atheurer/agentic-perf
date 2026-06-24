@@ -28,7 +28,7 @@ from agents.infra.command_policy import (
     check_command,
     load_policy,
 )
-from providers.secrets.factory import create_secrets_provider
+from agents.server_utils import build_secrets_provider as _build_secrets
 from providers.ssh import SSHExecutor, SSHResult
 
 logger = logging.getLogger(__name__)
@@ -53,12 +53,7 @@ def _get_ssh() -> SSHExecutor:
 def _get_secrets():
     global _secrets_provider
     if _secrets_provider is None:
-        backend = os.environ.get("SECRETS_BACKEND", "local")
-        config: dict[str, Any] = {}
-        secrets_path = os.environ.get("SECRETS_PATH")
-        if secrets_path:
-            config["path"] = secrets_path
-        _secrets_provider = create_secrets_provider(backend, **config)
+        _secrets_provider = _build_secrets()
     return _secrets_provider
 
 
@@ -274,32 +269,6 @@ async def transfer_file(
         "remote_path": remote_path,
         "error": result.stderr if result.exit_code != 0 else None,
     })
-
-
-@mcp.tool()
-async def install_packages(
-    host: str, packages: list[str], manager: str = "dnf"
-) -> str:
-    """Install packages on a remote host via package manager."""
-    ssh = _get_ssh()
-
-    for pkg in packages:
-        if not all(c.isalnum() or c in "-_." for c in pkg):
-            return json.dumps({
-                "success": False,
-                "error": f"Invalid package name: {pkg!r}",
-            })
-
-    if manager not in ("dnf", "yum", "apt-get"):
-        return json.dumps({
-            "success": False,
-            "error": f"Unsupported package manager: {manager}",
-        })
-
-    pkg_list = " ".join(packages)
-    cmd = f"{manager} install -y {pkg_list}"
-    result = await ssh.run(host, cmd, timeout=300)
-    return _format_result(result)
 
 
 @mcp.tool()

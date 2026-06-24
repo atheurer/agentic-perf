@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,10 +44,14 @@ class AgentMCPClient:
         if name is None:
             name = server_script
 
+        merged_env = None
+        if env is not None:
+            merged_env = {**os.environ, **env}
+
         params = StdioServerParameters(
             command=sys.executable,
             args=[server_script],
-            env=env,
+            env=merged_env,
         )
         stdio_cm = stdio_client(params)
         read_stream, write_stream = await stdio_cm.__aenter__()
