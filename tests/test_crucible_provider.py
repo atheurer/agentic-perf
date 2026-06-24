@@ -277,3 +277,48 @@ async def test_validate_runfile_rejects_extra_keys(provider: CrucibleSkillProvid
     validation = await provider.validate_runfile(bad_runfile)
     assert not validation["valid"]
     assert any("harness" in e for e in validation["errors"])
+
+
+class TestEndpointUserEnforcement:
+    """Crucible requires root — non-root endpoint_user must be overridden."""
+
+    def test_remotehosts_overrides_non_root(self):
+        p = CrucibleSkillProvider("/nonexistent")
+        template: dict = {}
+        p._build_remotehosts_endpoints(
+            template,
+            {"endpoint_user": "ec2-user"},
+            [{"host": "10.0.0.1", "roles": ["client"]}],
+        )
+        assert template["endpoints"][0]["settings"]["user"] == "root"
+
+    def test_remotehosts_keeps_root(self):
+        p = CrucibleSkillProvider("/nonexistent")
+        template: dict = {}
+        p._build_remotehosts_endpoints(
+            template,
+            {"endpoint_user": "root"},
+            [{"host": "10.0.0.1", "roles": ["client"]}],
+        )
+        assert template["endpoints"][0]["settings"]["user"] == "root"
+
+    def test_kube_overrides_non_root(self):
+        p = CrucibleSkillProvider("/nonexistent")
+        template: dict = {}
+        p._build_kube_endpoints(
+            template,
+            {"endpoint_user": "ec2-user", "kube_host": "10.0.0.1"},
+            [{"host": "10.0.0.1", "roles": ["client"]}],
+            "fio",
+        )
+        assert template["endpoints"][0]["user"] == "root"
+
+    def test_default_is_root(self):
+        p = CrucibleSkillProvider("/nonexistent")
+        template: dict = {}
+        p._build_remotehosts_endpoints(
+            template,
+            {},
+            [{"host": "10.0.0.1", "roles": ["client"]}],
+        )
+        assert template["endpoints"][0]["settings"]["user"] == "root"
