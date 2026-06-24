@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ KEYWORD_MAP = {
     ],
     "java": ["specjbb"],
     "python": ["pyperf"],
+    "pyperf": ["pyperf"],
+    "pyperformance": ["pyperf"],
+    "cpython": ["pyperf"],
     "scheduler": ["pig"],
     "boot": ["reboot_measure"],
     "reboot": ["reboot_measure"],
@@ -164,7 +168,7 @@ class ZathrasSkillProvider(SkillProvider):
 
         scores: dict[str, int] = {}
         for keyword, benchmarks in KEYWORD_MAP.items():
-            if keyword in search_text:
+            if re.search(rf"\b{re.escape(keyword)}\b", search_text):
                 for bench in benchmarks:
                     scores[bench] = scores.get(bench, 0) + 1
 

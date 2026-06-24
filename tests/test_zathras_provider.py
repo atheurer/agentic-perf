@@ -21,7 +21,7 @@ async def test_list_benchmarks(provider: ZathrasSkillProvider):
     assert "uperf" in names
     assert "coremark" in names
     assert "specjbb" in names
-    assert len(benchmarks) == 5
+    assert len(benchmarks) == 6
 
 
 @pytest.mark.asyncio
@@ -93,6 +93,25 @@ async def test_resolve_benchmark_network(provider: ZathrasSkillProvider):
         {"description": "network throughput", "workload_type": "network"}
     )
     assert result == "uperf"
+
+
+@pytest.mark.asyncio
+async def test_resolve_benchmark_python(provider: ZathrasSkillProvider):
+    result = await provider.resolve_benchmark(
+        {"description": "Python runtime performance", "workload_type": "python"}
+    )
+    assert result == "pyperf"
+
+
+@pytest.mark.asyncio
+async def test_resolve_benchmark_python_no_false_io_match(
+    provider: ZathrasSkillProvider,
+):
+    """'performance' should not match the 'io' keyword via substring."""
+    result = await provider.resolve_benchmark(
+        {"description": "Python performance benchmark", "workload_type": ""}
+    )
+    assert result == "pyperf"
 
 
 @pytest.mark.asyncio
