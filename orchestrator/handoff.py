@@ -14,9 +14,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def check_handoff(
-    status: str, ticket: dict[str, Any]
-) -> tuple[bool, str]:
+def check_handoff(status: str, ticket: dict[str, Any]) -> tuple[bool, str]:
     """Validate that a ticket is ready for the given status.
 
     Returns (ok, reason). If ok is False, reason explains what's wrong.
@@ -87,9 +85,7 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
         reverse.update({k: v for k, v in ip_mapping.items()})
         controller_canonical = reverse.get(controller, controller)
 
-    unique_targets = {
-        (ip_mapping.get(t, t) if t in ip_mapping else t) for t in targets
-    }
+    unique_targets = {(ip_mapping.get(t, t) if t in ip_mapping else t) for t in targets}
     if controller_canonical:
         unique_targets.discard(controller_canonical)
 

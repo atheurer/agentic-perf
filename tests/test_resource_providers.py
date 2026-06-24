@@ -285,6 +285,61 @@ class TestAWSResourceProvider:
         assert "skipped" in result["hosts"]["1.2.3.4"]
 
     @pytest.mark.asyncio
+    async def test_reserve_instance_count_alias(self):
+        """LLM may pass instance_count instead of count — both should work."""
+        provider = self._make_provider()
+        mock_ec2 = MagicMock()
+
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [
+                {
+                    "SubnetId": "subnet-456",
+                    "AvailabilityZone": "us-east-1a",
+                    "VpcId": "vpc-1",
+                },
+            ]
+        }
+        mock_ec2.describe_images.return_value = {
+            "Images": [{"RootDeviceName": "/dev/sda1"}]
+        }
+        mock_ec2.run_instances.return_value = {
+            "Instances": [
+                {"InstanceId": "i-one"},
+                {"InstanceId": "i-two"},
+            ]
+        }
+        mock_ec2.describe_instances.return_value = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": "i-one",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.2.3.4",
+                            "PrivateIpAddress": "10.0.0.1",
+                        },
+                        {
+                            "InstanceId": "i-two",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.2.3.5",
+                            "PrivateIpAddress": "10.0.0.2",
+                        },
+                    ]
+                }
+            ]
+        }
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        result = await provider.reserve(
+            selection={"instance_type": "m5.xlarge", "instance_count": 2},
+            description="test instance_count alias",
+        )
+        assert result["status"] == "success"
+        call_kwargs = mock_ec2.run_instances.call_args
+        assert call_kwargs.kwargs.get("MinCount", call_kwargs[1].get("MinCount")) == 2
+
+    @pytest.mark.asyncio
     async def test_reserve_az_fallback(self):
         """When first AZ has no capacity, retry in another AZ."""
         provider = self._make_provider()

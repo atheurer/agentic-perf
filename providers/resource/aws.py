@@ -181,7 +181,7 @@ class AWSResourceProvider(ResourceProvider):
         ec2 = self._get_ec2_client()
         instance_type = selection.get("instance_type", self._default_instance_type)
         ami = selection.get("ami", self._default_ami)
-        count = selection.get("count", 1)
+        count = selection.get("count", selection.get("instance_count", 1))
         root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
 
         logger.info(
