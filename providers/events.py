@@ -22,6 +22,7 @@ EVENT_TYPES = {
     "tool_skipped",
     "transition",
     "comment",
+    "llm_usage",
 }
 
 
@@ -54,6 +55,55 @@ class Event:
         }
 
 
+class CumulativeUsage:
+    """Accumulated LLM token and cost metrics per ticket.
+
+    Fed by the OTLP span processor — each completed LLM span
+    contributes its token counts, duration, and model info.
+    """
+
+    __slots__ = (
+        "input_tokens",
+        "output_tokens",
+        "llm_calls",
+        "total_duration_ms",
+        "models_used",
+    )
+
+    def __init__(self) -> None:
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.llm_calls: int = 0
+        self.total_duration_ms: int = 0
+        self.models_used: set[str] = set()
+
+    def record(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        duration_ms: int,
+        model: str = "",
+    ) -> None:
+        """Add one LLM call's usage to the totals."""
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.total_duration_ms += duration_ms
+        self.llm_calls += 1
+        if model:
+            self.models_used.add(model)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Snapshot of accumulated usage."""
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": (self.input_tokens + self.output_tokens),
+            "llm_calls": self.llm_calls,
+            "total_duration_ms": self.total_duration_ms,
+            "models_used": sorted(self.models_used),
+        }
+
+
 class EventBus:
     def __init__(self, log_dir: str | Path | None = None) -> None:
         self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
@@ -62,6 +112,7 @@ class EventBus:
         self._seq = 0
         self._lock = threading.Lock()
         self._file_handles: dict[str, Any] = {}
+        self._cumulative: dict[str, CumulativeUsage] = {}
 
     def emit(
         self,
@@ -77,6 +128,87 @@ class EventBus:
 
         self._write_to_file(ticket_id, event)
         return event
+
+    def record_llm_usage(
+        self,
+        ticket_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        duration_ms: int,
+        model: str = "",
+        agent_name: str = "",
+    ) -> None:
+        """Accumulate LLM token usage for a ticket.
+
+        Called by the OTLP span processor when a GenAI span
+        completes. Can also be called directly for providers
+        that don't use OTLP instrumentation.
+
+        Usage is tracked both at the ticket level and per
+        agent within the ticket.
+        """
+        with self._lock:
+            # Ticket-level accumulation
+            if ticket_id not in self._cumulative:
+                self._cumulative[ticket_id] = CumulativeUsage()
+            self._cumulative[ticket_id].record(
+                input_tokens,
+                output_tokens,
+                duration_ms,
+                model,
+            )
+
+            # Per-agent accumulation
+            if agent_name:
+                agent_key = f"{ticket_id}:{agent_name}"
+                if agent_key not in self._cumulative:
+                    self._cumulative[agent_key] = CumulativeUsage()
+                self._cumulative[agent_key].record(
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    model,
+                )
+
+    def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
+        """Get accumulated LLM usage for a ticket."""
+        usage = self._cumulative.get(ticket_id)
+        if usage is None:
+            return CumulativeUsage().to_dict()
+        return usage.to_dict()
+
+    def get_agent_usage(self, ticket_id: str) -> dict[str, dict[str, Any]]:
+        """Get per-agent LLM usage breakdown for a ticket.
+
+        Returns a dict of agent_name -> usage dict. Only
+        includes agents that have recorded usage.
+        """
+        result = {}
+        prefix = f"{ticket_id}:"
+        for key, usage in self._cumulative.items():
+            if key.startswith(prefix):
+                agent_name = key[len(prefix) :]
+                result[agent_name] = usage.to_dict()
+        return result
+
+    def get_global_usage(self) -> dict[str, Any]:
+        """Get accumulated LLM usage across all tickets.
+
+        Useful for system-wide budget enforcement (see #127).
+        Only includes ticket-level entries, not per-agent
+        sub-entries.
+        """
+        total = CumulativeUsage()
+        for key, usage in self._cumulative.items():
+            # Skip per-agent entries (contain ':')
+            if ":" in key:
+                continue
+            total.input_tokens += usage.input_tokens
+            total.output_tokens += usage.output_tokens
+            total.llm_calls += usage.llm_calls
+            total.total_duration_ms += usage.total_duration_ms
+            total.models_used.update(usage.models_used)
+        return total.to_dict()
 
     def get_events(
         self,

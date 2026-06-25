@@ -263,6 +263,23 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     )
     secrets = LocalSecretsProvider()
     events = EventBus()
+
+    # Initialize OpenTelemetry LLM instrumentation.
+    # Spans from the Anthropic/OpenAI SDKs are captured
+    # and fed into the EventBus for per-ticket token
+    # accumulation.
+    try:
+        from providers.telemetry import setup_telemetry
+
+        telemetry_config = config.raw.get("telemetry", {})
+        setup_telemetry(
+            event_bus=events,
+            otlp_endpoint=telemetry_config.get("otlp_endpoint"),
+            enabled=telemetry_config.get("enabled", True),
+        )
+    except ImportError:
+        logger.info("OpenTelemetry not installed — LLM token tracking disabled")
+
     dispatcher = Dispatcher(
         config.state_store_url,
         llm,

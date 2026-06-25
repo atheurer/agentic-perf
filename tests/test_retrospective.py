@@ -8,12 +8,9 @@ and per-agent statistics.
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from agents.retrospective.server import (
     _check_suspicious_tool_use,
@@ -515,13 +512,13 @@ class TestStateTransitions:
         assert TicketStatus.RETROSPECTIVE_PENDING.value == "retrospective_pending"
 
     def test_teardown_to_retrospective_transition(self):
-        from state_store.models import TicketStatus, VALID_TRANSITIONS
+        from state_store.models import VALID_TRANSITIONS, TicketStatus
 
         allowed = VALID_TRANSITIONS[TicketStatus.AWAITING_TEARDOWN]
         assert TicketStatus.RETROSPECTIVE_PENDING in allowed
 
     def test_retrospective_to_closed_transition(self):
-        from state_store.models import TicketStatus, VALID_TRANSITIONS
+        from state_store.models import VALID_TRANSITIONS, TicketStatus
 
         allowed = VALID_TRANSITIONS[TicketStatus.RETROSPECTIVE_PENDING]
         assert TicketStatus.CLOSED in allowed

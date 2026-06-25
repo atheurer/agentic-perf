@@ -28,6 +28,7 @@ class OrchestratorConfig:
         zathras_home: str | None = None,
     ) -> None:
         cfg = _load_config_file()
+        self.raw = cfg  # Full config for subsystem access
         llm_cfg = cfg.get("llm", {})
         store_cfg = cfg.get("state_store", {})
 

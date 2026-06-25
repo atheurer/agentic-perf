@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -16,8 +15,7 @@ from .prompts import RETROSPECTIVE_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 _MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_retrospective_tools()
-    if t.name != "submit_retrospective"
+    t.name for t in get_retrospective_tools() if t.name != "submit_retrospective"
 )
 
 
@@ -29,9 +27,7 @@ class RetrospectiveAgent(AgentBase):
         event_bus: EventBus | None = None,
     ) -> None:
         local_tools = [
-            t
-            for t in get_retrospective_tools()
-            if t.name not in _MCP_TOOL_NAMES
+            t for t in get_retrospective_tools() if t.name not in _MCP_TOOL_NAMES
         ]
 
         super().__init__(
@@ -63,8 +59,7 @@ class RetrospectiveAgent(AgentBase):
             await super().run(ticket_id)
         except Exception:
             logger.exception(
-                f"[retrospective-agent] Failed on {ticket_id}, "
-                f"closing ticket anyway"
+                f"[retrospective-agent] Failed on {ticket_id}, closing ticket anyway"
             )
             await self._add_comment(
                 ticket_id,
@@ -107,9 +102,7 @@ class RetrospectiveAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
-    async def _handle_completion(
-        self, ticket_id: str, response: LLMResponse
-    ) -> None:
+    async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
         result = self._get_submit_result(response)
         if not result:
             result = self._parse_json_response(response.text)
@@ -134,9 +127,7 @@ class RetrospectiveAgent(AgentBase):
             for f in findings:
                 cat = f.get("category", "unknown")
                 categories[cat] = categories.get(cat, 0) + 1
-            breakdown = ", ".join(
-                f"{count} {cat}" for cat, count in categories.items()
-            )
+            breakdown = ", ".join(f"{count} {cat}" for cat, count in categories.items())
             comment = (
                 f"**Retrospective:** {len(findings)} finding(s) — "
                 f"{breakdown}\n\n{summary}"

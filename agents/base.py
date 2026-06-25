@@ -64,12 +64,41 @@ class AgentBase(ABC):
 
         try:
             for i in range(max_iterations):
-                self._emit(ticket_id, "llm_request", {"iteration": i})
-                response = await self.llm.complete(
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tools=self.tools if self.tools else None,
+                self._emit(
+                    ticket_id,
+                    "llm_request",
+                    {"iteration": i},
                 )
+
+                # Set ticket context for OTLP span
+                # correlation so the span processor
+                # can attribute token usage to this
+                # ticket.
+                try:
+                    from opentelemetry import context
+
+                    from providers.telemetry import (
+                        set_ticket_context,
+                    )
+
+                    tok = context.attach(
+                        set_ticket_context(
+                            ticket_id,
+                            self.agent_name,
+                        )
+                    )
+                except ImportError:
+                    tok = None
+
+                try:
+                    response = await self.llm.complete(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=(self.tools if self.tools else None),
+                    )
+                finally:
+                    if tok is not None:
+                        context.detach(tok)
                 self._emit(
                     ticket_id,
                     "llm_response",
@@ -77,7 +106,7 @@ class AgentBase(ABC):
                         "iteration": i,
                         "stop_reason": response.stop_reason,
                         "tool_calls": [tc.name for tc in response.tool_calls],
-                        "text_length": len(response.text) if response.text else 0,
+                        "text_length": (len(response.text) if response.text else 0),
                         "text": response.text,
                         "raw_content": response.raw_content,
                     },

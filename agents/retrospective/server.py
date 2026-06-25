@@ -224,9 +224,7 @@ def _get_context(events: list[dict], idx: int, radius: int = 2) -> list[dict]:
                 "content": (data.get("content") or "")[:500],
             }
         else:
-            trimmed["data"] = {
-                k: _truncate_value(v, 200) for k, v in data.items()
-            }
+            trimmed["data"] = {k: _truncate_value(v, 200) for k, v in data.items()}
         context.append(trimmed)
     return context
 
@@ -251,56 +249,55 @@ def _extract_signals(events: list[dict]) -> list[dict]:
 
         # Tool errors
         if etype == "tool_result" and data.get("is_error"):
-            signals.append({
-                "type": "tool_error",
-                "agent": agent,
-                "tool": data.get("tool"),
-                "error": (data.get("content") or "")[:500],
-                "seq": evt.get("seq"),
-                "context": _get_context(events, i),
-            })
+            signals.append(
+                {
+                    "type": "tool_error",
+                    "agent": agent,
+                    "tool": data.get("tool"),
+                    "error": (data.get("content") or "")[:500],
+                    "seq": evt.get("seq"),
+                    "context": _get_context(events, i),
+                }
+            )
 
         # Max iterations
-        if (
-            etype == "agent_error"
-            and data.get("reason") == "max_iterations"
-        ):
-            signals.append({
-                "type": "max_iterations",
-                "agent": agent,
-                "seq": evt.get("seq"),
-                "context": _get_context(events, i),
-            })
+        if etype == "agent_error" and data.get("reason") == "max_iterations":
+            signals.append(
+                {
+                    "type": "max_iterations",
+                    "agent": agent,
+                    "seq": evt.get("seq"),
+                    "context": _get_context(events, i),
+                }
+            )
 
         # HITL escalations
-        if (
-            etype == "transition"
-            and data.get("to") == "awaiting_customer_guidance"
-        ):
-            signals.append({
-                "type": "hitl_escalation",
-                "agent": agent,
-                "comment": data.get("comment", ""),
-                "seq": evt.get("seq"),
-                "context": _get_context(events, i),
-            })
+        if etype == "transition" and data.get("to") == "awaiting_customer_guidance":
+            signals.append(
+                {
+                    "type": "hitl_escalation",
+                    "agent": agent,
+                    "comment": data.get("comment", ""),
+                    "seq": evt.get("seq"),
+                    "context": _get_context(events, i),
+                }
+            )
 
         # Self-correction language
         if etype == "llm_response":
             text = data.get("text") or ""
-            matched = [
-                p.pattern for p in SELF_CORRECTION_PATTERNS
-                if p.search(text)
-            ]
+            matched = [p.pattern for p in SELF_CORRECTION_PATTERNS if p.search(text)]
             if matched:
-                signals.append({
-                    "type": "self_correction",
-                    "agent": agent,
-                    "patterns": matched,
-                    "text_snippet": text[:300],
-                    "seq": evt.get("seq"),
-                    "context": _get_context(events, i, radius=1),
-                })
+                signals.append(
+                    {
+                        "type": "self_correction",
+                        "agent": agent,
+                        "patterns": matched,
+                        "text_snippet": text[:300],
+                        "seq": evt.get("seq"),
+                        "context": _get_context(events, i, radius=1),
+                    }
+                )
 
     # Retry sequences (consecutive tool_called for same tool, 3+)
     tool_calls = [
@@ -322,24 +319,21 @@ def _extract_signals(events: list[dict]) -> list[dict]:
             if streak_len >= 3:
                 first_idx = tool_calls[streak_start][0]
                 last_idx = tool_calls[j - 1][0]
-                tool_name = (
-                    tool_calls[streak_start][1]
-                    .get("data", {})
-                    .get("tool", "?")
+                tool_name = tool_calls[streak_start][1].get("data", {}).get("tool", "?")
+                signals.append(
+                    {
+                        "type": "retry_sequence",
+                        "agent": tool_calls[streak_start][1].get("agent", ""),
+                        "tool": tool_name,
+                        "count": streak_len,
+                        "seq_range": [
+                            events[first_idx].get("seq"),
+                            events[last_idx].get("seq"),
+                        ],
+                        "context": _get_context(events, first_idx, radius=1)
+                        + _get_context(events, last_idx, radius=1),
+                    }
                 )
-                signals.append({
-                    "type": "retry_sequence",
-                    "agent": tool_calls[streak_start][1].get("agent", ""),
-                    "tool": tool_name,
-                    "count": streak_len,
-                    "seq_range": [
-                        events[first_idx].get("seq"),
-                        events[last_idx].get("seq"),
-                    ],
-                    "context": _get_context(
-                        events, first_idx, radius=1
-                    ) + _get_context(events, last_idx, radius=1),
-                })
             streak_start = j
 
     # Fail-then-succeed patterns
@@ -358,15 +352,17 @@ def _extract_signals(events: list[dict]) -> list[dict]:
             and not data_b.get("is_error")
             and data_a.get("tool") == data_b.get("tool")
         ):
-            signals.append({
-                "type": "fail_then_succeed",
-                "agent": evt_a.get("agent", ""),
-                "tool": data_a.get("tool"),
-                "error": (data_a.get("content") or "")[:300],
-                "seq_range": [evt_a.get("seq"), evt_b.get("seq")],
-                "context": _get_context(events, idx_a)
-                + _get_context(events, idx_b),
-            })
+            signals.append(
+                {
+                    "type": "fail_then_succeed",
+                    "agent": evt_a.get("agent", ""),
+                    "tool": data_a.get("tool"),
+                    "error": (data_a.get("content") or "")[:300],
+                    "seq_range": [evt_a.get("seq"), evt_b.get("seq")],
+                    "context": _get_context(events, idx_a)
+                    + _get_context(events, idx_b),
+                }
+            )
 
     return signals
 

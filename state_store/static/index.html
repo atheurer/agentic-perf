@@ -867,6 +867,13 @@ function renderSidebar(ticket) {
       '<h4>Events</h4>' +
       '<div class="sidebar-event-count" id="event-count">0</div>' +
       '<div class="sidebar-event-label">events loaded</div>' +
+    '</div>' +
+
+    '<div class="sidebar-section">' +
+      '<h4>LLM Usage</h4>' +
+      '<div id="llm-usage" style="font-size:12px; color:var(--text-muted);">' +
+        'Waiting for data...' +
+      '</div>' +
     '</div>';
 }
 
@@ -973,9 +980,65 @@ async function pollEvents(ticketId) {
   try {
     var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
     var newEvents = data.events || [];
-    if (newEvents.length === 0) return;
-    lastSeq = data.latest_seq;
-    renderNewEvents(newEvents);
+    if (newEvents.length > 0) {
+      lastSeq = data.latest_seq;
+      renderNewEvents(newEvents);
+    }
+    updateUsageSidebar(ticketId);
+  } catch {}
+}
+
+async function updateUsageSidebar(ticketId) {
+  try {
+    var data = await api('/tickets/' + ticketId + '/usage');
+    var el = document.getElementById('llm-usage');
+    if (!el || !data.usage) return;
+    var u = data.usage;
+    if (u.llm_calls === 0) {
+      el.innerHTML = '<span style="color:var(--text-muted)">No LLM calls yet</span>';
+      return;
+    }
+    var cost = data.estimated_cost_usd;
+    var costStr = cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
+    el.innerHTML =
+      '<div style="margin-bottom:4px">' +
+        '<span style="color:var(--cyan)">' + u.total_tokens.toLocaleString() + '</span> tokens' +
+      '</div>' +
+      '<div style="margin-bottom:4px; font-size:11px">' +
+        u.input_tokens.toLocaleString() + ' in / ' +
+        u.output_tokens.toLocaleString() + ' out' +
+      '</div>' +
+      '<div style="margin-bottom:4px">' +
+        '<span style="color:var(--green)">' + u.llm_calls + '</span> calls' +
+        ' &middot; ' + (u.total_duration_ms / 1000).toFixed(1) + 's' +
+      '</div>' +
+      '<div style="margin-bottom:4px">' +
+        'Est. <span style="color:var(--yellow)">' + costStr + '</span>' +
+      '</div>' +
+      (u.models_used.length > 0 ?
+        '<div style="font-size:10px; color:var(--text-muted); margin-bottom:4px">' +
+          u.models_used.join(', ') +
+        '</div>' : '');
+    // Per-agent breakdown
+    var agents = data.by_agent || {};
+    var agentNames = Object.keys(agents);
+    if (agentNames.length > 1) {
+      var agentHtml = '<div style="margin-top:6px; border-top:1px solid var(--border); padding-top:4px; font-size:11px">';
+      agentHtml += '<div style="color:var(--text-muted); margin-bottom:2px">By agent:</div>';
+      for (var ai = 0; ai < agentNames.length; ai++) {
+        var an = agentNames[ai];
+        var au = agents[an];
+        var acost = au.estimated_cost_usd;
+        var acostStr = acost < 0.01 ? '<$0.01' : '$' + acost.toFixed(3);
+        agentHtml += '<div style="margin-bottom:2px">' +
+          '<span style="color:var(--cyan)">' + an.replace('-agent', '') + '</span> ' +
+          au.total_tokens.toLocaleString() + 't ' +
+          acostStr +
+        '</div>';
+      }
+      agentHtml += '</div>';
+      el.innerHTML += agentHtml;
+    }
   } catch {}
 }
 
@@ -1095,6 +1158,9 @@ function renderEvent(evt) {
     case 'llm_response':
       return renderLlmResponse(ts, data);
 
+    case 'llm_usage':
+      return renderLlmUsage(ts, data);
+
     case 'tool_called':
       return renderToolCalled(ts, data);
 
@@ -1211,8 +1277,25 @@ function renderLlmResponse(ts, data) {
   return '<div class="event">' +
     '<span class="event-ts">' + ts + '</span>' +
     '<span class="event-label label-llm">LLM RESPONSE</span>' +
-    '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop + '</span>' +
+    '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop +
+      (data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '') +
+    '</span>' +
     textHtml + toolsHtml +
+  '</div>';
+}
+
+function renderLlmUsage(ts, data) {
+  var inTok = (data.input_tokens || 0).toLocaleString();
+  var outTok = (data.output_tokens || 0).toLocaleString();
+  var model = data.model || '';
+  var dur = data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '';
+  return '<div class="event">' +
+    '<span class="event-ts">' + ts + '</span>' +
+    '<span class="event-label" style="background:var(--cyan); color:#000">TOKENS</span>' +
+    '<span style="color:var(--text-muted); font-size:12px;">' +
+      inTok + ' in &middot; ' + outTok + ' out' + dur +
+      (model ? ' &middot; ' + escHtml(model) : '') +
+    '</span>' +
   '</div>';
 }
 
