@@ -1,26 +1,24 @@
 """Horreum-backed Investigation Record storage.
 
 Stores Investigation Records as Horreum test runs under a
-dedicated test type. Records are uploaded as schemaless JSON
-payloads; Horreum's label extractors map queryable fields
-(state, subsystem, platform, metric) to labels.
+team-managed test type. Records are uploaded as JSON payloads
+tagged with a schema URI; Horreum's label extractors map
+queryable fields (state, subsystem, platform, metric) to labels.
 
-Requires a Horreum instance with:
-- A test named 'investigation-records' (auto-created if missing)
-- Network access to the Horreum API
+Requires:
+- A Horreum instance with network access
+- A test created by a team admin (test_id in config)
+- An API key or Bearer token for write access
 
 Configuration in config.json:
     {
         "investigation_records": {
             "backend": "horreum",
             "url": "https://horreum.example.com",
-            "token": "your-api-token"
+            "token": "HUSR_...",
+            "test_id": 426
         }
     }
-
-The token is optional — some Horreum instances allow anonymous
-uploads. For authenticated instances, use a Horreum API token
-or a service account token.
 """
 
 from __future__ import annotations
@@ -52,8 +50,9 @@ class HorreumRecordProvider(InvestigationRecordProvider):
     fields (state, subsystem, platform, metric) are extracted
     by Horreum's label system for filtering.
 
-    The provider auto-creates the test type on first use if
-    it doesn't exist.
+    The Horreum test must be created by a team admin with
+    appropriate ownership, folder, and permissions. The
+    test_id is required in configuration.
     """
 
     provider_name = "horreum"

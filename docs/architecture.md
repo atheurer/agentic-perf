@@ -338,6 +338,71 @@ Use cases:
 }
 ```
 
+#### Record Schema Reference
+
+Investigation Records use schema URI `urn:agentic-perf:investigation-record:v1`.
+Backend implementers should store and return records matching this structure:
+
+```json
+{
+    "schema_version": "v1",
+    "investigation_id": "RCA-6446E48B",
+    "state": "open",
+    "created_at": "2026-06-25T12:15:39Z",
+    "anomaly_context": {
+        "subsystem": "storage_io",
+        "metric": "iops_4k_randread",
+        "direction": "degrading",
+        "platform": "NXP_S32G",
+        "magnitude": "-31%"
+    },
+    "root_cause_summary": "virtio-blk single-queue path regression",
+    "jira_ticket": "RHIVOS-4821",
+    "confidence": 0.92,
+    "change_attribution": {
+        "classification": "ISOLATION",
+        "causal_commits": ["def456"],
+        "change_summary": "Multi-queue refactoring",
+        "trade_off_assessment": {}
+    },
+    "operational_metrics": {
+        "provision_cycles": 2,
+        "wall_clock_mins": 147,
+        "convergence_outcome": "ISOLATION",
+        "info_gain_trajectory": [0.0, 0.61, 0.92],
+        "stall_events": 0,
+        "resource_consumption": {
+            "llm_tokens_total": 12840,
+            "llm_invocations": 6,
+            "estimated_cost_usd": 0.042,
+            "hardware_time_mins": 94.3,
+            "by_cycle": []
+        },
+        "mcp_calls": {}
+    },
+    "build_history": [
+        {
+            "build_id": "2026.05.14",
+            "action": "FULL_INVESTIGATION",
+            "comment": "Initial discovery",
+            "timestamp": "2026-05-14T03:00:00Z"
+        }
+    ],
+    "skill_applied": {
+        "skill_id": "",
+        "name": "",
+        "accelerated_convergence": false,
+        "cycles_saved_estimate": 0
+    },
+    "trace_ref": ""
+}
+```
+
+Queryable fields that backends should support filtering on:
+`state`, `anomaly_context.subsystem`, `anomaly_context.platform`,
+`anomaly_context.metric`. The Pydantic models in
+`providers/investigation/models.py` are the definitive schema.
+
 #### Adding new backends
 
 New backends implement the `InvestigationRecordProvider` interface and
