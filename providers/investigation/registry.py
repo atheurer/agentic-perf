@@ -46,17 +46,14 @@ BACKEND_REGISTRY: dict[str, dict[str, str]] = {
     "file": {
         "class": ("providers.investigation.file.FileRecordProvider"),
     },
+    "horreum": {
+        "class": ("providers.investigation.horreum.HorreumRecordProvider"),
+    },
     # Future backends:
     # "opensearch": {
     #     "class": (
     #         "providers.investigation.opensearch"
     #         ".OpenSearchRecordProvider"
-    #     ),
-    # },
-    # "horreum": {
-    #     "class": (
-    #         "providers.investigation.horreum"
-    #         ".HorreumRecordProvider"
     #     ),
     # },
 }
