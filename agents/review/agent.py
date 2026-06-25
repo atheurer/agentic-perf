@@ -101,8 +101,31 @@ class ReviewAgent(AgentBase):
 
         if cf.get("hypothesis"):
             content += f"\n## Hypothesis\n{cf['hypothesis']}\n"
-        if cf.get("run_id"):
+
+        plan = cf.get("execution_plan")
+        if plan and plan.get("run_ids"):
+            content += "\n## Multi-Run Execution Plan Results\n"
+            for step in plan.get("steps", []):
+                if (
+                    step.get("status") == "completed"
+                    and step.get("agent_type") == "benchmark"
+                ):
+                    results = step.get("results", {})
+                    label = step.get("params", {}).get("label", f"Step {step['id']}")
+                    content += (
+                        f"\n### {label}\n"
+                        f"- **Run ID:** {results.get('run_id', 'UNKNOWN')}\n"
+                        f"- **Status:** "
+                        f"{results.get('benchmark_status', 'unknown')}\n"
+                    )
+            content += (
+                f"\n**All Run IDs for comparison:** "
+                f"{', '.join(plan['run_ids'])}\n"
+                f"Use these run IDs to retrieve and compare results.\n"
+            )
+        elif cf.get("run_id"):
             content += f"\n**Run ID:** {cf['run_id']}\n"
+
         if cf.get("benchmark_status"):
             content += f"**Benchmark Status:** {cf['benchmark_status']}\n"
         if cf.get("benchmark_suite"):

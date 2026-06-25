@@ -165,6 +165,33 @@ class BenchmarkAgent(AgentBase):
                 for doc in docs:
                     content += f"- `{doc['path']}`\n"
 
+        plan = cf.get("execution_plan")
+        if plan:
+            current_idx = plan.get("current_step", 0)
+            steps = plan.get("steps", [])
+            if current_idx < len(steps):
+                step = steps[current_idx]
+                step_params = step.get("params", {})
+                content += (
+                    f"\n## Execution Plan — Step {current_idx}\n"
+                    f"**Label:** {step_params.get('label', 'unnamed')}\n"
+                )
+                if step_params.get("mv_params"):
+                    content += (
+                        f"**Parameter overrides for this run:**\n"
+                        f"```json\n{json.dumps(step_params['mv_params'], indent=2)}\n```\n"
+                        f"Apply these values in the run-file's mv-params.\n"
+                    )
+                content += (
+                    f"\nThis is step {current_idx + 1} of {len(steps)} "
+                    f"in a multi-step plan.\n"
+                )
+            if plan.get("run_ids"):
+                content += (
+                    f"\n**Previous run IDs from earlier steps:** "
+                    f"{', '.join(plan['run_ids'])}\n"
+                )
+
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
             for comment in ticket["comments"]:

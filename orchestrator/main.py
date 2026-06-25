@@ -58,6 +58,104 @@ def _make_llm_factory(config: OrchestratorConfig):
     return factory
 
 
+PLAN_AGENT_STATUS = {
+    "benchmark": "executing_benchmark",
+    "review": "awaiting_review",
+}
+
+
+async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
+    """Advance the execution plan after an agent completes a step.
+
+    Only advances if the completed agent matches the current step's
+    agent_type — prevents non-plan agents (resource, provisioning)
+    from prematurely completing plan steps.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+        if r.status_code != 200:
+            return
+        ticket = r.json()
+        cf = ticket.get("custom_fields", {})
+        plan = cf.get("execution_plan")
+        if not plan:
+            return
+
+        steps = plan.get("steps", [])
+        current = plan.get("current_step", 0)
+
+        if current >= len(steps):
+            return
+
+        step = steps[current]
+        if step.get("status") != "in_progress":
+            return
+
+        expected_status = PLAN_AGENT_STATUS.get(step.get("agent_type", ""))
+        if expected_status != completed_status:
+            return
+
+        ticket_status = ticket.get("status", "")
+        if ticket_status == "awaiting_customer_guidance":
+            return
+
+        step["status"] = "completed"
+        step["results"] = {
+            "run_id": cf.get("run_id", ""),
+            "benchmark_status": cf.get("benchmark_status", ""),
+        }
+
+        run_ids = plan.get("run_ids", [])
+        if cf.get("run_id") and cf["run_id"] not in run_ids:
+            run_ids.append(cf["run_id"])
+        plan["run_ids"] = run_ids
+
+        next_idx = current + 1
+        plan["current_step"] = next_idx
+
+        if next_idx < len(steps):
+            next_step = steps[next_idx]
+            next_status = PLAN_AGENT_STATUS.get(next_step["agent_type"])
+            if next_status:
+                next_step["status"] = "in_progress"
+
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"execution_plan": plan}},
+                )
+
+                await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                    json={
+                        "author": "orchestrator",
+                        "body": (
+                            f"**Plan step {current} complete** — "
+                            f"advancing to step {next_idx} "
+                            f"({next_step['agent_type']})"
+                        ),
+                    },
+                )
+
+                await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": next_status,
+                        "comment": (
+                            f"Plan advancing to step {next_idx}: "
+                            f"{next_step['agent_type']}"
+                        ),
+                    },
+                )
+                return
+
+        await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"execution_plan": plan}},
+        )
+
+
 async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
     try:
         agent = dispatcher.create_agent(status)
@@ -67,6 +165,7 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
+        await _advance_plan(dispatcher.store_url, ticket_id, status)
         dispatcher.mark_done(ticket_id)
         try:
             await agent.close()

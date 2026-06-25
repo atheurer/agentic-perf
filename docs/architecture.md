@@ -176,6 +176,99 @@ the state machine; full implementations are planned.
   if a matching Investigation Record is found.
 - **Abort:** From `awaiting_customer_guidance`, the user can jump directly to
   `awaiting_teardown` to skip remaining work.
+- **Execution plan re-benchmark:** `awaiting_review` can transition back to
+  `executing_benchmark` when an execution plan has more benchmark steps
+  to run.
+
+### Execution Plans
+
+Tickets can carry a multi-step execution plan in
+`custom_fields.execution_plan`. This enables two modes of operation:
+
+#### Predetermined sequences (known at submission time)
+
+When the user requests multiple separate benchmark runs — e.g., "run
+crucible uperf with wsize=64, then run crucible again with wsize=16384" —
+the triage agent produces an execution plan:
+
+```json
+{
+  "current_step": 0,
+  "run_ids": [],
+  "steps": [
+    {"id": 0, "agent_type": "benchmark", "status": "in_progress",
+     "params": {"label": "wsize-64B", "mv_params": {"wsize": "64"}}},
+    {"id": 1, "agent_type": "benchmark", "status": "pending",
+     "params": {"label": "wsize-16384B", "mv_params": {"wsize": "16384"}}},
+    {"id": 2, "agent_type": "review", "status": "pending", "params": {}}
+  ]
+}
+```
+
+The orchestrator advances through the plan automatically after each
+agent completes. The benchmark agent reads step-specific parameters
+from the current step. The review agent sees all completed run IDs
+for comparison.
+
+**Important:** This is for separate harness invocations, not parameter
+sweeps within a single run. Many harnesses (e.g., crucible's mv-params)
+can test multiple parameter values in one invocation — the triage agent
+should use that capability when appropriate and only create an execution
+plan when separate runs are explicitly needed.
+
+#### Iterative convergence (unknown iteration count)
+
+When the number of iterations is not known upfront — e.g., "keep
+refining parameters until throughput stabilizes" — the same plan
+mechanism serves as the work ledger. The `evaluating_convergence`
+agent (from the recursive investigation loop) can dynamically append
+steps to the plan based on results:
+
+- **Not converged:** append a new benchmark step with refined parameters
+- **Converged:** append a review/synthesis step and stop
+
+This means the plan grows during execution rather than being fully
+specified at submission time. Completed steps remain immutable with
+their results, while the convergence agent extends the pending portion.
+
+The user defines convergence criteria on the ticket (see issue #134) —
+the evaluating agent reads them to decide whether to loop or stop, and
+a `max_iterations` bound prevents runaway loops.
+
+Both modes produce the same artifact: an ordered list of completed steps
+with run IDs, parameters, and results — giving the review agent (or
+human) a complete record of what ran and why.
+
+#### Plan step lifecycle
+
+```
+pending → in_progress → completed
+                      → failed
+```
+
+- **Completed steps** are immutable — results (run_id, benchmark_status)
+  are captured and cannot be modified.
+- **Pending steps** can be modified, reordered, or deleted by the user
+  via HITL (`awaiting_customer_guidance`), or extended by agents.
+- **In-progress steps** are locked while the agent is running.
+
+#### Orchestrator plan advancement
+
+After each agent completes, the orchestrator's `_advance_plan()`
+function checks whether the completed agent matches the current plan
+step. If so, it:
+
+1. Marks the step completed and captures results
+2. Appends the run_id to the plan's `run_ids` list
+3. Advances `current_step` to the next step
+4. Transitions the ticket to the next step's target status
+
+If the agent paused for HITL (pre-run approval, clarification), the
+plan is not advanced — the step stays in_progress until the agent
+actually finishes its work after the user replies.
+
+If the completed agent is not part of the plan (resource, provisioning),
+the plan is not touched.
 
 ## Agents
 
