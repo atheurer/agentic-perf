@@ -1,9 +1,9 @@
 """FastMCP server for Investigation Record tools.
 
 Exposes CRUD operations for Investigation Records over stdio.
-Any agent in the investigation loop (grounding, evaluate,
-synthesize) connects to this server to query, create, and
-update records.
+Any agent in the investigation loop (gathering_context,
+evaluating_convergence, synthesizing_results) connects to
+this server to query, create, and update records.
 
 The storage backend is pluggable — configured via
 investigation_records.backend in ~/.agentic-perf/config.json.
