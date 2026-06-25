@@ -250,6 +250,66 @@ Interface: `SecretsProvider` (`providers/secrets/base.py`)
 `quads/config.json`, `aws/config.json`) and injected only into the
 agents that need them.
 
+### Investigation Record Provider
+
+Interface: `InvestigationRecordProvider` (`providers/investigation/base.py`)
+
+Provides cross-investigation memory — agents can check whether a
+regression has already been investigated before starting a new
+investigation, and persist outcomes for future reference.
+
+Records are **write-once**: all investigation data (root cause,
+confidence, operational metrics, change attribution) is set at
+creation time and never modified. The only allowed mutations are:
+- Appending build history entries (tracking regression across builds)
+- Linking a Jira ticket (one-time, only if not already set)
+- Closing the record (OPEN → RESOLVED lifecycle transition)
+
+| Provider | Backend | Discovery |
+|---|---|---|
+| `FileRecordProvider` | JSON files on disk | Default, no external deps |
+| `HorreumRecordProvider` | Horreum REST API | Configured via URL + token |
+| `CompositeRecordProvider` | One writer + N readers | Fans out reads, deduplicates |
+
+The `CompositeRecordProvider` supports scenarios like migration (old
+records in files, new in the primary backend), federated dedup (query
+multiple teams' record stores), and local caching.
+
+Configuration in `~/.agentic-perf/config.json`:
+
+```json
+{
+    "investigation_records": {
+        "backend": "file",
+        "persist_dir": "/path/to/records"
+    }
+}
+```
+
+For composite (multi-read):
+
+```json
+{
+    "investigation_records": {
+        "backend": "composite",
+        "writer": {"backend": "opensearch", "url": "..."},
+        "readers": [
+            {"backend": "opensearch", "url": "..."},
+            {"backend": "file", "persist_dir": "/old/records"}
+        ]
+    }
+}
+```
+
+New backends implement the `InvestigationRecordProvider` interface and
+register in `providers/investigation/registry.py`.
+
+Agent tools are exposed via an MCP server
+(`agents/investigation/server.py`) with six tools: query, get, create,
+append build history, link Jira, and close. Agents use
+`AgentMCPClient.list_tools(include=...)` to expose only the tools
+relevant to their role.
+
 ### SSH Executor
 
 `SSHExecutor` (`providers/ssh.py`) provides async SSH command execution
