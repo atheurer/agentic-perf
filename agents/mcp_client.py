@@ -80,11 +80,25 @@ class AgentMCPClient:
             len(result.tools),
         )
 
-    async def list_tools(self) -> list[ToolDefinition]:
+    async def list_tools(
+        self,
+        include: set[str] | None = None,
+    ) -> list[ToolDefinition]:
+        """List tools from all connected servers.
+
+        Args:
+            include: If provided, only return tools whose names
+                are in this set. Tools not in the set are still
+                callable via call_tool() — this only controls
+                what the LLM sees. If None, all tools are
+                returned.
+        """
         tools = []
         for conn in self._servers.values():
             result = await conn.session.list_tools()
             for t in result.tools:
+                if include is not None and t.name not in include:
+                    continue
                 tools.append(
                     ToolDefinition(
                         name=t.name,

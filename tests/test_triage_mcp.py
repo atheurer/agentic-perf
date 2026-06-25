@@ -230,3 +230,26 @@ async def test_base_agent_mcp_dispatch():
     result = await agent._execute_tool(unknown_call)
     assert result.is_error
     assert "Unknown tool" in result.content
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_list_tools_with_filter(mock_triage_server: Path):
+    """list_tools(include=...) only returns matching tools."""
+    client = AgentMCPClient()
+    await client.connect(str(mock_triage_server))
+    try:
+        # Filter to just one tool
+        tools = await client.list_tools(
+            include={"list_benchmarks"},
+        )
+        names = {t.name for t in tools}
+        assert names == {"list_benchmarks"}
+
+        # Filtered-out tools are still callable
+        result = await client.call_tool(
+            "resolve_benchmark",
+            {"description": "network test"},
+        )
+        assert result  # didn't raise
+    finally:
+        await client.disconnect()
