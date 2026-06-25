@@ -57,15 +57,12 @@ def get_retrospective_tools() -> list[ToolDefinition]:
                                 },
                                 "agent": {
                                     "type": "string",
-                                    "description": (
-                                        "Which agent was affected"
-                                    ),
+                                    "description": ("Which agent was affected"),
                                 },
                                 "description": {
                                     "type": "string",
                                     "description": (
-                                        "Human-readable description of "
-                                        "the finding"
+                                        "Human-readable description of the finding"
                                     ),
                                 },
                                 "recommended_action": {
@@ -90,9 +87,7 @@ def get_retrospective_tools() -> list[ToolDefinition]:
                     },
                     "summary": {
                         "type": "string",
-                        "description": (
-                            "One-paragraph summary of the retrospective"
-                        ),
+                        "description": ("One-paragraph summary of the retrospective"),
                     },
                     "stats": {
                         "type": "object",
