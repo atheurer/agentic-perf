@@ -1,9 +1,14 @@
 """FastMCP server for Investigation Record tools.
 
-Exposes CRUD operations for Investigation Records over stdio.
+Exposes operations for Investigation Records over stdio.
 Any agent in the investigation loop (gathering_context,
 evaluating_convergence, synthesizing_results) connects to
-this server to query, create, and update records.
+this server to query, create, and track records.
+
+Records are write-once: investigation data is immutable after
+creation. The only mutations are appending build history
+(tracking regression across builds), linking a Jira ticket
+(one-time), and closing the record (OPEN -> RESOLVED).
 
 The storage backend is pluggable — configured via
 investigation_records.backend in ~/.agentic-perf/config.json.
@@ -19,7 +24,6 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
@@ -64,7 +68,7 @@ async def query_investigation_records(
     Use this to check whether a regression has already been
     investigated before starting a new investigation. All filters
     are optional — omitted filters match everything. Returns
-    records ordered by most recently updated first.
+    records ordered by most recently created first.
     """
     provider = _get_provider()
     records = await provider.query(
@@ -81,16 +85,16 @@ async def query_investigation_records(
                 {
                     "investigation_id": r.investigation_id,
                     "state": r.state.value,
-                    "subsystem": r.anomaly_context.subsystem,
+                    "subsystem": (r.anomaly_context.subsystem),
                     "metric": r.anomaly_context.metric,
                     "platform": r.anomaly_context.platform,
-                    "magnitude": r.anomaly_context.magnitude,
-                    "direction": r.anomaly_context.direction,
-                    "root_cause_summary": r.root_cause_summary,
+                    "magnitude": (r.anomaly_context.magnitude),
+                    "direction": (r.anomaly_context.direction),
+                    "root_cause_summary": (r.root_cause_summary),
                     "confidence": r.confidence,
                     "jira_ticket": r.jira_ticket,
                     "build_count": len(r.build_history),
-                    "updated_at": r.updated_at.isoformat(),
+                    "created_at": r.created_at.isoformat(),
                 }
                 for r in records
             ],
@@ -138,12 +142,16 @@ async def create_investigation_record(
     confidence: float = 0.0,
     jira_ticket: str = "",
     build_id: str = "",
+    convergence_outcome: str = "",
 ) -> str:
     """Create a new Investigation Record.
 
     Call this when an investigation completes (convergence gate
-    fires) to persist the outcome for future dedup checks. The
-    record starts in OPEN state.
+    fires) to persist the outcome. Records are write-once — all
+    investigation data must be provided at creation time. The
+    record cannot be modified after creation except for build
+    history (append-only), Jira linkage (one-time), and state
+    transition (close).
     """
     provider = _get_provider()
     record = InvestigationRecord(
@@ -158,6 +166,9 @@ async def create_investigation_record(
         confidence=confidence,
         jira_ticket=jira_ticket,
     )
+
+    if convergence_outcome:
+        record.operational_metrics.convergence_outcome = convergence_outcome
 
     if build_id:
         record.build_history.append(
@@ -180,60 +191,6 @@ async def create_investigation_record(
 
 
 @mcp.tool()
-async def update_investigation_record(
-    investigation_id: str,
-    root_cause_summary: str = "",
-    confidence: float = -1,
-    jira_ticket: str = "",
-    convergence_outcome: str = "",
-) -> str:
-    """Update fields on an existing Investigation Record.
-
-    Use this to refine the root cause, update confidence, or
-    link a Jira ticket as the investigation progresses. Only
-    non-empty fields are updated.
-    """
-    provider = _get_provider()
-    updates: dict[str, Any] = {}
-    if root_cause_summary:
-        updates["root_cause_summary"] = root_cause_summary
-    if confidence >= 0:
-        updates["confidence"] = confidence
-    if jira_ticket:
-        updates["jira_ticket"] = jira_ticket
-    if convergence_outcome:
-        updates["operational_metrics"] = {
-            "convergence_outcome": convergence_outcome,
-        }
-
-    if not updates:
-        return json.dumps(
-            {
-                "status": "no_changes",
-                "message": "No fields to update",
-            }
-        )
-
-    try:
-        record = await provider.update(investigation_id, updates)
-        return json.dumps(
-            {
-                "status": "updated",
-                "investigation_id": investigation_id,
-                "confidence": record.confidence,
-            },
-            indent=2,
-        )
-    except KeyError:
-        return json.dumps(
-            {
-                "status": "not_found",
-                "message": (f"No record found: {investigation_id}"),
-            }
-        )
-
-
-@mcp.tool()
 async def append_build_history(
     investigation_id: str,
     build_id: str,
@@ -244,8 +201,8 @@ async def append_build_history(
 
     Call this when a known regression is detected in a new build
     — the agent skips the full investigation and records that the
-    regression is still present. Action should be FULL_INVESTIGATION
-    or SKIP_MATCHED.
+    regression is still present. Action should be
+    FULL_INVESTIGATION or SKIP_MATCHED.
     """
     provider = _get_provider()
     entry = BuildHistoryEntry(
@@ -274,14 +231,53 @@ async def append_build_history(
 
 
 @mcp.tool()
+async def link_jira_ticket(
+    investigation_id: str,
+    jira_ticket: str,
+) -> str:
+    """Link a Jira ticket to an Investigation Record.
+
+    This can only be done once per record. Use this when
+    the Jira ticket is created after the investigation
+    completes. Raises an error if a ticket is already linked.
+    """
+    provider = _get_provider()
+    try:
+        await provider.link_jira(investigation_id, jira_ticket)
+        return json.dumps(
+            {
+                "status": "linked",
+                "investigation_id": investigation_id,
+                "jira_ticket": jira_ticket,
+            },
+            indent=2,
+        )
+    except KeyError:
+        return json.dumps(
+            {
+                "status": "not_found",
+                "message": (f"No record found: {investigation_id}"),
+            }
+        )
+    except ValueError as e:
+        return json.dumps(
+            {
+                "status": "already_linked",
+                "message": str(e),
+            }
+        )
+
+
+@mcp.tool()
 async def close_investigation_record(
     investigation_id: str,
 ) -> str:
     """Mark an Investigation Record as resolved.
 
-    Call this when the regression is fixed and confirmed across
-    builds. The record remains queryable but won't match as an
-    open investigation for dedup purposes.
+    Call this when the regression is fixed and confirmed. The
+    record remains queryable but won't match as an open
+    investigation for dedup purposes. This is a one-way
+    transition — records cannot be reopened.
     """
     provider = _get_provider()
     try:

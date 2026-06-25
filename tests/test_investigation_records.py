@@ -156,30 +156,37 @@ async def test_create_persists_to_disk(
 
 
 @pytest.mark.asyncio
-async def test_update_fields(provider: FileRecordProvider):
-    """Update modifies fields and bumps updated_at."""
+async def test_link_jira(provider: FileRecordProvider):
+    """Link a Jira ticket to a record."""
     record = _make_record()
     rid = await provider.create(record)
 
-    updated = await provider.update(
-        rid,
-        {
-            "root_cause_summary": "Confirmed: queue refactoring",
-            "confidence": 0.95,
-        },
-    )
-    assert updated.root_cause_summary == "Confirmed: queue refactoring"
-    assert updated.confidence == 0.95
-    assert updated.updated_at > record.created_at
+    await provider.link_jira(rid, "RHIVOS-4821")
+
+    fetched = await provider.get(rid)
+    assert fetched is not None
+    assert fetched.jira_ticket == "RHIVOS-4821"
 
 
 @pytest.mark.asyncio
-async def test_update_nonexistent(
+async def test_link_jira_already_linked(
     provider: FileRecordProvider,
 ):
-    """Updating a nonexistent record raises KeyError."""
+    """Linking a second Jira ticket raises ValueError."""
+    record = _make_record(jira_ticket="RHIVOS-0001")
+    rid = await provider.create(record)
+
+    with pytest.raises(ValueError, match="already linked"):
+        await provider.link_jira(rid, "RHIVOS-0002")
+
+
+@pytest.mark.asyncio
+async def test_link_jira_nonexistent(
+    provider: FileRecordProvider,
+):
+    """Linking to a nonexistent record raises KeyError."""
     with pytest.raises(KeyError):
-        await provider.update("RCA-NOPE", {"confidence": 0.5})
+        await provider.link_jira("RCA-NOPE", "RHIVOS-0001")
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,11 @@ Stores each record as a JSON file in a configurable directory.
 This is the default backend for development and testing — no
 external services required.
 
+Records are write-once: the JSON file is created by create()
+and the investigation data within it is never modified. Only
+build history (append-only), Jira linkage (one-time), and
+lifecycle state (OPEN -> RESOLVED) can change.
+
 Records are stored as:
     {persist_dir}/{investigation_id}.json
 """
@@ -14,7 +19,6 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from .base import InvestigationRecordProvider
 from .models import (
@@ -60,9 +64,12 @@ class FileRecordProvider(InvestigationRecordProvider):
             return None
 
     async def create(self, record: InvestigationRecord) -> str:
-        """Store a new record. Returns the investigation_id."""
+        """Store a new record. Returns the investigation_id.
+
+        All investigation data must be set on the record before
+        calling this. The record becomes immutable after creation.
+        """
         record.created_at = datetime.now(timezone.utc)
-        record.updated_at = record.created_at
         self._write(record)
         logger.info(f"[investigation] Created record {record.investigation_id}")
         return record.investigation_id
@@ -108,57 +115,55 @@ class FileRecordProvider(InvestigationRecordProvider):
             if len(results) >= limit:
                 break
 
-        # Sort by updated_at descending
-        results.sort(key=lambda r: r.updated_at, reverse=True)
+        # Sort by created_at descending
+        results.sort(key=lambda r: r.created_at, reverse=True)
         return results
-
-    async def update(
-        self,
-        investigation_id: str,
-        updates: dict[str, Any],
-    ) -> InvestigationRecord:
-        """Update fields on an existing record."""
-        record = await self.get(investigation_id)
-        if record is None:
-            raise KeyError(f"Record not found: {investigation_id}")
-
-        # Apply updates to the model
-        data = record.model_dump()
-        for key, value in updates.items():
-            if key in data:
-                data[key] = value
-        data["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        record = InvestigationRecord.model_validate(data)
-        self._write(record)
-        logger.info(f"[investigation] Updated record {investigation_id}")
-        return record
 
     async def append_build_history(
         self,
         investigation_id: str,
         entry: BuildHistoryEntry,
     ) -> None:
-        """Append a build history entry to an existing record."""
+        """Append a build history entry to an existing record.
+
+        Append-only — existing entries are never modified.
+        """
         record = await self.get(investigation_id)
         if record is None:
             raise KeyError(f"Record not found: {investigation_id}")
 
         record.build_history.append(entry)
-        record.updated_at = datetime.now(timezone.utc)
         self._write(record)
         logger.info(
             f"[investigation] Appended build history to "
             f"{investigation_id}: {entry.build_id}"
         )
 
+    async def link_jira(
+        self,
+        investigation_id: str,
+        jira_ticket: str,
+    ) -> None:
+        """Link a Jira ticket to a record (one-time only)."""
+        record = await self.get(investigation_id)
+        if record is None:
+            raise KeyError(f"Record not found: {investigation_id}")
+
+        if record.jira_ticket:
+            raise ValueError(
+                f"Record {investigation_id} already linked to {record.jira_ticket}"
+            )
+
+        record.jira_ticket = jira_ticket
+        self._write(record)
+        logger.info(f"[investigation] Linked {investigation_id} to {jira_ticket}")
+
     async def close_record(self, investigation_id: str) -> None:
-        """Mark a record as resolved."""
+        """Mark a record as resolved (one-way transition)."""
         record = await self.get(investigation_id)
         if record is None:
             raise KeyError(f"Record not found: {investigation_id}")
 
         record.state = InvestigationState.RESOLVED
-        record.updated_at = datetime.now(timezone.utc)
         self._write(record)
         logger.info(f"[investigation] Closed record {investigation_id}")

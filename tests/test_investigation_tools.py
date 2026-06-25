@@ -1,7 +1,8 @@
 """Tests for Investigation Record MCP server tools.
 
 Tests the tool functions directly (without MCP transport) to verify
-they correctly wrap the provider interface.
+they correctly wrap the provider interface. Records are write-once;
+tests verify immutability constraints.
 """
 
 from __future__ import annotations
@@ -12,16 +13,13 @@ from unittest.mock import patch
 
 import pytest
 
-# Import the tool functions directly from the server module.
-# They use _get_provider() internally, which we patch to use
-# a file provider with a temp directory.
 from agents.investigation.server import (
     append_build_history,
     close_investigation_record,
     create_investigation_record,
     get_investigation_record,
+    link_jira_ticket,
     query_investigation_records,
-    update_investigation_record,
 )
 from providers.investigation.file import FileRecordProvider
 
@@ -55,6 +53,7 @@ async def test_create_record():
             root_cause_summary="virtio-blk regression",
             confidence=0.92,
             build_id="2026.05.14",
+            convergence_outcome="ISOLATION",
         )
     )
     assert result["status"] == "created"
@@ -144,7 +143,11 @@ async def test_query_filters_by_state():
     open_result = json.loads(await query_investigation_records(state="open"))
     assert open_result["count"] == 1
 
-    resolved_result = json.loads(await query_investigation_records(state="resolved"))
+    resolved_result = json.loads(
+        await query_investigation_records(
+            state="resolved",
+        )
+    )
     assert resolved_result["count"] == 1
 
 
@@ -175,61 +178,6 @@ async def test_get_nonexistent_record():
     """Get a nonexistent record returns found=False."""
     result = json.loads(await get_investigation_record("RCA-NONEXIST"))
     assert result["found"] is False
-
-
-# --- Update ---
-
-
-@pytest.mark.asyncio
-async def test_update_record():
-    """Update modifies fields on an existing record."""
-    create_result = json.loads(
-        await create_investigation_record(
-            subsystem="storage_io",
-            metric="iops",
-        )
-    )
-    rid = create_result["investigation_id"]
-
-    update_result = json.loads(
-        await update_investigation_record(
-            investigation_id=rid,
-            root_cause_summary="Confirmed: queue refactoring",
-            confidence=0.95,
-            jira_ticket="RHIVOS-4821",
-        )
-    )
-    assert update_result["status"] == "updated"
-    assert update_result["confidence"] == 0.95
-
-    # Verify via get
-    get_result = json.loads(await get_investigation_record(rid))
-    record = get_result["record"]
-    assert record["root_cause_summary"] == "Confirmed: queue refactoring"
-    assert record["jira_ticket"] == "RHIVOS-4821"
-
-
-@pytest.mark.asyncio
-async def test_update_nonexistent():
-    """Update a nonexistent record returns not_found."""
-    result = json.loads(
-        await update_investigation_record(
-            investigation_id="RCA-NONEXIST",
-            confidence=0.5,
-        )
-    )
-    assert result["status"] == "not_found"
-
-
-@pytest.mark.asyncio
-async def test_update_no_changes():
-    """Update with no fields returns no_changes."""
-    result = json.loads(
-        await update_investigation_record(
-            investigation_id="RCA-WHATEVER",
-        )
-    )
-    assert result["status"] == "no_changes"
 
 
 # --- Build history ---
@@ -272,6 +220,66 @@ async def test_append_build_history_nonexistent():
         await append_build_history(
             investigation_id="RCA-NONEXIST",
             build_id="2026.05.14",
+        )
+    )
+    assert result["status"] == "not_found"
+
+
+# --- Link Jira ---
+
+
+@pytest.mark.asyncio
+async def test_link_jira_ticket():
+    """Link a Jira ticket to a record."""
+    create_result = json.loads(
+        await create_investigation_record(
+            subsystem="storage_io",
+            metric="iops",
+        )
+    )
+    rid = create_result["investigation_id"]
+
+    result = json.loads(
+        await link_jira_ticket(
+            investigation_id=rid,
+            jira_ticket="RHIVOS-4821",
+        )
+    )
+    assert result["status"] == "linked"
+
+    # Verify via get
+    get_result = json.loads(await get_investigation_record(rid))
+    assert get_result["record"]["jira_ticket"] == "RHIVOS-4821"
+
+
+@pytest.mark.asyncio
+async def test_link_jira_already_linked():
+    """Linking a second Jira ticket is rejected."""
+    create_result = json.loads(
+        await create_investigation_record(
+            subsystem="storage_io",
+            metric="iops",
+            jira_ticket="RHIVOS-0001",
+        )
+    )
+    rid = create_result["investigation_id"]
+
+    result = json.loads(
+        await link_jira_ticket(
+            investigation_id=rid,
+            jira_ticket="RHIVOS-0002",
+        )
+    )
+    assert result["status"] == "already_linked"
+
+
+@pytest.mark.asyncio
+async def test_link_jira_nonexistent():
+    """Linking to nonexistent record returns not_found."""
+    result = json.loads(
+        await link_jira_ticket(
+            investigation_id="RCA-NONEXIST",
+            jira_ticket="RHIVOS-0001",
         )
     )
     assert result["status"] == "not_found"
