@@ -1,0 +1,280 @@
+{
+  "$defs": {
+    "AnomalyContext": {
+      "description": "What was detected \u2014 the trigger for the investigation.",
+      "properties": {
+        "subsystem": {
+          "title": "Subsystem",
+          "type": "string"
+        },
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "direction": {
+          "default": "degrading",
+          "title": "Direction",
+          "type": "string"
+        },
+        "platform": {
+          "default": "",
+          "title": "Platform",
+          "type": "string"
+        },
+        "magnitude": {
+          "default": "",
+          "title": "Magnitude",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subsystem",
+        "metric"
+      ],
+      "title": "AnomalyContext",
+      "type": "object"
+    },
+    "BuildHistoryEntry": {
+      "description": "Tracks a regression across nightly builds.",
+      "properties": {
+        "build_id": {
+          "title": "Build Id",
+          "type": "string"
+        },
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "comment": {
+          "default": "",
+          "title": "Comment",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        }
+      },
+      "required": [
+        "build_id",
+        "action"
+      ],
+      "title": "BuildHistoryEntry",
+      "type": "object"
+    },
+    "ChangeAttribution": {
+      "description": "Links a regression to specific code changes.",
+      "properties": {
+        "classification": {
+          "default": "",
+          "title": "Classification",
+          "type": "string"
+        },
+        "causal_commits": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Causal Commits",
+          "type": "array"
+        },
+        "change_summary": {
+          "default": "",
+          "title": "Change Summary",
+          "type": "string"
+        },
+        "trade_off_assessment": {
+          "additionalProperties": true,
+          "title": "Trade Off Assessment",
+          "type": "object"
+        }
+      },
+      "title": "ChangeAttribution",
+      "type": "object"
+    },
+    "InvestigationState": {
+      "description": "Lifecycle state of an investigation.",
+      "enum": [
+        "open",
+        "resolved",
+        "expected"
+      ],
+      "title": "InvestigationState",
+      "type": "string"
+    },
+    "OperationalMetrics": {
+      "description": "How the agent worked \u2014 cycle counts, timing, convergence.",
+      "properties": {
+        "provision_cycles": {
+          "default": 0,
+          "title": "Provision Cycles",
+          "type": "integer"
+        },
+        "wall_clock_mins": {
+          "default": 0.0,
+          "title": "Wall Clock Mins",
+          "type": "number"
+        },
+        "convergence_outcome": {
+          "default": "",
+          "title": "Convergence Outcome",
+          "type": "string"
+        },
+        "info_gain_trajectory": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Info Gain Trajectory",
+          "type": "array"
+        },
+        "stall_events": {
+          "default": 0,
+          "title": "Stall Events",
+          "type": "integer"
+        },
+        "resource_consumption": {
+          "$ref": "#/$defs/ResourceConsumption"
+        },
+        "mcp_calls": {
+          "additionalProperties": true,
+          "title": "Mcp Calls",
+          "type": "object"
+        }
+      },
+      "title": "OperationalMetrics",
+      "type": "object"
+    },
+    "ResourceConsumption": {
+      "description": "Cost and resource usage for an investigation.",
+      "properties": {
+        "llm_tokens_total": {
+          "default": 0,
+          "title": "Llm Tokens Total",
+          "type": "integer"
+        },
+        "llm_invocations": {
+          "default": 0,
+          "title": "Llm Invocations",
+          "type": "integer"
+        },
+        "estimated_cost_usd": {
+          "default": 0.0,
+          "title": "Estimated Cost Usd",
+          "type": "number"
+        },
+        "hardware_time_mins": {
+          "default": 0.0,
+          "title": "Hardware Time Mins",
+          "type": "number"
+        },
+        "by_cycle": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "By Cycle",
+          "type": "array"
+        }
+      },
+      "title": "ResourceConsumption",
+      "type": "object"
+    },
+    "SkillApplied": {
+      "description": "Records which Investigation Skill was used.",
+      "properties": {
+        "skill_id": {
+          "default": "",
+          "title": "Skill Id",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "accelerated_convergence": {
+          "default": false,
+          "title": "Accelerated Convergence",
+          "type": "boolean"
+        },
+        "cycles_saved_estimate": {
+          "default": 0,
+          "title": "Cycles Saved Estimate",
+          "type": "integer"
+        }
+      },
+      "title": "SkillApplied",
+      "type": "object"
+    }
+  },
+  "description": "A complete investigation outcome.\n\nThis is the core data model for cross-investigation memory.\nEach record captures what was found, how the agent worked,\nand which builds have shown the regression.",
+  "properties": {
+    "schema_version": {
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "investigation_id": {
+      "title": "Investigation Id",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/InvestigationState",
+      "default": "open"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "anomaly_context": {
+      "$ref": "#/$defs/AnomalyContext"
+    },
+    "root_cause_summary": {
+      "default": "",
+      "title": "Root Cause Summary",
+      "type": "string"
+    },
+    "jira_ticket": {
+      "default": "",
+      "title": "Jira Ticket",
+      "type": "string"
+    },
+    "confidence": {
+      "default": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "change_attribution": {
+      "$ref": "#/$defs/ChangeAttribution"
+    },
+    "operational_metrics": {
+      "$ref": "#/$defs/OperationalMetrics"
+    },
+    "build_history": {
+      "items": {
+        "$ref": "#/$defs/BuildHistoryEntry"
+      },
+      "title": "Build History",
+      "type": "array"
+    },
+    "skill_applied": {
+      "$ref": "#/$defs/SkillApplied"
+    },
+    "trace_ref": {
+      "default": "",
+      "title": "Trace Ref",
+      "type": "string"
+    }
+  },
+  "required": [
+    "anomaly_context"
+  ],
+  "title": "InvestigationRecord",
+  "type": "object"
+}
