@@ -13,6 +13,20 @@ import pytest
 
 from providers.events import CumulativeUsage, EventBus
 
+# Skip tests that need OpenTelemetry when it's not installed
+# (telemetry deps are optional: pip install -e ".[telemetry]")
+try:
+    import opentelemetry.sdk  # noqa: F401
+
+    has_otlp = True
+except ImportError:
+    has_otlp = False
+
+requires_otlp = pytest.mark.skipif(
+    not has_otlp,
+    reason="opentelemetry-sdk not installed",
+)
+
 # --- CumulativeUsage ---
 
 
@@ -106,6 +120,7 @@ def test_eventbus_usage_per_ticket(event_bus: EventBus):
 # --- Span processor ---
 
 
+@requires_otlp
 def test_span_processor_extracts_usage(
     event_bus: EventBus,
 ):
@@ -139,6 +154,7 @@ def test_span_processor_extracts_usage(
     assert "claude-sonnet-4-6" in d["models_used"]
 
 
+@requires_otlp
 def test_span_processor_anthropic_attribute_names(
     event_bus: EventBus,
 ):
@@ -173,6 +189,7 @@ def test_span_processor_anthropic_attribute_names(
     assert d["total_duration_ms"] == 1500
 
 
+@requires_otlp
 def test_span_processor_ignores_non_llm_spans(
     event_bus: EventBus,
 ):
@@ -195,6 +212,7 @@ def test_span_processor_ignores_non_llm_spans(
     assert d["llm_calls"] == 0
 
 
+@requires_otlp
 def test_span_processor_ignores_missing_ticket(
     event_bus: EventBus,
 ):
@@ -223,6 +241,7 @@ def test_span_processor_ignores_missing_ticket(
 # --- Ticket context ---
 
 
+@requires_otlp
 def test_ticket_context_roundtrip():
     """Set and get ticket ID from OpenTelemetry context."""
     from providers.telemetry import (
@@ -285,6 +304,7 @@ def test_eventbus_agent_usage_empty(event_bus: EventBus):
     assert agents == {}
 
 
+@requires_otlp
 def test_span_processor_captures_agent(
     event_bus: EventBus,
 ):
@@ -316,6 +336,7 @@ def test_span_processor_captures_agent(
 # --- Span processor event emission ---
 
 
+@requires_otlp
 def test_span_processor_emits_llm_usage_event(
     event_bus: EventBus,
 ):
