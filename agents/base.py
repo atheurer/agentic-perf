@@ -81,7 +81,12 @@ class AgentBase(ABC):
                         set_ticket_context,
                     )
 
-                    tok = context.attach(set_ticket_context(ticket_id))
+                    tok = context.attach(
+                        set_ticket_context(
+                            ticket_id,
+                            self.agent_name,
+                        )
+                    )
                 except ImportError:
                     tok = None
 

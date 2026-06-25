@@ -41,21 +41,28 @@ from opentelemetry.semconv_ai import SpanAttributes
 
 logger = logging.getLogger(__name__)
 
-# Context key for ticket ID correlation. Set by the agent
-# loop before each LLM call so span processors can
-# attribute usage to the right ticket.
+# Context keys for correlation. Set by the agent loop
+# before each LLM call so span processors can attribute
+# usage to the right ticket and agent.
 _TICKET_ID_KEY = context.create_key("agentic_perf.ticket_id")
+_AGENT_NAME_KEY = context.create_key("agentic_perf.agent_name")
 
 
-def set_ticket_context(ticket_id: str) -> Context:
-    """Set the ticket ID in the current OpenTelemetry context.
+def set_ticket_context(
+    ticket_id: str,
+    agent_name: str = "",
+) -> Context:
+    """Set ticket and agent in the OpenTelemetry context.
 
     Call this in the agent loop before making LLM calls so
     that span processors can correlate token usage to the
-    ticket.
+    ticket and agent.
     """
     ctx = context.get_current()
-    return context.set_value(_TICKET_ID_KEY, ticket_id, ctx)
+    ctx = context.set_value(_TICKET_ID_KEY, ticket_id, ctx)
+    if agent_name:
+        ctx = context.set_value(_AGENT_NAME_KEY, agent_name, ctx)
+    return ctx
 
 
 def get_ticket_from_context(
@@ -64,6 +71,14 @@ def get_ticket_from_context(
     """Get the ticket ID from the OpenTelemetry context."""
     ctx = ctx or context.get_current()
     return context.get_value(_TICKET_ID_KEY, ctx)
+
+
+def get_agent_from_context(
+    ctx: Context | None = None,
+) -> str | None:
+    """Get the agent name from the OpenTelemetry context."""
+    ctx = ctx or context.get_current()
+    return context.get_value(_AGENT_NAME_KEY, ctx)
 
 
 class EventBusSpanProcessor(SpanProcessor):
@@ -82,10 +97,14 @@ class EventBusSpanProcessor(SpanProcessor):
         span: ReadableSpan,
         parent_context: Context | None = None,
     ) -> None:
-        """Store ticket ID on the span for later retrieval."""
+        """Store ticket and agent on the span."""
         ticket_id = get_ticket_from_context(parent_context)
-        if ticket_id and hasattr(span, "set_attribute"):
-            span.set_attribute("agentic_perf.ticket_id", ticket_id)
+        agent_name = get_agent_from_context(parent_context)
+        if hasattr(span, "set_attribute"):
+            if ticket_id:
+                span.set_attribute("agentic_perf.ticket_id", ticket_id)
+            if agent_name:
+                span.set_attribute("agentic_perf.agent_name", agent_name)
 
     def on_end(self, span: ReadableSpan) -> None:
         """Process completed spans for token accounting."""
@@ -121,6 +140,8 @@ class EventBusSpanProcessor(SpanProcessor):
             attrs.get("gen_ai.request.model", "unknown"),
         )
 
+        agent_name = attrs.get("agentic_perf.agent_name", "")
+
         # Record in the EventBus
         if hasattr(self._event_bus, "record_llm_usage"):
             self._event_bus.record_llm_usage(
@@ -129,6 +150,7 @@ class EventBusSpanProcessor(SpanProcessor):
                 output_tokens=int(output_tokens or 0),
                 duration_ms=int(duration_ms),
                 model=str(model),
+                agent_name=str(agent_name),
             )
 
     def shutdown(self) -> None:

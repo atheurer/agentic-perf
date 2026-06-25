@@ -1016,9 +1016,29 @@ async function updateUsageSidebar(ticketId) {
         'Est. <span style="color:var(--yellow)">' + costStr + '</span>' +
       '</div>' +
       (u.models_used.length > 0 ?
-        '<div style="font-size:10px; color:var(--text-muted)">' +
+        '<div style="font-size:10px; color:var(--text-muted); margin-bottom:4px">' +
           u.models_used.join(', ') +
         '</div>' : '');
+    // Per-agent breakdown
+    var agents = data.by_agent || {};
+    var agentNames = Object.keys(agents);
+    if (agentNames.length > 1) {
+      var agentHtml = '<div style="margin-top:6px; border-top:1px solid var(--border); padding-top:4px; font-size:11px">';
+      agentHtml += '<div style="color:var(--text-muted); margin-bottom:2px">By agent:</div>';
+      for (var ai = 0; ai < agentNames.length; ai++) {
+        var an = agentNames[ai];
+        var au = agents[an];
+        var acost = au.estimated_cost_usd;
+        var acostStr = acost < 0.01 ? '<$0.01' : '$' + acost.toFixed(3);
+        agentHtml += '<div style="margin-bottom:2px">' +
+          '<span style="color:var(--cyan)">' + an.replace('-agent', '') + '</span> ' +
+          au.total_tokens.toLocaleString() + 't ' +
+          acostStr +
+        '</div>';
+      }
+      agentHtml += '</div>';
+      el.innerHTML += agentHtml;
+    }
   } catch {}
 }
 

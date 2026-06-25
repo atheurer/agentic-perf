@@ -198,3 +198,81 @@ def test_ticket_context_roundtrip():
     ctx = set_ticket_context("PERF-CTX001")
     ticket = get_ticket_from_context(ctx)
     assert ticket == "PERF-CTX001"
+
+
+# --- Per-agent tracking ---
+
+
+def test_eventbus_per_agent_usage(event_bus: EventBus):
+    """Usage is tracked per agent within a ticket."""
+    event_bus.record_llm_usage(
+        "PERF-A",
+        100,
+        50,
+        500,
+        model="claude-sonnet-4-6",
+        agent_name="triage-agent",
+    )
+    event_bus.record_llm_usage(
+        "PERF-A",
+        200,
+        80,
+        700,
+        model="claude-sonnet-4-6",
+        agent_name="benchmark-agent",
+    )
+    event_bus.record_llm_usage(
+        "PERF-A",
+        150,
+        60,
+        400,
+        model="claude-sonnet-4-6",
+        agent_name="triage-agent",
+    )
+
+    # Ticket total
+    total = event_bus.get_cumulative_usage("PERF-A")
+    assert total["input_tokens"] == 450
+    assert total["llm_calls"] == 3
+
+    # Per-agent breakdown
+    agents = event_bus.get_agent_usage("PERF-A")
+    assert len(agents) == 2
+    assert agents["triage-agent"]["input_tokens"] == 250
+    assert agents["triage-agent"]["llm_calls"] == 2
+    assert agents["benchmark-agent"]["input_tokens"] == 200
+    assert agents["benchmark-agent"]["llm_calls"] == 1
+
+
+def test_eventbus_agent_usage_empty(event_bus: EventBus):
+    """No agent usage returns empty dict."""
+    agents = event_bus.get_agent_usage("PERF-NONE")
+    assert agents == {}
+
+
+def test_span_processor_captures_agent(
+    event_bus: EventBus,
+):
+    """Span processor passes agent name to EventBus."""
+    from providers.telemetry import (
+        EventBusSpanProcessor,
+    )
+
+    processor = EventBusSpanProcessor(event_bus)
+
+    span = MagicMock()
+    span.attributes = {
+        "gen_ai.request.model": "claude-sonnet-4-6",
+        "gen_ai.usage.prompt_tokens": 100,
+        "gen_ai.usage.completion_tokens": 50,
+        "agentic_perf.ticket_id": "PERF-AGENT1",
+        "agentic_perf.agent_name": "review-agent",
+    }
+    span.start_time = 1000000000
+    span.end_time = 2000000000
+
+    processor.on_end(span)
+
+    agents = event_bus.get_agent_usage("PERF-AGENT1")
+    assert "review-agent" in agents
+    assert agents["review-agent"]["input_tokens"] == 100

@@ -135,14 +135,19 @@ class EventBus:
         output_tokens: int,
         duration_ms: int,
         model: str = "",
+        agent_name: str = "",
     ) -> None:
         """Accumulate LLM token usage for a ticket.
 
         Called by the OTLP span processor when a GenAI span
         completes. Can also be called directly for providers
         that don't use OTLP instrumentation.
+
+        Usage is tracked both at the ticket level and per
+        agent within the ticket.
         """
         with self._lock:
+            # Ticket-level accumulation
             if ticket_id not in self._cumulative:
                 self._cumulative[ticket_id] = CumulativeUsage()
             self._cumulative[ticket_id].record(
@@ -152,12 +157,38 @@ class EventBus:
                 model,
             )
 
+            # Per-agent accumulation
+            if agent_name:
+                agent_key = f"{ticket_id}:{agent_name}"
+                if agent_key not in self._cumulative:
+                    self._cumulative[agent_key] = CumulativeUsage()
+                self._cumulative[agent_key].record(
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    model,
+                )
+
     def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
         """Get accumulated LLM usage for a ticket."""
         usage = self._cumulative.get(ticket_id)
         if usage is None:
             return CumulativeUsage().to_dict()
         return usage.to_dict()
+
+    def get_agent_usage(self, ticket_id: str) -> dict[str, dict[str, Any]]:
+        """Get per-agent LLM usage breakdown for a ticket.
+
+        Returns a dict of agent_name -> usage dict. Only
+        includes agents that have recorded usage.
+        """
+        result = {}
+        prefix = f"{ticket_id}:"
+        for key, usage in self._cumulative.items():
+            if key.startswith(prefix):
+                agent_name = key[len(prefix) :]
+                result[agent_name] = usage.to_dict()
+        return result
 
     def get_events(
         self,
