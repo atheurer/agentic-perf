@@ -1158,6 +1158,9 @@ function renderEvent(evt) {
     case 'llm_response':
       return renderLlmResponse(ts, data);
 
+    case 'llm_usage':
+      return renderLlmUsage(ts, data);
+
     case 'tool_called':
       return renderToolCalled(ts, data);
 
@@ -1275,10 +1278,24 @@ function renderLlmResponse(ts, data) {
     '<span class="event-ts">' + ts + '</span>' +
     '<span class="event-label label-llm">LLM RESPONSE</span>' +
     '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop +
-      (data.input_tokens ? ' | ' + data.input_tokens.toLocaleString() + ' in &middot; ' + data.output_tokens.toLocaleString() + ' out' : '') +
       (data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '') +
     '</span>' +
     textHtml + toolsHtml +
+  '</div>';
+}
+
+function renderLlmUsage(ts, data) {
+  var inTok = (data.input_tokens || 0).toLocaleString();
+  var outTok = (data.output_tokens || 0).toLocaleString();
+  var model = data.model || '';
+  var dur = data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '';
+  return '<div class="event">' +
+    '<span class="event-ts">' + ts + '</span>' +
+    '<span class="event-label" style="background:var(--cyan); color:#000">TOKENS</span>' +
+    '<span style="color:var(--text-muted); font-size:12px;">' +
+      inTok + ' in &middot; ' + outTok + ' out' + dur +
+      (model ? ' &middot; ' + escHtml(model) : '') +
+    '</span>' +
   '</div>';
 }
 

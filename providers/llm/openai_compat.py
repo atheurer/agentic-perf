@@ -177,12 +177,9 @@ class OpenAICompatLLMProvider(LLMProvider):
         else:
             stop_reason = finish_reason or "end_turn"
 
-        usage = getattr(response, "usage", None)
         return LLMResponse(
             text=text,
             tool_calls=tool_calls,
             stop_reason=stop_reason,
             raw_content=raw_content,
-            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
         )

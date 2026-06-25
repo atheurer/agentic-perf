@@ -32,10 +32,6 @@ class LLMResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"
     raw_content: list[dict[str, Any]] = field(default_factory=list)
-    # Token usage from the API response. Populated by
-    # providers that have access to usage data.
-    input_tokens: int = 0
-    output_tokens: int = 0
 
 
 class LLMProvider(ABC):

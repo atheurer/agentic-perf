@@ -72,14 +72,11 @@ class ClaudeLLMProvider(LLMProvider):
                     }
                 )
 
-        usage = getattr(response, "usage", None)
         return LLMResponse(
             text="\n".join(text_parts) if text_parts else None,
             tool_calls=tool_calls,
             stop_reason=response.stop_reason,
             raw_content=raw_content,
-            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
         )
 
     async def complete(

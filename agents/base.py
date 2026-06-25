@@ -109,24 +109,8 @@ class AgentBase(ABC):
                         "text_length": (len(response.text) if response.text else 0),
                         "text": response.text,
                         "raw_content": response.raw_content,
-                        "input_tokens": response.input_tokens,
-                        "output_tokens": response.output_tokens,
                     },
                 )
-
-                # Record token usage for per-ticket
-                # accounting. This uses direct extraction
-                # from the API response, not OTLP context
-                # propagation, to avoid thread-boundary
-                # issues with asyncio.to_thread.
-                if self._events and (response.input_tokens or response.output_tokens):
-                    self._events.record_llm_usage(
-                        ticket_id=ticket_id,
-                        input_tokens=response.input_tokens,
-                        output_tokens=response.output_tokens,
-                        duration_ms=0,
-                        agent_name=self.agent_name,
-                    )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     await self._handle_completion(ticket_id, response)

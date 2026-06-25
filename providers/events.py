@@ -22,6 +22,7 @@ EVENT_TYPES = {
     "tool_skipped",
     "transition",
     "comment",
+    "llm_usage",
 }
 
 

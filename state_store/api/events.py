@@ -60,10 +60,9 @@ def get_transcript(
 def get_usage(ticket_id: str, request: Request):
     """Get cumulative LLM token usage and estimated cost.
 
-    Computes usage from stored events (llm_response events
-    contain input_tokens and output_tokens). This works
-    across process boundaries since events are persisted
-    to JSONL files.
+    Computes usage from stored llm_usage events emitted by
+    the OTLP span processor. This works across process
+    boundaries since events are persisted to JSONL files.
     """
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
@@ -85,13 +84,15 @@ def get_usage(ticket_id: str, request: Request):
     total_duration = 0
     by_agent: dict[str, dict] = {}
 
+    models_seen: set[str] = set()
     for evt in events:
-        if evt.get("event_type") != "llm_response":
+        if evt.get("event_type") != "llm_usage":
             continue
         data = evt.get("data", {})
         in_tok = data.get("input_tokens", 0) or 0
         out_tok = data.get("output_tokens", 0) or 0
         dur = data.get("duration_ms", 0) or 0
+        model = data.get("model", "")
 
         if not in_tok and not out_tok:
             continue
@@ -100,9 +101,11 @@ def get_usage(ticket_id: str, request: Request):
         total_out += out_tok
         total_duration += dur
         llm_calls += 1
+        if model:
+            models_seen.add(model)
 
         agent = evt.get("agent", "")
-        if agent:
+        if agent and agent != "system":
             if agent not in by_agent:
                 by_agent[agent] = {
                     "input_tokens": 0,
@@ -124,7 +127,7 @@ def get_usage(ticket_id: str, request: Request):
         "total_tokens": total_in + total_out,
         "llm_calls": llm_calls,
         "total_duration_ms": total_duration,
-        "models_used": [],
+        "models_used": sorted(models_seen),
     }
 
     # Per-agent cost estimates

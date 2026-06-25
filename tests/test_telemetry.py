@@ -117,6 +117,7 @@ def test_span_processor_extracts_usage(
     processor = EventBusSpanProcessor(event_bus)
 
     # Create a mock span with GenAI attributes
+    # using the legacy prompt_tokens/completion_tokens names
     span = MagicMock()
     span.attributes = {
         "gen_ai.request.model": "claude-sonnet-4-6",
@@ -136,6 +137,40 @@ def test_span_processor_extracts_usage(
     assert d["llm_calls"] == 1
     assert d["total_duration_ms"] == 2000
     assert "claude-sonnet-4-6" in d["models_used"]
+
+
+def test_span_processor_anthropic_attribute_names(
+    event_bus: EventBus,
+):
+    """Span processor handles the input_tokens/output_tokens
+    names that the Anthropic instrumentor emits (different from
+    the semconv prompt_tokens/completion_tokens).
+    """
+    from providers.telemetry import (
+        EventBusSpanProcessor,
+    )
+
+    processor = EventBusSpanProcessor(event_bus)
+
+    span = MagicMock()
+    span.attributes = {
+        "gen_ai.request.model": "claude-sonnet-4-6",
+        "gen_ai.usage.input_tokens": 200,
+        "gen_ai.usage.output_tokens": 100,
+        "agentic_perf.ticket_id": "PERF-SPAN02",
+        "agentic_perf.agent_name": "triage-agent",
+    }
+    span.start_time = 1000000000
+    span.end_time = 2500000000
+
+    processor.on_end(span)
+
+    d = event_bus.get_cumulative_usage("PERF-SPAN02")
+    assert d["input_tokens"] == 200
+    assert d["output_tokens"] == 100
+    assert d["total_tokens"] == 300
+    assert d["llm_calls"] == 1
+    assert d["total_duration_ms"] == 1500
 
 
 def test_span_processor_ignores_non_llm_spans(
@@ -276,6 +311,46 @@ def test_span_processor_captures_agent(
     agents = event_bus.get_agent_usage("PERF-AGENT1")
     assert "review-agent" in agents
     assert agents["review-agent"]["input_tokens"] == 100
+
+
+# --- Span processor event emission ---
+
+
+def test_span_processor_emits_llm_usage_event(
+    event_bus: EventBus,
+):
+    """Span processor emits a llm_usage event to the
+    EventBus JSONL log so the state store process can
+    compute usage from persisted events.
+    """
+    from providers.telemetry import (
+        EventBusSpanProcessor,
+    )
+
+    processor = EventBusSpanProcessor(event_bus)
+
+    span = MagicMock()
+    span.attributes = {
+        "gen_ai.request.model": "claude-sonnet-4-6",
+        "gen_ai.usage.input_tokens": 300,
+        "gen_ai.usage.output_tokens": 120,
+        "agentic_perf.ticket_id": "PERF-EVT01",
+        "agentic_perf.agent_name": "benchmark-agent",
+    }
+    span.start_time = 1000000000
+    span.end_time = 3000000000
+
+    processor.on_end(span)
+
+    events = event_bus.get_events("PERF-EVT01")
+    usage_events = [e for e in events if e["event_type"] == "llm_usage"]
+    assert len(usage_events) == 1
+    evt = usage_events[0]
+    assert evt["agent"] == "benchmark-agent"
+    assert evt["data"]["input_tokens"] == 300
+    assert evt["data"]["output_tokens"] == 120
+    assert evt["data"]["duration_ms"] == 2000
+    assert evt["data"]["model"] == "claude-sonnet-4-6"
 
 
 # --- Global usage ---

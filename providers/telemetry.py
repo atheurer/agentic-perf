@@ -120,14 +120,19 @@ class EventBusSpanProcessor(SpanProcessor):
         if not ticket_id:
             return
 
-        # Extract token usage from span attributes
-        input_tokens = attrs.get(
-            SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
-            attrs.get("gen_ai.usage.prompt_tokens", 0),
+        # Extract token usage from span attributes.
+        # The semconv library uses prompt_tokens/completion_tokens
+        # but the Anthropic instrumentor emits input_tokens/
+        # output_tokens — check both naming conventions.
+        input_tokens = (
+            attrs.get(SpanAttributes.LLM_USAGE_PROMPT_TOKENS)
+            or attrs.get("gen_ai.usage.input_tokens")
+            or 0
         )
-        output_tokens = attrs.get(
-            SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
-            attrs.get("gen_ai.usage.completion_tokens", 0),
+        output_tokens = (
+            attrs.get(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS)
+            or attrs.get("gen_ai.usage.output_tokens")
+            or 0
         )
 
         # Calculate duration from span timestamps
@@ -142,15 +147,39 @@ class EventBusSpanProcessor(SpanProcessor):
 
         agent_name = attrs.get("agentic_perf.agent_name", "")
 
-        # Record in the EventBus
+        # Record in the EventBus: both in-memory accumulation
+        # (for the orchestrator) and a persisted event (for the
+        # state store, which is a separate process).
+        ticket_str = str(ticket_id)
+        agent_str = str(agent_name)
+        in_tok = int(input_tokens or 0)
+        out_tok = int(output_tokens or 0)
+        dur_ms = int(duration_ms)
+        model_str = str(model)
+
         if hasattr(self._event_bus, "record_llm_usage"):
             self._event_bus.record_llm_usage(
-                ticket_id=str(ticket_id),
-                input_tokens=int(input_tokens or 0),
-                output_tokens=int(output_tokens or 0),
-                duration_ms=int(duration_ms),
-                model=str(model),
-                agent_name=str(agent_name),
+                ticket_id=ticket_str,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                duration_ms=dur_ms,
+                model=model_str,
+                agent_name=agent_str,
+            )
+
+        # Persist as an event so the state store process
+        # can compute usage from the JSONL log.
+        if hasattr(self._event_bus, "emit"):
+            self._event_bus.emit(
+                ticket_str,
+                agent_str or "system",
+                "llm_usage",
+                {
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "duration_ms": dur_ms,
+                    "model": model_str,
+                },
             )
 
     def shutdown(self) -> None:
