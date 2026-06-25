@@ -265,17 +265,18 @@ creation time and never modified. The only allowed mutations are:
 - Linking a Jira ticket (one-time, only if not already set)
 - Closing the record (OPEN → RESOLVED lifecycle transition)
 
-| Provider | Backend | Discovery |
+| Provider | Backend | Use Case |
 |---|---|---|
-| `FileRecordProvider` | JSON files on disk | Default, no external deps |
-| `HorreumRecordProvider` | Horreum REST API | Configured via URL + token |
-| `CompositeRecordProvider` | One writer + N readers | Fans out reads, deduplicates |
+| `FileRecordProvider` | JSON files on disk | Default. No external deps. Development and testing. |
+| `HorreumRecordProvider` | Horreum REST API | Production use with Horreum as the data store. |
+| `CompositeRecordProvider` | One writer + N readers | Migration, federated dedup, local caching. |
 
-The `CompositeRecordProvider` supports scenarios like migration (old
-records in files, new in the primary backend), federated dedup (query
-multiple teams' record stores), and local caching.
+#### File backend (default)
 
-Configuration in `~/.agentic-perf/config.json`:
+Stores each record as a JSON file in a configurable directory
+(default: `~/.agentic-perf/investigation-records/`). No external
+services required. Queries scan all files and filter in memory —
+suitable for small-to-medium record counts.
 
 ```json
 {
@@ -286,23 +287,63 @@ Configuration in `~/.agentic-perf/config.json`:
 }
 ```
 
-For composite (multi-read):
+#### Horreum backend
+
+Stores records as Horreum test runs under a dedicated test type
+(`investigation_records`). The test is auto-created on first use
+if it doesn't exist. Records are uploaded as schemaless JSON
+payloads.
+
+Supports Horreum API keys (`HUSR_*` tokens via `X-Horreum-API-Key`
+header) and standard Bearer tokens. TLS verification can be
+disabled for instances with internal CA certificates.
+
+```json
+{
+    "investigation_records": {
+        "backend": "horreum",
+        "url": "https://horreum.example.com",
+        "token": "HUSR_...",
+        "tls_verify": false,
+        "test_id": 426
+    }
+}
+```
+
+The `test_id` is optional — if omitted, the provider searches for
+the test by name and creates it if missing.
+
+#### Composite backend (multi-read)
+
+Routes writes to a single authoritative backend and fans out reads
+across multiple backends concurrently. Results are deduplicated by
+`investigation_id` — the writer's copy takes precedence.
+
+Use cases:
+- **Migration**: old records in files, new records in the primary store
+- **Federated dedup**: check multiple teams' record stores before
+  starting an investigation
+- **Local cache**: write to primary, read from local mirror too
 
 ```json
 {
     "investigation_records": {
         "backend": "composite",
-        "writer": {"backend": "opensearch", "url": "..."},
+        "writer": {"backend": "horreum", "url": "..."},
         "readers": [
-            {"backend": "opensearch", "url": "..."},
+            {"backend": "horreum", "url": "..."},
             {"backend": "file", "persist_dir": "/old/records"}
         ]
     }
 }
 ```
 
+#### Adding new backends
+
 New backends implement the `InvestigationRecordProvider` interface and
-register in `providers/investigation/registry.py`.
+register in `providers/investigation/registry.py`. The interface
+enforces write-once semantics — backends must not allow modification
+of investigation data after creation.
 
 Agent tools are exposed via an MCP server
 (`agents/investigation/server.py`) with six tools: query, get, create,
