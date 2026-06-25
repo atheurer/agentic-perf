@@ -1,8 +1,9 @@
 """Pydantic models for Investigation Records.
 
 These define the backend-agnostic contract for storing and querying
-investigation outcomes. Any storage backend (file, Horreum, OpenSearch,
-etc.) must serialize and deserialize these models.
+investigation outcomes. Any storage backend (file, OpenSearch,
+Horreum, PostgreSQL, etc.) must serialize and deserialize
+these models.
 """
 
 from __future__ import annotations

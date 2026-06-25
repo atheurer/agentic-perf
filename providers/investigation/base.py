@@ -1,7 +1,7 @@
 """Abstract interface for Investigation Record storage.
 
-Any storage backend (file, Horreum, OpenSearch, Elasticsearch, S3,
-PostgreSQL, etc.) implements this interface. Agents interact with
+Any storage backend (file, OpenSearch, Elasticsearch, Horreum,
+S3, PostgreSQL, etc.) implements this interface. Agents interact with
 records through these methods, never with the backend directly.
 
 Records are write-once: all investigation data (root cause,

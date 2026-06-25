@@ -3,9 +3,9 @@
 Routes writes to a single authoritative backend and fans out
 reads across multiple backends. This supports scenarios like:
 
-- Migration: old records in files, new records in Horreum
+- Migration: old records in files, new records in OpenSearch
 - Federated dedup: check multiple teams' record stores
-- Local cache: write to Horreum, read from local mirror too
+- Local cache: write to primary backend, read from local mirror too
 
 Query results are deduplicated by investigation_id — if the
 same record exists in multiple backends, the writer's copy
