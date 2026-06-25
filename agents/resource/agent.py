@@ -150,7 +150,9 @@ class ResourceAgent(AgentBase):
             )
 
         await self._transition_ticket(
-            ticket_id, "closed", comment="Resource teardown complete"
+            ticket_id,
+            "retrospective_pending",
+            comment="Resource teardown complete, starting retrospective",
         )
         logger.info(f"[resource-agent] Teardown complete for {ticket_id}")
 

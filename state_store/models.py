@@ -16,6 +16,7 @@ class TicketStatus(str, Enum):
     AWAITING_REVIEW = "awaiting_review"
     AWAITING_TEARDOWN = "awaiting_teardown"
     AWAITING_CUSTOMER_GUIDANCE = "awaiting_customer_guidance"
+    RETROSPECTIVE_PENDING = "retrospective_pending"
     CLOSED = "closed"
 
     # Recursive investigation loop statuses (RHIVOS 03A)
@@ -53,10 +54,14 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_TEARDOWN: [
+        TicketStatus.RETROSPECTIVE_PENDING,
         TicketStatus.CLOSED,
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_CUSTOMER_GUIDANCE: [],  # filled dynamically
+    TicketStatus.RETROSPECTIVE_PENDING: [
+        TicketStatus.CLOSED,
+    ],
     TicketStatus.CLOSED: [],
     # --- Recursive investigation loop ---
     # Gathering context: check Investigation Records for dedup,

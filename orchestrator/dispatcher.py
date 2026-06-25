@@ -6,6 +6,7 @@ from typing import Any
 from agents.benchmark.agent import BenchmarkAgent
 from agents.provisioning.agent import ProvisioningAgent
 from agents.resource.agent import ResourceAgent
+from agents.retrospective.agent import RetrospectiveAgent
 from agents.review.agent import ReviewAgent
 from agents.stub import StubAgent
 from agents.triage.agent import TriageAgent
@@ -25,6 +26,7 @@ STATUS_AGENT_MAP = {
     "executing_benchmark": "benchmark",
     "awaiting_review": "review",
     "awaiting_teardown": "resource_teardown",
+    "retrospective_pending": "retrospective",
     # Recursive investigation loop
     "gathering_context": "gathering_context",
     "planning_investigation": "planning_investigation",
@@ -130,6 +132,12 @@ class Dispatcher:
                 state_store_url=self.store_url,
                 mode="teardown",
                 secrets_provider=self.secrets,
+                event_bus=self.events,
+            )
+        elif agent_type == "retrospective":
+            return RetrospectiveAgent(
+                llm_provider=llm,
+                state_store_url=self.store_url,
                 event_bus=self.events,
             )
 

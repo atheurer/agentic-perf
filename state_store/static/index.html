@@ -115,6 +115,7 @@ header h1 span { color: var(--accent); }
 .badge-evaluating_convergence { background: #352a3a; color: var(--purple); }
 .badge-synthesizing_results { background: #3a2a20; color: var(--orange); }
 .badge-awaiting_customer_guidance { background: #3a1a1a; color: var(--red); }
+.badge-retrospective_pending { background: #2d3a5c; color: var(--cyan); }
 .badge-closed { background: #1a2a1a; color: var(--green); }
 
 .filters {
@@ -704,6 +705,7 @@ async function renderList() {
         '<option value="synthesizing_results">Synthesizing Results</option>' +
         '<option value="awaiting_teardown">Awaiting Teardown</option>' +
         '<option value="awaiting_customer_guidance">Awaiting Guidance</option>' +
+        '<option value="retrospective_pending">Retrospective</option>' +
         '<option value="closed">Closed</option>' +
       '</select>' +
     '</div>' +
