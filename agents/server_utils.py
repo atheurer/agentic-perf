@@ -152,3 +152,16 @@ async def build_ssh_from_ticket(
     ssh_user = "root"
 
     return SSHExecutor(user=ssh_user, key_path=ssh_key), ticket
+
+
+def build_investigation_provider():
+    """Construct an InvestigationRecordProvider from config.
+
+    Reads investigation_records.backend from config.json.
+    Defaults to file-based storage.
+    """
+    from providers.investigation.registry import (
+        create_record_provider,
+    )
+
+    return create_record_provider()
