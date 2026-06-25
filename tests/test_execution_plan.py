@@ -49,7 +49,45 @@ async def test_advance_plan_no_plan_is_noop():
         mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
         client.get.return_value = mock_response
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST")
+        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+
+        client.patch.assert_not_called()
+        client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_advance_plan_skips_non_plan_agent():
+    """_advance_plan does nothing when the completed agent doesn't match the step."""
+    from orchestrator.main import _advance_plan
+
+    plan = {
+        "current_step": 0,
+        "run_ids": [],
+        "steps": [
+            {
+                "id": 0,
+                "agent_type": "benchmark",
+                "status": "in_progress",
+                "params": {},
+                "results": {},
+            },
+        ],
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "custom_fields": {"execution_plan": plan},
+    }
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        client = AsyncMock()
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        client.get.return_value = mock_response
+
+        # Resource agent completed — should NOT advance the benchmark step
+        await _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_hardware")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
@@ -106,7 +144,7 @@ async def test_advance_plan_completes_step_and_advances():
         client.patch.return_value = MagicMock(status_code=200)
         client.post.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST")
+        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -159,7 +197,7 @@ async def test_advance_plan_final_step_no_transition():
         client.get.return_value = mock_response
         client.patch.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST")
+        await _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_review")
 
         client.patch.assert_called_once()
         transition_calls = [
@@ -219,7 +257,7 @@ async def test_advance_plan_tracks_multiple_run_ids():
         client.patch.return_value = MagicMock(status_code=200)
         client.post.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST")
+        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]

@@ -64,8 +64,13 @@ PLAN_AGENT_STATUS = {
 }
 
 
-async def _advance_plan(store_url: str, ticket_id: str) -> None:
-    """Advance the execution plan after an agent completes a step."""
+async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
+    """Advance the execution plan after an agent completes a step.
+
+    Only advances if the completed agent matches the current step's
+    agent_type — prevents non-plan agents (resource, provisioning)
+    from prematurely completing plan steps.
+    """
     import httpx
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -86,6 +91,10 @@ async def _advance_plan(store_url: str, ticket_id: str) -> None:
 
         step = steps[current]
         if step.get("status") != "in_progress":
+            return
+
+        expected_status = PLAN_AGENT_STATUS.get(step.get("agent_type", ""))
+        if expected_status != completed_status:
             return
 
         step["status"] = "completed"
@@ -152,7 +161,7 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
-        await _advance_plan(dispatcher.store_url, ticket_id)
+        await _advance_plan(dispatcher.store_url, ticket_id, status)
         dispatcher.mark_done(ticket_id)
         try:
             await agent.close()
