@@ -86,6 +86,7 @@ The client must know where the server is. Use one of:
   this when the server has multiple interfaces and you want
   to target a specific one.
 
+Use ONE of these, not both — they are mutually exclusive.
 For most cases, use `remotehost` with the server's hostname
 or IP address. When testing specific NICs, prefer
 `remotehost` with the test-network IP if available, or
