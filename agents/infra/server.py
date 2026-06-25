@@ -41,6 +41,10 @@ _agent_name: str | None = None
 _policy: CommandPolicy | None = None
 _secrets_provider = None
 _state_store_url: str | None = None
+_ticket_id: str | None = None
+
+_APPROVAL_POLL_INTERVAL = 3
+_APPROVAL_TIMEOUT = 300
 
 
 def _get_ssh() -> SSHExecutor:
@@ -73,7 +77,9 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     Must be called before any SSH operations. Resolves ssh_key_path and
     ssh_user from the ticket so credentials never appear in tool inputs.
     """
-    global _ssh, _agent_name, _policy, _state_store_url
+    global _ssh, _agent_name, _policy, _state_store_url, _ticket_id
+
+    _ticket_id = ticket_id
 
     _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     import httpx
@@ -281,12 +287,123 @@ async def transfer_file(
     )
 
 
+def _extract_binary(command: str) -> str:
+    """Extract the primary binary name from a command string."""
+    import shlex
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        if "=" in token and not token.startswith("-"):
+            continue
+        return Path(token).name
+    return ""
+
+
+async def _get_ticket_approvals() -> list[str]:
+    """Read the per-ticket command_approvals list from custom_fields."""
+    if not _state_store_url or not _ticket_id:
+        return []
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_state_store_url}/api/v1/tickets/{_ticket_id}"
+            )
+            r.raise_for_status()
+            fields = r.json().get("custom_fields", {})
+            return fields.get("command_approvals", [])
+    except Exception:
+        return []
+
+
+async def _request_approval(
+    command: str, binary: str, host: str
+) -> str:
+    """Request user approval for a command not in the allowlist.
+
+    Writes a pending_approval request to the ticket's custom_fields,
+    then polls until the user responds or the timeout expires.
+
+    Returns: "approved_once", "approved_ticket", or "denied".
+    """
+    import asyncio
+    import uuid
+
+    import httpx
+
+    if not _state_store_url or not _ticket_id:
+        return "denied"
+
+    approval_id = f"appr-{uuid.uuid4().hex[:8]}"
+    pending = {
+        "id": approval_id,
+        "agent": _agent_name or "unknown",
+        "command": command[:500],
+        "binary": binary,
+        "host": host,
+        "requested_at": (
+            __import__("datetime")
+            .datetime.now(__import__("datetime").timezone.utc)
+            .isoformat()
+        ),
+        "status": "pending",
+    }
+
+    logger.info(
+        "Requesting approval for %s: %s on %s",
+        _agent_name,
+        command[:120],
+        host,
+    )
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.patch(
+            f"{_state_store_url}/api/v1/tickets/{_ticket_id}/fields",
+            json={"fields": {"pending_approval": pending}},
+        )
+
+        elapsed = 0
+        while elapsed < _APPROVAL_TIMEOUT:
+            await asyncio.sleep(_APPROVAL_POLL_INTERVAL)
+            elapsed += _APPROVAL_POLL_INTERVAL
+
+            try:
+                r = await client.get(
+                    f"{_state_store_url}/api/v1/tickets/{_ticket_id}"
+                )
+                r.raise_for_status()
+                fields = r.json().get("custom_fields", {})
+                pa = fields.get("pending_approval", {})
+                if pa.get("id") != approval_id:
+                    return "denied"
+                status = pa.get("status", "pending")
+                if status != "pending":
+                    logger.info(
+                        "Approval response for %s: %s",
+                        command[:80],
+                        status,
+                    )
+                    return status
+            except Exception:
+                logger.exception("Error polling for approval")
+
+    logger.warning("Approval timeout for: %s", command[:120])
+    return "denied"
+
+
 @mcp.tool()
 async def execute_command(host: str, command: str, timeout: int = 300) -> str:
     """Execute a command on a remote host via SSH.
 
     Subject to per-agent command policy: the command's binary must be in
     the agent's allowlist, and the command must not match any blocked pattern.
+    If the binary is not in the allowlist but is otherwise safe, the user
+    will be prompted for approval.
+
     Call set_ssh_context() with agent_name to load the policy.
     """
     ssh = _get_ssh()
@@ -294,20 +411,55 @@ async def execute_command(host: str, command: str, timeout: int = 300) -> str:
     if _policy is not None:
         allowed, reason = check_command(command, _policy)
         if not allowed:
-            logger.warning(
-                "Command blocked for %s: %s — %s",
-                _agent_name,
-                command[:120],
-                reason,
-            )
-            return json.dumps(
-                {
-                    "exit_code": -1,
-                    "stdout": "",
-                    "stderr": f"Command blocked by policy: {reason}",
-                    "blocked": True,
-                }
-            )
+            if "not in allowlist" in reason:
+                binary = _extract_binary(command)
+                ticket_approvals = await _get_ticket_approvals()
+                if binary in ticket_approvals:
+                    logger.info(
+                        "Binary %r pre-approved for ticket, executing",
+                        binary,
+                    )
+                else:
+                    decision = await _request_approval(
+                        command, binary, host
+                    )
+                    if decision not in (
+                        "approved_once",
+                        "approved_ticket",
+                    ):
+                        logger.warning(
+                            "Command denied by user for %s: %s",
+                            _agent_name,
+                            command[:120],
+                        )
+                        return json.dumps(
+                            {
+                                "exit_code": -1,
+                                "stdout": "",
+                                "stderr": (
+                                    f"Command denied by user: "
+                                    f"binary {binary!r} not approved"
+                                ),
+                                "blocked": True,
+                            }
+                        )
+            else:
+                logger.warning(
+                    "Command blocked for %s: %s — %s",
+                    _agent_name,
+                    command[:120],
+                    reason,
+                )
+                return json.dumps(
+                    {
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": (
+                            f"Command blocked by policy: {reason}"
+                        ),
+                        "blocked": True,
+                    }
+                )
 
         if timeout > _policy.max_timeout:
             timeout = _policy.max_timeout

@@ -288,6 +288,71 @@ def cmd_reply(args):
     print(f"Reply added and ticket resumed to: {previous}")
 
 
+def cmd_approve(args):
+    client, _ = get_client(args)
+
+    r = client.get(f"/api/v1/tickets/{args.ticket_id}")
+    r.raise_for_status()
+    t = r.json()
+
+    pa = t.get("custom_fields", {}).get("pending_approval")
+    if not pa or pa.get("status") != "pending":
+        print("No pending approval request on this ticket.")
+        return
+
+    print(f"  Agent:   {pa.get('agent', '?')}")
+    print(f"  Host:    {pa.get('host', '?')}")
+    print(f"  Binary:  {pa.get('binary', '?')}")
+    print(f"  Command: {pa.get('command', '?')}")
+
+    if args.ticket:
+        decision = "approved_ticket"
+        label = f"Approved '{pa['binary']}' for this ticket"
+    else:
+        decision = "approved_once"
+        label = "Approved (once)"
+
+    pa["status"] = decision
+    fields = {"pending_approval": pa}
+
+    if args.ticket:
+        approvals = t.get("custom_fields", {}).get("command_approvals", [])
+        binary = pa.get("binary", "")
+        if binary and binary not in approvals:
+            approvals.append(binary)
+        fields["command_approvals"] = approvals
+
+    r = client.patch(
+        f"/api/v1/tickets/{args.ticket_id}/fields",
+        json={"fields": fields},
+    )
+    r.raise_for_status()
+    print(f"{label}")
+
+
+def cmd_deny(args):
+    client, _ = get_client(args)
+
+    r = client.get(f"/api/v1/tickets/{args.ticket_id}")
+    r.raise_for_status()
+    t = r.json()
+
+    pa = t.get("custom_fields", {}).get("pending_approval")
+    if not pa or pa.get("status") != "pending":
+        print("No pending approval request on this ticket.")
+        return
+
+    print(f"  Denied: {pa.get('binary', '?')} — {pa.get('command', '?')[:80]}")
+
+    pa["status"] = "denied"
+    r = client.patch(
+        f"/api/v1/tickets/{args.ticket_id}/fields",
+        json={"fields": {"pending_approval": pa}},
+    )
+    r.raise_for_status()
+    print("Command denied.")
+
+
 def cmd_abort(args):
     client, url = get_client(args)
 
@@ -676,6 +741,19 @@ def main():
         help="Abort the ticket after replying (skip to cleanup)",
     )
 
+    p_approve = sub.add_parser(
+        "approve", help="Approve a pending command execution"
+    )
+    p_approve.add_argument("ticket_id", help="Ticket ID")
+    p_approve.add_argument(
+        "--ticket",
+        action="store_true",
+        help="Approve this binary for the entire ticket",
+    )
+
+    p_deny = sub.add_parser("deny", help="Deny a pending command execution")
+    p_deny.add_argument("ticket_id", help="Ticket ID")
+
     p_abort = sub.add_parser("abort", help="Abort a paused ticket and skip to cleanup")
     p_abort.add_argument("ticket_id", help="Ticket ID")
     p_abort.add_argument("reason", nargs="?", help="Reason for aborting (optional)")
@@ -718,6 +796,8 @@ def main():
         "show": cmd_show,
         "watch": cmd_watch,
         "reply": cmd_reply,
+        "approve": cmd_approve,
+        "deny": cmd_deny,
         "abort": cmd_abort,
         "transcript": cmd_transcript,
         "health": cmd_health,
