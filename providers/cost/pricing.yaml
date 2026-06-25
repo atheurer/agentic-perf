@@ -1,0 +1,65 @@
+# LLM token pricing for cost estimation.
+#
+# Prices are per-token in USD. Input and output tokens are
+# priced differently for most models. These are approximate
+# planning estimates — treat as guidance, not invoices.
+#
+# Model names use prefix matching: "claude-sonnet-4" matches
+# "claude-sonnet-4-6", "claude-sonnet-4-20260501", etc.
+#
+# Last updated: 2026-06-25
+#
+# Pricing sources:
+#   Anthropic: https://www.anthropic.com/pricing
+#   OpenAI:    https://openai.com/api/pricing
+#   Google:    https://ai.google.dev/pricing
+#
+# To update: edit this file with current per-token prices
+# from the provider's pricing page. The system reloads this
+# file on startup.
+
+# Fallback pricing for models not listed below.
+# Uses a middle-range estimate so costs are approximate
+# rather than zero.
+fallback:
+  input_per_token: 0.000003    # $3.00 / 1M tokens
+  output_per_token: 0.000015   # $15.00 / 1M tokens
+
+models:
+  # --- Anthropic ---
+  # Source: https://www.anthropic.com/pricing
+  claude-opus-4:
+    input_per_token: 0.000015    # $15.00 / 1M tokens
+    output_per_token: 0.000075   # $75.00 / 1M tokens
+
+  claude-sonnet-4:
+    input_per_token: 0.000003    # $3.00 / 1M tokens
+    output_per_token: 0.000015   # $15.00 / 1M tokens
+
+  claude-haiku-3.5:
+    input_per_token: 0.0000008   # $0.80 / 1M tokens
+    output_per_token: 0.000004   # $4.00 / 1M tokens
+
+  # --- OpenAI ---
+  # Source: https://openai.com/api/pricing
+  gpt-4o:
+    input_per_token: 0.0000025   # $2.50 / 1M tokens
+    output_per_token: 0.00001    # $10.00 / 1M tokens
+
+  gpt-4o-mini:
+    input_per_token: 0.00000015  # $0.15 / 1M tokens
+    output_per_token: 0.0000006  # $0.60 / 1M tokens
+
+  gpt-4-turbo:
+    input_per_token: 0.00001     # $10.00 / 1M tokens
+    output_per_token: 0.00003    # $30.00 / 1M tokens
+
+  # --- Google ---
+  # Source: https://ai.google.dev/pricing
+  gemini-2.5-pro:
+    input_per_token: 0.00000125  # $1.25 / 1M tokens
+    output_per_token: 0.00001    # $10.00 / 1M tokens
+
+  gemini-2.5-flash:
+    input_per_token: 0.00000015  # $0.15 / 1M tokens
+    output_per_token: 0.0000006  # $0.60 / 1M tokens
