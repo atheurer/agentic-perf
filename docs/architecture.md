@@ -233,7 +233,9 @@ their results, while the convergence agent extends the pending portion.
 
 The user defines convergence criteria on the ticket (see issue #134) —
 the evaluating agent reads them to decide whether to loop or stop, and
-a `max_iterations` bound prevents runaway loops.
+a `max_iterations` bound prevents runaway loops. Agents can also
+set `max_iterations=0` to remove the iteration cap entirely, relying
+on convergence gates and cost guardrails (#127) for termination.
 
 Both modes produce the same artifact: an ordered list of completed steps
 with run IDs, parameters, and results — giving the review agent (or

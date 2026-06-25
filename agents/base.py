@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 class AgentBase(ABC):
+    # Default inner-loop iteration budget. Agents can override
+    # via constructor. Set to 0 for unlimited iterations —
+    # termination is then driven by convergence gates, cost
+    # guardrails (#127), or HITL intervention rather than an
+    # arbitrary count.
+    DEFAULT_MAX_ITERATIONS = 20
+
     def __init__(
         self,
         agent_name: str,
@@ -28,6 +35,7 @@ class AgentBase(ABC):
         tools: list[ToolDefinition] | None = None,
         tool_handlers: dict[str, Callable] | None = None,
         event_bus: EventBus | None = None,
+        max_iterations: int | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.llm = llm_provider
@@ -37,6 +45,11 @@ class AgentBase(ABC):
         self._mcp = None
         self._client = httpx.AsyncClient(timeout=30.0)
         self._events = event_bus
+        self.max_iterations = (
+            max_iterations
+            if max_iterations is not None
+            else self.DEFAULT_MAX_ITERATIONS
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -60,10 +73,11 @@ class AgentBase(ABC):
                 "initial_messages": messages,
             },
         )
-        max_iterations = 20
-
         try:
-            for i in range(max_iterations):
+            iteration = 0
+            while self.max_iterations == 0 or iteration < self.max_iterations:
+                i = iteration
+                iteration += 1
                 self._emit(ticket_id, "llm_request", {"iteration": i})
                 response = await self.llm.complete(
                     system_prompt=system_prompt,
@@ -173,11 +187,20 @@ class AgentBase(ABC):
 
                 messages.append({"role": "user", "content": tool_results_content})
             else:
-                self._emit(ticket_id, "agent_error", {"reason": "max_iterations"})
-                logger.warning(f"[{self.agent_name}] Hit max iterations on {ticket_id}")
+                # while loop exhausted (max_iterations reached)
+                self._emit(
+                    ticket_id,
+                    "agent_error",
+                    {"reason": "max_iterations"},
+                )
+                logger.warning(
+                    f"[{self.agent_name}] Hit max iterations"
+                    f" ({self.max_iterations}) on {ticket_id}"
+                )
                 await self._add_comment(
                     ticket_id,
-                    f"Agent {self.agent_name} reached maximum iteration limit.",
+                    f"Agent {self.agent_name} reached maximum"
+                    f" iteration limit ({self.max_iterations}).",
                 )
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
