@@ -32,12 +32,24 @@ stateless and crash-recoverable: all durable state lives on the ticket.
 
 ## Ticket Lifecycle
 
+### Ad-hoc test execution
+
 ```
 new → triage_pending → awaiting_hardware → awaiting_provision →
 executing_benchmark → awaiting_review → awaiting_teardown → closed
 ```
 
-Any stage can pause at `awaiting_customer_guidance` for human input, and the
+### Recursive investigation
+
+```
+new → triage_pending → gathering_context → planning_investigation →
+awaiting_provision → executing_benchmark → evaluating_convergence →
+    │── loop back to planning_investigation (refine params)
+    │── loop back to awaiting_provision (re-flash hardware)
+    └── synthesizing_results → awaiting_teardown → closed
+```
+
+Both paths can pause at `awaiting_customer_guidance` for human input, and the
 user can reply to resume. Tickets can also be aborted to skip directly to
 teardown.
 

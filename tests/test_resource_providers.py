@@ -298,15 +298,15 @@ class TestAWSResourceProvider:
     async def test_match_instance_type_string_values(self):
         """LLM may pass numeric fields as strings — must not raise TypeError."""
         provider = self._make_provider()
-        assert provider._match_instance_type(
-            {"nic_speed": "25Gb"}
-        ) == "m5n.4xlarge"
-        assert provider._match_instance_type(
-            {"min_cores": "16", "min_ram_gb": "32"}
-        ) == "m5.4xlarge"
-        assert provider._match_instance_type(
-            {"nic_speed": "10", "min_ram_gb": "8"}
-        ) == "m5.xlarge"
+        assert provider._match_instance_type({"nic_speed": "25Gb"}) == "m5n.4xlarge"
+        assert (
+            provider._match_instance_type({"min_cores": "16", "min_ram_gb": "32"})
+            == "m5.4xlarge"
+        )
+        assert (
+            provider._match_instance_type({"nic_speed": "10", "min_ram_gb": "8"})
+            == "m5.xlarge"
+        )
 
     @pytest.mark.asyncio
     async def test_terminate(self):

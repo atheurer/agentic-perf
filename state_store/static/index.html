@@ -93,12 +93,27 @@ header h1 span { color: var(--accent); }
 }
 
 .badge-new { background: var(--accent-dim); color: var(--accent); }
+/*
+ * Badge color categories:
+ *   Cyan   = LLM reasoning (agent is thinking/deciding)
+ *   Yellow = External action (MCP/skill/SSH work in progress)
+ *   Green  = Active workload execution on target
+ *   Purple = LLM analysis of results
+ *   Orange = Winding down / cleanup
+ *   Red    = Blocked on human input
+ *   Green (dark bg) = Terminal success (closed)
+ */
 .badge-triage_pending { background: #2d3a5c; color: var(--cyan); }
 .badge-awaiting_hardware { background: #3a3520; color: var(--yellow); }
 .badge-awaiting_provision { background: #3a3520; color: var(--yellow); }
 .badge-executing_benchmark { background: #1a3a2a; color: var(--green); }
 .badge-awaiting_review { background: #352a3a; color: var(--purple); }
 .badge-awaiting_teardown { background: #3a2a20; color: var(--orange); }
+/* Investigation loop statuses use the same color categories */
+.badge-gathering_context { background: #2d3a5c; color: var(--cyan); }
+.badge-planning_investigation { background: #2d3a5c; color: var(--cyan); }
+.badge-evaluating_convergence { background: #352a3a; color: var(--purple); }
+.badge-synthesizing_results { background: #3a2a20; color: var(--orange); }
 .badge-awaiting_customer_guidance { background: #3a1a1a; color: var(--red); }
 .badge-closed { background: #1a2a1a; color: var(--green); }
 
@@ -679,10 +694,14 @@ async function renderList() {
         '<option value="">All</option>' +
         '<option value="new">New</option>' +
         '<option value="triage_pending">Triage Pending</option>' +
+        '<option value="gathering_context">Gathering Context</option>' +
+        '<option value="planning_investigation">Planning Investigation</option>' +
         '<option value="awaiting_hardware">Awaiting Hardware</option>' +
         '<option value="awaiting_provision">Awaiting Provision</option>' +
         '<option value="executing_benchmark">Executing Benchmark</option>' +
+        '<option value="evaluating_convergence">Evaluating Convergence</option>' +
         '<option value="awaiting_review">Awaiting Review</option>' +
+        '<option value="synthesizing_results">Synthesizing Results</option>' +
         '<option value="awaiting_teardown">Awaiting Teardown</option>' +
         '<option value="awaiting_customer_guidance">Awaiting Guidance</option>' +
         '<option value="closed">Closed</option>' +

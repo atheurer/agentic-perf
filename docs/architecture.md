@@ -42,7 +42,11 @@ ticket document.
 ## State Machine
 
 Tickets progress through a defined set of statuses. Each status maps to an
-agent that processes the ticket at that stage.
+agent that processes the ticket at that stage. Two paths are supported:
+ad-hoc test execution (original linear pipeline) and recursive investigation
+(iterative loop with convergence).
+
+### Ad-hoc test execution
 
 ```
                           ┌──────────────────┐
@@ -85,6 +89,62 @@ agent that processes the ticket at that stage.
                           └────────────────────────┘
 ```
 
+### Recursive investigation
+
+```
+                          ┌──────────────────┐
+                          │       new        │
+                          └────────┬─────────┘
+                                   │
+                          ┌────────▼─────────┐
+                          │  triage_pending   │─────────────────┐
+                          └────────┬──────────┘                 │
+                                   │                            │
+                          ┌────────▼──────────┐                 │
+                     ┌────│gathering_context   │──── closed     │
+                     │    └────────┬───────────┘   (dedup)      │
+                     │             │                             │
+              ┌──────│────┌────────▼──────────────┐             │
+              │      │    │planning_investigation  │─────┐      │
+              │      │    └────────┬───────────────┘     │      │
+              │      │             │                     │      │
+              │      │    ┌────────▼─────────┐           │      │
+              │      │ ┌──│awaiting_hardware  │          │      │
+              │      │ │  └────────┬──────────┘          │      │
+              │      │ │           │                     │      │
+              │      │ │  ┌────────▼─────────┐           │      │
+              │      │ │  │awaiting_provision │──┐       │      │
+              │      │ │  └────────┬──────────┘  │       │      │  All stages
+              │      │ │           │             │       │      │  can pause at
+              │      │ │  ┌────────▼──────────┐  │       │      │  awaiting_
+              │      │ │  │executing_benchmark│──┤       │      │  customer_
+              │      │ │  └────────┬──────────┘  │       │      │  guidance
+              │      │ │           │              │       │      │
+  refine──────┼──────┼─┼──┌───────▼────────────┐ │       │      │
+  params      │      │ │  │evaluating_         │─┤       │      │
+              │      │ │  │convergence         │ │       │      │
+  re-flash────┼──────┘ │  └───────┬────────────┘ │       │      │
+  hardware    │        │          │              │       │      │
+              │        │ ┌────────▼────────────┐  │       │      │
+              │        │ │synthesizing_results │──┘       │      │
+              │        │ └────────┬────────────┘          │      │
+              │        │          │                       │      │
+              │        │ ┌────────▼──────────┐            │      │
+              │        │ │awaiting_teardown  │────────────┘      │
+              │        │ └────────┬──────────┘                   │
+              │        │          │                              │
+              │        │ ┌────────▼─────────┐                    │
+              │        │ │     closed       │                    │
+              │        │ └──────────────────┘                    │
+              │        │                                         │
+              │        └─────────────┬───────────────────────────┘
+              │                      │
+              │             ┌────────▼───────────────┐
+              └─────────────│awaiting_customer_      │
+                            │guidance                │
+                            └────────────────────────┘
+```
+
 ### Status-to-Agent Mapping
 
 | Status | Agent | Mode |
@@ -95,15 +155,25 @@ agent that processes the ticket at that stage.
 | `executing_benchmark` | BenchmarkAgent | — |
 | `awaiting_review` | ReviewAgent | — |
 | `awaiting_teardown` | ResourceAgent | teardown |
+| `gathering_context` | *(stub)* | — |
+| `planning_investigation` | *(stub)* | — |
+| `evaluating_convergence` | *(stub)* | — |
+| `synthesizing_results` | *(stub)* | — |
 
 Terminal statuses (`closed`, `awaiting_customer_guidance`) do not dispatch
 agents. `awaiting_customer_guidance` resumes to the previous status when the
-user replies.
+user replies. Investigation loop agents are currently stubs that auto-advance
+the state machine; full implementations are planned.
 
 ### Special Transitions
 
 - **Rerun loop:** `awaiting_review` can transition back to `triage_pending`
   for iterative testing.
+- **Investigation loop-back:** `evaluating_convergence` can loop back to
+  `planning_investigation` (refine parameters) or `awaiting_provision`
+  (re-flash tainted hardware).
+- **Grounding dedup:** `gathering_context` can close the ticket directly
+  if a matching Investigation Record is found.
 - **Abort:** From `awaiting_customer_guidance`, the user can jump directly to
   `awaiting_teardown` to skip remaining work.
 
