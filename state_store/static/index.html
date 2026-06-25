@@ -867,6 +867,13 @@ function renderSidebar(ticket) {
       '<h4>Events</h4>' +
       '<div class="sidebar-event-count" id="event-count">0</div>' +
       '<div class="sidebar-event-label">events loaded</div>' +
+    '</div>' +
+
+    '<div class="sidebar-section">' +
+      '<h4>LLM Usage</h4>' +
+      '<div id="llm-usage" style="font-size:12px; color:var(--text-muted);">' +
+        'Waiting for data...' +
+      '</div>' +
     '</div>';
 }
 
@@ -973,9 +980,45 @@ async function pollEvents(ticketId) {
   try {
     var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
     var newEvents = data.events || [];
-    if (newEvents.length === 0) return;
-    lastSeq = data.latest_seq;
-    renderNewEvents(newEvents);
+    if (newEvents.length > 0) {
+      lastSeq = data.latest_seq;
+      renderNewEvents(newEvents);
+    }
+    updateUsageSidebar(ticketId);
+  } catch {}
+}
+
+async function updateUsageSidebar(ticketId) {
+  try {
+    var data = await api('/tickets/' + ticketId + '/usage');
+    var el = document.getElementById('llm-usage');
+    if (!el || !data.usage) return;
+    var u = data.usage;
+    if (u.llm_calls === 0) {
+      el.innerHTML = '<span style="color:var(--text-muted)">No LLM calls yet</span>';
+      return;
+    }
+    var cost = data.estimated_cost_usd;
+    var costStr = cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
+    el.innerHTML =
+      '<div style="margin-bottom:4px">' +
+        '<span style="color:var(--cyan)">' + u.total_tokens.toLocaleString() + '</span> tokens' +
+      '</div>' +
+      '<div style="margin-bottom:4px; font-size:11px">' +
+        u.input_tokens.toLocaleString() + ' in / ' +
+        u.output_tokens.toLocaleString() + ' out' +
+      '</div>' +
+      '<div style="margin-bottom:4px">' +
+        '<span style="color:var(--green)">' + u.llm_calls + '</span> calls' +
+        ' &middot; ' + (u.total_duration_ms / 1000).toFixed(1) + 's' +
+      '</div>' +
+      '<div style="margin-bottom:4px">' +
+        'Est. <span style="color:var(--yellow)">' + costStr + '</span>' +
+      '</div>' +
+      (u.models_used.length > 0 ?
+        '<div style="font-size:10px; color:var(--text-muted)">' +
+          u.models_used.join(', ') +
+        '</div>' : '');
   } catch {}
 }
 
@@ -1211,7 +1254,10 @@ function renderLlmResponse(ts, data) {
   return '<div class="event">' +
     '<span class="event-ts">' + ts + '</span>' +
     '<span class="event-label label-llm">LLM RESPONSE</span>' +
-    '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop + '</span>' +
+    '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop +
+      (data.input_tokens ? ' | ' + data.input_tokens.toLocaleString() + ' in &middot; ' + data.output_tokens.toLocaleString() + ' out' : '') +
+      (data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '') +
+    '</span>' +
     textHtml + toolsHtml +
   '</div>';
 }

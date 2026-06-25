@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 
+from providers.cost import estimate_cumulative_cost
+
 router = APIRouter(prefix="/tickets", tags=["events"])
 
 
@@ -48,4 +50,24 @@ def get_transcript(
         "ticket_id": ticket_id,
         "ticket": ticket_data,
         "events": events,
+    }
+
+
+@router.get("/{ticket_id}/usage")
+def get_usage(ticket_id: str, request: Request):
+    """Get cumulative LLM token usage and estimated cost for a ticket.
+
+    Returns accumulated input/output tokens, call count,
+    duration, models used, and an estimated USD cost.
+    Token data comes from OpenTelemetry instrumentation of
+    the LLM SDKs (when telemetry is enabled).
+    """
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is None:
+        return {"ticket_id": ticket_id, "usage": {}, "estimated_cost_usd": 0.0}
+    usage = event_bus.get_cumulative_usage(ticket_id)
+    return {
+        "ticket_id": ticket_id,
+        "usage": usage,
+        "estimated_cost_usd": round(estimate_cumulative_cost(usage), 6),
     }
