@@ -74,6 +74,7 @@ class AgentBase(ABC):
                 # correlation so the span processor
                 # can attribute token usage to this
                 # ticket.
+                tok = None
                 try:
                     from opentelemetry import context
 
@@ -88,7 +89,7 @@ class AgentBase(ABC):
                         )
                     )
                 except ImportError:
-                    tok = None
+                    pass
 
                 try:
                     response = await self.llm.complete(

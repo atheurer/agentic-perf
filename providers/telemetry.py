@@ -124,15 +124,17 @@ class EventBusSpanProcessor(SpanProcessor):
         # The semconv library uses prompt_tokens/completion_tokens
         # but the Anthropic instrumentor emits input_tokens/
         # output_tokens — check both naming conventions.
+        _prompt = attrs.get(SpanAttributes.LLM_USAGE_PROMPT_TOKENS)
+        _input = attrs.get("gen_ai.usage.input_tokens")
         input_tokens = (
-            attrs.get(SpanAttributes.LLM_USAGE_PROMPT_TOKENS)
-            or attrs.get("gen_ai.usage.input_tokens")
-            or 0
+            _prompt if _prompt is not None
+            else (_input if _input is not None else 0)
         )
+        _completion = attrs.get(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS)
+        _output = attrs.get("gen_ai.usage.output_tokens")
         output_tokens = (
-            attrs.get(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS)
-            or attrs.get("gen_ai.usage.output_tokens")
-            or 0
+            _completion if _completion is not None
+            else (_output if _output is not None else 0)
         )
 
         # Calculate duration from span timestamps

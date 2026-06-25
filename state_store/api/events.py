@@ -113,6 +113,7 @@ def get_usage(ticket_id: str, request: Request):
                     "total_tokens": 0,
                     "llm_calls": 0,
                     "total_duration_ms": 0,
+                    "models_used": set(),
                 }
             ba = by_agent[agent]
             ba["input_tokens"] += in_tok
@@ -120,6 +121,8 @@ def get_usage(ticket_id: str, request: Request):
             ba["total_tokens"] += in_tok + out_tok
             ba["llm_calls"] += 1
             ba["total_duration_ms"] += dur
+            if model:
+                ba["models_used"].add(model)
 
     usage = {
         "input_tokens": total_in,
@@ -133,6 +136,7 @@ def get_usage(ticket_id: str, request: Request):
     # Per-agent cost estimates
     agent_costs = {}
     for agent, au in by_agent.items():
+        au["models_used"] = sorted(au.get("models_used", set()))
         agent_costs[agent] = {
             **au,
             "estimated_cost_usd": round(estimate_cumulative_cost(au), 6),

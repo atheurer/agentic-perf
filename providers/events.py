@@ -172,10 +172,11 @@ class EventBus:
 
     def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
         """Get accumulated LLM usage for a ticket."""
-        usage = self._cumulative.get(ticket_id)
-        if usage is None:
-            return CumulativeUsage().to_dict()
-        return usage.to_dict()
+        with self._lock:
+            usage = self._cumulative.get(ticket_id)
+            if usage is None:
+                return CumulativeUsage().to_dict()
+            return usage.to_dict()
 
     def get_agent_usage(self, ticket_id: str) -> dict[str, dict[str, Any]]:
         """Get per-agent LLM usage breakdown for a ticket.
@@ -183,13 +184,14 @@ class EventBus:
         Returns a dict of agent_name -> usage dict. Only
         includes agents that have recorded usage.
         """
-        result = {}
-        prefix = f"{ticket_id}:"
-        for key, usage in self._cumulative.items():
-            if key.startswith(prefix):
-                agent_name = key[len(prefix) :]
-                result[agent_name] = usage.to_dict()
-        return result
+        with self._lock:
+            result = {}
+            prefix = f"{ticket_id}:"
+            for key, usage in self._cumulative.items():
+                if key.startswith(prefix):
+                    agent_name = key[len(prefix):]
+                    result[agent_name] = usage.to_dict()
+            return result
 
     def get_global_usage(self) -> dict[str, Any]:
         """Get accumulated LLM usage across all tickets.
@@ -198,17 +200,17 @@ class EventBus:
         Only includes ticket-level entries, not per-agent
         sub-entries.
         """
-        total = CumulativeUsage()
-        for key, usage in self._cumulative.items():
-            # Skip per-agent entries (contain ':')
-            if ":" in key:
-                continue
-            total.input_tokens += usage.input_tokens
-            total.output_tokens += usage.output_tokens
-            total.llm_calls += usage.llm_calls
-            total.total_duration_ms += usage.total_duration_ms
-            total.models_used.update(usage.models_used)
-        return total.to_dict()
+        with self._lock:
+            total = CumulativeUsage()
+            for key, usage in self._cumulative.items():
+                if ":" in key:
+                    continue
+                total.input_tokens += usage.input_tokens
+                total.output_tokens += usage.output_tokens
+                total.llm_calls += usage.llm_calls
+                total.total_duration_ms += usage.total_duration_ms
+                total.models_used.update(usage.models_used)
+            return total.to_dict()
 
     def get_events(
         self,
