@@ -55,4 +55,32 @@ Your job is to analyze a performance test request ticket and:
 
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the min_hosts and roles from the benchmark details.
+
+## Multi-Step Execution Plans
+
+When the user's request involves MULTIPLE benchmark runs with different parameters
+(e.g., "test with 1 thread then 8 threads", "compare message sizes 64B vs 1K vs 64K",
+"run uperf on RHEL9 then RHEL10"), include an execution_plan in your result.
+
+The execution_plan is a list of steps. Each step has:
+- agent_type: "benchmark" (for benchmark runs) or "review" (for final comparison)
+- params: step-specific parameters (label, mv_params overrides for the run-file)
+
+Example for "test uperf with 1 and 8 threads":
+[
+    {"agent_type": "benchmark", "params": {"label": "1-thread", "mv_params": {"num-threads": "1"}}},
+    {"agent_type": "benchmark", "params": {"label": "8-threads", "mv_params": {"num-threads": "8"}}},
+    {"agent_type": "review", "params": {}}
+]
+
+IMPORTANT: Many benchmark harnesses can test multiple parameters in a SINGLE invocation
+(e.g., crucible's mv-params can sweep thread counts, message sizes, etc. in one run).
+Only use execution_plan when the user explicitly wants SEPARATE harness invocations —
+for example, "run crucible once with X, then run crucible again with Y" or when runs
+need different infrastructure (different OS, different hosts). If the user just wants
+a parameter sweep, handle it within a single benchmark step using the harness's
+built-in parameter variation.
+
+Do NOT generate an execution_plan for single benchmark requests. The final step
+should always be "review" so all runs are compared together.
 """

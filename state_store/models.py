@@ -49,6 +49,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.AWAITING_REVIEW: [
         TicketStatus.AWAITING_TEARDOWN,
         TicketStatus.TRIAGE_PENDING,  # ad-hoc rerun loop
+        TicketStatus.EXECUTING_BENCHMARK,  # plan-driven re-benchmark
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_TEARDOWN: [

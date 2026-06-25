@@ -113,7 +113,7 @@ class TriageAgent(AgentBase):
         # Backward compat: top-level host_cleanup moves into directives
         if "host_cleanup" in result and "host_cleanup" not in directives:
             directives["host_cleanup"] = result["host_cleanup"]
-        fields = {
+        fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
             "benchmark_suite": result.get("benchmark_suite", ""),
@@ -122,6 +122,26 @@ class TriageAgent(AgentBase):
             "min_hosts": min_hosts,
             "directives": directives,
         }
+
+        raw_plan = result.get("execution_plan")
+        if raw_plan and isinstance(raw_plan, list) and len(raw_plan) > 1:
+            steps = []
+            for i, s in enumerate(raw_plan):
+                steps.append(
+                    {
+                        "id": i,
+                        "agent_type": s.get("agent_type", "benchmark"),
+                        "status": "in_progress" if i == 0 else "pending",
+                        "params": s.get("params", {}),
+                        "results": {},
+                    }
+                )
+            fields["execution_plan"] = {
+                "current_step": 0,
+                "run_ids": [],
+                "steps": steps,
+            }
+
         await self._update_fields(ticket_id, fields)
 
         summary = (
