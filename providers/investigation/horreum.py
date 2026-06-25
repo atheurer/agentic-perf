@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Horreum test name for investigation records. All records
 # are stored under this test type.
-_TEST_NAME = "investigation-records"
+_TEST_NAME = "investigation_records"
 
 # Schema URI used to tag investigation record payloads.
 # This is a logical identifier, not a fetchable URL.
@@ -67,6 +67,8 @@ class HorreumRecordProvider(InvestigationRecordProvider):
         self,
         url: str = "",
         token: str = "",
+        tls_verify: bool = True,
+        test_id: int | None = None,
         **_kwargs: Any,
     ) -> None:
         if not url:
@@ -77,14 +79,22 @@ class HorreumRecordProvider(InvestigationRecordProvider):
             base_url=self._url,
             timeout=30.0,
             headers=self._auth_headers(),
+            verify=tls_verify,
         )
-        self._test_id: int | None = None
+        self._test_id: int | None = test_id
 
     def _auth_headers(self) -> dict[str, str]:
-        """Build auth headers if a token is configured."""
-        if self._token:
-            return {"Authorization": f"Bearer {self._token}"}
-        return {}
+        """Build auth headers if a token is configured.
+
+        Horreum API keys (starting with HUSR_) use the
+        X-Horreum-API-Key header. Other tokens use the
+        standard Authorization: Bearer header.
+        """
+        if not self._token:
+            return {}
+        if self._token.startswith("HUSR_"):
+            return {"X-Horreum-API-Key": self._token}
+        return {"Authorization": f"Bearer {self._token}"}
 
     async def _ensure_test(self) -> int:
         """Get or create the investigation-records test.
