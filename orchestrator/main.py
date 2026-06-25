@@ -166,13 +166,14 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
-        try:
-            await asyncio.wait_for(
-                _advance_plan(dispatcher.store_url, ticket_id, status),
-                timeout=15.0,
-            )
-        except Exception:
-            logger.exception(f"_advance_plan failed for {ticket_id}")
+        if status in PLAN_AGENT_STATUS.values():
+            try:
+                await asyncio.wait_for(
+                    _advance_plan(dispatcher.store_url, ticket_id, status),
+                    timeout=15.0,
+                )
+            except Exception:
+                logger.exception(f"_advance_plan failed for {ticket_id}")
         dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
         try:
