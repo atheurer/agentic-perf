@@ -30,6 +30,43 @@ install tooling, execute benchmarks, and deliver structured analysis.
 | `skills/` | Per-harness docs read by agents at runtime |
 | `tests/conftest.py` | Test fixtures: MockSkillProvider, MockSSHExecutor |
 
+## Running Services
+
+### Interactive (foreground)
+
+```bash
+./start.sh      # state store (background) + orchestrator (foreground)
+                # Ctrl+C stops both
+```
+
+### Background (for AI agents and scripted testing)
+
+```bash
+./scripts/start-bg.sh           # start both services
+./scripts/start-bg.sh status    # check if running
+./scripts/start-bg.sh stop      # stop both services
+```
+
+**Why a separate script?** Background processes started from AI agent
+tool calls or compound shell commands inherit the parent's
+stdout/stderr. When the parent exits, writes to those file descriptors
+fail with SIGPIPE, which can kill the orchestrator even though it
+ignores SIGPIPE. `start-bg.sh` uses `nohup` with explicit log file
+redirection to fully isolate the processes.
+
+**Do NOT** start services with bare `&` in compound commands:
+```bash
+# BAD — orchestrator will die when the bash command completes
+python3 -m orchestrator.main 2>&1 &
+sleep 30 && curl http://localhost:8090/...
+
+# GOOD — use the helper script
+./scripts/start-bg.sh
+```
+
+Logs are written to `~/.agentic-perf/logs/orchestrator.log` and
+`~/.agentic-perf/logs/state-store.log`.
+
 ## Development Standards
 
 ### Always Do
