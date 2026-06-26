@@ -232,10 +232,26 @@ specified at submission time. Completed steps remain immutable with
 their results, while the convergence agent extends the pending portion.
 
 The user defines convergence criteria on the ticket (see issue #134) —
-the evaluating agent reads them to decide whether to loop or stop, and
-a `max_iterations` bound prevents runaway loops. Agents can also
-set `max_iterations=0` to remove the iteration cap entirely, relying
-on convergence gates and cost guardrails (#127) for termination.
+the evaluating agent reads them to decide whether to loop or stop.
+Criteria are stored in `custom_fields.convergence_criteria` and
+evaluated in two layers:
+
+1. **Deterministic gates** (checked first, no LLM call):
+   - `max_iterations` — hard ceiling (0 = unlimited)
+   - `metric` + `threshold_pct` + `consecutive_passes` —
+     statistical convergence (metric within N% for M runs)
+   - `compare_metric` + `compare_threshold_pct` —
+     comparative convergence (delta between last two runs)
+   - `min_info_gain` — entropy stall detection
+
+2. **LLM-driven evaluation** (when no deterministic gate fires):
+   The evaluate agent reasons about whether more data would change
+   the conclusion, using the accumulated iteration results and
+   the original hypothesis.
+
+The `ConvergenceCriteria` model and `evaluate_deterministic()` function
+live in `providers/convergence.py`. See `IterationResult` for the
+per-iteration data structure that feeds the evaluation.
 
 Both modes produce the same artifact: an ordered list of completed steps
 with run IDs, parameters, and results — giving the review agent (or
