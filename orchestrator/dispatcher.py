@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from agents.benchmark.agent import BenchmarkAgent
+from agents.gathering_context.agent import GatheringContextAgent
 from agents.provisioning.agent import ProvisioningAgent
 from agents.resource.agent import ResourceAgent
 from agents.retrospective.agent import RetrospectiveAgent
@@ -141,10 +142,17 @@ class Dispatcher:
                 event_bus=self.events,
             )
 
-        # Recursive investigation loop agents (stubs until
+        # Gathering context agent (dedup gate)
+        if agent_type == "gathering_context":
+            return GatheringContextAgent(
+                llm_provider=self.llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+
+        # Remaining investigation loop agents (stubs until
         # full implementations land in later issues)
         stub_targets = {
-            "gathering_context": "planning_investigation",
             "planning_investigation": "awaiting_provision",
             "evaluating_convergence": "synthesizing_results",
             "synthesizing_results": "awaiting_teardown",

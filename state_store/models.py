@@ -68,7 +68,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # collect change-context from source control.
     TicketStatus.GATHERING_CONTEXT: [
         TicketStatus.PLANNING_INVESTIGATION,
-        TicketStatus.CLOSED,  # matched existing record, skip
+        TicketStatus.RETROSPECTIVE_PENDING,  # dedup match, skip to retro
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     # Planning investigation: form test plan from hypothesis.

@@ -54,10 +54,13 @@ def test_grounding_to_planning():
     assert TicketStatus.PLANNING_INVESTIGATION in allowed
 
 
-def test_grounding_to_closed():
-    """Grounding can close the ticket when a matching record is found."""
+def test_grounding_to_retrospective():
+    """Grounding routes to retrospective on dedup match
+    (not directly to closed — retrospective still analyzes
+    the transcript)."""
     allowed = VALID_TRANSITIONS[TicketStatus.GATHERING_CONTEXT]
-    assert TicketStatus.CLOSED in allowed
+    assert TicketStatus.RETROSPECTIVE_PENDING in allowed
+    assert TicketStatus.CLOSED not in allowed
 
 
 def test_grounding_to_hitl():
