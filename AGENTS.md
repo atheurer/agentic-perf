@@ -127,6 +127,45 @@ pre-commit use.
    correctness.** Each piece of knowledge has exactly one home.
 4. **The ticket is the single source of truth.** Agents are stateless.
 5. **Contracts over hardcoded procedures.**
-6. **Human on the loop, not in the loop.**
+6. **Guardrails at every LLM/infrastructure boundary.** Validate
+   before executing. Use structured tool calls, not free-text
+   parsing — tool call schemas are enforced by the model's
+   tool-use training; free-text schemas are enforced by hope.
+7. **Agents should be boring.** One job each. If an agent seems
+   to need cross-boundary knowledge, that knowledge belongs in a
+   skill provider, not in the agent.
+8. **Human on the loop, not in the loop.**
+9. **The new-harness test.** If adding a benchmark harness requires
+   changing agent prompts, the orchestrator, or the state machine,
+   the knowledge is in the wrong layer. Refactor until it doesn't.
 
 See `docs/design-philosophy.md` for full rationale.
+
+### Knowledge Layering
+
+When adding something new, use this test to decide where it goes:
+
+| Question | Home |
+|---|---|
+| Would a different org using the same harness need this? | **Public skill** (`skills/` or `providers/skills/`) |
+| Is it specific to how our org deploys this harness? | **Private skill** (`~/.agentic-perf/private-skills/`) |
+| Is it about how an agent reasons through its task? | **Agent prompt** (`agents/{name}/prompts.py`) |
+| Can getting it wrong waste resources or compromise security? | **Deterministic code** |
+
+If ambiguous, prefer code over prompts, and skills over hardcoded
+values in either. Never put harness-specific knowledge in agent
+prompts — that is always a skill provider's job.
+
+### Guardrails Checklist
+
+Every place where LLM output touches real infrastructure must have
+a guardrail. Existing examples to follow:
+
+- Run-file schema validation before benchmark execution
+- Hostname-to-IP resolution (FQDNs cause container timeouts)
+- SSH key comment conventions (harness key cleaners)
+- Run-file tamper detection between generate and execute
+- Platform contract checks before install attempts
+- PID lock files against duplicate orchestrators
+- `submit_*` structured tool calls as the mandatory agent output
+  format (never parse free-text for structured results)
