@@ -139,3 +139,111 @@ class TestCheckCommand:
 
         allowed, _ = check_command("clusterbuster -f job.yaml", benchmark_policy)
         assert allowed
+
+
+class TestBenchmarkDiscoveryCommands:
+    """Verify the benchmark agent can run hardware discovery commands."""
+
+    def test_block_devices(self, benchmark_policy):
+        allowed, _ = check_command("lsblk -d -o NAME,SIZE,TYPE --json", benchmark_policy)
+        assert allowed
+
+    def test_network_interfaces(self, benchmark_policy):
+        allowed, _ = check_command("ip -j link show", benchmark_policy)
+        assert allowed
+
+    def test_ethtool(self, benchmark_policy):
+        allowed, _ = check_command("ethtool -i eth0", benchmark_policy)
+        assert allowed
+
+    def test_sysctl_read(self, benchmark_policy):
+        allowed, _ = check_command("sysctl -a", benchmark_policy)
+        assert allowed
+
+    def test_numactl(self, benchmark_policy):
+        allowed, _ = check_command("numactl --hardware", benchmark_policy)
+        assert allowed
+
+    def test_perf_stat(self, benchmark_policy):
+        allowed, _ = check_command("perf stat -a sleep 1", benchmark_policy)
+        assert allowed
+
+    def test_dd_to_tmpfile(self, benchmark_policy):
+        allowed, _ = check_command(
+            "dd if=/dev/zero of=/tmp/testfile bs=1M count=100",
+            benchmark_policy,
+        )
+        assert allowed
+
+    def test_mpstat(self, benchmark_policy):
+        allowed, _ = check_command("mpstat -P ALL 1 5", benchmark_policy)
+        assert allowed
+
+    def test_sar(self, benchmark_policy):
+        allowed, _ = check_command("sar -n DEV 1 5", benchmark_policy)
+        assert allowed
+
+    def test_dmidecode(self, benchmark_policy):
+        allowed, _ = check_command("dmidecode -t memory", benchmark_policy)
+        assert allowed
+
+    def test_dmesg(self, benchmark_policy):
+        allowed, _ = check_command("dmesg | tail -50", benchmark_policy)
+        assert allowed
+
+    def test_journalctl(self, benchmark_policy):
+        allowed, _ = check_command("journalctl -u crucible --no-pager -n 100", benchmark_policy)
+        assert allowed
+
+
+class TestBenchmarkBlockedPatterns:
+    """Verify destructive commands are caught by blocked_patterns."""
+
+    def test_dd_to_disk(self, benchmark_policy):
+        allowed, _ = check_command(
+            "dd if=/dev/zero of=/dev/sda bs=1M", benchmark_policy
+        )
+        assert not allowed
+
+    def test_dd_to_nvme(self, benchmark_policy):
+        allowed, _ = check_command(
+            "dd if=/dev/zero of=/dev/nvme0n1 bs=4k", benchmark_policy
+        )
+        assert not allowed
+
+    def test_mkfs(self, benchmark_policy):
+        allowed, _ = check_command("mkfs.xfs /dev/sdb1", benchmark_policy)
+        assert not allowed
+
+    def test_fdisk(self, benchmark_policy):
+        allowed, _ = check_command("fdisk /dev/sda", benchmark_policy)
+        assert not allowed
+
+    def test_parted(self, benchmark_policy):
+        allowed, _ = check_command("parted /dev/sda mklabel gpt", benchmark_policy)
+        assert not allowed
+
+    def test_wipefs(self, benchmark_policy):
+        allowed, _ = check_command("wipefs -a /dev/sdb", benchmark_policy)
+        assert not allowed
+
+    def test_iptables_flush(self, benchmark_policy):
+        allowed, _ = check_command("iptables -F", benchmark_policy)
+        assert not allowed
+
+    def test_nft_flush(self, benchmark_policy):
+        allowed, _ = check_command("nft flush ruleset", benchmark_policy)
+        assert not allowed
+
+    def test_disable_ip_forwarding(self, benchmark_policy):
+        allowed, _ = check_command(
+            "sysctl -w net.ipv4.ip_forward=0", benchmark_policy
+        )
+        assert not allowed
+
+    def test_sysctl_write_allowed(self, benchmark_policy):
+        """Non-blocked sysctl writes should be allowed (test system tuning)."""
+        allowed, _ = check_command(
+            "sysctl -w net.core.rmem_max=16777216", benchmark_policy
+        )
+        assert allowed

@@ -1,22 +1,63 @@
 {
     "allowed_binaries": [
         "bash", "sh",
-        "cat", "grep", "sed", "awk", "head", "tail", "wc", "sort", "tee", "tr", "cut",
-        "echo", "printf", "test", "true", "false",
-        "ls", "find", "stat", "file", "readlink",
-        "mkdir", "chmod", "rm", "cp", "mv", "touch", "ln",
-        "crucible", "zathras", "burden",
+
+        "cat", "grep", "sed", "awk", "head", "tail", "wc", "sort",
+        "tee", "tr", "cut", "diff", "uniq", "paste", "column",
+        "echo", "printf", "test", "true", "false", "date", "env",
+
+        "ls", "find", "stat", "file", "readlink", "realpath", "which",
+        "mkdir", "chmod", "chown", "rm", "cp", "mv", "touch", "ln",
+        "df", "du", "mount", "lsof",
+
+        "hostname", "uname", "nproc", "free", "lscpu", "lsmem",
+        "lsblk", "lspci", "lsmod", "dmidecode",
+        "numactl", "numastat", "lstopo",
+        "dmesg",
+
+        "ip", "ss", "ethtool", "nmcli", "ping",
+        "nstat", "tc", "bridge",
+
+        "sysctl",
+
+        "ps", "top", "pidof", "pgrep", "taskset", "chrt",
+        "mpstat", "vmstat", "iostat", "sar", "turbostat",
+        "perf",
+
+        "systemctl", "journalctl", "timedatectl",
+        "setenforce", "getenforce",
+
+        "dnf", "yum", "rpm",
+
+        "dd",
+
+        "curl", "wget",
+        "git",
         "podman",
-        "ssh-keygen", "ssh",
+        "ssh-keygen", "ssh", "scp",
+
         "kubectl", "oc", "k3s",
+        "crucible", "zathras", "burden",
         "kube-burner", "clusterbuster", "k8s-netperf", "vstorm",
+
         "python3", "python",
         "sleep", "xargs", "xzcat",
-        "curl",
-        "cd",
-        "hostname",
-        "ip", "ethtool", "lspci", "nmcli"
+        "cd"
     ],
-    "blocked_patterns": [],
+    "blocked_patterns": [
+        "\\bdd\\b.*\\bof\\s*=\\s*/dev/[sv]d",
+        "\\bdd\\b.*\\bof\\s*=\\s*/dev/nvme",
+        "\\bmkfs\\.",
+        "\\bfdisk\\b",
+        "\\bparted\\b",
+        "\\bwipefs\\b",
+        "\\bcfdisk\\b",
+        "\\bsgdisk\\b",
+        "\\bblkdiscard\\b",
+        "\\biptables\\s+.*-F\\b",
+        "\\bnft\\s+flush\\b",
+        "\\bsysctl\\s+-w\\s+net\\.ipv[46]\\..*(?:forward|forwarding)\\s*=\\s*0\\b",
+        "\\brm\\s+-[^\\s]*r[^\\s]*f[^\\s]*\\s+/$"
+    ],
     "max_timeout": 7200
 }
