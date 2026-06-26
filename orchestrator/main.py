@@ -338,10 +338,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     await _block_handoff_failed(config.state_store_url, tid, reason)
                     continue
 
-                dispatcher.mark_active(tid)
                 dispatcher.mark_dispatched(tid, status)
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
-                asyncio.create_task(run_agent_task(dispatcher, status, tid))
+                task = asyncio.create_task(run_agent_task(dispatcher, status, tid))
+                dispatcher.set_task(tid, task)
 
         await asyncio.sleep(config.poll_interval)
 

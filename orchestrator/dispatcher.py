@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -56,23 +57,29 @@ class Dispatcher:
         self.events = event_bus
         self.repo_cache = repo_cache
         self._llm_factory = llm_factory
-        self._active: set[str] = set()
+        self._tasks: dict[str, asyncio.Task] = {}
         self._dispatched: set[tuple[str, str]] = set()
 
     def is_active(self, ticket_id: str) -> bool:
-        return ticket_id in self._active
+        task = self._tasks.get(ticket_id)
+        if task is None:
+            return False
+        if task.done():
+            self._tasks.pop(ticket_id, None)
+            return False
+        return True
 
     def was_dispatched(self, ticket_id: str, status: str) -> bool:
         return (ticket_id, status) in self._dispatched
 
-    def mark_active(self, ticket_id: str) -> None:
-        self._active.add(ticket_id)
+    def set_task(self, ticket_id: str, task: asyncio.Task) -> None:
+        self._tasks[ticket_id] = task
 
     def mark_dispatched(self, ticket_id: str, status: str) -> None:
         self._dispatched.add((ticket_id, status))
 
     def mark_done(self, ticket_id: str) -> None:
-        self._active.discard(ticket_id)
+        self._tasks.pop(ticket_id, None)
         self._dispatched = {(t, s) for t, s in self._dispatched if t != ticket_id}
 
     def _get_llm(self, agent_type: str) -> LLMProvider:
