@@ -229,8 +229,20 @@ class AgentBase(ABC):
                 )
                 await self._add_comment(
                     ticket_id,
-                    f"Agent {self.agent_name} reached maximum"
-                    f" iteration limit ({self.max_iterations}).",
+                    f"**Agent {self.agent_name} reached maximum"
+                    f" iteration limit ({self.max_iterations}).**"
+                    f" The agent could not complete its work within"
+                    f" the iteration budget. You can reply to guide"
+                    f" next steps (e.g., retry, skip to review,"
+                    f" or abort).",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        f"{self.agent_name} hit max iterations"
+                        f" — pausing for guidance"
+                    ),
                 )
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
