@@ -38,16 +38,14 @@ class BenchmarkAgent(AgentBase):
         self._skill_provider = skill_provider
         self._secrets_provider = secrets_provider
         self._repo_cache = repo_cache
-        self._hitl_triggered = False
-        self._hitl_ticket_id: str | None = None
+        self._ticket_id: str | None = None
 
         local_tools = [
             t for t in get_benchmark_tools() if t.name not in _MCP_TOOL_NAMES
         ]
 
         async def _request_clarification(question: str) -> str:
-            await self._do_request_clarification(question)
-            return "Clarification requested. Ticket paused for human input."
+            return await self._do_request_clarification(question)
 
         async def _present_runfile_for_approval(
             run_file: dict,
@@ -61,10 +59,7 @@ class BenchmarkAgent(AgentBase):
                 f"```json\n{json.dumps(run_file, indent=2)}\n```\n\n"
                 "Do you approve this configuration? (approve / request changes / reject)"
             )
-            await self._do_request_clarification(question)
-            return (
-                "Clarification requested. Ticket paused for user approval of run-file."
-            )
+            return await self._do_request_clarification(question)
 
         local_handlers = {
             "request_clarification": _request_clarification,
@@ -80,14 +75,13 @@ class BenchmarkAgent(AgentBase):
             event_bus=event_bus,
         )
 
-    async def _do_request_clarification(self, question: str) -> None:
-        if self._hitl_ticket_id:
-            self._hitl_triggered = True
-            await self._request_human_input(self._hitl_ticket_id, question)
+    async def _do_request_clarification(self, question: str) -> str:
+        if self._ticket_id:
+            return await self._request_human_input(self._ticket_id, question)
+        return "No ticket context available."
 
     async def run(self, ticket_id: str) -> None:
-        self._hitl_ticket_id = ticket_id
-        self._hitl_triggered = False
+        self._ticket_id = ticket_id
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -203,10 +197,6 @@ class BenchmarkAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
-        if self._hitl_triggered:
-            logger.info(f"[benchmark-agent] HITL triggered for {ticket_id}")
-            return
-
         result = self._get_submit_result(response)
         if not result:
             result = self._parse_json_response(response.text)

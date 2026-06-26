@@ -56,8 +56,7 @@ class ResourceAgent(AgentBase):
         event_bus: EventBus | None = None,
     ) -> None:
         self._mode = mode
-        self._hitl_triggered = False
-        self._hitl_ticket_id: str | None = None
+        self._ticket_id: str | None = None
         self._secrets = secrets_provider
         self._registry = (
             ResourceProviderRegistry(secrets_provider) if secrets_provider else None
@@ -83,17 +82,16 @@ class ResourceAgent(AgentBase):
             event_bus=event_bus,
         )
 
-    async def _do_request_clarification(self, question: str) -> None:
-        if self._hitl_ticket_id:
-            self._hitl_triggered = True
-            await self._request_human_input(self._hitl_ticket_id, question)
+    async def _do_request_clarification(self, question: str) -> str:
+        if self._ticket_id:
+            return await self._request_human_input(self._ticket_id, question)
+        return "No ticket context available."
 
     async def run(self, ticket_id: str) -> None:
         if self._mode == "teardown":
             await self._run_teardown(ticket_id)
             return
-        self._hitl_ticket_id = ticket_id
-        self._hitl_triggered = False
+        self._ticket_id = ticket_id
 
         resource_server = str(Path(__file__).with_name("server.py"))
 
@@ -299,10 +297,6 @@ class ResourceAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
-        if self._hitl_triggered:
-            logger.info(f"[resource-agent] HITL triggered for {ticket_id}")
-            return
-
         result = self._get_submit_result(response)
         if not result:
             result = self._parse_json_response(response.text)
