@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -371,10 +372,43 @@ class AgentBase(ABC):
         r.raise_for_status()
         return r.json()
 
-    async def _request_human_input(self, ticket_id: str, question: str) -> None:
+    _HITL_POLL_INTERVAL = 5.0
+    _HITL_TIMEOUT = 1800.0
+
+    async def _request_human_input(self, ticket_id: str, question: str) -> str:
+        """Pause for human input and return the user's reply.
+
+        Transitions to awaiting_customer_guidance, polls until the
+        user replies (ticket leaves that status), then returns the
+        reply text. The agent's LLM loop continues with full context.
+        """
+        ticket = await self._get_ticket(ticket_id)
+        comment_count = len(ticket.get("comments", []))
         await self._add_comment(ticket_id, f"**Input needed:** {question}")
         await self._transition_ticket(
             ticket_id,
             "awaiting_customer_guidance",
             comment=f"Agent {self.agent_name} needs clarification",
         )
+
+        logger.info(f"[{self.agent_name}] Waiting for human input on {ticket_id}")
+        elapsed = 0.0
+        while elapsed < self._HITL_TIMEOUT:
+            await asyncio.sleep(self._HITL_POLL_INTERVAL)
+            elapsed += self._HITL_POLL_INTERVAL
+            ticket = await self._get_ticket(ticket_id)
+            if ticket.get("status") != "awaiting_customer_guidance":
+                new_comments = ticket.get("comments", [])[comment_count:]
+                user_replies = [
+                    c["body"]
+                    for c in new_comments
+                    if c.get("author") not in ("system", self.agent_name)
+                ]
+                reply = (
+                    "\n".join(user_replies) if user_replies else "User resumed ticket."
+                )
+                logger.info(f"[{self.agent_name}] Human input received on {ticket_id}")
+                return reply
+
+        logger.warning(f"[{self.agent_name}] HITL timeout on {ticket_id}")
+        return "No response received within timeout. Proceed with best judgment."
