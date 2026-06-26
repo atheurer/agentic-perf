@@ -565,6 +565,73 @@ details > .content { padding: 12px 16px; }
   word-break: break-word;
 }
 
+.ticket-tokens {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--cyan);
+  white-space: nowrap;
+  text-align: right;
+}
+
+.ticket-cost {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--yellow);
+  white-space: nowrap;
+  text-align: right;
+}
+
+th.col-right { text-align: right; }
+
+.agent-cost-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+
+.agent-cost-name {
+  width: 70px;
+  flex-shrink: 0;
+  color: var(--cyan);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-cost-bar-bg {
+  flex: 1;
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.agent-cost-bar {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.3s;
+}
+
+.agent-cost-val {
+  width: 52px;
+  flex-shrink: 0;
+  text-align: right;
+  color: var(--yellow);
+  font-family: var(--font-mono);
+}
+
+.agent-cost-detail {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  padding-left: 76px;
+  font-family: var(--font-mono);
+}
+
 @media (max-width: 900px) {
   .container { padding: 0 12px; }
   .ticket-summary { max-width: 250px; }
@@ -668,16 +735,37 @@ function prettyJson(obj) {
   } catch { return String(obj); }
 }
 
+function fmtCost(usd) {
+  if (usd === 0) return '$0.00';
+  if (usd < 0.01) return '<$0.01';
+  if (usd < 1) return '$' + usd.toFixed(3);
+  return '$' + usd.toFixed(2);
+}
+
 async function refreshHealth() {
   try {
-    const data = await api('/health');
-    const el = document.getElementById('health-stats');
+    var results = await Promise.all([
+      api('/health'),
+      api('/usage/summary').catch(function() { return null; }),
+    ]);
+    var data = results[0];
+    var usage = results[1];
+    var el = document.getElementById('health-stats');
     if (!el) return;
-    const counts = data.ticket_counts || {};
-    const active = data.total - (counts.closed || 0);
-    el.innerHTML =
+    var counts = data.ticket_counts || {};
+    var active = data.total - (counts.closed || 0);
+    var html =
       '<span>Total: <span class="stat-val">' + data.total + '</span></span>' +
       '<span>Active: <span class="stat-val">' + active + '</span></span>';
+    if (usage && usage.global && usage.global.total_tokens > 0) {
+      var g = usage.global;
+      html +=
+        '<span>Tokens: <span class="stat-val" style="color:var(--cyan)">' +
+          g.total_tokens.toLocaleString() + '</span></span>' +
+        '<span>Cost: <span class="stat-val" style="color:var(--yellow)">' +
+          fmtCost(g.estimated_cost_usd) + '</span></span>';
+    }
+    el.innerHTML = html;
   } catch {}
 }
 
@@ -724,9 +812,15 @@ async function renderList() {
 
 async function loadTickets() {
   try {
-    const qs = statusFilter ? '?status=' + statusFilter : '';
-    const tickets = await api('/tickets' + qs);
-    const el = document.getElementById('ticket-table');
+    var qs = statusFilter ? '?status=' + statusFilter : '';
+    var results = await Promise.all([
+      api('/tickets' + qs),
+      api('/usage/summary').catch(function() { return null; }),
+    ]);
+    var tickets = results[0];
+    var usage = results[1];
+    var byTicket = (usage && usage.by_ticket) || {};
+    var el = document.getElementById('ticket-table');
     if (!el) return;
 
     if (!tickets || tickets.length === 0) {
@@ -738,18 +832,23 @@ async function loadTickets() {
       return;
     }
 
-    const sorted = tickets.sort(function(a, b) {
+    var sorted = tickets.sort(function(a, b) {
       return new Date(b.created_at) - new Date(a.created_at);
     });
 
-    let rows = '';
+    var rows = '';
     for (var i = 0; i < sorted.length; i++) {
       var t = sorted[i];
+      var tu = byTicket[t.id];
+      var tokHtml = tu ? tu.total_tokens.toLocaleString() : '&mdash;';
+      var costHtml = tu ? fmtCost(tu.estimated_cost_usd) : '&mdash;';
       rows +=
         '<tr class="ticket-row" data-id="' + escHtml(t.id) + '">' +
           '<td class="ticket-id">' + escHtml(t.id) + '</td>' +
           '<td class="ticket-summary">' + escHtml(t.summary) + '</td>' +
           '<td>' + statusBadge(t.status) + '</td>' +
+          '<td class="ticket-tokens">' + tokHtml + '</td>' +
+          '<td class="ticket-cost">' + costHtml + '</td>' +
           '<td class="ticket-time">' + fmtTime(t.created_at) + '</td>' +
           '<td class="ticket-time">' + fmtTime(t.updated_at) + '</td>' +
         '</tr>';
@@ -758,7 +857,9 @@ async function loadTickets() {
     el.innerHTML =
       '<table>' +
         '<thead><tr>' +
-          '<th>Ticket</th><th>Summary</th><th>Status</th><th>Created</th><th>Updated</th>' +
+          '<th>Ticket</th><th>Summary</th><th>Status</th>' +
+          '<th class="col-right">Tokens</th><th class="col-right">Cost</th>' +
+          '<th>Created</th><th>Updated</th>' +
         '</tr></thead>' +
         '<tbody>' + rows + '</tbody>' +
       '</table>';
@@ -999,12 +1100,13 @@ async function updateUsageSidebar(ticketId) {
       return;
     }
     var cost = data.estimated_cost_usd;
-    var costStr = cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
     el.innerHTML =
       '<div style="margin-bottom:4px">' +
-        '<span style="color:var(--cyan)">' + u.total_tokens.toLocaleString() + '</span> tokens' +
+        '<span style="color:var(--cyan); font-size:16px; font-weight:700">' +
+          u.total_tokens.toLocaleString() + '</span>' +
+        '<span style="color:var(--text-muted)"> tokens</span>' +
       '</div>' +
-      '<div style="margin-bottom:4px; font-size:11px">' +
+      '<div style="margin-bottom:4px; font-size:11px; font-family:var(--font-mono)">' +
         u.input_tokens.toLocaleString() + ' in / ' +
         u.output_tokens.toLocaleString() + ' out' +
       '</div>' +
@@ -1013,28 +1115,43 @@ async function updateUsageSidebar(ticketId) {
         ' &middot; ' + (u.total_duration_ms / 1000).toFixed(1) + 's' +
       '</div>' +
       '<div style="margin-bottom:4px">' +
-        'Est. <span style="color:var(--yellow)">' + costStr + '</span>' +
+        'Est. <span style="color:var(--yellow); font-size:14px; font-weight:700">' +
+          fmtCost(cost) + '</span>' +
       '</div>' +
       (u.models_used.length > 0 ?
         '<div style="font-size:10px; color:var(--text-muted); margin-bottom:4px">' +
           u.models_used.join(', ') +
         '</div>' : '');
-    // Per-agent breakdown
+
     var agents = data.by_agent || {};
     var agentNames = Object.keys(agents);
-    if (agentNames.length > 1) {
-      var agentHtml = '<div style="margin-top:6px; border-top:1px solid var(--border); padding-top:4px; font-size:11px">';
-      agentHtml += '<div style="color:var(--text-muted); margin-bottom:2px">By agent:</div>';
+    if (agentNames.length > 0) {
+      agentNames.sort(function(a, b) {
+        return (agents[b].estimated_cost_usd || 0) - (agents[a].estimated_cost_usd || 0);
+      });
+      var maxCost = agents[agentNames[0]].estimated_cost_usd || 1;
+      var agentHtml = '<div style="margin-top:8px; border-top:1px solid var(--border); padding-top:8px">';
+      agentHtml += '<div style="color:var(--text-muted); font-size:10px; text-transform:uppercase; ' +
+        'letter-spacing:0.5px; margin-bottom:6px">By Agent</div>';
       for (var ai = 0; ai < agentNames.length; ai++) {
         var an = agentNames[ai];
         var au = agents[an];
-        var acost = au.estimated_cost_usd;
-        var acostStr = acost < 0.01 ? '<$0.01' : '$' + acost.toFixed(3);
-        agentHtml += '<div style="margin-bottom:2px">' +
-          '<span style="color:var(--cyan)">' + an.replace('-agent', '') + '</span> ' +
-          au.total_tokens.toLocaleString() + 't ' +
-          acostStr +
-        '</div>';
+        var acost = au.estimated_cost_usd || 0;
+        var pct = maxCost > 0 ? Math.round((acost / maxCost) * 100) : 0;
+        var shortName = an.replace(/-agent$/, '');
+        agentHtml +=
+          '<div class="agent-cost-row">' +
+            '<span class="agent-cost-name" title="' + escHtml(an) + '">' + escHtml(shortName) + '</span>' +
+            '<span class="agent-cost-bar-bg">' +
+              '<span class="agent-cost-bar" style="width:' + pct + '%"></span>' +
+            '</span>' +
+            '<span class="agent-cost-val">' + fmtCost(acost) + '</span>' +
+          '</div>' +
+          '<div class="agent-cost-detail">' +
+            au.total_tokens.toLocaleString() + 't &middot; ' +
+            au.llm_calls + ' calls &middot; ' +
+            (au.total_duration_ms / 1000).toFixed(1) + 's' +
+          '</div>';
       }
       agentHtml += '</div>';
       el.innerHTML += agentHtml;

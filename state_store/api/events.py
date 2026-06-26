@@ -5,6 +5,7 @@ from fastapi import APIRouter, Query, Request
 from providers.cost import estimate_cumulative_cost
 
 router = APIRouter(prefix="/tickets", tags=["events"])
+usage_router = APIRouter(prefix="/usage", tags=["usage"])
 
 
 @router.get("/{ticket_id}/events")
@@ -147,4 +148,83 @@ def get_usage(ticket_id: str, request: Request):
         "usage": usage,
         "estimated_cost_usd": round(estimate_cumulative_cost(usage), 6),
         "by_agent": agent_costs,
+    }
+
+
+def _compute_ticket_usage(
+    event_bus: object,
+    ticket_id: str,
+) -> dict:
+    """Compute lightweight usage summary for a single ticket."""
+    events = event_bus.get_events(ticket_id, since=0, limit=10000)
+
+    total_in = 0
+    total_out = 0
+    llm_calls = 0
+    models_seen: set[str] = set()
+
+    for evt in events:
+        if evt.get("event_type") != "llm_usage":
+            continue
+        data = evt.get("data", {})
+        in_tok = data.get("input_tokens", 0) or 0
+        out_tok = data.get("output_tokens", 0) or 0
+        if not in_tok and not out_tok:
+            continue
+        total_in += in_tok
+        total_out += out_tok
+        llm_calls += 1
+        model = data.get("model", "")
+        if model:
+            models_seen.add(model)
+
+    usage = {
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "total_tokens": total_in + total_out,
+        "llm_calls": llm_calls,
+        "models_used": sorted(models_seen),
+    }
+    return {
+        **usage,
+        "estimated_cost_usd": round(estimate_cumulative_cost(usage), 6),
+    }
+
+
+@usage_router.get("/summary")
+def get_usage_summary(request: Request):
+    """Get usage summary across all tickets."""
+    event_bus = getattr(request.app.state, "event_bus", None)
+    store = request.app.state.store
+    tickets = store.list_tickets()
+
+    empty_global = {
+        "total_tokens": 0,
+        "llm_calls": 0,
+        "estimated_cost_usd": 0.0,
+    }
+
+    if event_bus is None:
+        return {"global": empty_global, "by_ticket": {}}
+
+    by_ticket = {}
+    g_tokens = 0
+    g_calls = 0
+    g_cost = 0.0
+
+    for ticket in tickets:
+        tu = _compute_ticket_usage(event_bus, ticket.id)
+        if tu["llm_calls"] > 0:
+            by_ticket[ticket.id] = tu
+            g_tokens += tu["total_tokens"]
+            g_calls += tu["llm_calls"]
+            g_cost += tu["estimated_cost_usd"]
+
+    return {
+        "global": {
+            "total_tokens": g_tokens,
+            "llm_calls": g_calls,
+            "estimated_cost_usd": round(g_cost, 6),
+        },
+        "by_ticket": by_ticket,
     }
