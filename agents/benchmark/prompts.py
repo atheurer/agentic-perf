@@ -60,6 +60,8 @@ to construct a correct run file — getting the format right is critical.
    - Targets may be empty — workloads run as pods, not on separate hosts
 
 6. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
+   If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
+   Do NOT ask for approval when the user explicitly said not to.
    If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
 
 7. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
