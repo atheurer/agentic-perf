@@ -48,7 +48,7 @@ its own ID):
 ```json
 "endpoints": [{
   "type": "remotehosts",
-  "settings": {"user": "root", "controller-ip-address": "172.31.15.4"},
+  "settings": {"user": "root"},
   "remotes": [
     {"engines": [{"role": "client", "ids": ["1"]}], "config": {"host": "172.31.7.247"}},
     {"engines": [{"role": "server", "ids": ["1"]}], "config": {"host": "172.31.13.125"}},
@@ -191,3 +191,18 @@ can trigger IPv6 link-local resolution, causing timeouts.
 This rule does NOT apply to benchmark parameters like
 `remotehost` in mv-params — hostnames work fine there because
 the benchmark itself resolves them within the container.
+
+## controller-ip-address: omit unless necessary
+
+Do NOT include `controller-ip-address` in endpoint settings
+unless you have a specific reason (e.g., the controller has
+multiple network paths and crucible picks the wrong one).
+Crucible can determine the controller's IP automatically in
+most cases. Including a wrong IP (e.g., a libvirt bridge or
+OpenStack network IP) will break the run.
+
+If you do need to specify it, use the IP that the endpoints
+can reach the controller through — typically the management
+network IP. One way to discover this: SSH from the controller
+to an endpoint, then check `ss -tn` on either side to see
+which source IP was used.

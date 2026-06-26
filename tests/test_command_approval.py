@@ -82,8 +82,6 @@ class TestRequestApproval:
         mock_resp_patch = MagicMock()
         mock_resp_patch.raise_for_status = MagicMock()
 
-        original_patch = None
-
         def patch_side_effect(*args, **kwargs):
             nonlocal captured_approval_id
             body = kwargs.get("json", {})
@@ -183,9 +181,7 @@ class TestExecuteCommandApproval:
             )
             server._ssh = MagicMock()
 
-            result_str = await server.execute_command(
-                "10.0.0.1", "reboot", timeout=10
-            )
+            result_str = await server.execute_command("10.0.0.1", "reboot", timeout=10)
             result = json.loads(result_str)
             assert result["blocked"] is True
             assert "blocked by policy" in result["stderr"].lower()
@@ -208,9 +204,7 @@ class TestExecuteCommandApproval:
                 allowed_binaries={"ls"},
             )
             mock_ssh = AsyncMock()
-            mock_ssh.run.return_value = SSHResult(
-                stdout="ok", stderr="", exit_code=0
-            )
+            mock_ssh.run.return_value = SSHResult(stdout="ok", stderr="", exit_code=0)
             server._ssh = mock_ssh
 
             with patch.object(
@@ -285,9 +279,7 @@ class TestExecuteCommandApproval:
             )
             server._ssh = mock_ssh
 
-            result_str = await server.execute_command(
-                "10.0.0.1", "ls /tmp", timeout=10
-            )
+            result_str = await server.execute_command("10.0.0.1", "ls /tmp", timeout=10)
             result = json.loads(result_str)
             assert result["exit_code"] == 0
         finally:

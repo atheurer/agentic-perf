@@ -95,6 +95,7 @@ class ReviewAgent(AgentBase):
         cf = ticket.get("custom_fields", {})
         content = (
             f"## Performance Test Request\n\n"
+            f"**Ticket ID:** {ticket['id']}\n"
             f"**Summary:** {ticket['summary']}\n\n"
             f"**Description:**\n{ticket['description']}\n"
         )

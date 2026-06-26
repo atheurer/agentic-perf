@@ -14,7 +14,8 @@
         "sleep", "xargs", "xzcat",
         "curl",
         "cd",
-        "hostname"
+        "hostname",
+        "ip", "ethtool", "lspci", "nmcli"
     ],
     "blocked_patterns": [],
     "max_timeout": 7200

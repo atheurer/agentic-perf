@@ -6,9 +6,7 @@ generation, benchmark step params, review multi-run awareness.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from state_store.models import VALID_TRANSITIONS, TicketStatus
 
@@ -32,8 +30,7 @@ def test_original_review_transitions_intact():
 # --- Plan advancement ---
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_no_plan_is_noop():
+def test_advance_plan_no_plan_is_noop():
     """_advance_plan does nothing when ticket has no execution_plan."""
     from orchestrator.main import _advance_plan
 
@@ -43,20 +40,17 @@ async def test_advance_plan_no_plan_is_noop():
         "custom_fields": {"run_id": "RUN-001"},
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
+    client = MagicMock()
+    client.get.return_value = mock_response
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_skips_non_plan_agent():
+def test_advance_plan_skips_non_plan_agent():
     """_advance_plan does nothing when the completed agent doesn't match the step."""
     from orchestrator.main import _advance_plan
 
@@ -80,21 +74,17 @@ async def test_advance_plan_skips_non_plan_agent():
         "custom_fields": {"execution_plan": plan},
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
+    client = MagicMock()
+    client.get.return_value = mock_response
 
-        # Resource agent completed — should NOT advance the benchmark step
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_hardware")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_hardware")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_skips_when_hitl_paused():
+def test_advance_plan_skips_when_hitl_paused():
     """_advance_plan does nothing when the agent paused for human input."""
     from orchestrator.main import _advance_plan
 
@@ -119,20 +109,17 @@ async def test_advance_plan_skips_when_hitl_paused():
         "custom_fields": {"execution_plan": plan},
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
+    client = MagicMock()
+    client.get.return_value = mock_response
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_completes_step_and_advances():
+def test_advance_plan_completes_step_and_advances():
     """After benchmark step, plan marks it completed and transitions."""
     from orchestrator.main import _advance_plan
 
@@ -174,15 +161,13 @@ async def test_advance_plan_completes_step_and_advances():
         },
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
-        client.patch.return_value = MagicMock(status_code=200)
-        client.post.return_value = MagicMock(status_code=200)
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -201,8 +186,7 @@ async def test_advance_plan_completes_step_and_advances():
         assert transition_call.kwargs["json"]["status"] == "executing_benchmark"
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_final_step_no_transition():
+def test_advance_plan_final_step_no_transition():
     """After the last step, _advance_plan saves results but no transition."""
     from orchestrator.main import _advance_plan
 
@@ -228,14 +212,12 @@ async def test_advance_plan_final_step_no_transition():
         },
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
-        client.patch.return_value = MagicMock(status_code=200)
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_review")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_review")
 
         client.patch.assert_called_once()
         transition_calls = [
@@ -244,8 +226,7 @@ async def test_advance_plan_final_step_no_transition():
         assert len(transition_calls) == 0
 
 
-@pytest.mark.asyncio
-async def test_advance_plan_tracks_multiple_run_ids():
+def test_advance_plan_tracks_multiple_run_ids():
     """Each completed benchmark step's run_id is appended to plan.run_ids."""
     from orchestrator.main import _advance_plan
 
@@ -287,15 +268,13 @@ async def test_advance_plan_tracks_multiple_run_ids():
         },
     }
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-        client.get.return_value = mock_response
-        client.patch.return_value = MagicMock(status_code=200)
-        client.post.return_value = MagicMock(status_code=200)
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
 
-        await _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]

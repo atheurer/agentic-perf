@@ -310,9 +310,7 @@ async def _get_ticket_approvals() -> list[str]:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{_state_store_url}/api/v1/tickets/{_ticket_id}"
-            )
+            r = await client.get(f"{_state_store_url}/api/v1/tickets/{_ticket_id}")
             r.raise_for_status()
             fields = r.json().get("custom_fields", {})
             return fields.get("command_approvals", [])
@@ -320,9 +318,7 @@ async def _get_ticket_approvals() -> list[str]:
         return []
 
 
-async def _request_approval(
-    command: str, binary: str, host: str
-) -> str:
+async def _request_approval(command: str, binary: str, host: str) -> str:
     """Request user approval for a command not in the allowlist.
 
     Writes a pending_approval request to the ticket's custom_fields,
@@ -372,9 +368,7 @@ async def _request_approval(
             elapsed += _APPROVAL_POLL_INTERVAL
 
             try:
-                r = await client.get(
-                    f"{_state_store_url}/api/v1/tickets/{_ticket_id}"
-                )
+                r = await client.get(f"{_state_store_url}/api/v1/tickets/{_ticket_id}")
                 r.raise_for_status()
                 fields = r.json().get("custom_fields", {})
                 pa = fields.get("pending_approval", {})
@@ -420,9 +414,7 @@ async def execute_command(host: str, command: str, timeout: int = 300) -> str:
                         binary,
                     )
                 else:
-                    decision = await _request_approval(
-                        command, binary, host
-                    )
+                    decision = await _request_approval(command, binary, host)
                     if decision not in (
                         "approved_once",
                         "approved_ticket",
@@ -454,9 +446,7 @@ async def execute_command(host: str, command: str, timeout: int = 300) -> str:
                     {
                         "exit_code": -1,
                         "stdout": "",
-                        "stderr": (
-                            f"Command blocked by policy: {reason}"
-                        ),
+                        "stderr": (f"Command blocked by policy: {reason}"),
                         "blocked": True,
                     }
                 )

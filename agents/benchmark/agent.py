@@ -90,6 +90,7 @@ class BenchmarkAgent(AgentBase):
         self._hitl_triggered = False
 
         bench_server = str(Path(__file__).with_name("server.py"))
+        infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
         mcp = AgentMCPClient()
         await mcp.connect(
@@ -97,6 +98,7 @@ class BenchmarkAgent(AgentBase):
             name="benchmark",
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
+        await mcp.connect(infra_server, name="infra")
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
@@ -120,6 +122,7 @@ class BenchmarkAgent(AgentBase):
         cf = ticket.get("custom_fields", {})
         content = (
             f"## Performance Test Request\n\n"
+            f"**Ticket ID:** {ticket['id']}\n"
             f"**Summary:** {ticket['summary']}\n\n"
             f"**Description:**\n{ticket['description']}\n"
         )

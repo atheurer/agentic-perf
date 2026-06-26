@@ -741,9 +741,7 @@ def main():
         help="Abort the ticket after replying (skip to cleanup)",
     )
 
-    p_approve = sub.add_parser(
-        "approve", help="Approve a pending command execution"
-    )
+    p_approve = sub.add_parser("approve", help="Approve a pending command execution")
     p_approve.add_argument("ticket_id", help="Ticket ID")
     p_approve.add_argument(
         "--ticket",

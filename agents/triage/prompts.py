@@ -45,6 +45,9 @@ Your job is to analyze a performance test request ticket and:
    - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"
    - "run on kubernetes" / "use kube endpoints" / "run in pods" → endpoint_type: "kube"
    - "run on bare metal" / "use remotehosts" → endpoint_type: "remotehosts"
+   - "test the 25G NICs" / "use the Intel interfaces" / "not the management network"
+     → test_interfaces: "<description of which NICs>" (the benchmark agent will
+     discover the actual interface names and IPs on the hosts)
 
    If the user does not mention a directive, omit it — downstream agents will use
    their own defaults. Do NOT invent directives the user didn't ask for.

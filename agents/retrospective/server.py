@@ -11,28 +11,32 @@ mcp = FastMCP("retrospective")
 DEFAULT_LOG_DIR = Path.home() / ".agentic-perf" / "logs"
 DEFAULT_TICKET_DIR = Path.home() / ".agentic-perf" / "tickets"
 
-SENSITIVE_TOOLS = frozenset({
-    "execute_command",
-    "execute_benchmark",
-    "read_remote_file",
-    "write_remote_file",
-    "deploy_secret",
-})
+SENSITIVE_TOOLS = frozenset(
+    {
+        "execute_command",
+        "execute_benchmark",
+        "read_remote_file",
+        "write_remote_file",
+        "deploy_secret",
+    }
+)
 
-KNOWN_HARNESS_COMMANDS = frozenset({
-    "crucible",
-    "burden",
-    "zathras",
-    "kube-burner",
-    "k8s-netperf",
-    "benchmark-runner",
-    "clusterbuster",
-    "vstorm",
-    "ioscale",
-    "fio",
-    "uperf",
-    "iperf3",
-})
+KNOWN_HARNESS_COMMANDS = frozenset(
+    {
+        "crucible",
+        "burden",
+        "zathras",
+        "kube-burner",
+        "k8s-netperf",
+        "benchmark-runner",
+        "clusterbuster",
+        "vstorm",
+        "ioscale",
+        "fio",
+        "uperf",
+        "iperf3",
+    }
+)
 
 SENSITIVE_PATHS = [
     re.compile(r"/etc/(shadow|passwd|sudoers)"),
@@ -105,9 +109,7 @@ def _check_suspicious_tool_use(
     input_str = json.dumps(input_data, default=str).lower()
 
     if tool in ("execute_command", "execute_benchmark"):
-        command = input_data.get("command", "") or input_data.get(
-            "run_command", ""
-        )
+        command = input_data.get("command", "") or input_data.get("run_command", "")
         if not command and tool == "execute_command":
             command = input_str
 
@@ -115,13 +117,9 @@ def _check_suspicious_tool_use(
 
         for pattern in EGRESS_PATTERNS:
             if pattern.search(command_lower):
-                return (
-                    f"Command contains network egress pattern: "
-                    f"{command[:200]}"
-                )
+                return f"Command contains network egress pattern: {command[:200]}"
 
         if tool == "execute_benchmark":
-            harness = input_data.get("harness", "")
             run_cmd = input_data.get("run_command", "")
             if run_cmd:
                 first_word = run_cmd.strip().split()[0] if run_cmd.strip() else ""
@@ -132,9 +130,7 @@ def _check_suspicious_tool_use(
                         f"unknown binary '{base}': {run_cmd[:200]}"
                     )
 
-        target = input_data.get("controller", "") or input_data.get(
-            "host", ""
-        )
+        target = input_data.get("controller", "") or input_data.get("host", "")
         if target and ticket_ctx["hosts"] and target not in ticket_ctx["hosts"]:
             return (
                 f"Command targets host '{target}' not in "
@@ -142,14 +138,10 @@ def _check_suspicious_tool_use(
             )
 
     if tool in ("read_remote_file", "write_remote_file", "deploy_secret"):
-        file_path = input_data.get("path", "") or input_data.get(
-            "remote_path", ""
-        )
+        file_path = input_data.get("path", "") or input_data.get("remote_path", "")
         for pattern in SENSITIVE_PATHS:
             if pattern.search(file_path):
-                return (
-                    f"File operation on sensitive path: {file_path}"
-                )
+                return f"File operation on sensitive path: {file_path}"
 
     return None
 
@@ -165,14 +157,16 @@ def _detect_suspicious_tool_use(
             continue
         reason = _check_suspicious_tool_use(evt, ticket_ctx)
         if reason:
-            signals.append({
-                "type": "suspicious_tool_use",
-                "agent": evt.get("agent", ""),
-                "tool": evt.get("data", {}).get("tool", ""),
-                "reason": reason,
-                "seq": evt.get("seq"),
-                "context": _get_context(events, i, radius=3),
-            })
+            signals.append(
+                {
+                    "type": "suspicious_tool_use",
+                    "agent": evt.get("agent", ""),
+                    "tool": evt.get("data", {}).get("tool", ""),
+                    "reason": reason,
+                    "seq": evt.get("seq"),
+                    "context": _get_context(events, i, radius=3),
+                }
+            )
     return signals
 
 

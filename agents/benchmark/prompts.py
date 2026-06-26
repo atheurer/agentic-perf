@@ -44,6 +44,13 @@ to construct a correct run file — getting the format right is critical.
    - Call `get_example_runfile(benchmark, endpoint_type=...)` for a structural reference
    - Read the harness's run-file documentation for format details
    - Use endpoint IPs from assigned_hardware_ips (always use IPs, never hostnames)
+   - **Check directives for `test_interfaces`** — if the user requested specific
+     NICs or a non-management network, you MUST discover the actual interface
+     names and IPs on the hosts before constructing the run-file. Read the
+     benchmark's skill doc for guidance on network discovery and how to use
+     the discovered interfaces in the run-file parameters. Do not assume the
+     management IPs are correct for benchmark traffic when the user specified
+     different interfaces.
 
    **For kube endpoints** (endpoint_type: "kube"):
    - Read the harness's kube endpoint skill doc (e.g., `kube-endpoints.md`)
@@ -65,7 +72,7 @@ to construct a correct run file — getting the format right is critical.
 - Use IP addresses, never hostnames (IPv6 link-local causes timeouts)
 - `tags` must be an object `{"key": "val"}`, NOT an array
 - `ids` values must be strings: `"1"` not `1`
-- Set `controller-ip-address` in the remote's settings when controller is also an endpoint
+- Do NOT set `controller-ip-address` unless you have a specific reason — crucible determines it automatically. Setting the wrong IP breaks the run.
 - `userenv` should be `alma8` for trafficgen (not `default`)
 - `osruntime: podman` needs `host-mounts` for DPDK workloads (e.g., /dev/hugepages)
 - Every benchmark object MUST include `mv-params` — it is required by the schema.

@@ -189,7 +189,7 @@ class EventBus:
             prefix = f"{ticket_id}:"
             for key, usage in self._cumulative.items():
                 if key.startswith(prefix):
-                    agent_name = key[len(prefix):]
+                    agent_name = key[len(prefix) :]
                     result[agent_name] = usage.to_dict()
             return result
 
