@@ -145,7 +145,9 @@ class TestBenchmarkDiscoveryCommands:
     """Verify the benchmark agent can run hardware discovery commands."""
 
     def test_block_devices(self, benchmark_policy):
-        allowed, _ = check_command("lsblk -d -o NAME,SIZE,TYPE --json", benchmark_policy)
+        allowed, _ = check_command(
+            "lsblk -d -o NAME,SIZE,TYPE --json", benchmark_policy
+        )
         assert allowed
 
     def test_network_interfaces(self, benchmark_policy):
@@ -192,7 +194,9 @@ class TestBenchmarkDiscoveryCommands:
         assert allowed
 
     def test_journalctl(self, benchmark_policy):
-        allowed, _ = check_command("journalctl -u crucible --no-pager -n 100", benchmark_policy)
+        allowed, _ = check_command(
+            "journalctl -u crucible --no-pager -n 100", benchmark_policy
+        )
         assert allowed
 
 
@@ -236,9 +240,7 @@ class TestBenchmarkBlockedPatterns:
         assert not allowed
 
     def test_disable_ip_forwarding(self, benchmark_policy):
-        allowed, _ = check_command(
-            "sysctl -w net.ipv4.ip_forward=0", benchmark_policy
-        )
+        allowed, _ = check_command("sysctl -w net.ipv4.ip_forward=0", benchmark_policy)
         assert not allowed
 
     def test_sysctl_write_allowed(self, benchmark_policy):
