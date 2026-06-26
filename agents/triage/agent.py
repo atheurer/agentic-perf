@@ -158,8 +158,24 @@ class TriageAgent(AgentBase):
             summary += f"- **Notes:** {result['notes']}\n"
 
         await self._add_comment(ticket_id, summary)
-        await self._transition_ticket(
-            ticket_id,
-            "awaiting_hardware",
-            comment="Triage complete, requesting hardware",
-        )
+
+        # Route based on whether anomaly_context is present.
+        # Set by alert seeds, CLI, or API — not inferred by
+        # the LLM. Code enforces the routing invariant.
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if cf.get("anomaly_context"):
+            await self._transition_ticket(
+                ticket_id,
+                "gathering_context",
+                comment=(
+                    "Triage complete, anomaly context present"
+                    " — routing to investigation"
+                ),
+            )
+        else:
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_hardware",
+                comment="Triage complete, requesting hardware",
+            )
