@@ -64,7 +64,7 @@ PLAN_AGENT_STATUS = {
 }
 
 
-async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
+def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
     """Advance the execution plan after an agent completes a step.
 
     Only advances if the completed agent matches the current step's
@@ -73,8 +73,9 @@ async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -
     """
     import httpx
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+    client = httpx.Client(timeout=10.0)
+    try:
+        r = client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
             return
         ticket = r.json()
@@ -121,12 +122,12 @@ async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -
             if next_status:
                 next_step["status"] = "in_progress"
 
-                await client.patch(
+                client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={"fields": {"execution_plan": plan}},
                 )
 
-                await client.post(
+                client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
                         "author": "orchestrator",
@@ -138,7 +139,7 @@ async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -
                     },
                 )
 
-                await client.post(
+                client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={
                         "status": next_status,
@@ -150,10 +151,12 @@ async def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -
                 )
                 return
 
-        await client.patch(
+        client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={"fields": {"execution_plan": plan}},
         )
+    finally:
+        client.close()
 
 
 async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
@@ -168,10 +171,7 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         logger.info(f"run_agent_task finally block for {ticket_id}")
         if status in PLAN_AGENT_STATUS.values():
             try:
-                await asyncio.wait_for(
-                    _advance_plan(dispatcher.store_url, ticket_id, status),
-                    timeout=15.0,
-                )
+                _advance_plan(dispatcher.store_url, ticket_id, status)
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
         dispatcher.mark_done(ticket_id)
