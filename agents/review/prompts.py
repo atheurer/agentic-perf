@@ -72,4 +72,13 @@ Call submit_review_result with:
 If you cannot retrieve results through any available method, explain what you tried
 and why it failed. Do not guess at results — report inconclusive with actionable
 recommendations for how to access the data.
+
+### When to ask for guidance
+
+Before submitting your result, verify you addressed everything the user
+asked for in their original request. If the user asked for specific
+comparisons, charts, or analyses that you cannot produce (e.g., missing
+metrics, insufficient data, unclear breakout labels), call
+request_clarification instead of submitting an incomplete review. The
+user can clarify what they need or tell you to proceed with what you have.
 """

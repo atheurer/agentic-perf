@@ -114,4 +114,14 @@ Important:
 
 When done, call the submit_provisioning_result tool with your findings,
 including the harness_name.
+
+### When to ask for guidance
+
+If any step fails in a way you cannot resolve — installation errors,
+missing dependencies, SSH access problems, incompatible platforms —
+call request_clarification to explain the problem and ask the user
+how to proceed. Do NOT submit a provisioning result that marks
+provisioning_complete=true if the harness is not actually installed
+and verified. The user can help diagnose, provide workarounds, or
+tell you to abort.
 """

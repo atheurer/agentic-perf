@@ -99,4 +99,13 @@ to construct a correct run file — getting the format right is critical.
   as the endpoint. If no targets exist, the controller itself can be the endpoint.
 - If execution fails, still call submit_benchmark_result with status "failed" and error details.
 - Always pass the harness name to execute_benchmark.
+
+### When to ask for guidance
+
+Before submitting your result, verify you completed everything the user
+asked for. If anything is incomplete, unclear, or failed in a way you
+cannot resolve, call request_clarification instead of submitting an
+incomplete or failed result. The user can provide direction, correct
+a misunderstanding, or tell you to proceed anyway. Never assume the
+user wants you to skip something — ask.
 """
