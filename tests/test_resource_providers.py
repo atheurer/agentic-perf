@@ -580,6 +580,8 @@ class TestHandleCompletionIPSplit:
                         "2.2.2.2": "10.0.0.2",
                         "3.3.3.3": "10.0.0.3",
                     },
+                    "ssh_user": "root",
+                    "ssh_key_path": "/home/user/.ssh/provider.pem",
                 }
             ),
         )
@@ -650,6 +652,9 @@ class TestHandleCompletionIPSplit:
             "controller": "1.1.1.1",
             "targets": ["2.2.2.2", "3.3.3.3"],
         }
+
+        assert fields["ssh_user"] == "root"
+        assert fields["ssh_key_path"] == "/home/user/.ssh/provider.pem"
 
     @pytest.mark.asyncio
     async def test_no_mcp_falls_back_to_llm_metadata(self):

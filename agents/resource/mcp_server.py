@@ -406,7 +406,11 @@ def create_resource_tool_handlers(
         return await prov.get_reservation_status(reservation_id)
 
     async def get_accumulated_metadata() -> dict:
-        return last_reservation.get("provider_metadata", {})
+        result = dict(last_reservation.get("provider_metadata", {}))
+        for key in ("ssh_user", "ssh_key_path"):
+            if key in last_reservation:
+                result[key] = last_reservation[key]
+        return result
 
     handlers = {
         "parse_host_config": parse_host_config,

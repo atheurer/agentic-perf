@@ -350,6 +350,11 @@ class ResourceAgent(AgentBase):
         if provider_metadata:
             fields["resource_provider_metadata"] = provider_metadata
 
+        if reservation_metadata.get("ssh_user"):
+            fields["ssh_user"] = reservation_metadata["ssh_user"]
+        if reservation_metadata.get("ssh_key_path"):
+            fields["ssh_key_path"] = reservation_metadata["ssh_key_path"]
+
         if result.get("fresh_host"):
             fields["fresh_host"] = True
 
