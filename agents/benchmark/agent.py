@@ -151,6 +151,15 @@ class BenchmarkAgent(AgentBase):
                 content += f"- `{f.name}`\n"
             content += "\nUse `read_skill` to read each one.\n"
 
+        general_dir = Path(__file__).resolve().parent.parent.parent / "skills" / "general"
+        if general_dir.is_dir():
+            general_files = sorted(general_dir.glob("*.md"))
+            if general_files:
+                content += "\n## General Skills\n"
+                for f in general_files:
+                    content += f"- `{f.name}`\n"
+                content += "\nUse `read_skill(harness='general', filename='...')` to read.\n"
+
         if self._repo_cache:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
