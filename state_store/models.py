@@ -40,11 +40,13 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.AWAITING_PROVISION: [
         TicketStatus.EXECUTING_BENCHMARK,
+        TicketStatus.AWAITING_HARDWARE,  # handoff retry
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.EXECUTING_BENCHMARK: [
         TicketStatus.AWAITING_REVIEW,
         TicketStatus.EVALUATING_CONVERGENCE,  # investigation path
+        TicketStatus.AWAITING_PROVISION,  # handoff retry
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_REVIEW: [

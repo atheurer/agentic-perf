@@ -128,6 +128,43 @@ class AgentBase(ABC):
                 )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
+                    has_submit_tool = any(
+                        t.name.startswith("submit_")
+                        for t in (self.tools or [])
+                    )
+                    if has_submit_tool:
+                        summary = (
+                            response.text[:500] if response.text else
+                            "No explanation provided."
+                        )
+                        question = (
+                            f"Agent **{self.agent_name}** could not"
+                            f" complete its task and did not produce a"
+                            f" structured result.\n\n"
+                            f"**Agent's last message:**\n{summary}\n\n"
+                            f"How would you like to proceed?"
+                        )
+                        self._emit(
+                            ticket_id,
+                            "escalation",
+                            {"reason": "end_turn_without_submit"},
+                        )
+                        reply = await self._request_human_input(
+                            ticket_id, question
+                        )
+                        messages.append(
+                            {"role": "assistant", "content": response.raw_content}
+                        )
+                        messages.append(
+                            {"role": "user", "content": (
+                                f"The user has provided guidance:\n\n"
+                                f"{reply}\n\n"
+                                f"Please continue your work using this"
+                                f" feedback. When done, call your"
+                                f" submit tool with the results."
+                            )}
+                        )
+                        continue
                     await self._handle_completion(ticket_id, response)
                     break
 

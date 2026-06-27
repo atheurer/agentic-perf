@@ -214,10 +214,33 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
         )
 
 
-async def _block_handoff_failed(store_url: str, ticket_id: str, reason: str) -> None:
+HANDOFF_RETRY_STATUS = {
+    "awaiting_provision": "awaiting_hardware",
+    "executing_benchmark": "awaiting_provision",
+    "awaiting_review": "executing_benchmark",
+    "evaluating_convergence": "executing_benchmark",
+}
+
+
+async def _block_handoff_failed(
+    store_url: str, ticket_id: str, reason: str, current_status: str = ""
+) -> None:
     import httpx
 
+    retry_status = HANDOFF_RETRY_STATUS.get(current_status)
+
     async with httpx.AsyncClient(timeout=10.0) as client:
+        if retry_status:
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": retry_status,
+                    "comment": (
+                        f"Rewinding to {retry_status} so the agent"
+                        f" can retry after user guidance"
+                    ),
+                },
+            )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -339,7 +362,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         )
                         dispatcher.mark_handoff_blocked(tid, status)
                         await _block_handoff_failed(
-                            config.state_store_url, tid, reason
+                            config.state_store_url, tid, reason, status
                         )
                     continue
 
