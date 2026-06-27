@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -20,8 +21,11 @@ from .prompts import RESOURCE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+_INTERNAL_TOOLS = frozenset(
+    {"submit_resource_result", "get_accumulated_metadata"}
+)
 _MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_resource_tools() if t.name != "submit_resource_result"
+    t.name for t in get_resource_tools() if t.name not in _INTERNAL_TOOLS
 )
 
 
@@ -62,7 +66,6 @@ class ResourceAgent(AgentBase):
             ResourceProviderRegistry(secrets_provider) if secrets_provider else None
         )
 
-        self._last_reservation: dict[str, Any] = {}
         self._ssh: SSHExecutor | None = None
 
         # Only keep local tools (submit_resource_result) -- MCP tools
@@ -103,7 +106,10 @@ class ResourceAgent(AgentBase):
         )
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
+        mcp_tools = [
+            t for t in await mcp.list_tools()
+            if t.name != "get_accumulated_metadata"
+        ]
         self.tools = mcp_tools + self.tools
 
         try:
@@ -321,7 +327,17 @@ class ResourceAgent(AgentBase):
             fields["resource_reservation_id"] = reservation_id
 
         provider_metadata = result.get("resource_provider_metadata") or {}
-        reservation_metadata = self._last_reservation.get("provider_metadata", {})
+        reservation_metadata: dict[str, Any] = {}
+        if self._mcp:
+            try:
+                raw = await self._mcp.call_tool(
+                    "get_accumulated_metadata", {}
+                )
+                reservation_metadata = json.loads(raw) if raw else {}
+            except Exception:
+                logger.debug(
+                    "get_accumulated_metadata unavailable, skipping"
+                )
         for key in (
             "public_ips",
             "private_ips",

@@ -242,5 +242,11 @@ async def validate_host(
     )
 
 
+@mcp.tool()
+async def get_accumulated_metadata() -> str:
+    """Return accumulated provider metadata from prior reserve_resources calls. Includes public_ips, private_ips, and ip_mapping needed for splitting SSH vs benchmark IPs."""
+    return json.dumps(_last_reservation.get("provider_metadata", {}))
+
+
 if __name__ == "__main__":
     mcp.run()

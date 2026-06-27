@@ -554,6 +554,166 @@ class TestResourceToolHandlers:
 # ---------------------------------------------------------------------------
 
 
+class TestHandleCompletionIPSplit:
+    """_handle_completion must split public/private IPs using ip_mapping
+    from the MCP server's accumulated metadata (issue #165)."""
+
+    @pytest.mark.asyncio
+    async def test_splits_public_private_ips_via_mcp(self):
+        from agents.resource.agent import ResourceAgent
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://localhost:8090",
+        )
+
+        agent._mcp = AsyncMock()
+        agent._mcp.call_tool = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "instance_ids": ["i-ctrl", "i-t1", "i-t2"],
+                    "public_ips": ["1.1.1.1", "2.2.2.2", "3.3.3.3"],
+                    "private_ips": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+                    "ip_mapping": {
+                        "1.1.1.1": "10.0.0.1",
+                        "2.2.2.2": "10.0.0.2",
+                        "3.3.3.3": "10.0.0.3",
+                    },
+                }
+            ),
+        )
+
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {
+                            "controller": "1.1.1.1",
+                            "targets": ["2.2.2.2", "3.3.3.3"],
+                        },
+                        "ssh_user": "root",
+                        "ssh_key_path": "~/.ssh/id_rsa",
+                        "resource_provider": "aws",
+                        "resource_reservation_id": "i-ctrl,i-t1,i-t2",
+                        "resource_provider_metadata": {
+                            "instance_ids": ["i-ctrl", "i-t1", "i-t2"],
+                            "region": "us-east-2",
+                        },
+                        "fresh_host": True,
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        agent._mcp.call_tool.assert_called_once_with(
+            "get_accumulated_metadata", {}
+        )
+
+        patch_calls = agent._client.patch.call_args_list
+        fields_call = [
+            c
+            for c in patch_calls
+            if "/fields" in str(c)
+        ]
+        assert len(fields_call) == 1
+        body = fields_call[0].kwargs.get("json", {})
+        fields = body.get("fields", {})
+
+        assert fields["assigned_hardware_ips"] == {
+            "controller": "10.0.0.1",
+            "targets": ["10.0.0.2", "10.0.0.3"],
+        }
+        assert fields["ssh_hardware_ips"] == {
+            "controller": "1.1.1.1",
+            "targets": ["2.2.2.2", "3.3.3.3"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_falls_back_to_llm_metadata(self):
+        """Without MCP, uses whatever the LLM passed in provider_metadata."""
+        from agents.resource.agent import ResourceAgent
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://localhost:8090",
+        )
+
+        agent._mcp = None
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {
+                            "controller": "1.1.1.1",
+                            "targets": ["2.2.2.2"],
+                        },
+                        "ssh_user": "root",
+                        "resource_provider": "aws",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        patch_calls = agent._client.patch.call_args_list
+        fields_call = [
+            c for c in patch_calls if "/fields" in str(c)
+        ]
+        body = fields_call[0].kwargs.get("json", {})
+        fields = body.get("fields", {})
+
+        assert fields["assigned_hardware_ips"] == {
+            "controller": "1.1.1.1",
+            "targets": ["2.2.2.2"],
+        }
+        assert "ssh_hardware_ips" not in fields
+
+
 class TestTeardownDispatch:
     @pytest.mark.asyncio
     async def test_legacy_quads_fields_detected(self):
