@@ -107,8 +107,26 @@ When using a GPU cluster provider:
 4. Call submit_resource_result with assigned_hardware_ips={}, empty ssh_user/ssh_key_path,
    and the cluster info in resource_provider_metadata
 
+## Validating your allocation
+
+Before submitting, verify you allocated enough hosts:
+- Count the targets in assigned_hardware_ips — there must be at least
+  min_hosts endpoints
+- The controller must be a separate host (not also a target)
+- If you allocated fewer hosts than required, do NOT submit an incomplete
+  result. Instead:
+  1. Retry the allocation for the missing instances
+  2. If the retry fails, call request_clarification to explain what
+     happened and ask the user how to proceed (retry, use fewer hosts,
+     abort, etc.)
+
+Never submit with targets=[] when min_hosts > 0. The handoff validation
+will reject it and the ticket will get stuck.
+
 ## If something fails
 
-If no provider can satisfy requirements, call submit_resource_result with
-assigned_hardware_ips set to {} and explain the problem in the notes field.
+If no provider can satisfy requirements after retrying, call
+request_clarification to explain the problem and ask the user for
+guidance. Only submit with empty assigned_hardware_ips if the user
+explicitly says to proceed without resources.
 """
