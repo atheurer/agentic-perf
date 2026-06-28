@@ -15,7 +15,7 @@
         "numactl", "numastat", "lstopo",
         "dmesg",
 
-        "ip", "ss", "ethtool", "nmcli", "ping",
+        "ip", "ss", "ethtool", "nmcli", "ping", "nc", "ncat",
         "nstat", "tc", "bridge",
 
         "sysctl",

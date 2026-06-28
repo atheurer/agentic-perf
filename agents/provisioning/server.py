@@ -426,16 +426,16 @@ async def install_packages(host: str, packages: list[str], user: str = "root") -
     await _ensure_init()
     pkg_list = " ".join(packages)
     result = await _ssh.run(host, f"dnf install -y {pkg_list}", timeout=300)
-    return json.dumps(
-        {
-            "host": host,
-            "packages": packages,
-            "status": "success" if result.exit_code == 0 else "failed",
-            "exit_code": result.exit_code,
-            "output": result.stdout or "" if result.stdout else "",
-            "error": result.stderr or "" if result.stderr else "",
-        }
-    )
+    response = {
+        "host": host,
+        "packages": packages,
+        "status": "success" if result.exit_code == 0 else "failed",
+        "exit_code": result.exit_code,
+    }
+    if result.exit_code != 0:
+        response["output"] = result.stdout or ""
+        response["error"] = result.stderr or ""
+    return json.dumps(response)
 
 
 @mcp.tool()

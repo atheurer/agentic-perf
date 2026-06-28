@@ -48,14 +48,31 @@ def mock_infra_server(tmp_path: Path) -> Path:
             })
 
         @mcp.tool()
-        async def execute_command(host: str, command: str, timeout: int = 300) -> str:
+        async def execute_command(host: str, command: str, timeout: int = 300, background: bool = False) -> str:
             \"\"\"Execute a command.\"\"\"
             if not _context["ready"]:
                 return json.dumps({"error": "SSH context not set"})
+            if background or command.rstrip().endswith("&"):
+                return json.dumps({
+                    "status": "backgrounded",
+                    "bg_id": "bg-mock1234",
+                    "pid": 12345,
+                    "host": host,
+                })
             return json.dumps({
                 "exit_code": 0,
                 "stdout": f"mock output for: {command}",
             })
+
+        @mcp.tool()
+        async def stop_background_command(bg_id: str) -> str:
+            \"\"\"Stop a background command.\"\"\"
+            return json.dumps({"status": "stopped", "bg_id": bg_id, "pid": 12345})
+
+        @mcp.tool()
+        async def check_background_command(bg_id: str) -> str:
+            \"\"\"Check a background command.\"\"\"
+            return json.dumps({"bg_id": bg_id, "running": True, "pid": 12345, "output": "mock"})
 
         @mcp.tool()
         async def write_remote_file(host: str, remote_path: str, content: str) -> str:
@@ -146,6 +163,8 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "set_ssh_context",
             "check_host",
             "execute_command",
+            "stop_background_command",
+            "check_background_command",
             "write_remote_file",
             "read_remote_file",
             "deploy_secret",
@@ -256,7 +275,7 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "resolve_benchmark" in names
         assert "set_ssh_context" in names
         assert "execute_command" in names
-        assert len(names) == 10
+        assert len(names) == 12
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -307,7 +326,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 10
+    assert len(client._tool_routing) == 12
 
     await client.disconnect()
     assert len(client._servers) == 0

@@ -10,11 +10,13 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,7 @@ _ticket_id: str | None = None
 
 _APPROVAL_POLL_INTERVAL = 3
 _APPROVAL_TIMEOUT = 300
+_background_pids: dict[str, dict[str, Any]] = {}
 
 
 def _get_ssh() -> SSHExecutor:
@@ -390,7 +393,12 @@ async def _request_approval(command: str, binary: str, host: str) -> str:
 
 
 @mcp.tool()
-async def execute_command(host: str, command: str, timeout: int = 300) -> str:
+async def execute_command(
+    host: str,
+    command: str,
+    timeout: int = 300,
+    background: bool = False,
+) -> str:
     """Execute a command on a remote host via SSH.
 
     Subject to per-agent command policy: the command's binary must be in
@@ -398,9 +406,22 @@ async def execute_command(host: str, command: str, timeout: int = 300) -> str:
     If the binary is not in the allowlist but is otherwise safe, the user
     will be prompted for approval.
 
+    Set background=True (or end the command with &) to run the command in
+    the background. The response will include a bg_id and pid. You MUST
+    call stop_background_command(bg_id) when you no longer need the
+    background process — for example, after using nc to test port
+    connectivity, stop the listener before the benchmark needs that port.
+
     Call set_ssh_context() with agent_name to load the policy.
     """
     ssh = _get_ssh()
+
+    command = html.unescape(command)
+
+    stripped = command.rstrip()
+    if stripped.endswith("&"):
+        background = True
+        command = stripped[:-1].rstrip()
 
     if _policy is not None:
         allowed, reason = check_command(command, _policy)
@@ -454,8 +475,92 @@ async def execute_command(host: str, command: str, timeout: int = 300) -> str:
         if timeout > _policy.max_timeout:
             timeout = _policy.max_timeout
 
+    if background:
+        bg_id = f"bg-{uuid.uuid4().hex[:8]}"
+        bg_cmd = f"nohup {command} > /tmp/{bg_id}.out 2>&1 & echo $!"
+        result = await ssh.run(host, bg_cmd, timeout=10)
+        pid_str = result.stdout.strip().splitlines()[-1] if result.stdout else ""
+        if result.exit_code == 0 and pid_str.isdigit():
+            pid = int(pid_str)
+            _background_pids[bg_id] = {
+                "host": host,
+                "pid": pid,
+                "command": command,
+            }
+            return json.dumps(
+                {
+                    "status": "backgrounded",
+                    "bg_id": bg_id,
+                    "pid": pid,
+                    "host": host,
+                }
+            )
+        return json.dumps(
+            {
+                "status": "failed",
+                "exit_code": result.exit_code,
+                "stdout": result.stdout or "",
+                "stderr": result.stderr or "",
+            }
+        )
+
     result = await ssh.run(host, command, timeout=timeout)
     return _format_result(result)
+
+
+@mcp.tool()
+async def stop_background_command(bg_id: str) -> str:
+    """Stop a background command started by execute_command.
+
+    Pass the bg_id returned by execute_command when background=True.
+    Always call this when you no longer need the background process
+    — for example, after a connectivity test, stop the nc listener
+    before the benchmark needs that port.
+    """
+    ssh = _get_ssh()
+    entry = _background_pids.pop(bg_id, None)
+    if entry is None:
+        return json.dumps({"status": "error", "message": f"Unknown bg_id: {bg_id}"})
+
+    host = entry["host"]
+    pid = entry["pid"]
+
+    await ssh.run(host, f"kill {pid} 2>/dev/null", timeout=5)
+    check = await ssh.run(host, f"kill -0 {pid} 2>/dev/null", timeout=5)
+    if check.exit_code == 0:
+        await ssh.run(host, f"kill -9 {pid} 2>/dev/null", timeout=5)
+
+    return json.dumps({"status": "stopped", "bg_id": bg_id, "pid": pid})
+
+
+@mcp.tool()
+async def check_background_command(bg_id: str) -> str:
+    """Check whether a background command is still running.
+
+    Returns the running status and recent output (last 20 lines).
+    """
+    ssh = _get_ssh()
+    entry = _background_pids.get(bg_id)
+    if entry is None:
+        return json.dumps({"status": "error", "message": f"Unknown bg_id: {bg_id}"})
+
+    host = entry["host"]
+    pid = entry["pid"]
+
+    check = await ssh.run(host, f"kill -0 {pid} 2>/dev/null", timeout=5)
+    running = check.exit_code == 0
+
+    tail = await ssh.run(host, f"tail -20 /tmp/{bg_id}.out 2>/dev/null", timeout=5)
+    output = tail.stdout.strip() if tail.stdout else ""
+
+    return json.dumps(
+        {
+            "bg_id": bg_id,
+            "running": running,
+            "pid": pid,
+            "output": output,
+        }
+    )
 
 
 if __name__ == "__main__":
