@@ -179,6 +179,62 @@ def get_triage_tools() -> list[ToolDefinition]:
                             "required": ["agent_type", "params"],
                         },
                     },
+                    "scoped_context": {
+                        "type": "object",
+                        "description": (
+                            "Agent-scoped context partitioned from the user's "
+                            "request. Each key is an agent role (resource, "
+                            "provisioning, benchmark, review) or 'shared' for "
+                            "context relevant to all agents. Values are natural "
+                            "language summaries of the portions of the request "
+                            "relevant to that agent. Agent-prefixed directives "
+                            "(e.g., 'provision agent: install nmap-ncat') go in "
+                            "the corresponding agent's section."
+                        ),
+                        "properties": {
+                            "shared": {
+                                "type": "string",
+                                "description": (
+                                    "Context relevant to all agents "
+                                    "(environment, general constraints, "
+                                    "test objective summary)"
+                                ),
+                            },
+                            "resource": {
+                                "type": "string",
+                                "description": (
+                                    "Context for the resource agent "
+                                    "(host requirements, provider preferences, "
+                                    "instance types, regions)"
+                                ),
+                            },
+                            "provisioning": {
+                                "type": "string",
+                                "description": (
+                                    "Context for the provisioning agent "
+                                    "(installation instructions, package "
+                                    "requirements, setup directives)"
+                                ),
+                            },
+                            "benchmark": {
+                                "type": "string",
+                                "description": (
+                                    "Context for the benchmark agent "
+                                    "(test parameters, workload details, "
+                                    "connectivity requirements, run approval)"
+                                ),
+                            },
+                            "review": {
+                                "type": "string",
+                                "description": (
+                                    "Context for the review agent "
+                                    "(analysis expectations, comparison "
+                                    "criteria, reporting requirements)"
+                                ),
+                            },
+                        },
+                        "additionalProperties": True,
+                    },
                     "notes": {
                         "type": "string",
                         "description": "Additional notes about the triage",

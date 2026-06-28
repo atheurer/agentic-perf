@@ -117,6 +117,10 @@ class TriageAgent(AgentBase):
             "directives": directives,
         }
 
+        scoped_context = result.get("scoped_context")
+        if scoped_context and isinstance(scoped_context, dict):
+            fields["scoped_context"] = scoped_context
+
         raw_plan = result.get("execution_plan")
         if raw_plan and isinstance(raw_plan, list) and len(raw_plan) > 1:
             steps = []
@@ -147,6 +151,14 @@ class TriageAgent(AgentBase):
         )
         if directives:
             summary += f"- **Directives:** {', '.join(f'{k}={v}' for k, v in directives.items())}\n"
+        if fields.get("scoped_context"):
+            agents_with_context = [
+                k
+                for k in fields["scoped_context"]
+                if k != "shared" and fields["scoped_context"].get(k)
+            ]
+            if agents_with_context:
+                summary += f"- **Scoped Context:** {', '.join(agents_with_context)}\n"
         if result.get("notes"):
             summary += f"- **Notes:** {result['notes']}\n"
 

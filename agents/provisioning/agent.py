@@ -89,12 +89,20 @@ class ProvisioningAgent(AgentBase):
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
-        content = (
-            f"## Performance Test Request\n\n"
-            f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n\n"
-            f"**Description:**\n{ticket['description']}\n"
-        )
+        scoped = self._get_scoped_context(ticket, "provisioning")
+        if scoped is not None:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n\n"
+                f"{scoped}\n"
+            )
+        else:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n"
+                f"**Summary:** {ticket['summary']}\n\n"
+                f"**Description:**\n{ticket['description']}\n"
+            )
 
         if cf.get("ssh_hardware_ips"):
             content += f"\n## SSH Addresses (use these for SSH/SCP)\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"

@@ -90,12 +90,20 @@ class ReviewAgent(AgentBase):
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
-        content = (
-            f"## Performance Test Request\n\n"
-            f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n\n"
-            f"**Description:**\n{ticket['description']}\n"
-        )
+        scoped = self._get_scoped_context(ticket, "review")
+        if scoped is not None:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n\n"
+                f"{scoped}\n"
+            )
+        else:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n"
+                f"**Summary:** {ticket['summary']}\n\n"
+                f"**Description:**\n{ticket['description']}\n"
+            )
 
         if cf.get("hypothesis"):
             content += f"\n## Hypothesis\n{cf['hypothesis']}\n"
@@ -159,14 +167,18 @@ class ReviewAgent(AgentBase):
                 content += f"- `{f.name}`\n"
             content += "\nUse `read_skill` to read any of these.\n"
 
-        general_dir = Path(__file__).resolve().parent.parent.parent / "skills" / "general"
+        general_dir = (
+            Path(__file__).resolve().parent.parent.parent / "skills" / "general"
+        )
         if general_dir.is_dir():
             general_files = sorted(general_dir.glob("*.md"))
             if general_files:
                 content += "\n## General Skills\n"
                 for f in general_files:
                     content += f"- `{f.name}`\n"
-                content += "\nUse `read_skill(harness='general', filename='...')` to read.\n"
+                content += (
+                    "\nUse `read_skill(harness='general', filename='...')` to read.\n"
+                )
 
         if self._repo_cache:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])

@@ -129,13 +129,13 @@ class AgentBase(ABC):
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
-                        t.name.startswith("submit_")
-                        for t in (self.tools or [])
+                        t.name.startswith("submit_") for t in (self.tools or [])
                     )
                     if has_submit_tool:
                         summary = (
-                            response.text[:500] if response.text else
-                            "No explanation provided."
+                            response.text[:500]
+                            if response.text
+                            else "No explanation provided."
                         )
                         question = (
                             f"Agent **{self.agent_name}** could not"
@@ -149,20 +149,21 @@ class AgentBase(ABC):
                             "escalation",
                             {"reason": "end_turn_without_submit"},
                         )
-                        reply = await self._request_human_input(
-                            ticket_id, question
-                        )
+                        reply = await self._request_human_input(ticket_id, question)
                         messages.append(
                             {"role": "assistant", "content": response.raw_content}
                         )
                         messages.append(
-                            {"role": "user", "content": (
-                                f"The user has provided guidance:\n\n"
-                                f"{reply}\n\n"
-                                f"Please continue your work using this"
-                                f" feedback. When done, call your"
-                                f" submit tool with the results."
-                            )}
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"The user has provided guidance:\n\n"
+                                    f"{reply}\n\n"
+                                    f"Please continue your work using this"
+                                    f" feedback. When done, call your"
+                                    f" submit tool with the results."
+                                ),
+                            }
                         )
                         continue
                     await self._handle_completion(ticket_id, response)
@@ -277,8 +278,7 @@ class AgentBase(ABC):
                     ticket_id,
                     "awaiting_customer_guidance",
                     comment=(
-                        f"{self.agent_name} hit max iterations"
-                        f" — pausing for guidance"
+                        f"{self.agent_name} hit max iterations — pausing for guidance"
                     ),
                 )
         except Exception as e:
@@ -345,6 +345,25 @@ class AgentBase(ABC):
             if tc.name.startswith("submit_"):
                 return dict(tc.input)
         return None
+
+    @staticmethod
+    def _get_scoped_context(
+        ticket: dict[str, Any],
+        agent_key: str,
+    ) -> str | None:
+        """Return agent-scoped context, or None to fall back to full text."""
+        cf = ticket.get("custom_fields", {})
+        scoped = cf.get("scoped_context")
+        if not scoped or not isinstance(scoped, dict):
+            return None
+        parts = []
+        shared = scoped.get("shared")
+        if shared:
+            parts.append(shared)
+        agent_section = scoped.get(agent_key)
+        if agent_section:
+            parts.append(agent_section)
+        return "\n\n".join(parts) if parts else None
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         handler = self._tool_handlers.get(tool_call.name)

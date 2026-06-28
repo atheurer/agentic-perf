@@ -21,9 +21,7 @@ from .prompts import RESOURCE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_INTERNAL_TOOLS = frozenset(
-    {"submit_resource_result", "get_accumulated_metadata"}
-)
+_INTERNAL_TOOLS = frozenset({"submit_resource_result", "get_accumulated_metadata"})
 _MCP_TOOL_NAMES = frozenset(
     t.name for t in get_resource_tools() if t.name not in _INTERNAL_TOOLS
 )
@@ -107,8 +105,7 @@ class ResourceAgent(AgentBase):
         self._mcp = mcp
 
         mcp_tools = [
-            t for t in await mcp.list_tools()
-            if t.name != "get_accumulated_metadata"
+            t for t in await mcp.list_tools() if t.name != "get_accumulated_metadata"
         ]
         self.tools = mcp_tools + self.tools
 
@@ -260,12 +257,20 @@ class ResourceAgent(AgentBase):
         return RESOURCE_SYSTEM_PROMPT
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
-        content = (
-            f"## Performance Test Request\n\n"
-            f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n\n"
-            f"**Description:**\n{ticket['description']}\n"
-        )
+        scoped = self._get_scoped_context(ticket, "resource")
+        if scoped is not None:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n\n"
+                f"{scoped}\n"
+            )
+        else:
+            content = (
+                f"## Performance Test Request\n\n"
+                f"**Ticket ID:** {ticket['id']}\n"
+                f"**Summary:** {ticket['summary']}\n\n"
+                f"**Description:**\n{ticket['description']}\n"
+            )
 
         fields = ticket.get("custom_fields", {})
         specs = fields.get("parsed_specs")
@@ -330,14 +335,10 @@ class ResourceAgent(AgentBase):
         reservation_metadata: dict[str, Any] = {}
         if self._mcp:
             try:
-                raw = await self._mcp.call_tool(
-                    "get_accumulated_metadata", {}
-                )
+                raw = await self._mcp.call_tool("get_accumulated_metadata", {})
                 reservation_metadata = json.loads(raw) if raw else {}
             except Exception:
-                logger.debug(
-                    "get_accumulated_metadata unavailable, skipping"
-                )
+                logger.debug("get_accumulated_metadata unavailable, skipping")
         for key in (
             "public_ips",
             "private_ips",

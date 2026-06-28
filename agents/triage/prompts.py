@@ -56,6 +56,46 @@ Your job is to analyze a performance test request ticket and:
    user gives an operational instruction that doesn't fit the known fields, include it
    as a descriptive key-value pair (e.g., "run_count": 3 for "run it three times").
 
+7. Partition the user's request into AGENT-SCOPED CONTEXT. Downstream agents
+   (resource, provisioning, benchmark, review) should only see the parts of
+   the request relevant to their job. Include this in the "scoped_context"
+   field of your result.
+
+   Partition rules:
+   - "shared": Brief summary of the test objective and environment info
+     relevant to everyone (e.g., "AWS m5n.4xlarge instances, RHEL9"). This
+     key should always be present.
+   - "resource": Host/hardware requirements, provider preferences, instance
+     types, counts, regions, availability zones, RAM requirements.
+   - "provisioning": Harness installation instructions, packages to install,
+     setup requirements. Do NOT include benchmark parameters, test configs,
+     connectivity testing details, or reporting expectations here.
+   - "benchmark": Test parameters (message sizes, thread counts, protocols,
+     duration, samples), workload specifications, connectivity requirements,
+     tool selection, run approval preferences, and any benchmark-specific
+     instructions.
+   - "review": Analysis expectations, comparison criteria, specific metrics
+     to evaluate, reporting format, scaling analysis requests.
+
+   If the user prefixes an instruction with an agent name (e.g.,
+   "provision agent: install nmap-ncat", "benchmark agent: use 64K messages"),
+   place that instruction in the corresponding agent's section only.
+
+   The same information CAN appear in multiple agent sections when it is
+   relevant to more than one agent. For example, "use RHEL9" matters to
+   both the resource agent (pick the right AMI) and provisioning (platform
+   contract). Duplicate where appropriate rather than forcing agents to
+   infer from the shared section.
+
+   You may also add brief framing to an agent's section to clarify scope
+   boundaries. For example, in the provisioning section you might add:
+   "The benchmark agent will handle connectivity testing and run
+   configuration — your job is only to install the harness and required
+   packages." This helps agents stay focused without relying on negative
+   guardrails in the original ticket text.
+
+   Omit any agent key whose section would be empty.
+
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the min_hosts and roles from the benchmark details.
 
