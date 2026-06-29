@@ -39,7 +39,7 @@ class GatheringContextAgent(AgentBase):
             event_bus=event_bus,
         )
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return GATHERING_CONTEXT_SYSTEM_PROMPT
 
     def _build_messages(

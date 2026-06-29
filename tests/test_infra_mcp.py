@@ -342,7 +342,7 @@ async def test_base_agent_mcp_dispatch_multi_server():
     from providers.llm.base import ToolCall
 
     class _TestAgent(AgentBase):
-        def _system_prompt(self):
+        def _system_prompt(self, ticket):
             return "test"
 
         def _build_messages(self, ticket):

@@ -21,7 +21,7 @@ from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 class _StubAgent(AgentBase):
     """Minimal agent that counts iterations."""
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return "test"
 
     def _build_messages(

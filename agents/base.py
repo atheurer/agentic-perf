@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -64,7 +65,7 @@ class AgentBase(ABC):
     async def run(self, ticket_id: str) -> None:
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
-        system_prompt = self._system_prompt()
+        system_prompt = self._system_prompt(ticket)
         messages = self._build_messages(ticket)
         self._emit(
             ticket_id,
@@ -289,7 +290,7 @@ class AgentBase(ABC):
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
 
     @abstractmethod
-    def _system_prompt(self) -> str: ...
+    def _system_prompt(self, ticket: dict[str, Any]) -> str: ...
 
     @abstractmethod
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]: ...
@@ -364,6 +365,34 @@ class AgentBase(ABC):
         if agent_section:
             parts.append(agent_section)
         return "\n\n".join(parts) if parts else None
+
+    @staticmethod
+    def _load_prompt_fragments(
+        agent_dir: Path,
+        resource_provider: str | None = None,
+        endpoint_type: str | None = None,
+    ) -> str:
+        """Load prompt fragments from the agent's prompts/ directory."""
+        prompts_dir = agent_dir / "prompts"
+        if not prompts_dir.is_dir():
+            return ""
+
+        parts = []
+        if resource_provider:
+            provider_file = prompts_dir / f"{resource_provider}.md"
+            if provider_file.exists():
+                parts.append(provider_file.read_text().strip())
+        else:
+            auto_file = prompts_dir / "auto_select.md"
+            if auto_file.exists():
+                parts.append(auto_file.read_text().strip())
+
+        if endpoint_type:
+            endpoint_file = prompts_dir / f"{endpoint_type}.md"
+            if endpoint_file.exists():
+                parts.append(endpoint_file.read_text().strip())
+
+        return "\n\n".join(parts)
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         handler = self._tool_handlers.get(tool_call.name)

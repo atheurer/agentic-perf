@@ -74,7 +74,7 @@ class RetrospectiveAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return RETROSPECTIVE_SYSTEM_PROMPT
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:

@@ -72,7 +72,7 @@ class TestAgentConstruction:
             llm_provider=MockLLMProvider(),
             state_store_url="http://localhost:8090",
         )
-        prompt = agent._system_prompt()
+        prompt = agent._system_prompt({})
         assert "Investigation Records" in prompt
         assert "MATCH_FOUND" in prompt
         assert "NO_MATCH" in prompt

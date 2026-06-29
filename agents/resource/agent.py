@@ -17,7 +17,7 @@ from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
 from .mcp_server import get_resource_tools
-from .prompts import RESOURCE_SYSTEM_PROMPT
+from .prompts import RESOURCE_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -253,8 +253,20 @@ class ResourceAgent(AgentBase):
                 "**Host Cleanup**\n\n" + "\n".join(f"- {s}" for s in cleanup_summary),
             )
 
-    def _system_prompt(self) -> str:
-        return RESOURCE_SYSTEM_PROMPT
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
+        cf = ticket.get("custom_fields", {})
+        directives = cf.get("directives", {})
+        provider = cf.get("resource_provider") or directives.get("resource_provider")
+        endpoint = directives.get("endpoint_type", "remotehosts")
+
+        fragments = self._load_prompt_fragments(
+            Path(__file__).parent,
+            resource_provider=provider,
+            endpoint_type=endpoint,
+        )
+        if fragments:
+            return f"{RESOURCE_BASE_PROMPT}\n\n{fragments}"
+        return RESOURCE_BASE_PROMPT
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         scoped = self._get_scoped_context(ticket, "resource")

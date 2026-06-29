@@ -12,7 +12,7 @@ from providers.llm.base import LLMProvider, LLMResponse
 from providers.skills.repo_cache import RepoCache
 
 from .mcp_server import get_benchmark_tools
-from .prompts import BENCHMARK_SYSTEM_PROMPT
+from .prompts import BENCHMARK_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +109,20 @@ class BenchmarkAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
-    def _system_prompt(self) -> str:
-        return BENCHMARK_SYSTEM_PROMPT
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
+        cf = ticket.get("custom_fields", {})
+        directives = cf.get("directives", {})
+        provider = cf.get("resource_provider") or directives.get("resource_provider")
+        endpoint = directives.get("endpoint_type", "remotehosts")
+
+        fragments = self._load_prompt_fragments(
+            Path(__file__).parent,
+            resource_provider=provider,
+            endpoint_type=endpoint,
+        )
+        if fragments:
+            return f"{BENCHMARK_BASE_PROMPT}\n\n{fragments}"
+        return BENCHMARK_BASE_PROMPT
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
