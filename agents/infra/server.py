@@ -10,6 +10,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -559,6 +560,149 @@ async def check_background_command(bg_id: str) -> str:
             "running": running,
             "pid": pid,
             "output": output,
+        }
+    )
+
+
+@mcp.tool()
+async def check_hosts(hosts: list[str]) -> str:
+    """Test SSH connectivity and gather system info for multiple hosts at once.
+
+    Accepts a list of IPs or hostnames and checks them all concurrently.
+    Use this instead of calling check_host repeatedly — it saves iterations.
+    """
+    ssh = _get_ssh()
+
+    async def _check_one(host: str) -> dict[str, Any]:
+        result = await ssh.run(host, "echo SSH_OK", timeout=15)
+        if result.exit_code != 0:
+            return {
+                "host": host,
+                "reachable": False,
+                "error": result.stderr or result.stdout or "SSH failed",
+            }
+        info_cmd = (
+            "hostname -f 2>/dev/null || hostname; "
+            "cat /etc/os-release 2>/dev/null | grep -E '^(NAME|VERSION)=' | head -2; "
+            "nproc; "
+            "grep MemTotal /proc/meminfo 2>/dev/null "
+            "| awk '{printf \"%.0f\\n\", $2/1024/1024}'"
+        )
+        info = await ssh.run(host, info_cmd, timeout=15)
+        return {
+            "host": host,
+            "reachable": True,
+            "system_info": info.stdout.strip(),
+        }
+
+    results = await asyncio.gather(
+        *[_check_one(h) for h in hosts], return_exceptions=True
+    )
+    per_host = {}
+    reachable = []
+    unreachable = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        host = r["host"]
+        per_host[host] = r
+        if r["reachable"]:
+            reachable.append(host)
+        else:
+            unreachable.append(host)
+
+    return json.dumps(
+        {
+            "results": per_host,
+            "reachable": reachable,
+            "unreachable": unreachable,
+        }
+    )
+
+
+@mcp.tool()
+async def test_port_connectivity(
+    server_ssh_host: str,
+    client_ssh_host: str,
+    server_test_ip: str,
+    port: int,
+    client_test_ip: str = "",
+    timeout: int = 10,
+) -> str:
+    """Test TCP port connectivity between two hosts.
+
+    This is harness-agnostic — it works for any benchmark that needs to
+    verify that a client can reach a server on a specific TCP port.
+
+    The SSH hosts are how we reach the machines (may be public IPs). The
+    test IPs are what we actually test connectivity on (may be private IPs
+    that the hosts use to talk to each other).
+
+    Args:
+        server_ssh_host: IP to SSH into the server machine
+        client_ssh_host: IP to SSH into the client machine
+        server_test_ip: IP the server listens on (the IP being tested)
+        port: TCP port to test
+        client_test_ip: Optional — if provided, also tests reverse
+            connectivity (server connecting to client on the same port)
+        timeout: Seconds to wait for the connection test
+    """
+    ssh = _get_ssh()
+    results = []
+
+    async def _test_direction(
+        listener_ssh: str,
+        connector_ssh: str,
+        listen_ip: str,
+        label: str,
+    ) -> dict[str, Any]:
+        bg_cmd = f"nohup nc -l {listen_ip} {port} > /dev/null 2>&1 & echo $!"
+        start = await ssh.run(listener_ssh, bg_cmd, timeout=5)
+        pid_str = start.stdout.strip().splitlines()[-1] if start.stdout else ""
+
+        if not pid_str.isdigit():
+            return {
+                "direction": label,
+                "port": port,
+                "reachable": False,
+                "error": "Failed to start nc listener",
+            }
+
+        pid = int(pid_str)
+        try:
+            test_cmd = f"nc -z -w {timeout} {listen_ip} {port}"
+            test = await ssh.run(connector_ssh, test_cmd, timeout=timeout + 5)
+            return {
+                "direction": label,
+                "port": port,
+                "reachable": test.exit_code == 0,
+                "error": test.stderr.strip() if test.exit_code != 0 else "",
+            }
+        finally:
+            await ssh.run(listener_ssh, f"kill {pid} 2>/dev/null", timeout=5)
+
+    forward = await _test_direction(
+        server_ssh_host,
+        client_ssh_host,
+        server_test_ip,
+        f"client({client_ssh_host}) -> server({server_test_ip}:{port})",
+    )
+    results.append(forward)
+
+    if client_test_ip:
+        reverse = await _test_direction(
+            client_ssh_host,
+            server_ssh_host,
+            client_test_ip,
+            f"server({server_ssh_host}) -> client({client_test_ip}:{port})",
+        )
+        results.append(reverse)
+
+    all_reachable = all(r["reachable"] for r in results)
+    return json.dumps(
+        {
+            "all_reachable": all_reachable,
+            "tests": results,
         }
     )
 

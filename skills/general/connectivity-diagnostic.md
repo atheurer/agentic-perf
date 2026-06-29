@@ -7,7 +7,32 @@ groups, on intermediate switches, or anywhere in between.
 
 You need SSH access to both hosts.
 
-## Quick connectivity test
+## Quick connectivity test — use `test_port_connectivity`
+
+The `test_port_connectivity` tool handles the full nc listener/client
+lifecycle in a single call. Use it instead of manually orchestrating
+nc commands — it saves iterations and handles cleanup automatically.
+
+```
+test_port_connectivity(
+    server_ssh_host="3.1.2.3",       # SSH address to reach the server
+    client_ssh_host="3.4.5.6",       # SSH address to reach the client
+    server_test_ip="172.31.1.10",    # IP the server listens on (may differ from SSH)
+    port=30002,                       # TCP port to test
+    client_test_ip="172.31.1.20",    # Optional: also test reverse direction
+)
+```
+
+The SSH hosts are how you reach the machines (may be public IPs).
+The test IPs are what you actually test connectivity on (may be
+private IPs the hosts use to talk to each other). This distinction
+matters for cloud providers where SSH uses public IPs but benchmark
+traffic uses private IPs.
+
+If the tool is not available or you need more control, use the
+manual steps below.
+
+## Manual connectivity test (fallback)
 
 Use `nc` (netcat) to test whether a specific IP/port pair is
 reachable from a specific source interface.
@@ -16,7 +41,7 @@ reachable from a specific source interface.
 
 ```bash
 # On Host A: listen on a specific IP and port
-# Use & to background it so the SSH command returns
+# Use background=true or & to background it
 nc -l 10.10.0.1 9999 &
 ```
 
