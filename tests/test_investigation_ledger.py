@@ -191,7 +191,7 @@ class TestAgentBaseHelpers:
 
         # Create a minimal concrete subclass
         class _Stub(AgentBase):
-            def _system_prompt(self):
+            def _system_prompt(self, ticket=None):
                 return ""
 
             def _build_messages(self, ticket):
@@ -234,7 +234,7 @@ class TestAgentBaseHelpers:
         from providers.llm.mock import MockLLMProvider
 
         class _Stub(AgentBase):
-            def _system_prompt(self):
+            def _system_prompt(self, ticket=None):
                 return ""
 
             def _build_messages(self, ticket):

@@ -49,7 +49,7 @@ class EvaluateAgent(AgentBase):
         # Set by _build_messages, read by _handle_completion
         self._deterministic_outcome: str = ""
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return EVALUATE_SYSTEM_PROMPT
 
     def _build_messages(
