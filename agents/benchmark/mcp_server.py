@@ -587,9 +587,7 @@ def create_benchmark_tool_handlers(
                 )
                 if metrics_result.exit_code == 0 and metrics_result.stdout:
                     try:
-                        response["result_summary"] = json.loads(
-                            metrics_result.stdout
-                        )
+                        response["result_summary"] = json.loads(metrics_result.stdout)
                     except json.JSONDecodeError:
                         response["result_summary"] = metrics_result.stdout[:3000]
             if result.exit_code != 0:
