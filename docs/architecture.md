@@ -624,6 +624,47 @@ Telemetry dependencies are optional — install with
 `pip install -e ".[telemetry]"`. Without them, the system works
 normally but token tracking is disabled.
 
+### LLM Budget Guardrails
+
+Configurable budget limits prevent runaway LLM costs at two levels:
+
+**Per-ticket budgets** are set via `custom_fields.llm_budget`:
+
+```json
+{
+  "llm_budget": {
+    "max_tokens": 200000,
+    "max_cost_usd": 5.00,
+    "warn_pct": 80
+  }
+}
+```
+
+The agent loop checks the budget after each LLM call. At the warn
+threshold (default 80%), a comment is posted. If the limit is
+exceeded, the ticket transitions to `awaiting_customer_guidance`
+so the user can increase the budget or abort.
+
+**System-wide session budgets** are configured in
+`~/.agentic-perf/config.json`:
+
+```json
+{
+  "llm_budget": {
+    "session_cost_usd": 50.00
+  }
+}
+```
+
+The orchestrator checks the session budget before each dispatch
+cycle. If exceeded, no new agents are started (existing ones
+finish). The session budget is scoped to the orchestrator process
+lifetime, not calendar boundaries.
+
+Both checks are deterministic — no LLM call needed. Budgets are
+optional: if not configured, no checks run. The budget logic lives
+in `providers/budget.py`.
+
 ## Orchestrator
 
 The orchestrator (`orchestrator/`) is the control loop that drives the
