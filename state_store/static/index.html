@@ -235,6 +235,8 @@ body:has(.detail-view) { overflow: hidden; }
 
 .detail-main-context {
   flex-shrink: 0;
+  max-height: 40vh;
+  overflow-y: auto;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
 }
@@ -1253,6 +1255,16 @@ function renderNewEvents(events) {
 }
 
 function trackAgentPhase(evt) {
+  // Handle transitions regardless of agent name — orchestrator-driven
+  // transitions (e.g., to closed) may not carry an agent field
+  if (evt.event_type === 'transition') {
+    var statusEl = document.getElementById('detail-status-badge');
+    if (statusEl && evt.data && evt.data.to) {
+      statusEl.innerHTML = statusBadge(evt.data.to);
+      refreshResultSection(currentTicketId);
+    }
+  }
+
   var agent = evt.agent || '';
   if (!agent) return;
   var existing = null;
@@ -1269,14 +1281,6 @@ function trackAgentPhase(evt) {
     if (existing) existing.status = 'done';
   } else if (evt.event_type === 'agent_error') {
     if (existing) existing.status = 'error';
-  }
-  if (evt.event_type === 'transition') {
-    var statusEl = document.getElementById('detail-status-badge');
-    if (statusEl && evt.data && evt.data.to) {
-      statusEl.innerHTML = statusBadge(evt.data.to);
-
-      refreshResultSection(evt.data.ticket_id || currentTicketId);
-    }
   }
 }
 
