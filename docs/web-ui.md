@@ -22,25 +22,26 @@ The agentic-perf web dashboard provides a browser-based interface for monitoring
 
 ### Ticket Detail (`#/ticket/{id}`)
 
-Split-panel layout: a fixed **context header** at the top with ticket
-metadata that stays visible, and a scrollable **event stream** below
-that auto-follows live agent activity. The sidebar sits alongside the
-event stream.
+Split-panel layout with three vertical zones. The ticket header spans
+full width at the top. Below it, a two-column layout pairs the main
+content column with a sidebar. The sidebar is top-aligned with the
+hypothesis card, not the event stream, so it stays visually connected
+to the investigation context.
 
-**Context header (fixed, never scrolls off):**
+**Ticket header (fixed, full width):**
 - Breadcrumb navigation back to dashboard
-- Ticket header with ID, summary, and status badge
+- Ticket ID, summary, and status badge
+
+**Main content column (left):**
 - Hypothesis card — extracted from `custom_fields.hypothesis`, always
   visible when present (styled as a prominent card, not buried in the
   generic fields grid)
 - Collapsible description and custom fields sections (closed by default
   to keep the context area compact)
+- Event stream (scrollable, fills remaining viewport height) — full
+  transaction log rendered as events arrive; only this area scrolls
 
-**Event stream (scrollable, fills remaining viewport):**
-- Full transaction log rendered as events arrive
-- Only this area scrolls — context header and sidebar stay in place
-
-**Sidebar (alongside event stream):**
+**Sidebar (right, aligned with hypothesis card):**
 - Current ticket status (updates live on transitions)
 - Controls: Live/Pause polling, Auto-scroll toggle
 - Navigation: Jump to top/bottom of event stream, Collapse/Expand all

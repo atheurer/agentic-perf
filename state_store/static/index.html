@@ -215,8 +215,6 @@ body:has(.detail-view) { overflow: hidden; }
 
 .detail-context {
   flex-shrink: 0;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 8px;
 }
 
 .detail-body {
@@ -227,9 +225,23 @@ body:has(.detail-view) { overflow: hidden; }
   min-height: 0;
 }
 
-.detail-main {
+.detail-main-col {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.detail-main-context {
+  flex-shrink: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-main {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 8px 0;
 }
@@ -238,7 +250,6 @@ body:has(.detail-view) { overflow: hidden; }
   width: 220px;
   flex-shrink: 0;
   overflow-y: auto;
-  padding: 8px 0;
 }
 
 .hypothesis-card {
@@ -360,6 +371,7 @@ body:has(.detail-view) { overflow: hidden; }
 @media (max-width: 900px) {
   .detail-body { flex-direction: column; }
   .detail-view { height: auto; overflow: visible; }
+  .detail-main-col { overflow: visible; }
   .detail-main { max-height: 60vh; }
   .detail-sidebar {
     width: 100%;
@@ -941,12 +953,16 @@ async function renderDetail(ticketId) {
             '<span class="summary">' + escHtml(ticket.summary) + '</span>' +
             '<span id="detail-status-badge">' + statusBadge(ticket.status) + '</span>' +
           '</div>' +
-          '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
-          renderDescription(ticket) +
-          '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
         '</div>' +
         '<div class="detail-body">' +
-          '<div class="detail-main" id="event-stream"></div>' +
+          '<div class="detail-main-col">' +
+            '<div class="detail-main-context">' +
+              '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
+              renderDescription(ticket) +
+              '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
+            '</div>' +
+            '<div class="detail-main" id="event-stream"></div>' +
+          '</div>' +
           '<div class="detail-sidebar" id="sidebar">' +
             renderSidebar(ticket) +
           '</div>' +
