@@ -235,8 +235,6 @@ body:has(.detail-view) { overflow: hidden; }
 
 .detail-main-context {
   flex-shrink: 0;
-  max-height: 40vh;
-  overflow-y: auto;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
 }
@@ -1040,11 +1038,49 @@ function renderSidebar(ticket) {
 function renderHypothesisCard(ticket) {
   var fields = ticket.custom_fields || {};
   var hypothesis = fields.hypothesis;
-  if (!hypothesis) return '';
-  return '<div class="hypothesis-card">' +
-    '<h4>Hypothesis</h4>' +
-    '<div class="hypothesis-text">' + escHtml(String(hypothesis)) + '</div>' +
-  '</div>';
+  var verdict = fields.verdict;
+  var summary = fields.review_summary;
+  var detail = fields.detailed_analysis;
+  var chartData = fields.chart_data;
+  var resultsUrl = fields.results_url;
+  if (!hypothesis && !verdict) return '';
+  var html = '<div class="hypothesis-card">';
+  html += '<h4>Hypothesis</h4>';
+  if (hypothesis) {
+    html += '<div class="hypothesis-text">' + escHtml(String(hypothesis)) + '</div>';
+  }
+  if (verdict) {
+    var cls = 'inconclusive';
+    var v = String(verdict).toLowerCase();
+    if (v === 'pass' || v === 'passed' || v === 'meets_expectations' ||
+        v === 'hypothesis_confirmed') cls = 'pass';
+    else if (v === 'fail' || v === 'failed' || v === 'below_expectations' ||
+        v === 'hypothesis_refuted') cls = 'fail';
+    html += '<div class="result-verdict ' + cls + '" style="margin-top:12px">' +
+      escHtml(String(verdict)) + '</div>';
+    if (summary) {
+      html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
+    }
+    var chartId = 'hypo-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
+    if (chartData) {
+      html += '<div class="result-chart"><canvas id="' + chartId + '"></canvas></div>';
+      setTimeout(function() { mountChart(chartId, chartData); }, 0);
+    }
+    if (resultsUrl) {
+      html += '<a class="results-link" href="' + escHtml(String(resultsUrl)) +
+        '" target="_blank">View detailed results &#8599;</a>';
+    }
+    if (detail) {
+      html += '<details style="margin-top:8px; border:none;">' +
+        '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+          'Detailed Analysis (' + detail.length.toLocaleString() + ' chars)</summary>' +
+        '<div class="content"><div class="result-detail">' +
+          escHtml(String(detail)) + '</div></div>' +
+      '</details>';
+    }
+  }
+  html += '</div>';
+  return html;
 }
 
 function renderDescription(ticket) {
@@ -1056,27 +1092,6 @@ function renderDescription(ticket) {
 }
 
 var CHART_COLORS = ['#7aa2f7', '#9ece6a', '#e0af68', '#ff9e64', '#bb9af7', '#7dcfff', '#f7768e'];
-
-function renderResultBanner(fields, containerId) {
-  var verdict = fields.verdict;
-  var summary = fields.review_summary;
-  var detail = fields.detailed_analysis;
-  if (!verdict && !summary && !detail) return '';
-  var cls = 'inconclusive';
-  if (verdict) {
-    var v = String(verdict).toLowerCase();
-    if (v === 'pass' || v === 'passed' || v === 'meets_expectations') cls = 'pass';
-    else if (v === 'fail' || v === 'failed' || v === 'below_expectations') cls = 'fail';
-  }
-  var html = '<div class="result-banner">';
-  if (verdict) html += '<div class="result-verdict ' + cls + '">' + escHtml(String(verdict)) + '</div>';
-  if (summary) html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
-  if (fields.chart_data) html += '<div class="result-chart"><canvas id="' + containerId + '"></canvas></div>';
-  if (fields.results_url) html += '<a class="results-link" href="' + escHtml(String(fields.results_url)) + '" target="_blank">View detailed results &#8599;</a>';
-  if (detail) html += '<div class="result-detail">' + escHtml(String(detail)) + '</div>';
-  html += '</div>';
-  return html;
-}
 
 function mountChart(containerId, chartData) {
   var canvas = document.getElementById(containerId);
@@ -1108,8 +1123,7 @@ function mountChart(containerId, chartData) {
 function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
-  var chartId = 'result-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
-  var banner = renderResultBanner(fields, chartId);
+
   var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis'];
   var items = '';
   for (var k in fields) {
@@ -1126,10 +1140,7 @@ function renderCustomFields(ticket) {
       '<div class="content"><div class="fields-grid">' + items + '</div></div>' +
     '</details>';
   }
-  if (fields.chart_data) {
-    setTimeout(function() { mountChart(chartId, fields.chart_data); }, 0);
-  }
-  return banner + rest;
+  return rest;
 }
 
 // ── Event Polling & Rendering ──
