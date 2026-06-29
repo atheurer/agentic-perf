@@ -155,15 +155,15 @@ ad-hoc test execution (original linear pipeline) and recursive investigation
 | `executing_benchmark` | BenchmarkAgent | — |
 | `awaiting_review` | ReviewAgent | — |
 | `awaiting_teardown` | ResourceAgent | teardown |
-| `gathering_context` | *(stub)* | — |
+| `gathering_context` | GatheringContextAgent | Investigation Record dedup |
 | `planning_investigation` | *(stub)* | — |
-| `evaluating_convergence` | *(stub)* | — |
-| `synthesizing_results` | *(stub)* | — |
+| `evaluating_convergence` | EvaluateAgent | Convergence assessment |
+| `synthesizing_results` | SynthesisAgent | Investigation Record write-back |
 
 Terminal statuses (`closed`, `awaiting_customer_guidance`) do not dispatch
 agents. `awaiting_customer_guidance` resumes to the previous status when the
-user replies. Investigation loop agents are currently stubs that auto-advance
-the state machine; full implementations are planned.
+user replies. The `planning_investigation` agent is a stub that auto-advances;
+all other investigation loop agents are fully implemented.
 
 ### Special Transitions
 
@@ -172,13 +172,84 @@ the state machine; full implementations are planned.
 - **Investigation loop-back:** `evaluating_convergence` can loop back to
   `planning_investigation` (refine parameters) or `awaiting_provision`
   (re-flash tainted hardware).
-- **Grounding dedup:** `gathering_context` can close the ticket directly
-  if a matching Investigation Record is found.
+- **Grounding dedup:** `gathering_context` routes to `retrospective_pending`
+  (not directly to `closed`) if a matching Investigation Record is found,
+  so the retrospective agent can analyze the dedup-skipped ticket.
 - **Abort:** From `awaiting_customer_guidance`, the user can jump directly to
   `awaiting_teardown` to skip remaining work.
 - **Execution plan re-benchmark:** `awaiting_review` can transition back to
   `executing_benchmark` when an execution plan has more benchmark steps
   to run.
+
+### Investigation Pipeline
+
+Investigation-mode tickets (those with `anomaly_context` in
+`custom_fields`) follow a different path from ad-hoc benchmarks:
+
+```
+triage → gathering_context → planning (stub) → provision → benchmark
+  → evaluating_convergence → (loop or synthesizing_results)
+  → awaiting_teardown → retrospective → closed
+```
+
+**Routing is code-enforced, not LLM-inferred.** The triage agent
+checks for `anomaly_context` in `custom_fields` after completing
+its analysis. If present, it transitions to `gathering_context`
+instead of `awaiting_hardware`. The benchmark agent uses the same
+pattern — investigation tickets route to `evaluating_convergence`
+instead of `awaiting_review`. The `anomaly_context` field is set
+by alert seeds, CLI flags, or API calls before triage runs.
+
+#### Gathering Context (Dedup Gate)
+
+The `GatheringContextAgent` queries open Investigation Records for
+the same subsystem using LLM-driven semantic matching. If a match
+is found (cross-platform, label drift, and magnitude shifts are
+handled), the agent appends a `build_history` entry to the matched
+record and routes to `retrospective_pending` (skipping the full
+investigation). If no match, proceeds to `planning_investigation`.
+
+#### Evaluate Agent (Convergence Assessment)
+
+The `EvaluateAgent` drives the recursive investigation loop with
+two-layer evaluation:
+
+1. **Deterministic gates** (code-enforced): `max_iterations`,
+   statistical thresholds, info gain stall. If a gate fires, the
+   LLM cannot override it.
+2. **LLM reasoning** (when no deterministic gate fires): assesses
+   Isolation (≥90% confidence), Entropy Stall, Expected Regression
+   (when change context available), and Manual Interruption.
+
+On loop-back: appends a new execution plan step with refined
+parameters, writes a ledger entry, transitions to
+`planning_investigation` or `awaiting_provision`.
+
+On convergence: writes a final ledger entry, transitions to
+`synthesizing_results`. Uses `max_iterations=0` — termination
+is driven by convergence gates and budget guardrails.
+
+#### Synthesis Agent (Investigation Record Write-Back)
+
+The `SynthesisAgent` produces the Investigation Record when a
+convergence gate fires. It:
+
+1. Asks the LLM to produce a comprehensive root cause summary
+   from the investigation evidence
+2. Collects operational metrics from ticket state and EventBus:
+   provision_cycles, wall_clock_mins, hardware_time_mins,
+   info_gain_trajectory, stall_events, token/cost data
+3. Creates the Investigation Record via the investigation-records
+   MCP server with the complete operational context
+4. Transitions to `awaiting_teardown`
+
+#### Investigation Ledger
+
+The investigation ledger (`custom_fields.investigation_ledger`)
+tracks reasoning history alongside the execution plan. Each entry
+references plan steps by index, maintaining clear separation:
+the plan handles sequencing (what runs next), the ledger handles
+reasoning (what was learned). The ledger is append-only.
 
 ### Execution Plans
 
