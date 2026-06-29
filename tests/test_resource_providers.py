@@ -489,6 +489,241 @@ class TestAWSResourceProvider:
             )
         assert mock_ec2.run_instances.call_count == 2
 
+    def _mock_ec2_for_batch(
+        self, instance_ids: list[str], ips: list[tuple[str, str]]
+    ) -> MagicMock:
+        """Create a mock EC2 client pre-configured for a launch batch.
+
+        ``ips`` is a list of (public_ip, private_ip) tuples, one per
+        instance.  The mock handles describe_subnets, describe_images,
+        run_instances, and describe_instances for the given instances.
+        """
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [
+                {
+                    "SubnetId": "subnet-456",
+                    "AvailabilityZone": "us-east-1a",
+                    "VpcId": "vpc-1",
+                },
+            ],
+        }
+        mock_ec2.describe_images.return_value = {
+            "Images": [{"RootDeviceName": "/dev/sda1"}],
+        }
+        mock_ec2.run_instances.return_value = {
+            "Instances": [{"InstanceId": iid} for iid in instance_ids],
+        }
+        mock_ec2.describe_instances.return_value = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": iid,
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": pub,
+                            "PrivateIpAddress": priv,
+                        }
+                        for iid, (pub, priv) in zip(instance_ids, ips)
+                    ],
+                }
+            ],
+        }
+        return mock_ec2
+
+    @pytest.mark.asyncio
+    async def test_reserve_instance_specs_per_role(self):
+        """Per-role instance_specs launches separate batches with role tags."""
+        provider = self._make_provider()
+
+        call_count = 0
+        batch_responses = [
+            {
+                "Instances": [{"InstanceId": "i-ctrl"}],
+            },
+            {
+                "Instances": [
+                    {"InstanceId": "i-cli1"},
+                    {"InstanceId": "i-cli2"},
+                ],
+            },
+        ]
+        # Each batch calls describe_instances twice: once for
+        # _poll_until_running, once for _get_instance_ips.
+        ctrl_describe = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": "i-ctrl",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.0.0.1",
+                            "PrivateIpAddress": "10.0.0.1",
+                        },
+                    ],
+                }
+            ],
+        }
+        cli_describe = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": "i-cli1",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.0.0.2",
+                            "PrivateIpAddress": "10.0.0.2",
+                        },
+                        {
+                            "InstanceId": "i-cli2",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.0.0.3",
+                            "PrivateIpAddress": "10.0.0.3",
+                        },
+                    ],
+                }
+            ],
+        }
+        describe_responses = [
+            ctrl_describe,
+            ctrl_describe,
+            cli_describe,
+            cli_describe,
+        ]
+
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [
+                {
+                    "SubnetId": "subnet-456",
+                    "AvailabilityZone": "us-east-1a",
+                    "VpcId": "vpc-1",
+                },
+            ],
+        }
+        mock_ec2.describe_images.return_value = {
+            "Images": [{"RootDeviceName": "/dev/sda1"}],
+        }
+
+        def run_instances_side_effect(**kwargs):
+            nonlocal call_count
+            resp = batch_responses[call_count]
+            call_count += 1
+            return resp
+
+        mock_ec2.run_instances.side_effect = run_instances_side_effect
+
+        describe_call_count = 0
+
+        def describe_instances_side_effect(**kwargs):
+            nonlocal describe_call_count
+            resp = describe_responses[describe_call_count]
+            describe_call_count += 1
+            return resp
+
+        mock_ec2.describe_instances.side_effect = describe_instances_side_effect
+
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        result = await provider.reserve(
+            selection={
+                "instance_specs": [
+                    {
+                        "instance_type": "m5.4xlarge",
+                        "count": 1,
+                        "role": "controller",
+                    },
+                    {
+                        "instance_type": "m5n.4xlarge",
+                        "count": 2,
+                        "role": "client",
+                    },
+                ],
+            },
+            description="per-role test",
+            ticket_id="PERF-TEST",
+        )
+
+        assert result["status"] == "success"
+        assert mock_ec2.run_instances.call_count == 2
+
+        # First call: controller type
+        first_call = mock_ec2.run_instances.call_args_list[0]
+        assert first_call.kwargs["InstanceType"] == "m5.4xlarge"
+        assert first_call.kwargs["MinCount"] == 1
+        first_tags = first_call.kwargs["TagSpecifications"][0]["Tags"]
+        role_tags = [t for t in first_tags if t["Key"] == "role"]
+        assert role_tags == [{"Key": "role", "Value": "controller"}]
+
+        # Second call: client type
+        second_call = mock_ec2.run_instances.call_args_list[1]
+        assert second_call.kwargs["InstanceType"] == "m5n.4xlarge"
+        assert second_call.kwargs["MinCount"] == 2
+        second_tags = second_call.kwargs["TagSpecifications"][0]["Tags"]
+        role_tags = [t for t in second_tags if t["Key"] == "role"]
+        assert role_tags == [{"Key": "role", "Value": "client"}]
+
+        # Combined results
+        assert result["hosts"] == ["1.0.0.1", "1.0.0.2", "1.0.0.3"]
+        meta = result["provider_metadata"]
+        assert meta["instance_ids"] == ["i-ctrl", "i-cli1", "i-cli2"]
+        assert meta["public_ips"] == ["1.0.0.1", "1.0.0.2", "1.0.0.3"]
+        assert meta["private_ips"] == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+        assert meta["instance_types"] == {
+            "controller": "m5.4xlarge",
+            "client": "m5n.4xlarge",
+        }
+        assert "instance_type" not in meta
+
+    @pytest.mark.asyncio
+    async def test_reserve_instance_specs_single(self):
+        """Single-entry instance_specs works like legacy flat format."""
+        provider = self._make_provider()
+        mock_ec2 = self._mock_ec2_for_batch(
+            ["i-one"],
+            [("1.2.3.4", "10.0.0.1")],
+        )
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        result = await provider.reserve(
+            selection={
+                "instance_specs": [
+                    {"instance_type": "m5.xlarge", "count": 1},
+                ],
+            },
+            description="single spec",
+        )
+
+        assert result["status"] == "success"
+        assert mock_ec2.run_instances.call_count == 1
+        meta = result["provider_metadata"]
+        assert meta["instance_type"] == "m5.xlarge"
+        assert meta["instance_types"] == {"m5.xlarge": "m5.xlarge"}
+
+    @pytest.mark.asyncio
+    async def test_reserve_legacy_format_still_works(self):
+        """Legacy flat selection format produces same structure as before."""
+        provider = self._make_provider()
+        mock_ec2 = self._mock_ec2_for_batch(
+            ["i-a", "i-b"],
+            [("1.0.0.1", "10.0.0.1"), ("1.0.0.2", "10.0.0.2")],
+        )
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        result = await provider.reserve(
+            selection={"instance_type": "m5.xlarge", "count": 2},
+            description="legacy format",
+        )
+
+        assert result["status"] == "success"
+        meta = result["provider_metadata"]
+        assert meta["instance_type"] == "m5.xlarge"
+        assert meta["instance_ids"] == ["i-a", "i-b"]
+        assert meta["public_ips"] == ["1.0.0.1", "1.0.0.2"]
+
     @pytest.mark.asyncio
     async def test_from_secrets(self):
         from providers.resource.aws import AWSResourceProvider
@@ -630,16 +865,10 @@ class TestHandleCompletionIPSplit:
 
         await agent._handle_completion("PERF-TEST", response)
 
-        agent._mcp.call_tool.assert_called_once_with(
-            "get_accumulated_metadata", {}
-        )
+        agent._mcp.call_tool.assert_called_once_with("get_accumulated_metadata", {})
 
         patch_calls = agent._client.patch.call_args_list
-        fields_call = [
-            c
-            for c in patch_calls
-            if "/fields" in str(c)
-        ]
+        fields_call = [c for c in patch_calls if "/fields" in str(c)]
         assert len(fields_call) == 1
         body = fields_call[0].kwargs.get("json", {})
         fields = body.get("fields", {})
@@ -706,9 +935,7 @@ class TestHandleCompletionIPSplit:
         await agent._handle_completion("PERF-TEST", response)
 
         patch_calls = agent._client.patch.call_args_list
-        fields_call = [
-            c for c in patch_calls if "/fields" in str(c)
-        ]
+        fields_call = [c for c in patch_calls if "/fields" in str(c)]
         body = fields_call[0].kwargs.get("json", {})
         fields = body.get("fields", {})
 

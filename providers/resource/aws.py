@@ -186,36 +186,30 @@ class AWSResourceProvider(ResourceProvider):
         response = await asyncio.to_thread(ec2.describe_subnets, SubnetIds=[subnet_id])
         return response["Subnets"][0]["VpcId"]
 
-    async def reserve(
+    async def _launch_batch(
         self,
-        selection: dict[str, Any],
-        description: str,
-        duration_hours: int = 36,
-        ticket_id: str | None = None,
+        ec2: Any,
+        instance_type: str,
+        count: int,
+        ami: str,
+        root_volume_gb: int,
+        tags: list[dict[str, str]],
+        role: str | None = None,
     ) -> dict[str, Any]:
-        ec2 = self._get_ec2_client()
-        instance_type = selection.get("instance_type", self._default_instance_type)
-        ami = selection.get("ami", self._default_ami)
-        count = selection.get("count", selection.get("instance_count", 1))
-        root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
+        """Launch a batch of instances with the same type.
+
+        Returns instance_ids, public_ips, and private_ips for the batch.
+        """
+        batch_tags = list(tags)
+        if role:
+            batch_tags.append({"Key": "role", "Value": role})
 
         logger.info(
-            f"[aws-provider] Launching {count}x {instance_type} "
-            f"(AMI: {ami}, root_volume: {root_volume_gb}GB, region: {self._region})"
+            f"[aws-provider] Launching {count}x {instance_type}"
+            f"{f' (role: {role})' if role else ''} "
+            f"(AMI: {ami}, root_volume: {root_volume_gb}GB, "
+            f"region: {self._region})"
         )
-
-        if ticket_id:
-            instance_name = f"agentic-perf-{ticket_id}"
-        else:
-            instance_name = f"agentic-perf-{description[:50]}"
-
-        tags = [
-            {"Key": "Name", "Value": instance_name},
-            {"Key": "agentic-perf", "Value": "true"},
-            {"Key": "Description", "Value": description[:255]},
-        ]
-        if ticket_id:
-            tags.append({"Key": "ticket-id", "Value": ticket_id})
 
         ami_info = await asyncio.to_thread(ec2.describe_images, ImageIds=[ami])
         root_device = ami_info["Images"][0].get("RootDeviceName", "/dev/sda1")
@@ -240,7 +234,7 @@ class AWSResourceProvider(ResourceProvider):
             "TagSpecifications": [
                 {
                     "ResourceType": "instance",
-                    "Tags": tags,
+                    "Tags": batch_tags,
                 }
             ],
         }
@@ -258,8 +252,8 @@ class AWSResourceProvider(ResourceProvider):
                 error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
                 if error_code == "InsufficientInstanceCapacity":
                     logger.warning(
-                        f"[aws-provider] No capacity in subnet {subnet_id}, "
-                        f"trying next AZ..."
+                        f"[aws-provider] No capacity in subnet "
+                        f"{subnet_id}, trying next AZ..."
                     )
                     last_error = e
                     continue
@@ -273,35 +267,131 @@ class AWSResourceProvider(ResourceProvider):
         instance_ids = [i["InstanceId"] for i in response["Instances"]]
         logger.info(f"[aws-provider] Launched instances: {instance_ids}")
 
-        # AWS eventual consistency: instance IDs may not be findable immediately
         await asyncio.sleep(5)
         await self._poll_until_running(ec2, instance_ids)
         ips = await self._get_instance_ips(ec2, instance_ids)
-        public_ips = ips["public"]
-        private_ips = ips["private"]
 
-        # Bootstrap root SSH via the public IPs (orchestrator → instance)
-        await self.setup_ssh(public_ips)
+        return {
+            "instance_ids": instance_ids,
+            "public_ips": ips["public"],
+            "private_ips": ips["private"],
+        }
+
+    def _build_specs(self, selection: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize selection into a list of instance specs.
+
+        Accepts either the new per-role format::
+
+            {"instance_specs": [
+                {"instance_type": "m5.4xlarge", "count": 1,
+                 "role": "controller"},
+                {"instance_type": "m5n.4xlarge", "count": 2,
+                 "role": "client"},
+            ]}
+
+        or the legacy flat format::
+
+            {"instance_type": "m5.xlarge", "count": 2}
+        """
+        if "instance_specs" in selection:
+            specs = []
+            for spec in selection["instance_specs"]:
+                specs.append(
+                    {
+                        "instance_type": spec.get(
+                            "instance_type",
+                            self._default_instance_type,
+                        ),
+                        "count": spec.get("count", 1),
+                        "role": spec.get("role"),
+                    }
+                )
+            return specs
+
+        instance_type = selection.get("instance_type", self._default_instance_type)
+        count = selection.get("count", selection.get("instance_count", 1))
+        return [{"instance_type": instance_type, "count": count, "role": None}]
+
+    async def reserve(
+        self,
+        selection: dict[str, Any],
+        description: str,
+        duration_hours: int = 36,
+        ticket_id: str | None = None,
+    ) -> dict[str, Any]:
+        ec2 = self._get_ec2_client()
+        ami = selection.get("ami", self._default_ami)
+        root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
+
+        if ticket_id:
+            instance_name = f"agentic-perf-{ticket_id}"
+        else:
+            instance_name = f"agentic-perf-{description[:50]}"
+
+        base_tags = [
+            {"Key": "Name", "Value": instance_name},
+            {"Key": "agentic-perf", "Value": "true"},
+            {"Key": "Description", "Value": description[:255]},
+        ]
+        if ticket_id:
+            base_tags.append({"Key": "ticket-id", "Value": ticket_id})
+
+        specs = self._build_specs(selection)
+
+        all_instance_ids: list[str] = []
+        all_public_ips: list[str] = []
+        all_private_ips: list[str] = []
+        instance_types: dict[str, str] = {}
+        message_parts: list[str] = []
+
+        for spec in specs:
+            batch = await self._launch_batch(
+                ec2,
+                instance_type=spec["instance_type"],
+                count=spec["count"],
+                ami=ami,
+                root_volume_gb=root_volume_gb,
+                tags=base_tags,
+                role=spec["role"],
+            )
+            all_instance_ids.extend(batch["instance_ids"])
+            all_public_ips.extend(batch["public_ips"])
+            all_private_ips.extend(batch["private_ips"])
+
+            role_key = spec["role"] or spec["instance_type"]
+            instance_types[role_key] = spec["instance_type"]
+
+            label = (
+                f"{spec['count']}x {spec['instance_type']}"
+                f"{f' ({spec["role"]})' if spec['role'] else ''}"
+            )
+            message_parts.append(label)
+
+        await self.setup_ssh(all_public_ips)
+
+        metadata: dict[str, Any] = {
+            "instance_ids": all_instance_ids,
+            "region": self._region,
+            "instance_types": instance_types,
+            "ami": ami,
+            "cloud_login_user": self._ssh_user,
+            "public_ips": all_public_ips,
+            "private_ips": all_private_ips,
+            "ip_mapping": dict(zip(all_public_ips, all_private_ips)),
+        }
+        if len(instance_types) == 1:
+            metadata["instance_type"] = next(iter(instance_types.values()))
 
         return {
             "status": "success",
-            "reservation_id": ",".join(instance_ids),
-            "hosts": public_ips,
+            "reservation_id": ",".join(all_instance_ids),
+            "hosts": all_public_ips,
             "ssh_user": "root",
             "ssh_key_path": self._ssh_key_path,
             "lease_expiration": None,
             "provider": self.provider_name,
-            "provider_metadata": {
-                "instance_ids": instance_ids,
-                "region": self._region,
-                "instance_type": instance_type,
-                "ami": ami,
-                "cloud_login_user": self._ssh_user,
-                "public_ips": public_ips,
-                "private_ips": private_ips,
-                "ip_mapping": dict(zip(public_ips, private_ips)),
-            },
-            "message": f"Launched {count}x {instance_type} in {self._region}",
+            "provider_metadata": metadata,
+            "message": (f"Launched {', '.join(message_parts)} in {self._region}"),
         }
 
     async def _poll_until_running(

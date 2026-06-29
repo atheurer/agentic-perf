@@ -128,7 +128,10 @@ def get_resource_tools() -> list[ToolDefinition]:
                         "description": (
                             "What to reserve, based on check_available_resources results. "
                             "For quads: {hostnames: ['host1.example.com', ...]}. "
-                            "For aws: {instance_type: 'm5.xlarge', count: 2}. "
+                            "For aws: {instance_type: 'm5.xlarge', count: 2} for uniform "
+                            "instances, or {instance_specs: [{instance_type: 'm5.4xlarge', "
+                            "count: 1, role: 'controller'}, {instance_type: 'm5n.4xlarge', "
+                            "count: 2, role: 'client'}]} for per-role instance types. "
                             "For psap-cc: {cluster_id: '<uuid>'}."
                         ),
                     },
