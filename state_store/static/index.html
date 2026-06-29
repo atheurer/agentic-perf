@@ -203,23 +203,85 @@ tr.ticket-row:hover { background: var(--bg-hover); }
 .detail-header .ticket-id { font-size: 16px; }
 .detail-header .summary { font-size: 16px; color: var(--text-bright); flex: 1; }
 
-/* Detail layout: main content + sidebar */
-.detail-layout {
+/* Detail view: fixed context header + scrollable event stream */
+body:has(.detail-view) { overflow: hidden; }
+
+.detail-view {
   display: flex;
-  gap: 16px;
-  margin-top: 16px;
-  align-items: flex-start;
+  flex-direction: column;
+  height: calc(100vh - 54px);
+  overflow: hidden;
 }
 
-.detail-main { flex: 1; min-width: 0; }
+.detail-context {
+  flex-shrink: 0;
+}
+
+.detail-body {
+  flex: 1;
+  display: flex;
+  gap: 16px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.detail-main-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.detail-main-context {
+  flex-shrink: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Cap expanded card content so the context area never pushes
+   the event stream out of the viewport.  Only takes effect
+   when the user deliberately opens a <details> card. */
+.detail-main-context details > .content {
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.detail-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 0;
+}
 
 .detail-sidebar {
   width: 220px;
   flex-shrink: 0;
-  position: sticky;
-  top: 56px;
-  max-height: calc(100vh - 68px);
   overflow-y: auto;
+  margin-top: 12px;
+}
+
+.hypothesis-card {
+  background: linear-gradient(135deg, var(--bg-surface), #1e2340);
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-top: 12px;
+}
+
+.hypothesis-card h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.hypothesis-card .hypothesis-text {
+  font-size: 14px;
+  color: var(--text-bright);
+  line-height: 1.5;
 }
 
 .sidebar-section {
@@ -316,10 +378,12 @@ tr.ticket-row:hover { background: var(--bg-hover); }
 }
 
 @media (max-width: 900px) {
-  .detail-layout { flex-direction: column; }
+  .detail-body { flex-direction: column; }
+  .detail-view { height: auto; overflow: visible; }
+  .detail-main-col { overflow: visible; }
+  .detail-main { max-height: 60vh; }
   .detail-sidebar {
     width: 100%;
-    position: static;
     max-height: none;
     order: -1;
   }
@@ -487,37 +551,31 @@ details > .content { padding: 12px 16px; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.result-banner {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 8px;
-  background: var(--bg-surface);
-}
-
-.result-banner .result-verdict {
+.result-verdict {
   font-weight: 700;
   font-size: 15px;
   margin-bottom: 8px;
   text-transform: uppercase;
 }
 
-.result-banner .result-verdict.pass { color: var(--green); }
-.result-banner .result-verdict.fail { color: var(--red); }
-.result-banner .result-verdict.inconclusive { color: var(--yellow, #e2b340); }
+.result-verdict.pass { color: var(--green); }
+.result-verdict.fail { color: var(--red); }
+.result-verdict.inconclusive { color: var(--yellow, #e2b340); }
 
-.result-banner .result-summary {
+.result-summary {
   font-size: 14px;
   color: var(--text-bright);
   margin-bottom: 12px;
   line-height: 1.5;
 }
 
-.result-banner .result-detail {
+.result-detail {
+  font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text);
   line-height: 1.6;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .result-chart {
@@ -643,7 +701,7 @@ th.col-right { text-align: right; }
 
 <header>
   <div class="container">
-    <h1><span>Agentic</span> Perf</h1>
+    <h1><a href="#/" style="color: inherit; text-decoration: none;"><span>Agentic</span> Perf</a></h1>
     <div class="health-stats" id="health-stats"></div>
   </div>
 </header>
@@ -888,35 +946,41 @@ async function renderDetail(ticketId) {
     agentPhases = [];
 
     app.innerHTML =
-      '<div class="breadcrumb">' +
-        '<a href="#/">Dashboard</a> / ' + escHtml(ticket.id) +
-      '</div>' +
-      '<div class="detail-header">' +
-        '<span class="ticket-id">' + escHtml(ticket.id) + '</span>' +
-        '<span class="summary">' + escHtml(ticket.summary) + '</span>' +
-        '<span id="detail-status-badge">' + statusBadge(ticket.status) + '</span>' +
-      '</div>' +
-      '<div class="detail-layout">' +
-        '<div class="detail-main">' +
-          renderDescription(ticket) +
-          '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
-          '<div id="event-stream"></div>' +
+      '<div class="detail-view">' +
+        '<div class="detail-context">' +
+          '<div class="breadcrumb">' +
+            '<a href="#/">Dashboard</a> / ' + escHtml(ticket.id) +
+          '</div>' +
+          '<div class="detail-header">' +
+            '<span class="ticket-id">' + escHtml(ticket.id) + '</span>' +
+            '<span class="summary">' + escHtml(ticket.summary) + '</span>' +
+            '<span id="detail-status-badge">' + statusBadge(ticket.status) + '</span>' +
+          '</div>' +
         '</div>' +
-        '<div class="detail-sidebar" id="sidebar">' +
-          renderSidebar(ticket) +
+        '<div class="detail-body">' +
+          '<div class="detail-main-col">' +
+            '<div class="detail-main-context">' +
+              '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
+              renderDescription(ticket) +
+              '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
+            '</div>' +
+            '<div class="detail-main" id="event-stream"></div>' +
+          '</div>' +
+          '<div class="detail-sidebar" id="sidebar">' +
+            renderSidebar(ticket) +
+          '</div>' +
         '</div>' +
       '</div>';
 
     document.getElementById('btn-poll-toggle').addEventListener('click', togglePoll);
     document.getElementById('btn-auto-scroll').addEventListener('click', toggleAutoScroll);
     document.getElementById('btn-top').addEventListener('click', function() {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      var stream = document.getElementById('event-stream');
+      if (stream) stream.scrollTop = 0;
     });
     document.getElementById('btn-bottom').addEventListener('click', function() {
       var stream = document.getElementById('event-stream');
-      if (stream && stream.lastElementChild) {
-        stream.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
-      }
+      if (stream) stream.scrollTop = stream.scrollHeight;
     });
     document.getElementById('btn-collapse-all').addEventListener('click', function() {
       document.querySelectorAll('#event-stream details[open]').forEach(function(d) { d.open = false; });
@@ -936,11 +1000,6 @@ async function renderDetail(ticketId) {
 
 function renderSidebar(ticket) {
   return '' +
-    '<div class="sidebar-section">' +
-      '<h4>Status</h4>' +
-      '<div style="text-align:center">' + statusBadge(ticket.status) + '</div>' +
-    '</div>' +
-
     '<div class="sidebar-section">' +
       '<h4>Controls</h4>' +
       '<div class="sidebar-btn-row">' +
@@ -978,6 +1037,54 @@ function renderSidebar(ticket) {
     '</div>';
 }
 
+function renderHypothesisCard(ticket) {
+  var fields = ticket.custom_fields || {};
+  var hypothesis = fields.hypothesis;
+  var verdict = fields.verdict;
+  var summary = fields.review_summary;
+  var detail = fields.detailed_analysis;
+  var chartData = fields.chart_data;
+  var resultsUrl = fields.results_url;
+  if (!hypothesis && !verdict) return '';
+  var html = '<div class="hypothesis-card">';
+  html += '<h4>Hypothesis</h4>';
+  if (hypothesis) {
+    html += '<div class="hypothesis-text">' + escHtml(String(hypothesis)) + '</div>';
+  }
+  if (verdict) {
+    var cls = 'inconclusive';
+    var v = String(verdict).toLowerCase();
+    if (v === 'pass' || v === 'passed' || v === 'meets_expectations' ||
+        v === 'hypothesis_confirmed') cls = 'pass';
+    else if (v === 'fail' || v === 'failed' || v === 'below_expectations' ||
+        v === 'hypothesis_refuted') cls = 'fail';
+    html += '<div class="result-verdict ' + cls + '" style="margin-top:12px">' +
+      escHtml(String(verdict)) + '</div>';
+    if (summary) {
+      html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
+    }
+    var chartId = 'hypo-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
+    if (chartData) {
+      html += '<div class="result-chart"><canvas id="' + chartId + '"></canvas></div>';
+      setTimeout(function() { mountChart(chartId, chartData); }, 0);
+    }
+    if (resultsUrl) {
+      html += '<a class="results-link" href="' + escHtml(String(resultsUrl)) +
+        '" target="_blank">View detailed results &#8599;</a>';
+    }
+    if (detail) {
+      html += '<details style="margin-top:8px; border:none;">' +
+        '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+          'Detailed Analysis (' + detail.length.toLocaleString() + ' chars)</summary>' +
+        '<div class="content"><div class="result-detail">' +
+          escHtml(String(detail)) + '</div></div>' +
+      '</details>';
+    }
+  }
+  html += '</div>';
+  return html;
+}
+
 function renderDescription(ticket) {
   if (!ticket.description) return '';
   return '<details style="margin-top: 16px;">' +
@@ -987,27 +1094,6 @@ function renderDescription(ticket) {
 }
 
 var CHART_COLORS = ['#7aa2f7', '#9ece6a', '#e0af68', '#ff9e64', '#bb9af7', '#7dcfff', '#f7768e'];
-
-function renderResultBanner(fields, containerId) {
-  var verdict = fields.verdict;
-  var summary = fields.review_summary;
-  var detail = fields.detailed_analysis;
-  if (!verdict && !summary && !detail) return '';
-  var cls = 'inconclusive';
-  if (verdict) {
-    var v = String(verdict).toLowerCase();
-    if (v === 'pass' || v === 'passed' || v === 'meets_expectations') cls = 'pass';
-    else if (v === 'fail' || v === 'failed' || v === 'below_expectations') cls = 'fail';
-  }
-  var html = '<div class="result-banner">';
-  if (verdict) html += '<div class="result-verdict ' + cls + '">' + escHtml(String(verdict)) + '</div>';
-  if (summary) html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
-  if (fields.chart_data) html += '<div class="result-chart"><canvas id="' + containerId + '"></canvas></div>';
-  if (fields.results_url) html += '<a class="results-link" href="' + escHtml(String(fields.results_url)) + '" target="_blank">View detailed results &#8599;</a>';
-  if (detail) html += '<div class="result-detail">' + escHtml(String(detail)) + '</div>';
-  html += '</div>';
-  return html;
-}
 
 function mountChart(containerId, chartData) {
   var canvas = document.getElementById(containerId);
@@ -1039,9 +1125,8 @@ function mountChart(containerId, chartData) {
 function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
-  var chartId = 'result-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
-  var banner = renderResultBanner(fields, chartId);
-  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url'];
+
+  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis'];
   var items = '';
   for (var k in fields) {
     if (promoted.indexOf(k) !== -1) continue;
@@ -1057,10 +1142,7 @@ function renderCustomFields(ticket) {
       '<div class="content"><div class="fields-grid">' + items + '</div></div>' +
     '</details>';
   }
-  if (fields.chart_data) {
-    setTimeout(function() { mountChart(chartId, fields.chart_data); }, 0);
-  }
-  return banner + rest;
+  return rest;
 }
 
 // ── Event Polling & Rendering ──
@@ -1072,6 +1154,10 @@ async function refreshResultSection(ticketId) {
     var el = document.getElementById('result-section');
     if (el) {
       el.innerHTML = renderCustomFields(ticket);
+    }
+    var hypo = document.getElementById('hypothesis-section');
+    if (hypo) {
+      hypo.innerHTML = renderHypothesisCard(ticket);
     }
   } catch {}
 }
@@ -1177,12 +1263,21 @@ function renderNewEvents(events) {
   if (countEl) countEl.textContent = renderedEvents.length;
 
   if (autoScroll) {
-    var last = container.lastElementChild;
-    if (last) last.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    container.scrollTop = container.scrollHeight;
   }
 }
 
 function trackAgentPhase(evt) {
+  // Handle transitions regardless of agent name — orchestrator-driven
+  // transitions (e.g., to closed) may not carry an agent field
+  if (evt.event_type === 'transition') {
+    var statusEl = document.getElementById('detail-status-badge');
+    if (statusEl && evt.data && evt.data.to) {
+      statusEl.innerHTML = statusBadge(evt.data.to);
+      refreshResultSection(currentTicketId);
+    }
+  }
+
   var agent = evt.agent || '';
   if (!agent) return;
   var existing = null;
@@ -1199,15 +1294,6 @@ function trackAgentPhase(evt) {
     if (existing) existing.status = 'done';
   } else if (evt.event_type === 'agent_error') {
     if (existing) existing.status = 'error';
-  }
-  if (evt.event_type === 'transition') {
-    var statusEl = document.getElementById('detail-status-badge');
-    if (statusEl && evt.data && evt.data.to) {
-      statusEl.innerHTML = statusBadge(evt.data.to);
-      var sidebarStatus = document.querySelector('.detail-sidebar .sidebar-section:first-child div');
-      if (sidebarStatus) sidebarStatus.innerHTML = statusBadge(evt.data.to);
-      refreshResultSection(evt.data.ticket_id || currentTicketId);
-    }
   }
 }
 

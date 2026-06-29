@@ -99,6 +99,10 @@ class OrchestratorConfig:
             "base_url"
         )
 
+        # LLM budget guardrails (per orchestrator session)
+        budget_cfg = cfg.get("llm_budget", {})
+        self.budget_session_cost_usd: float = budget_cfg.get("session_cost_usd", 0.0)
+
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 

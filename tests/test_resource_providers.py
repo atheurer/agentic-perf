@@ -630,16 +630,10 @@ class TestHandleCompletionIPSplit:
 
         await agent._handle_completion("PERF-TEST", response)
 
-        agent._mcp.call_tool.assert_called_once_with(
-            "get_accumulated_metadata", {}
-        )
+        agent._mcp.call_tool.assert_called_once_with("get_accumulated_metadata", {})
 
         patch_calls = agent._client.patch.call_args_list
-        fields_call = [
-            c
-            for c in patch_calls
-            if "/fields" in str(c)
-        ]
+        fields_call = [c for c in patch_calls if "/fields" in str(c)]
         assert len(fields_call) == 1
         body = fields_call[0].kwargs.get("json", {})
         fields = body.get("fields", {})
@@ -706,9 +700,7 @@ class TestHandleCompletionIPSplit:
         await agent._handle_completion("PERF-TEST", response)
 
         patch_calls = agent._client.patch.call_args_list
-        fields_call = [
-            c for c in patch_calls if "/fields" in str(c)
-        ]
+        fields_call = [c for c in patch_calls if "/fields" in str(c)]
         body = fields_call[0].kwargs.get("json", {})
         fields = body.get("fields", {})
 
