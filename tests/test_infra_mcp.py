@@ -116,6 +116,22 @@ def mock_infra_server(tmp_path: Path) -> Path:
                 "stdout": f"Installed: {', '.join(packages)}",
             })
 
+        @mcp.tool()
+        async def check_hosts(hosts: list) -> str:
+            \"\"\"Batch check hosts.\"\"\"
+            results = {}
+            reachable = []
+            for h in hosts:
+                results[h] = {"host": h, "reachable": True, "system_info": "mock"}
+                reachable.append(h)
+            return json.dumps({"results": results, "reachable": reachable, "unreachable": []})
+
+        @mcp.tool()
+        async def test_port_connectivity(server_ssh_host: str, client_ssh_host: str, server_test_ip: str, port: int, client_test_ip: str = "", timeout: int = 10) -> str:
+            \"\"\"Test port connectivity.\"\"\"
+            tests = [{"direction": f"client -> server:{port}", "port": port, "reachable": True, "error": ""}]
+            return json.dumps({"all_reachable": True, "tests": tests})
+
         if __name__ == "__main__":
             mcp.run()
     """)
@@ -162,6 +178,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
         expected = {
             "set_ssh_context",
             "check_host",
+            "check_hosts",
             "execute_command",
             "stop_background_command",
             "check_background_command",
@@ -170,6 +187,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "deploy_secret",
             "transfer_file",
             "install_packages",
+            "test_port_connectivity",
         }
         assert expected == names
     finally:
@@ -275,7 +293,7 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "resolve_benchmark" in names
         assert "set_ssh_context" in names
         assert "execute_command" in names
-        assert len(names) == 12
+        assert len(names) == 14
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -326,7 +344,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 12
+    assert len(client._tool_routing) == 14
 
     await client.disconnect()
     assert len(client._servers) == 0

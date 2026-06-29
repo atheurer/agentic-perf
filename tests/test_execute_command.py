@@ -276,3 +276,181 @@ class TestNcInBenchmarkPolicy:
         policy = load_policy("benchmark-agent")
         assert "nc" in policy.allowed_binaries
         assert "ncat" in policy.allowed_binaries
+
+
+@pytest.mark.asyncio
+async def test_check_hosts_batch():
+    """check_hosts returns per-host results for multiple hosts."""
+    import agents.infra.server as infra
+
+    call_count = 0
+
+    async def _mock_run(host, cmd, timeout=300):
+        nonlocal call_count
+        call_count += 1
+        if "SSH_OK" in cmd:
+            if host == "10.0.0.3":
+                return _make_ssh_result(exit_code=1, stderr="Connection refused")
+            return _make_ssh_result(stdout="SSH_OK\n")
+        return _make_ssh_result(stdout="mockhost\nNAME=RHEL\n4\n16\n")
+
+    mock_ssh = AsyncMock()
+    mock_ssh.run = _mock_run
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.check_hosts(["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        data = json.loads(result)
+
+        assert "10.0.0.1" in data["reachable"]
+        assert "10.0.0.2" in data["reachable"]
+        assert "10.0.0.3" in data["unreachable"]
+        assert data["results"]["10.0.0.1"]["reachable"] is True
+        assert data["results"]["10.0.0.3"]["reachable"] is False
+
+
+@pytest.mark.asyncio
+async def test_check_hosts_empty_list():
+    """check_hosts handles empty list."""
+    import agents.infra.server as infra
+
+    mock_ssh = AsyncMock()
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.check_hosts([])
+        data = json.loads(result)
+        assert data["reachable"] == []
+        assert data["unreachable"] == []
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_forward_only():
+    """test_port_connectivity tests client -> server."""
+    import agents.infra.server as infra
+
+    call_log = []
+
+    async def _mock_run(host, cmd, timeout=300):
+        call_log.append((host, cmd))
+        if "nc -l" in cmd:
+            return _make_ssh_result(stdout="12345\n")
+        if "nc -z" in cmd:
+            return _make_ssh_result(exit_code=0)
+        if "kill" in cmd:
+            return _make_ssh_result(exit_code=0)
+        return _make_ssh_result()
+
+    mock_ssh = AsyncMock()
+    mock_ssh.run = _mock_run
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.test_port_connectivity(
+            server_ssh_host="1.1.1.1",
+            client_ssh_host="2.2.2.2",
+            server_test_ip="192.168.1.1",
+            port=30002,
+        )
+        data = json.loads(result)
+        assert data["all_reachable"] is True
+        assert len(data["tests"]) == 1
+        assert data["tests"][0]["port"] == 30002
+        assert data["tests"][0]["reachable"] is True
+
+        listener_cmds = [(h, c) for h, c in call_log if "nc -l" in c]
+        assert any("1.1.1.1" == h for h, _ in listener_cmds)
+        assert any("192.168.1.1" in c for _, c in listener_cmds)
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_bidirectional():
+    """test_port_connectivity tests both directions when client_test_ip given."""
+    import agents.infra.server as infra
+
+    async def _mock_run(host, cmd, timeout=300):
+        if "nc -l" in cmd:
+            return _make_ssh_result(stdout="99999\n")
+        if "nc -z" in cmd:
+            return _make_ssh_result(exit_code=0)
+        if "kill" in cmd:
+            return _make_ssh_result(exit_code=0)
+        return _make_ssh_result()
+
+    mock_ssh = AsyncMock()
+    mock_ssh.run = _mock_run
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.test_port_connectivity(
+            server_ssh_host="1.1.1.1",
+            client_ssh_host="2.2.2.2",
+            server_test_ip="192.168.1.1",
+            port=30002,
+            client_test_ip="192.168.1.2",
+        )
+        data = json.loads(result)
+        assert data["all_reachable"] is True
+        assert len(data["tests"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_failure():
+    """test_port_connectivity reports unreachable when nc fails."""
+    import agents.infra.server as infra
+
+    async def _mock_run(host, cmd, timeout=300):
+        if "nc -l" in cmd:
+            return _make_ssh_result(stdout="12345\n")
+        if "nc -z" in cmd:
+            return _make_ssh_result(exit_code=1, stderr="Connection refused")
+        if "kill" in cmd:
+            return _make_ssh_result(exit_code=0)
+        return _make_ssh_result()
+
+    mock_ssh = AsyncMock()
+    mock_ssh.run = _mock_run
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.test_port_connectivity(
+            server_ssh_host="1.1.1.1",
+            client_ssh_host="2.2.2.2",
+            server_test_ip="192.168.1.1",
+            port=30002,
+        )
+        data = json.loads(result)
+        assert data["all_reachable"] is False
+        assert data["tests"][0]["reachable"] is False
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_listener_fails():
+    """test_port_connectivity handles listener start failure."""
+    import agents.infra.server as infra
+
+    async def _mock_run(host, cmd, timeout=300):
+        if "nc -l" in cmd:
+            return _make_ssh_result(stdout="not_a_pid\n")
+        return _make_ssh_result()
+
+    mock_ssh = AsyncMock()
+    mock_ssh.run = _mock_run
+
+    with (
+        patch.object(infra, "_ssh", mock_ssh),
+    ):
+        result = await infra.test_port_connectivity(
+            server_ssh_host="1.1.1.1",
+            client_ssh_host="2.2.2.2",
+            server_test_ip="192.168.1.1",
+            port=30002,
+        )
+        data = json.loads(result)
+        assert data["all_reachable"] is False
+        assert "Failed to start" in data["tests"][0]["error"]

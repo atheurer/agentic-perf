@@ -3,6 +3,43 @@
 These are common mistakes when constructing crucible run files,
 discovered through real benchmark runs and user feedback.
 
+## Tags: what they are and are not for
+
+Tags are metadata for information NOT already captured elsewhere
+in the run data. Benchmark parameters (message size, thread count,
+protocol, duration, etc.) are already stored in the run-file and
+searchable in OpenSearch — do NOT duplicate them as tags.
+
+Good tags:
+```json
+"tags": {
+  "study": "throughput-scaling-june2026",
+  "hypothesis": "linear scaling to 8 threads",
+  "environment": "aws-us-east-2",
+  "jira": "PERF-12345"
+}
+```
+
+Bad tags (redundant with run-file params):
+```json
+"tags": {
+  "benchmark": "uperf",
+  "protocol": "tcp",
+  "message-size": "16384",
+  "thread-counts": "1,8,32",
+  "duration": "30",
+  "samples": "3"
+}
+```
+
+Also: tag values must NOT contain commas. Crucible's tag parser
+splits on commas, so `"thread-counts": "1,8,32"` causes a parse
+error ("format for tag is not valid: 8"). Use dashes or other
+separators if you must encode multiple values in one tag.
+
+Keep tags minimal — 2-4 entries that help identify the study or
+context, not a summary of the run-file.
+
 ## Engine ID pairing for client-server benchmarks
 
 For benchmarks with client and server roles (uperf, iperf,
