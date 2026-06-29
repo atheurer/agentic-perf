@@ -178,6 +178,27 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         agent = dispatcher.create_agent(status)
         if agent is None:
             return
+
+        # Investigation tickets get unlimited iterations for
+        # all agents — convergence gates and budget guardrails
+        # handle termination, not arbitrary iteration caps.
+        # Without this, agents like the benchmark agent exhaust
+        # their default max_iterations re-reading skills and
+        # host state on each investigation loop-back.
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                if r.status_code == 200:
+                    cf = r.json().get("custom_fields", {})
+                    if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+                        agent.max_iterations = 0
+        except Exception:
+            pass  # proceed with default iterations
+
         await agent.run(ticket_id)
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
