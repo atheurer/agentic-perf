@@ -1234,7 +1234,11 @@ function renderHypothesisCard(ticket) {
   var detail = fields.detailed_analysis;
   var chartData = fields.chart_data;
   var resultsUrl = fields.results_url;
-  if (!hypothesis && !verdict) return '';
+  // Investigation pipeline results
+  var evalResult = fields.evaluation_result;
+  var synthResult = fields.synthesis_result;
+  var dedupResult = fields.dedup_result;
+  if (!hypothesis && !verdict && !evalResult && !synthResult && !dedupResult) return '';
   var html = '<div class="hypothesis-card">';
   html += '<h4>Hypothesis</h4>';
   if (hypothesis) {
@@ -1284,6 +1288,55 @@ function renderHypothesisCard(ticket) {
       }
     }
   }
+  // Investigation pipeline outcomes
+  if (!verdict && dedupResult && dedupResult.decision === 'MATCH_FOUND') {
+    html += '<div class="result-verdict pass" style="margin-top:12px">' +
+      'DEDUP MATCH \u2014 ' + escHtml(String(dedupResult.matched_investigation_id)) + '</div>';
+    html += '<div class="result-summary">' +
+      'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
+      escHtml(String(dedupResult.match_rationale || '').substring(0, 200)) + '</div>';
+  }
+  if (!verdict && synthResult) {
+    var sCls = 'inconclusive';
+    var sOutcome = String(synthResult.convergence_outcome || '').toUpperCase();
+    if (sOutcome === 'ISOLATION') sCls = 'pass';
+    else if (sOutcome === 'ENTROPY_STALL' || sOutcome === 'MAX_ITERATIONS') sCls = 'fail';
+    else if (sOutcome === 'EXPECTED_REGRESSION') sCls = 'pass';
+    html += '<div class="result-verdict ' + sCls + '" style="margin-top:12px">' +
+      escHtml(sOutcome || 'INVESTIGATION COMPLETE') + '</div>';
+    if (synthResult.root_cause_summary) {
+      html += '<div class="result-summary">' +
+        escHtml(String(synthResult.root_cause_summary)) + '</div>';
+    }
+    var om = synthResult.operational_metrics;
+    if (om) {
+      var rc = om.resource_consumption || {};
+      html += '<div style="margin-top:8px; font-size:12px; color:var(--text-muted)">' +
+        'Iterations: ' + (om.info_gain_trajectory || []).length +
+        ' \u2022 Tokens: ' + (rc.llm_tokens_total || 0).toLocaleString() +
+        ' \u2022 Cost: $' + (rc.estimated_cost_usd || 0).toFixed(4) +
+        ' \u2022 Wall clock: ' + (om.wall_clock_mins || 0).toFixed(1) + 'm' +
+        '</div>';
+    }
+    if (synthResult.notes) {
+      html += '<details style="margin-top:8px; border:none;">' +
+        '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+          'Investigation Notes</summary>' +
+        '<div class="content"><div class="result-detail">' +
+          renderMarkdown(String(synthResult.notes)) + '</div></div>' +
+      '</details>';
+    }
+  } else if (!verdict && evalResult && !synthResult) {
+    // Evaluation in progress (not yet synthesized)
+    var eCls = evalResult.decision === 'converged' ? 'pass' :
+      evalResult.decision === 'stalled' ? 'fail' : 'inconclusive';
+    html += '<div class="result-verdict ' + eCls + '" style="margin-top:12px">' +
+      'EVALUATING: ' + escHtml(String(evalResult.decision || '').toUpperCase()) + '</div>';
+    if (evalResult.root_cause_summary) {
+      html += '<div class="result-summary">' +
+        escHtml(String(evalResult.root_cause_summary)) + '</div>';
+    }
+  }
   html += '</div>';
   return html;
 }
@@ -1329,7 +1382,7 @@ function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
 
-  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis'];
+  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis', 'evaluation_result', 'synthesis_result', 'dedup_result'];
   var items = '';
   for (var k in fields) {
     if (promoted.indexOf(k) !== -1) continue;
