@@ -484,6 +484,44 @@ class AgentBase(ABC):
 
         return "ok"
 
+    async def _get_investigation_ledger(
+        self,
+        ticket_id: str,
+    ) -> list[dict[str, Any]]:
+        """Read the investigation ledger from the ticket."""
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        return cf.get("investigation_ledger", [])
+
+    async def _append_ledger_entry(
+        self,
+        ticket_id: str,
+        iteration: int,
+        plan_steps: list[int] | None = None,
+        hypothesis: str = "",
+        params_rationale: str = "",
+        conclusion: str = "",
+        info_gain: float = 0.0,
+    ) -> None:
+        """Append an entry to the investigation ledger.
+
+        Performs a read-modify-write on the ledger list.
+        """
+        from providers.ledger import LedgerEntry, append_ledger_entry
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        entry = LedgerEntry(
+            iteration=iteration,
+            plan_steps=plan_steps or [],
+            hypothesis=hypothesis,
+            params_rationale=params_rationale,
+            conclusion=conclusion,
+            info_gain=info_gain,
+        )
+        fields = append_ledger_entry(cf, entry)
+        await self._update_fields(ticket_id, fields)
+
     async def _get_ticket(self, ticket_id: str) -> dict[str, Any]:
         r = await self._client.get(f"{self.store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
