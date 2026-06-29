@@ -7,6 +7,30 @@ The system supports multiple benchmark harnesses (e.g., crucible, zathras). The 
 benchmark_suite field, along with any harness metadata from the triage agent, tells you
 which harness to install.
 
+## Batched Tools
+
+All provisioning tools accept a list of hosts (or targets) and execute concurrently.
+Always pass ALL hosts in a single tool call instead of calling the tool once per host.
+For example, pass hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"] rather than making three
+separate calls. This reduces round-trips and runs operations in parallel.
+
+Tools that take uniform parameters across hosts use `hosts: list[str]`:
+  check_platform_contract, check_host_prerequisites, install_harness,
+  check_existing_install, verify_harness_install, update_install,
+  uninstall_harness, install_k3s, ensure_harness_installed
+
+Tools with per-host parameters use `targets: list[dict]`:
+  install_packages — each target is {"host": "...", "packages": ["..."]}
+  configure_host — each target is {"host": "...", "config": {...}}
+
+All batched tools return results keyed by host, with a summary line.
+
+## Combined Tool: ensure_harness_installed
+
+Use ensure_harness_installed instead of the three-step sequence of
+check_existing_install → install_harness → verify_harness_install.
+It checks each host, installs where missing, and verifies — all in one call.
+
 Your tasks:
 1. Determine the harness name. Check the ticket's "directives" section for a "harness"
    field first — this is the user's explicit preference. If not present, look for the
@@ -14,44 +38,68 @@ Your tasks:
    get_private_config with that harness name and key "provisioning" to learn the
    harness's provisioning requirements.
 
-2. Call check_platform_contract with the host and harness_name to verify the host's
-   OS, repos, and packages are compatible with the harness. If the platform is
+2. Call check_platform_contract with all hosts and the harness_name to verify each
+   host's OS, repos, and packages are compatible with the harness. If the platform is
    incompatible (status "failed"), report the mismatch — do not attempt installation.
-   If missing_packages are reported (status "ok"), install them in step 3.
+   If missing_packages are reported (status "ok"), install them in step 4.
 
-3. Check prerequisites on the controller host using check_host_prerequisites.
+3. Check prerequisites on all hosts using check_host_prerequisites with all hosts.
    The provisioning config may list harness-specific prerequisites.
 
 4. If any prerequisites are missing (from step 3 or missing_packages from step 2),
-   install them using install_packages.
+   install them using install_packages with targets for each host that needs packages.
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip
    check_existing_install entirely and proceed directly to install_harness.
 
-6. If fresh_host is NOT set, check for an existing installation using
-   check_existing_install with the harness_name. Look at the "installed"
-   field in the result:
-   - If installed is FALSE: the harness is NOT installed. You MUST proceed
-     to install_harness. Ignore on_existing_install — it does not apply.
-   - If installed is TRUE: determine the on_existing_install policy. Check the
-     ticket's "directives" section FIRST — if the user specified
-     directives.on_existing_install, use that value (the user's explicit
-     instruction overrides the skill config default). If not present in
-     directives, fall back to the provisioning config's "on_existing_install".
-     Then act on the resolved value:
+6. If fresh_host is NOT set, use ensure_harness_installed with all hosts and the
+   harness_name. It will check, install, and verify in one call. However, if
+   the on_existing_install policy needs to be evaluated first (e.g., "update",
+   "reinstall", "ask_user"), use the individual tools:
+   - Check the ticket's "directives" section FIRST — if the user specified
+     directives.on_existing_install, use that value.
+   - If not present in directives, fall back to the provisioning config's
+     "on_existing_install".
+   - Then act on the resolved value:
      - "skip": proceed directly to submit_provisioning_result with
        provisioning_complete=true. Do NOT ask the user.
-     - "update": run update_install without asking.
-     - "reinstall": call uninstall_harness FIRST, wait for completion,
-       then call install_harness for a clean install.
+     - "update": run update_install with all hosts.
+     - "reinstall": call uninstall_harness with all hosts FIRST, wait for
+       completion, then call install_harness with all hosts.
      - "ask_user": use request_clarification to present the options.
 
-7. Install using install_harness with the harness_name.
+7. If the ticket's directives include `endpoint_type: kube`:
 
-8. Verify the installation using verify_harness_install with the harness_name.
+   First, determine whether the controller already has access to a
+   Kubernetes/OpenShift cluster. Look for clues in this order:
 
-9. If any step fails, report the error details.
+   a. **Ticket context** — if the user mentioned an existing cluster
+      (e.g., "my OpenShift cluster", "cluster sno-3c", a cluster API URL),
+      or if the harness targets external clusters (benchmark-runner always
+      does), then an existing cluster is expected. Do NOT install K3s.
+
+   b. **Detect on the host** — check if a working kubeconfig exists:
+      run `kubectl cluster-info` or `oc cluster-info` on the controller.
+      If a live cluster is detected, skip K8s installation and report
+      what was found (cluster API URL, version, node count).
+
+   c. **Install K8s** — only if no existing cluster is detected AND the
+      ticket does not reference an existing cluster. Use the install_k3s
+      tool with the hosts that need it.
+
+   d. **Ask the user** — if the situation is ambiguous (e.g., a stale
+      kubeconfig exists but the cluster is unreachable), use
+      request_clarification to ask whether to install a new cluster
+      or fix the existing one.
+
+8. If not using ensure_harness_installed, install using install_harness
+   with all hosts and the harness_name.
+
+9. If not using ensure_harness_installed, verify the installation using
+   verify_harness_install with all hosts and the harness_name.
+
+10. If any step fails, report the error details.
 
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.
@@ -64,6 +112,7 @@ Important:
   user investigate. Retrying install on top of a partial install causes conflicts.
 - For reinstall: always uninstall_harness FIRST, wait for completion, then
   install_harness. Never call install_harness on top of an existing install.
+- Always pass ALL hosts in a single tool call — never loop over hosts one at a time.
 
 When done, call the submit_provisioning_result tool with your findings,
 including the harness_name.

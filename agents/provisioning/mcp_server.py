@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -36,6 +37,42 @@ def _os_matches(detected: str, supported: list[str]) -> bool:
         if detected.startswith(s) or s.startswith(detected):
             return True
     return False
+
+
+def _summarize(results: dict[str, dict]) -> dict:
+    """Wrap per-host results with a summary line."""
+    total = len(results)
+    success = sum(
+        1
+        for r in results.values()
+        if r.get("status") in ("success", "ok", "already_installed", "ready")
+        or r.get("all_met") is True
+        or r.get("installed") is True
+        or r.get("verified") is True
+    )
+    failed = total - success
+    return {
+        "results": results,
+        "summary": f"{total} host(s): {success} success, {failed} failed",
+    }
+
+
+async def _gather_for_hosts(
+    hosts: list[str],
+    coro_fn,
+    *args,
+    **kwargs,
+) -> dict[str, dict]:
+    """Run coro_fn(host, *args, **kwargs) for each host concurrently."""
+    coros = [coro_fn(h, *args, **kwargs) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, dict] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"status": "error", "message": str(result)}
+        else:
+            results[host] = result
+    return results
 
 
 async def validate_platform_contract(
@@ -136,16 +173,13 @@ async def _discover_crucible_token_files(
         return []
 
     paths = []
-    # controller.pull-token
     if reg.get("controller", {}).get("pull-token"):
         paths.append(reg["controller"]["pull-token"])
-    # engines.public
     pub = reg.get("engines", {}).get("public", {})
     if pub.get("push-token"):
         paths.append(pub["push-token"])
     if pub.get("quay", {}).get("refresh-expiration", {}).get("token-file"):
         paths.append(pub["quay"]["refresh-expiration"]["token-file"])
-    # engines.private
     priv = reg.get("engines", {}).get("private", {})
     if priv.get("tokens", {}).get("push"):
         paths.append(priv["tokens"]["push"])
@@ -153,7 +187,6 @@ async def _discover_crucible_token_files(
         paths.append(priv["tokens"]["pull"])
     if priv.get("quay", {}).get("refresh-expiration", {}).get("token-file"):
         paths.append(priv["quay"]["refresh-expiration"]["token-file"])
-    # userenvs[].pull-token
     for ue in reg.get("userenvs", []):
         if ue.get("pull-token"):
             paths.append(ue["pull-token"])
@@ -176,16 +209,14 @@ async def cleanup_harness(
         logger.info(f"[provision] Pre-uninstall on {host}: {cmd}")
         await ssh.run(host, cmd, timeout=120)
 
-    # --- crucible-specific cleanup (TODO: migrate to crucible project) ---
     if harness_name == "crucible":
-        # 1. Discover auth token files from registries.json before removing anything
         token_files = await _discover_crucible_token_files(ssh, host, path)
         if token_files:
             logger.info(
-                f"[provision] Found {len(token_files)} token files in registries.json on {host}"
+                f"[provision] Found {len(token_files)} token files in "
+                f"registries.json on {host}"
             )
 
-        # 2. Stop and remove all crucible containers
         await ssh.run(
             host,
             "podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^crucible-'"
@@ -198,13 +229,11 @@ async def cleanup_harness(
         cleanup_details.append("containers: stopped and removed")
         logger.info(f"[provision] Stopped crucible containers on {host}")
 
-        # 3. Remove auth token files discovered from registries.json
         for token_path in token_files:
             await ssh.run(host, f"rm -f {token_path}")
             cleanup_details.append(f"token: {token_path}")
         logger.info(f"[provision] Removed {len(token_files)} token files on {host}")
 
-        # 4. Remove system artifacts
         for artifact in [
             "/usr/bin/crucible",
             "/etc/sysconfig/crucible",
@@ -213,15 +242,12 @@ async def cleanup_harness(
             await ssh.run(host, f"rm -f {artifact}")
         cleanup_details.append("system: symlinks, sysconfig, profile.d")
 
-        # 5. Remove user config
         await ssh.run(host, "rm -rf /root/.crucible", timeout=60)
         cleanup_details.append("config: /root/.crucible")
 
-        # 6. Remove run data
         await ssh.run(host, "rm -rf /var/lib/crucible", timeout=120)
         cleanup_details.append("data: /var/lib/crucible")
 
-    # Remove the install directory
     logger.info(f"[provision] Removing {harness_name} install dir {path} on {host}")
     result = await ssh.run(host, f"rm -rf {path}", timeout=120)
     if result.exit_code != 0:
@@ -249,16 +275,20 @@ def get_provisioning_tools() -> list[ToolDefinition]:
         ToolDefinition(
             name="check_platform_contract",
             description=(
-                "Check if a host meets the platform requirements (OS, repos, packages) "
+                "Check if hosts meet the platform requirements (OS, repos, packages) "
                 "for a benchmark harness. Call this before attempting installation to "
                 "verify compatibility. Returns detected OS, missing repos, and missing "
-                "packages. OS or repo mismatches are hard failures; missing packages "
-                "are warnings (they can be installed)."
+                "packages per host. OS or repo mismatches are hard failures; missing "
+                "packages are warnings (they can be installed)."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "IP or hostname"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of IPs or hostnames",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
@@ -268,60 +298,82 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="check_host_prerequisites",
             description=(
-                "Check if a host has the required software installed "
-                "(podman, git, jq, curl). Returns the status of each prerequisite."
+                "Check if hosts have the required software installed "
+                "(podman, git, jq, curl). Returns the status of each "
+                "prerequisite per host."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "IP or hostname"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of IPs or hostnames",
+                    },
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host"],
+                "required": ["hosts"],
             },
         ),
         ToolDefinition(
             name="install_packages",
-            description="Install required packages on a host via the system package manager.",
+            description=(
+                "Install required packages on multiple hosts via the system "
+                "package manager. Each target specifies a host and its packages."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
-                    "packages": {
+                    "targets": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Package names to install",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "host": {"type": "string"},
+                                "packages": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["host", "packages"],
+                        },
+                        "description": "List of {host, packages} targets",
                     },
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host", "packages"],
+                "required": ["targets"],
             },
         ),
         ToolDefinition(
             name="install_harness",
             description=(
-                "Install the benchmark harness on a host. Uses private skill config to "
-                "determine the install method: 'public_install' downloads and runs the "
-                "upstream installer with skill-driven flags; 'git_clone' clones from a "
-                "URL and runs install.sh. Validates and deploys required secrets from "
-                "the install_contract before running the installer."
+                "Install the benchmark harness on multiple hosts. Uses private "
+                "skill config to determine the install method: 'public_install' "
+                "downloads and runs the upstream installer with skill-driven flags; "
+                "'git_clone' clones from a URL and runs install.sh. Validates and "
+                "deploys required secrets from the install_contract before running "
+                "the installer."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
@@ -332,22 +384,27 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     },
                     "branch": {
                         "type": "string",
-                        "description": "Specific git branch or release tag. Omit to install the default/latest version.",
+                        "description": "Specific git branch or release tag.",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="verify_harness_install",
             description=(
-                "Verify that the benchmark harness is correctly installed and functional "
-                "on a host. Uses private skill config's verify_command."
+                "Verify that the benchmark harness is correctly installed and "
+                "functional on multiple hosts. Uses private skill config's "
+                "verify_command."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
@@ -361,45 +418,54 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "description": "Install path override",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="check_existing_install",
             description=(
-                "Check if the benchmark harness is already installed on a host. "
-                "Returns whether an installation exists and its version info."
+                "Check if the benchmark harness is already installed on multiple "
+                "hosts. Returns whether an installation exists and its version "
+                "info per host."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
                     },
                     "install_path": {
                         "type": "string",
-                        "description": "Path to check (read from private config if omitted)",
+                        "description": "Path to check",
                     },
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="update_install",
             description=(
-                "Update an existing benchmark harness installation. "
-                "Runs the harness-specific update command from private config."
+                "Update an existing benchmark harness installation on multiple "
+                "hosts. Runs the harness-specific update command from private config."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
@@ -413,20 +479,23 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="uninstall_harness",
             description=(
-                "Remove an existing benchmark harness installation from a host. "
-                "Must be called BEFORE install_harness when reinstalling. "
-                "Removes the install directory and cleans up any moved/backup copies."
+                "Remove an existing benchmark harness installation from multiple "
+                "hosts. Must be called BEFORE install_harness when reinstalling."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
                     "harness_name": {
                         "type": "string",
                         "description": "Harness name (e.g., 'crucible', 'zathras')",
@@ -436,58 +505,105 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host", "harness_name"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
             name="install_k3s",
             description=(
-                "Install K3s (lightweight Kubernetes) on a host. K3s provides "
-                "a single-node Kubernetes cluster that crucible uses for kube "
-                "endpoints. Call this BEFORE install_harness when the ticket's "
-                "directives include endpoint_type: kube."
+                "Install K3s (lightweight Kubernetes) on multiple hosts. K3s "
+                "provides a single-node Kubernetes cluster that crucible uses "
+                "for kube endpoints."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {
-                        "type": "string",
-                        "description": "Target host IP or hostname",
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target host IPs or hostnames",
                     },
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
                 },
-                "required": ["host"],
+                "required": ["hosts"],
             },
         ),
         ToolDefinition(
             name="configure_host",
             description=(
-                "Apply OS-level configuration for optimal benchmark performance. "
+                "Apply OS-level configuration for optimal benchmark performance "
+                "on multiple hosts. Each target specifies a host and its config. "
                 "Supports CPU isolation, hugepages, IRQ affinity, tuned profiles."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Target host"},
+                    "targets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "host": {"type": "string"},
+                                "config": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cpu_isolation": {"type": "string"},
+                                        "hugepages": {"type": "integer"},
+                                        "irq_affinity": {"type": "string"},
+                                        "tuned_profile": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "required": ["host", "config"],
+                        },
+                        "description": "List of {host, config} targets",
+                    },
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
-                    "config": {
-                        "type": "object",
-                        "description": "Configuration to apply",
-                        "properties": {
-                            "cpu_isolation": {"type": "string"},
-                            "hugepages": {"type": "integer"},
-                            "irq_affinity": {"type": "string"},
-                            "tuned_profile": {"type": "string"},
-                        },
+                },
+                "required": ["targets"],
+            },
+        ),
+        ToolDefinition(
+            name="ensure_harness_installed",
+            description=(
+                "Check if harness is installed on each host, install where "
+                "missing, and verify all installations. Combines "
+                "check_existing_install + install_harness + verify_harness_install "
+                "into one batched call. Returns per-host status: "
+                "already_installed, success, or failure details."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of target hosts",
+                    },
+                    "harness_name": {
+                        "type": "string",
+                        "description": "Harness name (e.g., 'crucible', 'zathras')",
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Specific git branch or release tag.",
+                    },
+                    "install_path": {
+                        "type": "string",
+                        "description": "Install path override",
                     },
                 },
-                "required": ["host", "config"],
+                "required": ["hosts", "harness_name"],
             },
         ),
         ToolDefinition(
@@ -508,7 +624,7 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     },
                     "key": {
                         "type": "string",
-                        "description": "Config key to fetch (e.g., 'constraints', 'provisioning', 'execution')",
+                        "description": "Config key to fetch",
                     },
                 },
                 "required": ["harness_name", "key"],
@@ -532,13 +648,16 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "provisioning_complete": {"type": "boolean"},
-                    "hosts_provisioned": {"type": "array", "items": {"type": "string"}},
+                    "hosts_provisioned": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "harness_version": {"type": "string"},
                     "harness_name": {"type": "string"},
                     "configuration_applied": {"type": "object"},
                     "k3s_installed": {
                         "type": "boolean",
-                        "description": "Whether K3s was installed on the controller (kube endpoints only)",
+                        "description": "Whether K3s was installed",
                     },
                     "k3s_version": {
                         "type": "string",
@@ -646,13 +765,12 @@ def create_provisioning_tool_handlers(
             "message": f"Contract satisfied: {len(deployed)} file(s) deployed",
         }
 
-    async def check_platform_contract(
-        host: str, harness_name: str, user: str = "root"
-    ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
+    # --- Single-host helper functions ---
+
+    async def _check_platform_contract_one(host: str, private_config: dict) -> dict:
         return await validate_platform_contract(ssh, host, private_config)
 
-    async def check_host_prerequisites(host: str, user: str = "root") -> dict:
+    async def _check_host_prerequisites_one(host: str) -> dict:
         prereqs = {}
         for cmd in ["podman", "git", "jq", "curl"]:
             result = await ssh.run(
@@ -678,9 +796,7 @@ def create_provisioning_tool_handlers(
             else f"Missing prerequisites on {host}",
         }
 
-    async def install_packages(
-        host: str, packages: list[str], user: str = "root"
-    ) -> dict:
+    async def _install_packages_one(host: str, packages: list[str]) -> dict:
         pkg_list = " ".join(packages)
         result = await ssh.run(host, f"dnf install -y {pkg_list}", timeout=300)
         return {
@@ -688,21 +804,20 @@ def create_provisioning_tool_handlers(
             "packages": packages,
             "status": "success" if result.exit_code == 0 else "failed",
             "exit_code": result.exit_code,
-            "output": result.stdout or "" if result.stdout else "",
-            "error": result.stderr or "" if result.stderr else "",
+            "output": result.stdout or "",
+            "error": result.stderr or "",
         }
 
-    async def install_harness(
+    async def _install_harness_one(
         host: str,
         harness_name: str,
-        user: str = "root",
+        private_config: dict,
+        provisioning: dict,
+        constraints: dict,
         branch: str = "",
     ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
-        provisioning = private_config.get("provisioning", {})
         install_method = provisioning.get("install_method", "git_clone")
         target_path = provisioning.get("install_target_path", f"/opt/{harness_name}")
-        constraints = private_config.get("constraints", {})
 
         platform_result = await validate_platform_contract(ssh, host, private_config)
         if platform_result["status"] == "failed":
@@ -730,14 +845,16 @@ def create_provisioning_tool_handlers(
                 return {
                     "host": host,
                     "status": "failed",
-                    "message": f"No installer_url in private config for {harness_name}",
+                    "message": (
+                        f"No installer_url in private config for {harness_name}"
+                    ),
                 }
 
             installer_path = "/tmp/harness-install.sh"
-            logger.info(f"[provision] Downloading installer from {installer_url}")
             dl_result = await ssh.run(
                 host,
-                f"curl --fail --silent --output {installer_path} {installer_url} && chmod +x {installer_path}",
+                f"curl --fail --silent --output {installer_path} {installer_url}"
+                f" && chmod +x {installer_path}",
                 timeout=60,
             )
             if dl_result.exit_code != 0:
@@ -759,7 +876,6 @@ def create_provisioning_tool_handlers(
             flags_str = " ".join(flag_parts)
 
             cmd = f"{installer_path} {flags_str}"
-            logger.info(f"[provision] Running installer on {host}: {cmd}")
             result = await ssh.run(host, cmd, timeout=1800)
 
             if result.exit_code != 0:
@@ -769,13 +885,12 @@ def create_provisioning_tool_handlers(
                     "status": "failed",
                     "exit_code": result.exit_code,
                     "install_path": target_path,
-                    "output": result.stdout or "" if result.stdout else "",
-                    "error": result.stderr or "" if result.stderr else "",
+                    "output": result.stdout or "",
+                    "error": result.stderr or "",
                     "message": f"Install failed (exit {result.exit_code})",
                 }
 
             for post_cmd in provisioning.get("post_install_commands", []):
-                logger.info(f"[provision] Post-install on {host}: {post_cmd}")
                 post_result = await ssh.run(host, post_cmd, timeout=120)
                 if post_result.exit_code != 0:
                     logger.warning(
@@ -792,7 +907,7 @@ def create_provisioning_tool_handlers(
                 "install_path": target_path,
                 "constraints": constraints,
                 "contract": contract_result.get("deployed_files", []),
-                "output": result.stdout or "" if result.stdout else "",
+                "output": result.stdout or "",
                 "message": f"{harness_name} installed via public installer",
             }
 
@@ -802,20 +917,18 @@ def create_provisioning_tool_handlers(
                 return {
                     "host": host,
                     "status": "failed",
-                    "message": f"No git_url in private config for {harness_name}",
+                    "message": (f"No git_url in private config for {harness_name}"),
                 }
 
             pre_install_steps = provisioning.get("pre_install_steps", [])
             for step in pre_install_steps:
-                logger.info(f"[provision] Pre-install step on {host}: {step}")
                 pre_result = await ssh.run(host, step, timeout=300)
                 if pre_result.exit_code != 0:
                     logger.warning(
-                        f"[provision] Pre-install step failed (continuing): {pre_result.stderr}"
+                        f"[provision] Pre-install step failed: {pre_result.stderr}"
                     )
 
             branch_flag = f"-b {branch}" if branch else ""
-            logger.info(f"[provision] Cloning {git_url} to {host}:{target_path}")
             await ssh.run(host, f"rm -rf {target_path}")
             result = await ssh.run(
                 host,
@@ -834,7 +947,6 @@ def create_provisioning_tool_handlers(
                 install_script = provisioning.get("install_script", "install.sh")
                 install_cmd = f"./{install_script}"
             cmd = f"cd {target_path} && {install_cmd}"
-            logger.info(f"[provision] Running install on {host}: {cmd}")
             result = await ssh.run(host, cmd, timeout=900)
 
             return {
@@ -845,79 +957,27 @@ def create_provisioning_tool_handlers(
                 "install_path": target_path,
                 "constraints": constraints,
                 "contract": contract_result.get("deployed_files", []),
-                "output": result.stdout or "" if result.stdout else "",
-                "error": result.stderr or "" if result.stderr else "",
+                "output": result.stdout or "",
+                "error": result.stderr or "",
                 "message": f"{harness_name} installed"
                 if result.exit_code == 0
                 else f"Install failed (exit {result.exit_code})",
             }
 
-        if install_method == "binary_download":
-            install_cmd = provisioning.get("install_command")
-            if not install_cmd:
-                return {
-                    "host": host,
-                    "status": "failed",
-                    "message": f"No install_command in private config for {harness_name}",
-                }
-
-            logger.info(f"[provision] Installing {harness_name} binary on {host}")
-            result = await ssh.run(host, install_cmd, timeout=120)
-            return {
-                "host": host,
-                "harness": harness_name,
-                "status": "success" if result.exit_code == 0 else "failed",
-                "exit_code": result.exit_code,
-                "install_path": target_path,
-                "output": result.stdout or "" if result.stdout else "",
-                "error": result.stderr or "" if result.stderr else "",
-                "message": (
-                    f"{harness_name} binary installed"
-                    if result.exit_code == 0
-                    else f"Binary install failed (exit {result.exit_code})"
-                ),
-            }
-
-        if install_method == "container_image":
-            image = provisioning.get("container_image")
-            if not image:
-                return {
-                    "host": host,
-                    "status": "failed",
-                    "message": f"No container_image in private config for {harness_name}",
-                }
-
-            logger.info(f"[provision] Pulling container image {image} on {host}")
-            result = await ssh.run(host, f"podman pull {image}", timeout=300)
-            return {
-                "host": host,
-                "harness": harness_name,
-                "status": "success" if result.exit_code == 0 else "failed",
-                "exit_code": result.exit_code,
-                "install_path": image,
-                "output": result.stdout[-1000:] if result.stdout else "",
-                "error": result.stderr[-1000:] if result.stderr else "",
-                "message": (
-                    f"{harness_name} container image pulled"
-                    if result.exit_code == 0
-                    else f"Image pull failed (exit {result.exit_code})"
-                ),
-            }
-
         return {
             "host": host,
             "status": "failed",
-            "message": f"Unknown install_method '{install_method}' for {harness_name}",
+            "message": (
+                f"Unknown install_method '{install_method}' for {harness_name}"
+            ),
         }
 
-    async def verify_harness_install(
+    async def _verify_harness_install_one(
         host: str,
         harness_name: str,
-        user: str = "root",
-        install_path: str | None = None,
+        provisioning: dict,
+        install_path: str = "",
     ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
-        provisioning = private_config.get("provisioning", {})
         path = install_path or provisioning.get(
             "install_target_path", f"/opt/{harness_name}"
         )
@@ -938,27 +998,18 @@ def create_provisioning_tool_handlers(
             else f"Verification failed: {result.stderr[:200]}",
         }
 
-    async def check_existing_install(
+    async def _check_existing_install_one(
         host: str,
         harness_name: str,
-        install_path: str | None = None,
-        user: str = "root",
+        provisioning: dict,
+        install_path: str = "",
     ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
-        provisioning = private_config.get("provisioning", {})
         path = install_path or provisioning.get(
             "install_target_path", f"/opt/{harness_name}"
         )
         verify_cmd = provisioning.get(
             "verify_command", f"{path}/bin/{harness_name} help"
         )
-
-        ssh_debug = {
-            "user": ssh.user,
-            "key_path": ssh.key_path,
-            "connect_timeout": ssh.connect_timeout,
-            "command": f"{verify_cmd} > /dev/null 2>&1",
-        }
 
         result = await ssh.run(host, f"{verify_cmd} > /dev/null 2>&1")
         if result.exit_code == 0:
@@ -982,76 +1033,53 @@ def create_provisioning_tool_handlers(
             "install_path": path,
             "exit_code": result.exit_code,
             "stderr": result.stderr[:500] if result.stderr else "",
-            "ssh": ssh_debug,
-            "message": f"No {harness_name} installation found at {path} (exit_code={result.exit_code})",
+            "message": (
+                f"No {harness_name} installation found at {path} "
+                f"(exit_code={result.exit_code})"
+            ),
         }
 
-    async def update_install(
+    async def _update_install_one(
         host: str,
         harness_name: str,
-        install_path: str | None = None,
-        user: str = "root",
+        provisioning: dict,
+        install_path: str = "",
     ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
-        provisioning = private_config.get("provisioning", {})
         path = install_path or provisioning.get(
             "install_target_path", f"/opt/{harness_name}"
         )
         update_cmd = provisioning.get("update_command", f"cd {path} && git pull")
 
-        logger.info(f"[provision] Running {harness_name} update on {host}")
         result = await ssh.run(host, update_cmd, timeout=600)
         return {
             "host": host,
             "harness": harness_name,
             "status": "success" if result.exit_code == 0 else "failed",
             "exit_code": result.exit_code,
-            "output": result.stdout or "" if result.stdout else "",
-            "error": result.stderr or "" if result.stderr else "",
+            "output": result.stdout or "",
+            "error": result.stderr or "",
             "message": "Update completed"
             if result.exit_code == 0
             else f"Update failed (exit {result.exit_code})",
         }
 
-    async def uninstall_harness(
-        host: str,
-        harness_name: str,
-        user: str = "root",
-    ) -> dict:
-        private_config = await skill_provider.get_all_private_config(harness_name)
-        provisioning = private_config.get("provisioning", {})
-        return await cleanup_harness(
-            ssh,
-            host,
-            harness_name,
-            install_path=provisioning.get("install_target_path"),
-            pre_uninstall_commands=provisioning.get("pre_uninstall_commands"),
-        )
-
-    async def install_k3s(host: str, user: str = "root") -> dict:
-        logger.info(f"[provision] Installing K3s on {host}")
-
+    async def _install_k3s_one(host: str) -> dict:
         selinux_result = await ssh.run(host, "getenforce 2>/dev/null")
         if (
             selinux_result.exit_code == 0
             and selinux_result.stdout.strip() == "Enforcing"
         ):
-            logger.info(f"[provision] Setting SELinux to permissive on {host}")
             await ssh.run(host, "setenforce 0")
 
-        result = await ssh.run(
-            host,
-            "curl -sfL https://get.k3s.io | sh -",
-            timeout=300,
-        )
+        result = await ssh.run(host, "curl -sfL https://get.k3s.io | sh -", timeout=300)
         if result.exit_code != 0:
             return {
                 "host": host,
                 "status": "failed",
-                "message": f"K3s install failed: {result.stderr or '' if result.stderr else ''}",
+                "message": f"K3s install failed: {result.stderr or ''}",
             }
 
-        for attempt in range(12):
+        for _attempt in range(12):
             check = await ssh.run(host, "k3s kubectl cluster-info 2>/dev/null")
             if check.exit_code == 0:
                 break
@@ -1069,10 +1097,10 @@ def create_provisioning_tool_handlers(
             "-n kube-system --timeout=120s",
             timeout=150,
         )
-
         await ssh.run(
             host,
-            "mkdir -p /root/.kube && ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config",
+            "mkdir -p /root/.kube && "
+            "ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config",
         )
 
         kubectl_check = await ssh.run(host, "test -x /usr/local/bin/kubectl")
@@ -1082,7 +1110,8 @@ def create_provisioning_tool_handlers(
         self_ssh_ok = False
         keygen = await ssh.run(
             host,
-            'test -f /root/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "k3s-self-ssh" -N ""',
+            "test -f /root/.ssh/id_rsa || "
+            'ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "k3s-self-ssh" -N ""',
         )
         if keygen.exit_code == 0:
             await ssh.run(
@@ -1093,7 +1122,8 @@ def create_provisioning_tool_handlers(
             )
             verify = await ssh.run(
                 host,
-                "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes localhost hostname",
+                "ssh -o StrictHostKeyChecking=accept-new "
+                "-o BatchMode=yes localhost hostname",
                 timeout=15,
             )
             self_ssh_ok = verify.exit_code == 0
@@ -1115,15 +1145,207 @@ def create_provisioning_tool_handlers(
             "message": "K3s installed and cluster ready",
         }
 
-    async def configure_host(host: str, config: dict, user: str = "root") -> dict:
-        # Keep simulated for now — tuning is benchmark-specific
-        return {
-            "host": host,
-            "config_applied": config,
-            "status": "success",
-            "reboot_required": False,
-            "message": f"Configuration applied on {host} (simulated)",
-        }
+    async def _ensure_harness_one(
+        host: str,
+        harness_name: str,
+        private_config: dict,
+        provisioning: dict,
+        constraints: dict,
+        branch: str = "",
+        install_path: str = "",
+    ) -> dict:
+        existing = await _check_existing_install_one(
+            host, harness_name, provisioning, install_path
+        )
+        if existing.get("installed"):
+            return {
+                "host": host,
+                "harness": harness_name,
+                "status": "already_installed",
+                "install_path": existing.get("install_path", ""),
+                "version": existing.get("version", "unknown"),
+                "message": f"{harness_name} already installed on {host}",
+            }
+
+        install_result = await _install_harness_one(
+            host, harness_name, private_config, provisioning, constraints, branch
+        )
+        if install_result.get("status") not in ("success", "ready"):
+            return install_result
+
+        verify_result = await _verify_harness_install_one(
+            host, harness_name, provisioning, install_path
+        )
+        if not verify_result.get("verified"):
+            verify_result["status"] = "install_succeeded_verify_failed"
+            return verify_result
+
+        verify_result["status"] = "success"
+        return verify_result
+
+    # --- Batched handler functions ---
+
+    async def check_platform_contract(
+        hosts: list[str], harness_name: str, user: str = "root"
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        results = await _gather_for_hosts(
+            hosts, _check_platform_contract_one, private_config
+        )
+        return _summarize(results)
+
+    async def check_host_prerequisites(hosts: list[str], user: str = "root") -> dict:
+        results = await _gather_for_hosts(hosts, _check_host_prerequisites_one)
+        return _summarize(results)
+
+    async def install_packages(targets: list[dict], user: str = "root") -> dict:
+        coros = [_install_packages_one(t["host"], t["packages"]) for t in targets]
+        raw = await asyncio.gather(*coros, return_exceptions=True)
+        results: dict[str, dict] = {}
+        for target, result in zip(targets, raw):
+            host = target["host"]
+            if isinstance(result, Exception):
+                results[host] = {"status": "error", "message": str(result)}
+            else:
+                results[host] = result
+        return _summarize(results)
+
+    async def check_existing_install(
+        hosts: list[str],
+        harness_name: str,
+        install_path: str = "",
+        user: str = "root",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        results = await _gather_for_hosts(
+            hosts,
+            _check_existing_install_one,
+            harness_name,
+            provisioning,
+            install_path,
+        )
+        return _summarize(results)
+
+    async def update_install(
+        hosts: list[str],
+        harness_name: str,
+        install_path: str = "",
+        user: str = "root",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        results = await _gather_for_hosts(
+            hosts,
+            _update_install_one,
+            harness_name,
+            provisioning,
+            install_path,
+        )
+        return _summarize(results)
+
+    async def uninstall_harness(
+        hosts: list[str],
+        harness_name: str,
+        user: str = "root",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        results: dict[str, dict] = {}
+        coros = [
+            cleanup_harness(
+                ssh,
+                h,
+                harness_name,
+                install_path=provisioning.get("install_target_path"),
+                pre_uninstall_commands=provisioning.get("pre_uninstall_commands"),
+            )
+            for h in hosts
+        ]
+        raw = await asyncio.gather(*coros, return_exceptions=True)
+        for host, result in zip(hosts, raw):
+            if isinstance(result, Exception):
+                results[host] = {"status": "error", "message": str(result)}
+            else:
+                results[host] = result
+        return _summarize(results)
+
+    async def install_harness(
+        hosts: list[str],
+        harness_name: str,
+        user: str = "root",
+        branch: str = "",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        constraints = private_config.get("constraints", {})
+        results = await _gather_for_hosts(
+            hosts,
+            _install_harness_one,
+            harness_name,
+            private_config,
+            provisioning,
+            constraints,
+            branch,
+        )
+        return _summarize(results)
+
+    async def install_k3s(hosts: list[str], user: str = "root") -> dict:
+        results = await _gather_for_hosts(hosts, _install_k3s_one)
+        return _summarize(results)
+
+    async def verify_harness_install(
+        hosts: list[str],
+        harness_name: str,
+        user: str = "root",
+        install_path: str = "",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        results = await _gather_for_hosts(
+            hosts,
+            _verify_harness_install_one,
+            harness_name,
+            provisioning,
+            install_path,
+        )
+        return _summarize(results)
+
+    async def configure_host(targets: list[dict], user: str = "root") -> dict:
+        results: dict[str, dict] = {}
+        for t in targets:
+            host = t["host"]
+            config = t.get("config", {})
+            results[host] = {
+                "host": host,
+                "config_applied": config,
+                "status": "success",
+                "reboot_required": False,
+                "message": f"Configuration applied on {host} (simulated)",
+            }
+        return _summarize(results)
+
+    async def ensure_harness_installed(
+        hosts: list[str],
+        harness_name: str,
+        user: str = "root",
+        branch: str = "",
+        install_path: str = "",
+    ) -> dict:
+        private_config = await skill_provider.get_all_private_config(harness_name)
+        provisioning = private_config.get("provisioning", {})
+        constraints = private_config.get("constraints", {})
+        results = await _gather_for_hosts(
+            hosts,
+            _ensure_harness_one,
+            harness_name,
+            private_config,
+            provisioning,
+            constraints,
+            branch,
+            install_path,
+        )
+        return _summarize(results)
 
     async def get_private_config(harness_name: str, key: str) -> Any:
         result = await skill_provider.get_private_config(harness_name, key)
@@ -1150,6 +1372,7 @@ def create_provisioning_tool_handlers(
         "install_k3s": install_k3s,
         "verify_harness_install": verify_harness_install,
         "configure_host": configure_host,
+        "ensure_harness_installed": ensure_harness_installed,
         "get_private_config": get_private_config,
         "request_clarification": request_clarification,
     }
