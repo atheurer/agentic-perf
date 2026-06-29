@@ -69,7 +69,7 @@ class TestAgentConstruction:
             llm_provider=MockLLMProvider(),
             state_store_url="http://localhost:8090",
         )
-        prompt = agent._system_prompt()
+        prompt = agent._system_prompt({})
         assert "Isolation" in prompt
         assert "Entropy Stall" in prompt
         assert "Expected Regression" in prompt
