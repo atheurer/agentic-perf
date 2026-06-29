@@ -166,6 +166,7 @@ class SynthesisAgent(AgentBase):
 
         # Create the Investigation Record via MCP
         anomaly = cf.get("anomaly_context", {})
+        rc = metrics.get("resource_consumption", {})
         record_created = False
         if self._mcp and anomaly:
             try:
@@ -181,6 +182,19 @@ class SynthesisAgent(AgentBase):
                         "confidence": confidence,
                         "convergence_outcome": outcome,
                         "build_id": build_id,
+                        "provision_cycles": metrics.get("provision_cycles", 0),
+                        "wall_clock_mins": metrics.get("wall_clock_mins", 0.0),
+                        "info_gain_trajectory": json.dumps(
+                            metrics.get("info_gain_trajectory", [])
+                        ),
+                        "stall_events": metrics.get("stall_events", 0),
+                        "llm_tokens_total": rc.get("llm_tokens_total", 0),
+                        "llm_invocations": rc.get("llm_invocations", 0),
+                        "estimated_cost_usd": rc.get("estimated_cost_usd", 0.0),
+                        "hardware_time_mins": metrics.get("hardware_time_mins", 0.0),
+                        "change_classification": change_class,
+                        "causal_commits": ",".join(causal_commits),
+                        "change_summary": change_summary,
                     },
                 )
                 record_created = True
@@ -250,17 +264,36 @@ class SynthesisAgent(AgentBase):
         """
         ledger = custom_fields.get("investigation_ledger", [])
         eval_result = custom_fields.get("evaluation_result", {})
-        plan = custom_fields.get("execution_plan", {})
-
         # Info gain trajectory from ledger
         info_gains = [entry.get("info_gain", 0.0) for entry in ledger]
 
-        # Count provision cycles from plan steps
+        # Fetch all events once for metric computation
+        events: list[dict] = []
+        if self._events:
+            events = self._events.get_events(ticket_id, since=0, limit=10000)
+
+        # Count provision cycles from transitions
         provision_cycles = sum(
             1
-            for s in plan.get("steps", [])
-            if s.get("agent_type") == "benchmark" and s.get("status") == "completed"
+            for e in events
+            if e.get("event_type") == "transition"
+            and e.get("data", {}).get("to") == "awaiting_provision"
         )
+
+        # Wall-clock time from first to last event
+        wall_clock_mins = 0.0
+        if events:
+            from datetime import datetime
+
+            try:
+                first_ts = events[0].get("timestamp", "")
+                last_ts = events[-1].get("timestamp", "")
+                if first_ts and last_ts:
+                    t0 = datetime.fromisoformat(first_ts)
+                    t1 = datetime.fromisoformat(last_ts)
+                    wall_clock_mins = round((t1 - t0).total_seconds() / 60, 2)
+            except Exception:
+                pass
 
         # Token/cost from EventBus
         resource = {}
@@ -281,10 +314,53 @@ class SynthesisAgent(AgentBase):
                 "estimated_cost_usd": round(cost, 6),
             }
 
+        # Count stall events — iterations with near-zero info gain
+        # after the first iteration (first iteration can't stall).
+        convergence_criteria = custom_fields.get("convergence_criteria", {})
+        min_gain = convergence_criteria.get("min_info_gain", 0.05)
+        stall_events = sum(1 for ig in info_gains[1:] if ig < min_gain)
+
+        # Hardware time from provision/benchmark transitions
+        hardware_time_mins = 0.0
+        if self._events and events:
+            from datetime import datetime as _dt
+
+            hw_start = None
+            for e in events:
+                if e.get("event_type") != "transition":
+                    continue
+                to_status = e.get("data", {}).get("to", "")
+                if to_status == "awaiting_provision":
+                    try:
+                        hw_start = _dt.fromisoformat(e["timestamp"])
+                    except (ValueError, KeyError):
+                        pass
+                elif (
+                    to_status
+                    in (
+                        "evaluating_convergence",
+                        "awaiting_review",
+                        "awaiting_customer_guidance",
+                    )
+                    and hw_start
+                ):
+                    try:
+                        hw_end = _dt.fromisoformat(e["timestamp"])
+                        hardware_time_mins += (hw_end - hw_start).total_seconds() / 60
+                        hw_start = None
+                    except (ValueError, KeyError):
+                        pass
+            hardware_time_mins = round(hardware_time_mins, 2)
+
         return {
             "provision_cycles": provision_cycles,
+            "wall_clock_mins": wall_clock_mins,
+            "hardware_time_mins": hardware_time_mins,
             "convergence_outcome": eval_result.get("convergence_gate", ""),
             "info_gain_trajectory": info_gains,
-            "stall_events": 0,
+            "stall_events": stall_events,
             "resource_consumption": resource,
+            # Deferred (requires new instrumentation):
+            # - by_cycle: per-iteration token/cost breakdown
+            # - mcp_calls: call distribution per MCP server
         }
