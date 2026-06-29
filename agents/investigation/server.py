@@ -143,15 +143,29 @@ async def create_investigation_record(
     jira_ticket: str = "",
     build_id: str = "",
     convergence_outcome: str = "",
+    provision_cycles: int = 0,
+    wall_clock_mins: float = 0.0,
+    info_gain_trajectory: str = "",
+    stall_events: int = 0,
+    llm_tokens_total: int = 0,
+    llm_invocations: int = 0,
+    estimated_cost_usd: float = 0.0,
+    hardware_time_mins: float = 0.0,
+    change_classification: str = "",
+    causal_commits: str = "",
+    change_summary: str = "",
 ) -> str:
     """Create a new Investigation Record.
 
     Call this when an investigation completes (convergence gate
-    fires) to persist the outcome. Records are write-once — all
-    investigation data must be provided at creation time. The
-    record cannot be modified after creation except for build
-    history (append-only), Jira linkage (one-time), and state
-    transition (close).
+    fires) to persist the outcome with operational metrics.
+    Records are write-once — all investigation data must be
+    provided at creation time. The record cannot be modified
+    after creation except for build history (append-only),
+    Jira linkage (one-time), and state transition (close).
+
+    info_gain_trajectory: JSON array string, e.g. "[0.0, 0.5, 0.9]"
+    causal_commits: comma-separated commit hashes
     """
     provider = _get_provider()
     record = InvestigationRecord(
@@ -167,8 +181,36 @@ async def create_investigation_record(
         jira_ticket=jira_ticket,
     )
 
-    if convergence_outcome:
-        record.operational_metrics.convergence_outcome = convergence_outcome
+    # Operational metrics
+    record.operational_metrics.convergence_outcome = convergence_outcome
+    record.operational_metrics.provision_cycles = provision_cycles
+    record.operational_metrics.wall_clock_mins = wall_clock_mins
+    record.operational_metrics.stall_events = stall_events
+    if info_gain_trajectory:
+        try:
+            record.operational_metrics.info_gain_trajectory = json.loads(
+                info_gain_trajectory
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+    record.operational_metrics.resource_consumption.llm_tokens_total = llm_tokens_total
+    record.operational_metrics.resource_consumption.llm_invocations = llm_invocations
+    record.operational_metrics.resource_consumption.estimated_cost_usd = (
+        estimated_cost_usd
+    )
+    record.operational_metrics.resource_consumption.hardware_time_mins = (
+        hardware_time_mins
+    )
+
+    # Change attribution
+    if change_classification:
+        record.change_attribution.classification = change_classification
+    if causal_commits:
+        record.change_attribution.causal_commits = [
+            c.strip() for c in causal_commits.split(",") if c.strip()
+        ]
+    if change_summary:
+        record.change_attribution.change_summary = change_summary
 
     if build_id:
         record.build_history.append(

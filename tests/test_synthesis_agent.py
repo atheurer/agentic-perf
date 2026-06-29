@@ -116,7 +116,24 @@ class TestOperationalMetrics:
         from providers.events import EventBus
         from providers.llm.mock import MockLLMProvider
 
-        event_bus = EventBus(log_dir="/tmp/test-synth-logs")
+        tmp = Path("/tmp/test-synth-logs")
+        tmp.mkdir(exist_ok=True)
+        event_bus = EventBus(log_dir=tmp)
+
+        # Emit transition events for provision cycle counting
+        event_bus.emit(
+            "PERF-TEST",
+            "system",
+            "transition",
+            {"from": "planning", "to": "awaiting_provision"},
+        )
+        event_bus.emit(
+            "PERF-TEST",
+            "system",
+            "transition",
+            {"from": "evaluating", "to": "awaiting_provision"},
+        )
+
         agent = SynthesisAgent(
             llm_provider=MockLLMProvider(),
             state_store_url="http://localhost:8090",
@@ -131,18 +148,6 @@ class TestOperationalMetrics:
             ],
             "evaluation_result": {
                 "convergence_gate": "isolation",
-            },
-            "execution_plan": {
-                "steps": [
-                    {
-                        "agent_type": "benchmark",
-                        "status": "completed",
-                    },
-                    {
-                        "agent_type": "benchmark",
-                        "status": "completed",
-                    },
-                ],
             },
         }
 
