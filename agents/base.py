@@ -77,6 +77,7 @@ class AgentBase(ABC):
         )
         try:
             iteration = 0
+            self._budget_grace = False
             while self.max_iterations == 0 or iteration < self.max_iterations:
                 iteration += 1
                 self._emit(
@@ -127,6 +128,57 @@ class AgentBase(ABC):
                         "raw_content": response.raw_content,
                     },
                 )
+
+                # Check per-ticket budget after each LLM call.
+                # Uses the EventBus cumulative usage which is
+                # updated by the OTLP span processor.
+                if self._events and iteration > 1:
+                    budget_status = await self._check_budget(
+                        ticket_id,
+                    )
+                    if budget_status == "pause":
+                        # Inject a final system message so the
+                        # LLM can wrap up gracefully before we
+                        # cut it off on the next iteration.
+                        if not getattr(self, "_budget_grace", False):
+                            self._budget_grace = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your token/cost "
+                                        "budget for this ticket is "
+                                        "exhausted. You MUST wrap up "
+                                        "immediately: submit your "
+                                        "best result now using your "
+                                        "submit_* tool, even if "
+                                        "incomplete. Summarize what "
+                                        "was accomplished and what "
+                                        "remains. This is your final "
+                                        "LLM call."
+                                    ),
+                                }
+                            )
+                            continue  # one more LLM call
+                        # Grace iteration used — hard stop.
+                        break
+                    if budget_status == "warn":
+                        # Soft limit: inform the LLM so it can
+                        # start winding down proactively.
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[SYSTEM] Budget warning: you "
+                                    "are approaching your token/cost "
+                                    "limit for this ticket. Begin "
+                                    "wrapping up your work. Finish "
+                                    "any critical in-progress steps, "
+                                    "then submit your results. Do "
+                                    "not start new exploratory work."
+                                ),
+                            }
+                        )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
@@ -431,6 +483,79 @@ class AgentBase(ABC):
             content=f"Unknown tool: {tool_call.name}",
             is_error=True,
         )
+
+    async def _check_budget(self, ticket_id: str) -> str:
+        """Check per-ticket LLM budget.
+
+        Returns 'ok', 'warn', or 'pause'. On 'pause', the agent
+        transitions the ticket to awaiting_customer_guidance so
+        the user can decide to increase the budget or abort.
+        """
+        try:
+            from orchestrator.config import _load_config_file
+            from providers.budget import (
+                BudgetAction,
+                budget_from_custom_fields,
+                check_ticket_budget,
+            )
+            from providers.cost import estimate_cumulative_cost
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            config = _load_config_file()
+            budget = budget_from_custom_fields(cf, config)
+            if budget is None:
+                return "ok"
+
+            assert self._events is not None
+            usage = self._events.get_cumulative_usage(ticket_id)
+            cost = estimate_cumulative_cost(usage)
+            status = check_ticket_budget(budget, usage, cost)
+
+            if status.action == BudgetAction.PAUSE:
+                self._emit(
+                    ticket_id,
+                    "agent_error",
+                    {
+                        "reason": "budget_exceeded",
+                        "detail": status.reason,
+                    },
+                )
+                logger.warning(
+                    f"[{self.agent_name}] Budget exceeded on"
+                    f" {ticket_id}: {status.reason}"
+                )
+                await self._add_comment(
+                    ticket_id,
+                    f"**Budget exceeded:** {status.reason}\n\n"
+                    f"Ticket paused. Increase the budget in "
+                    f"custom_fields.llm_budget or approve "
+                    f"continued spending.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=f"Budget exceeded: {status.reason}",
+                )
+                return "pause"
+
+            if status.action == BudgetAction.WARN:
+                logger.info(
+                    f"[{self.agent_name}] Budget warning on"
+                    f" {ticket_id}: {status.reason}"
+                )
+                await self._add_comment(
+                    ticket_id,
+                    f"**Budget warning:** {status.reason}",
+                )
+                return "warn"
+
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(f"[{self.agent_name}] Budget check failed")
+
+        return "ok"
 
     async def _get_ticket(self, ticket_id: str) -> dict[str, Any]:
         r = await self._client.get(f"{self.store_url}/api/v1/tickets/{ticket_id}")

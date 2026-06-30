@@ -327,7 +327,40 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         f"poll={config.poll_interval}s, llm={config.llm_provider})"
     )
 
+    # System-wide budget check (per orchestrator session)
+    system_budget = None
+    if config.budget_session_cost_usd > 0:
+        from providers.budget import SystemBudget
+
+        system_budget = SystemBudget(
+            session_cost_usd=config.budget_session_cost_usd,
+        )
+        logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
+
     while True:
+        # Check system-wide budget before dispatching
+        if system_budget is not None and events is not None:
+            from providers.budget import (
+                BudgetAction,
+                check_system_budget,
+            )
+            from providers.cost import estimate_cumulative_cost
+
+            global_usage = events.get_global_usage()
+            global_cost = estimate_cumulative_cost(global_usage)
+            sys_status = check_system_budget(
+                system_budget,
+                global_usage,
+                global_cost,
+            )
+            if sys_status.action == BudgetAction.PAUSE:
+                logger.warning(
+                    f"System budget exceeded: {sys_status.reason}"
+                    f" — skipping dispatch cycle"
+                )
+                await asyncio.sleep(config.poll_interval)
+                continue
+
         for status in STATUS_AGENT_MAP:
             try:
                 tickets = await fetch_tickets_by_status(config.state_store_url, status)
