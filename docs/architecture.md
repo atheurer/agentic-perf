@@ -546,6 +546,20 @@ append build history, link Jira, and close. Agents use
 `AgentMCPClient.list_tools(include=...)` to expose only the tools
 relevant to their role.
 
+### External MCP Servers
+
+`AgentMCPClient` supports both Python and non-Python MCP servers:
+
+- `connect(server_script)` — launches a Python MCP server script
+  with the current interpreter (used for all built-in agents)
+- `connect_command(command, args)` — launches an arbitrary binary
+  that speaks MCP over stdio (for external tools like Jumpstarter's
+  `jmp mcp serve`)
+
+Both methods share the same session management, tool routing, and
+disconnect logic. `connect()` delegates to `connect_command()`
+internally.
+
 ### SSH Executor
 
 `SSHExecutor` (`providers/ssh.py`) provides async SSH command execution
