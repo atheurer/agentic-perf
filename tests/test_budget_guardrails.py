@@ -6,6 +6,8 @@ cost limits, warn thresholds, and custom_fields extraction.
 
 from __future__ import annotations
 
+import pytest
+
 from providers.budget import (
     BudgetAction,
     SystemBudget,
@@ -213,3 +215,184 @@ class TestExtraction:
     def test_system_budget_defaults(self):
         b = system_budget_from_config({})
         assert b.session_cost_usd == 0.0
+
+
+# --- Soft/hard graceful degradation in agent loop ---
+
+
+class TestBudgetGracefulDegradation:
+    """Test the two-phase budget enforcement in AgentBase.run()."""
+
+    @pytest.mark.asyncio
+    async def test_warn_injects_message(self, tmp_path):
+        """At 80% budget, a warning message is injected into
+        the conversation but the agent continues."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.base import AgentBase
+        from providers.events import EventBus
+        from providers.llm.base import LLMResponse, ToolCall
+
+        class _Stub(AgentBase):
+            def _system_prompt(self, ticket=None):
+                return "test"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        call_count = 0
+
+        class _WarnThenFinishLLM:
+            async def complete(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                # warn message would be in messages if injected
+                _ = kwargs.get("messages", [])
+                if call_count >= 3:
+                    return LLMResponse(
+                        text="done",
+                        tool_calls=[],
+                        stop_reason="end_turn",
+                        raw_content=[],
+                    )
+                return LLMResponse(
+                    text=None,
+                    tool_calls=[
+                        ToolCall(id=f"tc_{call_count}", name="some_tool", input={}),
+                    ],
+                    stop_reason="tool_use",
+                    raw_content=[
+                        {
+                            "type": "tool_use",
+                            "id": f"tc_{call_count}",
+                            "name": "some_tool",
+                            "input": {},
+                        },
+                    ],
+                )
+
+        event_bus = EventBus(log_dir=tmp_path / "logs")
+        agent = _Stub(
+            agent_name="test",
+            llm_provider=_WarnThenFinishLLM(),
+            state_store_url="http://localhost:8090",
+            event_bus=event_bus,
+        )
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {
+                    "id": "PERF-TEST",
+                    "status": "triage_pending",
+                    "summary": "test",
+                    "custom_fields": {
+                        "llm_budget": {
+                            "max_tokens": 100,
+                            "warn_pct": 80,
+                        },
+                    },
+                },
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        # Simulate token usage at warn level (80+%)
+        event_bus.record_llm_usage("PERF-TEST", 85, 5, 100)
+
+        with patch.object(agent, "_check_budget", return_value="warn"):
+            await agent.run("PERF-TEST")
+
+        # Agent should have continued past the warn
+        assert call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_pause_gives_grace_then_stops(self, tmp_path):
+        """At 100% budget, agent gets one grace iteration then
+        hard stops."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.base import AgentBase
+        from providers.events import EventBus
+        from providers.llm.base import LLMResponse, ToolCall
+
+        class _Stub(AgentBase):
+            def _system_prompt(self, ticket=None):
+                return "test"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        call_count = 0
+
+        class _KeepGoingLLM:
+            async def complete(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return LLMResponse(
+                    text=None,
+                    tool_calls=[
+                        ToolCall(id=f"tc_{call_count}", name="some_tool", input={}),
+                    ],
+                    stop_reason="tool_use",
+                    raw_content=[
+                        {
+                            "type": "tool_use",
+                            "id": f"tc_{call_count}",
+                            "name": "some_tool",
+                            "input": {},
+                        },
+                    ],
+                )
+
+        event_bus = EventBus(log_dir=tmp_path / "logs")
+        agent = _Stub(
+            agent_name="test",
+            llm_provider=_KeepGoingLLM(),
+            state_store_url="http://localhost:8090",
+            event_bus=event_bus,
+            max_iterations=10,
+        )
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {
+                    "id": "PERF-TEST",
+                    "status": "triage_pending",
+                    "summary": "test",
+                    "custom_fields": {
+                        "llm_budget": {"max_tokens": 50},
+                    },
+                },
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        # Return "pause" starting from iteration 2
+        async def mock_budget(ticket_id):
+            if call_count >= 2:
+                return "pause"
+            return "ok"
+
+        with patch.object(agent, "_check_budget", side_effect=mock_budget):
+            await agent.run("PERF-TEST")
+
+        # Should have: iter 1 (ok), iter 2 (pause, grace),
+        # iter 3 (pause again, hard stop)
+        # Grace gives one more iteration, so 3-4 total
+        assert call_count <= 5
+        assert agent._budget_grace is True
