@@ -448,6 +448,20 @@ class AgentBase(ABC):
             json=body,
         )
         r.raise_for_status()
+        # Emit through the orchestrator's EventBus so the transition
+        # event shares seq ordering with agent events.  The state
+        # store does not emit transition events itself — keeping all
+        # events on one seq counter avoids collisions between the
+        # two independent EventBus instances.
+        self._emit(
+            ticket_id,
+            "transition",
+            {
+                "to": new_status,
+                "comment": comment,
+                "ticket_id": ticket_id,
+            },
+        )
         return r.json()
 
     async def _update_fields(

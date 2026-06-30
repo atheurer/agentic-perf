@@ -64,7 +64,12 @@ PLAN_AGENT_STATUS = {
 }
 
 
-def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
+def _advance_plan(
+    store_url: str,
+    ticket_id: str,
+    completed_status: str,
+    event_bus: EventBus | None = None,
+) -> None:
     """Advance the execution plan after an agent completes a step.
 
     Only advances if the completed agent matches the current step's
@@ -139,16 +144,24 @@ def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None
                     },
                 )
 
+                comment = (
+                    f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
+                )
                 client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                    json={
-                        "status": next_status,
-                        "comment": (
-                            f"Plan advancing to step {next_idx}: "
-                            f"{next_step['agent_type']}"
-                        ),
-                    },
+                    json={"status": next_status, "comment": comment},
                 )
+                if event_bus:
+                    event_bus.emit(
+                        ticket_id,
+                        "orchestrator",
+                        "transition",
+                        {
+                            "to": next_status,
+                            "comment": comment,
+                            "ticket_id": ticket_id,
+                        },
+                    )
                 return
 
         client.patch(
@@ -171,7 +184,12 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         logger.info(f"run_agent_task finally block for {ticket_id}")
         if status in PLAN_AGENT_STATUS.values():
             try:
-                _advance_plan(dispatcher.store_url, ticket_id, status)
+                _advance_plan(
+                    dispatcher.store_url,
+                    ticket_id,
+                    status,
+                    event_bus=dispatcher.events,
+                )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
         dispatcher.mark_done(ticket_id)
@@ -182,7 +200,11 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
             pass
 
 
-async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
+async def _block_absent_suite(
+    store_url: str,
+    ticket_id: str,
+    event_bus: EventBus | None = None,
+) -> None:
     import httpx
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -212,6 +234,17 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
                 "comment": "Absent benchmark suite — no harness can run this",
             },
         )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "transition",
+                {
+                    "to": "awaiting_customer_guidance",
+                    "comment": "Absent benchmark suite — no harness can run this",
+                    "ticket_id": ticket_id,
+                },
+            )
 
 
 HANDOFF_RETRY_STATUS = {
@@ -223,7 +256,11 @@ HANDOFF_RETRY_STATUS = {
 
 
 async def _block_handoff_failed(
-    store_url: str, ticket_id: str, reason: str, current_status: str = ""
+    store_url: str,
+    ticket_id: str,
+    reason: str,
+    current_status: str = "",
+    event_bus: EventBus | None = None,
 ) -> None:
     import httpx
 
@@ -231,16 +268,25 @@ async def _block_handoff_failed(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         if retry_status:
+            rewind_comment = (
+                f"Rewinding to {retry_status} so the agent"
+                f" can retry after user guidance"
+            )
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                json={
-                    "status": retry_status,
-                    "comment": (
-                        f"Rewinding to {retry_status} so the agent"
-                        f" can retry after user guidance"
-                    ),
-                },
+                json={"status": retry_status, "comment": rewind_comment},
             )
+            if event_bus:
+                event_bus.emit(
+                    ticket_id,
+                    "orchestrator",
+                    "transition",
+                    {
+                        "to": retry_status,
+                        "comment": rewind_comment,
+                        "ticket_id": ticket_id,
+                    },
+                )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -253,13 +299,25 @@ async def _block_handoff_failed(
                 ),
             },
         )
+        block_comment = f"Handoff validation failed: {reason}"
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
-                "comment": f"Handoff validation failed: {reason}",
+                "comment": block_comment,
             },
         )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "transition",
+                {
+                    "to": "awaiting_customer_guidance",
+                    "comment": block_comment,
+                    "ticket_id": ticket_id,
+                },
+            )
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
@@ -351,7 +409,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         f"Ticket {tid} has absent_suite=True, pausing for human input"
                     )
                     dispatcher.mark_dispatched(tid, status)
-                    await _block_absent_suite(config.state_store_url, tid)
+                    await _block_absent_suite(
+                        config.state_store_url, tid, event_bus=dispatcher.events
+                    )
                     continue
 
                 ok, reason = check_handoff(status, ticket)
@@ -362,7 +422,11 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         )
                         dispatcher.mark_handoff_blocked(tid, status)
                         await _block_handoff_failed(
-                            config.state_store_url, tid, reason, status
+                            config.state_store_url,
+                            tid,
+                            reason,
+                            status,
+                            event_bus=dispatcher.events,
                         )
                     continue
 
