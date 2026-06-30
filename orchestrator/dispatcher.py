@@ -5,12 +5,14 @@ import logging
 from typing import Any
 
 from agents.benchmark.agent import BenchmarkAgent
+from agents.evaluate.agent import EvaluateAgent
 from agents.gathering_context.agent import GatheringContextAgent
 from agents.provisioning.agent import ProvisioningAgent
 from agents.resource.agent import ResourceAgent
 from agents.retrospective.agent import RetrospectiveAgent
 from agents.review.agent import ReviewAgent
 from agents.stub import StubAgent
+from agents.synthesis.agent import SynthesisAgent
 from agents.triage.agent import TriageAgent
 from providers.events import EventBus
 from providers.llm.base import LLMProvider
@@ -173,12 +175,26 @@ class Dispatcher:
                 event_bus=self.events,
             )
 
+        # Evaluating convergence agent
+        if agent_type == "evaluating_convergence":
+            return EvaluateAgent(
+                llm_provider=llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+
+        # Synthesizing results agent
+        if agent_type == "synthesizing_results":
+            return SynthesisAgent(
+                llm_provider=llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+
         # Remaining investigation loop agents (stubs until
         # full implementations land in later issues)
         stub_targets = {
             "planning_investigation": "awaiting_provision",
-            "evaluating_convergence": "synthesizing_results",
-            "synthesizing_results": "awaiting_teardown",
         }
         if agent_type in stub_targets:
             return StubAgent(

@@ -121,8 +121,13 @@ class TriageAgent(AgentBase):
         if scoped_context and isinstance(scoped_context, dict):
             fields["scoped_context"] = scoped_context
 
+        # Every ticket gets an execution plan — even single-
+        # benchmark requests get a 1-step plan. This ensures
+        # the investigation ledger always has plan_steps to
+        # reference, and lets review/users extend the plan
+        # dynamically via HITL (#135).
         raw_plan = result.get("execution_plan")
-        if raw_plan and isinstance(raw_plan, list) and len(raw_plan) > 1:
+        if raw_plan and isinstance(raw_plan, list) and len(raw_plan) > 0:
             steps = []
             for i, s in enumerate(raw_plan):
                 steps.append(
@@ -134,11 +139,22 @@ class TriageAgent(AgentBase):
                         "results": {},
                     }
                 )
-            fields["execution_plan"] = {
-                "current_step": 0,
-                "run_ids": [],
-                "steps": steps,
-            }
+        else:
+            # Single-benchmark request — create a default 1-step plan
+            steps = [
+                {
+                    "id": 0,
+                    "agent_type": "benchmark",
+                    "status": "in_progress",
+                    "params": {},
+                    "results": {},
+                },
+            ]
+        fields["execution_plan"] = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": steps,
+        }
 
         await self._update_fields(ticket_id, fields)
 
