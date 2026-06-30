@@ -677,3 +677,137 @@ async def test_all_tools_use_hosts_or_targets():
         assert has_hosts or has_targets, (
             f"Tool {t.name} must have either 'hosts' or 'targets' array"
         )
+
+
+@pytest.mark.asyncio
+async def test_ensure_prerequisites_tool_in_definitions():
+    """ensure_prerequisites tool exists in the tool definitions."""
+    from agents.provisioning.mcp_server import get_provisioning_tools
+
+    tools = get_provisioning_tools()
+    names = [t.name for t in tools]
+    assert "ensure_prerequisites" in names
+
+    tool = next(t for t in tools if t.name == "ensure_prerequisites")
+    assert "hosts" in tool.input_schema["properties"]
+    assert "extra_packages" in tool.input_schema["properties"]
+    assert "controller_host" in tool.input_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_prerequisites_controller_gets_harness_prereqs():
+    """Controller host gets harness prereqs + extras; targets get extras only."""
+    from agents.provisioning.server import (
+        _ensure_prerequisites_one,
+    )
+
+    call_log = []
+
+    async def mock_run(host, cmd, **kwargs):
+        call_log.append((host, cmd))
+        if "which podman" in cmd or "which git" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="")
+        if "which jq" in cmd or "which curl" in cmd:
+            return SSHResult(stdout="/usr/bin/jq\njq-1.7")
+        if "which ncat" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="")
+        if "dnf install" in cmd:
+            return SSHResult(stdout="Complete!")
+        return SSHResult(stdout="ok")
+
+    import agents.provisioning.server as prov
+
+    with patch.object(prov, "_ssh", type("SSH", (), {"run": staticmethod(mock_run)})()):
+        result = await _ensure_prerequisites_one(
+            "10.0.0.1",
+            is_controller=True,
+            extra_packages=["ncat"],
+        )
+
+    assert "jq" in result["already_present"]
+    assert "curl" in result["already_present"]
+    assert "podman" in result["newly_installed"] or "podman" in result["failed"]
+    assert "git" in result["newly_installed"] or "git" in result["failed"]
+    assert result["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_ensure_prerequisites_target_gets_extras_only():
+    """Non-controller host only checks/installs extra_packages."""
+    from agents.provisioning.server import (
+        _ensure_prerequisites_one,
+    )
+
+    async def mock_run(host, cmd, **kwargs):
+        if "which ncat" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="")
+        if "dnf install" in cmd:
+            return SSHResult(stdout="Complete!")
+        return SSHResult(stdout="ok")
+
+    import agents.provisioning.server as prov
+
+    with patch.object(prov, "_ssh", type("SSH", (), {"run": staticmethod(mock_run)})()):
+        result = await _ensure_prerequisites_one(
+            "10.0.0.2",
+            is_controller=False,
+            extra_packages=["ncat"],
+        )
+
+    assert "ncat" in result["newly_installed"]
+    assert "podman" not in result.get("newly_installed", [])
+    assert "podman" not in result.get("already_present", [])
+
+
+@pytest.mark.asyncio
+async def test_ensure_prerequisites_no_output_on_success():
+    """Successful installs don't include verbose dnf output."""
+    from agents.provisioning.server import (
+        _ensure_prerequisites_one,
+    )
+
+    async def mock_run(host, cmd, **kwargs):
+        if "which" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="")
+        if "dnf install" in cmd:
+            return SSHResult(stdout="Lots of dnf output here...")
+        return SSHResult(stdout="ok")
+
+    import agents.provisioning.server as prov
+
+    with patch.object(prov, "_ssh", type("SSH", (), {"run": staticmethod(mock_run)})()):
+        result = await _ensure_prerequisites_one(
+            "10.0.0.1",
+            is_controller=False,
+            extra_packages=["ncat"],
+        )
+
+    assert "output" not in result
+    assert "Lots of dnf" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_ensure_prerequisites_reports_failures():
+    """Failed installs are reported in the failed list."""
+    from agents.provisioning.server import (
+        _ensure_prerequisites_one,
+    )
+
+    async def mock_run(host, cmd, **kwargs):
+        if "which" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="")
+        if "dnf install" in cmd:
+            return SSHResult(exit_code=1, stdout="", stderr="No package found")
+        return SSHResult(stdout="ok")
+
+    import agents.provisioning.server as prov
+
+    with patch.object(prov, "_ssh", type("SSH", (), {"run": staticmethod(mock_run)})()):
+        result = await _ensure_prerequisites_one(
+            "10.0.0.1",
+            is_controller=False,
+            extra_packages=["nonexistent-pkg"],
+        )
+
+    assert "nonexistent-pkg" in result["failed"]
+    assert result["status"] == "failed"
