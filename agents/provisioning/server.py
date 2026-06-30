@@ -238,14 +238,16 @@ async def _install_packages_one(host: str, packages: list[str]) -> dict:
     """Install packages on a single host."""
     pkg_list = " ".join(packages)
     result = await _ssh.run(host, f"dnf install -y {pkg_list}", timeout=300)
-    return {
+    response = {
         "host": host,
         "packages": packages,
         "status": "success" if result.exit_code == 0 else "failed",
         "exit_code": result.exit_code,
-        "output": result.stdout or "",
-        "error": result.stderr or "",
     }
+    if result.exit_code != 0:
+        response["output"] = result.stdout or ""
+        response["error"] = result.stderr or ""
+    return response
 
 
 async def _discover_crucible_token_files(host: str, install_path: str) -> list[str]:
