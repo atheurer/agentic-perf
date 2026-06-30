@@ -77,6 +77,7 @@ class AgentBase(ABC):
         )
         try:
             iteration = 0
+            self._budget_grace = False
             while self.max_iterations == 0 or iteration < self.max_iterations:
                 iteration += 1
                 self._emit(
@@ -136,7 +137,48 @@ class AgentBase(ABC):
                         ticket_id,
                     )
                     if budget_status == "pause":
+                        # Inject a final system message so the
+                        # LLM can wrap up gracefully before we
+                        # cut it off on the next iteration.
+                        if not getattr(self, "_budget_grace", False):
+                            self._budget_grace = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your token/cost "
+                                        "budget for this ticket is "
+                                        "exhausted. You MUST wrap up "
+                                        "immediately: submit your "
+                                        "best result now using your "
+                                        "submit_* tool, even if "
+                                        "incomplete. Summarize what "
+                                        "was accomplished and what "
+                                        "remains. This is your final "
+                                        "LLM call."
+                                    ),
+                                }
+                            )
+                            continue  # one more LLM call
+                        # Grace iteration used — hard stop.
                         break
+                    if budget_status == "warn":
+                        # Soft limit: inform the LLM so it can
+                        # start winding down proactively.
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[SYSTEM] Budget warning: you "
+                                    "are approaching your token/cost "
+                                    "limit for this ticket. Begin "
+                                    "wrapping up your work. Finish "
+                                    "any critical in-progress steps, "
+                                    "then submit your results. Do "
+                                    "not start new exploratory work."
+                                ),
+                            }
+                        )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
