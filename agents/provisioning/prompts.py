@@ -15,7 +15,7 @@ For example, pass hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"] rather than making 
 separate calls. This reduces round-trips and runs operations in parallel.
 
 Tools that take uniform parameters across hosts use `hosts: list[str]`:
-  check_platform_contract, check_host_prerequisites, install_harness,
+  check_platform_contract, ensure_prerequisites, install_harness,
   check_existing_install, verify_harness_install, update_install,
   uninstall_harness, install_k3s, ensure_harness_installed
 

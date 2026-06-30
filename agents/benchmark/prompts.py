@@ -6,6 +6,16 @@ you read the benchmark harness's documentation and skill configuration to unders
 to run it. The system supports multiple benchmark harnesses (e.g., crucible, zathras).
 The ticket's metadata tells you which harness and benchmark to use.
 
+## Efficient Tool Usage
+
+Use batch tools to minimize iterations:
+- **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
+  (not check_host per host)
+- **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**
+  — verify TCP port reachability between hosts in one call, handling nc
+  listener lifecycle automatically. Read the connectivity-diagnostic skill
+  doc for details.
+
 ## Reading Harness Documentation
 
 You have access to the harness's documentation via tools. The ticket message includes
