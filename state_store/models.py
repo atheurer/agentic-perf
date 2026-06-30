@@ -25,6 +25,11 @@ class TicketStatus(str, Enum):
     EVALUATING_CONVERGENCE = "evaluating_convergence"
     SYNTHESIZING_RESULTS = "synthesizing_results"
 
+    # Async suspension — LLM parked while hardware
+    # operations run (provisioning, benchmark execution).
+    # The orchestrator monitors for completion and resumes.
+    ASYNC_WAIT = "async_wait"
+
 
 VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # --- Original linear pipeline ---
@@ -42,12 +47,14 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.EXECUTING_BENCHMARK,
         TicketStatus.AWAITING_HARDWARE,  # handoff retry
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+        TicketStatus.ASYNC_WAIT,  # suspend during long provision
     ],
     TicketStatus.EXECUTING_BENCHMARK: [
         TicketStatus.AWAITING_REVIEW,
         TicketStatus.EVALUATING_CONVERGENCE,  # investigation path
         TicketStatus.AWAITING_PROVISION,  # handoff retry
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+        TicketStatus.ASYNC_WAIT,  # suspend during long benchmark
     ],
     TicketStatus.AWAITING_REVIEW: [
         TicketStatus.AWAITING_TEARDOWN,
@@ -61,6 +68,15 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_CUSTOMER_GUIDANCE: [],  # filled dynamically
+    # Async wait can resume to any operational status.
+    # The target is stored in custom_fields.async_context.resume_to_status.
+    TicketStatus.ASYNC_WAIT: [
+        TicketStatus.AWAITING_PROVISION,
+        TicketStatus.EXECUTING_BENCHMARK,
+        TicketStatus.AWAITING_REVIEW,
+        TicketStatus.EVALUATING_CONVERGENCE,
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+    ],
     TicketStatus.RETROSPECTIVE_PENDING: [
         TicketStatus.CLOSED,
     ],

@@ -64,7 +64,12 @@ PLAN_AGENT_STATUS = {
 }
 
 
-def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None:
+def _advance_plan(
+    store_url: str,
+    ticket_id: str,
+    completed_status: str,
+    event_bus: EventBus | None = None,
+) -> None:
     """Advance the execution plan after an agent completes a step.
 
     Only advances if the completed agent matches the current step's
@@ -139,16 +144,24 @@ def _advance_plan(store_url: str, ticket_id: str, completed_status: str) -> None
                     },
                 )
 
+                comment = (
+                    f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
+                )
                 client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                    json={
-                        "status": next_status,
-                        "comment": (
-                            f"Plan advancing to step {next_idx}: "
-                            f"{next_step['agent_type']}"
-                        ),
-                    },
+                    json={"status": next_status, "comment": comment},
                 )
+                if event_bus:
+                    event_bus.emit(
+                        ticket_id,
+                        "orchestrator",
+                        "transition",
+                        {
+                            "to": next_status,
+                            "comment": comment,
+                            "ticket_id": ticket_id,
+                        },
+                    )
                 return
 
         client.patch(
@@ -164,6 +177,27 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         agent = dispatcher.create_agent(status)
         if agent is None:
             return
+
+        # Investigation tickets get unlimited iterations for
+        # all agents — convergence gates and budget guardrails
+        # handle termination, not arbitrary iteration caps.
+        # Without this, agents like the benchmark agent exhaust
+        # their default max_iterations re-reading skills and
+        # host state on each investigation loop-back.
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                if r.status_code == 200:
+                    cf = r.json().get("custom_fields", {})
+                    if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+                        agent.max_iterations = 0
+        except Exception:
+            pass  # proceed with default iterations
+
         await agent.run(ticket_id)
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
@@ -171,7 +205,12 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         logger.info(f"run_agent_task finally block for {ticket_id}")
         if status in PLAN_AGENT_STATUS.values():
             try:
-                _advance_plan(dispatcher.store_url, ticket_id, status)
+                _advance_plan(
+                    dispatcher.store_url,
+                    ticket_id,
+                    status,
+                    event_bus=dispatcher.events,
+                )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
         dispatcher.mark_done(ticket_id)
@@ -182,7 +221,11 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
             pass
 
 
-async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
+async def _block_absent_suite(
+    store_url: str,
+    ticket_id: str,
+    event_bus: EventBus | None = None,
+) -> None:
     import httpx
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -212,6 +255,17 @@ async def _block_absent_suite(store_url: str, ticket_id: str) -> None:
                 "comment": "Absent benchmark suite — no harness can run this",
             },
         )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "transition",
+                {
+                    "to": "awaiting_customer_guidance",
+                    "comment": "Absent benchmark suite — no harness can run this",
+                    "ticket_id": ticket_id,
+                },
+            )
 
 
 HANDOFF_RETRY_STATUS = {
@@ -223,7 +277,11 @@ HANDOFF_RETRY_STATUS = {
 
 
 async def _block_handoff_failed(
-    store_url: str, ticket_id: str, reason: str, current_status: str = ""
+    store_url: str,
+    ticket_id: str,
+    reason: str,
+    current_status: str = "",
+    event_bus: EventBus | None = None,
 ) -> None:
     import httpx
 
@@ -231,16 +289,25 @@ async def _block_handoff_failed(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         if retry_status:
+            rewind_comment = (
+                f"Rewinding to {retry_status} so the agent"
+                f" can retry after user guidance"
+            )
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                json={
-                    "status": retry_status,
-                    "comment": (
-                        f"Rewinding to {retry_status} so the agent"
-                        f" can retry after user guidance"
-                    ),
-                },
+                json={"status": retry_status, "comment": rewind_comment},
             )
+            if event_bus:
+                event_bus.emit(
+                    ticket_id,
+                    "orchestrator",
+                    "transition",
+                    {
+                        "to": retry_status,
+                        "comment": rewind_comment,
+                        "ticket_id": ticket_id,
+                    },
+                )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -253,13 +320,25 @@ async def _block_handoff_failed(
                 ),
             },
         )
+        block_comment = f"Handoff validation failed: {reason}"
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
-                "comment": f"Handoff validation failed: {reason}",
+                "comment": block_comment,
             },
         )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "transition",
+                {
+                    "to": "awaiting_customer_guidance",
+                    "comment": block_comment,
+                    "ticket_id": ticket_id,
+                },
+            )
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
@@ -327,7 +406,40 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         f"poll={config.poll_interval}s, llm={config.llm_provider})"
     )
 
+    # System-wide budget check (per orchestrator session)
+    system_budget = None
+    if config.budget_session_cost_usd > 0:
+        from providers.budget import SystemBudget
+
+        system_budget = SystemBudget(
+            session_cost_usd=config.budget_session_cost_usd,
+        )
+        logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
+
     while True:
+        # Check system-wide budget before dispatching
+        if system_budget is not None and events is not None:
+            from providers.budget import (
+                BudgetAction,
+                check_system_budget,
+            )
+            from providers.cost import estimate_cumulative_cost
+
+            global_usage = events.get_global_usage()
+            global_cost = estimate_cumulative_cost(global_usage)
+            sys_status = check_system_budget(
+                system_budget,
+                global_usage,
+                global_cost,
+            )
+            if sys_status.action == BudgetAction.PAUSE:
+                logger.warning(
+                    f"System budget exceeded: {sys_status.reason}"
+                    f" — skipping dispatch cycle"
+                )
+                await asyncio.sleep(config.poll_interval)
+                continue
+
         for status in STATUS_AGENT_MAP:
             try:
                 tickets = await fetch_tickets_by_status(config.state_store_url, status)
@@ -351,7 +463,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         f"Ticket {tid} has absent_suite=True, pausing for human input"
                     )
                     dispatcher.mark_dispatched(tid, status)
-                    await _block_absent_suite(config.state_store_url, tid)
+                    await _block_absent_suite(
+                        config.state_store_url, tid, event_bus=dispatcher.events
+                    )
                     continue
 
                 ok, reason = check_handoff(status, ticket)
@@ -362,7 +476,11 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         )
                         dispatcher.mark_handoff_blocked(tid, status)
                         await _block_handoff_failed(
-                            config.state_store_url, tid, reason, status
+                            config.state_store_url,
+                            tid,
+                            reason,
+                            status,
+                            event_bus=dispatcher.events,
                         )
                     continue
 
@@ -371,7 +489,128 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 task = asyncio.create_task(run_agent_task(dispatcher, status, tid))
                 dispatcher.set_task(tid, task)
 
+        # Check async_wait tickets for completion or timeout
+        await _check_async_wait_tickets(
+            config.state_store_url,
+            event_bus=events,
+        )
+
         await asyncio.sleep(config.poll_interval)
+
+
+async def _check_async_wait_tickets(
+    store_url: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Monitor async_wait tickets for timeout.
+
+    Checks each async_wait ticket's elapsed time against its
+    timeout limit (2x expected_duration_mins).  If exceeded,
+    transitions to awaiting_customer_guidance.
+
+    Completion detection is handled by the CloudEvents signal
+    endpoint (POST /api/v1/tickets/{id}/signal).  External
+    systems (benchmark harnesses, Jumpstarter, Horreum, CI
+    pipelines) send CloudEvents to resume tickets.  The
+    orchestrator does not poll infrastructure directly —
+    that would violate the trust boundary between the
+    control plane and agent execution.
+    """
+    import httpx
+
+    try:
+        tickets = await fetch_tickets_by_status(
+            store_url,
+            "async_wait",
+        )
+    except Exception:
+        return
+
+    if not tickets:
+        return
+
+    from datetime import datetime, timezone
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for ticket in tickets:
+            tid = ticket["id"]
+            cf = ticket.get("custom_fields", {})
+            ctx = cf.get("async_context", {})
+            if not ctx:
+                continue
+
+            started_at = ctx.get("started_at", "")
+            expected_mins = ctx.get(
+                "expected_duration_mins",
+                60,
+            )
+            timeout_mins = expected_mins * 2
+            if not started_at:
+                continue
+
+            try:
+                start = datetime.fromisoformat(started_at)
+                elapsed = datetime.now(timezone.utc) - start
+                elapsed_mins = elapsed.total_seconds() / 60
+            except (ValueError, TypeError):
+                continue
+
+            if elapsed_mins <= timeout_mins:
+                continue
+
+            logger.warning(
+                f"[async_wait] Ticket {tid} timed "
+                f"out after {elapsed_mins:.0f}m "
+                f"(limit {timeout_mins:.0f}m)"
+            )
+            ctx["timed_out"] = True
+            ctx["elapsed_mins"] = round(
+                elapsed_mins,
+                1,
+            )
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{tid}/fields",
+                json={
+                    "fields": {
+                        "async_context": ctx,
+                    },
+                },
+            )
+            await client.post(
+                f"{store_url}/api/v1/tickets/{tid}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Async timeout:** Operation "
+                        f"exceeded {timeout_mins:.0f}m "
+                        f"limit ({elapsed_mins:.0f}m "
+                        f"elapsed). Pausing for "
+                        f"guidance."
+                    ),
+                },
+            )
+            await client.post(
+                f"{store_url}/api/v1/tickets/{tid}/transition",
+                json={
+                    "status": ("awaiting_customer_guidance"),
+                    "comment": (f"Async operation timed out after {elapsed_mins:.0f}m"),
+                },
+            )
+            if event_bus:
+                event_bus.emit(
+                    tid,
+                    "orchestrator",
+                    "async_timeout",
+                    {
+                        "wait_type": ctx.get(
+                            "wait_type",
+                        ),
+                        "elapsed_mins": round(
+                            elapsed_mins,
+                            1,
+                        ),
+                    },
+                )
 
 
 LOCK_FILE = Path.home() / ".agentic-perf" / "orchestrator.pid"
