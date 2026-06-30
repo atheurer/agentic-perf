@@ -9,12 +9,21 @@ Per-ticket budgets are stored in custom_fields:
         "max_cost_usd": 5.00,   # estimated dollar cost
     }
 
-System-wide budgets are configured in ~/.agentic-perf/config.json:
+System-wide and default per-ticket budgets are configured in
+~/.agentic-perf/config.json:
     {
         "llm_budget": {
-            "session_cost_usd": 50.00
+            "session_cost_usd": 50.00,
+            "default_ticket_budget": {
+                "max_tokens": 200000,
+                "max_cost_usd": 5.00,
+                "warn_pct": 80.0
+            }
         }
     }
+
+Per-ticket budgets in custom_fields override the config default.
+If neither is set, no per-ticket budget is enforced.
 
 Budget checks return a BudgetStatus indicating whether the budget
 is within limits, over a soft limit (warn but continue), or over
@@ -201,16 +210,38 @@ def check_system_budget(
 
 def budget_from_custom_fields(
     custom_fields: dict[str, Any],
+    config: dict[str, Any] | None = None,
 ) -> TicketBudget | None:
     """Extract ticket budget from custom_fields.
 
-    Returns None if no budget is configured — caller should
-    skip budget checks entirely.
+    Falls back to default_ticket_budget from orchestrator config
+    if the ticket has no per-ticket budget. Returns None if
+    neither is configured — caller should skip budget checks.
+
+    Config format::
+
+        {
+            "llm_budget": {
+                "session_cost_usd": 50.00,
+                "default_ticket_budget": {
+                    "max_tokens": 200000,
+                    "max_cost_usd": 5.00,
+                    "warn_pct": 80.0
+                }
+            }
+        }
     """
     raw = custom_fields.get("llm_budget")
-    if not raw:
-        return None
-    return TicketBudget(**raw)
+    if raw:
+        return TicketBudget(**raw)
+    # Fall back to config default
+    if config:
+        default = config.get("llm_budget", {}).get(
+            "default_ticket_budget",
+        )
+        if default:
+            return TicketBudget(**default)
+    return None
 
 
 def system_budget_from_config(

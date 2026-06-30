@@ -492,6 +492,7 @@ class AgentBase(ABC):
         the user can decide to increase the budget or abort.
         """
         try:
+            from orchestrator.config import _load_config_file
             from providers.budget import (
                 BudgetAction,
                 budget_from_custom_fields,
@@ -501,7 +502,8 @@ class AgentBase(ABC):
 
             ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
-            budget = budget_from_custom_fields(cf)
+            config = _load_config_file()
+            budget = budget_from_custom_fields(cf, config)
             if budget is None:
                 return "ok"
 

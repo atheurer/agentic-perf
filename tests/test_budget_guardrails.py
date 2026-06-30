@@ -159,6 +159,48 @@ class TestExtraction:
         b = budget_from_custom_fields({})
         assert b is None
 
+    def test_no_budget_falls_back_to_config_default(self):
+        """When ticket has no llm_budget, use config default."""
+        config = {
+            "llm_budget": {
+                "default_ticket_budget": {
+                    "max_tokens": 150_000,
+                    "max_cost_usd": 3.00,
+                },
+            },
+        }
+        b = budget_from_custom_fields({}, config)
+        assert b is not None
+        assert b.max_tokens == 150_000
+        assert b.max_cost_usd == 3.00
+
+    def test_ticket_budget_overrides_config_default(self):
+        """Per-ticket budget takes precedence over config default."""
+        config = {
+            "llm_budget": {
+                "default_ticket_budget": {
+                    "max_tokens": 150_000,
+                    "max_cost_usd": 3.00,
+                },
+            },
+        }
+        cf = {
+            "llm_budget": {
+                "max_tokens": 500_000,
+                "max_cost_usd": 10.00,
+            },
+        }
+        b = budget_from_custom_fields(cf, config)
+        assert b is not None
+        assert b.max_tokens == 500_000
+        assert b.max_cost_usd == 10.00
+
+    def test_no_budget_no_config_returns_none(self):
+        """No ticket budget + no config default = None."""
+        config = {"llm_budget": {"session_cost_usd": 50.0}}
+        b = budget_from_custom_fields({}, config)
+        assert b is None
+
     def test_system_budget_from_config(self):
         cfg = {
             "llm_budget": {
