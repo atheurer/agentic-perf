@@ -570,6 +570,48 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
+            name="ensure_prerequisites",
+            description=(
+                "Check and install missing prerequisites on all hosts in one "
+                "call. Harness prerequisites (podman, git, jq, curl) are "
+                "checked and installed only on the controller_host. Extra "
+                "packages (e.g., nmap-ncat from user directives) are checked "
+                "and installed on ALL hosts. Use this instead of calling "
+                "check_host_prerequisites then install_packages separately."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of all host IPs to process",
+                    },
+                    "extra_packages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Additional packages to install on ALL hosts "
+                            "(e.g., ['nmap-ncat'] from user directives)"
+                        ),
+                    },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — harness prereqs (podman, "
+                            "git, etc.) are only installed here. If empty, "
+                            "only extra_packages are installed."
+                        ),
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                },
+                "required": ["hosts"],
+            },
+        ),
+        ToolDefinition(
             name="ensure_harness_installed",
             description=(
                 "Check if harness is installed on each host, install where "

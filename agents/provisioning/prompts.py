@@ -20,16 +20,19 @@ Tools that take uniform parameters across hosts use `hosts: list[str]`:
   uninstall_harness, install_k3s, ensure_harness_installed
 
 Tools with per-host parameters use `targets: list[dict]`:
-  install_packages — each target is {"host": "...", "packages": ["..."]}
   configure_host — each target is {"host": "...", "config": {...}}
 
 All batched tools return results keyed by host, with a summary line.
 
-## Combined Tool: ensure_harness_installed
+## Combined Tools
 
-Use ensure_harness_installed instead of the three-step sequence of
-check_existing_install → install_harness → verify_harness_install.
-It checks each host, installs where missing, and verifies — all in one call.
+**ensure_prerequisites** — checks what's installed and installs what's missing
+in one call. Pass controller_host so harness prereqs (podman, git, etc.) are
+only installed on the controller. Pass extra_packages for user-requested
+packages (e.g., nmap-ncat) that go on ALL hosts.
+
+**ensure_harness_installed** — combines check_existing_install + install_harness
++ verify_harness_install into one batched call.
 
 Your tasks:
 1. Determine the harness name. Check the ticket's "directives" section for a "harness"
@@ -41,13 +44,11 @@ Your tasks:
 2. Call check_platform_contract with all hosts and the harness_name to verify each
    host's OS, repos, and packages are compatible with the harness. If the platform is
    incompatible (status "failed"), report the mismatch — do not attempt installation.
-   If missing_packages are reported (status "ok"), install them in step 4.
 
-3. Check prerequisites on all hosts using check_host_prerequisites with all hosts.
-   The provisioning config may list harness-specific prerequisites.
-
-4. If any prerequisites are missing (from step 3 or missing_packages from step 2),
-   install them using install_packages with targets for each host that needs packages.
+3. Call ensure_prerequisites with all hosts. Set controller_host to the controller's
+   IP so harness prerequisites (podman, git, jq, curl) are installed only there.
+   Include any user-requested packages (e.g., nmap-ncat) in extra_packages — these
+   are installed on ALL hosts including targets.
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip

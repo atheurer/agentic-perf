@@ -250,6 +250,48 @@ async def _install_packages_one(host: str, packages: list[str]) -> dict:
     return response
 
 
+async def _ensure_prerequisites_one(
+    host: str,
+    is_controller: bool,
+    extra_packages: list[str],
+) -> dict:
+    """Check and install missing prerequisites on a single host."""
+    already_present = []
+    to_install = list(extra_packages)
+
+    if is_controller:
+        prereqs = await _check_host_prerequisites_one(host)
+        for pkg, info in prereqs.get("prerequisites", {}).items():
+            if info.get("installed"):
+                already_present.append(pkg)
+            else:
+                if pkg not in to_install:
+                    to_install.append(pkg)
+    else:
+        for pkg in extra_packages:
+            check = await _ssh.run(host, f"which {pkg} 2>/dev/null", timeout=10)
+            if check.exit_code == 0:
+                already_present.append(pkg)
+                to_install.remove(pkg)
+
+    newly_installed = []
+    failed = []
+    if to_install:
+        result = await _install_packages_one(host, to_install)
+        if result.get("status") == "success":
+            newly_installed = to_install
+        else:
+            failed = to_install
+
+    return {
+        "host": host,
+        "already_present": already_present,
+        "newly_installed": newly_installed,
+        "failed": failed,
+        "status": "success" if not failed else "failed",
+    }
+
+
 async def _discover_crucible_token_files(host: str, install_path: str) -> list[str]:
     """Read registries.json on the host and extract all referenced token file paths."""
     result = await _ssh.run(
@@ -970,6 +1012,39 @@ async def install_packages(targets: list[dict], user: str = "root") -> str:
             results[host] = {"status": "error", "message": str(result)}
         else:
             results[host] = result
+    return json.dumps(_summarize(results))
+
+
+@mcp.tool()
+async def ensure_prerequisites(
+    hosts: list[str],
+    extra_packages: list[str] | None = None,
+    controller_host: str = "",
+    user: str = "root",
+) -> str:
+    """Check and install missing prerequisites on all hosts in one call.
+
+    Harness prerequisites (podman, git, jq, curl) are checked and installed
+    only on the controller_host. Extra packages (e.g., nmap-ncat) are
+    checked and installed on ALL hosts. Use this instead of calling
+    check_host_prerequisites then install_packages separately.
+
+    Args:
+        hosts: List of host IPs to process
+        extra_packages: Additional packages to install on all hosts
+            (e.g., ["nmap-ncat"] from user directives)
+        controller_host: The controller IP — harness prereqs are only
+            installed here. If empty, harness prereqs are skipped on
+            all hosts (only extra_packages are installed).
+    """
+    await _ensure_init()
+    extras = extra_packages or []
+
+    async def _run_one(host: str) -> dict:
+        is_controller = host == controller_host
+        return await _ensure_prerequisites_one(host, is_controller, extras)
+
+    results = await _gather_for_hosts(hosts, _run_one)
     return json.dumps(_summarize(results))
 
 

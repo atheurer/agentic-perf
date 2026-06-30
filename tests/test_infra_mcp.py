@@ -109,14 +109,6 @@ def mock_infra_server(tmp_path: Path) -> Path:
             })
 
         @mcp.tool()
-        async def install_packages(host: str, packages: list, manager: str = "dnf") -> str:
-            \"\"\"Install packages.\"\"\"
-            return json.dumps({
-                "exit_code": 0,
-                "stdout": f"Installed: {', '.join(packages)}",
-            })
-
-        @mcp.tool()
         async def check_hosts(hosts: list) -> str:
             \"\"\"Batch check hosts.\"\"\"
             results = {}
@@ -186,7 +178,6 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "read_remote_file",
             "deploy_secret",
             "transfer_file",
-            "install_packages",
             "test_port_connectivity",
         }
         assert expected == names
@@ -293,7 +284,7 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "resolve_benchmark" in names
         assert "set_ssh_context" in names
         assert "execute_command" in names
-        assert len(names) == 14
+        assert len(names) == 13
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -344,7 +335,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 14
+    assert len(client._tool_routing) == 13
 
     await client.disconnect()
     assert len(client._servers) == 0
