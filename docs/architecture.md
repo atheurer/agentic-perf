@@ -375,6 +375,7 @@ Interface: `ResourceProvider` (`providers/resource/base.py`)
 | `QuadsResourceProvider` | bare_metal | `~/.agentic-perf/secrets/quads/config.json` |
 | `AWSResourceProvider` | cloud | `~/.agentic-perf/secrets/aws/config.json` |
 | `PSAPCCResourceProvider` | gpu_cluster | `~/.agentic-perf/secrets/psap-cc/config.json` |
+| `JumpstarterResourceProvider` | bare_metal | `~/.agentic-perf/secrets/jumpstarter/config.json` |
 
 Providers are lazy-loaded by `ResourceProviderRegistry` — a provider is
 only instantiated when its secrets file exists. The registry maps provider
@@ -386,6 +387,25 @@ Each provider implements:
 - `get_reservation_status(reservation_id)` — Poll status
 - `terminate(reservation_id)` — Release resources
 - `setup_ssh(hosts)` / `cleanup_ssh_keys(hosts)` — SSH key management
+
+#### Jumpstarter
+
+The [Jumpstarter](https://jumpstarter.dev) provider manages lab
+hardware — embedded and automotive devices (NXP S32G, Qualcomm
+SA8775P, etc.) from a Jumpstarter controller. Devices are leased
+via label selectors (e.g., `target=ride4_sa8775p_sx_r3`).
+
+Configuration requires both secrets (`~/.agentic-perf/secrets/
+jumpstarter/config.json`) and the `jmp` CLI config
+(`~/.config/jumpstarter/clients/<name>.yaml`) which handles gRPC
+channel creation and TLS. Set `tls.insecure: true` in the CLI
+config for internal deployments with self-signed certificates.
+
+The provider uses the `jumpstarter` Python package for the
+resource lifecycle (Layer 1). Device-level operations (power
+cycling, serial console, firmware) use the Jumpstarter MCP
+server (`jmp mcp serve`) attached to agents via
+`connect_command()` (Layer 2).
 
 ### Skill Providers
 
