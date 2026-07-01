@@ -159,7 +159,23 @@ class ProvisioningAgent(AgentBase):
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("resource_provider_metadata"):
-            content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
+            metadata = cf["resource_provider_metadata"]
+            content += f"\n## Provider Metadata\n```json\n{json.dumps(metadata, indent=2)}\n```\n"
+
+            # Surface Jumpstarter lease info for the skill
+            if cf.get("resource_provider") == "jumpstarter":
+                lease_id = cf.get("resource_reservation_id") or metadata.get(
+                    "lease_id", ""
+                )
+                content += (
+                    f"\n## Jumpstarter Device\n"
+                    f"- **Lease ID:** {lease_id}\n"
+                    f"- **Board:** {metadata.get('exporter_name', 'unknown')}\n"
+                    f"- **Selector:** {metadata.get('selector', 'unknown')}\n"
+                    f"- This is a physical embedded board that needs\n"
+                    f"  flashing before use. Follow the Jumpstarter\n"
+                    f"  provisioning skill above.\n"
+                )
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
@@ -188,6 +204,21 @@ class ProvisioningAgent(AgentBase):
         if result.get("k3s_installed"):
             fields["k3s_installed"] = True
             fields["k3s_version"] = result.get("k3s_version", "unknown")
+
+        # Jumpstarter: the provisioning agent discovers the
+        # SSH IP during flashing. Update ticket fields so
+        # downstream agents can SSH directly.
+        if result.get("ssh_hardware_ips"):
+            fields["ssh_hardware_ips"] = result["ssh_hardware_ips"]
+            fields["assigned_hardware_ips"] = result.get(
+                "assigned_hardware_ips",
+                result["ssh_hardware_ips"],
+            )
+        if result.get("ssh_user"):
+            fields["ssh_user"] = result["ssh_user"]
+        if result.get("ssh_key_path"):
+            fields["ssh_key_path"] = result["ssh_key_path"]
+
         await self._update_fields(ticket_id, fields)
 
         summary = (

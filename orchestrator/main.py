@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
@@ -611,6 +612,141 @@ async def _check_async_wait_tickets(
                         ),
                     },
                 )
+
+            # Clean up Jumpstarter lease if ticket
+            # is being parked due to timeout.
+            await _cleanup_jumpstarter_lease(store_url, tid, client, event_bus)
+
+
+async def _cleanup_jumpstarter_lease(
+    store_url: str,
+    ticket_id: str,
+    client: Any = None,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Terminate a Jumpstarter lease for a parked ticket.
+
+    Called when a ticket with an active Jumpstarter lease is
+    entering a state where no agent will run (e.g.,
+    awaiting_customer_guidance after timeout). Without this,
+    the lease would sit open until it expires on the
+    controller.
+
+    This is a safety net — normal lease cleanup happens
+    through the resource teardown agent. This catches the
+    cases where teardown is bypassed.
+    """
+    import httpx
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=30.0)
+
+    try:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+        if r.status_code != 200:
+            return
+        cf = r.json().get("custom_fields", {})
+
+        if cf.get("resource_provider") != "jumpstarter":
+            return
+
+        lease_id = cf.get("resource_reservation_id") or cf.get(
+            "resource_provider_metadata", {}
+        ).get("lease_id")
+        if not lease_id:
+            return
+
+        # Already cleaned up?
+        if cf.get("jumpstarter_lease_cleaned_up"):
+            return
+
+        logger.warning(
+            f"[jumpstarter-cleanup] Releasing lease "
+            f"{lease_id} for parked ticket {ticket_id}"
+        )
+
+        try:
+            from providers.resource.jumpstarter import (
+                JumpstarterResourceProvider,
+            )
+
+            # Attempt to load from secrets
+            try:
+                from providers.secrets.file import (
+                    FileSecretsProvider,
+                )
+
+                secrets = FileSecretsProvider()
+                provider = await JumpstarterResourceProvider.from_secrets(secrets)
+            except Exception:
+                # Fall back to default construction
+                from pathlib import Path
+
+                cli_config = (
+                    Path.home() / ".config" / "jumpstarter" / "clients" / "perf-ci.yaml"
+                )
+                provider = JumpstarterResourceProvider(
+                    client_name="perf-ci",
+                    config_path=(cli_config if cli_config.exists() else None),
+                )
+
+            result = await provider.terminate(lease_id)
+            await provider.close()
+
+            # Mark as cleaned up on the ticket
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "jumpstarter_lease_cleaned_up": True,
+                    },
+                },
+            )
+
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Jumpstarter lease cleanup:** "
+                        f"Lease {lease_id} terminated "
+                        f"(ticket parked without "
+                        f"reaching teardown). "
+                        f"Status: {result.get('status')}"
+                    ),
+                },
+            )
+
+            if event_bus:
+                event_bus.emit(
+                    ticket_id,
+                    "orchestrator",
+                    "jumpstarter_lease_cleanup",
+                    {
+                        "lease_id": lease_id,
+                        "result": result.get("status"),
+                    },
+                )
+
+            logger.info(
+                f"[jumpstarter-cleanup] Lease {lease_id} terminated for {ticket_id}"
+            )
+
+        except ImportError:
+            logger.warning(
+                "[jumpstarter-cleanup] jumpstarter package "
+                "not available — lease not cleaned up"
+            )
+        except Exception:
+            logger.exception(
+                f"[jumpstarter-cleanup] Failed to terminate "
+                f"lease {lease_id} for {ticket_id}"
+            )
+
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 LOCK_FILE = Path.home() / ".agentic-perf" / "orchestrator.pid"
