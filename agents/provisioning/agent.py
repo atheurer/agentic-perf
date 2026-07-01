@@ -80,16 +80,21 @@ class ProvisioningAgent(AgentBase):
             suspend_for_device_ready,
         )
 
-        has_jmp = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
 
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Exclude lease management tools if Jumpstarter attached
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
 
         # Suspend while Jumpstarter device boots, unless
         # already resumed from a previous suspension.
-        if has_jmp:
+        if jmp_tools is not None:
             suspended = await suspend_for_device_ready(self, ticket_id, self.store_url)
             if suspended:
                 # Agent exits here. Orchestrator will
