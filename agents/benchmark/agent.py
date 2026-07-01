@@ -254,12 +254,14 @@ class BenchmarkAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        fields = {
+        fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
         }
+        if result.get("benchmark_results"):
+            fields["benchmark_results"] = result["benchmark_results"]
         await self._update_fields(ticket_id, fields)
 
         status = fields["benchmark_status"]

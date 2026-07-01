@@ -250,11 +250,6 @@ class JumpstarterResourceProvider(ResourceProvider):
             "duration_seconds": duration_sec,
             "ssh_user": self._ssh_user,
             "status": "active",
-            # The Jumpstarter MCP tunnel is available
-            # immediately after lease creation. The
-            # provisioning agent can connect and flash
-            # without waiting for an external signal.
-            "device_ready": True,
         }
 
     async def get_reservation_status(

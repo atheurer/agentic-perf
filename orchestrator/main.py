@@ -208,6 +208,11 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
         except Exception:
             pass  # proceed with default iterations
 
+        # Jumpstarter: resolve image URLs before provisioning.
+        # This is a deterministic HTTP lookup — no LLM needed.
+        if status == "awaiting_provision":
+            await _resolve_jumpstarter_images(dispatcher.store_url, ticket_id)
+
         await agent.run(ticket_id)
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
@@ -278,6 +283,125 @@ async def _block_absent_suite(
             )
 
 
+async def _resolve_jumpstarter_images(
+    store_url: str,
+    ticket_id: str,
+) -> None:
+    """Resolve Jumpstarter image URLs before provisioning.
+
+    Fetches the build server manifest and resolves the flash
+    command for the board. Stores the result in
+    custom_fields.jumpstarter_flash so the provisioning agent
+    can flash without needing to resolve URLs itself.
+
+    This is deterministic code — no LLM reasoning needed.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+            if r.status_code != 200:
+                return
+            cf = r.json().get("custom_fields", {})
+
+        if cf.get("resource_provider") != "jumpstarter":
+            return
+
+        # Already resolved?
+        if cf.get("jumpstarter_flash"):
+            return
+
+        directives = cf.get("directives", {})
+        metadata = cf.get("resource_provider_metadata", {})
+
+        # Extract image parameters from directives
+        base_url = directives.get(
+            "image_server",
+            "https://autosd.sig.centos.org/",
+        )
+        image_version = directives.get("image_version", "AutoSD-10")
+        release = directives.get("release", "nightly")
+        image_name = directives.get("image_name", "ps")
+        image_type = directives.get("image_type", "regular")
+
+        # Board target from selector
+        selector = directives.get("board_selector") or metadata.get("selector", "")
+        board_target = selector.split("=", 1)[-1] if "=" in selector else selector
+
+        from providers.resource.jumpstarter_images import (
+            resolve_image_urls,
+        )
+
+        result = await resolve_image_urls(
+            base_url=base_url,
+            image_version=image_version,
+            release=release,
+            board_target=board_target,
+            image_name=image_name,
+            image_type=image_type,
+        )
+
+        # If exact match failed, try fallbacks
+        if result.get("error") and result.get("available_variants"):
+            variants = result["available_variants"]
+            # Try same image_name with other type
+            for v in variants:
+                if v["image_name"] == image_name:
+                    result = await resolve_image_urls(
+                        base_url=base_url,
+                        image_version=image_version,
+                        release=release,
+                        board_target=board_target,
+                        image_name=v["image_name"],
+                        image_type=v["image_type"],
+                    )
+                    if not result.get("error"):
+                        break
+
+        # Include the orchestrator's SSH public key so
+        # the provisioning agent can inject it into the
+        # board without needing a local file-read tool.
+        try:
+            from pathlib import Path
+
+            pub_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+            if pub_key_path.exists():
+                result["ssh_public_key"] = pub_key_path.read_text().strip()
+                result["ssh_key_path"] = str(pub_key_path.with_suffix(""))
+        except Exception:
+            pass
+
+        # Store on ticket (after adding SSH key)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "jumpstarter_flash": result,
+                    },
+                },
+            )
+
+        if result.get("error"):
+            logger.warning(
+                f"[jumpstarter-images] Resolution failed "
+                f"for {ticket_id}: {result['error']}"
+            )
+        else:
+            logger.info(
+                f"[jumpstarter-images] Resolved "
+                f"{len(result.get('flash_targets', []))} "
+                f"partition(s) for {ticket_id}"
+            )
+
+    except Exception:
+        logger.debug(
+            "[jumpstarter-images] Resolution skipped",
+            exc_info=True,
+        )
+
+
 async def _redirect_to_investigation(
     store_url: str,
     ticket_id: str,
@@ -303,6 +427,16 @@ async def _redirect_to_investigation(
                     "investigation path (gathering_context) "
                     "for proper convergence tracking."
                 ),
+            },
+        )
+        # Mark as redirected so we don't loop if planning
+        # stub routes back to awaiting_hardware.
+        await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={
+                "fields": {
+                    "investigation_redirected": True,
+                },
             },
         )
         await client.post(
@@ -532,10 +666,16 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 # If triage routed to awaiting_hardware but
                 # the ticket has anomaly_context, redirect
                 # to gathering_context (investigation path).
+                # Only on first pass — if investigation_ledger
+                # exists, the ticket already went through
+                # gathering_context and is legitimately heading
+                # to hardware acquisition.
                 # LLM decides intent; code enforces invariants.
                 if status == "awaiting_hardware":
                     cf = ticket.get("custom_fields", {})
-                    if cf.get("anomaly_context"):
+                    if cf.get("anomaly_context") and not cf.get(
+                        "investigation_redirected"
+                    ):
                         logger.info(
                             f"Redirecting {tid} to "
                             f"gathering_context "

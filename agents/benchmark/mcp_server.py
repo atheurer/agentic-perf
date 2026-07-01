@@ -356,6 +356,15 @@ def get_benchmark_tools(
                         },
                         "run_file_used": {"type": "object"},
                         "benchmark_duration": {"type": ["integer", "null"]},
+                        "benchmark_results": {
+                            "type": "object",
+                            "description": (
+                                "Key numeric results from the benchmark "
+                                "(e.g., {bogo_ops_per_sec: 200.5, "
+                                "variance_pct: 0.01}). Extract from "
+                                "arcaflow output or result files."
+                            ),
+                        },
                         "notes": {"type": "string"},
                     },
                     "required": ["run_id", "benchmark_status"],

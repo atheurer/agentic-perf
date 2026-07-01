@@ -67,9 +67,6 @@ class EvaluateAgent(AgentBase):
             f"## Investigation Ticket\n\n"
             f"**Ticket ID:** {ticket.get('id', '')}\n"
             f"**Summary:** {ticket.get('summary', '')}\n\n"
-            f"When using infra tools (set_ssh_context, check_host, "
-            f"execute_command), use the ticket ID above — not a "
-            f"run ID.\n\n"
         )
 
         if anomaly:
@@ -152,18 +149,28 @@ class EvaluateAgent(AgentBase):
         # Latest benchmark results
         run_id = cf.get("run_id", "")
         bench_status = cf.get("benchmark_status", "")
+        bench_results = cf.get("benchmark_results", {})
         if run_id:
             content += (
                 f"**Latest Benchmark Result:**\n"
                 f"- Run ID: {run_id}\n"
-                f"- Status: {bench_status}\n\n"
+                f"- Status: {bench_status}\n"
             )
+            if bench_results:
+                content += (
+                    f"- Results: ```json\n{json.dumps(bench_results, indent=2)}\n```\n"
+                )
+            content += "\n"
 
         content += (
-            "Evaluate the convergence gates and submit your "
-            "decision. If infra tools are available, you may "
-            "query the host for detailed benchmark results "
-            "before deciding.\n"
+            "To retrieve detailed benchmark results, "
+            "use execute_command on the SSH host (see "
+            "SSH Access section below) to read arcaflow "
+            "result files. Run results are stored in the "
+            "working directory identified by each run ID."
+            "\n\n"
+            "Evaluate the convergence gates and submit "
+            "your decision.\n"
         )
 
         return [{"role": "user", "content": content}]

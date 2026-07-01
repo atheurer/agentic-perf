@@ -121,8 +121,8 @@ class TestAttachment:
 
 class TestAsyncWait:
     @pytest.mark.asyncio
-    async def test_suspends_for_jumpstarter(self):
-        """Suspends agent when resource_provider is jumpstarter."""
+    async def test_suspends_for_long_provisioning(self):
+        """Suspends when expected duration exceeds threshold."""
         mock_agent = AsyncMock()
         mock_agent._suspend_for_async = AsyncMock()
 
@@ -132,6 +132,9 @@ class TestAsyncWait:
                     "resource_provider": "jumpstarter",
                     "resource_provider_metadata": {
                         "lease_id": "lease-abc",
+                    },
+                    "jumpstarter_flash": {
+                        "expected_duration_mins": 30,
                     },
                 }
             )
@@ -147,7 +150,33 @@ class TestAsyncWait:
         call_kwargs = mock_agent._suspend_for_async.call_args.kwargs
         assert call_kwargs["wait_type"] == "jumpstarter_device_ready"
         assert call_kwargs["operation_id"] == "lease-abc"
-        assert call_kwargs["resume_to_status"] == "awaiting_provision"
+        assert call_kwargs["expected_duration_mins"] == 30
+
+    @pytest.mark.asyncio
+    async def test_skips_for_short_provisioning(self):
+        """Does not suspend when provisioning is short."""
+        mock_agent = AsyncMock()
+
+        with patch("agents.jumpstarter_mcp.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _make_mock_httpx(
+                {
+                    "resource_provider": "jumpstarter",
+                    "resource_provider_metadata": {
+                        "lease_id": "lease-abc",
+                    },
+                    "jumpstarter_flash": {
+                        "expected_duration_mins": 5,
+                    },
+                }
+            )
+
+            from agents.jumpstarter_mcp import suspend_for_device_ready
+
+            result = await suspend_for_device_ready(
+                mock_agent, "PERF-TEST", "http://localhost:8090"
+            )
+
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_skips_when_not_jumpstarter(self):

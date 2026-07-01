@@ -101,6 +101,50 @@ class ProvisioningAgent(AgentBase):
                 # re-dispatch when CloudEvent arrives.
                 return
 
+        # Idempotency: if provisioning already completed
+        # (e.g., crash recovery or investigation loop-back),
+        # skip re-provisioning unless explicitly needed.
+        # Re-provision only when directives say so (e.g.,
+        # different image for the next investigation cycle).
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if cf.get("provisioning_complete"):
+            needs_reprovision = cf.get("directives", {}).get("reprovision", False)
+            if not needs_reprovision:
+                # Verify SSH IPs are set — they may be
+                # missing if a previous run crashed after
+                # setting provisioning_complete but before
+                # recording IPs.
+                if not cf.get("ssh_hardware_ips"):
+                    logger.info(
+                        f"[provisioning-agent] "
+                        f"{ticket_id}: provisioned but "
+                        f"no IPs — running agent to "
+                        f"finish setup"
+                    )
+                else:
+                    logger.info(
+                        f"[provisioning-agent] Skipping "
+                        f"{ticket_id}: already provisioned"
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        "**Provisioning skipped:** Board "
+                        "is already provisioned from a "
+                        "previous cycle. Proceeding to "
+                        "benchmark.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "executing_benchmark",
+                        comment=(
+                            "Provisioning already complete, skipping to benchmark"
+                        ),
+                    )
+                    await mcp.disconnect()
+                    self._mcp = None
+                    return
+
         try:
             await super().run(ticket_id)
         finally:
@@ -177,6 +221,32 @@ class ProvisioningAgent(AgentBase):
                     f"  provisioning skill above.\n"
                 )
 
+                flash = cf.get("jumpstarter_flash", {})
+                if flash.get("flash_command"):
+                    content += (
+                        f"\n## Pre-Resolved Flash Command\n"
+                        f"```\n{flash['flash_command']}\n```\n"
+                        f"Run this via `jmp_run` with "
+                        f"timeout_seconds=600.\n"
+                    )
+                    if flash.get("ssh_public_key"):
+                        content += (
+                            f"\n## SSH Public Key "
+                            f"(for key injection)\n"
+                            f"```\n"
+                            f"{flash['ssh_public_key']}\n"
+                            f"```\n"
+                            f"**Key path:** "
+                            f"{flash.get('ssh_key_path', '/root/.ssh/id_rsa')}\n"
+                        )
+                elif flash.get("error"):
+                    content += f"\n## Image Resolution Error\n{flash['error']}\n"
+                    if flash.get("available_variants"):
+                        content += (
+                            f"Available variants: "
+                            f"{json.dumps(flash['available_variants'])}\n"
+                        )
+
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
             for comment in ticket["comments"]:
@@ -214,10 +284,26 @@ class ProvisioningAgent(AgentBase):
                 "assigned_hardware_ips",
                 result["ssh_hardware_ips"],
             )
+        elif not fields.get("ssh_hardware_ips") and fields["hosts_provisioned"]:
+            # Fallback: construct IPs from hosts_provisioned
+            # if the LLM didn't provide ssh_hardware_ips.
+            host = fields["hosts_provisioned"][0]
+            hw = {"controller": host, "targets": [host]}
+            fields["ssh_hardware_ips"] = hw
+            fields["assigned_hardware_ips"] = hw
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
         if result.get("ssh_key_path"):
             fields["ssh_key_path"] = result["ssh_key_path"]
+
+        # Mark device as ready so investigation loop-backs
+        # skip both suspension and re-provisioning.
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if cf.get("resource_provider") == "jumpstarter":
+            metadata = cf.get("resource_provider_metadata", {})
+            metadata["device_ready"] = True
+            fields["resource_provider_metadata"] = metadata
 
         await self._update_fields(ticket_id, fields)
 
@@ -230,7 +316,7 @@ class ProvisioningAgent(AgentBase):
         if config:
             summary += "- **Configuration:**\n"
             for host, items in config.items():
-                summary += f"  - {host}: {', '.join(items) if isinstance(items, list) else items}\n"
+                summary += f"  - {host}: {', '.join(str(i) for i in items) if isinstance(items, list) else items}\n"
         if result.get("notes"):
             summary += f"- **Notes:** {result['notes']}\n"
 

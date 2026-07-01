@@ -79,10 +79,24 @@ to construct a correct run file — getting the format right is critical.
    If it failed (non-zero exit code), you may retry once. If the retry also fails,
    submit with status "failed" and include the error output.
 
-   **IMPORTANT: Your job ends here.** Do NOT analyze results, query metrics,
-   check OpenSearch, or do any post-benchmark investigation. Result analysis
-   is the review agent's responsibility. After execute_benchmark returns,
-   call submit_benchmark_result immediately — do not run additional commands.
+   **IMPORTANT: Your job ends after execute_benchmark.** Do NOT:
+   - Analyze or interpret results
+   - Compare results to baselines or previous runs
+   - Query metrics, check OpenSearch, or investigate root causes
+   - Run additional diagnostic commands (version checks, perf traces, etc.)
+   - Attempt to explain regressions or characterize anomalies
+
+   Result interpretation and root-cause investigation are the evaluate
+   agent's responsibility in investigation tickets, and the review
+   agent's responsibility in ad-hoc tickets. After execute_benchmark
+   returns, call submit_benchmark_result immediately.
+
+   **For investigation tickets** (anomaly_context or investigation_ledger
+   present): read the key numeric metrics from the execute_benchmark
+   output (e.g., bogo_ops_per_sec, throughput, latency) and include
+   them in the `benchmark_results` field. This is result *extraction*,
+   not analysis. Do NOT run extra commands to get these numbers — they
+   should be in the execute_benchmark output already.
 
 ### Common pitfalls:
 - Use IP addresses, never hostnames (IPv6 link-local causes timeouts)

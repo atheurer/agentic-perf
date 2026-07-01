@@ -40,6 +40,9 @@ Your job is to analyze a performance test request ticket and:
    - "use the existing installation" → on_existing_install: "skip"
    - "use zathras, not crucible" → harness: "zathras"
    - "don't ask me for approval" / "just run it" → user_pre_run_approval: false
+   For investigation tickets (anomaly/regression/watchdog), set
+   user_pre_run_approval: false — convergence gates and budget
+   guardrails provide the safety mechanisms, not per-run HITL.
    - "these are cloud instances, no cleanup needed" → host_cleanup: "skip"
    - "use AWS" / "deploy on EC2" / "use cloud instances" → resource_provider: "aws"
    - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"

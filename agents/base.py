@@ -76,6 +76,16 @@ class AgentBase(ABC):
         ticket = await self._get_ticket(ticket_id)
         system_prompt = self._system_prompt(ticket)
         messages = self._build_messages(ticket)
+
+        # Inject SSH access info into messages so agents
+        # always know the actual host IPs. Prevents agents
+        # from using the ticket ID as an SSH target.
+        ssh_context = self._get_ssh_context_note(ticket)
+        if ssh_context and messages:
+            last = messages[-1]
+            if isinstance(last.get("content"), str):
+                last["content"] += ssh_context
+
         self._emit(
             ticket_id,
             "agent_started",
@@ -86,7 +96,6 @@ class AgentBase(ABC):
         )
         try:
             iteration = 0
-            self._budget_grace = False
             while self.max_iterations == 0 or iteration < self.max_iterations:
                 iteration += 1
                 self._emit(
@@ -146,48 +155,7 @@ class AgentBase(ABC):
                         ticket_id,
                     )
                     if budget_status == "pause":
-                        # Inject a final system message so the
-                        # LLM can wrap up gracefully before we
-                        # cut it off on the next iteration.
-                        if not getattr(self, "_budget_grace", False):
-                            self._budget_grace = True
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "[SYSTEM] Your token/cost "
-                                        "budget for this ticket is "
-                                        "exhausted. You MUST wrap up "
-                                        "immediately: submit your "
-                                        "best result now using your "
-                                        "submit_* tool, even if "
-                                        "incomplete. Summarize what "
-                                        "was accomplished and what "
-                                        "remains. This is your final "
-                                        "LLM call."
-                                    ),
-                                }
-                            )
-                            continue  # one more LLM call
-                        # Grace iteration used — hard stop.
                         break
-                    if budget_status == "warn":
-                        # Soft limit: inform the LLM so it can
-                        # start winding down proactively.
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "[SYSTEM] Budget warning: you "
-                                    "are approaching your token/cost "
-                                    "limit for this ticket. Begin "
-                                    "wrapping up your work. Finish "
-                                    "any critical in-progress steps, "
-                                    "then submit your results. Do "
-                                    "not start new exploratory work."
-                                ),
-                            }
-                        )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
@@ -351,7 +319,7 @@ class AgentBase(ABC):
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
 
     @abstractmethod
-    def _system_prompt(self, ticket: dict[str, Any]) -> str: ...
+    def _system_prompt(self) -> str: ...
 
     @abstractmethod
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]: ...
@@ -407,6 +375,48 @@ class AgentBase(ABC):
             if tc.name.startswith("submit_"):
                 return dict(tc.input)
         return None
+
+    @staticmethod
+    @staticmethod
+    def _get_ssh_context_note(
+        ticket: dict[str, Any],
+    ) -> str:
+        """Build an SSH context note from ticket fields.
+
+        Returns a markdown fragment with SSH access info,
+        or empty string if no SSH IPs are available.
+        Appended to agent messages by run() so every agent
+        sees the actual host IPs.
+        """
+        cf = ticket.get("custom_fields", {})
+        ssh_ips = cf.get("ssh_hardware_ips", {})
+        if not ssh_ips:
+            return ""
+
+        controller = ssh_ips.get("controller", "")
+        targets = ssh_ips.get("targets", [])
+        ssh_user = cf.get("ssh_user", "root")
+        ssh_key = cf.get("ssh_key_path", "")
+
+        hosts = []
+        if controller:
+            hosts.append(f"controller: {controller}")
+        if targets:
+            hosts.append(f"targets: {', '.join(str(t) for t in targets)}")
+
+        if not hosts:
+            return ""
+
+        note = f"\n\n## SSH Access\n- {', '.join(hosts)}\n- User: {ssh_user}\n"
+        if ssh_key:
+            note += f"- Key: {ssh_key}\n"
+        note += (
+            f"\n**IMPORTANT:** Use the IP addresses above "
+            f"for SSH operations (set_ssh_context, "
+            f"check_host, execute_command). The ticket ID "
+            f"({ticket.get('id', '')}) is NOT a hostname.\n"
+        )
+        return note
 
     @staticmethod
     def _get_scoped_context(
@@ -469,7 +479,13 @@ class AgentBase(ABC):
             return self.DEFAULT_TOOL_MIN_INTERVAL
 
     async def _throttle_tool_call(self) -> None:
-        """Enforce minimum interval between tool calls."""
+        """Enforce minimum interval between tool calls.
+
+        Prevents agents from overwhelming hosts with rapid-fire
+        SSH commands or API calls. Without this, an agent with
+        max_iterations=0 can spawn hundreds of SSH subprocesses
+        in seconds, crashing the target host.
+        """
         if self._tool_min_interval <= 0:
             return
         now = time.monotonic()
@@ -525,7 +541,6 @@ class AgentBase(ABC):
         the user can decide to increase the budget or abort.
         """
         try:
-            from orchestrator.config import _load_config_file
             from providers.budget import (
                 BudgetAction,
                 budget_from_custom_fields,
@@ -535,8 +550,7 @@ class AgentBase(ABC):
 
             ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
-            config = _load_config_file()
-            budget = budget_from_custom_fields(cf, config)
+            budget = budget_from_custom_fields(cf)
             if budget is None:
                 return "ok"
 
@@ -644,12 +658,17 @@ class AgentBase(ABC):
             json=body,
         )
         r.raise_for_status()
+        # Emit through the orchestrator's EventBus so the transition
+        # event shares seq ordering with agent events.  The state
+        # store does not emit transition events itself — keeping all
+        # events on one seq counter avoids collisions between the
+        # two independent EventBus instances.
         self._emit(
             ticket_id,
             "transition",
             {
                 "to": new_status,
-                "comment": comment or "",
+                "comment": comment,
                 "ticket_id": ticket_id,
             },
         )
@@ -741,29 +760,13 @@ class AgentBase(ABC):
         CloudEvents signal endpoint
         (``POST /api/v1/tickets/{id}/signal``).
 
-        This is the machine-signal equivalent of
-        ``_request_human_input`` — same park-and-resume pattern,
-        but the signal comes from hardware completion instead
-        of a human reply.
-
-        The external system that completes the operation sends
-        a CloudEvents POST with ``id`` matching ``operation_id``
-        to resume the ticket.
-
         Args:
             ticket_id: Ticket to suspend.
-            wait_type: What we're waiting for
-                (e.g., ``benchmark_execution``, ``provisioning``).
-            operation_id: Unique ID for the operation (run ID,
-                lease ID, etc.).  Must match the CloudEvent
-                ``id`` field in the completion signal.
-            resume_to_status: Status to transition to when the
-                operation completes.
-            resume_context: Dict of context the resumed agent
-                needs (what to analyze, harness, run ID, etc.).
-                Stored in ``custom_fields.async_context``.
-            expected_duration_mins: Estimated duration for
-                timeout detection (timeout = 2x this value).
+            wait_type: What we're waiting for.
+            operation_id: Must match the CloudEvent ``id`` field.
+            resume_to_status: Status to transition to on resume.
+            resume_context: Context for the resumed agent.
+            expected_duration_mins: Estimated duration (timeout = 2x).
         """
         from datetime import datetime, timezone
 
@@ -807,10 +810,4 @@ class AgentBase(ABC):
             ticket_id,
             "async_wait",
             comment=(f"Async suspend: {wait_type} (op={operation_id})"),
-        )
-
-        logger.info(
-            f"[{self.agent_name}] Suspended {ticket_id} for "
-            f"{wait_type} (op={operation_id}, "
-            f"resume_to={resume_to_status})"
         )

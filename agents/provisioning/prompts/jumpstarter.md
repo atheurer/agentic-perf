@@ -16,31 +16,20 @@ Call `jmp_connect` with the `lease_id` from the ticket's
 resource_provider_metadata. This establishes the tunnel to the
 physical device and returns a `connection_id`.
 
-#### Step 2: Resolve image URLs
+#### Step 2: Flash the OS image
 
-Before flashing, you MUST resolve the actual image file URLs from
-the image server's metadata. Do NOT guess filenames.
+Image URLs are pre-resolved by the orchestrator and stored in
+the ticket's `jumpstarter_flash` field. Check this field for:
+- `flash_command`: the complete `j storage flash` command to run
+- `flash_targets`: list of {partition, url} for each partition
+- `error`: if resolution failed, with `available_variants`
 
-Use `jmp_run` to download and read the image info JSON:
-```
-j ssh -- curl -sL https://autosd.sig.centos.org/AutoSD-10/nightly/info/test_images_info.json
-```
-
-The JSON contains board-specific image paths keyed by target label
-(e.g., `ride4_sa8775p_sx_r3` or `qc8775`). Find the entry matching
-the board type and the requested image_name (e.g., `ps`) and
-image_type (e.g., `regular`). Extract:
-- For multi-partition boards: `root_image_path`, `aboot_image_path`,
-  and optionally `qm_var_path`
-- For single-image boards: `path`
-
-Prepend the base URL to get full download URLs:
-`https://autosd.sig.centos.org/AutoSD-10/nightly/<path_from_json>`
-
-#### Step 3: Flash the OS image
-
-Use `jmp_run` to flash with the resolved URLs. This takes several
+If `jumpstarter_flash` is present and has no error, use the
+`flash_command` directly via `jmp_run`. This takes several
 minutes — use a timeout of at least 600 seconds.
+
+Do NOT try to resolve image URLs yourself. Do NOT fetch
+test_images_info.json. The URLs are already resolved.
 
 **Multi-partition boards** (Qualcomm RideSX4 SA8775P):
 ```
@@ -101,30 +90,24 @@ Verify there is a `scope global` interface (routable network).
 The board uses password auth by default (`root`/`password`). Set up
 key-based SSH so subsequent agents can connect directly.
 
-Use `jmp_run` to inject the orchestrator's SSH public key via the
-Jumpstarter tunnel. Run these as separate `jmp_run` calls:
+The orchestrator's SSH public key is pre-provided in the
+`jumpstarter_flash.ssh_public_key` field. Use it directly:
 
 ```
 j ssh -- "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
 ```
 
 ```
-j ssh -- sh -c "cat >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" < /root/.ssh/id_rsa.pub
+j ssh -- "echo '<ssh_public_key value>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
 ```
 
-If the above stdin redirection doesn't work through the tunnel,
-first read the public key with a local `jmp_run` call:
-```
-cat /root/.ssh/id_rsa.pub
-```
-Then inject it directly:
-```
-j ssh -- "echo '<PUBLIC_KEY_CONTENT>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
-```
+Replace `<ssh_public_key value>` with the actual key string from
+the `jumpstarter_flash.ssh_public_key` field. Do NOT try to read
+the key from the local filesystem.
 
 After injecting the key, verify direct SSH works using `execute_command`
 to SSH directly to `SUT_IP` as root (not through the Jumpstarter tunnel).
-Use `ssh_key_path` of `/root/.ssh/id_rsa`.
+Use `ssh_key_path` from `jumpstarter_flash.ssh_key_path`.
 
 #### Step 8: Submit result
 
