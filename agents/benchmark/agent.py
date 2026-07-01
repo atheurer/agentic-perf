@@ -94,15 +94,23 @@ class BenchmarkAgent(AgentBase):
         )
         await mcp.connect(infra_server, name="infra")
 
-        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
+        # Returns allowed tool names for filtering, or None.
         from agents.jumpstarter_mcp import attach_jumpstarter_mcp
 
-        await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
 
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Get all tools, but if Jumpstarter is attached,
+        # exclude lease management tools (resource provider's
+        # job, not the agent's).
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
 
         try:
             ticket = await self._get_ticket(ticket_id)

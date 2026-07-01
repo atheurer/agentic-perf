@@ -783,6 +783,26 @@ def main():
         "--yes", "-y", action="store_true", help="Skip confirmation prompt"
     )
 
+    p_signal = sub.add_parser(
+        "signal", help="Send a CloudEvents signal to resume an async_wait ticket"
+    )
+    p_signal.add_argument("ticket_id", help="Ticket ID to signal")
+    p_signal.add_argument(
+        "operation_id", help="Operation ID (must match async_context.operation_id)"
+    )
+    p_signal.add_argument(
+        "--event-type",
+        default=None,
+        help="CloudEvents type (default: dev.agentic-perf.device.ready)",
+    )
+    p_signal.add_argument(
+        "--source", default=None, help="CloudEvents source URI (default: cli/signal)"
+    )
+    p_signal.add_argument("--data", default=None, help="JSON payload (default: empty)")
+    p_signal.add_argument(
+        "--store", default="http://localhost:8090", help="State store URL"
+    )
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -800,9 +820,37 @@ def main():
         "transcript": cmd_transcript,
         "health": cmd_health,
         "cleanup": cmd_cleanup,
+        "signal": cmd_signal,
     }
     commands[args.command](args)
 
 
 if __name__ == "__main__":
     main()
+
+
+def cmd_signal(args):
+    """Send a CloudEvents completion signal to resume an async_wait ticket."""
+    import json
+    from datetime import datetime, timezone
+
+    event = {
+        "specversion": "1.0",
+        "type": args.event_type or "dev.agentic-perf.device.ready",
+        "source": args.source or "cli/signal",
+        "id": args.operation_id,
+        "subject": args.ticket_id,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "data": json.loads(args.data) if args.data else {},
+    }
+
+    r = httpx.post(
+        f"{args.store}/api/v1/tickets/{args.ticket_id}/signal",
+        json=event,
+    )
+    if r.ok:
+        result = r.json()
+        print(f"Signal sent: {result.get('status', 'ok')}")
+        print(f"Ticket {args.ticket_id} resumed to: {result.get('resumed_to', '?')}")
+    else:
+        print(f"Error: {r.status_code} — {r.text}")

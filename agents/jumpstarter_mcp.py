@@ -54,7 +54,7 @@ async def attach_jumpstarter_mcp(
     mcp_client: AgentMCPClient,
     ticket_id: str,
     store_url: str,
-) -> bool:
+) -> set[str] | None:
     """Conditionally attach Jumpstarter MCP to an agent.
 
     Checks if the ticket uses Jumpstarter-provisioned hardware.
@@ -72,7 +72,8 @@ async def attach_jumpstarter_mcp(
         store_url: State store URL for ticket lookup.
 
     Returns:
-        True if Jumpstarter MCP was attached, False otherwise.
+        Set of allowed tool names if attached (for use with
+        list_tools(include=...)), or None if not attached.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -97,7 +98,7 @@ async def attach_jumpstarter_mcp(
             "[jumpstarter-mcp] Not attached (not configured or not available)",
             exc_info=True,
         )
-        return False
+        return None
 
 
 async def suspend_for_device_ready(
@@ -135,6 +136,13 @@ async def suspend_for_device_ready(
         # Skip if already signaled (resuming from suspension)
         async_ctx = cf.get("async_context", {})
         if async_ctx.get("signal_received"):
+            return False
+
+        # Check if device is already connected/ready.
+        # If the lease is active and we can get a TCP address,
+        # the device is ready — no need to suspend.
+        metadata = cf.get("resource_provider_metadata", {})
+        if metadata.get("device_ready"):
             return False
 
         # Get the lease ID from resource allocation
