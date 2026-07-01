@@ -77,6 +77,12 @@ class ProvisioningAgent(AgentBase):
             },
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware
+        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
+
+        await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()

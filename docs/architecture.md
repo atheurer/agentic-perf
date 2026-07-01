@@ -502,6 +502,14 @@ cycling, serial console, firmware) use the Jumpstarter MCP
 server (`jmp mcp serve`) attached to agents via
 `connect_command()` (Layer 2).
 
+When a ticket uses Jumpstarter hardware (`resource_provider =
+"jumpstarter"`), the benchmark and provisioning agents
+automatically attach the Jumpstarter MCP server via
+`attach_jumpstarter_mcp()`. Tool filtering ensures agents see
+device interaction tools (`jmp_run`, `jmp_connect`, `jmp_explore`)
+but not lease management tools (`jmp_create_lease`,
+`jmp_delete_lease`) which are the resource provider's job.
+
 ### Skill Providers
 
 Interface: `SkillProvider` (`providers/skills/base.py`)
