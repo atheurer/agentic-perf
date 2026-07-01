@@ -371,6 +371,19 @@ async def _resolve_jumpstarter_images(
                 },
             )
 
+        # Include the orchestrator's SSH public key so
+        # the provisioning agent can inject it into the
+        # board without needing a local file-read tool.
+        try:
+            from pathlib import Path
+
+            pub_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+            if pub_key_path.exists():
+                result["ssh_public_key"] = pub_key_path.read_text().strip()
+                result["ssh_key_path"] = str(pub_key_path.with_suffix(""))
+        except Exception:
+            pass
+
         if result.get("error"):
             logger.warning(
                 f"[jumpstarter-images] Resolution failed "

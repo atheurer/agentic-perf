@@ -94,30 +94,24 @@ Verify there is a `scope global` interface (routable network).
 The board uses password auth by default (`root`/`password`). Set up
 key-based SSH so subsequent agents can connect directly.
 
-Use `jmp_run` to inject the orchestrator's SSH public key via the
-Jumpstarter tunnel. Run these as separate `jmp_run` calls:
+The orchestrator's SSH public key is pre-provided in the
+`jumpstarter_flash.ssh_public_key` field. Use it directly:
 
 ```
 j ssh -- "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
 ```
 
 ```
-j ssh -- sh -c "cat >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" < /root/.ssh/id_rsa.pub
+j ssh -- "echo '<ssh_public_key value>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
 ```
 
-If the above stdin redirection doesn't work through the tunnel,
-first read the public key with a local `jmp_run` call:
-```
-cat /root/.ssh/id_rsa.pub
-```
-Then inject it directly:
-```
-j ssh -- "echo '<PUBLIC_KEY_CONTENT>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
-```
+Replace `<ssh_public_key value>` with the actual key string from
+the `jumpstarter_flash.ssh_public_key` field. Do NOT try to read
+the key from the local filesystem.
 
 After injecting the key, verify direct SSH works using `execute_command`
 to SSH directly to `SUT_IP` as root (not through the Jumpstarter tunnel).
-Use `ssh_key_path` of `/root/.ssh/id_rsa`.
+Use `ssh_key_path` from `jumpstarter_flash.ssh_key_path`.
 
 #### Step 7: Submit result
 

@@ -274,6 +274,16 @@ class ProvisioningAgent(AgentBase):
                         f"Run this via `jmp_run` with "
                         f"timeout_seconds=600.\n"
                     )
+                    if flash.get("ssh_public_key"):
+                        content += (
+                            f"\n## SSH Public Key "
+                            f"(for key injection)\n"
+                            f"```\n"
+                            f"{flash['ssh_public_key']}\n"
+                            f"```\n"
+                            f"**Key path:** "
+                            f"{flash.get('ssh_key_path', '/root/.ssh/id_rsa')}\n"
+                        )
                 elif flash.get("error"):
                     content += f"\n## Image Resolution Error\n{flash['error']}\n"
                     if flash.get("available_variants"):
