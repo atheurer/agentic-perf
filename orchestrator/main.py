@@ -360,17 +360,6 @@ async def _resolve_jumpstarter_images(
                     if not result.get("error"):
                         break
 
-        # Store on ticket
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.patch(
-                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {
-                        "jumpstarter_flash": result,
-                    },
-                },
-            )
-
         # Include the orchestrator's SSH public key so
         # the provisioning agent can inject it into the
         # board without needing a local file-read tool.
@@ -383,6 +372,17 @@ async def _resolve_jumpstarter_images(
                 result["ssh_key_path"] = str(pub_key_path.with_suffix(""))
         except Exception:
             pass
+
+        # Store on ticket (after adding SSH key)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "jumpstarter_flash": result,
+                    },
+                },
+            )
 
         if result.get("error"):
             logger.warning(
