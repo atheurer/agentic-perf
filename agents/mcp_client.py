@@ -40,16 +40,50 @@ class AgentMCPClient:
         name: str | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
+        """Connect to a Python MCP server script.
+
+        Launches the script with the current Python interpreter.
+        For non-Python MCP servers (e.g., Jumpstarter's
+        ``jmp mcp serve``), use connect_command() instead.
+        """
+        await self.connect_command(
+            command=sys.executable,
+            args=[server_script],
+            name=name or server_script,
+            env=env,
+        )
+
+    async def connect_command(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        name: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Connect to an MCP server started by an arbitrary command.
+
+        This supports non-Python MCP servers such as Jumpstarter
+        (``jmp mcp serve``) or any other binary that speaks MCP
+        over stdio. The underlying transport is identical to
+        connect() — only the launch command differs.
+
+        Args:
+            command: The executable to run (e.g., "jmp").
+            args: Arguments to pass (e.g., ["mcp", "serve"]).
+            name: Display name for logging and tool routing.
+            env: Extra environment variables (merged with
+                os.environ).
+        """
         if name is None:
-            name = server_script
+            name = command
 
         merged_env = None
         if env is not None:
             merged_env = {**os.environ, **env}
 
         params = StdioServerParameters(
-            command=sys.executable,
-            args=[server_script],
+            command=command,
+            args=args or [],
             env=merged_env,
         )
         stdio_cm = stdio_client(params)
