@@ -357,6 +357,7 @@ class ResourceAgent(AgentBase):
             "ip_mapping",
             "ami",
             "cloud_login_user",
+            "device_ready",
         ):
             if key in reservation_metadata and key not in provider_metadata:
                 provider_metadata[key] = reservation_metadata[key]

@@ -93,10 +93,24 @@ class BenchmarkAgent(AgentBase):
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
+        # Returns allowed tool names for filtering, or None.
+        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
+
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Get all tools, but if Jumpstarter is attached,
+        # exclude lease management tools (resource provider's
+        # job, not the agent's).
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
 
         try:
             ticket = await self._get_ticket(ticket_id)
@@ -143,8 +157,17 @@ class BenchmarkAgent(AgentBase):
 
         if cf.get("parsed_specs"):
             content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
-        if cf.get("benchmark_suite"):
-            content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
+        suite = cf.get("benchmark_suite", "")
+        harness = cf.get("directives", {}).get("harness", "")
+        if suite:
+            content += (
+                f"\n**Benchmark Suite:** {suite}\n"
+                f"Use this exact name in get_benchmark_params, "
+                f"get_example_runfile, and generate_runfile "
+                f"calls."
+            )
+            if harness:
+                content += f" Use harness='{harness}' in those calls.\n"
         if cf.get("absent_suite"):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
@@ -240,12 +263,14 @@ class BenchmarkAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        fields = {
+        fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
         }
+        if result.get("benchmark_results"):
+            fields["benchmark_results"] = result["benchmark_results"]
         await self._update_fields(ticket_id, fields)
 
         status = fields["benchmark_status"]
@@ -268,8 +293,19 @@ class BenchmarkAgent(AgentBase):
                 comment="Benchmark failed — needs investigation",
             )
         else:
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_review",
-                comment="Benchmark completed, ready for review",
-            )
+            # Route based on whether this is an investigation
+            # ticket. Same code-enforced pattern as triage.
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+                await self._transition_ticket(
+                    ticket_id,
+                    "evaluating_convergence",
+                    comment=("Benchmark completed, evaluating convergence"),
+                )
+            else:
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_review",
+                    comment=("Benchmark completed, ready for review"),
+                )

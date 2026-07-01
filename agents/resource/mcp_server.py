@@ -410,7 +410,7 @@ def create_resource_tool_handlers(
 
     async def get_accumulated_metadata() -> dict:
         result = dict(last_reservation.get("provider_metadata", {}))
-        for key in ("ssh_user", "ssh_key_path"):
+        for key in ("ssh_user", "ssh_key_path", "device_ready"):
             if key in last_reservation:
                 result[key] = last_reservation[key]
         return result

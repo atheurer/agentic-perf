@@ -116,9 +116,30 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     )
 
 
+def _validate_host(host: str) -> str | None:
+    """Reject ticket IDs used as SSH targets.
+
+    Returns an error message if the host looks like a ticket
+    ID (e.g., PERF-ABC123), or None if it's valid.
+    """
+    import re
+
+    if re.match(r"^PERF-[A-F0-9]+$", host, re.IGNORECASE):
+        return (
+            f"ERROR: '{host}' is a ticket ID, not a "
+            f"hostname or IP address. Use the actual "
+            f"host IP from the ticket's SSH Access "
+            f"section (e.g., 10.x.x.x) instead."
+        )
+    return None
+
+
 @mcp.tool()
 async def check_host(host: str) -> str:
     """Test SSH connectivity and gather system info (OS, CPU, RAM, hostname)."""
+    err = _validate_host(host)
+    if err:
+        return err
     ssh = _get_ssh()
 
     result = await ssh.run(host, "echo SSH_OK", timeout=15)
@@ -415,6 +436,9 @@ async def execute_command(
 
     Call set_ssh_context() with agent_name to load the policy.
     """
+    err = _validate_host(host)
+    if err:
+        return err
     ssh = _get_ssh()
 
     command = html.unescape(command)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +30,12 @@ class AgentBase(ABC):
     # arbitrary count.
     DEFAULT_MAX_ITERATIONS = 20
 
+    # Minimum seconds between tool calls. Prevents agents
+    # from overwhelming hosts with rapid-fire SSH commands
+    # or API calls. Configurable via config.json:
+    #   { "tool_rate_limit": { "min_interval_sec": 2.0 } }
+    DEFAULT_TOOL_MIN_INTERVAL = 1.0
+
     def __init__(
         self,
         agent_name: str,
@@ -47,6 +54,9 @@ class AgentBase(ABC):
         self._mcp = None
         self._client = httpx.AsyncClient(timeout=30.0)
         self._events = event_bus
+        self._last_tool_call_time: float = 0.0
+        self._tool_min_interval = self._load_tool_rate_limit()
+        self._budget_grace = False
         self.max_iterations = (
             max_iterations
             if max_iterations is not None
@@ -67,6 +77,16 @@ class AgentBase(ABC):
         ticket = await self._get_ticket(ticket_id)
         system_prompt = self._system_prompt(ticket)
         messages = self._build_messages(ticket)
+
+        # Inject SSH access info into messages so agents
+        # always know the actual host IPs. Prevents agents
+        # from using the ticket ID as an SSH target.
+        ssh_context = self._get_ssh_context_note(ticket)
+        if ssh_context and messages:
+            last = messages[-1]
+            if isinstance(last.get("content"), str):
+                last["content"] += ssh_context
+
         self._emit(
             ticket_id,
             "agent_started",
@@ -127,6 +147,52 @@ class AgentBase(ABC):
                         "raw_content": response.raw_content,
                     },
                 )
+
+                # Check per-ticket budget after each LLM call.
+                # Uses the EventBus cumulative usage which is
+                # updated by the OTLP span processor.
+                if self._events and iteration > 1:
+                    budget_status = await self._check_budget(
+                        ticket_id,
+                    )
+                    if budget_status == "pause":
+                        # Inject a final system message so
+                        # the LLM can wrap up gracefully
+                        # before we cut it off.
+                        if not getattr(self, "_budget_grace", False):
+                            self._budget_grace = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your token/"
+                                        "cost budget for this "
+                                        "ticket is exhausted. "
+                                        "You MUST wrap up "
+                                        "immediately: submit "
+                                        "your best result now "
+                                        "using your submit_* "
+                                        "tool, even if "
+                                        "incomplete. This is "
+                                        "your final LLM call."
+                                    ),
+                                }
+                            )
+                            continue  # one more LLM call
+                        # Grace iteration used — hard stop.
+                        break
+                    if budget_status == "warn":
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[SYSTEM] Budget warning: "
+                                    "you are approaching your "
+                                    "token/cost limit. Start "
+                                    "wrapping up proactively."
+                                ),
+                            }
+                        )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
@@ -290,7 +356,7 @@ class AgentBase(ABC):
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
 
     @abstractmethod
-    def _system_prompt(self, ticket: dict[str, Any]) -> str: ...
+    def _system_prompt(self) -> str: ...
 
     @abstractmethod
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]: ...
@@ -348,6 +414,48 @@ class AgentBase(ABC):
         return None
 
     @staticmethod
+    @staticmethod
+    def _get_ssh_context_note(
+        ticket: dict[str, Any],
+    ) -> str:
+        """Build an SSH context note from ticket fields.
+
+        Returns a markdown fragment with SSH access info,
+        or empty string if no SSH IPs are available.
+        Appended to agent messages by run() so every agent
+        sees the actual host IPs.
+        """
+        cf = ticket.get("custom_fields", {})
+        ssh_ips = cf.get("ssh_hardware_ips", {})
+        if not ssh_ips:
+            return ""
+
+        controller = ssh_ips.get("controller", "")
+        targets = ssh_ips.get("targets", [])
+        ssh_user = cf.get("ssh_user", "root")
+        ssh_key = cf.get("ssh_key_path", "")
+
+        hosts = []
+        if controller:
+            hosts.append(f"controller: {controller}")
+        if targets:
+            hosts.append(f"targets: {', '.join(str(t) for t in targets)}")
+
+        if not hosts:
+            return ""
+
+        note = f"\n\n## SSH Access\n- {', '.join(hosts)}\n- User: {ssh_user}\n"
+        if ssh_key:
+            note += f"- Key: {ssh_key}\n"
+        note += (
+            f"\n**IMPORTANT:** Use the IP addresses above "
+            f"for SSH operations (set_ssh_context, "
+            f"check_host, execute_command). The ticket ID "
+            f"({ticket.get('id', '')}) is NOT a hostname.\n"
+        )
+        return note
+
+    @staticmethod
     def _get_scoped_context(
         ticket: dict[str, Any],
         agent_key: str,
@@ -394,7 +502,37 @@ class AgentBase(ABC):
 
         return "\n\n".join(parts)
 
+    def _load_tool_rate_limit(self) -> float:
+        """Load tool rate limit from config."""
+        try:
+            from orchestrator.config import _load_config_file
+
+            cfg = _load_config_file()
+            return cfg.get("tool_rate_limit", {}).get(
+                "min_interval_sec",
+                self.DEFAULT_TOOL_MIN_INTERVAL,
+            )
+        except Exception:
+            return self.DEFAULT_TOOL_MIN_INTERVAL
+
+    async def _throttle_tool_call(self) -> None:
+        """Enforce minimum interval between tool calls.
+
+        Prevents agents from overwhelming hosts with rapid-fire
+        SSH commands or API calls. Without this, an agent with
+        max_iterations=0 can spawn hundreds of SSH subprocesses
+        in seconds, crashing the target host.
+        """
+        if self._tool_min_interval <= 0:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_tool_call_time
+        if elapsed < self._tool_min_interval:
+            await asyncio.sleep(self._tool_min_interval - elapsed)
+        self._last_tool_call_time = time.monotonic()
+
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
+        await self._throttle_tool_call()
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
             try:
@@ -432,6 +570,115 @@ class AgentBase(ABC):
             is_error=True,
         )
 
+    async def _check_budget(self, ticket_id: str) -> str:
+        """Check per-ticket LLM budget.
+
+        Returns 'ok', 'warn', or 'pause'. On 'pause', the agent
+        transitions the ticket to awaiting_customer_guidance so
+        the user can decide to increase the budget or abort.
+        """
+        try:
+            from providers.budget import (
+                BudgetAction,
+                budget_from_custom_fields,
+                check_ticket_budget,
+            )
+            from providers.cost import estimate_cumulative_cost
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            budget = budget_from_custom_fields(cf)
+            if budget is None:
+                return "ok"
+
+            assert self._events is not None
+            usage = self._events.get_cumulative_usage(ticket_id)
+            cost = estimate_cumulative_cost(usage)
+            status = check_ticket_budget(budget, usage, cost)
+
+            if status.action == BudgetAction.PAUSE:
+                self._emit(
+                    ticket_id,
+                    "agent_error",
+                    {
+                        "reason": "budget_exceeded",
+                        "detail": status.reason,
+                    },
+                )
+                logger.warning(
+                    f"[{self.agent_name}] Budget exceeded on"
+                    f" {ticket_id}: {status.reason}"
+                )
+                await self._add_comment(
+                    ticket_id,
+                    f"**Budget exceeded:** {status.reason}\n\n"
+                    f"Ticket paused. Increase the budget in "
+                    f"custom_fields.llm_budget or approve "
+                    f"continued spending.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=f"Budget exceeded: {status.reason}",
+                )
+                return "pause"
+
+            if status.action == BudgetAction.WARN:
+                logger.info(
+                    f"[{self.agent_name}] Budget warning on"
+                    f" {ticket_id}: {status.reason}"
+                )
+                await self._add_comment(
+                    ticket_id,
+                    f"**Budget warning:** {status.reason}",
+                )
+                return "warn"
+
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(f"[{self.agent_name}] Budget check failed")
+
+        return "ok"
+
+    async def _get_investigation_ledger(
+        self,
+        ticket_id: str,
+    ) -> list[dict[str, Any]]:
+        """Read the investigation ledger from the ticket."""
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        return cf.get("investigation_ledger", [])
+
+    async def _append_ledger_entry(
+        self,
+        ticket_id: str,
+        iteration: int,
+        plan_steps: list[int] | None = None,
+        hypothesis: str = "",
+        params_rationale: str = "",
+        conclusion: str = "",
+        info_gain: float = 0.0,
+    ) -> None:
+        """Append an entry to the investigation ledger.
+
+        Performs a read-modify-write on the ledger list.
+        """
+        from providers.ledger import LedgerEntry, append_ledger_entry
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        entry = LedgerEntry(
+            iteration=iteration,
+            plan_steps=plan_steps or [],
+            hypothesis=hypothesis,
+            params_rationale=params_rationale,
+            conclusion=conclusion,
+            info_gain=info_gain,
+        )
+        fields = append_ledger_entry(cf, entry)
+        await self._update_fields(ticket_id, fields)
+
     async def _get_ticket(self, ticket_id: str) -> dict[str, Any]:
         r = await self._client.get(f"{self.store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
@@ -448,6 +695,20 @@ class AgentBase(ABC):
             json=body,
         )
         r.raise_for_status()
+        # Emit through the orchestrator's EventBus so the transition
+        # event shares seq ordering with agent events.  The state
+        # store does not emit transition events itself — keeping all
+        # events on one seq counter avoids collisions between the
+        # two independent EventBus instances.
+        self._emit(
+            ticket_id,
+            "transition",
+            {
+                "to": new_status,
+                "comment": comment,
+                "ticket_id": ticket_id,
+            },
+        )
         return r.json()
 
     async def _update_fields(
@@ -517,3 +778,73 @@ class AgentBase(ABC):
                 comment=f"HITL timeout — resuming from {prev}",
             )
         return "No response received within timeout. Proceed with best judgment."
+
+    async def _suspend_for_async(
+        self,
+        ticket_id: str,
+        wait_type: str,
+        operation_id: str,
+        resume_to_status: str,
+        resume_context: dict[str, Any] | None = None,
+        expected_duration_mins: int = 60,
+    ) -> None:
+        """Suspend the agent for a long-running async operation.
+
+        Writes execution context to the ticket and transitions
+        to ``async_wait``.  The agent exits cleanly (LLM session
+        ends, compute released).  The orchestrator monitors for
+        timeout; completion is signaled externally via the
+        CloudEvents signal endpoint
+        (``POST /api/v1/tickets/{id}/signal``).
+
+        Args:
+            ticket_id: Ticket to suspend.
+            wait_type: What we're waiting for.
+            operation_id: Must match the CloudEvent ``id`` field.
+            resume_to_status: Status to transition to on resume.
+            resume_context: Context for the resumed agent.
+            expected_duration_mins: Estimated duration (timeout = 2x).
+        """
+        from datetime import datetime, timezone
+
+        async_context: dict[str, Any] = {
+            "wait_type": wait_type,
+            "operation_id": operation_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "expected_duration_mins": expected_duration_mins,
+            "resume_to_status": resume_to_status,
+            "resume_context": resume_context or {},
+            "suspended_by": self.agent_name,
+        }
+
+        await self._update_fields(
+            ticket_id,
+            {"async_context": async_context},
+        )
+
+        self._emit(
+            ticket_id,
+            "async_suspend",
+            {
+                "wait_type": wait_type,
+                "operation_id": operation_id,
+                "resume_to_status": resume_to_status,
+                "expected_duration_mins": expected_duration_mins,
+            },
+        )
+
+        await self._add_comment(
+            ticket_id,
+            f"**Async suspension:** {self.agent_name} has "
+            f"started a long-running {wait_type} operation "
+            f"(~{expected_duration_mins} min expected). The "
+            f"LLM session is parked to save compute. The "
+            f"orchestrator will resume automatically when "
+            f"the operation completes.",
+        )
+
+        await self._transition_ticket(
+            ticket_id,
+            "async_wait",
+            comment=(f"Async suspend: {wait_type} (op={operation_id})"),
+        )
