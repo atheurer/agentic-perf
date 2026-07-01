@@ -158,7 +158,7 @@ class TestReserve:
         mock_svc.CreateLease = AsyncMock(return_value=mock_lease)
         provider._service = mock_svc
 
-        result = await provider.reserve({}, ticket_id="PERF-TEST")
+        result = await provider.reserve({}, description="test", ticket_id="PERF-TEST")
         assert result["provider"] == "jumpstarter"
         assert result["lease_id"] == "lease-abc123"
         assert result["status"] == "active"

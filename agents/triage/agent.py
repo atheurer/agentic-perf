@@ -121,6 +121,33 @@ class TriageAgent(AgentBase):
         if scoped_context and isinstance(scoped_context, dict):
             fields["scoped_context"] = scoped_context
 
+        # Detect anomaly context from the triage result or
+        # ticket description. This field drives code-enforced
+        # routing to the investigation path.
+        anomaly_ctx = result.get("anomaly_context")
+        if not anomaly_ctx:
+            # Check if the ticket description has anomaly
+            # indicators that triage recognized.
+            ticket = await self._get_ticket(ticket_id)
+            desc = ticket.get("description", "").lower()
+            hypothesis = fields.get("hypothesis", "").lower()
+            anomaly_markers = (
+                "regression",
+                "anomaly",
+                "watchdog",
+                "degradation",
+                "deviation",
+            )
+            if any(m in desc for m in anomaly_markers) and any(
+                m in hypothesis for m in anomaly_markers
+            ):
+                anomaly_ctx = {
+                    "source": "triage_detection",
+                    "hypothesis": fields.get("hypothesis", ""),
+                }
+        if anomaly_ctx:
+            fields["anomaly_context"] = anomaly_ctx
+
         # Every ticket gets an execution plan — even single-
         # benchmark requests get a 1-step plan. This ensures
         # the investigation ledger always has plan_steps to

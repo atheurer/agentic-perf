@@ -825,10 +825,6 @@ def main():
     commands[args.command](args)
 
 
-if __name__ == "__main__":
-    main()
-
-
 def cmd_signal(args):
     """Send a CloudEvents completion signal to resume an async_wait ticket."""
     import json
@@ -848,9 +844,13 @@ def cmd_signal(args):
         f"{args.store}/api/v1/tickets/{args.ticket_id}/signal",
         json=event,
     )
-    if r.ok:
+    if r.is_success:
         result = r.json()
         print(f"Signal sent: {result.get('status', 'ok')}")
         print(f"Ticket {args.ticket_id} resumed to: {result.get('resumed_to', '?')}")
     else:
         print(f"Error: {r.status_code} — {r.text}")
+
+
+if __name__ == "__main__":
+    main()

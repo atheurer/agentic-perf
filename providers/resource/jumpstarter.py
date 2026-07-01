@@ -182,24 +182,36 @@ class JumpstarterResourceProvider(ResourceProvider):
 
     async def reserve(
         self,
-        requirements: dict[str, Any],
-        ticket_id: str = "",
+        selection: dict[str, Any],
+        description: str = "",
+        duration_hours: int = 36,
+        ticket_id: str | None = None,
     ) -> dict[str, Any]:
         """Reserve a Jumpstarter device via lease.
 
         Creates a lease for a device matching the selector.
         Returns the lease ID and device info.
+
+        Args:
+            selection: Must include jumpstarter_selector and
+                optionally lease_duration_seconds.
+            description: Reservation description (for logging).
+            duration_hours: Fallback duration if not in selection
+                (converted to seconds).
+            ticket_id: Ticket ID for lease naming.
         """
         await self._ensure_connected()
         assert self._service is not None
 
-        selector = requirements.get(
+        selector = selection.get(
             "jumpstarter_selector",
             self._default_selector,
         )
-        duration_sec = requirements.get(
+        # Prefer explicit seconds from selection, else use
+        # duration_hours converted, else default.
+        duration_sec = selection.get(
             "lease_duration_seconds",
-            self._default_duration,
+            duration_hours * 3600 if duration_hours != 36 else self._default_duration,
         )
         duration = timedelta(seconds=duration_sec)
 
@@ -238,6 +250,11 @@ class JumpstarterResourceProvider(ResourceProvider):
             "duration_seconds": duration_sec,
             "ssh_user": self._ssh_user,
             "status": "active",
+            # The Jumpstarter MCP tunnel is available
+            # immediately after lease creation. The
+            # provisioning agent can connect and flash
+            # without waiting for an external signal.
+            "device_ready": True,
         }
 
     async def get_reservation_status(
@@ -267,6 +284,7 @@ class JumpstarterResourceProvider(ResourceProvider):
     async def terminate(
         self,
         reservation_id: str,
+        provider_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Delete a lease and release the device."""
         await self._ensure_connected()

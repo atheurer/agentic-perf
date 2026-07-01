@@ -56,7 +56,12 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
     controller = ips.get("controller")
     targets = ips.get("targets", [])
 
+    # Jumpstarter devices don't have IPs until the provisioning
+    # agent flashes and boots them. Skip this check for Jumpstarter.
+    provider = cf.get("resource_provider")
     if not controller and not targets:
+        if provider == "jumpstarter":
+            return True, "ok (Jumpstarter — IP discovered during provisioning)"
         return False, "No hosts allocated — assigned_hardware_ips is empty"
 
     meta = cf.get("resource_provider_metadata", {})
