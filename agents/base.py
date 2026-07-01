@@ -56,6 +56,7 @@ class AgentBase(ABC):
         self._events = event_bus
         self._last_tool_call_time: float = 0.0
         self._tool_min_interval = self._load_tool_rate_limit()
+        self._budget_grace = False
         self.max_iterations = (
             max_iterations
             if max_iterations is not None
@@ -155,7 +156,43 @@ class AgentBase(ABC):
                         ticket_id,
                     )
                     if budget_status == "pause":
+                        # Inject a final system message so
+                        # the LLM can wrap up gracefully
+                        # before we cut it off.
+                        if not getattr(self, "_budget_grace", False):
+                            self._budget_grace = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your token/"
+                                        "cost budget for this "
+                                        "ticket is exhausted. "
+                                        "You MUST wrap up "
+                                        "immediately: submit "
+                                        "your best result now "
+                                        "using your submit_* "
+                                        "tool, even if "
+                                        "incomplete. This is "
+                                        "your final LLM call."
+                                    ),
+                                }
+                            )
+                            continue  # one more LLM call
+                        # Grace iteration used — hard stop.
                         break
+                    if budget_status == "warn":
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[SYSTEM] Budget warning: "
+                                    "you are approaching your "
+                                    "token/cost limit. Start "
+                                    "wrapping up proactively."
+                                ),
+                            }
+                        )
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(
