@@ -24,6 +24,18 @@ Use `jmp_run` to flash. The command depends on the board type:
 ```
 j storage flash <IMAGE_URL>
 ```
+Image URLs are pre-resolved by the orchestrator and stored in
+the ticket's `jumpstarter_flash` field. Check this field for:
+- `flash_command`: the complete `j storage flash` command to run
+- `flash_targets`: list of {partition, url} for each partition
+- `error`: if resolution failed, with `available_variants`
+
+If `jumpstarter_flash` is present and has no error, use the
+`flash_command` directly via `jmp_run`. This takes several
+minutes — use a timeout of at least 600 seconds.
+
+Do NOT try to resolve image URLs yourself. Do NOT fetch
+test_images_info.json. The URLs are already resolved.
 
 **Multi-partition boards** (Qualcomm RideSX4 SA8775P):
 ```

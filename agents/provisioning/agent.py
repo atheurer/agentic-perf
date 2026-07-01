@@ -266,6 +266,22 @@ class ProvisioningAgent(AgentBase):
                     f"  provisioning skill above.\n"
                 )
 
+                flash = cf.get("jumpstarter_flash", {})
+                if flash.get("flash_command"):
+                    content += (
+                        f"\n## Pre-Resolved Flash Command\n"
+                        f"```\n{flash['flash_command']}\n```\n"
+                        f"Run this via `jmp_run` with "
+                        f"timeout_seconds=600.\n"
+                    )
+                elif flash.get("error"):
+                    content += f"\n## Image Resolution Error\n{flash['error']}\n"
+                    if flash.get("available_variants"):
+                        content += (
+                            f"Available variants: "
+                            f"{json.dumps(flash['available_variants'])}\n"
+                        )
+
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
             for comment in ticket["comments"]:
