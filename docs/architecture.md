@@ -510,6 +510,27 @@ device interaction tools (`jmp_run`, `jmp_connect`, `jmp_explore`)
 but not lease management tools (`jmp_create_lease`,
 `jmp_delete_lease`) which are the resource provider's job.
 
+**Orchestrator pre-flight for Jumpstarter tickets:**
+
+- **Image resolution:** Before the provisioning agent runs, the
+  orchestrator fetches `test_images_info.json` from the build
+  server and resolves the flash command deterministically. The
+  result (including `flash_command`, partition URLs, and the
+  orchestrator's SSH public key) is stored in
+  `custom_fields.jumpstarter_flash`. Agents never touch the
+  image server.
+- **Provisioning idempotency:** If `provisioning_complete` is
+  set and SSH IPs are recorded, the provisioning agent skips
+  directly to `executing_benchmark`. This prevents re-flashing
+  on investigation loop-backs and crash recovery.
+- **Threshold-based suspension:** If expected provisioning
+  duration exceeds `SUSPEND_THRESHOLD_MINS` (10 min), the
+  agent suspends via `_suspend_for_async()` to save LLM
+  compute. Short operations proceed synchronously.
+- **Lease cleanup:** `_cleanup_jumpstarter_lease()` in the
+  orchestrator terminates leases when tickets are parked
+  (timeout, budget exhaustion) without reaching teardown.
+
 ### Skill Providers
 
 Interface: `SkillProvider` (`providers/skills/base.py`)
