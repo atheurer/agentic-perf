@@ -268,8 +268,19 @@ class BenchmarkAgent(AgentBase):
                 comment="Benchmark failed — needs investigation",
             )
         else:
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_review",
-                comment="Benchmark completed, ready for review",
-            )
+            # Route based on whether this is an investigation
+            # ticket. Same code-enforced pattern as triage.
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+                await self._transition_ticket(
+                    ticket_id,
+                    "evaluating_convergence",
+                    comment=("Benchmark completed, evaluating convergence"),
+                )
+            else:
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_review",
+                    comment=("Benchmark completed, ready for review"),
+                )

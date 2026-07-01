@@ -314,3 +314,61 @@ async def test_early_exit_no_error(tmp_path):
     events = event_bus.get_events("PERF-TEST")
     error_events = [e for e in events if e["event_type"] == "agent_error"]
     assert len(error_events) == 0
+
+
+# --- Tool rate limiting ---
+
+
+@pytest.mark.asyncio
+async def test_tool_rate_limiting():
+    """Tool calls are throttled by min_interval_sec."""
+    import time
+
+    from providers.llm.base import ToolCall
+
+    llm = _CountingLLM()
+    agent = _StubAgent(
+        agent_name="test",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+    )
+    agent._tool_min_interval = 0.1  # 100ms for fast test
+
+    # Make 3 rapid tool calls and measure elapsed time
+    start = time.monotonic()
+    for i in range(3):
+        tc = ToolCall(id=f"tc_{i}", name="unknown_tool", input={})
+        await agent._execute_tool(tc)
+    elapsed = time.monotonic() - start
+
+    # Should take at least 0.2s (2 intervals between 3 calls)
+    assert elapsed >= 0.18, f"Expected >= 0.18s, got {elapsed:.3f}s"
+
+
+def test_tool_rate_limit_default():
+    """Default rate limit is loaded."""
+    llm = _CountingLLM()
+    agent = _StubAgent(
+        agent_name="test",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+    )
+    assert agent._tool_min_interval > 0
+
+
+@pytest.mark.asyncio
+async def test_tool_rate_limit_zero_disables():
+    """Setting min_interval_sec to 0 disables throttling."""
+    import time
+
+    llm = _CountingLLM()
+    agent = _StubAgent(
+        agent_name="test",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+    )
+    agent._tool_min_interval = 0.0
+    start = time.monotonic()
+    await agent._throttle_tool_call()
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.05
