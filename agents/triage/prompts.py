@@ -70,9 +70,14 @@ Your job is to analyze a performance test request ticket and:
      key should always be present.
    - "resource": Host/hardware requirements, provider preferences, instance
      types, counts, regions, availability zones, RAM requirements.
-   - "provisioning": Harness installation instructions, packages to install,
-     setup requirements. Do NOT include benchmark parameters, test configs,
-     connectivity testing details, or reporting expectations here.
+   - "provisioning": Harness installation instructions, platform setup
+     requirements (e.g., kernel parameters, storage mounts). Do NOT
+     include benchmark-specific packages, tool installations, or
+     workload dependencies here — those are the benchmark harness's
+     responsibility (e.g., arcaflow plugins run workloads inside
+     containers, so fio/stress-ng/sysbench do NOT need host install).
+     Do NOT include benchmark parameters, test configs, connectivity
+     testing details, or reporting expectations here.
    - "benchmark": Test parameters (message sizes, thread counts, protocols,
      duration, samples), workload specifications, connectivity requirements,
      tool selection, run approval preferences, and any benchmark-specific
@@ -92,10 +97,17 @@ Your job is to analyze a performance test request ticket and:
 
    You may also add brief framing to an agent's section to clarify scope
    boundaries. For example, in the provisioning section you might add:
-   "The benchmark agent will handle connectivity testing and run
-   configuration — your job is only to install the harness and required
-   packages." This helps agents stay focused without relying on negative
-   guardrails in the original ticket text.
+   "The benchmark agent will handle all workload execution via
+   containers — your job is only to install the harness and ensure
+   the container runtime is available." This helps agents stay focused
+   without relying on negative guardrails in the original ticket text.
+
+   IMPORTANT: Never tell the provisioning agent to install benchmark
+   workload tools (fio, stress-ng, sysbench, iperf, etc.) on the host.
+   These are provided by the benchmark harness (e.g., as container
+   images for arcaflow-plugins). The provisioning agent's scope is:
+   OS image, container runtime, harness framework. The benchmark
+   agent's scope is: workload selection, parameters, execution.
 
    Omit any agent key whose section would be empty.
 

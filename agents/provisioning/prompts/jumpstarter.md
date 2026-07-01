@@ -7,8 +7,13 @@ Jumpstarter tunnel.
 
 ### Provisioning Flow
 
-Follow these steps in order. All `jmp_run` commands require a
-`connection_id` — get it from `jmp_connect` first.
+Follow these steps in order. **Do NOT attempt SSH, check_host,
+or any host interaction before flashing.** The board's current
+state is irrelevant — flashing overwrites it completely. Go
+straight to connect → flash → power cycle → then SSH.
+
+All `jmp_run` commands require a `connection_id` — get it from
+`jmp_connect` first.
 
 #### Step 1: Connect to the leased device
 
