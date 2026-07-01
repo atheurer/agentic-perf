@@ -75,14 +75,26 @@ class ProvisioningAgent(AgentBase):
         await mcp.connect(infra_server, name="infra")
 
         # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware
-        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
+        from agents.jumpstarter_mcp import (
+            attach_jumpstarter_mcp,
+            suspend_for_device_ready,
+        )
 
-        await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+        has_jmp = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
 
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
         self.tools = mcp_tools + self.tools
+
+        # Suspend while Jumpstarter device boots, unless
+        # already resumed from a previous suspension.
+        if has_jmp:
+            suspended = await suspend_for_device_ready(self, ticket_id, self.store_url)
+            if suspended:
+                # Agent exits here. Orchestrator will
+                # re-dispatch when CloudEvent arrives.
+                return
 
         try:
             await super().run(ticket_id)
