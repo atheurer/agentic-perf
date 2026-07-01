@@ -354,6 +354,15 @@ async def run_agent_task(
                             f" provider={llm_override.get('provider', '')}"
                             f" model={llm_override.get('model', '')}"
                         )
+                    # Jumpstarter provisioning needs many tool
+                    # calls (flash, boot, IP discovery, SSH key
+                    # injection). Budget guardrails are the real
+                    # safety net, not iteration caps.
+                    elif (
+                        status == "awaiting_provision"
+                        and cf.get("resource_provider") == "jumpstarter"
+                    ):
+                        agent.max_iterations = 0
         except Exception:
             pass  # proceed with default iterations
 
@@ -616,6 +625,56 @@ async def _block_absent_suite(
             )
 
 
+async def _redirect_to_investigation(
+    store_url: str,
+    ticket_id: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Redirect a ticket from awaiting_hardware to gathering_context.
+
+    Code-enforced invariant: tickets with anomaly_context belong
+    on the investigation path. If triage routed to the ad-hoc
+    path, the orchestrator corrects it here.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={
+                "author": "orchestrator",
+                "body": (
+                    "**Investigation redirect:** Ticket has "
+                    "anomaly_context but was routed to the "
+                    "ad-hoc path. Redirecting to the "
+                    "investigation path (gathering_context) "
+                    "for proper convergence tracking."
+                ),
+            },
+        )
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": "gathering_context",
+                "comment": (
+                    "Code-enforced redirect: anomaly_context → investigation path"
+                ),
+            },
+        )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "investigation_redirect",
+                {
+                    "from": "awaiting_hardware",
+                    "to": "gathering_context",
+                    "reason": "anomaly_context present",
+                },
+            )
+    logger.info(f"[investigation-redirect] {ticket_id} redirected to gathering_context")
+
+
 HANDOFF_RETRY_STATUS = {
     "awaiting_provision": "awaiting_hardware",
     "executing_benchmark": "awaiting_provision",
@@ -843,6 +902,30 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         config.state_store_url, tid, event_bus=dispatcher.events
                     )
                     continue
+
+                # Code-enforce investigation routing.
+                # If triage routed to awaiting_hardware but
+                # the ticket has anomaly_context, redirect
+                # to gathering_context (investigation path).
+                # LLM decides intent; code enforces invariants.
+                if status == "awaiting_hardware":
+                    cf = ticket.get("custom_fields", {})
+                    if cf.get("anomaly_context"):
+                        logger.info(
+                            f"Redirecting {tid} to "
+                            f"gathering_context "
+                            f"(anomaly_context present)"
+                        )
+                        try:
+                            await _redirect_to_investigation(
+                                config.state_store_url,
+                                tid,
+                                event_bus=dispatcher.events,
+                            )
+                        except Exception:
+                            logger.exception(f"Failed to redirect {tid}")
+                        dispatcher.mark_dispatched(tid, status)
+                        continue
 
                 ok, reason = check_handoff(status, ticket)
                 if not ok:
