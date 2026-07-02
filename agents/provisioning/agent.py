@@ -81,7 +81,6 @@ class ProvisioningAgent(AgentBase):
         # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware
         from agents.jumpstarter_mcp import (
             attach_jumpstarter_mcp,
-            suspend_for_device_ready,
         )
 
         jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
@@ -96,14 +95,14 @@ class ProvisioningAgent(AgentBase):
             all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
         self.tools = all_tools + self.tools
 
-        # Suspend while Jumpstarter device boots, unless
-        # already resumed from a previous suspension.
-        if jmp_tools is not None:
-            suspended = await suspend_for_device_ready(self, ticket_id, self.store_url)
-            if suspended:
-                # Agent exits here. Orchestrator will
-                # re-dispatch when CloudEvent arrives.
-                return
+        # NOTE: Provisioning suspension is disabled.
+        # The provisioning agent itself performs the flash,
+        # so suspending before flashing creates a deadlock
+        # (nobody left to do the work or send the wake
+        # signal). Provisioning runs synchronously; the
+        # proper fix is tool-level async suspension
+        # (issue #25) where the flash tool suspends AFTER
+        # starting the operation.
 
         try:
             await super().run(ticket_id)
