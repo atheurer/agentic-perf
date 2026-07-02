@@ -47,6 +47,15 @@ The tool returns averaged timing metrics across all samples:
 | `avg_userspace_s` | seconds | Userspace startup time |
 | `sample_count` | count | Number of samples successfully collected |
 
+## Provisioning Scope
+
+The boot-time harness has NO provisioning step. The
+`execute_boot_time_test` tool automatically installs
+`boot-time-analysis-tools` on the SUT via SSH before running.
+The provisioning agent should only ensure the board is flashed
+and SSH-reachable — do NOT tell provisioning to install any
+boot-time packages.
+
 ## What the Tool Does NOT Do
 
 - **No analysis** — submit the raw KPIs; analysis belongs in the
