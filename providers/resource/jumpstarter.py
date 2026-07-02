@@ -169,6 +169,24 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         count = requirements.get("count", 1)
 
+        # No matches — return available targets so the
+        # agent can pick the right one instead of guessing.
+        if not matching:
+            targets = await self.list_targets()
+            return {
+                "provider": "jumpstarter",
+                "available": False,
+                "matching_devices": 0,
+                "requested": count,
+                "selector": selector,
+                "error": (
+                    f"No devices match selector "
+                    f"'{selector}'. Use one of the "
+                    f"available target selectors below."
+                ),
+                "available_targets": targets,
+            }
+
         return {
             "provider": "jumpstarter",
             "available": len(matching) >= count,
