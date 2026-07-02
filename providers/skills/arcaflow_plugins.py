@@ -16,9 +16,10 @@ from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
 logger = logging.getLogger(__name__)
 
-QUAY_ORG = "arcalot"
+QUAY_ORGS = ["arcalot", "redhat-performance"]
+QUAY_PRIMARY_ORG = "arcalot"
 QUAY_API = "https://quay.io/api/v1"
-QUAY_IMAGE_PREFIX = f"quay.io/{QUAY_ORG}"
+QUAY_IMAGE_PREFIX = f"quay.io/{QUAY_PRIMARY_ORG}"
 
 # Default directory for caching plugin schemas
 _DEFAULT_SCHEMA_CACHE_DIR = Path.home() / ".agentic-perf" / "plugin-schema-cache"
@@ -553,6 +554,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             schema_cache_dir or _DEFAULT_SCHEMA_CACHE_DIR
         )
         self._discover_schemas = discover_schemas
+        self._repo_orgs: dict[str, str] = {}
 
     def _is_cache_valid(self) -> bool:
         if not self._catalog:
@@ -572,7 +574,9 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         for repo_name, version in discovered_repos.items():
             benchmark_name = _plugin_name_to_benchmark(repo_name)
             meta = PLUGIN_METADATA.get(repo_name, {})
-            image_ref = f"{QUAY_IMAGE_PREFIX}/{repo_name}:{version}"
+            org = self._repo_orgs.get(repo_name, QUAY_PRIMARY_ORG)
+            image_prefix = f"quay.io/{org}"
+            image_ref = f"{image_prefix}/{repo_name}:{version}"
 
             # Check schema cache, discover if needed
             discovered = self._schema_cache.get(repo_name, version)
@@ -589,7 +593,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             default_step = steps[0] if steps else meta.get("step", "workload")
 
             catalog[benchmark_name] = {
-                "image": f"{QUAY_IMAGE_PREFIX}/{repo_name}",
+                "image": f"{image_prefix}/{repo_name}",
                 "version": version,
                 "description": meta.get(
                     "description",
@@ -624,34 +628,50 @@ class ArcaflowPluginSkillProvider(SkillProvider):
     async def _discover_from_quay(self) -> dict[str, str]:
         """Query Quay.io for arcaflow-plugin-* repos and latest versions.
 
+        Searches QUAY_ORGS in order (arcalot first, then
+        redhat-performance). If a plugin exists in both orgs,
+        the primary org (arcalot) takes precedence.
+
         Returns a dict of repo_name -> latest_version_tag.
         """
         repos: dict[str, str] = {}
+        # Track which org owns each repo for image path
+        repo_orgs: dict[str, str] = {}
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(
-                    f"{QUAY_API}/repository",
-                    params={
-                        "namespace": QUAY_ORG,
-                        "public": "true",
-                    },
-                )
-                r.raise_for_status()
-                data = r.json()
+                for org in QUAY_ORGS:
+                    try:
+                        r = await client.get(
+                            f"{QUAY_API}/repository",
+                            params={
+                                "namespace": org,
+                                "public": "true",
+                            },
+                        )
+                        r.raise_for_status()
+                        data = r.json()
 
-                for repo in data.get("repositories", []):
-                    name = repo["name"]
-                    if not name.startswith("arcaflow-plugin-"):
-                        continue
-                    if name in _EXCLUDED_REPOS:
-                        continue
-                    repos[name] = "latest"
+                        for repo in data.get("repositories", []):
+                            name = repo["name"]
+                            if not name.startswith("arcaflow-plugin-"):
+                                continue
+                            if name in _EXCLUDED_REPOS:
+                                continue
+                            # Primary org takes precedence
+                            if name not in repos:
+                                repos[name] = "latest"
+                                repo_orgs[name] = org
+                    except Exception:
+                        logger.debug(
+                            f"[arcaflow-plugins] Failed to discover from {org}"
+                        )
 
                 # Fetch latest version tag for each repo
                 for name in list(repos.keys()):
+                    org = repo_orgs.get(name, QUAY_PRIMARY_ORG)
                     try:
                         r = await client.get(
-                            f"{QUAY_API}/repository/{QUAY_ORG}/{name}/tag/",
+                            f"{QUAY_API}/repository/{org}/{name}/tag/",
                             params={
                                 "onlyActiveTags": "true",
                                 "limit": 10,
@@ -678,10 +698,11 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                             break
                     except Exception:
                         logger.debug(
-                            f"[arcaflow-plugins] Failed to fetch tags for {name}"
+                            f"[arcaflow-plugins] Failed to fetch tags for {org}/{name}"
                         )
         except Exception:
             logger.warning("[arcaflow-plugins] Failed to discover plugins from Quay.io")
+        self._repo_orgs = repo_orgs
         return repos
 
     def _build_from_local_metadata(self) -> None:
