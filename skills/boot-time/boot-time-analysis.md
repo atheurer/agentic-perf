@@ -64,6 +64,12 @@ boot-time packages.
 - **No diagnosis** — do not investigate why boot time is slow
 - **No parameter tuning** — use the defaults unless the ticket
   explicitly requests different parameters
+- **No improvisation** — if `execute_boot_time_test` fails, report
+  the error and request clarification. Do NOT write your own reboot
+  scripts, manually SSH into the SUT to reboot it, or attempt to
+  replicate the tool's behavior with execute_command. The tool
+  handles all reboot orchestration, timing collection, and result
+  merging — manual alternatives will produce incompatible output.
 
 ## Common KPI Patterns
 
