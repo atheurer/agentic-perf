@@ -502,6 +502,52 @@ cycling, serial console, firmware) use the Jumpstarter MCP
 server (`jmp mcp serve`) attached to agents via
 `connect_command()` (Layer 2).
 
+Required Python packages:
+
+- `jumpstarter` — core client and CLI
+- `jumpstarter-driver-can` — CAN bus communication
+- `jumpstarter-driver-composite` — composite exporter support
+- `jumpstarter-driver-flashers` — board-agnostic flash orchestration
+- `jumpstarter-driver-gpiod` — GPIO control (R-Car S4, S32G)
+- `jumpstarter-driver-http` — HTTP image fetching (flasher dep)
+- `jumpstarter-driver-network` — TCP forwarding and SSH tunnels
+- `jumpstarter-driver-opendal` — storage backend abstraction
+- `jumpstarter-driver-power` — power control base
+- `jumpstarter-driver-pyserial` — serial console access
+- `jumpstarter-driver-ridesx` — Qualcomm RideSX4 storage/power
+- `jumpstarter-driver-shell` — shell command execution
+- `jumpstarter-driver-snmp` — SNMP-based external power control
+- `jumpstarter-driver-ssh` — SSH wrapper for board access
+- `jumpstarter-driver-tftp` — TFTP image serving (flasher dep)
+- `jumpstarter-driver-tmt` — TMT test framework integration
+- `jumpstarter-driver-uboot` — U-Boot serial interaction
+- `jumpstarter-driver-ustreamer` — video streaming
+- `jumpstarter-driver-vnc` — VNC remote display
+
+Install all drivers to support the full range of board types:
+
+```bash
+pip install jumpstarter \
+  jumpstarter-driver-can \
+  jumpstarter-driver-composite \
+  jumpstarter-driver-flashers \
+  jumpstarter-driver-gpiod \
+  jumpstarter-driver-http \
+  jumpstarter-driver-network \
+  jumpstarter-driver-opendal \
+  jumpstarter-driver-power \
+  jumpstarter-driver-pyserial \
+  jumpstarter-driver-ridesx \
+  jumpstarter-driver-shell \
+  jumpstarter-driver-snmp \
+  jumpstarter-driver-ssh \
+  jumpstarter-driver-tftp \
+  jumpstarter-driver-tmt \
+  jumpstarter-driver-uboot \
+  jumpstarter-driver-ustreamer \
+  jumpstarter-driver-vnc
+```
+
 When a ticket uses Jumpstarter hardware (`resource_provider =
 "jumpstarter"`), the benchmark and provisioning agents
 automatically attach the Jumpstarter MCP server via
