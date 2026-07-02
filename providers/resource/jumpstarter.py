@@ -268,11 +268,7 @@ class JumpstarterResourceProvider(ResourceProvider):
             err = str(e)
             # The controller returns FAILED_PRECONDITION
             # for released leases.
-            status = (
-                "released"
-                if "already been released" in err
-                else "unknown"
-            )
+            status = "released" if "already been released" in err else "unknown"
             return {
                 "provider": "jumpstarter",
                 "lease_id": reservation_id,
