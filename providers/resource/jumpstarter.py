@@ -82,6 +82,32 @@ class JumpstarterResourceProvider(ResourceProvider):
         )
         config_path = cli_config if cli_config.exists() else None
 
+        # Ensure this client is set as the active/current
+        # client in the jmp CLI config. Without this, the
+        # jmp CLI and MCP server won't find the client
+        # config even if the file exists.
+        if config_path is not None:
+            user_config = Path.home() / ".config" / "jumpstarter" / "config.yaml"
+            needs_set = True
+            if user_config.exists():
+                try:
+                    import yaml
+
+                    uc = yaml.safe_load(user_config.read_text())
+                    if uc and uc.get("config", {}).get("current-client") == client_name:
+                        needs_set = False
+                except Exception:
+                    pass
+            if needs_set:
+                user_config.parent.mkdir(parents=True, exist_ok=True)
+                user_config.write_text(
+                    "apiVersion: jumpstarter.dev/v1alpha1\n"
+                    "kind: UserConfig\n"
+                    "config:\n"
+                    f"  current-client: {client_name}\n"
+                )
+                logger.info(f"[jumpstarter] Set current client to {client_name}")
+
         return cls(
             client_name=client_name,
             config_path=config_path,
