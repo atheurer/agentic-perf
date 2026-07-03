@@ -62,10 +62,10 @@ class TestGetTestedHostIds:
 
 
 class TestGetFleetProgress:
-    def test_full_progress(self):
+    def test_hard_exhaustion(self):
         cf = {
             "fleet_investigation": {
-                "total_available": 3,
+                "fleet_exhausted": {"hard": True},
                 "tested_hosts": [
                     {"host_id": "a", "status": "completed"},
                     {"host_id": "b", "status": "partial"},
@@ -74,17 +74,42 @@ class TestGetFleetProgress:
             },
         }
         p = get_fleet_progress(cf)
-        assert p["total_available"] == 3
         assert p["tested"] == 3
         assert p["completed"] == 2
         assert p["partial"] == 1
-        assert p["remaining"] == 0
+        assert p["fleet_exhausted"] is True
+        assert p["exhaustion_type"] == "hard"
         assert p["converged"] is True
 
-    def test_partial_progress(self):
+    def test_soft_exhaustion(self):
         cf = {
             "fleet_investigation": {
-                "total_available": 5,
+                "fleet_exhausted": {
+                    "soft": True,
+                    "unavailable_hosts": [
+                        "board-04",
+                        "board-05",
+                    ],
+                },
+                "tested_hosts": [
+                    {"host_id": "a", "status": "completed"},
+                    {"host_id": "b", "status": "completed"},
+                ],
+            },
+        }
+        p = get_fleet_progress(cf)
+        assert p["tested"] == 2
+        assert p["fleet_exhausted"] is True
+        assert p["exhaustion_type"] == "soft"
+        assert p["unavailable_hosts"] == [
+            "board-04",
+            "board-05",
+        ]
+        assert p["converged"] is True
+
+    def test_not_exhausted(self):
+        cf = {
+            "fleet_investigation": {
                 "tested_hosts": [
                     {"host_id": "a", "status": "completed"},
                 ],
@@ -92,13 +117,14 @@ class TestGetFleetProgress:
         }
         p = get_fleet_progress(cf)
         assert p["tested"] == 1
-        assert p["remaining"] == 4
+        assert p["fleet_exhausted"] is False
+        assert p["exhaustion_type"] is None
         assert p["converged"] is False
 
     def test_empty(self):
         p = get_fleet_progress({})
         assert p["converged"] is False
-        assert p["remaining"] == 0
+        assert p["fleet_exhausted"] is False
 
 
 class TestBuildTestedHostEntry:

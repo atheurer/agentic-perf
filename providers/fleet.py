@@ -56,16 +56,31 @@ def get_fleet_progress(
     """Return fleet investigation progress summary."""
     fleet = custom_fields.get("fleet_investigation", {})
     tested = fleet.get("tested_hosts", [])
-    total = fleet.get("total_available", 0)
+    exhaustion = fleet.get("fleet_exhausted", {})
     completed = [h for h in tested if h.get("status") == "completed"]
     failed = [h for h in tested if h.get("status") == "partial"]
+
+    # Exhaustion is a dict with:
+    #   "hard": true if every device has been tested
+    #   "soft": true if untested devices exist but are
+    #           currently unavailable
+    #   "unavailable_hosts": list of device names that
+    #           were not tested because they were leased
+    is_exhausted = bool(exhaustion)
     return {
-        "total_available": total,
         "tested": len(tested),
         "completed": len(completed),
         "partial": len(failed),
-        "remaining": max(0, total - len(tested)),
-        "converged": total > 0 and len(tested) >= total,
+        "fleet_exhausted": is_exhausted,
+        "exhaustion_type": (
+            "hard"
+            if exhaustion.get("hard")
+            else "soft"
+            if exhaustion.get("soft")
+            else None
+        ),
+        "unavailable_hosts": exhaustion.get("unavailable_hosts", []),
+        "converged": is_exhausted and len(tested) > 0,
     }
 
 
