@@ -57,8 +57,98 @@ class ProvisioningAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Fleet investigation: provisioning failure on
+            # one host should not stop the whole fleet.
+            # Record the failure and move to the next host.
+            if await self._handle_fleet_provision_failure(self._ticket_id, question):
+                return (
+                    "Fleet investigation: this host has "
+                    "been recorded as a provisioning "
+                    "failure. Submit your result and "
+                    "the system will move to the next "
+                    "host automatically."
+                )
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _handle_fleet_provision_failure(
+        self, ticket_id: str, reason: str
+    ) -> bool:
+        """Record provision failure for fleet investigations.
+
+        Returns True if this is a fleet investigation and the
+        failure was recorded (caller should skip clarification).
+        Returns False for non-fleet tickets (normal behavior).
+        """
+        from providers.fleet import (
+            build_tested_host_entry,
+            is_fleet_investigation,
+        )
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if not is_fleet_investigation(cf):
+            return False
+
+        fleet = cf.get("fleet_investigation", {})
+        tested = fleet.get("tested_hosts", [])
+
+        metadata = cf.get("resource_provider_metadata", {})
+        host_id = metadata.get("exporter_name") or metadata.get("exporter") or "unknown"
+
+        # Skip if already recorded
+        if any(h["host_id"] == host_id for h in tested):
+            return True
+
+        entry = build_tested_host_entry(
+            host_id=host_id,
+            lease_id=metadata.get("lease_id", ""),
+            status="provision_failed",
+            failure_reason=reason[:500],
+        )
+        tested.append(entry)
+        fleet["tested_hosts"] = tested
+        await self._update_fields(
+            ticket_id,
+            {"fleet_investigation": fleet},
+        )
+
+        await self._add_comment(
+            ticket_id,
+            f"**Fleet: provisioning failed for "
+            f"{host_id}**\n\n"
+            f"Reason: {reason[:300]}\n\n"
+            f"Recording failure and moving to next "
+            f"host.",
+        )
+
+        # Transition to awaiting_hardware so the
+        # resource agent picks the next board.
+        # Release the failed lease first.
+        lease_id = metadata.get("lease_id")
+        if lease_id:
+            try:
+                from providers.resource.registry import (
+                    get_resource_registry,
+                )
+
+                reg = get_resource_registry()
+                prov = await reg.get_provider("jumpstarter")
+                await prov.terminate(lease_id)
+                logger.info(f"[fleet] Released failed lease {lease_id}")
+            except Exception:
+                logger.debug(
+                    "[fleet] Failed to release lease",
+                    exc_info=True,
+                )
+
+        await self._transition_ticket(
+            ticket_id,
+            "awaiting_hardware",
+            comment=(f"Fleet: {host_id} failed provisioning, acquiring next host"),
+        )
+
+        return True
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
