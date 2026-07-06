@@ -1471,6 +1471,23 @@ async def execute_boot_time_test(
             }
         )
 
+    # ── Wait for SSH readiness ─────────────────────────
+    # Freshly provisioned boards may not have SSH ready
+    # immediately. Wait up to 60s for port 22.
+    import asyncio as _asyncio
+    import socket as _socket
+
+    for _attempt in range(12):
+        try:
+            s = _socket.create_connection((sut_host, 22), timeout=5)
+            s.close()
+            break
+        except (OSError, ConnectionRefusedError):
+            logger.info(
+                f"[boot-time] Waiting for SSH on {sut_host} (attempt {_attempt + 1}/12)"
+            )
+            await _asyncio.sleep(5)
+
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
     ssh_user = "root"
     ssh_password = "password"
