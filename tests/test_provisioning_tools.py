@@ -696,7 +696,7 @@ async def test_ensure_prerequisites_tool_in_definitions():
 
 @pytest.mark.asyncio
 async def test_ensure_prerequisites_controller_gets_harness_prereqs():
-    """Controller host gets harness prereqs + extras; targets get extras only."""
+    """Controller host gets harness prereqs + base host packages."""
     from agents.provisioning.server import (
         _ensure_prerequisites_one,
     )
@@ -709,8 +709,6 @@ async def test_ensure_prerequisites_controller_gets_harness_prereqs():
             return SSHResult(exit_code=1, stdout="", stderr="")
         if "which jq" in cmd or "which curl" in cmd:
             return SSHResult(stdout="/usr/bin/jq\njq-1.7")
-        if "which ncat" in cmd:
-            return SSHResult(exit_code=1, stdout="", stderr="")
         if "dnf install" in cmd:
             return SSHResult(stdout="Complete!")
         return SSHResult(stdout="ok")
@@ -721,7 +719,7 @@ async def test_ensure_prerequisites_controller_gets_harness_prereqs():
         result = await _ensure_prerequisites_one(
             "10.0.0.1",
             is_controller=True,
-            extra_packages=["ncat"],
+            extra_packages=[],
         )
 
     assert "jq" in result["already_present"]
@@ -732,14 +730,14 @@ async def test_ensure_prerequisites_controller_gets_harness_prereqs():
 
 
 @pytest.mark.asyncio
-async def test_ensure_prerequisites_target_gets_extras_only():
-    """Non-controller host only checks/installs extra_packages."""
+async def test_ensure_prerequisites_target_gets_base_packages():
+    """Non-controller host gets base host packages (nmap-ncat) automatically."""
     from agents.provisioning.server import (
         _ensure_prerequisites_one,
     )
 
     async def mock_run(host, cmd, **kwargs):
-        if "which ncat" in cmd:
+        if "rpm -q nmap-ncat" in cmd:
             return SSHResult(exit_code=1, stdout="", stderr="")
         if "dnf install" in cmd:
             return SSHResult(stdout="Complete!")
@@ -751,10 +749,10 @@ async def test_ensure_prerequisites_target_gets_extras_only():
         result = await _ensure_prerequisites_one(
             "10.0.0.2",
             is_controller=False,
-            extra_packages=["ncat"],
+            extra_packages=[],
         )
 
-    assert "ncat" in result["newly_installed"]
+    assert "nmap-ncat" in result["newly_installed"]
     assert "podman" not in result.get("newly_installed", [])
     assert "podman" not in result.get("already_present", [])
 
@@ -767,7 +765,7 @@ async def test_ensure_prerequisites_no_output_on_success():
     )
 
     async def mock_run(host, cmd, **kwargs):
-        if "which" in cmd:
+        if "rpm -q" in cmd:
             return SSHResult(exit_code=1, stdout="", stderr="")
         if "dnf install" in cmd:
             return SSHResult(stdout="Lots of dnf output here...")
@@ -779,7 +777,7 @@ async def test_ensure_prerequisites_no_output_on_success():
         result = await _ensure_prerequisites_one(
             "10.0.0.1",
             is_controller=False,
-            extra_packages=["ncat"],
+            extra_packages=[],
         )
 
     assert "output" not in result
@@ -794,7 +792,7 @@ async def test_ensure_prerequisites_reports_failures():
     )
 
     async def mock_run(host, cmd, **kwargs):
-        if "which" in cmd:
+        if "rpm -q" in cmd:
             return SSHResult(exit_code=1, stdout="", stderr="")
         if "dnf install" in cmd:
             return SSHResult(exit_code=1, stdout="", stderr="No package found")

@@ -250,6 +250,8 @@ async def _install_packages_one(host: str, packages: list[str]) -> dict:
     return response
 
 
+BASE_HOST_PACKAGES = ["nmap-ncat"]
+
 async def _ensure_prerequisites_one(
     host: str,
     is_controller: bool,
@@ -257,7 +259,10 @@ async def _ensure_prerequisites_one(
 ) -> dict:
     """Check and install missing prerequisites on a single host."""
     already_present = []
-    to_install = list(extra_packages)
+    to_install = list(BASE_HOST_PACKAGES)
+    for pkg in extra_packages:
+        if pkg not in to_install:
+            to_install.append(pkg)
 
     if is_controller:
         prereqs = await _check_host_prerequisites_one(host)
@@ -268,8 +273,10 @@ async def _ensure_prerequisites_one(
                 if pkg not in to_install:
                     to_install.append(pkg)
     else:
-        for pkg in extra_packages:
-            check = await _ssh.run(host, f"which {pkg} 2>/dev/null", timeout=10)
+        for pkg in list(to_install):
+            check = await _ssh.run(
+                host, f"rpm -q {pkg} 2>/dev/null", timeout=10,
+            )
             if check.exit_code == 0:
                 already_present.append(pkg)
                 to_install.remove(pkg)
@@ -1025,14 +1032,15 @@ async def ensure_prerequisites(
     """Check and install missing prerequisites on all hosts in one call.
 
     Harness prerequisites (podman, git, jq, curl) are checked and installed
-    only on the controller_host. Extra packages (e.g., nmap-ncat) are
-    checked and installed on ALL hosts. Use this instead of calling
+    only on the controller_host. Base host packages (nmap-ncat) are always
+    installed on ALL hosts for connectivity testing. Additional extra_packages
+    are also installed on all hosts. Use this instead of calling
     check_host_prerequisites then install_packages separately.
 
     Args:
         hosts: List of host IPs to process
         extra_packages: Additional packages to install on all hosts
-            (e.g., ["nmap-ncat"] from user directives)
+            beyond the base host packages
         controller_host: The controller IP — harness prereqs are only
             installed here. If empty, harness prereqs are skipped on
             all hosts (only extra_packages are installed).

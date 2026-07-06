@@ -49,6 +49,10 @@ Your tasks:
    IP so harness prerequisites (podman, git, jq, curl) are installed only there.
    Include any user-requested packages (e.g., nmap-ncat) in extra_packages — these
    are installed on ALL hosts including targets.
+   IMPORTANT: Do not assume benchmark tool binaries (e.g., uperf, fio, iperf,
+   trafficgen) need to be installed on the host. Check the harness's skill
+   configuration first — some harnesses (e.g., crucible) run benchmark tools
+   inside containers and do not require host-level installation.
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip
