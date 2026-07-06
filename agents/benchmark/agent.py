@@ -100,6 +100,27 @@ class BenchmarkAgent(AgentBase):
 
         try:
             ticket = await self._get_ticket(ticket_id)
+
+            # Scope tools to the harness. Standalone
+            # harnesses (boot-time) need only a few tools
+            # — hiding the rest prevents the agent from
+            # exploring harness-specific tools (runfile
+            # schemas, example configs) or running
+            # diagnostic SSH commands.
+            harness = (
+                ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+            )
+            if harness == "boot-time":
+                _BOOT_TIME_TOOLS = {
+                    "read_skill",
+                    "set_ssh_context",
+                    "check_host",
+                    "execute_boot_time_test",
+                    "submit_benchmark_result",
+                    "request_clarification",
+                }
+                self.tools = [t for t in self.tools if t.name in _BOOT_TIME_TOOLS]
+
             ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
             if ssh_key:
                 # SSH key is now handled server-side via ticket data
