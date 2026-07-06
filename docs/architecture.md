@@ -216,6 +216,11 @@ can test multiple parameter values in one invocation — the triage agent
 should use that capability when appropriate and only create an execution
 plan when separate runs are explicitly needed.
 
+**Universal plans:** Every ticket gets an execution plan, even single-
+benchmark requests (which get a 1-step plan). This ensures the
+investigation ledger always has `plan_steps` to reference, and lets
+review agents and users extend any ticket's plan dynamically.
+
 #### Iterative convergence (unknown iteration count)
 
 When the number of iterations is not known upfront — e.g., "keep
@@ -256,6 +261,25 @@ per-iteration data structure that feeds the evaluation.
 Both modes produce the same artifact: an ordered list of completed steps
 with run IDs, parameters, and results — giving the review agent (or
 human) a complete record of what ran and why.
+
+#### Investigation Ledger
+
+The investigation ledger (`custom_fields.investigation_ledger`) tracks
+reasoning history alongside the execution plan. Each entry references
+plan steps by index, maintaining clear separation:
+
+- **Execution plan** — shared mutable, tracks sequencing (what runs
+  next). Written by the orchestrator, users (via HITL), review agents,
+  and the evaluate agent.
+- **Investigation ledger** — append-only, tracks reasoning (what was
+  learned). Written only by the evaluate agent. Each entry has:
+  `iteration`, `plan_steps`, `hypothesis`, `params_rationale`,
+  `conclusion`, `info_gain`, `timestamp`.
+
+The split exists because the plan is edited by multiple writers
+including humans via HITL — investigation reasoning belongs in a
+separate write-once structure. The `LedgerEntry` model and helpers
+live in `providers/ledger.py`.
 
 #### Plan step lifecycle
 
