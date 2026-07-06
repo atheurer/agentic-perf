@@ -252,6 +252,7 @@ async def _install_packages_one(host: str, packages: list[str]) -> dict:
 
 BASE_HOST_PACKAGES = ["nmap-ncat"]
 
+
 async def _ensure_prerequisites_one(
     host: str,
     is_controller: bool,
@@ -275,7 +276,9 @@ async def _ensure_prerequisites_one(
     else:
         for pkg in list(to_install):
             check = await _ssh.run(
-                host, f"rpm -q {pkg} 2>/dev/null", timeout=10,
+                host,
+                f"rpm -q {pkg} 2>/dev/null",
+                timeout=10,
             )
             if check.exit_code == 0:
                 already_present.append(pkg)
