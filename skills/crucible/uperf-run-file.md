@@ -4,22 +4,74 @@ uperf is a client-server network benchmark. The client
 generates traffic to the server and measures throughput
 and latency.
 
-## Network connectivity
+## Connectivity — three distinct layers
 
-uperf requires the client and server to communicate over
-a network path. Which network path depends on what the
-user wants to test:
+uperf requires the client and server to communicate over a
+network path. Before constructing the run-file, understand
+that there are three separate connectivity layers — each
+with different requirements, and testing one does NOT
+guarantee the others work:
 
-- **Management network (default):** The IPs in
-  `assigned_hardware_ips` are management addresses. Using
-  these tests the default network path — typically the
-  onboard NIC or whatever interface carries SSH traffic.
-- **Specific NICs / test network:** When the user asks to
-  test specific NICs (e.g., "25G NICs", "ConnectX-7",
-  "the high-speed interfaces"), the benchmark traffic must
-  flow over those NICs, not the management network. This
-  requires knowing the interface names or IPs on the test
-  network.
+1. **Agentic-perf → hosts (SSH):** How the automation
+   platform reaches the hosts. Uses `ssh_hardware_ips`
+   (often public IPs in cloud). This is already verified
+   by the resource agent before you receive the ticket.
+
+2. **Crucible controller → remotes (SSH):** How the
+   crucible controller orchestrates the endpoints. Uses
+   the IPs in the `host` field of each remote in the
+   run-file's `endpoints` section. These must be IPs the
+   controller can SSH to as root — typically the private
+   IPs in `assigned_hardware_ips`.
+
+3. **Benchmark data-plane (uperf ports):** How the uperf
+   client reaches the uperf server during the actual test.
+   This uses the IP set in the `remotehost` mv-param.
+   Crucible's uperf server listens on specific TCP ports,
+   so ping or SSH connectivity does NOT prove this works.
+
+**You must verify layer 3 before constructing the run-file.**
+Layers 1 and 2 may use different IPs than layer 3,
+especially in cloud environments where hosts have multiple
+interfaces or IP addresses.
+
+### uperf port formula
+
+Crucible's uperf benchmark uses these TCP ports per
+client-server instance (called a "csid"):
+
+- **Control port:** `30000 + 2 * N`
+- **Data port:** `30000 + 2 * N + 1`
+
+Where N is the csid. For a single client-server pair, the
+default csid is 1, so the ports are **30002** (control) and
+**30003** (data).
+
+For multiple pairs, pair 2 uses 30004/30005, pair 3 uses
+30006/30007, etc.
+
+### Choosing the remotehost IP
+
+When hosts have multiple IPs (common in cloud — public IP,
+private management IP, possibly additional private IPs on
+different subnets), you must pick the IP pair where the
+uperf ports are reachable:
+
+1. List candidate IPs on both client and server hosts.
+2. For each candidate server IP, test port connectivity
+   from the client using `test_port_connectivity` or
+   manual `nc` — test on the actual uperf ports (30002
+   and 30003 for a single pair), not just ping.
+3. Use the server IP that passes the port test as the
+   `remotehost` value.
+
+See `general/connectivity-diagnostic.md` for the full
+connectivity testing procedure.
+
+**Do NOT assume** that the management/SSH IP is the right
+choice for `remotehost`. In cloud environments, the private
+subnet IPs often work while public IPs have security group
+rules blocking the uperf port range.
 
 ### Discovering test interfaces
 
