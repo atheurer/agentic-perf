@@ -191,17 +191,15 @@ class EvaluateAgent(AgentBase):
                 f"- Run ID: {run_id}\n"
                 f"- Status: {bench_status}\n"
             )
-<<<<<<< HEAD
             if output_dir:
                 content += (
                     f"- Output Dir: {output_dir}\n"
                     f"  (use this path with list_benchmark_artifacts "
                     f"and read_benchmark_artifact)\n"
-=======
+                )
             if bench_results:
                 content += (
                     f"- Results: ```json\n{json.dumps(bench_results, indent=2)}\n```\n"
->>>>>>> 2865261 (feat(fleet): full fleet investigation support)
                 )
             content += "\n"
 
