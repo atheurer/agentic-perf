@@ -170,6 +170,7 @@ class AgentBase(ABC):
                             )
                             continue  # one more LLM call
                         # Grace iteration used — hard stop.
+                        await self._handle_budget_pause(ticket_id)
                         break
                     if budget_status == "warn":
                         # Soft limit: inform the LLM so it can
@@ -454,6 +455,7 @@ class AgentBase(ABC):
                 parts.append(endpoint_file.read_text().strip())
 
         return "\n\n".join(parts)
+
     def _load_tool_rate_limit(self) -> float:
         """Load tool rate limit from config."""
         try:
@@ -520,6 +522,27 @@ class AgentBase(ABC):
             tool_use_id=tool_call.id,
             content=f"Unknown tool: {tool_call.name}",
             is_error=True,
+        )
+
+    async def _handle_budget_pause(self, ticket_id: str) -> None:
+        """Handle budget pause during agent execution.
+
+        Default: transition to awaiting_customer_guidance.
+        Investigation agents should override to route to
+        evaluating_convergence so partial results can be
+        assessed.
+        """
+        await self._add_comment(
+            ticket_id,
+            f"**Agent {self.agent_name} paused: LLM "
+            f"budget exhausted.**\n\n"
+            f"The per-ticket token/cost budget has been "
+            f"reached. Partial results may be available.",
+        )
+        await self._transition_ticket(
+            ticket_id,
+            "awaiting_customer_guidance",
+            comment=(f"{self.agent_name} budget exhausted — pausing for guidance"),
         )
 
     async def _check_budget(self, ticket_id: str) -> str:

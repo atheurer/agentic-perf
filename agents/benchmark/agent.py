@@ -229,6 +229,31 @@ class BenchmarkAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
+    async def _handle_budget_pause(self, ticket_id: str) -> None:
+        """Route budget-exhausted investigation tickets
+        to evaluating_convergence so partial results can
+        be assessed. Non-investigation tickets get the
+        default behavior (awaiting_customer_guidance).
+        """
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+            await self._add_comment(
+                ticket_id,
+                "**Budget exhausted during benchmark "
+                "iteration.** Routing to convergence "
+                "assessment with partial results.",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "evaluating_convergence",
+                comment=(
+                    "Budget exhausted — evaluating convergence with partial results"
+                ),
+            )
+        else:
+            await super()._handle_budget_pause(ticket_id)
+
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
         result = self._get_submit_result(response)
         if not result:

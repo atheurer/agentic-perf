@@ -199,6 +199,24 @@ class EvaluateAgent(AgentBase):
                 exc_info=True,
             )
 
+        # Budget exhaustion: if the previous agent was
+        # paused due to budget, treat as a resource
+        # exhaustion convergence signal.
+        comments = custom_fields.get("comments", [])
+        if any(
+            "budget exhausted" in str(c).lower()
+            for c in (
+                custom_fields.get("benchmark_status", ""),
+                *(c.get("body", "") for c in comments if isinstance(c, dict)),
+            )
+        ):
+            return (
+                "BUDGET_EXHAUSTED — the benchmark agent "
+                "ran out of LLM budget. Assess any "
+                "partial results that were submitted "
+                "before the budget was exhausted."
+            )
+
         return ""
 
     async def run(self, ticket_id: str) -> None:
