@@ -151,4 +151,20 @@ built-in parameter variation.
 
 Do NOT generate an execution_plan for single benchmark requests. The final step
 should always be "review" so all runs are compared together.
+
+## Fleet Investigations
+
+When the user wants to test ALL available devices of a particular type and
+compare results across the fleet (e.g., "test all R-Car boards", "which hosts
+have failures", "run on every available board"), set `fleet_investigation: true`
+in your submit_triage_result call.
+
+Fleet investigations iterate through each device one at a time via the
+investigation loop-back mechanism. You do NOT need to create multiple execution
+plan steps — a single benchmark step is sufficient. The system will automatically
+loop back to acquire the next device after each test completes.
+
+Fleet investigations are always investigation tickets — they involve isolating
+problems across hardware, which is inherently anomaly investigation work.
+Set min_hosts to 1 (one device per iteration).
 """
