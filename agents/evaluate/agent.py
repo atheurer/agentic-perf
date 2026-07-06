@@ -97,6 +97,37 @@ class EvaluateAgent(AgentBase):
                 f"Your response should reflect this outcome.\n\n"
             )
 
+        # Fleet investigation: show per-host results
+        fleet = cf.get("fleet_investigation", {})
+        if fleet.get("enabled"):
+            tested = fleet.get("tested_hosts", [])
+            if tested:
+                content += "**Fleet Investigation Results:**\n\n"
+                content += "| Host ID | Status | Samples | Boot Time (s) |\n"
+                content += "|---------|--------|--------|----------------|\n"
+                for h in tested:
+                    kpis = h.get("kpis", {})
+                    boot = kpis.get("avg_total_boot_s", "N/A")
+                    fail = h.get("failure_reason", "")
+                    status_str = h.get("status", "?")
+                    if fail:
+                        status_str += f" ({fail[:40]})"
+                    content += (
+                        f"| {h.get('host_id', '?')} "
+                        f"| {status_str} "
+                        f"| {h.get('samples_collected', '?')}"
+                        f"/{h.get('samples_requested', '?')} "
+                        f"| {boot} |\n"
+                    )
+                content += "\n"
+                content += (
+                    "**IMPORTANT:** Always reference hosts "
+                    "by their host_id (e.g., "
+                    "renesas-rcar-s4-02) in your "
+                    "assessment, never by generic labels "
+                    "like 'board 3'.\n\n"
+                )
+
         if criteria:
             content += (
                 f"**Convergence Criteria:**\n"
@@ -153,17 +184,24 @@ class EvaluateAgent(AgentBase):
         run_id = cf.get("run_id", "")
         bench_status = cf.get("benchmark_status", "")
         output_dir = cf.get("output_dir", "")
+        bench_results = cf.get("benchmark_results", {})
         if run_id:
             content += (
                 f"**Latest Benchmark Result:**\n"
                 f"- Run ID: {run_id}\n"
                 f"- Status: {bench_status}\n"
             )
+<<<<<<< HEAD
             if output_dir:
                 content += (
                     f"- Output Dir: {output_dir}\n"
                     f"  (use this path with list_benchmark_artifacts "
                     f"and read_benchmark_artifact)\n"
+=======
+            if bench_results:
+                content += (
+                    f"- Results: ```json\n{json.dumps(bench_results, indent=2)}\n```\n"
+>>>>>>> 2865261 (feat(fleet): full fleet investigation support)
                 )
             content += "\n"
 
@@ -223,6 +261,46 @@ class EvaluateAgent(AgentBase):
                 "ran out of LLM budget. Assess any "
                 "partial results that were submitted "
                 "before the budget was exhausted."
+            )
+
+        # Fleet investigation: not converged until all
+        # hosts are tested.
+        try:
+            from providers.fleet import (
+                get_fleet_progress,
+                is_fleet_investigation,
+            )
+
+            if is_fleet_investigation(custom_fields):
+                progress = get_fleet_progress(custom_fields)
+                if not progress["fleet_exhausted"]:
+                    return (
+                        f"FLEET_NOT_COMPLETE — tested "
+                        f"{progress['tested']} hosts so "
+                        f"far. More untested devices may "
+                        f"be available. Loop back to "
+                        f"test the next host."
+                    )
+                if progress["converged"]:
+                    etype = progress["exhaustion_type"]
+                    unavail = progress["unavailable_hosts"]
+                    msg = f"FLEET_COMPLETE — {progress['tested']} hosts tested."
+                    if etype == "hard":
+                        msg += " All devices in the fleet have been tested."
+                    elif etype == "soft":
+                        msg += (
+                            f" {len(unavail)} device(s) "
+                            f"were unavailable: "
+                            f"{', '.join(unavail)}. "
+                            f"Include these as untested "
+                            f"in the comparative report."
+                        )
+                    msg += " Synthesize comparative results."
+                    return msg
+        except Exception:
+            logger.debug(
+                "Fleet convergence check failed",
+                exc_info=True,
             )
 
         return ""
@@ -312,6 +390,15 @@ class EvaluateAgent(AgentBase):
                     f"LLM wanted to {result.get('decision')}: "
                     f"{notes}"
                 )
+            elif "FLEET_NOT_COMPLETE" in det:
+                # Fleet not done — let the loop-back proceed.
+                # Don't override the LLM's loop decision.
+                logger.info(
+                    f"[{self.agent_name}] Fleet not complete — allowing loop-back"
+                )
+            elif "FLEET_COMPLETE" in det:
+                decision = "converged"
+                gate = "fleet_complete"
             else:
                 decision = "converged"
                 gate = "deterministic_threshold"
@@ -457,6 +544,15 @@ class EvaluateAgent(AgentBase):
                 {"execution_plan": plan},
             )
 
+            # Fleet investigation: release the current
+            # lease before looping back for a new host.
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            from providers.fleet import is_fleet_investigation
+
+            if is_fleet_investigation(cf):
+                await self._release_fleet_lease(ticket_id, cf)
+
             await self._transition_ticket(
                 ticket_id,
                 "planning_investigation",
@@ -466,17 +562,42 @@ class EvaluateAgent(AgentBase):
             )
 
         elif decision == "loop_provision":
-            summary = (
-                f"**Loop Back: Re-provision Hardware**\n\n"
-                f"- **Reason:** {params_rationale or notes}\n"
-                f"- **Info Gain:** {info_gain}\n"
-            )
-            await self._add_comment(ticket_id, summary)
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_provision",
-                comment="Loop back: re-provisioning hardware",
-            )
+            # Fleet investigation: release the current
+            # lease and go to awaiting_hardware for a new
+            # board. Non-fleet: re-provision same hardware.
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+
+            from providers.fleet import is_fleet_investigation
+
+            if is_fleet_investigation(cf):
+                # Release current lease before getting
+                # the next board.
+                await self._release_fleet_lease(ticket_id, cf)
+                summary = (
+                    f"**Fleet: moving to next host**\n\n"
+                    f"- **Tested so far:** "
+                    f"{len(cf.get('fleet_investigation', {}).get('tested_hosts', []))}\n"
+                    f"- **Info Gain:** {info_gain}\n"
+                )
+                await self._add_comment(ticket_id, summary)
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_hardware",
+                    comment=("Fleet: acquiring next host"),
+                )
+            else:
+                summary = (
+                    f"**Loop Back: Re-provision Hardware**\n\n"
+                    f"- **Reason:** {params_rationale or notes}\n"
+                    f"- **Info Gain:** {info_gain}\n"
+                )
+                await self._add_comment(ticket_id, summary)
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_provision",
+                    comment="Loop back: re-provisioning hardware",
+                )
 
         else:
             # Unknown decision — pause for human guidance
@@ -490,3 +611,44 @@ class EvaluateAgent(AgentBase):
                 "awaiting_customer_guidance",
                 comment=(f"Unexpected evaluation decision: {decision}"),
             )
+
+    async def _release_fleet_lease(
+        self,
+        ticket_id: str,
+        custom_fields: dict[str, Any],
+    ) -> None:
+        """Release the current Jumpstarter lease for fleet rotation."""
+        metadata = custom_fields.get("resource_provider_metadata", {})
+        lease_id = metadata.get("lease_id")
+        if not lease_id:
+            return
+        provider = custom_fields.get("resource_provider")
+        if provider != "jumpstarter":
+            return
+        try:
+            from providers.resource.registry import (
+                get_resource_registry,
+            )
+
+            reg = get_resource_registry()
+            prov = await reg.get_provider("jumpstarter")
+            await prov.terminate(lease_id)
+            logger.info(f"[fleet] Released lease {lease_id} for {ticket_id}")
+        except Exception:
+            logger.debug(
+                "[fleet] Failed to release lease",
+                exc_info=True,
+            )
+
+        # Clear provisioning state so the next board
+        # gets flashed instead of skipping via the
+        # idempotency check.
+        await self._update_fields(
+            ticket_id,
+            {
+                "provisioning_complete": False,
+                "ssh_hardware_ips": None,
+                "resource_reservation_id": None,
+                "resource_provider_metadata": {},
+            },
+        )

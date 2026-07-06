@@ -82,6 +82,25 @@ class GatheringContextAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def run(self, ticket_id: str) -> None:
+        # Dedup runs once per investigation. If the
+        # ticket already has a dedup_result (from a
+        # prior pass through gathering_context), skip
+        # the LLM and proceed directly to planning.
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if cf.get("dedup_result"):
+            logger.info(
+                f"[{self.agent_name}] Dedup already "
+                f"completed for {ticket_id}, skipping "
+                f"to planning"
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "planning_investigation",
+                comment=("Dedup already completed, proceeding to planning"),
+            )
+            return
+
         gc_server = str(Path(__file__).with_name("server.py"))
         ir_server = str(Path(__file__).parent.parent / "investigation" / "server.py")
 

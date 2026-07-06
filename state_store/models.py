@@ -118,6 +118,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # the evaluate agent to sequence additional benchmark runs.
     TicketStatus.EVALUATING_CONVERGENCE: [
         TicketStatus.PLANNING_INVESTIGATION,  # refine params
+        TicketStatus.AWAITING_HARDWARE,  # fleet: next device
         TicketStatus.AWAITING_PROVISION,  # re-flash hardware
         TicketStatus.SYNTHESIZING_RESULTS,  # convergence gate met
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # manual interrupt
