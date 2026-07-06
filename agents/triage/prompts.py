@@ -209,4 +209,20 @@ IMPORTANT: Many benchmark harnesses can test multiple parameters in a SINGLE inv
 (e.g., crucible's mv-params can sweep thread counts, message sizes, etc. in one run).
 Only use multiple benchmark steps when the user explicitly wants SEPARATE harness
 invocations or when runs need different infrastructure.
+
+## Fleet Investigations
+
+When the user wants to test ALL available devices of a particular type and
+compare results across the fleet (e.g., "test all R-Car boards", "which hosts
+have failures", "run on every available board"), set `fleet_investigation: true`
+in your submit_triage_result call.
+
+Fleet investigations iterate through each device one at a time via the
+investigation loop-back mechanism. You do NOT need to create multiple execution
+plan steps — a single benchmark step is sufficient. The system will automatically
+loop back to acquire the next device after each test completes.
+
+Fleet investigations are always investigation tickets — they involve isolating
+problems across hardware, which is inherently anomaly investigation work.
+Use a single required_hosts entry with the appropriate role (one device per iteration).
 """
