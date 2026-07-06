@@ -77,44 +77,6 @@ class BenchmarkAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
-            # Fleet investigation: benchmark failure on
-            # one host should not stop the whole fleet.
-            from providers.fleet import (
-                build_tested_host_entry,
-                is_fleet_investigation,
-            )
-
-            ticket = await self._get_ticket(self._ticket_id)
-            cf = ticket.get("custom_fields", {})
-            if is_fleet_investigation(cf):
-                fleet = cf.get("fleet_investigation", {})
-                tested = fleet.get("tested_hosts", [])
-                metadata = cf.get("resource_provider_metadata", {})
-                host_id = (
-                    metadata.get("exporter_name")
-                    or metadata.get("exporter")
-                    or "unknown"
-                )
-                if not any(h["host_id"] == host_id for h in tested):
-                    entry = build_tested_host_entry(
-                        host_id=host_id,
-                        lease_id=metadata.get("lease_id", ""),
-                        status="benchmark_failed",
-                        failure_reason=question[:500],
-                    )
-                    tested.append(entry)
-                    fleet["tested_hosts"] = tested
-                    await self._update_fields(
-                        self._ticket_id,
-                        {"fleet_investigation": fleet},
-                    )
-                return (
-                    "Fleet investigation: this host has "
-                    "been recorded as a benchmark "
-                    "failure. Submit your result and "
-                    "the system will move to the next "
-                    "host automatically."
-                )
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
@@ -131,24 +93,10 @@ class BenchmarkAgent(AgentBase):
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
         await mcp.connect(infra_server, name="infra")
-
-        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
-        # Returns allowed tool names for filtering, or None.
-        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
-
-        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
-
         self._mcp = mcp
 
-        # Get all tools, but if Jumpstarter is attached,
-        # exclude lease management tools (resource provider's
-        # job, not the agent's).
-        all_tools = await mcp.list_tools()
-        if jmp_tools is not None:
-            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
-
-            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
-        self.tools = all_tools + self.tools
+        mcp_tools = await mcp.list_tools()
+        self.tools = mcp_tools + self.tools
 
         try:
             ticket = await self._get_ticket(ticket_id)
@@ -195,17 +143,8 @@ class BenchmarkAgent(AgentBase):
 
         if cf.get("parsed_specs"):
             content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
-        suite = cf.get("benchmark_suite", "")
-        harness = cf.get("directives", {}).get("harness", "")
-        if suite:
-            content += (
-                f"\n**Benchmark Suite:** {suite}\n"
-                f"Use this exact name in get_benchmark_params, "
-                f"get_example_runfile, and generate_runfile "
-                f"calls."
-            )
-            if harness:
-                content += f" Use harness='{harness}' in those calls.\n"
+        if cf.get("benchmark_suite"):
+            content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("absent_suite"):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
@@ -301,19 +240,13 @@ class BenchmarkAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        fields: dict[str, Any] = {
+        fields = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
         }
-        if result.get("benchmark_results"):
-            fields["benchmark_results"] = result["benchmark_results"]
         await self._update_fields(ticket_id, fields)
-
-        # Fleet investigation: append this host's results
-        # to the tested_hosts list for loop-back tracking.
-        await self._record_fleet_host(ticket_id, result)
 
         status = fields["benchmark_status"]
         summary = (
@@ -329,129 +262,14 @@ class BenchmarkAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
 
         if status == "failed":
-            # Fleet investigation: record failure and
-            # continue to evaluate (which will loop back
-            # for the next host). Don't stop the fleet.
-            ticket = await self._get_ticket(ticket_id)
-            cf = ticket.get("custom_fields", {})
-            from providers.fleet import is_fleet_investigation
-
-            if is_fleet_investigation(cf):
-                await self._transition_ticket(
-                    ticket_id,
-                    "evaluating_convergence",
-                    comment=(
-                        "Benchmark failed on this host, evaluating fleet progress"
-                    ),
-                )
-            else:
-                await self._transition_ticket(
-                    ticket_id,
-                    "awaiting_customer_guidance",
-                    comment=("Benchmark failed — needs investigation"),
-                )
-        else:
-            # Route based on whether this is an investigation
-            # ticket. Same code-enforced pattern as triage.
-            ticket = await self._get_ticket(ticket_id)
-            cf = ticket.get("custom_fields", {})
-            if cf.get("investigation_ledger") or cf.get("anomaly_context"):
-                await self._transition_ticket(
-                    ticket_id,
-                    "evaluating_convergence",
-                    comment=("Benchmark completed, evaluating convergence"),
-                )
-            else:
-                await self._transition_ticket(
-                    ticket_id,
-                    "awaiting_review",
-                    comment=("Benchmark completed, ready for review"),
-                )
-
-    async def _record_fleet_host(
-        self,
-        ticket_id: str,
-        result: dict[str, Any],
-    ) -> None:
-        """Append this host's results to fleet tracking.
-
-        Only activates for fleet investigations (code-enforced
-        guardrail via is_fleet_investigation).
-        """
-        from providers.fleet import (
-            build_tested_host_entry,
-            is_fleet_investigation,
-        )
-
-        ticket = await self._get_ticket(ticket_id)
-        cf = ticket.get("custom_fields", {})
-        if not is_fleet_investigation(cf):
-            return
-
-        fleet = cf.get("fleet_investigation", {})
-        tested = fleet.get("tested_hosts", [])
-
-        # Get host identifier from resource metadata
-        metadata = cf.get("resource_provider_metadata", {})
-        ssh_ips = cf.get("ssh_hardware_ips", {})
-        # ssh_hardware_ips is a dict with controller/targets
-        first_ip = ""
-        if isinstance(ssh_ips, dict):
-            targets = ssh_ips.get("targets", [])
-            first_ip = targets[0] if targets else ""
-        elif isinstance(ssh_ips, list) and ssh_ips:
-            first_ip = ssh_ips[0]
-        host_id = (
-            metadata.get("exporter_name")
-            or metadata.get("exporter")
-            or first_ip
-            or "unknown"
-        )
-
-        # Skip if already recorded (idempotency)
-        if any(h["host_id"] == host_id for h in tested):
-            return
-
-        bench_results = result.get("benchmark_results", {})
-        # KPIs may be at the top level of benchmark_results
-        # or nested under a 'kpis' key depending on how
-        # the LLM structured the submit.
-        kpis = bench_results.get("kpis")
-        if not kpis:
-            # Extract KPI fields directly from bench_results
-            kpi_keys = (
-                "avg_total_boot_s",
-                "avg_kernel_s",
-                "avg_initrd_s",
-                "avg_userspace_s",
-                "sample_count",
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment="Benchmark failed — needs investigation",
             )
-            extracted = {k: bench_results[k] for k in kpi_keys if k in bench_results}
-            if extracted:
-                kpis = extracted
-
-        entry = build_tested_host_entry(
-            host_id=host_id,
-            lease_id=metadata.get("lease_id", ""),
-            ip=first_ip,
-            status=(
-                "completed"
-                if result.get("benchmark_status") == "completed"
-                else "partial"
-            ),
-            samples_collected=bench_results.get("samples_collected", 0),
-            samples_requested=bench_results.get("samples_requested", 0),
-            failure_reason=(
-                bench_results.get("failure_reason") or result.get("notes")
-                if result.get("benchmark_status") == "failed"
-                else None
-            ),
-            kpis=kpis,
-        )
-
-        tested.append(entry)
-        fleet["tested_hosts"] = tested
-        await self._update_fields(
-            ticket_id,
-            {"fleet_investigation": fleet},
-        )
+        else:
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_review",
+                comment="Benchmark completed, ready for review",
+            )
