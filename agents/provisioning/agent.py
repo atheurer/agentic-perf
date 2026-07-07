@@ -302,15 +302,14 @@ class ProvisioningAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
 
         # Fleet investigation: if provisioning failed
-        # (no hosts provisioned), record the failure and
-        # loop back for the next host.
-        if not fields["provisioning_complete"]:
-            from providers.fleet import is_fleet_investigation
+        # Fleet investigation: record failures and loop
+        # back for the next host instead of blocking.
+        from providers.fleet import is_fleet_investigation
 
-            ticket = await self._get_ticket(ticket_id)
-            cf = ticket.get("custom_fields", {})
-            if is_fleet_investigation(cf):
-                # Record as provision_failed and loop back
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if is_fleet_investigation(cf):
+            if not fields["provisioning_complete"]:
                 await self._handle_fleet_provision_failure(
                     ticket_id,
                     result.get(
@@ -319,6 +318,21 @@ class ProvisioningAgent(AgentBase):
                     ),
                 )
                 return
+            # Provisioned but no SSH IP — can't benchmark
+            if not cf.get("ssh_hardware_ips"):
+                await self._handle_fleet_provision_failure(
+                    ticket_id,
+                    (
+                        "Provisioning completed but no "
+                        "SSH IP was discovered. The "
+                        "board may not be reachable "
+                        "via direct SSH."
+                    ),
+                )
+                return
+        elif not fields["provisioning_complete"]:
+            # Non-fleet: pause for guidance
+            pass  # handoff validation will catch it
 
         await self._transition_ticket(
             ticket_id,
