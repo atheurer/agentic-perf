@@ -88,6 +88,7 @@ class OrchestratorConfig:
             "vstorm": "https://github.com/gqlo/vstorm.git",
             "ioscale": "https://github.com/ekuric/ioscale.git",
             "forge": "https://github.com/openshift-psap/forge.git",
+            "boot-time-analysis-scripts": "https://gitlab.com/redhat/edge/tests/perfscale/boot-time-analysis-scripts.git",
         }
         env_repos = os.environ.get("HARNESS_REPOS")
         if env_repos:

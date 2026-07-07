@@ -35,10 +35,37 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("benchmark-agent")
 
+CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
+
+# Hosts that must never be passed as a reboot target.
+# boot-timings-test.sh reboots the SUT — hitting localhost
+# would kill the orchestrator.
+_FORBIDDEN_REBOOT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _is_self_host(host: str) -> bool:
+    """Return True if *host* resolves to the orchestrator itself."""
+    import socket
+
+    if host.lower() in _FORBIDDEN_REBOOT_HOSTS:
+        return True
+    try:
+        own_hostname = socket.gethostname()
+        if host.lower() == own_hostname.lower():
+            return True
+        own_fqdn = socket.getfqdn()
+        if host.lower() == own_fqdn.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
 _initialized = False
+_boot_time_executed = False
 _ssh = None
 _skill_provider = None
 _repo_cache = None
@@ -1357,6 +1384,366 @@ async def get_run_logs(
             "status": "ok" if log_result.exit_code == 0 else "error",
         }
     )
+
+
+@mcp.tool()
+async def execute_boot_time_test(
+    sut_host: str,
+    samples: int = 50,
+    kpi_pattern: str = "",
+    clean_journal: bool = False,
+    description: str = "",
+) -> str:
+    """Run a boot-time analysis test on a remote System Under Test.
+
+    This reboots the SUT multiple times, collecting boot timing
+    metrics (kernel, initrd, userspace, systemd-analyze) per cycle.
+    The SUT must have boot-time-analysis-tools installed — the tool
+    will attempt to install the package automatically before testing.
+
+    WARNING: This tool reboots the target host. It will NEVER run
+    against localhost or the orchestrator host.
+
+    Args:
+        sut_host: IP address or hostname of the SUT (NEVER localhost).
+        samples: Number of reboot cycles to collect (default 50).
+        kpi_pattern: Regex pattern for KPI log matching.
+        clean_journal: Delete journal before each reboot cycle.
+        description: Human-readable test description.
+    """
+    await _ensure_init()
+
+    # ── Guardrail: one execution per agent session ───────
+    global _boot_time_executed
+    if _boot_time_executed:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "error": (
+                    "Boot-time test already executed in "
+                    "this session. Submit your result "
+                    "and exit. The system handles fleet "
+                    "iteration via loop-back — do not "
+                    "call this tool again."
+                ),
+            }
+        )
+    _boot_time_executed = True
+
+    # ── Guardrail: never reboot the orchestrator ──────────────
+    if _is_self_host(sut_host):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "error": (
+                    f"SAFETY: refusing to run boot-time test "
+                    f"against '{sut_host}' — this would reboot "
+                    f"the orchestrator host."
+                ),
+            }
+        )
+
+    # ── Locate boot-time-analysis-scripts repo ────────────────
+    scripts_dir = None
+    if _repo_cache is not None:
+        scripts_dir = _repo_cache.get_path("boot-time-analysis-scripts")
+    if scripts_dir is None:
+        return json.dumps(
+            {
+                "status": "failed",
+                "error": (
+                    "boot-time-analysis-scripts repo not found "
+                    "in skill cache. Ensure it is configured in "
+                    "harness_repos."
+                ),
+            }
+        )
+
+    test_script = scripts_dir / "boot-timings-test.sh"
+    install_script = scripts_dir / "install-boot-time-analysis-tool.sh"
+    merge_script = scripts_dir / "boot-time-merge.py"
+
+    if not test_script.exists():
+        return json.dumps(
+            {
+                "status": "failed",
+                "error": (f"boot-timings-test.sh not found at {test_script}"),
+            }
+        )
+
+    # ── Wait for SSH readiness ─────────────────────────
+    # Freshly provisioned boards may not have SSH ready
+    # immediately. Wait up to 60s for port 22.
+    import asyncio as _asyncio
+    import socket as _socket
+
+    for _attempt in range(12):
+        try:
+            s = _socket.create_connection((sut_host, 22), timeout=5)
+            s.close()
+            break
+        except (OSError, ConnectionRefusedError):
+            logger.info(
+                f"[boot-time] Waiting for SSH on {sut_host} (attempt {_attempt + 1}/12)"
+            )
+            await _asyncio.sleep(5)
+
+    # ── Prep: install boot-time-analysis-tools on SUT ─────────
+    ssh_user = "root"
+    ssh_password = "password"
+    if _ticket:
+        fields = _ticket.get("custom_fields", {})
+        ssh_user = fields.get("ssh_user", ssh_user)
+        ssh_password = fields.get("ssh_password", ssh_password)
+
+    if install_script.exists():
+        logger.info(f"[boot-time] Installing boot-time-analysis-tools on {sut_host}")
+        import asyncio as _asyncio
+
+        install_proc = await _asyncio.create_subprocess_exec(
+            str(install_script),
+            sut_host,
+            f"--username={ssh_user}",
+            f"--password={ssh_password}",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+            cwd=str(scripts_dir),
+        )
+        install_out, install_err = await install_proc.communicate()
+        if install_proc.returncode != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "error": (
+                        f"Failed to install boot-time-analysis-tools on {sut_host}"
+                    ),
+                    "output": install_out.decode(errors="replace")[-2000:],
+                    "stderr": install_err.decode(errors="replace")[-1000:],
+                }
+            )
+        logger.info(f"[boot-time] boot-time-analysis-tools installed on {sut_host}")
+
+    # ── Build command ─────────────────────────────────────────
+    import asyncio as _asyncio
+
+    run_uuid = uuid.uuid4().hex[:8]
+    output_dir = Path(tempfile.mkdtemp(prefix=f"boot-time-{run_uuid}-"))
+
+    cmd = [
+        str(test_script),
+        sut_host,
+        str(samples),
+        f"--username={ssh_user}",
+        f"--password={ssh_password}",
+        "--folder-prefix=results",
+    ]
+    if clean_journal:
+        cmd.append("--clean-journal=true")
+
+    # Auto-enable Jumpstarter serial capture when a
+    # Jumpstarter lease is active. Serial data is written
+    # to files — it does NOT flow into LLM context.
+    if _ticket:
+        fields = _ticket.get("custom_fields", {})
+        metadata = fields.get("resource_provider_metadata", {})
+        lease_id = metadata.get("lease_id", "")
+        if lease_id and fields.get("resource_provider") == "jumpstarter":
+            cmd.append("--jumpstarter-serial")
+            cmd.append(f"--jumpstarter-lease-name={lease_id}")
+
+    # Separator for boot-time-analysis-tools arguments
+    cmd.append("--")
+    cmd.extend(["--max-time", "0"])
+    if kpi_pattern:
+        cmd.extend(["--kpi-re-pattern", kpi_pattern])
+    if description:
+        cmd.extend(["--description", description])
+
+    logger.info(f"[boot-time] Executing: {' '.join(cmd[:6])}... ({samples} samples)")
+
+    # ── Execute ───────────────────────────────────────────
+    # Run from output_dir so boot-timings-test.sh creates
+    # its results folder (and SCPs files) here, not relative
+    # to the scripts repo.
+    proc = await _asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+        cwd=str(output_dir),
+    )
+    stdout_bytes, stderr_bytes = await proc.communicate()
+    exit_code = proc.returncode or 0
+    stdout_str = stdout_bytes.decode(errors="replace")
+    stderr_str = stderr_bytes.decode(errors="replace")
+
+    # ── Parse results ─────────────────────────────────────────
+    # Find the results folder created by boot-timings-test.sh
+    result_folders = sorted(output_dir.glob("results-*"))
+    if not result_folders:
+        # Try without prefix pattern
+        result_folders = [d for d in output_dir.iterdir() if d.is_dir()]
+
+    boot_time_logs: list[Path] = []
+    for folder in result_folders:
+        boot_time_logs.extend(sorted(folder.glob("*boot_time_logs.json")))
+
+    # ── Collect system metadata ───────────────────────
+    metadata_file = output_dir / "metadata.json"
+    collect_metadata = scripts_dir / "collect-system-metadata.sh"
+    if collect_metadata.exists():
+        logger.info(f"[boot-time] Collecting system metadata from {sut_host}")
+        meta_proc = await _asyncio.create_subprocess_exec(
+            str(collect_metadata),
+            sut_host,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+            cwd=str(scripts_dir),
+        )
+        meta_out, _ = await meta_proc.communicate()
+        if meta_proc.returncode == 0 and meta_out:
+            metadata_file.write_bytes(meta_out)
+            logger.info("[boot-time] Metadata collected")
+        else:
+            # Create minimal stub so merge can proceed
+            metadata_file.write_text("{}")
+            logger.info("[boot-time] Metadata collection failed — using empty stub")
+    else:
+        metadata_file.write_text("{}")
+
+    # ── Merge into Horreum-compatible JSON ─────────────
+    merged_file = output_dir / "merged-results.json"
+    if boot_time_logs and merge_script.exists():
+        merge_cmd = [
+            sys.executable,
+            str(merge_script),
+            "-m",
+            str(metadata_file),
+            "--schema",
+            "urn:boot-time-verbose:07",
+            "--run-source",
+            "agentic-perf",
+        ]
+        if description:
+            merge_cmd.extend(["--description", description])
+        # Pass partial-run info if available
+        for folder in result_folders:
+            status_file = folder / "collection_status.json"
+            if status_file.exists():
+                try:
+                    cs = json.loads(status_file.read_text())
+                    merge_cmd.extend(
+                        [
+                            "--requested-samples",
+                            str(cs.get("requested_samples", samples)),
+                        ]
+                    )
+                    if cs.get("partial"):
+                        merge_cmd.extend(
+                            [
+                                "--partial-run",
+                                "--partial-failure-reason",
+                                cs.get(
+                                    "failure_reason",
+                                    "unknown",
+                                ),
+                            ]
+                        )
+                except (json.JSONDecodeError, OSError):
+                    pass
+                break
+        merge_cmd.extend(str(f) for f in boot_time_logs)
+
+        merge_proc = await _asyncio.create_subprocess_exec(
+            *merge_cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+            cwd=str(scripts_dir),
+        )
+        merge_out, merge_err = await merge_proc.communicate()
+        if merge_proc.returncode == 0 and merge_out:
+            merged_file.write_bytes(merge_out)
+            logger.info(f"[boot-time] Merged results saved to {merged_file}")
+        else:
+            logger.warning(
+                "[boot-time] Merge failed: " + merge_err.decode(errors="replace")[:200]
+            )
+
+    # ── Extract KPIs from per-sample summary files ───────
+    kpis: dict[str, Any] = {}
+    summary_files: list[Path] = []
+    for folder in result_folders:
+        summary_files.extend(sorted(folder.glob("*_summary.json")))
+    # Exclude all_summary.json (combined file)
+    summary_files = [f for f in summary_files if f.name != "all_summary.json"]
+    if summary_files:
+        sa_totals: list[float] = []
+        sa_kernels: list[float] = []
+        sa_initrds: list[float] = []
+        sa_userspaces: list[float] = []
+        for sf in summary_files:
+            try:
+                sd = json.loads(sf.read_text())
+                sa = sd.get("satime", {})
+                if "total" in sa:
+                    sa_totals.append(sa["total"])
+                if "kernel" in sa:
+                    sa_kernels.append(sa["kernel"])
+                if "initrd" in sa:
+                    sa_initrds.append(sa["initrd"])
+                if "userspace" in sa:
+                    sa_userspaces.append(sa["userspace"])
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        def _avg(vals: list[float]) -> float | None:
+            return round(sum(vals) / len(vals), 3) if vals else None
+
+        kpis = {
+            "sample_count": len(summary_files),
+            "avg_total_boot_s": _avg(sa_totals),
+            "avg_kernel_s": _avg(sa_kernels),
+            "avg_initrd_s": _avg(sa_initrds),
+            "avg_userspace_s": _avg(sa_userspaces),
+        }
+
+    response: dict[str, Any] = {
+        "status": "completed" if exit_code == 0 else "failed",
+        "exit_code": exit_code,
+        "run_id": f"boot-time-{run_uuid}",
+        "harness": "boot-time",
+        "samples_requested": samples,
+        "samples_collected": len(boot_time_logs),
+        "output_dir": str(output_dir),
+        "message": (
+            f"Boot time test completed ({len(boot_time_logs)}/{samples} samples)"
+            if exit_code in (0, 2)
+            else f"Boot time test failed (exit {exit_code})"
+        ),
+    }
+    if kpis:
+        response["kpis"] = kpis
+    if merged_file.exists():
+        response["merged_results_file"] = str(merged_file)
+        try:
+            merged = json.loads(merged_file.read_text())
+            cfg = merged.get("rhivos_config", {})
+            if cfg:
+                response["system_config"] = {
+                    k: cfg[k]
+                    for k in (
+                        "kernel",
+                        "os_name",
+                        "architecture",
+                    )
+                    if cfg.get(k)
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+    if exit_code not in (0, 2):
+        response["output"] = stdout_str[-3000:]
+        response["error"] = stderr_str[-1000:]
+
+    return json.dumps(response)
 
 
 if __name__ == "__main__":
