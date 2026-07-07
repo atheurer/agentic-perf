@@ -62,6 +62,11 @@ class OrchestratorConfig:
         self.anthropic_api_key = anthropic_api_key or os.environ.get(
             "ANTHROPIC_API_KEY"
         )
+        self._gemini_api_key = (
+            os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+            or llm_cfg.get("gemini_api_key")
+        )
         self.crucible_home = (
             crucible_home
             or os.environ.get("CRUCIBLE_HOME")
