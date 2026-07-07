@@ -112,12 +112,13 @@ class TestMessageBuilding:
 
 class TestOperationalMetrics:
     def test_collects_from_ledger(self):
+        import tempfile
+
         from agents.synthesis.agent import SynthesisAgent
         from providers.events import EventBus
         from providers.llm.mock import MockLLMProvider
 
-        tmp = Path("/tmp/test-synth-logs")
-        tmp.mkdir(exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="test-synth-"))
         event_bus = EventBus(log_dir=tmp)
 
         # Emit transition events for provision cycle counting
