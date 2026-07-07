@@ -158,7 +158,7 @@ class TestReserve:
         mock_svc.CreateLease = AsyncMock(return_value=mock_lease)
         provider._service = mock_svc
 
-        result = await provider.reserve({}, ticket_id="PERF-TEST")
+        result = await provider.reserve({}, description="test", ticket_id="PERF-TEST")
         assert result["provider"] == "jumpstarter"
         assert result["lease_id"] == "lease-abc123"
         assert result["status"] == "active"
@@ -218,3 +218,96 @@ class TestRegistry:
             "JumpstarterResourceProvider" in PROVIDER_REGISTRY["jumpstarter"]["class"]
         )
         assert PROVIDER_REGISTRY["jumpstarter"]["secret"] == "jumpstarter/config.json"
+
+
+class TestListTargets:
+    @pytest.mark.asyncio
+    async def test_returns_unique_targets(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        mock_exporters = []
+        for i, (name, target) in enumerate(
+            [
+                ("sa8775p-01", "ride4_sa8775p_sx_r3"),
+                ("sa8775p-02", "ride4_sa8775p_sx_r3"),
+                ("rcar-s4-01", "rcar_s4"),
+                ("s32g-01", "s32g_vnp_rdb3"),
+            ]
+        ):
+            e = MagicMock()
+            e.name = name
+            e.labels = {"target": target, "board-type": f"type-{i}"}
+            e.online = True
+            mock_exporters.append(e)
+
+        mock_result = MagicMock()
+        mock_result.exporters = mock_exporters
+
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+
+        targets = await provider.list_targets()
+        assert len(targets) == 3
+
+        # Sorted by count descending
+        assert targets[0]["target"] == "ride4_sa8775p_sx_r3"
+        assert targets[0]["count"] == 2
+        assert targets[0]["selector"] == "target=ride4_sa8775p_sx_r3"
+
+        assert targets[1]["target"] == "rcar_s4"
+        assert targets[1]["count"] == 1
+        assert targets[1]["selector"] == "target=rcar_s4"
+
+        assert targets[2]["target"] == "s32g_vnp_rdb3"
+        assert targets[2]["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_excludes_offline(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        online = MagicMock()
+        online.name = "dev-01"
+        online.labels = {"target": "myboard"}
+        online.online = True
+
+        offline = MagicMock()
+        offline.name = "dev-02"
+        offline.labels = {"target": "myboard"}
+        offline.online = False
+
+        mock_result = MagicMock()
+        mock_result.exporters = [online, offline]
+
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+
+        targets = await provider.list_targets()
+        assert len(targets) == 1
+        assert targets[0]["count"] == 1
+
+
+class TestCheckAvailableRequiresSelector:
+    @pytest.mark.asyncio
+    async def test_no_selector_returns_error_with_targets(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        mock_exporter = MagicMock()
+        mock_exporter.name = "device-01"
+        mock_exporter.labels = {"target": "myboard", "board-type": "x"}
+        mock_exporter.online = True
+
+        mock_result = MagicMock()
+        mock_result.exporters = [mock_exporter]
+
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+
+        result = await provider.check_available({})
+        assert result["available"] is False
+        assert "error" in result
+        assert "list_jumpstarter_targets" in result["error"]
+        assert len(result["available_targets"]) == 1
+        assert result["available_targets"][0]["selector"] == "target=myboard"

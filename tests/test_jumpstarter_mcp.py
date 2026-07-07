@@ -121,8 +121,8 @@ class TestAttachment:
 
 class TestAsyncWait:
     @pytest.mark.asyncio
-    async def test_suspends_for_jumpstarter(self):
-        """Suspends agent when resource_provider is jumpstarter."""
+    async def test_suspends_for_long_provisioning(self):
+        """Suspends agent when expected duration exceeds threshold."""
         mock_agent = AsyncMock()
         mock_agent._suspend_for_async = AsyncMock()
 
@@ -132,6 +132,9 @@ class TestAsyncWait:
                     "resource_provider": "jumpstarter",
                     "resource_provider_metadata": {
                         "lease_id": "lease-abc",
+                    },
+                    "jumpstarter_flash": {
+                        "expected_duration_mins": 20,
                     },
                 }
             )

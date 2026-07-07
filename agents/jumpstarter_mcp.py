@@ -101,27 +101,37 @@ async def attach_jumpstarter_mcp(
         return None
 
 
+# Provisioning operations shorter than this threshold run
+# synchronously (the LLM waits for the tool result). Longer
+# operations trigger async suspension to save LLM compute.
+SUSPEND_THRESHOLD_MINS = 10
+
+
 async def suspend_for_device_ready(
     agent: Any,
     ticket_id: str,
     store_url: str,
     lease_id: str = "",
-    expected_duration_mins: int = 10,
+    expected_duration_mins: int = 0,
 ) -> bool:
-    """Suspend the agent while waiting for a Jumpstarter device.
+    """Conditionally suspend the agent during provisioning.
 
-    Checks if the ticket uses Jumpstarter hardware. If so,
-    suspends the agent via _suspend_for_async() and returns
-    True. The orchestrator will resume the agent when a
-    CloudEvent is received at POST /api/v1/tickets/{id}/signal
-    with an event ID matching the operation_id.
+    Decision logic:
+    - If device_ready is set (provisioning already done,
+      e.g., investigation loop-back), skip.
+    - If already resumed from a previous suspension
+      (signal_received present), skip.
+    - If expected provisioning duration exceeds
+      SUSPEND_THRESHOLD_MINS, suspend and wait for a
+      CloudEvents signal.
+    - Otherwise, let the agent proceed synchronously.
 
-    The operation_id is set to the lease ID so that the
-    Jumpstarter webhook (or polling adapter) can signal
-    completion by posting a CloudEvent with that ID.
+    The expected duration comes from jumpstarter_flash
+    metadata (set by the orchestrator's image resolution)
+    or from the caller's estimate.
 
-    Returns False if the ticket doesn't use Jumpstarter or
-    if the device is already signaled ready.
+    Returns True if the agent was suspended (caller should
+    return immediately), False otherwise.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -138,16 +148,35 @@ async def suspend_for_device_ready(
         if async_ctx.get("signal_received"):
             return False
 
-        # Check if device is already connected/ready.
-        # If the lease is active and we can get a TCP address,
-        # the device is ready — no need to suspend.
+        # Skip if device is already provisioned (loop-back)
         metadata = cf.get("resource_provider_metadata", {})
         if metadata.get("device_ready"):
             return False
 
-        # Get the lease ID from resource allocation
-        op_id = lease_id or cf.get("resource_provider_metadata", {}).get(
-            "lease_id", f"jmp-{ticket_id.lower()}"
+        # Determine expected duration. The orchestrator's
+        # image resolution may set an estimate, or the
+        # caller can provide one.
+        flash_info = cf.get("jumpstarter_flash", {})
+        est_mins = expected_duration_mins or flash_info.get("expected_duration_mins", 0)
+
+        # Short operations: let the agent handle it
+        # synchronously. The LLM waits for the tool result
+        # but for < 10 minutes that's acceptable.
+        if est_mins < SUSPEND_THRESHOLD_MINS:
+            logger.info(
+                f"[jumpstarter-mcp] Provisioning "
+                f"{ticket_id} estimated at {est_mins}m "
+                f"(< {SUSPEND_THRESHOLD_MINS}m threshold) "
+                f"— proceeding synchronously"
+            )
+            return False
+
+        # Long operations: suspend to save LLM compute.
+        op_id = lease_id or metadata.get("lease_id", f"jmp-{ticket_id.lower()}")
+
+        logger.info(
+            f"[jumpstarter-mcp] Suspending {ticket_id} "
+            f"for provisioning (~{est_mins}m expected)"
         )
 
         await agent._suspend_for_async(
@@ -159,13 +188,14 @@ async def suspend_for_device_ready(
                 "lease_id": op_id,
                 "device_ready": True,
             },
-            expected_duration_mins=expected_duration_mins,
+            expected_duration_mins=est_mins,
         )
         return True
 
     except Exception:
         logger.debug(
-            "[jumpstarter-mcp] Async suspension not available or not needed",
+            "[jumpstarter-mcp] Async suspension check "
+            "failed — proceeding synchronously",
             exc_info=True,
         )
         return False

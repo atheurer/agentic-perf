@@ -14,7 +14,7 @@ Configuration via ~/.agentic-perf/secrets/jumpstarter/config.json:
         "controller_endpoint": "grpc.jumpstarter.example.com:443",
         "token": "...",
         "namespace": "jumpstarter-lab",
-        "default_selector": "target=ride4_sa8775p_sx_r3",
+        "default_selector": "",
         "default_lease_duration_seconds": 7200,
         "ssh_user": "root",
         "tls_insecure": true
@@ -152,6 +152,47 @@ class JumpstarterResourceProvider(ResourceProvider):
             f"[jumpstarter] Connected to controller (namespace={self._namespace})"
         )
 
+    async def list_targets(self) -> list[dict[str, Any]]:
+        """List unique target types from all online exporters.
+
+        Returns a list of dicts, each with:
+        - target: the target label value (used as selector)
+        - selector: full selector string for reserve/check calls
+        - count: number of online devices with this target
+        - example_device: name of one device (for reference)
+        - labels: union of all labels seen for this target
+        """
+        await self._ensure_connected()
+        assert self._service is not None
+
+        exporters = await self._service.ListExporters()
+        targets: dict[str, dict[str, Any]] = {}
+        for e in exporters.exporters:
+            labels = dict(e.labels)
+            online = getattr(e, "online", True)
+            if not online:
+                continue
+            target = labels.get("target", "unknown")
+            if target not in targets:
+                targets[target] = {
+                    "target": target,
+                    "selector": f"target={target}",
+                    "count": 0,
+                    "example_device": e.name,
+                    "labels": {},
+                }
+            targets[target]["count"] += 1
+            # Merge labels (union of all seen values)
+            for k, v in labels.items():
+                if k not in targets[target]["labels"]:
+                    targets[target]["labels"][k] = v
+
+        return sorted(
+            targets.values(),
+            key=lambda t: t["count"],
+            reverse=True,
+        )
+
     async def check_available(
         self,
         requirements: dict[str, Any],
@@ -180,24 +221,67 @@ class JumpstarterResourceProvider(ResourceProvider):
                 }
             )
 
-        # Filter by selector if provided
+        # Require a selector — the agent must resolve the
+        # user's platform to a target via list_jumpstarter_targets
+        # before checking availability.
         selector = requirements.get(
             "jumpstarter_selector",
             self._default_selector,
         )
-        if selector:
-            key, _, value = selector.partition("=")
-            matching = [
-                d for d in all_devices if d["labels"].get(key) == value and d["online"]
-            ]
-        else:
-            matching = [d for d in all_devices if d["online"]]
+        if not selector:
+            # Return available targets so the agent can pick one
+            targets = await self.list_targets()
+            return {
+                "provider": "jumpstarter",
+                "available": False,
+                "error": (
+                    "No jumpstarter_selector provided. Call "
+                    "list_jumpstarter_targets first to see "
+                    "available hardware types, then match the "
+                    "user's platform request to the correct "
+                    "target selector."
+                ),
+                "available_targets": targets,
+            }
+
+        key, _, value = selector.partition("=")
+        matching = [
+            d for d in all_devices if d["labels"].get(key) == value and d["online"]
+        ]
+
+        # Fleet exclusion: filter out already-tested hosts
+        exclude = requirements.get("exclude_hosts", [])
+        if exclude:
+            excluded = []
+            remaining = []
+            for d in matching:
+                if d["name"] in exclude:
+                    excluded.append(d["name"])
+                else:
+                    remaining.append(d)
+            matching = remaining
 
         count = requirements.get("count", 1)
 
-        # No matches — return available targets so the
-        # agent can pick the right one instead of guessing.
+        # No matches — distinguish between "wrong
+        # selector" and "all devices already tested."
         if not matching:
+            if exclude:
+                # All matching devices have been tested
+                return {
+                    "provider": "jumpstarter",
+                    "available": False,
+                    "matching_devices": 0,
+                    "requested": count,
+                    "selector": selector,
+                    "fleet_exhausted": True,
+                    "tested_hosts": exclude,
+                    "message": (
+                        "All matching devices have "
+                        "been tested. Fleet "
+                        "investigation complete."
+                    ),
+                }
             targets = await self.list_targets()
             return {
                 "provider": "jumpstarter",
@@ -226,24 +310,36 @@ class JumpstarterResourceProvider(ResourceProvider):
 
     async def reserve(
         self,
-        requirements: dict[str, Any],
-        ticket_id: str = "",
+        selection: dict[str, Any],
+        description: str = "",
+        duration_hours: int = 36,
+        ticket_id: str | None = None,
     ) -> dict[str, Any]:
         """Reserve a Jumpstarter device via lease.
 
         Creates a lease for a device matching the selector.
         Returns the lease ID and device info.
+
+        Args:
+            selection: Must include jumpstarter_selector and
+                optionally lease_duration_seconds.
+            description: Reservation description (for logging).
+            duration_hours: Fallback duration if not in selection
+                (converted to seconds).
+            ticket_id: Ticket ID for lease naming.
         """
         await self._ensure_connected()
         assert self._service is not None
 
-        selector = requirements.get(
+        selector = selection.get(
             "jumpstarter_selector",
             self._default_selector,
         )
-        duration_sec = requirements.get(
+        # Prefer explicit seconds from selection, else use
+        # duration_hours converted, else default.
+        duration_sec = selection.get(
             "lease_duration_seconds",
-            self._default_duration,
+            duration_hours * 3600 if duration_hours != 36 else self._default_duration,
         )
         duration = timedelta(seconds=duration_sec)
 
@@ -323,6 +419,7 @@ class JumpstarterResourceProvider(ResourceProvider):
     async def terminate(
         self,
         reservation_id: str,
+        provider_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Delete a lease and release the device."""
         await self._ensure_connected()
