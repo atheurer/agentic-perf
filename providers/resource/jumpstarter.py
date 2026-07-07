@@ -349,11 +349,35 @@ class JumpstarterResourceProvider(ResourceProvider):
         if ticket_id:
             lease_id = ticket_id.lower().replace("_", "-")
 
-        lease = await self._service.CreateLease(
-            selector=selector,
-            duration=duration,
-            lease_id=lease_id,
-        )
+        # Fleet iterations reuse the same ticket_id.
+        # If a lease with this name already exists (e.g.
+        # previous iteration wasn't fully cleaned up),
+        # append an iteration suffix to avoid conflicts.
+        if lease_id:
+            base_id = lease_id
+            suffix = 2
+            while True:
+                try:
+                    lease = await self._service.CreateLease(
+                        selector=selector,
+                        duration=duration,
+                        lease_id=lease_id,
+                    )
+                    break
+                except Exception as exc:
+                    if "already exists" in str(exc):
+                        lease_id = f"{base_id}-{suffix}"
+                        suffix += 1
+                        if suffix > 100:
+                            raise
+                        continue
+                    raise
+        else:
+            lease = await self._service.CreateLease(
+                selector=selector,
+                duration=duration,
+                lease_id=lease_id,
+            )
 
         lease_name = lease.name if hasattr(lease, "name") else str(lease)
         self._active_leases[lease_name] = lease
