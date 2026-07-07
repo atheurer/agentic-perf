@@ -23,7 +23,7 @@ openai = [
     "openai>=1.0.0",
 ]
 gemini = [
-    "google-genai>=1.0.0",
+    "google-genai>=2.0.0",
 ]
 telemetry = [
     "opentelemetry-sdk>=1.20.0",

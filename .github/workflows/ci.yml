@@ -17,7 +17,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,gemini,openai]"
 
       - name: Lint
         run: ./scripts/lint.sh
@@ -35,7 +35,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,gemini,openai]"
 
       - name: Test with coverage
         run: ./scripts/test.sh
@@ -60,7 +60,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]" bandit pip-audit
+        run: pip install -e ".[dev,gemini,openai]" bandit pip-audit
 
       - name: Static security scan (bandit)
         run: |
