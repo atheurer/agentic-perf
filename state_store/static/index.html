@@ -1337,10 +1337,7 @@ async function updateUsageSidebar(ticketId) {
         'Est. <span style="color:var(--yellow); font-size:14px; font-weight:700">' +
           fmtCost(cost) + '</span>' +
       '</div>' +
-      (u.models_used.length > 0 ?
-        '<div style="font-size:10px; color:var(--text-muted); margin-bottom:4px">' +
-          u.models_used.join(', ') +
-        '</div>' : '');
+      '';
 
     var agents = data.by_agent || {};
     var agentNames = Object.keys(agents);
@@ -1373,7 +1370,11 @@ async function updateUsageSidebar(ticketId) {
             ' &middot; ' +
             au.llm_calls + ' calls &middot; ' +
             (au.total_duration_ms / 1000).toFixed(1) + 's' +
-          '</div>';
+          '</div>' +
+          ((au.models_used && au.models_used.length > 0) ?
+            '<div style="font-size:9px; color:var(--text-muted); margin-left:4px; margin-bottom:4px">' +
+              au.models_used.join(', ') +
+            '</div>' : '');
       }
       agentHtml += '</div>';
       el.innerHTML += agentHtml;
