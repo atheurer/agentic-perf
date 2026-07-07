@@ -127,27 +127,23 @@ class EventBus:
     def _next_seq(self, ticket_id: str) -> int:
         """Return the next sequence number for a ticket.
 
-        On first call for a given ticket, reads the max seq from the
-        existing JSONL file so that sequence numbers survive restarts.
+        On first call for a given ticket, counts lines in the existing
+        JSONL file so that sequence numbers survive restarts. Uses line
+        count (not embedded seq values) to stay consistent with
+        _read_from_file which renumbers events by line position.
         """
         if ticket_id not in self._seq:
-            max_seq = 0
+            line_count = 0
             path = self._log_dir / f"{ticket_id}.jsonl"
             if path.exists():
                 try:
                     with open(path, encoding="utf-8") as f:
                         for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                evt = json.loads(line)
-                                max_seq = max(max_seq, evt.get("seq", 0))
-                            except json.JSONDecodeError:
-                                continue
+                            if line.strip():
+                                line_count += 1
                 except Exception:
-                    logger.exception(f"Failed to read max seq from {path}")
-            self._seq[ticket_id] = max_seq
+                    logger.exception(f"Failed to count lines in {path}")
+            self._seq[ticket_id] = line_count
         self._seq[ticket_id] += 1
         return self._seq[ticket_id]
 
@@ -283,6 +279,7 @@ class EventBus:
             return []
         results = []
         try:
+            line_num = 0
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -292,7 +289,9 @@ class EventBus:
                         evt = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if evt.get("seq", 0) > since:
+                    line_num += 1
+                    evt["seq"] = line_num
+                    if line_num > since:
                         results.append(evt)
                         if len(results) >= limit:
                             break
