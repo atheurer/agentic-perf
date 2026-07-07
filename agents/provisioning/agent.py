@@ -327,11 +327,24 @@ class ProvisioningAgent(AgentBase):
         # Jumpstarter: the provisioning agent discovers the
         # SSH IP during flashing. Update ticket fields so
         # downstream agents can SSH directly.
-        if result.get("ssh_hardware_ips"):
-            fields["ssh_hardware_ips"] = result["ssh_hardware_ips"]
+        ssh_ips = result.get("ssh_hardware_ips")
+        if not ssh_ips and result.get("hosts_provisioned"):
+            # LLM didn't set ssh_hardware_ips explicitly.
+            # Derive from hosts_provisioned — single-host
+            # Jumpstarter boards use the same IP for
+            # controller and target.
+            hosts = result["hosts_provisioned"]
+            first_ip = str(hosts[0]) if hosts else ""
+            if first_ip:
+                ssh_ips = {
+                    "controller": first_ip,
+                    "targets": [first_ip],
+                }
+        if ssh_ips:
+            fields["ssh_hardware_ips"] = ssh_ips
             fields["assigned_hardware_ips"] = result.get(
                 "assigned_hardware_ips",
-                result["ssh_hardware_ips"],
+                ssh_ips,
             )
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
