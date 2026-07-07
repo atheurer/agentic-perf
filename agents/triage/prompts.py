@@ -79,9 +79,13 @@ Your job is to analyze a performance test request ticket and:
      key should always be present.
    - "resource": Host/hardware requirements, provider preferences, instance
      types, counts, regions, availability zones, RAM requirements.
-   - "provisioning": Harness installation instructions, packages to install,
-     setup requirements. Do NOT include benchmark parameters, test configs,
-     connectivity testing details, or reporting expectations here.
+   - "provisioning": Harness installation instructions, user-requested
+     packages (e.g., "install nmap-ncat"). Do NOT include benchmark tool
+     names (uperf, fio, trafficgen, etc.), benchmark parameters, test
+     configs, connectivity testing, SSH key setup, or reporting
+     expectations. The provisioning agent installs the harness only —
+     benchmark tools run inside the harness's containers and do not need
+     host-level installation.
    - "benchmark": Test parameters (message sizes, thread counts, protocols,
      duration, samples), workload specifications, connectivity requirements,
      tool selection, run approval preferences, and any benchmark-specific
