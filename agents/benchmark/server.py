@@ -253,6 +253,124 @@ async def get_example_runfile(
     )
 
 
+CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
+
+
+@mcp.tool()
+async def setup_passwordless_ssh(
+    source: str,
+    targets: list[str],
+    target_ssh_hosts: list[str] | None = None,
+    ssh_user: str = "root",
+) -> str:
+    """Set up passwordless SSH from a source host to target hosts.
+
+    Generates a key pair on the source if needed and copies the public
+    key to each target's authorized_keys. Safe to call multiple times —
+    existing keys are deduplicated by comment tag.
+
+    In cloud environments, targets may only be reachable via public IPs
+    from the agent machine, but the source host reaches them via private
+    IPs. Pass target_ssh_hosts with the SSH-reachable (public) IPs for
+    key injection, while targets contains the internal IPs that the
+    source uses to connect after setup.
+    """
+    await _ensure_init()
+    user = ssh_user
+    ssh_hosts = target_ssh_hosts or targets
+    if len(ssh_hosts) != len(targets):
+        return json.dumps(
+            {
+                "status": "failed",
+                "message": (
+                    f"target_ssh_hosts length ({len(ssh_hosts)}) must match "
+                    f"targets length ({len(targets)})"
+                ),
+            }
+        )
+    logger.info(f"[benchmark] Setting up SSH keys: {source} -> {targets}")
+
+    pubkey_result = await _ssh.run(source, "cat /root/.ssh/id_rsa.pub 2>/dev/null")
+    if pubkey_result.exit_code != 0 or not pubkey_result.stdout.strip():
+        keygen_result = await _ssh.run(
+            source,
+            f'ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{CONTROLLER_KEY_COMMENT}" -N ""',
+        )
+        if keygen_result.exit_code != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "message": f"Key generation failed: {keygen_result.stderr}",
+                }
+            )
+        pubkey_result = await _ssh.run(source, "cat /root/.ssh/id_rsa.pub")
+
+    pubkey = pubkey_result.stdout.strip()
+    if CONTROLLER_KEY_COMMENT not in pubkey:
+        await _ssh.run(
+            source,
+            "rm -f /root/.ssh/id_rsa /root/.ssh/id_rsa.pub && "
+            f'ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{CONTROLLER_KEY_COMMENT}" -N ""',
+        )
+        pubkey_result = await _ssh.run(source, "cat /root/.ssh/id_rsa.pub")
+        pubkey = pubkey_result.stdout.strip()
+
+    results = {}
+
+    for target, ssh_host in zip(targets, ssh_hosts):
+        check = await _ssh.run(
+            source,
+            f"ssh -o ConnectTimeout=5 -o BatchMode=yes "
+            f"-o StrictHostKeyChecking=accept-new "
+            f"{user}@{target} hostname",
+        )
+        if check.exit_code == 0:
+            results[target] = {
+                "status": "already_accessible",
+                "hostname": check.stdout.strip(),
+            }
+            continue
+
+        inject = await _ssh.run(
+            ssh_host,
+            f"mkdir -p /root/.ssh && "
+            f'sed -i "/{CONTROLLER_KEY_COMMENT}/d" /root/.ssh/authorized_keys 2>/dev/null; '
+            f'echo "{pubkey}" >> /root/.ssh/authorized_keys && '
+            f"chmod 600 /root/.ssh/authorized_keys",
+        )
+        if inject.exit_code != 0:
+            results[target] = {
+                "status": "failed",
+                "message": inject.stderr,
+            }
+            continue
+
+        verify = await _ssh.run(
+            source,
+            f"ssh -o ConnectTimeout=5 -o BatchMode=yes "
+            f"-o StrictHostKeyChecking=accept-new "
+            f"{user}@{target} hostname",
+        )
+        results[target] = {
+            "status": "configured" if verify.exit_code == 0 else "failed",
+            "hostname": verify.stdout.strip() if verify.exit_code == 0 else "",
+            "message": verify.stderr if verify.exit_code != 0 else "",
+        }
+
+    all_ok = all(
+        r["status"] in ("already_accessible", "configured") for r in results.values()
+    )
+    return json.dumps(
+        {
+            "status": "success" if all_ok else "partial_failure",
+            "results": results,
+            "message": "All targets accessible from source"
+            if all_ok
+            else "Some targets failed SSH setup",
+        }
+    )
+
+
 @mcp.tool()
 async def execute_benchmark(
     controller: str,
