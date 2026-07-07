@@ -46,7 +46,13 @@ to construct a correct run file — getting the format right is critical.
    - The run command and run-file format
 
 4. **Execute pre-run steps** — For example, if "ssh_key_setup" is listed, call
-   `setup_controller_ssh_keys`.
+   `setup_passwordless_ssh` with:
+   - source: the controller's SSH-reachable IP (from ssh_hardware_ips.controller)
+   - targets: the endpoint private IPs (from assigned_hardware_ips.targets)
+   - target_ssh_hosts: the endpoint SSH-reachable IPs (from ssh_hardware_ips.targets)
+   This generates a key on the controller and injects it on each endpoint via
+   their SSH-reachable IPs, then verifies the controller can reach each endpoint
+   on the private IPs. Do NOT use execute_command to set up SSH keys manually.
 
 5. **Construct the run-file** — You are responsible for building a correct run-file:
    - Call `get_runfile_schema()` to understand required fields and structure

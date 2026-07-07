@@ -51,15 +51,16 @@ cluster node. There are no separate endpoint/target hosts.
 
 ## SSH Key Setup
 
-For kube, `setup_controller_ssh_keys` must ensure the
+For kube, `setup_passwordless_ssh` must ensure the
 controller can SSH to the kube host. For single-node K8s,
-pass the controller's SSH address as the controller and
-the controller's private IP as the endpoint:
+pass the controller's SSH address as the source and
+the controller's private IP as the target:
 
 ```
-setup_controller_ssh_keys(
-  controller=<ssh_hardware_ips.controller>,
-  endpoints=[<assigned_hardware_ips.controller>]
+setup_passwordless_ssh(
+  source=<ssh_hardware_ips.controller>,
+  targets=[<assigned_hardware_ips.controller>],
+  target_ssh_hosts=[<ssh_hardware_ips.controller>]
 )
 ```
 

@@ -150,7 +150,7 @@ class BenchmarkAgent(AgentBase):
         if cf.get("hypothesis"):
             content += f"\n**Hypothesis:** {cf['hypothesis']}\n"
         if cf.get("ssh_hardware_ips"):
-            content += f"\n## SSH Addresses (use these for SSH/SCP and setup_controller_ssh_keys)\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"
+            content += f"\n## SSH Addresses (use these for SSH/SCP and setup_passwordless_ssh)\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"
             content += f"\n## Private Addresses (use these for run-file host entries and controller-ip-address)\n```json\n{json.dumps(cf.get('assigned_hardware_ips', {}), indent=2)}\n```\n"
         elif cf.get("assigned_hardware_ips"):
             content += f"\n## Assigned Hardware\n```json\n{json.dumps(cf['assigned_hardware_ips'], indent=2)}\n```\n"

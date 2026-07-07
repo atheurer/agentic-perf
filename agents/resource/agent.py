@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
-from agents.infra.server import cleanup_controller_ssh_keys
+from agents.infra.server import cleanup_passwordless_ssh
 from agents.mcp_client import AgentMCPClient
 from agents.provisioning.mcp_server import cleanup_harness
 from providers.events import EventBus
@@ -211,7 +211,7 @@ class ResourceAgent(AgentBase):
 
         if controller and targets:
             try:
-                result = await cleanup_controller_ssh_keys(ssh, controller, targets)
+                result = await cleanup_passwordless_ssh(ssh, controller, targets)
                 cleanup_summary.append(f"Controller SSH keys: {result['status']}")
                 logger.info(f"[resource-agent] Controller key cleanup: {result}")
             except Exception as e:

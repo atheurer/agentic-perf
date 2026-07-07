@@ -54,15 +54,10 @@ Your tasks:
    configuration first — some harnesses (e.g., crucible) run benchmark tools
    inside containers and do not require host-level installation.
 
-4. Set up controller-to-target SSH keys. Benchmark harnesses need the controller
-   to SSH into target hosts as root. Call `setup_controller_ssh_keys` with:
-   - controller: the controller's SSH-reachable IP (from ssh_hardware_ips.controller)
-   - endpoints: the target IPs that the controller will SSH to internally
-     (from assigned_hardware_ips.targets — these are the private/internal IPs)
-   This tool safely generates a key pair on the controller and appends the public
-   key to each target's authorized_keys (idempotent — safe to call multiple times).
-   Do NOT use write_remote_file or execute_command to set up SSH keys manually —
-   write_remote_file overwrites the file and will destroy existing keys.
+4. Do NOT set up SSH keys between the controller and endpoints. That is the
+   benchmark agent's responsibility (it runs as a pre-run step). Do NOT use
+   setup_passwordless_ssh, write_remote_file, or execute_command to distribute
+   SSH keys — any of these can destroy existing keys or duplicate work.
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip
