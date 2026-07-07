@@ -100,6 +100,15 @@ class BenchmarkAgent(AgentBase):
 
         try:
             ticket = await self._get_ticket(ticket_id)
+
+            # Scope tools to the harness. Standalone
+            # harnesses need only a few tools — hiding
+            # the rest prevents the agent from exploring
+            # harness-specific tools (runfile schemas,
+            # example configs) or running diagnostic SSH
+            # commands instead of its one job.
+            self._apply_tool_scoping(ticket)
+
             ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
             if ssh_key:
                 # SSH key is now handled server-side via ticket data
@@ -108,6 +117,34 @@ class BenchmarkAgent(AgentBase):
         finally:
             await mcp.disconnect()
             self._mcp = None
+
+    # Tool sets per harness. Each harness declares the
+    # tools its benchmark agent needs. Tools not listed
+    # are hidden from the LLM to prevent exploration and
+    # scope creep (upstream #201).
+    _HARNESS_TOOLS: dict[str, set[str]] = {
+        "boot-time": {
+            "read_skill",
+            "set_ssh_context",
+            "check_host",
+            "execute_boot_time_test",
+            "submit_benchmark_result",
+            "request_clarification",
+        },
+    }
+
+    def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
+        """Filter tools based on harness type.
+
+        Harnesses listed in _HARNESS_TOOLS get a reduced
+        tool set. Unlisted harnesses keep all tools.
+        """
+        harness = (
+            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        )
+        allowed = self._HARNESS_TOOLS.get(harness)
+        if allowed is not None:
+            self.tools = [t for t in self.tools if t.name in allowed]
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
