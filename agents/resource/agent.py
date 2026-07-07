@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
-from agents.benchmark.mcp_server import cleanup_controller_ssh_keys
+from agents.infra.server import cleanup_controller_ssh_keys
 from agents.mcp_client import AgentMCPClient
 from agents.provisioning.mcp_server import cleanup_harness
 from providers.events import EventBus

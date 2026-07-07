@@ -35,8 +35,6 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("benchmark-agent")
 
-CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
-
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
@@ -251,90 +249,6 @@ async def get_example_runfile(
             "harness": harness_name,
             "endpoint_type": ep_type,
             "run_file": example,
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# SSH tools
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def setup_controller_ssh_keys(
-    controller: str, endpoints: list[str], ssh_user: str = "root"
-) -> str:
-    """Set up passwordless SSH from the controller host to endpoint hosts. Generates a key pair on the controller if needed and copies the public key to each endpoint."""
-    await _ensure_init()
-    user = ssh_user
-    logger.info(f"[benchmark] Setting up SSH keys: {controller} -> {endpoints}")
-
-    pubkey_result = await _ssh.run(controller, "cat /root/.ssh/id_rsa.pub 2>/dev/null")
-    if pubkey_result.exit_code != 0 or not pubkey_result.stdout.strip():
-        keygen_result = await _ssh.run(
-            controller,
-            f'ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{CONTROLLER_KEY_COMMENT}" -N ""',
-        )
-        if keygen_result.exit_code != 0:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "message": f"Key generation failed: {keygen_result.stderr}",
-                }
-            )
-        pubkey_result = await _ssh.run(controller, "cat /root/.ssh/id_rsa.pub")
-
-    pubkey = pubkey_result.stdout.strip()
-    if CONTROLLER_KEY_COMMENT not in pubkey:
-        await _ssh.run(
-            controller,
-            f'rm -f /root/.ssh/id_rsa /root/.ssh/id_rsa.pub && ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -C "{CONTROLLER_KEY_COMMENT}" -N ""',
-        )
-        pubkey_result = await _ssh.run(controller, "cat /root/.ssh/id_rsa.pub")
-        pubkey = pubkey_result.stdout.strip()
-
-    results = {}
-
-    for endpoint in endpoints:
-        check = await _ssh.run(
-            controller,
-            f"ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new {user}@{endpoint} hostname",
-        )
-        if check.exit_code == 0:
-            results[endpoint] = {
-                "status": "already_accessible",
-                "hostname": check.stdout.strip(),
-            }
-            continue
-
-        inject = await _ssh.run(
-            endpoint,
-            f'mkdir -p /root/.ssh && sed -i "/{CONTROLLER_KEY_COMMENT}/d" /root/.ssh/authorized_keys 2>/dev/null; echo "{pubkey}" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys',
-        )
-        if inject.exit_code != 0:
-            results[endpoint] = {"status": "failed", "message": inject.stderr}
-            continue
-
-        verify = await _ssh.run(
-            controller,
-            f"ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new {user}@{endpoint} hostname",
-        )
-        results[endpoint] = {
-            "status": "configured" if verify.exit_code == 0 else "failed",
-            "hostname": verify.stdout.strip() if verify.exit_code == 0 else "",
-            "message": verify.stderr if verify.exit_code != 0 else "",
-        }
-
-    all_ok = all(
-        r["status"] in ("already_accessible", "configured") for r in results.values()
-    )
-    return json.dumps(
-        {
-            "status": "success" if all_ok else "partial_failure",
-            "results": results,
-            "message": "All endpoints accessible"
-            if all_ok
-            else "Some endpoints failed SSH setup",
         }
     )
 
