@@ -265,3 +265,24 @@ class TestNoCheckStatuses:
     def test_awaiting_teardown(self):
         ok, _ = check_handoff("awaiting_teardown", {})
         assert ok
+
+
+class TestEnrichedRequiredHosts:
+    """required_hosts with hardware specs must still pass validation."""
+
+    def test_enriched_hosts_pass_handoff(self):
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "min_memory_gb": 16},
+                    {"roles": ["client"], "nic_speed": 25, "os": "RHEL9"},
+                    {"roles": ["server"], "nic_speed": 25, "os": "RHEL9"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": ["10.0.0.2", "10.0.0.3"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason

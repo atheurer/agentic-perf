@@ -16,9 +16,14 @@ Always call submit_resource_result with:
 
 ## Host Count
 
-The ticket's required_hosts field lists every host needed with its role,
-e.g. [{"role": "controller"}, {"role": "client"}, {"role": "server"}].
+The ticket's required_hosts field lists every host needed with its roles
+and optional hardware specs (nic_speed, min_cores, min_memory_gb, os).
 Allocate exactly this many hosts: 1 controller + the rest as targets.
+
+When required_hosts entries include hardware specs, pass them to
+check_available_resources via the required_hosts parameter to get
+per-host instance type recommendations. Use those recommendations
+to build per-role instance_specs in reserve_resources.
 
 ## Validating your allocation
 

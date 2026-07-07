@@ -132,11 +132,27 @@ async def list_resource_providers() -> str:
 
 @mcp.tool()
 async def check_available_resources(
-    provider: str, requirements: dict | None = None
+    provider: str,
+    requirements: dict | None = None,
+    required_hosts: list[dict] | None = None,
 ) -> str:
-    """Check what resources are available from a specific provider. For bare-metal providers (quads), returns available hosts with CPU, memory, disk, and NIC details. For cloud providers (aws), returns recommended instance types. For GPU cluster providers (psap-cc), returns available clusters with GPU type, count, and cluster details. Use filters to narrow results."""
+    """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
     await _ensure_init()
     prov = await _registry.get_provider(provider)
+    if required_hosts:
+        recommendations = []
+        for host_req in required_hosts:
+            result = await prov.check_available(host_req)
+            rec = dict(host_req)
+            if result.get("options"):
+                rec["recommended"] = result["options"][0]
+            recommendations.append(rec)
+        return json.dumps(
+            {
+                "provider": prov.provider_name,
+                "per_host_recommendations": recommendations,
+            }
+        )
     result = await prov.check_available(requirements or {})
     return json.dumps(result)
 

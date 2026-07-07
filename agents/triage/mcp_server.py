@@ -99,18 +99,40 @@ def get_triage_tools() -> list[ToolDefinition]:
                                         '["controller", "client"])'
                                     ),
                                 },
+                                "nic_speed": {
+                                    "type": ["integer", "string"],
+                                    "description": (
+                                        "Required NIC speed in Gbps "
+                                        "(e.g. 25, '100Gbps')"
+                                    ),
+                                },
+                                "min_cores": {
+                                    "type": "integer",
+                                    "description": "Minimum CPU cores",
+                                },
+                                "min_memory_gb": {
+                                    "type": "integer",
+                                    "description": "Minimum RAM in GB",
+                                },
+                                "os": {
+                                    "type": "string",
+                                    "description": (
+                                        "OS requirement (e.g. 'RHEL9')"
+                                    ),
+                                },
                             },
                             "required": ["roles"],
                         },
                         "description": (
                             "Every host needed for the test, each with its "
-                            "roles. Always include a controller. A host can "
-                            "serve multiple roles (e.g. controller + client). "
-                            "Use multiple entries for multiple clients/servers. "
-                            "Example for uperf: [{roles: [controller]}, "
-                            "{roles: [client]}, {roles: [server]}]. "
-                            "Example for single-host fio: "
-                            "[{roles: [controller, client]}]"
+                            "roles and optional hardware requirements. "
+                            "Always include a controller. A host can serve "
+                            "multiple roles (e.g. controller + client). "
+                            "Attach hardware specs the user requested to "
+                            "the relevant host entries. "
+                            "Example: [{roles: [controller], min_memory_gb: 16}, "
+                            "{roles: [client], nic_speed: 25, os: 'RHEL9'}, "
+                            "{roles: [server], nic_speed: 25, os: 'RHEL9'}]"
                         ),
                     },
                     "directives": {

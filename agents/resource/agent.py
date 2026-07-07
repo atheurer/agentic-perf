@@ -299,10 +299,19 @@ class ResourceAgent(AgentBase):
         endpoint_type = directives.get("endpoint_type", "remotehosts")
         if required_hosts:
             content += "\n## Resource Requirements\n"
-            roles_str = ", ".join(
-                "+".join(h.get("roles", ["?"])) for h in required_hosts
-            )
-            content += f"- **Required hosts:** {len(required_hosts)} ({roles_str})\n"
+            for i, h in enumerate(required_hosts, 1):
+                roles_str = "+".join(h.get("roles", ["?"]))
+                specs = []
+                if h.get("nic_speed"):
+                    specs.append(f"NIC: {h['nic_speed']}Gbps")
+                if h.get("min_memory_gb"):
+                    specs.append(f"RAM: ≥{h['min_memory_gb']}GB")
+                if h.get("min_cores"):
+                    specs.append(f"CPU: ≥{h['min_cores']} cores")
+                if h.get("os"):
+                    specs.append(f"OS: {h['os']}")
+                spec_str = f" ({', '.join(specs)})" if specs else ""
+                content += f"- Host {i}: **{roles_str}**{spec_str}\n"
             if endpoint_type == "kube":
                 content += "- **Endpoint type:** kube (workloads run as pods)\n"
                 content += "- **Total hosts to provision:** 1 (single host: controller + K8s cluster)\n"

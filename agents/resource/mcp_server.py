@@ -80,7 +80,9 @@ def get_resource_tools() -> list[ToolDefinition]:
                 "CPU, memory, disk, and NIC details. For cloud providers (aws), "
                 "returns recommended instance types. For GPU cluster providers "
                 "(psap-cc), returns available clusters with GPU type, count, "
-                "and cluster details. Use filters to narrow results."
+                "and cluster details. Use required_hosts (preferred) for "
+                "per-host recommendations, or requirements for a single "
+                "uniform recommendation."
             ),
             input_schema={
                 "type": "object",
@@ -89,10 +91,24 @@ def get_resource_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Provider name (e.g., 'quads', 'aws')",
                     },
+                    "required_hosts": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Per-host requirements from the ticket's "
+                            "required_hosts field. Each entry has roles "
+                            "plus optional hardware specs (nic_speed, "
+                            "min_cores, min_memory_gb, os). Returns a "
+                            "recommendation for each entry. Preferred "
+                            "over the flat 'requirements' parameter."
+                        ),
+                    },
                     "requirements": {
                         "type": "object",
                         "description": (
-                            "Resource requirements. Common keys: "
+                            "Uniform resource requirements (use "
+                            "required_hosts instead for per-host specs). "
+                            "Common keys: "
                             "min_cores (int), min_memory_gb (int), "
                             "nic_speed (int, Gbps), nic_vendor (str), "
                             "disk_type (str), count (int, hosts needed), "
@@ -386,10 +402,24 @@ def create_resource_tool_handlers(
         }
 
     async def check_available_resources(
-        provider: str, requirements: dict | None = None
+        provider: str,
+        requirements: dict | None = None,
+        required_hosts: list[dict] | None = None,
     ) -> dict:
         reg = _get_registry()
         prov = await reg.get_provider(provider)
+        if required_hosts:
+            recommendations = []
+            for host_req in required_hosts:
+                result = await prov.check_available(host_req)
+                rec = dict(host_req)
+                if result.get("options"):
+                    rec["recommended"] = result["options"][0]
+                recommendations.append(rec)
+            return {
+                "provider": prov.provider_name,
+                "per_host_recommendations": recommendations,
+            }
         return await prov.check_available(requirements or {})
 
     last_reservation: dict[str, Any] = {}

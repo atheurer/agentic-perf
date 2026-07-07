@@ -27,10 +27,19 @@ Your job is to analyze a performance test request ticket and:
 4. From the benchmark details, note the RESOURCE REQUIREMENTS — specifically the roles
    (e.g., ["client"] or ["client", "server"]) and min_hosts count. Build the
    `required_hosts` list for your result: take the benchmark's endpoint roles and
-   always add {"role": "controller"}. Every host needed for the test must appear
-   in this list with its role.
+   always add {"roles": ["controller"]}. Every host needed for the test must appear
+   in this list with its roles.
 
-   Example: uperf has roles ["client", "server"]. Your required_hosts should be:
+   Attach any hardware requirements the user specified to the relevant host entries.
+   Available optional fields: nic_speed (int, Gbps), min_cores (int),
+   min_memory_gb (int), os (string). Only include specs the user actually requested.
+
+   Example: uperf on AWS with 25Gb NICs, 16GB controller, RHEL9:
+   [{"roles": ["controller"], "min_memory_gb": 16},
+    {"roles": ["client"], "nic_speed": 25, "os": "RHEL9"},
+    {"roles": ["server"], "nic_speed": 25, "os": "RHEL9"}]
+
+   Example without hardware specs (defaults will be used):
    [{"roles": ["controller"]}, {"roles": ["client"]}, {"roles": ["server"]}]
 
    A single-host benchmark like fio has roles ["client"]. If the controller
