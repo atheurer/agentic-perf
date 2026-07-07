@@ -316,15 +316,57 @@ async def _resolve_jumpstarter_images(
         directives = cf.get("directives", {})
         metadata = cf.get("resource_provider_metadata", {})
 
-        # Extract image parameters from directives
+        # Resolve image source. No hardcoded OS defaults
+        # — if the user didn't specify and there's no
+        # config, the provisioning agent must ask.
+        from orchestrator.config import _load_config_file
+
+        img_cfg = _load_config_file().get("jumpstarter_images", {})
+
         base_url = directives.get(
             "image_server",
-            "https://autosd.sig.centos.org/",
+            img_cfg.get(
+                "server",
+                "https://autosd.sig.centos.org/",
+            ),
         )
-        image_version = directives.get("image_version", "AutoSD-10")
+        image_version = directives.get(
+            "image_version",
+            img_cfg.get("image_version", ""),
+        )
         release = directives.get("release", "nightly")
         image_name = directives.get("image_name", "ps")
         image_type = directives.get("image_type", "regular")
+
+        if not image_version:
+            logger.info(
+                f"[jumpstarter-images] No image_version "
+                f"for {ticket_id} — provisioning agent "
+                f"will need to ask the user"
+            )
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={
+                        "fields": {
+                            "jumpstarter_flash": {
+                                "error": (
+                                    "No OS image version"
+                                    " specified. Set "
+                                    "image_version in "
+                                    "ticket directives "
+                                    "(e.g., AutoSD-10, "
+                                    "RHIVOS-2) or "
+                                    "configure "
+                                    "jumpstarter_images."
+                                    "image_version in "
+                                    "config.json."
+                                ),
+                            },
+                        },
+                    },
+                )
+            return
 
         # Board target from selector
         selector = directives.get("board_selector") or metadata.get("selector", "")
@@ -359,6 +401,18 @@ async def _resolve_jumpstarter_images(
                     )
                     if not result.get("error"):
                         break
+
+        # Flash duration estimate by board type.
+        _FLASH_DURATION_MINS: dict[str, int] = {
+            "ride4_sa8775p_sx_r3": 8,
+            "ride4_sa8775p_sx": 8,
+            "ride4_sa8775p_sx_legacy": 8,
+            "ride4_sa8650p_sx_r3": 8,
+            "rcar_s4": 20,
+            "s32g_vnp_rdb3": 20,
+            "j784s4evm": 20,
+        }
+        result["expected_duration_mins"] = _FLASH_DURATION_MINS.get(board_target, 15)
 
         # Include the orchestrator's SSH public key so
         # the provisioning agent can inject it into the
