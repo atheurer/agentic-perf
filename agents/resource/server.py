@@ -249,9 +249,9 @@ async def validate_host(
         "for iface in $(ip -o link show "
         "| awk -F'[ :]+' '/^[0-9]+: (eth|ens|eno|enp)/"
         "{print $2}'); do "
-        "speed=$(ethtool \"$iface\" 2>/dev/null "
+        'speed=$(ethtool "$iface" 2>/dev/null '
         "| awk '/Speed:/{print $2}'); "
-        "echo \"${iface}:${speed:-unknown}\"; "
+        'echo "${iface}:${speed:-unknown}"; '
         "done"
     )
     nic_result = await ssh.run(host, nic_cmd, timeout=15)

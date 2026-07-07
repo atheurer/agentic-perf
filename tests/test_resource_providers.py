@@ -315,23 +315,11 @@ class TestAWSResourceProvider:
             provider._match_instance_type({"network_interface": "25Gb"})
             == "m5n.4xlarge"
         )
-        assert (
-            provider._match_instance_type({"network_speed": 25}) == "m5n.4xlarge"
-        )
-        assert (
-            provider._match_instance_type({"nic_speed_gbps": "25"})
-            == "m5n.4xlarge"
-        )
-        assert (
-            provider._match_instance_type({"controller_ram_gb": 32})
-            == "m5.4xlarge"
-        )
-        assert (
-            provider._match_instance_type({"ram_gb": 32}) == "m5.4xlarge"
-        )
-        assert (
-            provider._match_instance_type({"memory_gb": 32}) == "m5.4xlarge"
-        )
+        assert provider._match_instance_type({"network_speed": 25}) == "m5n.4xlarge"
+        assert provider._match_instance_type({"nic_speed_gbps": "25"}) == "m5n.4xlarge"
+        assert provider._match_instance_type({"controller_ram_gb": 32}) == "m5.4xlarge"
+        assert provider._match_instance_type({"ram_gb": 32}) == "m5.4xlarge"
+        assert provider._match_instance_type({"memory_gb": 32}) == "m5.4xlarge"
 
     @pytest.mark.asyncio
     async def test_terminate(self):

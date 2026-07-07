@@ -22,8 +22,7 @@ def show_disclaimer():
         return
 
     print(
-        "\n⚠️  AI-generated content may contain errors. "
-        "Always verify before acting.\n"
+        "\n⚠️  AI-generated content may contain errors. Always verify before acting.\n"
     )
     os.environ["AGENTIC_PERF_DISCLAIMER_SHOWN"] = "1"
 

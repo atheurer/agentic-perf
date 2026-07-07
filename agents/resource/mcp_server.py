@@ -365,22 +365,18 @@ def create_resource_tool_handlers(
             "for iface in $(ip -o link show "
             "| awk -F'[ :]+' '/^[0-9]+: (eth|ens|eno|enp)/"
             "{print $2}'); do "
-            "speed=$(ethtool \"$iface\" 2>/dev/null "
+            'speed=$(ethtool "$iface" 2>/dev/null '
             "| awk '/Speed:/{print $2}'); "
-            "echo \"${iface}:${speed:-unknown}\"; "
+            'echo "${iface}:${speed:-unknown}"; '
             "done"
         )
-        nic_result = await ssh.run(
-            host, nic_cmd, timeout=15, key_path=effective_key
-        )
+        nic_result = await ssh.run(host, nic_cmd, timeout=15, key_path=effective_key)
         nic_info = []
         if nic_result.exit_code == 0 and nic_result.stdout.strip():
             for nic_line in nic_result.stdout.strip().splitlines():
                 parts = nic_line.split(":", 1)
                 if len(parts) == 2:
-                    nic_info.append(
-                        {"name": parts[0], "speed": parts[1]}
-                    )
+                    nic_info.append({"name": parts[0], "speed": parts[1]})
 
         return {
             "host": host,

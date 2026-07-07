@@ -116,9 +116,7 @@ def get_triage_tools() -> list[ToolDefinition]:
                                 },
                                 "os": {
                                     "type": "string",
-                                    "description": (
-                                        "OS requirement (e.g. 'RHEL9')"
-                                    ),
+                                    "description": ("OS requirement (e.g. 'RHEL9')"),
                                 },
                             },
                             "required": ["roles"],
