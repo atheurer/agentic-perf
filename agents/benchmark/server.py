@@ -1612,13 +1612,38 @@ async def execute_boot_time_test(
     # Auto-enable Jumpstarter serial capture when a
     # Jumpstarter lease is active. Serial data is written
     # to files — it does NOT flow into LLM context.
+    #
+    # When the Jumpstarter MCP connection is active, the
+    # socket is at /tmp/jumpstarter-*/socket. Pass it as
+    # JUMPSTARTER_HOST so boot-timings-test.sh uses the
+    # existing connection instead of creating a new one
+    # via `jmp shell --lease` (which would conflict with
+    # the active MCP connection).
+    jumpstarter_env: dict[str, str] = {}
     if _ticket:
         fields = _ticket.get("custom_fields", {})
         metadata = fields.get("resource_provider_metadata", {})
         lease_id = metadata.get("lease_id", "")
         if lease_id and fields.get("resource_provider") == "jumpstarter":
             cmd.append("--jumpstarter-serial")
-            cmd.append(f"--jumpstarter-lease-name={lease_id}")
+            # Find active Jumpstarter socket
+            jmp_sockets = sorted(
+                Path("/tmp").glob("jumpstarter-*/socket"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if jmp_sockets:
+                jumpstarter_env["JUMPSTARTER_HOST"] = str(
+                    jmp_sockets[0]
+                )
+                logger.info(
+                    f"[boot-time] Using existing Jumpstarter "
+                    f"socket: {jmp_sockets[0]}"
+                )
+            else:
+                # Fallback: let boot-timings-test.sh create
+                # a new connection via jmp shell
+                cmd.append(f"--jumpstarter-lease-name={lease_id}")
 
     # Separator for boot-time-analysis-tools arguments
     cmd.append("--")
@@ -1634,11 +1659,16 @@ async def execute_boot_time_test(
     # Run from output_dir so boot-timings-test.sh creates
     # its results folder (and SCPs files) here, not relative
     # to the scripts repo.
+    # Merge Jumpstarter env vars with current environment
+    import os as _os
+
+    run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
     proc = await _asyncio.create_subprocess_exec(
         *cmd,
         stdout=_asyncio.subprocess.PIPE,
         stderr=_asyncio.subprocess.PIPE,
         cwd=str(output_dir),
+        env=run_env,
     )
     stdout_bytes, stderr_bytes = await proc.communicate()
     exit_code = proc.returncode or 0
