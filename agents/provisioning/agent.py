@@ -167,16 +167,23 @@ class ProvisioningAgent(AgentBase):
             fields["k3s_version"] = result.get("k3s_version", "unknown")
         await self._update_fields(ticket_id, fields)
 
+        hosts = [
+            str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))
+            for h in fields["hosts_provisioned"]
+        ]
         summary = (
             f"**Provisioning Complete**\n\n"
-            f"- **Hosts:** {', '.join(fields['hosts_provisioned'])}\n"
+            f"- **Hosts:** {', '.join(hosts)}\n"
             f"- **Harness:** {fields['harness_name']} (version: {fields['harness_version']})\n"
         )
         config = fields["configuration_applied"]
         if config:
             summary += "- **Configuration:**\n"
             for host, items in config.items():
-                summary += f"  - {host}: {', '.join(items) if isinstance(items, list) else items}\n"
+                if isinstance(items, list):
+                    summary += f"  - {host}: {', '.join(str(i) for i in items)}\n"
+                else:
+                    summary += f"  - {host}: {items}\n"
         if result.get("notes"):
             summary += f"- **Notes:** {result['notes']}\n"
 
