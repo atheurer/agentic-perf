@@ -160,6 +160,8 @@ def _compute_ticket_usage(
 
     total_in = 0
     total_out = 0
+    total_cache_read = 0
+    total_cache_create = 0
     llm_calls = 0
     models_seen: set[str] = set()
 
@@ -173,6 +175,8 @@ def _compute_ticket_usage(
             continue
         total_in += in_tok
         total_out += out_tok
+        total_cache_read += data.get("cache_read_input_tokens", 0) or 0
+        total_cache_create += data.get("cache_creation_input_tokens", 0) or 0
         llm_calls += 1
         model = data.get("model", "")
         if model:
@@ -181,6 +185,8 @@ def _compute_ticket_usage(
     usage = {
         "input_tokens": total_in,
         "output_tokens": total_out,
+        "cache_read_input_tokens": total_cache_read,
+        "cache_creation_input_tokens": total_cache_create,
         "total_tokens": total_in + total_out,
         "llm_calls": llm_calls,
         "models_used": sorted(models_seen),

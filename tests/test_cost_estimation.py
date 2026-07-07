@@ -97,6 +97,75 @@ def test_user_pricing_override(tmp_path: Path):
         assert abs(c - 2.0) < 0.001
 
 
+def test_cache_aware_pricing():
+    """Cache tokens are priced at discounted rates."""
+    # Without cache: 1000 input * $3/1M + 500 output * $15/1M = $0.0105
+    cost_no_cache = estimate_cost("claude-sonnet-4", 1000, 500)
+
+    # With 800 tokens from cache read (90% off): much cheaper
+    cost_with_cache = estimate_cost(
+        "claude-sonnet-4",
+        1000,
+        500,
+        cache_read_input_tokens=800,
+    )
+    assert cost_with_cache < cost_no_cache
+
+    # Verify the math:
+    # uncached: (1000-800) * $3/1M = $0.0006
+    # cache_read: 800 * $0.30/1M = $0.00024
+    # output: 500 * $15/1M = $0.0075
+    expected = 200 * 0.000003 + 800 * 0.0000003 + 500 * 0.000015
+    assert abs(cost_with_cache - expected) < 0.000001
+
+
+def test_cache_write_premium():
+    """Cache write tokens cost more than regular input."""
+    cost_no_cache = estimate_cost("claude-sonnet-4", 1000, 0)
+    cost_with_write = estimate_cost(
+        "claude-sonnet-4",
+        1000,
+        0,
+        cache_creation_input_tokens=1000,
+    )
+    # 1.25x premium on writes: more expensive than regular input
+    assert cost_with_write > cost_no_cache
+
+
+def test_cache_fallback_to_input_rate():
+    """Models without cache rates in pricing.yaml use input rate."""
+    # gpt-4-turbo has no cache_read_per_token in pricing.yaml
+    cost_no_cache = estimate_cost("gpt-4-turbo", 1000, 500)
+    cost_with_cache = estimate_cost(
+        "gpt-4-turbo",
+        1000,
+        500,
+        cache_read_input_tokens=800,
+    )
+    # Falls back to input rate, so cost is the same
+    assert abs(cost_with_cache - cost_no_cache) < 0.000001
+
+
+def test_cumulative_cost_with_cache():
+    """Cumulative cost accounts for cache tokens."""
+    usage = {
+        "input_tokens": 10000,
+        "output_tokens": 5000,
+        "cache_read_input_tokens": 8000,
+        "cache_creation_input_tokens": 0,
+        "models_used": ["claude-sonnet-4-6"],
+    }
+    cost_cached = estimate_cumulative_cost(usage)
+
+    usage_no_cache = {
+        "input_tokens": 10000,
+        "output_tokens": 5000,
+        "models_used": ["claude-sonnet-4-6"],
+    }
+    cost_no_cache = estimate_cumulative_cost(usage_no_cache)
+    assert cost_cached < cost_no_cache
+
+
 def test_pricing_yaml_exists():
     """Bundled pricing.yaml exists and is valid."""
     pricing_file = Path(__file__).parent.parent / "providers" / "cost" / "pricing.yaml"

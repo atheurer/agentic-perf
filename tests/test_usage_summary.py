@@ -35,6 +35,8 @@ def _emit_usage(
     duration_ms: int,
     model: str = "claude-sonnet-4-6",
     agent: str = "system",
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
 ) -> None:
     """Emit an llm_usage event, matching what the OTLP span processor does."""
     event_bus.emit(
@@ -44,6 +46,8 @@ def _emit_usage(
         {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
             "duration_ms": duration_ms,
             "model": model,
         },
@@ -130,6 +134,28 @@ class TestGetUsageSummary:
         assert len(result["by_ticket"]) == 2
         assert result["by_ticket"][t1.id]["total_tokens"] == 150
         assert result["by_ticket"][t2.id]["total_tokens"] == 280
+
+    def test_cache_tokens_in_summary(self, store: TicketStore, event_bus: EventBus):
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="test", description="desc")
+        )
+        _emit_usage(
+            event_bus,
+            ticket.id,
+            1000,
+            500,
+            500,
+            cache_read_input_tokens=800,
+            cache_creation_input_tokens=50,
+        )
+        request = _make_request(store, event_bus)
+        result = get_usage_summary(request)
+        ticket_usage = result["by_ticket"][ticket.id]
+        assert ticket_usage["cache_read_input_tokens"] == 800
+        assert ticket_usage["cache_creation_input_tokens"] == 50
+        # Cost should be lower than if all 1000 tokens were uncached
+        no_cache_cost = 1000 * 0.000003 + 500 * 0.000015
+        assert ticket_usage["estimated_cost_usd"] < no_cache_cost
 
     def test_mixed_tickets_with_and_without_usage(
         self, store: TicketStore, event_bus: EventBus

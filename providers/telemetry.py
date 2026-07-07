@@ -137,6 +137,25 @@ class EventBusSpanProcessor(SpanProcessor):
             else (_output if _output is not None else 0)
         )
 
+        # Extract cache token counts from span attributes.
+        # Check the current semconv names first, then the
+        # deprecated aliases.
+        _cache_read = attrs.get(
+            SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            attrs.get(
+                SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS_DEPRECATED,
+            ),
+        )
+        cache_read = int(_cache_read) if _cache_read is not None else 0
+
+        _cache_create = attrs.get(
+            SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            attrs.get(
+                SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS_DEPRECATED,
+            ),
+        )
+        cache_create = int(_cache_create) if _cache_create is not None else 0
+
         # Calculate duration from span timestamps
         duration_ms = 0
         if span.start_time and span.end_time:
@@ -167,6 +186,8 @@ class EventBusSpanProcessor(SpanProcessor):
                 duration_ms=dur_ms,
                 model=model_str,
                 agent_name=agent_str,
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_create,
             )
 
         # Persist as an event so the state store process
@@ -179,6 +200,8 @@ class EventBusSpanProcessor(SpanProcessor):
                 {
                     "input_tokens": in_tok,
                     "output_tokens": out_tok,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_create,
                     "duration_ms": dur_ms,
                     "model": model_str,
                 },

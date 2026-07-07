@@ -65,6 +65,8 @@ class CumulativeUsage:
     __slots__ = (
         "input_tokens",
         "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
         "llm_calls",
         "total_duration_ms",
         "models_used",
@@ -73,6 +75,8 @@ class CumulativeUsage:
     def __init__(self) -> None:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        self.cache_read_input_tokens: int = 0
+        self.cache_creation_input_tokens: int = 0
         self.llm_calls: int = 0
         self.total_duration_ms: int = 0
         self.models_used: set[str] = set()
@@ -83,10 +87,14 @@ class CumulativeUsage:
         output_tokens: int,
         duration_ms: int,
         model: str = "",
+        cache_read_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
     ) -> None:
         """Add one LLM call's usage to the totals."""
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+        self.cache_read_input_tokens += cache_read_input_tokens
+        self.cache_creation_input_tokens += cache_creation_input_tokens
         self.total_duration_ms += duration_ms
         self.llm_calls += 1
         if model:
@@ -97,6 +105,8 @@ class CumulativeUsage:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "total_tokens": (self.input_tokens + self.output_tokens),
             "llm_calls": self.llm_calls,
             "total_duration_ms": self.total_duration_ms,
@@ -137,6 +147,8 @@ class EventBus:
         duration_ms: int,
         model: str = "",
         agent_name: str = "",
+        cache_read_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
     ) -> None:
         """Accumulate LLM token usage for a ticket.
 
@@ -156,6 +168,8 @@ class EventBus:
                 output_tokens,
                 duration_ms,
                 model,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
             )
 
             # Per-agent accumulation
@@ -168,6 +182,8 @@ class EventBus:
                     output_tokens,
                     duration_ms,
                     model,
+                    cache_read_input_tokens=cache_read_input_tokens,
+                    cache_creation_input_tokens=cache_creation_input_tokens,
                 )
 
     def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
@@ -207,6 +223,8 @@ class EventBus:
                     continue
                 total.input_tokens += usage.input_tokens
                 total.output_tokens += usage.output_tokens
+                total.cache_read_input_tokens += usage.cache_read_input_tokens
+                total.cache_creation_input_tokens += usage.cache_creation_input_tokens
                 total.llm_calls += usage.llm_calls
                 total.total_duration_ms += usage.total_duration_ms
                 total.models_used.update(usage.models_used)

@@ -65,51 +65,67 @@ def _match_model(model: str, pricing: dict[str, Any]) -> dict[str, float]:
     Model names from APIs often include version suffixes
     (e.g., claude-sonnet-4-6, gpt-4o-2024-05-13). We match
     by checking if a pricing key is a prefix of the model.
+
+    Returns input, output, cache_read, and cache_write rates.
+    Cache rates fall back to the input rate when not specified.
     """
     models = pricing.get("models", {})
 
+    def _rates(entry: dict[str, Any]) -> dict[str, float]:
+        input_rate = entry.get("input_per_token", 0)
+        return {
+            "input": input_rate,
+            "output": entry.get("output_per_token", 0),
+            "cache_read": entry.get("cache_read_per_token", input_rate),
+            "cache_write": entry.get("cache_write_per_token", input_rate),
+        }
+
     # Exact match
     if model in models:
-        entry = models[model]
-        return {
-            "input": entry.get("input_per_token", 0),
-            "output": entry.get("output_per_token", 0),
-        }
+        return _rates(models[model])
 
     # Prefix match
     for key, entry in models.items():
         if model.startswith(key):
-            return {
-                "input": entry.get("input_per_token", 0),
-                "output": entry.get("output_per_token", 0),
-            }
+            return _rates(entry)
 
     # Fallback
     fallback = pricing.get("fallback", {})
-    return {
-        "input": fallback.get("input_per_token", 0),
-        "output": fallback.get("output_per_token", 0),
-    }
+    return _rates(fallback)
 
 
 def estimate_cost(
     model: str,
     input_tokens: int,
     output_tokens: int,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
 ) -> float:
     """Estimate USD cost for a single LLM call.
 
     Args:
         model: Model name (e.g., "claude-sonnet-4-6").
-        input_tokens: Number of input/prompt tokens.
+        input_tokens: Number of input/prompt tokens (total,
+            including cached — the API reports this as the
+            full count).
         output_tokens: Number of output/completion tokens.
+        cache_read_input_tokens: Tokens served from cache
+            (discounted rate).
+        cache_creation_input_tokens: Tokens written to cache
+            (may have a write premium).
 
     Returns:
         Estimated cost in USD.
     """
     pricing = _load_pricing()
     rates = _match_model(model, pricing)
-    return input_tokens * rates["input"] + output_tokens * rates["output"]
+    uncached = input_tokens - cache_read_input_tokens - cache_creation_input_tokens
+    return (
+        max(0, uncached) * rates["input"]
+        + cache_read_input_tokens * rates["cache_read"]
+        + cache_creation_input_tokens * rates["cache_write"]
+        + output_tokens * rates["output"]
+    )
 
 
 def estimate_cumulative_cost(
@@ -126,6 +142,8 @@ def estimate_cumulative_cost(
         model,
         int(usage.get("input_tokens", 0)),
         int(usage.get("output_tokens", 0)),
+        cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0)),
+        cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0)),
     )
 
 

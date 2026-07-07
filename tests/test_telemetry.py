@@ -36,6 +36,8 @@ def test_cumulative_usage_initial():
     d = u.to_dict()
     assert d["input_tokens"] == 0
     assert d["output_tokens"] == 0
+    assert d["cache_read_input_tokens"] == 0
+    assert d["cache_creation_input_tokens"] == 0
     assert d["total_tokens"] == 0
     assert d["llm_calls"] == 0
     assert d["total_duration_ms"] == 0
@@ -50,10 +52,14 @@ def test_cumulative_usage_single_record():
         output_tokens=50,
         duration_ms=500,
         model="claude-sonnet-4-6",
+        cache_read_input_tokens=80,
+        cache_creation_input_tokens=10,
     )
     d = u.to_dict()
     assert d["input_tokens"] == 100
     assert d["output_tokens"] == 50
+    assert d["cache_read_input_tokens"] == 80
+    assert d["cache_creation_input_tokens"] == 10
     assert d["total_tokens"] == 150
     assert d["llm_calls"] == 1
     assert d["total_duration_ms"] == 500
@@ -63,12 +69,14 @@ def test_cumulative_usage_single_record():
 def test_cumulative_usage_accumulates():
     """Multiple records accumulate correctly."""
     u = CumulativeUsage()
-    u.record(100, 50, 500, "claude-sonnet-4-6")
-    u.record(200, 80, 700, "claude-sonnet-4-6")
+    u.record(100, 50, 500, "claude-sonnet-4-6", cache_read_input_tokens=60)
+    u.record(200, 80, 700, "claude-sonnet-4-6", cache_read_input_tokens=150)
     u.record(150, 60, 400, "gpt-4o")
     d = u.to_dict()
     assert d["input_tokens"] == 450
     assert d["output_tokens"] == 190
+    assert d["cache_read_input_tokens"] == 210
+    assert d["cache_creation_input_tokens"] == 0
     assert d["total_tokens"] == 640
     assert d["llm_calls"] == 3
     assert d["total_duration_ms"] == 1600
@@ -334,6 +342,43 @@ def test_span_processor_captures_agent(
 
 
 # --- Span processor event emission ---
+
+
+@requires_otlp
+def test_span_processor_extracts_cache_tokens(
+    event_bus: EventBus,
+):
+    """Span processor extracts cache token counts from spans."""
+    from providers.telemetry import (
+        EventBusSpanProcessor,
+    )
+
+    processor = EventBusSpanProcessor(event_bus)
+
+    span = MagicMock()
+    span.attributes = {
+        "gen_ai.request.model": "claude-sonnet-4-6",
+        "gen_ai.usage.input_tokens": 500,
+        "gen_ai.usage.output_tokens": 100,
+        "gen_ai.usage.cache_read.input_tokens": 400,
+        "gen_ai.usage.cache_creation.input_tokens": 50,
+        "agentic_perf.ticket_id": "PERF-CACHE01",
+    }
+    span.start_time = 1000000000
+    span.end_time = 2000000000
+
+    processor.on_end(span)
+
+    d = event_bus.get_cumulative_usage("PERF-CACHE01")
+    assert d["input_tokens"] == 500
+    assert d["cache_read_input_tokens"] == 400
+    assert d["cache_creation_input_tokens"] == 50
+
+    events = event_bus.get_events("PERF-CACHE01")
+    usage_events = [e for e in events if e["event_type"] == "llm_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["data"]["cache_read_input_tokens"] == 400
+    assert usage_events[0]["data"]["cache_creation_input_tokens"] == 50
 
 
 @requires_otlp

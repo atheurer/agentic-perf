@@ -28,38 +28,51 @@ fallback:
 models:
   # --- Anthropic ---
   # Source: https://www.anthropic.com/pricing
+  # Cache: 90% discount on reads, 25% premium on writes (5-min TTL)
   claude-opus-4:
-    input_per_token: 0.000015    # $15.00 / 1M tokens
-    output_per_token: 0.000075   # $75.00 / 1M tokens
+    input_per_token: 0.000015       # $15.00 / 1M tokens
+    cache_read_per_token: 0.0000015  # $1.50 / 1M tokens (90% off)
+    cache_write_per_token: 0.00001875  # $18.75 / 1M tokens (1.25x)
+    output_per_token: 0.000075      # $75.00 / 1M tokens
 
   claude-sonnet-4:
-    input_per_token: 0.000003    # $3.00 / 1M tokens
-    output_per_token: 0.000015   # $15.00 / 1M tokens
+    input_per_token: 0.000003       # $3.00 / 1M tokens
+    cache_read_per_token: 0.0000003  # $0.30 / 1M tokens (90% off)
+    cache_write_per_token: 0.00000375  # $3.75 / 1M tokens (1.25x)
+    output_per_token: 0.000015      # $15.00 / 1M tokens
 
   claude-haiku-3.5:
-    input_per_token: 0.0000008   # $0.80 / 1M tokens
-    output_per_token: 0.000004   # $4.00 / 1M tokens
+    input_per_token: 0.0000008      # $0.80 / 1M tokens
+    cache_read_per_token: 0.00000008  # $0.08 / 1M tokens (90% off)
+    cache_write_per_token: 0.000001  # $1.00 / 1M tokens (1.25x)
+    output_per_token: 0.000004      # $4.00 / 1M tokens
 
   # --- OpenAI ---
   # Source: https://openai.com/api/pricing
+  # Cache: 50% discount on reads, no write premium
   gpt-4o:
-    input_per_token: 0.0000025   # $2.50 / 1M tokens
-    output_per_token: 0.00001    # $10.00 / 1M tokens
+    input_per_token: 0.0000025      # $2.50 / 1M tokens
+    cache_read_per_token: 0.00000125  # $1.25 / 1M tokens (50% off)
+    output_per_token: 0.00001       # $10.00 / 1M tokens
 
   gpt-4o-mini:
-    input_per_token: 0.00000015  # $0.15 / 1M tokens
-    output_per_token: 0.0000006  # $0.60 / 1M tokens
+    input_per_token: 0.00000015     # $0.15 / 1M tokens
+    cache_read_per_token: 0.000000075  # $0.075 / 1M tokens (50% off)
+    output_per_token: 0.0000006     # $0.60 / 1M tokens
 
   gpt-4-turbo:
-    input_per_token: 0.00001     # $10.00 / 1M tokens
-    output_per_token: 0.00003    # $30.00 / 1M tokens
+    input_per_token: 0.00001        # $10.00 / 1M tokens
+    output_per_token: 0.00003       # $30.00 / 1M tokens
 
   # --- Google ---
   # Source: https://ai.google.dev/pricing
+  # Cache: ~90% discount on reads
   gemini-2.5-pro:
-    input_per_token: 0.00000125  # $1.25 / 1M tokens
-    output_per_token: 0.00001    # $10.00 / 1M tokens
+    input_per_token: 0.00000125     # $1.25 / 1M tokens
+    cache_read_per_token: 0.000000315  # $0.315 / 1M tokens
+    output_per_token: 0.00001       # $10.00 / 1M tokens
 
   gemini-2.5-flash:
-    input_per_token: 0.00000015  # $0.15 / 1M tokens
-    output_per_token: 0.0000006  # $0.60 / 1M tokens
+    input_per_token: 0.00000015     # $0.15 / 1M tokens
+    cache_read_per_token: 0.0000000375  # $0.0375 / 1M tokens
+    output_per_token: 0.0000006     # $0.60 / 1M tokens
