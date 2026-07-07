@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -13,6 +14,18 @@ from pathlib import Path
 import httpx
 
 DEFAULT_STORE_URL = "http://localhost:8090"
+
+
+def show_disclaimer():
+    """Show AI safety disclaimer once per session."""
+    if os.environ.get("AGENTIC_PERF_DISCLAIMER_SHOWN"):
+        return
+
+    print(
+        "\n⚠️  AI-generated content may contain errors. "
+        "Always verify before acting.\n"
+    )
+    os.environ["AGENTIC_PERF_DISCLAIMER_SHOWN"] = "1"
 
 
 def get_client(args) -> tuple[httpx.Client, str]:
@@ -694,6 +707,8 @@ def cmd_health(args):
 
 
 def main():
+    show_disclaimer()
+
     parser = argparse.ArgumentParser(
         prog="agentic-perf",
         description="Agentic Performance Testing CLI",

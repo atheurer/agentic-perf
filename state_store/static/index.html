@@ -802,6 +802,45 @@ th.col-right { text-align: right; }
   .container { padding: 0 12px; }
   .ticket-summary { max-width: 250px; }
 }
+
+.ai-disclaimer {
+  background: linear-gradient(135deg, rgba(224, 175, 104, 0.15), rgba(255, 158, 100, 0.15));
+  border-bottom: 1px solid var(--orange);
+  padding: 12px 0;
+  position: sticky;
+  top: 61px;
+  z-index: 99;
+  transition: opacity 0.3s, transform 0.3s;
+}
+
+.ai-disclaimer.hidden {
+  display: none;
+}
+
+.ai-disclaimer .container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  color: var(--orange);
+  font-weight: 500;
+}
+
+.disclaimer-close {
+  background: none;
+  border: none;
+  color: var(--orange);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 8px;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+
+.disclaimer-close:hover {
+  opacity: 1;
+}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
@@ -815,12 +854,35 @@ th.col-right { text-align: right; }
   </div>
 </header>
 
+<div id="ai-disclaimer" class="ai-disclaimer">
+  <div class="container">
+    <span>⚠️ AI-generated content may contain errors. Always verify before acting.</span>
+    <button onclick="dismissDisclaimer()" class="disclaimer-close" title="Dismiss">&times;</button>
+  </div>
+</div>
+
 <div class="container">
   <div id="app"></div>
 </div>
 
 <script>
 const API = '/api/v1';
+
+// AI Safety Disclaimer
+function dismissDisclaimer() {
+  const banner = document.getElementById('ai-disclaimer');
+  if (banner) {
+    banner.classList.add('hidden');
+    localStorage.setItem('dismissedDisclaimer', 'true');
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (localStorage.getItem('dismissedDisclaimer') === 'true') {
+    const banner = document.getElementById('ai-disclaimer');
+    if (banner) banner.classList.add('hidden');
+  }
+});
 
 let currentView = 'list';
 let currentTicketId = null;
