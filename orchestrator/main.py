@@ -714,8 +714,13 @@ async def _resolve_jumpstarter_images(
                 )
             return
 
-        # Board target from selector
-        selector = directives.get("board_selector") or metadata.get("selector", "")
+        # Board target from selector. The resource agent
+        # may store it as 'selector' or 'jumpstarter_selector'.
+        selector = (
+            directives.get("board_selector")
+            or metadata.get("selector", "")
+            or metadata.get("jumpstarter_selector", "")
+        )
         board_target = selector.split("=", 1)[-1] if "=" in selector else selector
 
         from providers.resource.jumpstarter_images import (
