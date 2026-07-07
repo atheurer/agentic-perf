@@ -43,6 +43,7 @@ def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: st
         project_id=config.llm_project_id,
         region=config.llm_region,
         base_url=config._openai_base_url,
+        gemini_api_key=config._gemini_api_key,
     )
 
 
