@@ -117,9 +117,20 @@ class AWSResourceProvider(ResourceProvider):
 
         cores = self._parse_numeric(requirements.get("min_cores", 0))
         ram_gb = self._parse_numeric(
-            requirements.get("min_memory_gb", requirements.get("min_ram_gb", 0))
+            requirements.get("min_memory_gb")
+            or requirements.get("min_ram_gb")
+            or requirements.get("ram_gb")
+            or requirements.get("controller_ram_gb")
+            or requirements.get("memory_gb")
+            or 0
         )
-        nic_speed = self._parse_numeric(requirements.get("nic_speed", 0))
+        nic_speed = self._parse_numeric(
+            requirements.get("nic_speed")
+            or requirements.get("network_interface")
+            or requirements.get("network_speed")
+            or requirements.get("nic_speed_gbps")
+            or 0
+        )
 
         if nic_speed >= 100 and "network_100g" in self._instance_type_map:
             return self._instance_type_map["network_100g"]

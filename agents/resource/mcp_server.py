@@ -34,10 +34,12 @@ def get_resource_tools() -> list[ToolDefinition]:
             name="validate_host",
             description=(
                 "Validate that a host is reachable via SSH. "
-                "Returns connectivity status, FQDN, and basic system info "
-                "(OS, CPU count, RAM). This is for connectivity verification "
-                "only — for submit_resource_result, use the IPs from the "
-                "reserve_resources result, not the FQDN from this tool."
+                "Returns connectivity status, FQDN, basic system info "
+                "(OS, CPU count, RAM), and NIC details (interface names "
+                "and link speeds from ethtool). This is for connectivity "
+                "verification only — for submit_resource_result, use the "
+                "IPs from the reserve_resources result, not the FQDN "
+                "from this tool."
             ),
             input_schema={
                 "type": "object",
@@ -343,6 +345,27 @@ def create_resource_tool_handlers(
         except ValueError:
             ram_gb = 0
 
+        nic_cmd = (
+            "for iface in $(ip -o link show "
+            "| awk -F'[ :]+' '/^[0-9]+: (eth|ens|eno|enp)/"
+            "{print $2}'); do "
+            "speed=$(ethtool \"$iface\" 2>/dev/null "
+            "| awk '/Speed:/{print $2}'); "
+            "echo \"${iface}:${speed:-unknown}\"; "
+            "done"
+        )
+        nic_result = await ssh.run(
+            host, nic_cmd, timeout=15, key_path=effective_key
+        )
+        nic_info = []
+        if nic_result.exit_code == 0 and nic_result.stdout.strip():
+            for nic_line in nic_result.stdout.strip().splitlines():
+                parts = nic_line.split(":", 1)
+                if len(parts) == 2:
+                    nic_info.append(
+                        {"name": parts[0], "speed": parts[1]}
+                    )
+
         return {
             "host": host,
             "fqdn": fqdn,
@@ -350,6 +373,7 @@ def create_resource_tool_handlers(
             "os": os_info,
             "cpu_count": cpu_count,
             "ram_gb": ram_gb,
+            "nic_info": nic_info,
             "message": f"Host {host} validated via SSH",
         }
 
