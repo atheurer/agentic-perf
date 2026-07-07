@@ -81,6 +81,8 @@ def get_usage(ticket_id: str, request: Request):
 
     total_in = 0
     total_out = 0
+    total_cache_read = 0
+    total_cache_create = 0
     llm_calls = 0
     total_duration = 0
     by_agent: dict[str, dict] = {}
@@ -94,12 +96,16 @@ def get_usage(ticket_id: str, request: Request):
         out_tok = data.get("output_tokens", 0) or 0
         dur = data.get("duration_ms", 0) or 0
         model = data.get("model", "")
+        cr = data.get("cache_read_input_tokens", 0) or 0
+        cc = data.get("cache_creation_input_tokens", 0) or 0
 
         if not in_tok and not out_tok:
             continue
 
         total_in += in_tok
         total_out += out_tok
+        total_cache_read += cr
+        total_cache_create += cc
         total_duration += dur
         llm_calls += 1
         if model:
@@ -111,6 +117,8 @@ def get_usage(ticket_id: str, request: Request):
                 by_agent[agent] = {
                     "input_tokens": 0,
                     "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
                     "total_tokens": 0,
                     "llm_calls": 0,
                     "total_duration_ms": 0,
@@ -119,6 +127,8 @@ def get_usage(ticket_id: str, request: Request):
             ba = by_agent[agent]
             ba["input_tokens"] += in_tok
             ba["output_tokens"] += out_tok
+            ba["cache_read_input_tokens"] += cr
+            ba["cache_creation_input_tokens"] += cc
             ba["total_tokens"] += in_tok + out_tok
             ba["llm_calls"] += 1
             ba["total_duration_ms"] += dur
@@ -128,6 +138,8 @@ def get_usage(ticket_id: str, request: Request):
     usage = {
         "input_tokens": total_in,
         "output_tokens": total_out,
+        "cache_read_input_tokens": total_cache_read,
+        "cache_creation_input_tokens": total_cache_create,
         "total_tokens": total_in + total_out,
         "llm_calls": llm_calls,
         "total_duration_ms": total_duration,
