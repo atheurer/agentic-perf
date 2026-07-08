@@ -1540,6 +1540,17 @@ async def execute_boot_time_test(
             }
         )
 
+    # ── Clear stale host keys ─────────────────────────
+    # Flashing always changes host keys. Clear stale
+    # entries to prevent SSH "host key changed" errors.
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["ssh-keygen", "-R", sut_host],
+        capture_output=True,
+        timeout=5,
+    )
+
     # ── Wait for SSH readiness ─────────────────────────
     # Freshly provisioned boards may not have SSH ready
     # immediately. Wait up to 60s for port 22.

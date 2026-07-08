@@ -353,6 +353,25 @@ class ProvisioningAgent(AgentBase):
 
         await self._update_fields(ticket_id, fields)
 
+        # Clear stale SSH known_hosts entries for
+        # provisioned hosts. Flashing always changes
+        # host keys — clearing deterministically avoids
+        # wasting LLM iterations on host key errors.
+        for ip in fields.get("hosts_provisioned", []):
+            host = str(ip) if not isinstance(ip, dict) else ip.get("host", ip.get("ip", ""))
+            if host:
+                import subprocess
+
+                subprocess.run(
+                    ["ssh-keygen", "-R", host],
+                    capture_output=True,
+                    timeout=5,
+                )
+                logger.info(
+                    f"[provisioning] Cleared stale "
+                    f"known_hosts for {host}"
+                )
+
         hosts = [
             str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))
             for h in fields["hosts_provisioned"]
