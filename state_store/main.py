@@ -35,7 +35,10 @@ def create_app() -> FastAPI:
 
         @app.get("/")
         def serve_dashboard():
-            return FileResponse(str(STATIC_DIR / "index.html"))
+            return FileResponse(
+                str(STATIC_DIR / "index.html"),
+                headers={"Cache-Control": "no-cache"},
+            )
 
     return app
 

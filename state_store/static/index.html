@@ -508,8 +508,12 @@ details > .content { padding: 12px 16px; }
 .label-tool { color: var(--cyan); }
 .label-transition { color: var(--green); }
 .label-comment { color: var(--yellow); }
+.label-progress { color: var(--text-muted); }
 .label-error { color: var(--red); }
 .label-agent { color: var(--accent); }
+
+.event.tool-progress { opacity: 0.7; }
+.hide-progress .event.tool-progress { display: none; }
 
 .event-text {
   font-family: var(--font-mono);
@@ -1160,6 +1164,7 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn active" id="btn-auto-scroll">Scroll</button>' +
             '<button class="toolbar-btn" id="btn-top">&uarr; Top</button>' +
             '<button class="toolbar-btn" id="btn-bottom">&darr; Bottom</button>' +
+            '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
           '</div>' +
@@ -1198,6 +1203,11 @@ async function renderDetail(ticketId) {
     document.getElementById('btn-bottom').addEventListener('click', function() {
       var stream = document.getElementById('event-stream');
       if (stream) stream.scrollTop = stream.scrollHeight;
+    });
+    document.getElementById('btn-progress-toggle').addEventListener('click', function() {
+      var stream = document.getElementById('event-stream');
+      if (stream) stream.classList.toggle('hide-progress');
+      this.classList.toggle('active');
     });
     document.getElementById('btn-collapse-all').addEventListener('click', function() {
       document.querySelectorAll('#event-stream details[open]').forEach(function(d) { d.open = false; });
@@ -1605,6 +1615,13 @@ function renderEvent(evt) {
     case 'transition':
       return '';
 
+    case 'tool_progress':
+      return '<div class="event tool-progress">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label label-progress">PROGRESS</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + escHtml(data.body || '') + '</span>' +
+      '</div>';
+
     case 'comment':
       return '<div class="event">' +
         '<span class="event-ts">' + ts + '</span>' +
@@ -1657,11 +1674,8 @@ function renderAgentStarted(evt, ts, agent, data) {
 
 function renderLlmResponse(ts, data) {
   var text = data.text || '';
-  var raw = data.raw_content || [];
   var iteration = data.iteration || '?';
   var stop = data.stop_reason || '?';
-
-  var toolCalls = raw.filter(function(b) { return b && b.type === 'tool_use'; });
 
   var textHtml = '';
   if (text) {
@@ -1676,35 +1690,13 @@ function renderLlmResponse(ts, data) {
     }
   }
 
-  var toolsHtml = '';
-  for (var i = 0; i < toolCalls.length; i++) {
-    var tc = toolCalls[i];
-    var inp = tc.input ? prettyJson(tc.input) : '{}';
-    if (inp.length > 300) {
-      toolsHtml +=
-        '<div class="tool-call">' +
-          '<span class="tool-name">' + escHtml(tc.name || '?') + '</span>' +
-          '<details>' +
-            '<summary style="font-size:12px; color:var(--text-muted);">Input (' + inp.length + ' chars)</summary>' +
-            '<div class="content"><div class="event-text">' + escHtml(inp) + '</div></div>' +
-          '</details>' +
-        '</div>';
-    } else {
-      toolsHtml +=
-        '<div class="tool-call">' +
-          '<span class="tool-name">' + escHtml(tc.name || '?') + '</span>' +
-          '<div class="event-text short">' + escHtml(inp) + '</div>' +
-        '</div>';
-    }
-  }
-
   return '<div class="event">' +
     '<span class="event-ts">' + ts + '</span>' +
     '<span class="event-label label-llm">LLM RESPONSE</span>' +
     '<span style="color:var(--text-muted); font-size:12px;">iter ' + iteration + ', stop=' + stop +
       (data.duration_ms ? ' &middot; ' + (data.duration_ms / 1000).toFixed(1) + 's' : '') +
     '</span>' +
-    textHtml + toolsHtml +
+    textHtml +
   '</div>';
 }
 

@@ -100,7 +100,11 @@ class ResourceAgent(AgentBase):
         await mcp.connect(
             resource_server,
             name="resource",
-            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+            env={
+                "TICKET_ID": ticket_id,
+                "STATE_STORE_URL": self.store_url,
+                "AGENT_NAME": self.agent_name,
+            },
         )
         self._mcp = mcp
 

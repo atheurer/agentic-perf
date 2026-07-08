@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agents.server_utils import tool_progress
 from providers.llm.base import ToolDefinition
 from providers.skills.repo_cache import RepoCache
 from providers.ssh import SSHExecutor
@@ -389,6 +390,13 @@ def create_benchmark_tool_handlers(
         run_uuid = uuid.uuid4().hex[:8]
         harness_name = harness or "crucible"
 
+        async def _benchmark_progress(output_line: str, elapsed: int) -> None:
+            minutes = elapsed // 60
+            await tool_progress(
+                f"[{minutes}m] {output_line}",
+                "execute_benchmark",
+            )
+
         if harness_name == "kube-burner":
             try:
                 import yaml
@@ -427,7 +435,9 @@ def create_benchmark_tool_handlers(
                 f"cd {template_dir} && {kb_cmd} -c {config_path} --uuid {run_uuid} 2>&1"
             )
             logger.info(f"[benchmark] Executing kube-burner: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             response = {
                 "status": "completed" if result.exit_code == 0 else "failed",
@@ -487,7 +497,9 @@ def create_benchmark_tool_handlers(
                 f"{container_image} 2>&1"
             )
             logger.info(f"[benchmark] Executing benchmark-runner: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             artifacts_cmd = f"ls {artifacts_dir}/ 2>/dev/null | tail -1"
             artifacts_result = await ssh.run(controller, artifacts_cmd)
@@ -621,7 +633,9 @@ def create_benchmark_tool_handlers(
 
             cmd = f"cd /opt/zathras && {burden_cmd} --scenario {scenario_path}"
             logger.info(f"[benchmark] Executing zathras: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             run_dir = ""
             run_dir_re = re.compile(r"Results stored in:\s*(\S+)")
@@ -834,7 +848,9 @@ def create_benchmark_tool_handlers(
                 )
 
             logger.info(f"[benchmark] Executing ioscale {test_type}: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             response = {
                 "status": "completed" if result.exit_code == 0 else "failed",
@@ -867,7 +883,9 @@ def create_benchmark_tool_handlers(
             vs_cmd = run_command or "/opt/vstorm/vstorm"
             cmd = f"KUBECONFIG={kubeconfig} {vs_cmd} {args_str} 2>&1"
             logger.info(f"[benchmark] Executing vstorm: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             batch_id = ""
             for line in (result.stdout or "").split("\n"):
@@ -921,8 +939,8 @@ def create_benchmark_tool_handlers(
 
             prep_cmd = f"{env_prefix} {forge_cmd} {project} {preset_flags} prepare 2>&1"
             logger.info(f"[benchmark] Forge prepare: {prep_cmd}")
-            prep_result = await ssh.run(
-                controller, prep_cmd, timeout=0, allocate_pty=True
+            prep_result = await ssh.run_with_progress(
+                controller, prep_cmd, progress_callback=_benchmark_progress,
             )
 
             if prep_result.exit_code != 0:
@@ -943,7 +961,9 @@ def create_benchmark_tool_handlers(
                 f"{' ' + args_str if args_str else ''} 2>&1"
             )
             logger.info(f"[benchmark] Forge test: {test_cmd}")
-            result = await ssh.run(controller, test_cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, test_cmd, progress_callback=_benchmark_progress,
+            )
 
             ai_eval = "{}"
             eval_cmd = (
@@ -1001,7 +1021,9 @@ def create_benchmark_tool_handlers(
             cb_cmd = run_command or "clusterbuster"
             cmd = f"KUBECONFIG={kubeconfig} {cb_cmd} -f {job_path} 2>&1"
             logger.info(f"[benchmark] Executing clusterbuster: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             response = {
                 "status": "completed" if result.exit_code == 0 else "failed",
@@ -1073,7 +1095,9 @@ def create_benchmark_tool_handlers(
             np_cmd = run_command or "k8s-netperf"
             cmd = f"{np_cmd} --config {config_path} {flags_str} --json 2>&1"
             logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
-            result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+            result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
             response = {
                 "status": "completed" if result.exit_code == 0 else "failed",
@@ -1200,11 +1224,10 @@ def create_benchmark_tool_handlers(
                     f"{plugin_image} {step_flag}-f - 2>&1"
                 )
                 logger.info(f"[benchmark] Executing Arcaflow plugin via SSH: {cmd}")
-                result = await ssh.run(
+                result = await ssh.run_with_progress(
                     controller,
                     cmd,
-                    timeout=0,
-                    allocate_pty=True,
+                    progress_callback=_benchmark_progress,
                 )
                 exit_code = result.exit_code
                 stdout_str = result.stdout or ""
@@ -1275,7 +1298,9 @@ def create_benchmark_tool_handlers(
 
         cmd = f"{run_command or 'crucible run'} {remote_path}"
         logger.info(f"[benchmark] Executing: {cmd}")
-        result = await ssh.run(controller, cmd, timeout=0, allocate_pty=True)
+        result = await ssh.run_with_progress(
+                controller, cmd, progress_callback=_benchmark_progress,
+            )
 
         run_dir = ""
         run_dir_re = re.compile(r"(/var/lib/crucible/run/[^/\s]+)")
