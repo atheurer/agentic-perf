@@ -148,13 +148,48 @@ class AgentMCPClient:
                 )
         return tools
 
+    # Timeout for jmp_connect — prevents indefinite hang
+    # when all exporters are leased or offline. The
+    # Jumpstarter client config has acquisition_timeout
+    # (default 7200s) but we want to fail faster so the
+    # fleet loop can move to the next host.
+    _JMP_CONNECT_TIMEOUT = 180  # 3 minutes
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
             raise RuntimeError(f"No server provides tool {name!r}")
 
         conn = self._servers[server_name]
-        result = await conn.session.call_tool(name, arguments)
+
+        # Apply timeout to jmp_connect to prevent hanging
+        # when no exporters are available.
+        if name == "jmp_connect":
+            import asyncio
+
+            try:
+                result = await asyncio.wait_for(
+                    conn.session.call_tool(name, arguments),
+                    timeout=self._JMP_CONNECT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                import json
+
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Failed to connect: lease "
+                            f"acquisition timed out after "
+                            f"{self._JMP_CONNECT_TIMEOUT} "
+                            f"seconds. No exporter was "
+                            f"assigned — the board may be "
+                            f"offline or leased by another "
+                            f"user."
+                        ),
+                    }
+                )
+        else:
+            result = await conn.session.call_tool(name, arguments)
         parts = []
         for block in result.content:
             if hasattr(block, "text"):

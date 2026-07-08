@@ -27,12 +27,15 @@ logger = logging.getLogger(__name__)
 # Tools that agents should see for device interaction.
 # Lease management tools are excluded — the resource
 # provider handles that, not agents.
+# jmp_disconnect is intentionally excluded — the MCP
+# connection must stay alive through provisioning
+# AND benchmarking. Disconnecting kills the socket
+# that boot-timings-test.sh needs for serial capture.
 AGENT_DEVICE_TOOLS = frozenset(
     {
         "jmp_run",
         "jmp_explore",
         "jmp_connect",
-        "jmp_disconnect",
         "jmp_drivers",
         "jmp_driver_methods",
         "jmp_get_env",

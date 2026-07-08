@@ -29,7 +29,9 @@ class TestToolSets:
     def test_device_tools_include_interaction(self):
         assert "jmp_run" in AGENT_DEVICE_TOOLS
         assert "jmp_connect" in AGENT_DEVICE_TOOLS
-        assert "jmp_disconnect" in AGENT_DEVICE_TOOLS
+        # jmp_disconnect intentionally excluded — MCP
+        # connection must stay alive through benchmark
+        assert "jmp_disconnect" not in AGENT_DEVICE_TOOLS
         assert "jmp_explore" in AGENT_DEVICE_TOOLS
         assert "jmp_drivers" in AGENT_DEVICE_TOOLS
 
