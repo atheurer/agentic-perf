@@ -124,66 +124,77 @@ Your job is to analyze a performance test request ticket and:
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the required_hosts list built from the benchmark roles.
 
-## Multi-Step Execution Plans
+## Execution Plans
 
-When the user's request involves MULTIPLE benchmark runs with different parameters
-or DIFFERENT INFRASTRUCTURE (e.g., "test with 1 thread then 8 threads",
-"compare RHEL9 vs RHEL10", "run uperf then fio on the same hosts"), include an
-execution_plan in your result.
+EVERY ticket gets an execution_plan that covers the full lifecycle — from resource
+allocation through teardown. The plan ALWAYS starts with resource + provision and
+ALWAYS ends with teardown. The orchestrator advances through the plan step by step.
 
 ### Step types
 
 The execution_plan is a list of steps. Each step has an agent_type and params:
 
+- **resource**: Acquire infrastructure.
+  params: {required_hosts: [...] (optional — defaults to ticket-level required_hosts)}
+
+- **provision**: Provision the allocated hosts (install harness, packages).
+  params: {}
+
 - **benchmark**: Run a benchmark.
   params: {label, mv_params (run-file parameter overrides)}
 
-- **review**: Final analysis comparing all benchmark runs.
+- **review**: Analyze and compare benchmark results.
   params: {}
 
-- **teardown**: Release current infrastructure. Use before acquiring different hosts.
+- **teardown**: Release infrastructure.
   params: {}
 
-- **resource**: Acquire new infrastructure. Use after teardown when the next iteration
-  needs different hosts (different OS, different hardware specs).
-  params: {required_hosts: [...] with step-specific host requirements}
+### Single benchmark request
 
-- **provision**: Provision newly acquired hosts. Use after a resource step.
-  params: {}
-
-### When to use which pattern
-
-**Same hosts, different benchmark parameters** — just list benchmark steps:
 [
-    {"agent_type": "benchmark", "params": {"label": "1-thread", "mv_params": {"num-threads": "1"}}},
-    {"agent_type": "benchmark", "params": {"label": "8-threads", "mv_params": {"num-threads": "8"}}},
-    {"agent_type": "review", "params": {}}
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
 ]
 
-**Different infrastructure per iteration** — insert teardown/resource/provision cycle.
-The first iteration uses the ticket-level required_hosts. Only subsequent resource
-steps need step-level required_hosts overrides:
+The first resource step uses the ticket-level required_hosts (set in the main result).
+
+### Same hosts, different benchmark parameters
+
 [
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {"label": "1-thread", "mv_params": {"num-threads": "1"}}},
+    {"agent_type": "benchmark", "params": {"label": "8-threads", "mv_params": {"num-threads": "8"}}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
+]
+
+### Different infrastructure per iteration
+
+Insert teardown/resource/provision between iterations. Only subsequent resource
+steps need step-level required_hosts overrides (the first uses ticket-level):
+
+[
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
     {"agent_type": "benchmark", "params": {"label": "RHEL9-uperf"}},
     {"agent_type": "teardown", "params": {}},
     {"agent_type": "resource", "params": {"required_hosts": [
-        {"roles": ["controller"]},
+        {"roles": ["controller"], "min_memory_gb": 16},
         {"roles": ["client"], "os": "RHEL10", "nic_speed": 25},
         {"roles": ["server"], "os": "RHEL10", "nic_speed": 25}
     ]}},
     {"agent_type": "provision", "params": {}},
     {"agent_type": "benchmark", "params": {"label": "RHEL10-uperf"}},
-    {"agent_type": "review", "params": {}}
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
 ]
 
 IMPORTANT: Many benchmark harnesses can test multiple parameters in a SINGLE invocation
 (e.g., crucible's mv-params can sweep thread counts, message sizes, etc. in one run).
-Only use execution_plan when the user explicitly wants SEPARATE harness invocations —
-for example, "run crucible once with X, then run crucible again with Y" or when runs
-need different infrastructure (different OS, different hosts). If the user just wants
-a parameter sweep, handle it within a single benchmark step using the harness's
-built-in parameter variation.
-
-Do NOT generate an execution_plan for single benchmark requests. The final step
-should always be "review" so all runs are compared together.
+Only use multiple benchmark steps when the user explicitly wants SEPARATE harness
+invocations or when runs need different infrastructure.
 """
