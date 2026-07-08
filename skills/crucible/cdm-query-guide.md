@@ -38,7 +38,7 @@ Then re-query with the breakout you need:
   "period": "<period-id>",
   "source": "uperf",
   "type": "Gbps",
-  "breakouts": ["csid"]
+  "breakout": ["csid"]
 }
 ```
 
@@ -70,7 +70,7 @@ For **tool metrics** (e.g., mpstat Busy-CPU, sar):
    primary-period-ids
 2. Query one period with NO breakouts to see
    `remainingBreakouts`
-3. Re-query with `breakouts: ["csid"]` to split by pair
+3. Re-query with `breakout: ["csid"]` to split by pair
 4. Map csid values to OS pairs using the run file's
    endpoint ID assignments
 5. For CPU data, map tool instance numbers (sysstat-1,
