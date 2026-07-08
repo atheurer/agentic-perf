@@ -707,13 +707,25 @@ class AgentBase(ABC):
         r.raise_for_status()
         return r.json()
 
-    async def _plan_controls_next_transition(self, ticket_id: str) -> bool:
-        """Check whether the execution plan has more steps.
+    _PLAN_AGENT_STATUS = {
+        "teardown": "awaiting_teardown",
+        "resource": "awaiting_hardware",
+        "provision": "awaiting_provision",
+        "benchmark": "executing_benchmark",
+        "review": "awaiting_review",
+    }
 
-        When True, the agent should skip its own _transition_ticket()
-        call — the orchestrator's _advance_plan() will read the plan
-        and transition to the correct next status after this agent's
-        run_agent_task completes.
+    async def _plan_controls_next_transition(self, ticket_id: str) -> bool:
+        """Check whether the execution plan controls the next transition.
+
+        Returns True only when:
+        1. A plan exists with more steps after the current one, AND
+        2. The current step's agent_type matches this agent (i.e., this
+           agent is executing a plan-managed step, not a pre-plan step
+           in the normal pipeline).
+
+        This prevents pre-plan agents (e.g., the initial resource/provision
+        cycle before step 0) from deferring their transitions.
         """
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
@@ -722,7 +734,14 @@ class AgentBase(ABC):
             return False
         steps = plan.get("steps", [])
         current_idx = plan.get("current_step", 0)
-        return current_idx < len(steps) and current_idx + 1 < len(steps)
+        if current_idx >= len(steps) or current_idx + 1 >= len(steps):
+            return False
+        step = steps[current_idx]
+        expected_status = self._PLAN_AGENT_STATUS.get(
+            step.get("agent_type", ""),
+        )
+        ticket_status = ticket.get("status", "")
+        return expected_status == ticket_status
 
     _HITL_POLL_INTERVAL = 5.0
     _HITL_TIMEOUT = 1800.0
