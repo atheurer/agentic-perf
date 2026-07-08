@@ -154,6 +154,9 @@ class ResourceAgent(AgentBase):
                 "Resources released (no managed reservation to terminate).",
             )
 
+        if await self._plan_controls_next_transition(ticket_id):
+            logger.info(f"[resource-agent] Teardown complete for {ticket_id}")
+            return
         await self._transition_ticket(
             ticket_id,
             "retrospective_pending",
@@ -440,6 +443,8 @@ class ResourceAgent(AgentBase):
             summary += f"- **Notes:** {result['notes']}\n"
 
         await self._add_comment(ticket_id, summary)
+        if await self._plan_controls_next_transition(ticket_id):
+            return
         await self._transition_ticket(
             ticket_id,
             "awaiting_provision",

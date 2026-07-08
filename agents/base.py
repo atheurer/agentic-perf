@@ -707,6 +707,23 @@ class AgentBase(ABC):
         r.raise_for_status()
         return r.json()
 
+    async def _plan_controls_next_transition(self, ticket_id: str) -> bool:
+        """Check whether the execution plan has more steps.
+
+        When True, the agent should skip its own _transition_ticket()
+        call — the orchestrator's _advance_plan() will read the plan
+        and transition to the correct next status after this agent's
+        run_agent_task completes.
+        """
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        plan = cf.get("execution_plan")
+        if not plan:
+            return False
+        steps = plan.get("steps", [])
+        current_idx = plan.get("current_step", 0)
+        return current_idx < len(steps) and current_idx + 1 < len(steps)
+
     _HITL_POLL_INTERVAL = 5.0
     _HITL_TIMEOUT = 1800.0
 

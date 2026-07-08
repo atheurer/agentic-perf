@@ -163,6 +163,11 @@ class TriageAgent(AgentBase):
             f"- **Required Hosts:** {len(required_hosts)} ({', '.join('+'.join(h.get('roles', ['?'])) for h in required_hosts)})\n"
             f"- **Absent Suite:** {fields['absent_suite']}\n"
         )
+        if len(steps) > 1:
+            step_types = [s["agent_type"] for s in steps]
+            summary += (
+                f"- **Execution Plan:** {len(steps)} steps ({' → '.join(step_types)})\n"
+            )
         if directives:
             summary += f"- **Directives:** {', '.join(f'{k}={v}' for k, v in directives.items())}\n"
         if fields.get("scoped_context"):

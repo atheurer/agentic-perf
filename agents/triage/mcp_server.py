@@ -194,24 +194,33 @@ def get_triage_tools() -> list[ToolDefinition]:
                         "type": "array",
                         "description": (
                             "Optional multi-step execution plan. Include "
-                            "only when the user's request requires multiple "
-                            "benchmark runs with different parameters. Each "
-                            "step specifies an agent_type and params. The "
-                            "final step should be 'review'."
+                            "when the user's request requires multiple "
+                            "benchmark runs or different infrastructure "
+                            "per iteration. Each step specifies an "
+                            "agent_type and params. The final step "
+                            "should be 'review'."
                         ),
                         "items": {
                             "type": "object",
                             "properties": {
                                 "agent_type": {
                                     "type": "string",
-                                    "enum": ["benchmark", "review"],
+                                    "enum": [
+                                        "teardown",
+                                        "resource",
+                                        "provision",
+                                        "benchmark",
+                                        "review",
+                                    ],
                                 },
                                 "params": {
                                     "type": "object",
                                     "description": (
                                         "Step-specific params. For benchmark: "
                                         "label and mv_params overrides. "
-                                        "For review: empty."
+                                        "For resource: required_hosts list "
+                                        "and optional directives overrides. "
+                                        "For teardown/provision/review: empty."
                                     ),
                                 },
                             },

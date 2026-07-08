@@ -127,17 +127,52 @@ findings, including the required_hosts list built from the benchmark roles.
 ## Multi-Step Execution Plans
 
 When the user's request involves MULTIPLE benchmark runs with different parameters
-(e.g., "test with 1 thread then 8 threads", "compare message sizes 64B vs 1K vs 64K",
-"run uperf on RHEL9 then RHEL10"), include an execution_plan in your result.
+or DIFFERENT INFRASTRUCTURE (e.g., "test with 1 thread then 8 threads",
+"compare RHEL9 vs RHEL10", "run uperf then fio on the same hosts"), include an
+execution_plan in your result.
 
-The execution_plan is a list of steps. Each step has:
-- agent_type: "benchmark" (for benchmark runs) or "review" (for final comparison)
-- params: step-specific parameters (label, mv_params overrides for the run-file)
+### Step types
 
-Example for "test uperf with 1 and 8 threads":
+The execution_plan is a list of steps. Each step has an agent_type and params:
+
+- **benchmark**: Run a benchmark.
+  params: {label, mv_params (run-file parameter overrides)}
+
+- **review**: Final analysis comparing all benchmark runs.
+  params: {}
+
+- **teardown**: Release current infrastructure. Use before acquiring different hosts.
+  params: {}
+
+- **resource**: Acquire new infrastructure. Use after teardown when the next iteration
+  needs different hosts (different OS, different hardware specs).
+  params: {required_hosts: [...] with step-specific host requirements}
+
+- **provision**: Provision newly acquired hosts. Use after a resource step.
+  params: {}
+
+### When to use which pattern
+
+**Same hosts, different benchmark parameters** — just list benchmark steps:
 [
     {"agent_type": "benchmark", "params": {"label": "1-thread", "mv_params": {"num-threads": "1"}}},
     {"agent_type": "benchmark", "params": {"label": "8-threads", "mv_params": {"num-threads": "8"}}},
+    {"agent_type": "review", "params": {}}
+]
+
+**Different infrastructure per iteration** — insert teardown/resource/provision cycle.
+The first iteration uses the ticket-level required_hosts. Only subsequent resource
+steps need step-level required_hosts overrides:
+[
+    {"agent_type": "benchmark", "params": {"label": "RHEL9-uperf"}},
+    {"agent_type": "teardown", "params": {}},
+    {"agent_type": "resource", "params": {"required_hosts": [
+        {"roles": ["controller"]},
+        {"roles": ["client"], "os": "RHEL10", "nic_speed": 25},
+        {"roles": ["server"], "os": "RHEL10", "nic_speed": 25}
+    ]}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {"label": "RHEL10-uperf"}},
     {"agent_type": "review", "params": {}}
 ]
 
