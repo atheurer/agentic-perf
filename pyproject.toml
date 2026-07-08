@@ -55,6 +55,8 @@ jumpstarter = [
     "jumpstarter-driver-can>=0.8.0",
     "jumpstarter-driver-dutlink>=0.8.0",
     "jumpstarter-driver-sdwire>=0.8.0",
+    "jumpstarter-driver-tmt>=0.8.0",
+    "jumpstarter-driver-vnc>=0.8.0",
 ]
 dev = [
     "pytest>=8.0",
