@@ -76,11 +76,13 @@ class TestCheckAvailable:
             "board-type": "qc8775",
         }
         mock_exporter.online = True
+        mock_exporter.status = "AVAILABLE"
 
         mock_exporter2 = MagicMock()
         mock_exporter2.name = "device-02"
         mock_exporter2.labels = {"target": "other"}
         mock_exporter2.online = True
+        mock_exporter2.status = "AVAILABLE"
 
         mock_result = MagicMock()
         mock_result.exporters = [mock_exporter, mock_exporter2]
@@ -105,6 +107,7 @@ class TestCheckAvailable:
         mock_exporter.name = "custom-01"
         mock_exporter.labels = {"target": "custom"}
         mock_exporter.online = True
+        mock_exporter.status = "AVAILABLE"
 
         mock_result = MagicMock()
         mock_result.exporters = [mock_exporter]
@@ -238,6 +241,7 @@ class TestListTargets:
             e.name = name
             e.labels = {"target": target, "board-type": f"type-{i}"}
             e.online = True
+            e.status = "AVAILABLE"
             mock_exporters.append(e)
 
         mock_result = MagicMock()
@@ -270,14 +274,70 @@ class TestListTargets:
         online.name = "dev-01"
         online.labels = {"target": "myboard"}
         online.online = True
+        online.status = "AVAILABLE"
 
         offline = MagicMock()
         offline.name = "dev-02"
         offline.labels = {"target": "myboard"}
         offline.online = False
+        offline.status = "OFFLINE"
 
         mock_result = MagicMock()
         mock_result.exporters = [online, offline]
+
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+
+        targets = await provider.list_targets()
+        assert len(targets) == 1
+        assert targets[0]["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_excludes_disabled(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        enabled = MagicMock()
+        enabled.name = "dev-01"
+        enabled.labels = {"target": "myboard", "enabled": "true"}
+        enabled.online = True
+        enabled.status = "AVAILABLE"
+
+        disabled = MagicMock()
+        disabled.name = "dev-02"
+        disabled.labels = {"target": "myboard", "enabled": "false"}
+        disabled.online = True
+        disabled.status = "AVAILABLE"
+
+        mock_result = MagicMock()
+        mock_result.exporters = [enabled, disabled]
+
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+
+        targets = await provider.list_targets()
+        assert len(targets) == 1
+        assert targets[0]["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_excludes_leased(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        available = MagicMock()
+        available.name = "dev-01"
+        available.labels = {"target": "myboard"}
+        available.online = True
+        available.status = "AVAILABLE"
+
+        leased = MagicMock()
+        leased.name = "dev-02"
+        leased.labels = {"target": "myboard"}
+        leased.online = True
+        leased.status = "LEASE_READY"
+
+        mock_result = MagicMock()
+        mock_result.exporters = [available, leased]
 
         mock_svc = AsyncMock()
         mock_svc.ListExporters = AsyncMock(return_value=mock_result)
@@ -297,6 +357,7 @@ class TestCheckAvailableRequiresSelector:
         mock_exporter.name = "device-01"
         mock_exporter.labels = {"target": "myboard", "board-type": "x"}
         mock_exporter.online = True
+        mock_exporter.status = "AVAILABLE"
 
         mock_result = MagicMock()
         mock_result.exporters = [mock_exporter]

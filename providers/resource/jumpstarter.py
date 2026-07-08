@@ -169,8 +169,10 @@ class JumpstarterResourceProvider(ResourceProvider):
         targets: dict[str, dict[str, Any]] = {}
         for e in exporters.exporters:
             labels = dict(e.labels)
-            online = getattr(e, "online", True)
-            if not online:
+            online = getattr(e, "online", False)
+            enabled = labels.get("enabled", "true") == "true"
+            status = getattr(e, "status", None)
+            if not (online and enabled and status == "AVAILABLE"):
                 continue
             target = labels.get("target", "unknown")
             if target not in targets:
@@ -213,11 +215,26 @@ class JumpstarterResourceProvider(ResourceProvider):
         all_devices = []
         for e in exporters.exporters:
             labels = dict(e.labels)
+            online = getattr(e, "online", False)
+            enabled = labels.get("enabled", "true") == "true"
+            status = getattr(e, "status", None)
+            # A device is available when:
+            # - online: exporter process connected
+            # - enabled: not disabled by admin
+            # - status AVAILABLE: not leased or offline
+            available = (
+                online
+                and enabled
+                and status == "AVAILABLE"
+            )
             all_devices.append(
                 {
                     "name": e.name,
                     "labels": labels,
-                    "online": getattr(e, "online", True),
+                    "online": online,
+                    "enabled": enabled,
+                    "status": status,
+                    "available": available,
                 }
             )
 
@@ -246,7 +263,9 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         key, _, value = selector.partition("=")
         matching = [
-            d for d in all_devices if d["labels"].get(key) == value and d["online"]
+            d
+            for d in all_devices
+            if d["labels"].get(key) == value and d["available"]
         ]
 
         # Fleet exclusion: filter out already-tested hosts
