@@ -170,6 +170,21 @@ async def check_host(host: str) -> str:
 
     result = await ssh.run(host, "echo SSH_OK", timeout=15)
     if result.exit_code != 0:
+        # Auto-recover from stale host keys (common after
+        # flashing embedded boards). Clear and retry once
+        # so no agent wastes iterations on this.
+        output = (result.stderr or result.stdout or "")
+        if "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
+            import subprocess
+
+            subprocess.run(
+                ["ssh-keygen", "-R", host],
+                capture_output=True,
+                timeout=5,
+            )
+            result = await ssh.run(host, "echo SSH_OK", timeout=15)
+
+    if result.exit_code != 0:
         return json.dumps(
             {
                 "reachable": False,
@@ -594,6 +609,19 @@ async def execute_command(
         )
 
     result = await ssh.run(host, command, timeout=timeout)
+
+    # Auto-recover from stale host keys.
+    output = (result.stderr or result.stdout or "")
+    if result.exit_code != 0 and "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
+        import subprocess
+
+        subprocess.run(
+            ["ssh-keygen", "-R", host],
+            capture_output=True,
+            timeout=5,
+        )
+        result = await ssh.run(host, command, timeout=timeout)
+
     return _format_result(result)
 
 
