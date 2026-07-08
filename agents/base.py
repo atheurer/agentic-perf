@@ -733,6 +733,16 @@ class AgentBase(ABC):
             elapsed += self._HITL_POLL_INTERVAL
             ticket = await self._get_ticket(ticket_id)
             if ticket.get("status") != "awaiting_customer_guidance":
+                resumed_status = ticket.get("status", "")
+                self._emit(
+                    ticket_id,
+                    "transition",
+                    {
+                        "to": resumed_status,
+                        "comment": "Resumed after user reply",
+                        "ticket_id": ticket_id,
+                    },
+                )
                 new_comments = ticket.get("comments", [])[comment_count:]
                 user_replies = [
                     c["body"]

@@ -70,7 +70,11 @@ class ProvisioningAgent(AgentBase):
         await mcp.connect(
             prov_server,
             name="provisioning",
-            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+            env={
+                "TICKET_ID": ticket_id,
+                "STATE_STORE_URL": self.store_url,
+                "AGENT_NAME": self.agent_name,
+            },
         )
         await mcp.connect(infra_server, name="infra")
         self._mcp = mcp

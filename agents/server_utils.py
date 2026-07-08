@@ -155,6 +155,79 @@ async def build_ssh_from_ticket(
     return SSHExecutor(user=ssh_user, key_path=ssh_key), ticket
 
 
+async def tool_progress(
+    message: str,
+    tool_name: str,
+    ticket_id: str | None = None,
+    state_store_url: str | None = None,
+) -> None:
+    """Post a progress update to the ticket from within an MCP tool.
+
+    Creates both a comment (via the state store API) and an event
+    (appended directly to the JSONL event log) so the web UI can
+    display progress in real time.
+
+    The event uses type "tool_progress" so the UI can distinguish
+    it from regular comments and allow collapsing/minimizing.
+
+    Author is formatted as "agent-name/tool-name" (e.g.,
+    "resource-agent/setup_ssh"). The agent name comes from the
+    AGENT_NAME env var; tool_name is provided by the caller.
+
+    Reads TICKET_ID and STATE_STORE_URL from env if not provided.
+    Silently no-ops if ticket_id is unavailable (e.g., in tests).
+    """
+    import httpx
+
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
+    state_store_url = state_store_url or os.environ.get(
+        "STATE_STORE_URL",
+        "http://localhost:8090",
+    )
+    if not ticket_id:
+        return
+
+    agent_name = os.environ.get("AGENT_NAME", "system")
+    author = f"{agent_name}/{tool_name}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={"author": author, "body": message},
+            )
+    except Exception:
+        pass
+
+    _emit_tool_progress_event(ticket_id, author, message)
+
+
+def _emit_tool_progress_event(
+    ticket_id: str,
+    author: str,
+    message: str,
+) -> None:
+    """Append a tool_progress event directly to the JSONL event log."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    log_dir = Path.home() / ".agentic-perf" / "logs"
+    path = log_dir / f"{ticket_id}.jsonl"
+
+    try:
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ticket_id": ticket_id,
+            "agent": author,
+            "event_type": "tool_progress",
+            "data": {"body": message},
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(event, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def build_investigation_provider():
     """Construct an InvestigationRecordProvider from config.
 

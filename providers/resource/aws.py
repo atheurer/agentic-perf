@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from agents.server_utils import tool_progress
+
 from .base import ResourceProvider
 
 logger = logging.getLogger(__name__)
@@ -456,6 +458,10 @@ class AWSResourceProvider(ResourceProvider):
         interval: int = 15,
     ) -> None:
         logger.info(f"[aws-provider] Waiting for SSH on {len(hosts)} hosts...")
+        await tool_progress(
+            f"Waiting for SSH connectivity on {len(hosts)} hosts...",
+            "setup_ssh",
+        )
         for host in hosts:
             for attempt in range(retries):
                 proc = await asyncio.create_subprocess_exec(
@@ -476,6 +482,10 @@ class AWSResourceProvider(ResourceProvider):
                 stdout, _ = await proc.communicate()
                 if proc.returncode == 0 and b"SSH_OK" in stdout:
                     logger.info(f"[aws-provider] SSH ready on {host}")
+                    await tool_progress(
+                        f"SSH ready on {host}",
+                        "setup_ssh",
+                    )
                     break
                 if attempt < retries - 1:
                     await asyncio.sleep(interval)
@@ -542,6 +552,11 @@ class AWSResourceProvider(ResourceProvider):
         """
         await self._wait_for_ssh(hosts)
 
+        await tool_progress(
+            f"Bootstrapping root SSH access on {len(hosts)} hosts...",
+            "setup_ssh",
+        )
+
         results: dict[str, str] = {}
         pubkey = await self._get_public_key()
 
@@ -552,6 +567,12 @@ class AWSResourceProvider(ResourceProvider):
             except Exception as e:
                 logger.warning(f"[aws-provider] Root bootstrap failed on {host}: {e}")
                 results[host] = f"failed: {e}"
+
+        succeeded = sum(1 for v in results.values() if "root" in v)
+        await tool_progress(
+            f"Root SSH enabled on {succeeded}/{len(hosts)} hosts",
+            "setup_ssh",
+        )
 
         return {
             "status": "success"
@@ -653,6 +674,7 @@ class AWSResourceProvider(ResourceProvider):
         if proc.returncode != 0 or b"ROOT_OK" not in stdout:
             raise RuntimeError("Root SSH verification failed after bootstrap")
         logger.info(f"[aws-provider] Root SSH enabled on {host}")
+        await tool_progress(f"Root SSH verified on {host}", "setup_ssh")
 
     async def cleanup_ssh_keys(self, hosts: list[str]) -> dict[str, Any]:
         return {

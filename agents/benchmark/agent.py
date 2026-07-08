@@ -90,7 +90,11 @@ class BenchmarkAgent(AgentBase):
         await mcp.connect(
             bench_server,
             name="benchmark",
-            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+            env={
+                "TICKET_ID": ticket_id,
+                "STATE_STORE_URL": self.store_url,
+                "AGENT_NAME": self.agent_name,
+            },
         )
         await mcp.connect(infra_server, name="infra")
         self._mcp = mcp

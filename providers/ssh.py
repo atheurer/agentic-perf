@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,103 @@ class SSHExecutor:
             )
 
         return result
+
+    async def run_with_progress(
+        self,
+        host: str,
+        command: str,
+        progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
+        poll_interval: int = 30,
+        key_path: str | None = None,
+    ) -> SSHResult:
+        """Run a long-running command with periodic progress callbacks.
+
+        Launches the command in the background on the remote host,
+        polls its output file periodically, and invokes the callback
+        with the last new output line and elapsed seconds. Only calls
+        the callback when output has changed since the last poll.
+
+        Returns the same SSHResult as run() with the full output.
+        """
+        run_id = uuid.uuid4().hex[:8]
+        out_file = f"/tmp/run-{run_id}.out"
+        rc_file = f"/tmp/run-{run_id}.rc"
+
+        escaped = command.replace("'", "'\\''")
+        bg_cmd = (
+            f"nohup sh -c '{escaped}; echo $? > {rc_file}' > {out_file} 2>&1 & echo $!"
+        )
+        launch = await self.run(host, bg_cmd, timeout=15, key_path=key_path)
+        pid_str = launch.stdout.strip().splitlines()[-1] if launch.stdout else ""
+        if launch.exit_code != 0 or not pid_str.isdigit():
+            return SSHResult(
+                stdout=launch.stdout or "",
+                stderr=launch.stderr or "Failed to launch background command",
+                exit_code=launch.exit_code or 1,
+            )
+        pid = int(pid_str)
+        logger.info(f"[ssh] {host}: background pid={pid} for: {command[:120]}")
+
+        last_reported = ""
+        elapsed = 0
+
+        while True:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            done_check = await self.run(
+                host,
+                f"test -f {rc_file}",
+                timeout=5,
+                key_path=key_path,
+            )
+            finished = done_check.exit_code == 0
+
+            if progress_callback:
+                tail = await self.run(
+                    host,
+                    f"tail -5 {out_file} 2>/dev/null",
+                    timeout=10,
+                    key_path=key_path,
+                )
+                lines = [ln for ln in (tail.stdout or "").splitlines() if ln.strip()]
+                last_line = lines[-1] if lines else ""
+                if last_line and last_line != last_reported:
+                    last_reported = last_line
+                    try:
+                        await progress_callback(last_line, elapsed)
+                    except Exception:
+                        pass
+
+            if finished:
+                break
+
+        full_output = await self.run(
+            host,
+            f"cat {out_file}",
+            timeout=60,
+            key_path=key_path,
+        )
+        rc_output = await self.run(
+            host,
+            f"cat {rc_file}",
+            timeout=5,
+            key_path=key_path,
+        )
+        exit_code = int(rc_output.stdout.strip() or "1")
+
+        await self.run(
+            host,
+            f"rm -f {out_file} {rc_file}",
+            timeout=5,
+            key_path=key_path,
+        )
+
+        return SSHResult(
+            stdout=full_output.stdout or "",
+            stderr="",
+            exit_code=exit_code,
+        )
 
     async def copy_to(
         self,
