@@ -1637,24 +1637,46 @@ async def execute_boot_time_test(
         lease_id = metadata.get("lease_id", "")
         if lease_id and fields.get("resource_provider") == "jumpstarter":
             cmd.append("--jumpstarter-serial")
-            # Find active Jumpstarter socket
+            # Find an active Jumpstarter socket. The
+            # provisioning agent's MCP subprocess may
+            # have exited, leaving a dead socket file.
+            # Verify connectivity before using it.
+            import socket as _sock
+
             jmp_sockets = sorted(
                 Path("/tmp").glob("jumpstarter-*/socket"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-            if jmp_sockets:
+            live_socket = None
+            for sp in jmp_sockets:
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                try:
+                    s.connect(str(sp))
+                    s.close()
+                    live_socket = sp
+                    break
+                except (OSError, ConnectionRefusedError):
+                    s.close()
+                    continue
+
+            if live_socket:
                 jumpstarter_env["JUMPSTARTER_HOST"] = str(
-                    jmp_sockets[0]
+                    live_socket
                 )
                 logger.info(
-                    f"[boot-time] Using existing Jumpstarter "
-                    f"socket: {jmp_sockets[0]}"
+                    f"[boot-time] Using live Jumpstarter "
+                    f"socket: {live_socket}"
                 )
             else:
-                # Fallback: let boot-timings-test.sh create
-                # a new connection via jmp shell
+                # No live socket — fall back to jmp shell
+                # which creates a new connection from the
+                # lease.
                 cmd.append(f"--jumpstarter-lease-name={lease_id}")
+                logger.info(
+                    "[boot-time] No live Jumpstarter socket "
+                    "found, using --jumpstarter-lease-name"
+                )
 
     # Separator for boot-time-analysis-tools arguments
     cmd.append("--")
