@@ -180,12 +180,19 @@ class TriageAgent(AgentBase):
             "steps": steps,
         }
 
-        # Clear the first step's scoped_context section so the
-        # agent relies on structured data (required_hosts) instead
-        # of multi-iteration text. _apply_step_overrides handles
-        # this for subsequent steps, but step 0 runs before any
-        # plan advancement.
+        # Apply step 0's overrides directly — _apply_step_overrides
+        # handles this for subsequent steps, but step 0 runs before
+        # any plan advancement.
+        first_params = steps[0].get("params", {})
         first_type = steps[0]["agent_type"]
+
+        # Step 0's required_hosts override the ticket-level list
+        if first_type == "resource" and first_params.get("required_hosts"):
+            fields["required_hosts"] = first_params["required_hosts"]
+
+        # Clear the first step's scoped_context section so the
+        # agent relies on structured data instead of multi-iteration
+        # text.
         agent_key_map = {
             "resource": "resource",
             "provision": "provisioning",
