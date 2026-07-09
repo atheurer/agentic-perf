@@ -10,6 +10,7 @@ on the way out. No changes to AgentBase or agent code required.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -113,12 +114,16 @@ class GeminiLLMProvider(LLMProvider):
                         tool_id = block.get("id", "")
                         name = block["name"]
                         tool_call_names[tool_id] = name
-                        parts.append(
-                            types.Part.from_function_call(
+                        fc_part = types.Part(
+                            function_call=types.FunctionCall(
                                 name=name,
                                 args=block.get("input", {}),
-                            )
+                            ),
                         )
+                        ts = block.get("thought_signature")
+                        if ts is not None:
+                            fc_part.thought_signature = base64.b64decode(ts)
+                        parts.append(fc_part)
                 if parts:
                     contents.append(types.Content(role="model", parts=parts))
                 continue
@@ -208,14 +213,18 @@ class GeminiLLMProvider(LLMProvider):
                     args = dict(fc.args) if fc.args else {}
                     tool_call_names[fc_id] = name
                     tool_calls.append(ToolCall(id=fc_id, name=name, input=args))
-                    raw_content.append(
-                        {
-                            "type": "tool_use",
-                            "id": fc_id,
-                            "name": name,
-                            "input": args,
-                        }
-                    )
+                    block: dict[str, Any] = {
+                        "type": "tool_use",
+                        "id": fc_id,
+                        "name": name,
+                        "input": args,
+                    }
+                    ts = getattr(part, "thought_signature", None)
+                    if ts is not None:
+                        block["thought_signature"] = base64.b64encode(
+                            ts if isinstance(ts, bytes) else ts.encode()
+                        ).decode("ascii")
+                    raw_content.append(block)
 
         if tool_calls:
             stop_reason = "tool_use"
