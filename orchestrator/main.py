@@ -60,9 +60,118 @@ def _make_llm_factory(config: OrchestratorConfig):
 
 
 PLAN_AGENT_STATUS = {
+    "teardown": "awaiting_teardown",
+    "resource": "awaiting_hardware",
+    "provision": "awaiting_provision",
     "benchmark": "executing_benchmark",
     "review": "awaiting_review",
 }
+
+
+def _capture_step_results(agent_type: str, cf: dict) -> dict:
+    """Snapshot agent-type-specific fields from custom_fields.
+
+    Called when a plan step completes so per-iteration state
+    (IPs, run_ids, provisioning info) survives teardown.
+    """
+    if agent_type == "benchmark":
+        return {
+            "run_id": cf.get("run_id", ""),
+            "benchmark_status": cf.get("benchmark_status", ""),
+            "benchmark_duration": cf.get("benchmark_duration"),
+            "run_file_used": cf.get("run_file_used", {}),
+        }
+    elif agent_type == "resource":
+        return {
+            "assigned_hardware_ips": cf.get("assigned_hardware_ips", {}),
+            "ssh_hardware_ips": cf.get("ssh_hardware_ips", {}),
+            "ssh_user": cf.get("ssh_user", ""),
+            "ssh_key_path": cf.get("ssh_key_path", ""),
+            "resource_provider": cf.get("resource_provider", ""),
+            "resource_reservation_id": cf.get(
+                "resource_reservation_id",
+                "",
+            ),
+            "resource_provider_metadata": cf.get(
+                "resource_provider_metadata",
+                {},
+            ),
+        }
+    elif agent_type == "provision":
+        return {
+            "provisioning_complete": cf.get("provisioning_complete", False),
+            "hosts_provisioned": cf.get("hosts_provisioned", []),
+            "harness_name": cf.get("harness_name", ""),
+            "harness_version": cf.get("harness_version", ""),
+        }
+    elif agent_type == "teardown":
+        return {"teardown_complete": True}
+    elif agent_type == "review":
+        return {
+            "verdict": cf.get("verdict", ""),
+            "review_summary": cf.get("review_summary", ""),
+        }
+    return {}
+
+
+def _apply_step_overrides(
+    store_url: str,
+    client: object,
+    ticket_id: str,
+    next_step: dict,
+    cf: dict,
+) -> None:
+    """Write step-level param overrides to ticket custom_fields.
+
+    Resource steps can carry per-step required_hosts, directives,
+    and scoped_context. Provision steps can carry per-step directive
+    merges. Resource steps also clear stale provisioning state so the
+    provisioning agent re-runs, and replace scoped_context for the
+    agent's section so stale multi-iteration text doesn't mislead.
+    """
+    agent_type = next_step.get("agent_type", "")
+    step_params = next_step.get("params", {})
+    override_fields: dict = {}
+
+    if agent_type == "teardown":
+        if step_params.get("preserve_roles"):
+            override_fields["teardown_preserve_roles"] = step_params["preserve_roles"]
+
+    if agent_type == "resource":
+        if step_params.get("required_hosts"):
+            override_fields["required_hosts"] = step_params["required_hosts"]
+        override_fields["provisioning_complete"] = False
+        override_fields["hosts_provisioned"] = []
+
+    if agent_type in ("resource", "provision"):
+        if step_params.get("directives"):
+            existing = dict(cf.get("directives", {}))
+            existing.update(step_params["directives"])
+            override_fields["directives"] = existing
+
+    # Apply per-step scoped_context if provided, or clear the
+    # agent's section so it falls back to structured data
+    # (required_hosts) instead of stale ticket-level text.
+    scoped = dict(cf.get("scoped_context", {}))
+    if step_params.get("scoped_context"):
+        scoped.update(step_params["scoped_context"])
+        override_fields["scoped_context"] = scoped
+    elif agent_type in ("resource", "provision", "benchmark", "review"):
+        agent_key = {
+            "resource": "resource",
+            "provision": "provisioning",
+            "benchmark": "benchmark",
+            "review": "review",
+        }.get(agent_type)
+        if agent_key and agent_key in scoped:
+            del scoped[agent_key]
+            override_fields["scoped_context"] = scoped
+
+    if override_fields:
+        client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": override_fields},
+        )
 
 
 def _advance_plan(
@@ -73,9 +182,10 @@ def _advance_plan(
 ) -> None:
     """Advance the execution plan after an agent completes a step.
 
+    Snapshots step results, applies per-step param overrides for the
+    next step, and transitions the ticket to the next step's status.
     Only advances if the completed agent matches the current step's
-    agent_type — prevents non-plan agents (resource, provisioning)
-    from prematurely completing plan steps.
+    agent_type.
     """
     import httpx
 
@@ -109,10 +219,10 @@ def _advance_plan(
             return
 
         step["status"] = "completed"
-        step["results"] = {
-            "run_id": cf.get("run_id", ""),
-            "benchmark_status": cf.get("benchmark_status", ""),
-        }
+        step["results"] = _capture_step_results(
+            step.get("agent_type", ""),
+            cf,
+        )
 
         run_ids = plan.get("run_ids", [])
         if cf.get("run_id") and cf["run_id"] not in run_ids:
@@ -133,6 +243,18 @@ def _advance_plan(
                     json={"fields": {"execution_plan": plan}},
                 )
 
+                _apply_step_overrides(
+                    store_url,
+                    client,
+                    ticket_id,
+                    next_step,
+                    cf,
+                )
+
+                label = next_step.get("params", {}).get(
+                    "label",
+                    next_step["agent_type"],
+                )
                 client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
@@ -140,7 +262,7 @@ def _advance_plan(
                         "body": (
                             f"**Plan step {current} complete** — "
                             f"advancing to step {next_idx} "
-                            f"({next_step['agent_type']})"
+                            f"({next_step['agent_type']}: {label})"
                         ),
                     },
                 )

@@ -124,31 +124,89 @@ Your job is to analyze a performance test request ticket and:
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the required_hosts list built from the benchmark roles.
 
-## Multi-Step Execution Plans
+## Execution Plans
 
-When the user's request involves MULTIPLE benchmark runs with different parameters
-(e.g., "test with 1 thread then 8 threads", "compare message sizes 64B vs 1K vs 64K",
-"run uperf on RHEL9 then RHEL10"), include an execution_plan in your result.
+EVERY ticket gets an execution_plan that covers the full lifecycle — from resource
+allocation through teardown. The plan ALWAYS starts with resource + provision and
+ALWAYS ends with teardown. The orchestrator advances through the plan step by step.
 
-The execution_plan is a list of steps. Each step has:
-- agent_type: "benchmark" (for benchmark runs) or "review" (for final comparison)
-- params: step-specific parameters (label, mv_params overrides for the run-file)
+### Step types
 
-Example for "test uperf with 1 and 8 threads":
+The execution_plan is a list of steps. Each step has an agent_type and params:
+
+- **resource**: Acquire infrastructure.
+  params: {required_hosts: [...] (optional — defaults to ticket-level required_hosts)}
+
+- **provision**: Provision the allocated hosts (install harness, packages).
+  params: {}
+
+- **benchmark**: Run a benchmark.
+  params: {label, mv_params (run-file parameter overrides)}
+
+- **review**: Analyze and compare benchmark results.
+  params: {}
+
+- **teardown**: Release infrastructure.
+  params: {preserve_roles: [...] (optional — roles to keep alive, e.g. ["controller"])}
+
+Any step can include an optional **scoped_context** dict in its params to provide
+step-specific natural language context for the agent. This replaces the ticket-level
+scoped_context for that agent's section. Use this when different iterations need
+different instructions — for example, a resource step for RHEL10 should NOT include
+RHEL9 instructions. Keys match agent roles: "resource", "provisioning", "benchmark",
+"review". If omitted, the orchestrator clears the agent's section so the agent relies
+on structured data (required_hosts, directives) instead of stale ticket-level text.
+
+  Mid-plan teardowns (between iterations) should ALWAYS preserve the controller
+  so the harness installation and benchmark results from earlier iterations remain
+  accessible. Only the final teardown at the end of the plan should release everything.
+
+### Single benchmark request
+
 [
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
+]
+
+The first resource step uses the ticket-level required_hosts (set in the main result).
+
+### Same hosts, different benchmark parameters
+
+[
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
     {"agent_type": "benchmark", "params": {"label": "1-thread", "mv_params": {"num-threads": "1"}}},
     {"agent_type": "benchmark", "params": {"label": "8-threads", "mv_params": {"num-threads": "8"}}},
-    {"agent_type": "review", "params": {}}
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
+]
+
+### Different infrastructure per iteration
+
+Insert teardown/resource/provision between iterations. Mid-plan teardowns preserve
+the controller (so the harness and results survive). The next resource step only
+requests client+server since the controller is already running:
+
+[
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {"label": "RHEL9-uperf"}},
+    {"agent_type": "teardown", "params": {"preserve_roles": ["controller"]}},
+    {"agent_type": "resource", "params": {"required_hosts": [
+        {"roles": ["client"], "os": "RHEL10", "nic_speed": 25},
+        {"roles": ["server"], "os": "RHEL10", "nic_speed": 25}
+    ]}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {"label": "RHEL10-uperf"}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
 ]
 
 IMPORTANT: Many benchmark harnesses can test multiple parameters in a SINGLE invocation
 (e.g., crucible's mv-params can sweep thread counts, message sizes, etc. in one run).
-Only use execution_plan when the user explicitly wants SEPARATE harness invocations —
-for example, "run crucible once with X, then run crucible again with Y" or when runs
-need different infrastructure (different OS, different hosts). If the user just wants
-a parameter sweep, handle it within a single benchmark step using the harness's
-built-in parameter variation.
-
-Do NOT generate an execution_plan for single benchmark requests. The final step
-should always be "review" so all runs are compared together.
+Only use multiple benchmark steps when the user explicitly wants SEPARATE harness
+invocations or when runs need different infrastructure.
 """

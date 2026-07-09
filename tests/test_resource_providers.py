@@ -911,6 +911,13 @@ class TestHandleCompletionIPSplit:
         )
 
         agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
         agent._client.patch = AsyncMock(
             return_value=AsyncMock(
                 status_code=200,
@@ -987,6 +994,13 @@ class TestHandleCompletionIPSplit:
 
         agent._mcp = None
         agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
         agent._client.patch = AsyncMock(
             return_value=AsyncMock(
                 status_code=200,

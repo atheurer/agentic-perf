@@ -296,7 +296,7 @@ class TestAgentBaseHelpers:
 class TestUniversalPlan:
     @pytest.mark.asyncio
     async def test_single_benchmark_gets_plan(self):
-        """Triage creates a 1-step plan for single-benchmark
+        """Triage creates a full-lifecycle plan for single-benchmark
         requests (no execution_plan in LLM result)."""
         from agents.triage.agent import TriageAgent
         from providers.llm.base import LLMResponse, ToolCall
@@ -368,9 +368,13 @@ class TestUniversalPlan:
         assert "execution_plan" in fields
         plan = fields["execution_plan"]
         assert plan["current_step"] == 0
-        assert len(plan["steps"]) == 1
-        assert plan["steps"][0]["agent_type"] == "benchmark"
+        assert len(plan["steps"]) == 5
+        assert plan["steps"][0]["agent_type"] == "resource"
         assert plan["steps"][0]["status"] == "in_progress"
+        assert plan["steps"][1]["agent_type"] == "provision"
+        assert plan["steps"][2]["agent_type"] == "benchmark"
+        assert plan["steps"][3]["agent_type"] == "review"
+        assert plan["steps"][4]["agent_type"] == "teardown"
 
     @pytest.mark.asyncio
     async def test_multi_step_plan_preserved(self):

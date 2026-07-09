@@ -119,11 +119,9 @@ class TriageAgent(AgentBase):
         if scoped_context and isinstance(scoped_context, dict):
             fields["scoped_context"] = scoped_context
 
-        # Every ticket gets an execution plan — even single-
-        # benchmark requests get a 1-step plan. This ensures
-        # the investigation ledger always has plan_steps to
-        # reference, and lets review/users extend the plan
-        # dynamically via HITL (#135).
+        # Every ticket gets a full-lifecycle execution plan covering
+        # resource allocation through teardown. The LLM should
+        # produce this, but if it doesn't, we build a default.
         raw_plan = result.get("execution_plan")
         if raw_plan and isinstance(raw_plan, list) and len(raw_plan) > 0:
             steps = []
@@ -138,12 +136,40 @@ class TriageAgent(AgentBase):
                     }
                 )
         else:
-            # Single-benchmark request — create a default 1-step plan
+            # Default full-lifecycle plan
             steps = [
                 {
                     "id": 0,
-                    "agent_type": "benchmark",
+                    "agent_type": "resource",
                     "status": "in_progress",
+                    "params": {},
+                    "results": {},
+                },
+                {
+                    "id": 1,
+                    "agent_type": "provision",
+                    "status": "pending",
+                    "params": {},
+                    "results": {},
+                },
+                {
+                    "id": 2,
+                    "agent_type": "benchmark",
+                    "status": "pending",
+                    "params": {},
+                    "results": {},
+                },
+                {
+                    "id": 3,
+                    "agent_type": "review",
+                    "status": "pending",
+                    "params": {},
+                    "results": {},
+                },
+                {
+                    "id": 4,
+                    "agent_type": "teardown",
+                    "status": "pending",
                     "params": {},
                     "results": {},
                 },
@@ -154,6 +180,33 @@ class TriageAgent(AgentBase):
             "steps": steps,
         }
 
+        # Apply step 0's overrides directly — _apply_step_overrides
+        # handles this for subsequent steps, but step 0 runs before
+        # any plan advancement.
+        first_params = steps[0].get("params", {})
+        first_type = steps[0]["agent_type"]
+
+        # Step 0's required_hosts override the ticket-level list
+        if first_type == "resource" and first_params.get("required_hosts"):
+            fields["required_hosts"] = first_params["required_hosts"]
+
+        # Clear the first step's scoped_context section so the
+        # agent relies on structured data instead of multi-iteration
+        # text.
+        agent_key_map = {
+            "resource": "resource",
+            "provision": "provisioning",
+            "benchmark": "benchmark",
+            "review": "review",
+        }
+        first_key = agent_key_map.get(first_type)
+        if (
+            first_key
+            and "scoped_context" in fields
+            and first_key in fields["scoped_context"]
+        ):
+            del fields["scoped_context"][first_key]
+
         await self._update_fields(ticket_id, fields)
 
         summary = (
@@ -162,6 +215,10 @@ class TriageAgent(AgentBase):
             f"- **Benchmark Suite:** {fields['benchmark_suite']}\n"
             f"- **Required Hosts:** {len(required_hosts)} ({', '.join('+'.join(h.get('roles', ['?'])) for h in required_hosts)})\n"
             f"- **Absent Suite:** {fields['absent_suite']}\n"
+        )
+        step_types = [s["agent_type"] for s in steps]
+        summary += (
+            f"- **Execution Plan:** {len(steps)} steps ({' → '.join(step_types)})\n"
         )
         if directives:
             summary += f"- **Directives:** {', '.join(f'{k}={v}' for k, v in directives.items())}\n"
@@ -193,8 +250,14 @@ class TriageAgent(AgentBase):
                 ),
             )
         else:
+            # Transition to the first plan step's target status
+            first_step_type = steps[0]["agent_type"]
+            first_status = self._PLAN_AGENT_STATUS.get(
+                first_step_type,
+                "awaiting_hardware",
+            )
             await self._transition_ticket(
                 ticket_id,
-                "awaiting_hardware",
-                comment="Triage complete, requesting hardware",
+                first_status,
+                comment=f"Triage complete, starting plan step 0: {first_step_type}",
             )

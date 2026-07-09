@@ -237,6 +237,8 @@ class ReviewAgent(AgentBase):
                 comment += f"- {r}\n"
 
         await self._add_comment(ticket_id, comment)
+        if await self._plan_controls_next_transition(ticket_id):
+            return
         await self._transition_ticket(
             ticket_id,
             "awaiting_teardown",

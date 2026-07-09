@@ -344,6 +344,8 @@ class BenchmarkAgent(AgentBase):
                     "evaluating_convergence",
                     comment=("Benchmark completed, evaluating convergence"),
                 )
+            elif await self._plan_controls_next_transition(ticket_id):
+                return
             else:
                 await self._transition_ticket(
                     ticket_id,

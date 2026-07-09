@@ -128,14 +128,47 @@ class ResourceAgent(AgentBase):
             "host_cleanup", fields.get("host_cleanup", "required")
         )
 
-        if host_cleanup == "required":
-            await self._run_host_cleanup(ticket_id, fields)
+        preserve_roles = fields.get("teardown_preserve_roles", [])
+        selective = bool(preserve_roles)
 
+        if selective:
+            await self._run_selective_teardown(
+                ticket_id,
+                fields,
+                preserve_roles,
+                host_cleanup,
+            )
+        else:
+            if host_cleanup == "required":
+                await self._run_host_cleanup(ticket_id, fields)
+            await self._terminate_all(ticket_id, fields)
+
+        # Clear the transient flag
+        if selective:
+            await self._update_fields(
+                ticket_id,
+                {"teardown_preserve_roles": None},
+            )
+
+        if await self._plan_controls_next_transition(ticket_id):
+            logger.info(f"[resource-agent] Teardown complete for {ticket_id}")
+            return
+        await self._transition_ticket(
+            ticket_id,
+            "retrospective_pending",
+            comment="Resource teardown complete, starting retrospective",
+        )
+        logger.info(f"[resource-agent] Teardown complete for {ticket_id}")
+
+    async def _terminate_all(
+        self,
+        ticket_id: str,
+        fields: dict,
+    ) -> None:
         provider_name = fields.get("resource_provider")
         reservation_id = fields.get("resource_reservation_id")
         provider_metadata = fields.get("resource_provider_metadata", {})
 
-        # Backward compat: infer provider from legacy QUADS fields
         if not provider_name and fields.get("quads_assignment_id"):
             provider_name = "quads"
             reservation_id = str(fields["quads_assignment_id"])
@@ -154,12 +187,131 @@ class ResourceAgent(AgentBase):
                 "Resources released (no managed reservation to terminate).",
             )
 
-        await self._transition_ticket(
-            ticket_id,
-            "retrospective_pending",
-            comment="Resource teardown complete, starting retrospective",
+    async def _run_selective_teardown(
+        self,
+        ticket_id: str,
+        fields: dict,
+        preserve_roles: list[str],
+        host_cleanup: str,
+    ) -> None:
+        """Teardown only hosts whose roles are NOT in preserve_roles."""
+        hw = fields.get("ssh_hardware_ips") or fields.get(
+            "assigned_hardware_ips",
+            {},
         )
-        logger.info(f"[resource-agent] Teardown complete for {ticket_id}")
+        assigned = fields.get("assigned_hardware_ips", {})
+        controller = hw.get("controller")
+        targets = hw.get("targets", [])
+        assigned_targets = assigned.get("targets", [])
+
+        # Determine which hosts to keep vs tear down
+        keep_controller = "controller" in preserve_roles
+        teardown_targets = list(targets)
+        teardown_assigned_targets = list(assigned_targets)
+
+        teardown_hosts = []
+        if not keep_controller and controller:
+            teardown_hosts.append(controller)
+        teardown_hosts.extend(teardown_targets)
+
+        preserve_summary = ", ".join(preserve_roles)
+        await self._add_comment(
+            ticket_id,
+            f"**Selective teardown** — preserving roles: {preserve_summary}",
+        )
+
+        if host_cleanup == "required" and teardown_hosts:
+            ssh_key_path = fields.get("ssh_key_path")
+            harness_name = fields.get("harness_name")
+            ssh = SSHExecutor(user="root", key_path=ssh_key_path)
+            cleanup_summary = []
+            if harness_name:
+                for host in teardown_hosts:
+                    try:
+                        result = await cleanup_harness(ssh, host, harness_name)
+                        cleanup_summary.append(
+                            f"Harness on {host}: {result['status']}",
+                        )
+                    except Exception as e:
+                        cleanup_summary.append(
+                            f"Harness on {host}: failed ({e})",
+                        )
+            if cleanup_summary:
+                await self._add_comment(
+                    ticket_id,
+                    "**Host Cleanup (selective)**\n\n"
+                    + "\n".join(f"- {s}" for s in cleanup_summary),
+                )
+
+        # Terminate only the non-preserved instances
+        provider_name = fields.get("resource_provider")
+        provider_metadata = fields.get("resource_provider_metadata", {})
+        if (
+            provider_name
+            and provider_name != "user_provided"
+            and provider_metadata.get("instance_ids")
+        ):
+            all_instance_ids = provider_metadata["instance_ids"]
+            all_public_ips = provider_metadata.get("public_ips", [])
+            all_private_ips = provider_metadata.get("private_ips", [])
+
+            # Build list of instance IDs to terminate by matching
+            # teardown hosts to provider IPs
+            teardown_set = set(teardown_hosts)
+            if assigned_targets:
+                teardown_set.update(teardown_assigned_targets)
+            terminate_ids = []
+            keep_ids = []
+            for i, iid in enumerate(all_instance_ids):
+                pub = all_public_ips[i] if i < len(all_public_ips) else ""
+                priv = all_private_ips[i] if i < len(all_private_ips) else ""
+                if pub in teardown_set or priv in teardown_set:
+                    terminate_ids.append(iid)
+                else:
+                    keep_ids.append(iid)
+
+            if terminate_ids:
+                teardown_metadata = dict(provider_metadata)
+                teardown_metadata["instance_ids"] = terminate_ids
+                await self._terminate_provider_resources(
+                    ticket_id,
+                    provider_name,
+                    ",".join(terminate_ids),
+                    teardown_metadata,
+                )
+
+            # Update assigned_hardware_ips to reflect preserved hosts
+            new_hw: dict[str, Any] = {}
+            new_ssh_hw: dict[str, Any] = {}
+            if keep_controller and controller:
+                new_hw["controller"] = assigned.get("controller", controller)
+                new_ssh_hw["controller"] = controller
+            new_hw["targets"] = []
+            new_ssh_hw["targets"] = []
+
+            # Update provider_metadata to only track kept instances
+            new_metadata = dict(provider_metadata)
+            new_metadata["instance_ids"] = keep_ids
+            new_metadata["public_ips"] = [
+                ip for ip in all_public_ips if ip not in teardown_set
+            ]
+            new_metadata["private_ips"] = [
+                ip for ip in all_private_ips if ip not in teardown_set
+            ]
+
+            await self._update_fields(
+                ticket_id,
+                {
+                    "assigned_hardware_ips": new_hw,
+                    "ssh_hardware_ips": new_ssh_hw,
+                    "resource_provider_metadata": new_metadata,
+                },
+            )
+        else:
+            await self._add_comment(
+                ticket_id,
+                "Selective teardown: no managed instances to terminate.",
+            )
 
     async def _terminate_provider_resources(
         self,
@@ -413,6 +565,56 @@ class ResourceAgent(AgentBase):
             fields["ssh_hardware_ips"] = ssh_hw
             fields["assigned_hardware_ips"] = private_hw
 
+        # Merge with preserved hosts from selective teardown.
+        # If a prior teardown kept the controller alive, the new
+        # allocation only covers targets. The LLM may have included
+        # the controller IP in its result (it sees it in comments),
+        # but it wasn't newly allocated — use the existing SSH
+        # mapping for the controller.
+        ticket = await self._get_ticket(ticket_id)
+        existing_cf = ticket.get("custom_fields", {})
+        existing_hw = existing_cf.get("assigned_hardware_ips", {})
+        existing_ssh = existing_cf.get("ssh_hardware_ips", {})
+        existing_meta = existing_cf.get("resource_provider_metadata", {})
+        new_hw = fields.get("assigned_hardware_ips", {})
+        new_ssh = fields.get("ssh_hardware_ips", {})
+        new_meta = fields.get("resource_provider_metadata", {})
+        new_instance_ids = set(new_meta.get("instance_ids", []))
+
+        # Check if the controller was preserved (exists in prior
+        # state but not in the new allocation's instance IDs)
+        ctrl_preserved = bool(
+            existing_hw.get("controller")
+            and existing_meta.get("instance_ids")
+            and not new_instance_ids.intersection(
+                existing_meta.get("instance_ids", []),
+            )
+        )
+
+        if ctrl_preserved:
+            new_hw["controller"] = existing_hw["controller"]
+            fields["assigned_hardware_ips"] = new_hw
+            if existing_ssh.get("controller"):
+                new_ssh["controller"] = existing_ssh["controller"]
+                fields["ssh_hardware_ips"] = new_ssh
+
+            # Merge provider metadata (keep preserved instance IDs)
+            if existing_meta.get("instance_ids") and new_meta.get(
+                "instance_ids",
+            ):
+                new_meta["instance_ids"] = (
+                    existing_meta["instance_ids"] + new_meta["instance_ids"]
+                )
+                new_meta["public_ips"] = existing_meta.get(
+                    "public_ips",
+                    [],
+                ) + new_meta.get("public_ips", [])
+                new_meta["private_ips"] = existing_meta.get(
+                    "private_ips",
+                    [],
+                ) + new_meta.get("private_ips", [])
+                fields["resource_provider_metadata"] = new_meta
+
         # Backward compat: write legacy QUADS fields when provider is quads
         provider = fields.get("resource_provider")
         if provider == "quads":
@@ -440,6 +642,8 @@ class ResourceAgent(AgentBase):
             summary += f"- **Notes:** {result['notes']}\n"
 
         await self._add_comment(ticket_id, summary)
+        if await self._plan_controls_next_transition(ticket_id):
+            return
         await self._transition_ticket(
             ticket_id,
             "awaiting_provision",
