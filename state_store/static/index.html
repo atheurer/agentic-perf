@@ -253,6 +253,81 @@ body:has(.detail-view) .container { max-width: none; }
 .toolbar-btn:hover { background: var(--bg-hover); }
 .toolbar-btn.active { border-color: var(--accent); color: var(--accent); }
 
+.toolbar-btn.btn-stop-graceful {
+  border-color: var(--yellow);
+  color: var(--yellow);
+}
+.toolbar-btn.btn-stop-graceful:hover {
+  background: rgba(224, 175, 104, 0.15);
+}
+.toolbar-btn.btn-stop-hard {
+  border-color: var(--red);
+  color: var(--red);
+}
+.toolbar-btn.btn-stop-hard:hover {
+  background: rgba(247, 118, 142, 0.15);
+}
+.toolbar-btn.btn-stop-all {
+  border-color: var(--red);
+  color: var(--red);
+  margin-left: 8px;
+}
+.toolbar-btn.btn-stop-all:hover {
+  background: rgba(247, 118, 142, 0.15);
+}
+
+.stop-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.stop-confirm-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 400px;
+  width: 90%;
+}
+.stop-confirm-dialog h3 {
+  margin-bottom: 12px;
+  color: var(--text-bright);
+}
+.stop-confirm-dialog p {
+  margin-bottom: 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.stop-confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.stop-confirm-actions button {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+}
+.stop-confirm-actions button:hover {
+  background: var(--bg-hover);
+}
+.stop-confirm-actions .btn-confirm-hard {
+  border-color: var(--red);
+  color: var(--red);
+}
+.stop-confirm-actions .btn-confirm-graceful {
+  border-color: var(--yellow);
+  color: var(--yellow);
+}
+
 /* Two-panel split container */
 .detail-panels {
   flex: 1;
@@ -855,6 +930,7 @@ th.col-right { text-align: right; }
   <div class="container">
     <h1><a href="#/" style="color: inherit; text-decoration: none;"><span>Agentic</span> Perf</a></h1>
     <div class="health-stats" id="health-stats"></div>
+    <button class="toolbar-btn btn-stop-all" id="btn-stop-all-header" title="Stop all running agents">Stop All Tickets</button>
   </div>
 </header>
 
@@ -886,6 +962,10 @@ window.addEventListener('DOMContentLoaded', () => {
     const banner = document.getElementById('ai-disclaimer');
     if (banner) banner.classList.add('hidden');
   }
+  var stopAllBtn = document.getElementById('btn-stop-all-header');
+  if (stopAllBtn) {
+    stopAllBtn.addEventListener('click', showStopAllConfirm);
+  }
 });
 
 let currentView = 'list';
@@ -896,6 +976,71 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
+
+const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
+function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
+
+async function stopTicket(ticketId, mode) {
+  try {
+    var r = await fetch(API + '/tickets/' + ticketId + '/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: mode}),
+    });
+    if (r.status === 409) {
+      var data = await r.json();
+      alert(data.detail || 'Ticket is already in a terminal state.');
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var label = mode === 'hard' ? 'Hard stop' : 'Graceful stop';
+    var btn = mode === 'hard'
+      ? document.getElementById('btn-stop-hard')
+      : document.getElementById('btn-stop-graceful');
+    if (btn) { btn.textContent = label + ' requested'; btn.disabled = true; }
+  } catch (err) {
+    alert('Stop failed: ' + err.message);
+  }
+}
+
+function showStopAllConfirm() {
+  var overlay = document.createElement('div');
+  overlay.className = 'stop-confirm-overlay';
+  overlay.innerHTML =
+    '<div class="stop-confirm-dialog">' +
+      '<h3>Stop All Tickets</h3>' +
+      '<p>This will request a stop for all active (non-terminal) tickets. ' +
+        'Graceful stop lets agents finish their current action. ' +
+        'Hard stop kills agents immediately.</p>' +
+      '<div class="stop-confirm-actions">' +
+        '<button onclick="this.closest(\'.stop-confirm-overlay\').remove()">Cancel</button>' +
+        '<button class="btn-confirm-graceful" onclick="doStopAll(\'graceful\', this)">Graceful Stop</button>' +
+        '<button class="btn-confirm-hard" onclick="doStopAll(\'hard\', this)">Hard Stop</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+async function doStopAll(mode, btn) {
+  try {
+    var r = await fetch(API + '/stop-all', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: mode}),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var data = await r.json();
+    var overlay = btn.closest('.stop-confirm-overlay');
+    if (overlay) overlay.remove();
+    var label = mode === 'hard' ? 'Hard stop' : 'Graceful stop';
+    alert(label + ' requested for ' + data.count + ' ticket(s).');
+  } catch (err) {
+    alert('Stop all failed: ' + err.message);
+  }
+}
 
 async function api(path) {
   const r = await fetch(API + path);
@@ -1167,6 +1312,11 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
+            (isTerminalStatus(ticket.status) ? '' :
+              '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
+              '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful" title="Finish current action, then pause">Pause</button>' +
+              '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard" title="Kill agent immediately">Stop</button>'
+            ) +
           '</div>' +
         '</div>' +
         '<div class="detail-panels" id="detail-panels">' +
@@ -1215,6 +1365,14 @@ async function renderDetail(ticketId) {
     document.getElementById('btn-expand-all').addEventListener('click', function() {
       document.querySelectorAll('#event-stream details.agent-section').forEach(function(d) { d.open = true; });
     });
+    var stopGraceful = document.getElementById('btn-stop-graceful');
+    if (stopGraceful) {
+      stopGraceful.addEventListener('click', function() { stopTicket(ticketId, 'graceful'); });
+    }
+    var stopHard = document.getElementById('btn-stop-hard');
+    if (stopHard) {
+      stopHard.addEventListener('click', function() { stopTicket(ticketId, 'hard'); });
+    }
     initPanelDivider();
 
     await pollEvents(ticketId);

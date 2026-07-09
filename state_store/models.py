@@ -148,3 +148,12 @@ class UpdateFieldsRequest(BaseModel):
 class AddCommentRequest(BaseModel):
     author: str
     body: str
+
+
+class StopMode(str, Enum):
+    GRACEFUL = "graceful"
+    HARD = "hard"
+
+
+class StopRequest(BaseModel):
+    mode: StopMode = StopMode.GRACEFUL

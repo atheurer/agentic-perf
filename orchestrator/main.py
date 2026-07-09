@@ -296,10 +296,13 @@ def _advance_plan(
 
 
 async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
+    agent = None
     try:
         agent = dispatcher.create_agent(status)
         if agent is None:
             return
+
+        dispatcher.set_agent(ticket_id, agent)
 
         # Investigation tickets get unlimited iterations for
         # all agents — convergence gates and budget guardrails
@@ -322,6 +325,32 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
             pass  # proceed with default iterations
 
         await agent.run(ticket_id)
+    except asyncio.CancelledError:
+        logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.patch(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"interrupted": True}},
+                )
+                await client.post(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": "Agent hard-stopped by user request",
+                    },
+                )
+        except Exception:
+            logger.exception(f"Failed to transition hard-stopped ticket {ticket_id}")
+        if dispatcher.events:
+            dispatcher.events.emit(
+                ticket_id,
+                f"{status}-agent",
+                "agent_stopped",
+                {"mode": "hard"},
+            )
     except Exception:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
@@ -336,12 +365,14 @@ async def run_agent_task(dispatcher: Dispatcher, status: str, ticket_id: str):
                 )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
+        dispatcher.clear_agent(ticket_id)
         dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
-        try:
-            await agent.close()
-        except Exception:
-            pass
+        if agent is not None:
+            try:
+                await agent.close()
+            except Exception:
+                pass
 
 
 async def _block_absent_suite(
@@ -462,6 +493,36 @@ async def _block_handoff_failed(
                     "ticket_id": ticket_id,
                 },
             )
+
+
+async def _process_stop_requests(
+    dispatcher: Dispatcher,
+    store_url: str,
+) -> None:
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{store_url}/api/v1/tickets")
+            if r.status_code != 200:
+                return
+            for ticket in r.json():
+                stop_req = ticket.get("custom_fields", {}).get(
+                    "stop_requested",
+                )
+                if not stop_req:
+                    continue
+                tid = ticket["id"]
+                mode = stop_req.get("mode", "graceful")
+                if dispatcher.is_active(tid):
+                    dispatcher.stop_agent(tid, mode)
+                    logger.info(f"Processed stop request for {tid} (mode={mode})")
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{tid}/fields",
+                    json={"fields": {"stop_requested": None}},
+                )
+    except Exception:
+        logger.exception("Failed to process stop requests")
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
@@ -611,6 +672,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
                 task = asyncio.create_task(run_agent_task(dispatcher, status, tid))
                 dispatcher.set_task(tid, task)
+
+        await _process_stop_requests(dispatcher, config.state_store_url)
 
         await asyncio.sleep(config.poll_interval)
 

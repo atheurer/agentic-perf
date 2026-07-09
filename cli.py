@@ -401,6 +401,52 @@ def cmd_abort(args):
     print(f"Ticket {args.ticket_id} aborted — moving to teardown.")
 
 
+def cmd_stop(args):
+    client, url = get_client(args)
+
+    mode = "hard" if args.hard else "graceful"
+    r = client.post(
+        f"/api/v1/tickets/{args.ticket_id}/stop",
+        json={"mode": mode},
+    )
+    if r.status_code == 404:
+        print(f"Ticket {args.ticket_id} not found.")
+        return
+    if r.status_code == 409:
+        print(r.json().get("detail", "Ticket is already in a terminal state."))
+        return
+    r.raise_for_status()
+
+    label = "Hard stop" if args.hard else "Graceful stop"
+    print(f"{label} requested for ticket {args.ticket_id}.")
+
+
+def cmd_stop_all(args):
+    client, url = get_client(args)
+
+    mode = "hard" if args.hard else "graceful"
+
+    if not args.yes:
+        r = client.get("/api/v1/health")
+        r.raise_for_status()
+        total = r.json().get("total", 0)
+        label = "hard-stop" if args.hard else "stop"
+        confirm = input(
+            f"This will {label} all active tickets"
+            f" ({total} total). Continue? [y/N] "
+        )
+        if confirm.lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    r = client.post("/api/v1/stop-all", json={"mode": mode})
+    r.raise_for_status()
+    data = r.json()
+    count = data.get("count", 0)
+    label = "Hard stop" if args.hard else "Graceful stop"
+    print(f"{label} requested for {count} active ticket(s).")
+
+
 def _load_aws_config() -> dict:
     config_path = Path.home() / ".agentic-perf" / "secrets" / "aws" / "config.json"
     if not config_path.exists():
@@ -770,6 +816,27 @@ def main():
     p_abort.add_argument("ticket_id", help="Ticket ID")
     p_abort.add_argument("reason", nargs="?", help="Reason for aborting (optional)")
 
+    p_stop = sub.add_parser("stop", help="Stop a running agent on a ticket")
+    p_stop.add_argument("ticket_id", help="Ticket ID")
+    p_stop.add_argument(
+        "--hard",
+        action="store_true",
+        help="Kill the agent immediately instead of waiting for it to finish",
+    )
+
+    p_stop_all = sub.add_parser(
+        "stop-all",
+        help="Stop all running agents across all active tickets",
+    )
+    p_stop_all.add_argument(
+        "--hard",
+        action="store_true",
+        help="Kill all agents immediately",
+    )
+    p_stop_all.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt",
+    )
+
     p_transcript = sub.add_parser(
         "transcript", help="Show full agent conversation transcript"
     )
@@ -811,6 +878,8 @@ def main():
         "approve": cmd_approve,
         "deny": cmd_deny,
         "abort": cmd_abort,
+        "stop": cmd_stop,
+        "stop-all": cmd_stop_all,
         "transcript": cmd_transcript,
         "health": cmd_health,
         "cleanup": cmd_cleanup,

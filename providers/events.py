@@ -24,6 +24,7 @@ EVENT_TYPES = {
     "comment",
     "tool_progress",
     "llm_usage",
+    "agent_stopped",
 }
 
 

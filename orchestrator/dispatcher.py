@@ -59,6 +59,7 @@ class Dispatcher:
         self.repo_cache = repo_cache
         self._llm_factory = llm_factory
         self._tasks: dict[str, asyncio.Task] = {}
+        self._agents: dict[str, Any] = {}
         self._dispatched: set[tuple[str, str]] = set()
         self._handoff_blocked: set[tuple[str, str]] = set()
 
@@ -77,6 +78,12 @@ class Dispatcher:
     def set_task(self, ticket_id: str, task: asyncio.Task) -> None:
         self._tasks[ticket_id] = task
 
+    def set_agent(self, ticket_id: str, agent: Any) -> None:
+        self._agents[ticket_id] = agent
+
+    def clear_agent(self, ticket_id: str) -> None:
+        self._agents.pop(ticket_id, None)
+
     def mark_dispatched(self, ticket_id: str, status: str) -> None:
         self._dispatched.add((ticket_id, status))
 
@@ -94,8 +101,24 @@ class Dispatcher:
             (t, s) for t, s in self._handoff_blocked if t != ticket_id
         }
 
+    def stop_agent(self, ticket_id: str, mode: str = "graceful") -> bool:
+        if mode == "graceful":
+            agent = self._agents.get(ticket_id)
+            if agent is not None and hasattr(agent, "request_stop"):
+                agent.request_stop()
+                logger.info(f"Graceful stop requested for {ticket_id}")
+                return True
+        elif mode == "hard":
+            task = self._tasks.get(ticket_id)
+            if task is not None and not task.done():
+                task.cancel()
+                logger.info(f"Hard stop (task.cancel) for {ticket_id}")
+                return True
+        return False
+
     def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
+        self._agents.pop(ticket_id, None)
         self._dispatched = {(t, s) for t, s in self._dispatched if t != ticket_id}
         self.clear_handoff_blocked(ticket_id)
 

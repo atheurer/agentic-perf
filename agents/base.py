@@ -61,6 +61,10 @@ class AgentBase(ABC):
             if max_iterations is not None
             else self.DEFAULT_MAX_ITERATIONS
         )
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -88,6 +92,19 @@ class AgentBase(ABC):
             iteration = 0
             self._budget_grace = False
             while self.max_iterations == 0 or iteration < self.max_iterations:
+                if self._stop_requested:
+                    self._emit(
+                        ticket_id,
+                        "agent_stopped",
+                        {"mode": "graceful"},
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=("Agent stopped (graceful) by user request"),
+                    )
+                    break
+
                 iteration += 1
                 self._emit(
                     ticket_id,
