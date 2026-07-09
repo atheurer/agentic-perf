@@ -180,6 +180,26 @@ class TriageAgent(AgentBase):
             "steps": steps,
         }
 
+        # Clear the first step's scoped_context section so the
+        # agent relies on structured data (required_hosts) instead
+        # of multi-iteration text. _apply_step_overrides handles
+        # this for subsequent steps, but step 0 runs before any
+        # plan advancement.
+        first_type = steps[0]["agent_type"]
+        agent_key_map = {
+            "resource": "resource",
+            "provision": "provisioning",
+            "benchmark": "benchmark",
+            "review": "review",
+        }
+        first_key = agent_key_map.get(first_type)
+        if (
+            first_key
+            and "scoped_context" in fields
+            and first_key in fields["scoped_context"]
+        ):
+            del fields["scoped_context"][first_key]
+
         await self._update_fields(ticket_id, fields)
 
         summary = (
