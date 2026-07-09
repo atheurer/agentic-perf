@@ -133,6 +133,10 @@ def _apply_step_overrides(
     step_params = next_step.get("params", {})
     override_fields: dict = {}
 
+    if agent_type == "teardown":
+        if step_params.get("preserve_roles"):
+            override_fields["teardown_preserve_roles"] = step_params["preserve_roles"]
+
     if agent_type == "resource":
         if step_params.get("required_hosts"):
             override_fields["required_hosts"] = step_params["required_hosts"]

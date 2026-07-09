@@ -147,7 +147,11 @@ The execution_plan is a list of steps. Each step has an agent_type and params:
   params: {}
 
 - **teardown**: Release infrastructure.
-  params: {}
+  params: {preserve_roles: [...] (optional — roles to keep alive, e.g. ["controller"])}
+
+  Mid-plan teardowns (between iterations) should ALWAYS preserve the controller
+  so the harness installation and benchmark results from earlier iterations remain
+  accessible. Only the final teardown at the end of the plan should release everything.
 
 ### Single benchmark request
 
@@ -174,16 +178,16 @@ The first resource step uses the ticket-level required_hosts (set in the main re
 
 ### Different infrastructure per iteration
 
-Insert teardown/resource/provision between iterations. Only subsequent resource
-steps need step-level required_hosts overrides (the first uses ticket-level):
+Insert teardown/resource/provision between iterations. Mid-plan teardowns preserve
+the controller (so the harness and results survive). The next resource step only
+requests client+server since the controller is already running:
 
 [
     {"agent_type": "resource", "params": {}},
     {"agent_type": "provision", "params": {}},
     {"agent_type": "benchmark", "params": {"label": "RHEL9-uperf"}},
-    {"agent_type": "teardown", "params": {}},
+    {"agent_type": "teardown", "params": {"preserve_roles": ["controller"]}},
     {"agent_type": "resource", "params": {"required_hosts": [
-        {"roles": ["controller"], "min_memory_gb": 16},
         {"roles": ["client"], "os": "RHEL10", "nic_speed": 25},
         {"roles": ["server"], "os": "RHEL10", "nic_speed": 25}
     ]}},
