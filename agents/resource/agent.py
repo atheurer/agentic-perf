@@ -567,33 +567,51 @@ class ResourceAgent(AgentBase):
 
         # Merge with preserved hosts from selective teardown.
         # If a prior teardown kept the controller alive, the new
-        # allocation only has targets — merge them together.
+        # allocation only covers targets. The LLM may have included
+        # the controller IP in its result (it sees it in comments),
+        # but it wasn't newly allocated — use the existing SSH
+        # mapping for the controller.
         ticket = await self._get_ticket(ticket_id)
         existing_cf = ticket.get("custom_fields", {})
         existing_hw = existing_cf.get("assigned_hardware_ips", {})
         existing_ssh = existing_cf.get("ssh_hardware_ips", {})
+        existing_meta = existing_cf.get("resource_provider_metadata", {})
         new_hw = fields.get("assigned_hardware_ips", {})
         new_ssh = fields.get("ssh_hardware_ips", {})
+        new_meta = fields.get("resource_provider_metadata", {})
+        new_instance_ids = set(new_meta.get("instance_ids", []))
 
-        if existing_hw.get("controller") and not new_hw.get("controller"):
+        # Check if the controller was preserved (exists in prior
+        # state but not in the new allocation's instance IDs)
+        ctrl_preserved = bool(
+            existing_hw.get("controller")
+            and existing_meta.get("instance_ids")
+            and not new_instance_ids.intersection(
+                existing_meta.get("instance_ids", []),
+            )
+        )
+
+        if ctrl_preserved:
             new_hw["controller"] = existing_hw["controller"]
             fields["assigned_hardware_ips"] = new_hw
-            if existing_ssh.get("controller") and not new_ssh.get("controller"):
+            if existing_ssh.get("controller"):
                 new_ssh["controller"] = existing_ssh["controller"]
                 fields["ssh_hardware_ips"] = new_ssh
 
             # Merge provider metadata (keep preserved instance IDs)
-            existing_meta = existing_cf.get("resource_provider_metadata", {})
-            new_meta = fields.get("resource_provider_metadata", {})
-            if existing_meta.get("instance_ids") and new_meta.get("instance_ids"):
+            if existing_meta.get("instance_ids") and new_meta.get(
+                "instance_ids",
+            ):
                 new_meta["instance_ids"] = (
                     existing_meta["instance_ids"] + new_meta["instance_ids"]
                 )
                 new_meta["public_ips"] = existing_meta.get(
-                    "public_ips", []
+                    "public_ips",
+                    [],
                 ) + new_meta.get("public_ips", [])
                 new_meta["private_ips"] = existing_meta.get(
-                    "private_ips", []
+                    "private_ips",
+                    [],
                 ) + new_meta.get("private_ips", [])
                 fields["resource_provider_metadata"] = new_meta
 
