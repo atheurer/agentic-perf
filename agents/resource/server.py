@@ -157,6 +157,23 @@ async def check_available_resources(
     return json.dumps(result)
 
 
+def _infer_os_from_ticket() -> str:
+    """Extract the OS from the ticket's required_hosts.
+
+    Returns the OS if all non-controller hosts share the same value,
+    otherwise returns empty string.
+    """
+    required_hosts = _ticket.get("custom_fields", {}).get("required_hosts", [])
+    os_values = set()
+    for h in required_hosts:
+        os_val = h.get("os", "")
+        if os_val and "controller" not in h.get("roles", []):
+            os_values.add(os_val)
+    if len(os_values) == 1:
+        return os_values.pop()
+    return ""
+
+
 @mcp.tool()
 async def reserve_resources(
     provider: str,
@@ -167,6 +184,14 @@ async def reserve_resources(
 ) -> str:
     """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
     await _ensure_init()
+    # Inject OS from ticket required_hosts when the LLM doesn't
+    # include it in the selection — ensures AMI resolution fires
+    # in the provider regardless of LLM behavior.
+    if not selection.get("ami") and not selection.get("os"):
+        os_name = _infer_os_from_ticket()
+        if os_name:
+            selection = dict(selection)
+            selection["os"] = os_name
     prov = await _registry.get_provider(provider)
     result = await prov.reserve(
         selection, description, duration_hours, ticket_id=ticket_id
