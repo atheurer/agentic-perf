@@ -325,6 +325,7 @@ class BenchmarkAgent(AgentBase):
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
+            "output_dir": result.get("output_dir", ""),
         }
         await self._update_fields(ticket_id, fields)
 

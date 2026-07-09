@@ -1838,8 +1838,27 @@ async def execute_boot_time_test(
             "avg_userspace_s": _avg(sa_userspaces),
         }
 
+    # KPI pattern was requested but no matching data found.
+    # This indicates the board didn't produce expected boot
+    # metrics — treat as a node-level failure condition.
+    kpi_failure = False
+    if kpi_pattern and exit_code == 0:
+        has_kpi_data = bool(
+            kpis.get("avg_kernel_s")
+            or kpis.get("avg_initrd_s")
+            or kpis.get("avg_userspace_s")
+        )
+        if not has_kpi_data:
+            kpi_failure = True
+
+    status = "completed"
+    if exit_code != 0:
+        status = "failed"
+    elif kpi_failure:
+        status = "completed_no_kpi"
+
     response: dict[str, Any] = {
-        "status": "completed" if exit_code == 0 else "failed",
+        "status": status,
         "exit_code": exit_code,
         "run_id": f"boot-time-{run_uuid}",
         "harness": "boot-time",
@@ -1848,7 +1867,14 @@ async def execute_boot_time_test(
         "output_dir": str(output_dir),
         "message": (
             f"Boot time test completed ({len(boot_time_logs)}/{samples} samples)"
-            if exit_code in (0, 2)
+            if exit_code in (0, 2) and not kpi_failure
+            else (
+                "Boot time test completed but expected KPI "
+                "patterns not found (kernel/initrd/userspace). "
+                "The board may not be producing valid boot "
+                "metrics. This is a node-level issue."
+            )
+            if kpi_failure
             else f"Boot time test failed (exit {exit_code})"
         ),
     }
@@ -1874,6 +1900,58 @@ async def execute_boot_time_test(
     if exit_code not in (0, 2):
         response["output"] = stdout_str[-3000:]
         response["error"] = stderr_str[-1000:]
+    else:
+        # On success, include a compact summary so the
+        # evaluate agent can see serial capture status
+        # and key metrics without the full log.
+        summary_lines = []
+        for line in stdout_str.split("\n"):
+            ll = line.lower()
+            if any(
+                k in ll
+                for k in (
+                    "serial capture",
+                    "jumpstarter",
+                    "sample",
+                    "error",
+                    "\u2713",
+                    "\u2717",
+                    "boot_time",
+                    "kpi",
+                    "warning",
+                    "failed",
+                )
+            ):
+                summary_lines.append(line.rstrip())
+        if summary_lines:
+            response["output_summary"] = "\n".join(
+                summary_lines[-30:]
+            )
+
+    # Save output_dir to ticket so the evaluate agent
+    # can find artifacts. The LLM's submit_benchmark_result
+    # doesn't include output_dir, so we write it directly.
+    if _ticket and response.get("output_dir"):
+        try:
+            import os
+
+            import httpx
+
+            store_url = os.environ.get(
+                "STATE_STORE_URL", "http://localhost:8090"
+            )
+            ticket_id = _ticket.get("id", "")
+            if ticket_id:
+                httpx.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"output_dir": response["output_dir"]}},
+                    timeout=10.0,
+                )
+                logger.info(
+                    f"[boot-time] Saved output_dir to ticket {ticket_id}"
+                )
+        except Exception:
+            logger.warning("Failed to save output_dir", exc_info=True)
 
     return json.dumps(response)
 
