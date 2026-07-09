@@ -192,7 +192,12 @@ async def create_investigation_record(
                 info_gain_trajectory
             )
         except (json.JSONDecodeError, TypeError):
-            pass
+            logger.warning(
+                "Malformed info_gain_trajectory for"
+                " investigation record — data dropped:"
+                " %r",
+                info_gain_trajectory,
+            )
     record.operational_metrics.resource_consumption.llm_tokens_total = llm_tokens_total
     record.operational_metrics.resource_consumption.llm_invocations = llm_invocations
     record.operational_metrics.resource_consumption.estimated_cost_usd = (

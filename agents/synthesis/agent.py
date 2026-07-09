@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +147,10 @@ class SynthesisAgent(AgentBase):
 
         root_cause = result.get("root_cause_summary", "")
         confidence = result.get("confidence", 0.0)
-        outcome = result.get("convergence_outcome", "")
+        # convergence_outcome is resolved below from the
+        # deterministic evaluation_result.convergence_gate
+        # rather than LLM free-text, to avoid conflicting
+        # values (e.g. case or naming differences).
         change_class = result.get("change_classification", "")
         causal_commits_str = result.get("causal_commits", "")
         change_summary = result.get("change_summary", "")
@@ -162,6 +166,11 @@ class SynthesisAgent(AgentBase):
         # Collect operational metrics from ticket and EventBus
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
+        eval_result = cf.get("evaluation_result", {})
+        outcome = eval_result.get(
+            "convergence_gate",
+            result.get("convergence_outcome", ""),
+        )
         metrics = self._collect_operational_metrics(ticket_id, cf)
 
         # Create the Investigation Record via MCP
@@ -283,8 +292,6 @@ class SynthesisAgent(AgentBase):
         # Wall-clock time from first to last event
         wall_clock_mins = 0.0
         if events:
-            from datetime import datetime
-
             try:
                 first_ts = events[0].get("timestamp", "")
                 last_ts = events[-1].get("timestamp", "")
@@ -293,7 +300,13 @@ class SynthesisAgent(AgentBase):
                     t1 = datetime.fromisoformat(last_ts)
                     wall_clock_mins = round((t1 - t0).total_seconds() / 60, 2)
             except Exception:
-                pass
+                logger.warning(
+                    "[synthesis-agent] Failed to parse"
+                    " event timestamps for wall-clock"
+                    " calculation on %s",
+                    ticket_id,
+                    exc_info=True,
+                )
 
         # Token/cost from EventBus
         resource = {}
@@ -323,8 +336,6 @@ class SynthesisAgent(AgentBase):
         # Hardware time from provision/benchmark transitions
         hardware_time_mins = 0.0
         if self._events and events:
-            from datetime import datetime as _dt
-
             hw_start = None
             for e in events:
                 if e.get("event_type") != "transition":
@@ -332,9 +343,14 @@ class SynthesisAgent(AgentBase):
                 to_status = e.get("data", {}).get("to", "")
                 if to_status == "awaiting_provision":
                     try:
-                        hw_start = _dt.fromisoformat(e["timestamp"])
+                        hw_start = datetime.fromisoformat(e["timestamp"])
                     except (ValueError, KeyError):
-                        pass
+                        logger.warning(
+                            "[synthesis-agent] Failed to"
+                            " parse provision start"
+                            " timestamp on %s",
+                            ticket_id,
+                        )
                 elif (
                     to_status
                     in (
@@ -345,11 +361,16 @@ class SynthesisAgent(AgentBase):
                     and hw_start
                 ):
                     try:
-                        hw_end = _dt.fromisoformat(e["timestamp"])
+                        hw_end = datetime.fromisoformat(e["timestamp"])
                         hardware_time_mins += (hw_end - hw_start).total_seconds() / 60
                         hw_start = None
                     except (ValueError, KeyError):
-                        pass
+                        logger.warning(
+                            "[synthesis-agent] Failed to"
+                            " parse hardware end"
+                            " timestamp on %s",
+                            ticket_id,
+                        )
             hardware_time_mins = round(hardware_time_mins, 2)
 
         return {
