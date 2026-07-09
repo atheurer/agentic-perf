@@ -31,6 +31,7 @@ class AWSResourceProvider(ResourceProvider):
         default_ami: str,
         default_instance_type: str,
         instance_type_map: dict[str, str] | None = None,
+        ami_map: dict[str, str] | None = None,
         session_token: str | None = None,
         root_volume_gb: int = 50,
     ) -> None:
@@ -46,6 +47,7 @@ class AWSResourceProvider(ResourceProvider):
         self._default_ami = default_ami
         self._default_instance_type = default_instance_type
         self._instance_type_map = instance_type_map or {}
+        self._ami_map = ami_map or {}
         self._default_root_volume_gb = root_volume_gb
         self._ec2_client = None
 
@@ -82,6 +84,7 @@ class AWSResourceProvider(ResourceProvider):
             default_ami=config["default_ami"],
             default_instance_type=config["default_instance_type"],
             instance_type_map=config.get("instance_type_map"),
+            ami_map=config.get("ami_map"),
             session_token=config.get("session_token"),
             root_volume_gb=config.get("root_volume_gb", 50),
         )
@@ -147,9 +150,93 @@ class AWSResourceProvider(ResourceProvider):
 
         return self._default_instance_type
 
+    async def _resolve_ami(self, os_name: str) -> str:
+        """Resolve an OS name (e.g., 'RHEL9') to an AMI ID.
+
+        Checks the static ami_map first, then falls back to querying
+        the AWS API for the latest matching AMI.
+        """
+        normalized = os_name.strip().upper()
+        for key, ami_id in self._ami_map.items():
+            if key.upper() == normalized:
+                logger.info(
+                    f"[aws-provider] Resolved {os_name} to {ami_id} via ami_map",
+                )
+                return ami_id
+
+        # Dynamic fallback: query AWS for official RHEL AMIs
+        # Red Hat's AWS owner ID for official images
+        rhel_owner = "309956199498"
+        name_patterns = []
+        if "RHEL" in normalized:
+            version = normalized.replace("RHEL", "").strip()
+            name_patterns = [f"RHEL-{version}*x86_64*"]
+        elif "CENTOS" in normalized:
+            version = normalized.replace("CENTOS", "").strip()
+            name_patterns = [f"CentOS*{version}*x86_64*"]
+            rhel_owner = "125523088429"
+
+        if not name_patterns:
+            logger.warning(
+                f"[aws-provider] Cannot resolve OS '{os_name}'"
+                f" — no pattern match, using default AMI",
+            )
+            return self._default_ami
+
+        try:
+            ec2 = self._get_ec2_client()
+            response = await asyncio.to_thread(
+                ec2.describe_images,
+                Owners=[rhel_owner],
+                Filters=[
+                    {"Name": "name", "Values": name_patterns},
+                    {"Name": "architecture", "Values": ["x86_64"]},
+                    {"Name": "state", "Values": ["available"]},
+                ],
+            )
+            images = sorted(
+                response.get("Images", []),
+                key=lambda x: x.get("CreationDate", ""),
+                reverse=True,
+            )
+            if images:
+                ami_id = images[0]["ImageId"]
+                ami_name = images[0].get("Name", "?")
+                logger.info(
+                    f"[aws-provider] Resolved {os_name} to {ami_id}"
+                    f" ({ami_name}) via AWS API",
+                )
+                return ami_id
+        except Exception:
+            logger.exception(
+                f"[aws-provider] Failed to resolve AMI for {os_name}",
+            )
+
+        logger.warning(
+            f"[aws-provider] No AMI found for '{os_name}' — using default",
+        )
+        return self._default_ami
+
+    @staticmethod
+    def _extract_os(d: dict[str, Any]) -> str:
+        """Extract an OS name from a dict, checking common key variations."""
+        for key in ("os", "client_server_os", "target_os", "operating_system"):
+            if d.get(key):
+                return str(d[key])
+        for key, val in d.items():
+            if isinstance(val, str) and "RHEL" in val.upper():
+                return val
+        return ""
+
     async def check_available(self, requirements: dict[str, Any]) -> dict[str, Any]:
         recommended = self._match_instance_type(requirements)
-        ami = requirements.get("ami", self._default_ami)
+        ami = requirements.get("ami")
+        if not ami:
+            os_name = self._extract_os(requirements)
+            if os_name:
+                ami = await self._resolve_ami(os_name)
+        if not ami:
+            ami = self._default_ami
         count = requirements.get("count", 1)
         return {
             "provider": self.provider_name,
@@ -333,7 +420,13 @@ class AWSResourceProvider(ResourceProvider):
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
         ec2 = self._get_ec2_client()
-        ami = selection.get("ami", self._default_ami)
+        ami = selection.get("ami")
+        if not ami:
+            os_name = self._extract_os(selection)
+            if os_name:
+                ami = await self._resolve_ami(os_name)
+        if not ami:
+            ami = self._default_ami
         root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
 
         if ticket_id:
