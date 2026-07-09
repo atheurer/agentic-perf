@@ -149,6 +149,14 @@ The execution_plan is a list of steps. Each step has an agent_type and params:
 - **teardown**: Release infrastructure.
   params: {preserve_roles: [...] (optional — roles to keep alive, e.g. ["controller"])}
 
+Any step can include an optional **scoped_context** dict in its params to provide
+step-specific natural language context for the agent. This replaces the ticket-level
+scoped_context for that agent's section. Use this when different iterations need
+different instructions — for example, a resource step for RHEL10 should NOT include
+RHEL9 instructions. Keys match agent roles: "resource", "provisioning", "benchmark",
+"review". If omitted, the orchestrator clears the agent's section so the agent relies
+on structured data (required_hosts, directives) instead of stale ticket-level text.
+
   Mid-plan teardowns (between iterations) should ALWAYS preserve the controller
   so the harness installation and benchmark results from earlier iterations remain
   accessible. Only the final teardown at the end of the plan should release everything.
