@@ -435,20 +435,24 @@ class AWSResourceProvider(ResourceProvider):
     async def _get_instance_ips(
         self, ec2, instance_ids: list[str]
     ) -> dict[str, list[str]]:
-        """Return both public and private IPs for instances."""
+        """Return both public and private IPs for instances.
+
+        IPs are returned in the same order as instance_ids so
+        parallel array indexing is safe (describe_instances does
+        not guarantee order).
+        """
         response = await asyncio.to_thread(
             ec2.describe_instances, InstanceIds=instance_ids
         )
-        public_ips = []
-        private_ips = []
+        by_id: dict[str, dict[str, str]] = {}
         for reservation in response["Reservations"]:
             for inst in reservation["Instances"]:
-                pub = inst.get("PublicIpAddress")
-                priv = inst.get("PrivateIpAddress")
-                if pub:
-                    public_ips.append(pub)
-                if priv:
-                    private_ips.append(priv)
+                by_id[inst["InstanceId"]] = {
+                    "public": inst.get("PublicIpAddress", ""),
+                    "private": inst.get("PrivateIpAddress", ""),
+                }
+        public_ips = [by_id.get(iid, {}).get("public", "") for iid in instance_ids]
+        private_ips = [by_id.get(iid, {}).get("private", "") for iid in instance_ids]
         return {"public": public_ips, "private": private_ips}
 
     async def _wait_for_ssh(
