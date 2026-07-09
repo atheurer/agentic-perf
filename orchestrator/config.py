@@ -52,7 +52,7 @@ class OrchestratorConfig:
         self.llm_model = (
             llm_model
             or os.environ.get("LLM_MODEL")
-            or llm_cfg.get("model", "claude-sonnet-4-6")
+            or llm_cfg.get("model", "claude-haiku-4-5")
         )
         self.llm_backend = os.environ.get("LLM_BACKEND") or llm_cfg.get("backend")
         self.llm_project_id = os.environ.get(

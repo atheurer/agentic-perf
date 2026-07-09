@@ -13,7 +13,7 @@ class ClaudeLLMProvider(LLMProvider):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-haiku-4-5",
         backend: str | None = None,
         project_id: str | None = None,
         region: str | None = None,

@@ -33,7 +33,7 @@ def _emit_usage(
     input_tokens: int,
     output_tokens: int,
     duration_ms: int,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-4-5",
     agent: str = "system",
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,

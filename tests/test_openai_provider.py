@@ -360,11 +360,9 @@ class TestConfigResolution:
     def test_default_config(self):
         from orchestrator.config import OrchestratorConfig
 
-        config = OrchestratorConfig(
-            llm_provider="claude", llm_model="claude-sonnet-4-6"
-        )
+        config = OrchestratorConfig(llm_provider="claude", llm_model="claude-haiku-4-5")
         result = config.get_agent_llm_config("triage")
-        assert result == {"provider": "claude", "model": "claude-sonnet-4-6"}
+        assert result == {"provider": "claude", "model": "claude-haiku-4-5"}
 
     def test_agent_specific_override(self, tmp_path):
         import json

@@ -21,7 +21,7 @@ def create_llm_provider(
 
         return ClaudeLLMProvider(
             api_key=config.get("api_key"),
-            model=model or "claude-sonnet-4-6",
+            model=model or "claude-haiku-4-5",
             backend=config.get("backend"),
             project_id=config.get("project_id"),
             region=config.get("region"),

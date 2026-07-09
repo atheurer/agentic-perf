@@ -21,7 +21,7 @@ Crucible does NOT need to be pre-installed on the controller host. The provision
         "backend": "vertex",
         "project_id": "your-gcp-project-id",
         "region": "global",
-        "model": "claude-sonnet-4-6"
+        "model": "claude-haiku-4-5"
     },
     "crucible_home": "/opt/crucible",
     "state_store": {

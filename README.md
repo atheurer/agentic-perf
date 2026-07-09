@@ -103,7 +103,7 @@ Create `~/.agentic-perf/config.json`:
 {
     "llm": {
         "provider": "claude",
-        "model": "claude-sonnet-4-6",
+        "model": "claude-haiku-4-5",
         "backend": "vertex",
         "project_id": "your-gcp-project",
         "region": "us-east5"

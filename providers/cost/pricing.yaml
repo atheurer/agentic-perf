@@ -41,6 +41,12 @@ models:
     cache_write_per_token: 0.00000375  # $3.75 / 1M tokens (1.25x)
     output_per_token: 0.000015      # $15.00 / 1M tokens
 
+  claude-haiku-4:
+    input_per_token: 0.000001       # $1.00 / 1M tokens
+    cache_read_per_token: 0.0000001  # $0.10 / 1M tokens (90% off)
+    cache_write_per_token: 0.00000125  # $1.25 / 1M tokens (1.25x)
+    output_per_token: 0.000005      # $5.00 / 1M tokens
+
   claude-haiku-3.5:
     input_per_token: 0.0000008      # $0.80 / 1M tokens
     cache_read_per_token: 0.00000008  # $0.08 / 1M tokens (90% off)
