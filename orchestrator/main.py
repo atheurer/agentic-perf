@@ -123,10 +123,11 @@ def _apply_step_overrides(
 ) -> None:
     """Write step-level param overrides to ticket custom_fields.
 
-    Resource steps can carry per-step required_hosts and directives.
-    Provision steps can carry per-step directive merges. Resource
-    steps also clear stale provisioning state so the provisioning
-    agent re-runs.
+    Resource steps can carry per-step required_hosts, directives,
+    and scoped_context. Provision steps can carry per-step directive
+    merges. Resource steps also clear stale provisioning state so the
+    provisioning agent re-runs, and replace scoped_context for the
+    agent's section so stale multi-iteration text doesn't mislead.
     """
     agent_type = next_step.get("agent_type", "")
     step_params = next_step.get("params", {})
@@ -143,6 +144,24 @@ def _apply_step_overrides(
             existing = dict(cf.get("directives", {}))
             existing.update(step_params["directives"])
             override_fields["directives"] = existing
+
+    # Apply per-step scoped_context if provided, or clear the
+    # agent's section so it falls back to structured data
+    # (required_hosts) instead of stale ticket-level text.
+    scoped = dict(cf.get("scoped_context", {}))
+    if step_params.get("scoped_context"):
+        scoped.update(step_params["scoped_context"])
+        override_fields["scoped_context"] = scoped
+    elif agent_type in ("resource", "provision", "benchmark", "review"):
+        agent_key = {
+            "resource": "resource",
+            "provision": "provisioning",
+            "benchmark": "benchmark",
+            "review": "review",
+        }.get(agent_type)
+        if agent_key and agent_key in scoped:
+            del scoped[agent_key]
+            override_fields["scoped_context"] = scoped
 
     if override_fields:
         client.patch(
