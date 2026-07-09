@@ -41,12 +41,16 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.AWAITING_PROVISION: [
         TicketStatus.EXECUTING_BENCHMARK,
         TicketStatus.AWAITING_HARDWARE,  # handoff retry
+        TicketStatus.AWAITING_TEARDOWN,  # plan-driven
+        TicketStatus.AWAITING_REVIEW,  # plan-driven
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.EXECUTING_BENCHMARK: [
         TicketStatus.AWAITING_REVIEW,
         TicketStatus.EVALUATING_CONVERGENCE,  # investigation path
         TicketStatus.AWAITING_PROVISION,  # handoff retry
+        TicketStatus.AWAITING_TEARDOWN,  # plan-driven teardown after benchmark
+        TicketStatus.AWAITING_HARDWARE,  # plan-driven infrastructure cycle
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_REVIEW: [
@@ -61,6 +65,9 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.RETROSPECTIVE_PENDING,
         TicketStatus.CLOSED,
         TicketStatus.AWAITING_HARDWARE,  # plan-driven infrastructure cycle
+        TicketStatus.AWAITING_PROVISION,  # plan-driven
+        TicketStatus.EXECUTING_BENCHMARK,  # plan-driven
+        TicketStatus.AWAITING_REVIEW,  # plan-driven
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_CUSTOMER_GUIDANCE: [],  # filled dynamically
