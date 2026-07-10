@@ -1011,6 +1011,32 @@ async function stopTicket(ticketId, mode) {
   }
 }
 
+function actionButtonsHtml(status) {
+  if (status === 'awaiting_customer_guidance') {
+    return '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
+      '<button class="toolbar-btn btn-abort" id="btn-abort" title="Abort ticket and tear down resources">Abort</button>';
+  }
+  if (isTerminalStatus(status)) return '';
+  return '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
+    '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful" title="Finish current action, then pause">Pause</button>' +
+    '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard" title="Kill agent immediately">Stop</button>';
+}
+
+function bindActionButtons(ticketId) {
+  var stopGraceful = document.getElementById('btn-stop-graceful');
+  if (stopGraceful) {
+    stopGraceful.addEventListener('click', function() { stopTicket(ticketId, 'graceful'); });
+  }
+  var stopHard = document.getElementById('btn-stop-hard');
+  if (stopHard) {
+    stopHard.addEventListener('click', function() { stopTicket(ticketId, 'hard'); });
+  }
+  var abortBtn = document.getElementById('btn-abort');
+  if (abortBtn) {
+    abortBtn.addEventListener('click', function() { showAbortConfirm(ticketId); });
+  }
+}
+
 function showAbortConfirm(ticketId) {
   var overlay = document.createElement('div');
   overlay.className = 'stop-confirm-overlay';
@@ -1363,14 +1389,7 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
-            (ticket.status === 'awaiting_customer_guidance' ?
-              '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
-              '<button class="toolbar-btn btn-abort" id="btn-abort" title="Abort ticket and tear down resources">Abort</button>'
-            : isTerminalStatus(ticket.status) ? '' :
-              '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
-              '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful" title="Finish current action, then pause">Pause</button>' +
-              '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard" title="Kill agent immediately">Stop</button>'
-            ) +
+            '<span id="action-buttons">' + actionButtonsHtml(ticket.status) + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="detail-panels" id="detail-panels">' +
@@ -1419,18 +1438,7 @@ async function renderDetail(ticketId) {
     document.getElementById('btn-expand-all').addEventListener('click', function() {
       document.querySelectorAll('#event-stream details.agent-section').forEach(function(d) { d.open = true; });
     });
-    var stopGraceful = document.getElementById('btn-stop-graceful');
-    if (stopGraceful) {
-      stopGraceful.addEventListener('click', function() { stopTicket(ticketId, 'graceful'); });
-    }
-    var stopHard = document.getElementById('btn-stop-hard');
-    if (stopHard) {
-      stopHard.addEventListener('click', function() { stopTicket(ticketId, 'hard'); });
-    }
-    var abortBtn = document.getElementById('btn-abort');
-    if (abortBtn) {
-      abortBtn.addEventListener('click', function() { showAbortConfirm(ticketId); });
-    }
+    bindActionButtons(ticketId);
     initPanelDivider();
 
     await pollEvents(ticketId);
@@ -1758,6 +1766,11 @@ function trackAgentPhase(evt) {
     if (statusEl && evt.data && evt.data.to) {
       statusEl.innerHTML = statusBadge(evt.data.to);
       refreshResultSection(currentTicketId);
+      var actionEl = document.getElementById('action-buttons');
+      if (actionEl) {
+        actionEl.innerHTML = actionButtonsHtml(evt.data.to);
+        bindActionButtons(currentTicketId);
+      }
     }
   }
 }
