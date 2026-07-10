@@ -77,6 +77,40 @@ class BenchmarkAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Collect Jumpstarter diagnostics before any
+            # clarification or fleet redirect. Serial logs
+            # and tunnel data are critical for diagnosing
+            # node failures.
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            diag = ""
+            if cf.get("resource_provider") == "jumpstarter":
+                diag = await self._collect_jumpstarter_diagnostics()
+                if diag:
+                    # Store diagnostics on the ticket so
+                    # evaluate agent can see them.
+                    await self._update_fields(
+                        self._ticket_id,
+                        {"node_diagnostics": diag[:5000]},
+                    )
+                    question = f"{question}\n\n## Node Diagnostics\n{diag}"
+            # Fleet investigation: failures are data
+            # points. Submit failed result instead of
+            # parking. Diagnostics are already collected
+            # and attached above.
+            from providers.fleet import is_fleet_investigation
+
+            if is_fleet_investigation(cf):
+                return (
+                    "Fleet investigation: this failure is "
+                    "a critical data point, not a blocker. "
+                    "Submit your benchmark result with "
+                    "benchmark_status=failed and include "
+                    "the failure details and diagnostics "
+                    "in the notes. The system will record "
+                    "the failure and move to the next "
+                    "host."
+                )
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
@@ -283,6 +317,93 @@ class BenchmarkAgent(AgentBase):
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]
+
+    async def _collect_jumpstarter_diagnostics(
+        self,
+    ) -> str:
+        """Collect diagnostics via Jumpstarter tunnel.
+
+        Called deterministically when a fleet benchmark
+        fails. The tunnel may still work even when direct
+        SSH doesn't. Captures serial output, power state,
+        and tunnel SSH — the only data available to
+        diagnose node failures.
+        """
+        if self._mcp is None:
+            return "No MCP connection available"
+
+        import json as _json
+
+        diag: list[str] = []
+
+        try:
+            conns_raw = await self._mcp.call_tool("jmp_list_connections", {})
+            conns = _json.loads(conns_raw)
+            conn_list = conns.get("connections", [])
+            if not conn_list:
+                return "No active Jumpstarter connection"
+            conn_id = conn_list[0]["connection_id"]
+        except Exception as exc:
+            return f"Could not list connections: {exc}"
+
+        # Serial capture — most critical diagnostic
+        try:
+            serial = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": ["serial", "pipe"],
+                    "timeout_seconds": 15,
+                },
+            )
+            sd = _json.loads(serial)
+            stdout = sd.get("stdout", "")
+            if stdout:
+                diag.append(f"Serial output:\n{stdout[:3000]}")
+            else:
+                diag.append("Serial: no output (board may be hung or powered off)")
+        except Exception as exc:
+            diag.append(f"Serial capture failed: {exc}")
+
+        # Power state
+        try:
+            power = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": ["power", "read"],
+                },
+            )
+            pd = _json.loads(power)
+            diag.append(f"Power: {pd.get('stdout', 'unknown').strip()}")
+        except Exception as exc:
+            diag.append(f"Power check failed: {exc}")
+
+        # SSH via tunnel
+        try:
+            ssh = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": [
+                        "ssh",
+                        "--",
+                        "uptime",
+                    ],
+                    "timeout_seconds": 15,
+                },
+            )
+            sd = _json.loads(ssh)
+            if sd.get("exit_code") == 0:
+                diag.append(f"Tunnel SSH: OK — {sd.get('stdout', '').strip()}")
+            else:
+                diag.append(
+                    f"Tunnel SSH: failed — {sd.get('stderr', '').strip()[:200]}"
+                )
+        except Exception as exc:
+            diag.append(f"Tunnel SSH failed: {exc}")
+
+        return "\n".join(diag)
 
     async def _handle_budget_pause(self, ticket_id: str) -> None:
         """Route budget-exhausted investigation tickets
