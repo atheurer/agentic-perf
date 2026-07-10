@@ -24,35 +24,52 @@ logger = logging.getLogger(__name__)
 def _resolve_json_refs(obj: Any) -> Any:
     """Inline JSON Schema $ref definitions so Gemini doesn't
     misinterpret '#/definitions/...' as internal part references.
+
+    Walks the entire tree looking for dicts that contain a
+    'definitions' or '$defs' key, then resolves any '$ref'
+    pointers within that subtree.
     """
-    if not isinstance(obj, dict):
+    if not isinstance(obj, dict) and not isinstance(obj, list):
         return obj
 
-    definitions = obj.get("definitions") or obj.get("$defs") or {}
+    def _resolve_subtree(root: dict) -> dict:
+        defs = root.get("definitions") or root.get("$defs") or {}
 
-    def _resolve(node: Any) -> Any:
+        def _resolve(node: Any) -> Any:
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if isinstance(ref, str) and ref.startswith("#/"):
+                    path = ref.lstrip("#/").split("/")
+                    target: Any = root
+                    for p in path:
+                        if isinstance(target, dict):
+                            target = target.get(p)
+                        else:
+                            return node
+                    if target is not None:
+                        return _resolve(target)
+                    return node
+                skip = ("definitions", "$defs")
+                return {k: _resolve(v) for k, v in node.items() if k not in skip}
+            if isinstance(node, list):
+                return [_resolve(item) for item in node]
+            return node
+
+        if defs:
+            return _resolve(root)
+        return root
+
+    def _walk(node: Any) -> Any:
         if isinstance(node, dict):
-            ref = node.get("$ref")
-            if isinstance(ref, str) and ref.startswith("#/"):
-                parts = ref.lstrip("#/").split("/")
-                target: Any = obj
-                for p in parts:
-                    if isinstance(target, dict):
-                        target = target.get(p)
-                    else:
-                        return node
-                if target is not None:
-                    return _resolve(target)
-                return node
-            skip = ("definitions", "$defs")
-            return {k: _resolve(v) for k, v in node.items() if k not in skip}
+            has_defs = "definitions" in node or "$defs" in node
+            if has_defs:
+                node = _resolve_subtree(node)
+            return {k: _walk(v) for k, v in node.items()}
         if isinstance(node, list):
-            return [_resolve(item) for item in node]
+            return [_walk(item) for item in node]
         return node
 
-    if not definitions:
-        return obj
-    return _resolve(obj)
+    return _walk(obj)
 
 
 class GeminiLLMProvider(LLMProvider):
