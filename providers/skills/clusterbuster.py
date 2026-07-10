@@ -379,6 +379,7 @@ class ClusterbusterSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "git_clone",
+                "controller_only_install": True,
                 "git_url": ("https://github.com/redhat-performance/clusterbuster.git"),
                 "install_target_path": "/opt/clusterbuster",
                 "run_install_as_root": "pip install -e .",

@@ -29,6 +29,7 @@ ZATHRAS_PRIVATE_CONFIG = {
     },
     "provisioning": {
         "install_method": "git_clone",
+        "controller_only_install": True,
         "git_url": "https://github.com/redhat-performance/zathras.git",
         "install_script": "install.sh",
         "install_target_path": "/opt/zathras",
@@ -50,6 +51,7 @@ CRUCIBLE_PRIVATE_CONFIG = {
     },
     "provisioning": {
         "install_method": "public_install",
+        "controller_only_install": True,
         "installer_url": "https://raw.githubusercontent.com/perftool-incubator/crucible/master/crucible-install.sh",
         "install_flags": {
             "engine-registry": "quay.io/crucible/client-server",
@@ -809,3 +811,115 @@ async def test_ensure_prerequisites_reports_failures():
 
     assert "nonexistent-pkg" in result["failed"]
     assert result["status"] == "failed"
+
+
+# --- controller_only_install tests ---
+
+
+def test_filter_controller_only_skips_non_controller():
+    """When controller_only_install is true, non-controller hosts are skipped."""
+    from agents.provisioning.mcp_server import _filter_controller_only
+
+    hosts = ["ctrl", "target1", "target2"]
+    provisioning = {"controller_only_install": True}
+    filtered, skipped = _filter_controller_only(
+        hosts, "ctrl", provisioning, "crucible"
+    )
+    assert filtered == ["ctrl"]
+    assert set(skipped.keys()) == {"target1", "target2"}
+    for h in ["target1", "target2"]:
+        assert skipped[h]["status"] == "skipped"
+        assert "controller_only_install" in skipped[h]["message"]
+
+
+def test_filter_controller_only_false_installs_all():
+    """When controller_only_install is false, all hosts pass through."""
+    from agents.provisioning.mcp_server import _filter_controller_only
+
+    hosts = ["ctrl", "target1", "target2"]
+    provisioning = {"controller_only_install": False}
+    filtered, skipped = _filter_controller_only(
+        hosts, "ctrl", provisioning, "crucible"
+    )
+    assert filtered == hosts
+    assert skipped == {}
+
+
+def test_filter_controller_only_no_controller_host_passes_all():
+    """When controller_host is empty, all hosts pass through regardless of flag."""
+    from agents.provisioning.mcp_server import _filter_controller_only
+
+    hosts = ["h1", "h2", "h3"]
+    provisioning = {"controller_only_install": True}
+    filtered, skipped = _filter_controller_only(
+        hosts, "", provisioning, "crucible"
+    )
+    assert filtered == hosts
+    assert skipped == {}
+
+
+def test_filter_controller_only_default_is_true():
+    """When controller_only_install is absent, it defaults to True."""
+    from agents.provisioning.mcp_server import _filter_controller_only
+
+    hosts = ["ctrl", "target1"]
+    provisioning = {}
+    filtered, skipped = _filter_controller_only(
+        hosts, "ctrl", provisioning, "myharness"
+    )
+    assert filtered == ["ctrl"]
+    assert "target1" in skipped
+
+
+def test_filter_controller_only_server_module():
+    """The server.py module has its own _filter_controller_only."""
+    from agents.provisioning.server import _filter_controller_only
+
+    hosts = ["ctrl", "target1", "target2"]
+    provisioning = {"controller_only_install": True}
+    filtered, skipped = _filter_controller_only(
+        hosts, "ctrl", provisioning, "crucible"
+    )
+    assert filtered == ["ctrl"]
+    assert set(skipped.keys()) == {"target1", "target2"}
+
+
+@pytest.mark.asyncio
+async def test_install_harness_tool_has_controller_host():
+    """install_harness tool schema includes controller_host property."""
+    from agents.provisioning.mcp_server import get_provisioning_tools
+
+    tools = get_provisioning_tools()
+    tool = next(t for t in tools if t.name == "install_harness")
+    assert "controller_host" in tool.input_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_harness_installed_tool_has_controller_host():
+    """ensure_harness_installed tool schema includes controller_host property."""
+    from agents.provisioning.mcp_server import get_provisioning_tools
+
+    tools = get_provisioning_tools()
+    tool = next(t for t in tools if t.name == "ensure_harness_installed")
+    assert "controller_host" in tool.input_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_all_install_tools_have_controller_host():
+    """All install-related tools have controller_host in their schema."""
+    from agents.provisioning.mcp_server import get_provisioning_tools
+
+    tools = get_provisioning_tools()
+    install_tools = [
+        "install_harness",
+        "ensure_harness_installed",
+        "uninstall_harness",
+        "verify_harness_install",
+        "check_existing_install",
+        "update_install",
+    ]
+    for name in install_tools:
+        tool = next(t for t in tools if t.name == name)
+        assert "controller_host" in tool.input_schema["properties"], (
+            f"Tool {name} missing controller_host property"
+        )

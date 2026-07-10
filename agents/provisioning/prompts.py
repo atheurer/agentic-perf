@@ -19,6 +19,11 @@ Tools that take uniform parameters across hosts use `hosts: list[str]`:
   check_existing_install, verify_harness_install, update_install,
   uninstall_harness, install_k3s, ensure_harness_installed
 
+Install-related tools (install_harness, ensure_harness_installed, uninstall_harness,
+verify_harness_install, check_existing_install, update_install) also accept
+`controller_host` — always set this to the controller's IP so the harness is
+only installed/checked/verified on the controller (the default behavior).
+
 Tools with per-host parameters use `targets: list[dict]`:
   configure_host — each target is {"host": "...", "config": {...}}
 
@@ -61,11 +66,13 @@ Your tasks:
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip
-   check_existing_install entirely and proceed directly to install_harness.
+   check_existing_install entirely and proceed directly to install_harness
+   with the controller host (set controller_host to the controller's IP).
 
-6. If fresh_host is NOT set, use ensure_harness_installed with all hosts and the
-   harness_name. It will check, install, and verify in one call. However, if
-   the on_existing_install policy needs to be evaluated first (e.g., "update",
+6. If fresh_host is NOT set, use ensure_harness_installed with the controller
+   host and the harness_name (set controller_host to the controller's IP).
+   It will check, install, and verify in one call. However, if the
+   on_existing_install policy needs to be evaluated first (e.g., "update",
    "reinstall", "ask_user"), use the individual tools:
    - Check the ticket's "directives" section FIRST — if the user specified
      directives.on_existing_install, use that value.
@@ -74,10 +81,12 @@ Your tasks:
    - Then act on the resolved value:
      - "skip": proceed directly to submit_provisioning_result with
        provisioning_complete=true. Do NOT ask the user.
-     - "update": run update_install with all hosts.
-     - "reinstall": call uninstall_harness with all hosts FIRST, wait for
-       completion, then call install_harness with all hosts.
+     - "update": run update_install with the controller host.
+     - "reinstall": call uninstall_harness with the controller host FIRST,
+       wait for completion, then call install_harness with the controller host.
      - "ask_user": use request_clarification to present the options.
+   Always set controller_host on these tools so the harness is only
+   installed/updated/removed on the controller, not on target hosts.
 
 7. If the ticket's directives include `endpoint_type: kube`:
 
@@ -104,15 +113,19 @@ Your tasks:
       or fix the existing one.
 
 8. If not using ensure_harness_installed, install using install_harness
-   with all hosts and the harness_name.
+   with the controller host and the harness_name (set controller_host).
 
 9. If not using ensure_harness_installed, verify the installation using
-   verify_harness_install with all hosts and the harness_name.
+   verify_harness_install with the controller host and the harness_name
+   (set controller_host).
 
 10. If any step fails, report the error details.
 
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.
+  Always set controller_host on install_harness, ensure_harness_installed,
+  uninstall_harness, verify_harness_install, check_existing_install, and
+  update_install so the tool enforces this automatically.
 - Installation can take several minutes — be patient.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly — do not ask the user
@@ -122,7 +135,9 @@ Important:
   user investigate. Retrying install on top of a partial install causes conflicts.
 - For reinstall: always uninstall_harness FIRST, wait for completion, then
   install_harness. Never call install_harness on top of an existing install.
-- Always pass ALL hosts in a single tool call — never loop over hosts one at a time.
+- For tools that accept multiple hosts (ensure_prerequisites,
+  check_platform_contract), pass all hosts in a single call — never loop
+  one at a time.
 
 When done, call the submit_provisioning_result tool with your findings,
 including the harness_name.

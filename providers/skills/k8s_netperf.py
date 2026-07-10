@@ -226,6 +226,7 @@ class K8sNetperfSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "binary_download",
+                "controller_only_install": True,
                 "install_command": (
                     "curl -Ls https://raw.githubusercontent.com/cloud-bulldozer/"
                     "k8s-netperf/refs/heads/main/hack/install.sh"

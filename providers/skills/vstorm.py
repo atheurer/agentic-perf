@@ -209,6 +209,7 @@ class VstormSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "git_clone",
+                "controller_only_install": True,
                 "git_url": "https://github.com/gqlo/vstorm.git",
                 "install_target_path": "/opt/vstorm",
                 "run_install_as_root": (

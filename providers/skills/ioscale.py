@@ -265,6 +265,7 @@ class IoscaleSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "git_clone",
+                "controller_only_install": True,
                 "git_url": "https://github.com/ekuric/ioscale.git",
                 "install_target_path": "/opt/ioscale",
                 "run_install_as_root": "pip install pyyaml paramiko",
