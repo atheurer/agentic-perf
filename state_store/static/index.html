@@ -276,6 +276,14 @@ body:has(.detail-view) .container { max-width: none; }
   background: rgba(247, 118, 142, 0.15);
 }
 
+.toolbar-btn.btn-abort {
+  border-color: var(--red);
+  color: var(--red);
+}
+.toolbar-btn.btn-abort:hover {
+  background: rgba(247, 118, 142, 0.15);
+}
+
 .stop-confirm-overlay {
   position: fixed;
   inset: 0;
@@ -1003,6 +1011,49 @@ async function stopTicket(ticketId, mode) {
   }
 }
 
+function showAbortConfirm(ticketId) {
+  var overlay = document.createElement('div');
+  overlay.className = 'stop-confirm-overlay';
+  overlay.innerHTML =
+    '<div class="stop-confirm-dialog">' +
+      '<h3>Abort Ticket</h3>' +
+      '<p>This will abort the ticket and tear down all associated resources. ' +
+        'This action cannot be undone.</p>' +
+      '<div class="stop-confirm-actions">' +
+        '<button onclick="this.closest(\'.stop-confirm-overlay\').remove()">Cancel</button>' +
+        '<button class="btn-confirm-hard" onclick="doAbort(\'' + ticketId + '\', this)">Abort</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+async function doAbort(ticketId, btn) {
+  try {
+    btn.disabled = true;
+    btn.textContent = 'Aborting...';
+    var r = await fetch(API + '/tickets/' + ticketId + '/abort', {
+      method: 'POST',
+    });
+    if (r.status === 409) {
+      var data = await r.json();
+      alert(data.detail || 'Ticket cannot be aborted in its current state.');
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var overlay = btn.closest('.stop-confirm-overlay');
+    if (overlay) overlay.remove();
+    var abortBtn = document.getElementById('btn-abort');
+    if (abortBtn) { abortBtn.textContent = 'Abort requested'; abortBtn.disabled = true; }
+  } catch (err) {
+    alert('Abort failed: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Abort';
+  }
+}
+
 function showStopAllConfirm() {
   var overlay = document.createElement('div');
   overlay.className = 'stop-confirm-overlay';
@@ -1312,7 +1363,10 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
-            (isTerminalStatus(ticket.status) ? '' :
+            (ticket.status === 'awaiting_customer_guidance' ?
+              '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
+              '<button class="toolbar-btn btn-abort" id="btn-abort" title="Abort ticket and tear down resources">Abort</button>'
+            : isTerminalStatus(ticket.status) ? '' :
               '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
               '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful" title="Finish current action, then pause">Pause</button>' +
               '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard" title="Kill agent immediately">Stop</button>'
@@ -1372,6 +1426,10 @@ async function renderDetail(ticketId) {
     var stopHard = document.getElementById('btn-stop-hard');
     if (stopHard) {
       stopHard.addEventListener('click', function() { stopTicket(ticketId, 'hard'); });
+    }
+    var abortBtn = document.getElementById('btn-abort');
+    if (abortBtn) {
+      abortBtn.addEventListener('click', function() { showAbortConfirm(ticketId); });
     }
     initPanelDivider();
 

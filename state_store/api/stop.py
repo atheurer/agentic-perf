@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..models import StopRequest, TicketStatus
+from ..models import AddCommentRequest, StopRequest, TicketStatus, TransitionRequest
 from ..store import TicketNotFound
 
 TERMINAL_STATUSES = {TicketStatus.CLOSED, TicketStatus.AWAITING_CUSTOMER_GUIDANCE}
@@ -37,6 +37,40 @@ def stop_ticket(ticket_id: str, body: StopRequest, request: Request):
                 "requested_at": datetime.now(timezone.utc).isoformat(),
             },
         },
+    )
+    return updated
+
+
+@router.post("/tickets/{ticket_id}/abort")
+def abort_ticket(ticket_id: str, request: Request):
+    store = request.app.state.store
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if ticket.status != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Abort is only available when the ticket is in"
+                f" awaiting_customer_guidance (current: '{ticket.status.value}')"
+            ),
+        )
+
+    store.add_comment(
+        ticket_id,
+        AddCommentRequest(
+            author="user",
+            body="**Abort requested:** User requested abort from web UI",
+        ),
+    )
+    updated = store.transition_ticket(
+        ticket_id,
+        TransitionRequest(
+            status=TicketStatus.AWAITING_TEARDOWN,
+            comment="User requested abort, skipping to cleanup",
+        ),
     )
     return updated
 
