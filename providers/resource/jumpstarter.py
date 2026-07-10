@@ -401,6 +401,27 @@ class JumpstarterResourceProvider(ResourceProvider):
                     break
                 except Exception as exc:
                     if "already exists" in str(exc):
+                        # Release the stale lease before
+                        # creating a new one. This is the
+                        # natural cleanup point — we have
+                        # a live gRPC connection and know
+                        # exactly which lease to release.
+                        try:
+                            await self._service.DeleteLease(
+                                name=lease_id,
+                            )
+                            logger.info(
+                                f"[jumpstarter] Released stale lease {lease_id}"
+                            )
+                            # Retry with the same name
+                            continue
+                        except Exception:
+                            logger.debug(
+                                f"[jumpstarter] Could not "
+                                f"release {lease_id}, "
+                                f"trying suffix",
+                                exc_info=True,
+                            )
                         lease_id = f"{base_id}-{suffix}"
                         suffix += 1
                         if suffix > 100:

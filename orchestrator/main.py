@@ -308,6 +308,7 @@ async def run_agent_task(
     agent_task_timeout: float = 0,
 ):
     agent = None
+    _jumpstarter_lease_id = ""  # captured for cleanup in finally
     try:
         agent = dispatcher.create_agent(status)
         if agent is None:
@@ -363,6 +364,13 @@ async def run_agent_task(
                         and cf.get("resource_provider") == "jumpstarter"
                     ):
                         agent.max_iterations = 0
+                    # Capture lease ID for post-benchmark cleanup
+                    if cf.get("resource_provider") == "jumpstarter":
+                        _jumpstarter_lease_id = cf.get(
+                            "resource_reservation_id"
+                        ) or cf.get("resource_provider_metadata", {}).get(
+                            "lease_id", ""
+                        )
         except Exception:
             pass  # proceed with default iterations
 
@@ -452,20 +460,28 @@ async def run_agent_task(
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
         # Release Jumpstarter lease after benchmark completes.
-        # The lease is no longer needed — serial capture and
-        # SSH are done. Releasing here (not in evaluate or
-        # orchestrator poll) ensures exactly one lease is
-        # active at a time during fleet investigations.
-        if status == "executing_benchmark":
+        # Uses pre-captured lease_id and subprocess (not async)
+        # so it can't hang or fail silently.
+        if status == "executing_benchmark" and _jumpstarter_lease_id:
+            import subprocess
+
             try:
-                await _cleanup_jumpstarter_lease(
-                    dispatcher.store_url,
-                    ticket_id,
-                    event_bus=dispatcher.events,
+                _r = subprocess.run(
+                    ["jmp", "delete", "lease", _jumpstarter_lease_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
+                if _r.returncode == 0:
+                    logger.info(f"[lease-cleanup] Released {_jumpstarter_lease_id}")
+                else:
+                    logger.warning(
+                        f"[lease-cleanup] Failed to release "
+                        f"{_jumpstarter_lease_id}: {_r.stderr[:200]}"
+                    )
             except Exception:
-                logger.debug(
-                    f"Post-benchmark lease cleanup failed for {ticket_id}",
+                logger.warning(
+                    f"[lease-cleanup] Error releasing {_jumpstarter_lease_id}",
                     exc_info=True,
                 )
 
@@ -1329,22 +1345,26 @@ async def _cleanup_jumpstarter_lease(
     try:
         r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
+            logger.info(f"[jumpstarter-cleanup] Ticket {ticket_id} not found")
             return
         cf = r.json().get("custom_fields", {})
 
         if cf.get("resource_provider") != "jumpstarter":
+            logger.info(f"[jumpstarter-cleanup] Not jumpstarter, skipping {ticket_id}")
             return
 
         lease_id = cf.get("resource_reservation_id") or cf.get(
             "resource_provider_metadata", {}
         ).get("lease_id")
         if not lease_id:
+            logger.info(f"[jumpstarter-cleanup] No lease_id for {ticket_id}")
             return
 
         # Already cleaned up? Skip for fleet — each
         # iteration has a different lease ID.
         fleet = cf.get("fleet_investigation", {})
         if cf.get("jumpstarter_lease_cleaned_up") and not fleet.get("enabled"):
+            logger.info(f"[jumpstarter-cleanup] Already cleaned up {ticket_id}")
             return
 
         logger.warning(
