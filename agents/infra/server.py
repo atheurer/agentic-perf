@@ -173,7 +173,7 @@ async def check_host(host: str) -> str:
         # Auto-recover from stale host keys (common after
         # flashing embedded boards). Clear and retry once
         # so no agent wastes iterations on this.
-        output = (result.stderr or result.stdout or "")
+        output = result.stderr or result.stdout or ""
         if "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
             import subprocess
 
@@ -611,7 +611,7 @@ async def execute_command(
     result = await ssh.run(host, command, timeout=timeout)
 
     # Auto-recover from stale host keys.
-    output = (result.stderr or result.stdout or "")
+    output = result.stderr or result.stdout or ""
     if result.exit_code != 0 and "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
         import subprocess
 

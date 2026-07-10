@@ -465,8 +465,7 @@ async def run_agent_task(
                 )
             except Exception:
                 logger.debug(
-                    f"Post-benchmark lease cleanup failed "
-                    f"for {ticket_id}",
+                    f"Post-benchmark lease cleanup failed for {ticket_id}",
                     exc_info=True,
                 )
 
@@ -1114,9 +1113,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 if status == "awaiting_hardware":
                     cf = ticket.get("custom_fields", {})
                     fleet = cf.get("fleet_investigation", {})
-                    if cf.get("anomaly_context") and not fleet.get(
-                        "enabled"
-                    ):
+                    if cf.get("anomaly_context") and not fleet.get("enabled"):
                         logger.info(
                             f"Redirecting {tid} to "
                             f"gathering_context "
@@ -1347,9 +1344,7 @@ async def _cleanup_jumpstarter_lease(
         # Already cleaned up? Skip for fleet — each
         # iteration has a different lease ID.
         fleet = cf.get("fleet_investigation", {})
-        if cf.get("jumpstarter_lease_cleaned_up") and not fleet.get(
-            "enabled"
-        ):
+        if cf.get("jumpstarter_lease_cleaned_up") and not fleet.get("enabled"):
             return
 
         logger.warning(
@@ -1438,7 +1433,6 @@ async def _cleanup_jumpstarter_lease(
     finally:
         if owns_client:
             await client.aclose()
-
 
 
 _lock_fd: int | None = None

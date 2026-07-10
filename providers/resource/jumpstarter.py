@@ -223,14 +223,8 @@ class JumpstarterResourceProvider(ResourceProvider):
             # - online: exporter process connected
             # - enabled: not disabled by admin
             # - status AVAILABLE: not leased or offline
-            status_name = (
-                status.name if hasattr(status, "name") else str(status)
-            )
-            available = (
-                online
-                and enabled
-                and status_name == "AVAILABLE"
-            )
+            status_name = status.name if hasattr(status, "name") else str(status)
+            available = online and enabled and status_name == "AVAILABLE"
             all_devices.append(
                 {
                     "name": e.name,
@@ -268,9 +262,7 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         key, _, value = selector.partition("=")
         matching = [
-            d
-            for d in all_devices
-            if d["labels"].get(key) == value and d["available"]
+            d for d in all_devices if d["labels"].get(key) == value and d["available"]
         ]
 
         # Fleet exclusion: filter out already-tested hosts

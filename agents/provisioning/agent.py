@@ -382,9 +382,7 @@ class ProvisioningAgent(AgentBase):
         )
         if board_name:
             ticket = await self._get_ticket(ticket_id)
-            meta = ticket.get("custom_fields", {}).get(
-                "resource_provider_metadata", {}
-            )
+            meta = ticket.get("custom_fields", {}).get("resource_provider_metadata", {})
             if not meta.get("exporter_name"):
                 meta["exporter_name"] = board_name
                 fields["resource_provider_metadata"] = meta
@@ -396,7 +394,11 @@ class ProvisioningAgent(AgentBase):
         # host keys — clearing deterministically avoids
         # wasting LLM iterations on host key errors.
         for ip in fields.get("hosts_provisioned", []):
-            host = str(ip) if not isinstance(ip, dict) else ip.get("host", ip.get("ip", ""))
+            host = (
+                str(ip)
+                if not isinstance(ip, dict)
+                else ip.get("host", ip.get("ip", ""))
+            )
             if host:
                 import subprocess
 
@@ -405,10 +407,7 @@ class ProvisioningAgent(AgentBase):
                     capture_output=True,
                     timeout=5,
                 )
-                logger.info(
-                    f"[provisioning] Cleared stale "
-                    f"known_hosts for {host}"
-                )
+                logger.info(f"[provisioning] Cleared stale known_hosts for {host}")
 
         hosts = [
             str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))

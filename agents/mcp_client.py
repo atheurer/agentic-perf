@@ -224,9 +224,7 @@ class AgentMCPClient:
 
         # Trim verbose Jumpstarter responses to reduce
         # token accumulation in conversation history.
-        content = self._trim_jumpstarter_response(
-            name, content
-        )
+        content = self._trim_jumpstarter_response(name, content)
 
         return content
 
@@ -256,12 +254,8 @@ class AgentMCPClient:
                     trimmed = {
                         "connection_id": data["connection_id"],
                         "lease_name": data.get("lease_name", ""),
-                        "exporter_name": data.get(
-                            "exporter_name", ""
-                        ),
-                        "socket_path": data.get(
-                            "socket_path", ""
-                        ),
+                        "exporter_name": data.get("exporter_name", ""),
+                        "socket_path": data.get("socket_path", ""),
                     }
                     return _json.dumps(trimmed, indent=2)
             except (ValueError, KeyError):
@@ -273,18 +267,13 @@ class AgentMCPClient:
                 # Only trim successful commands with
                 # large stdout (flash logs, etc.)
                 stdout = data.get("stdout", "")
-                if (
-                    data.get("exit_code") == 0
-                    and len(stdout) > 2000
-                ):
+                if data.get("exit_code") == 0 and len(stdout) > 2000:
                     # Keep first and last lines for context
                     lines = stdout.strip().split("\n")
                     if len(lines) > 10:
                         summary = (
-                            "\n".join(lines[:3])
-                            + f"\n... ({len(lines) - 6} lines "
-                            f"trimmed) ...\n"
-                            + "\n".join(lines[-3:])
+                            "\n".join(lines[:3]) + f"\n... ({len(lines) - 6} lines "
+                            f"trimmed) ...\n" + "\n".join(lines[-3:])
                         )
                         data["stdout"] = summary
                         data["_trimmed"] = True

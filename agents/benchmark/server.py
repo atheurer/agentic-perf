@@ -1661,13 +1661,8 @@ async def execute_boot_time_test(
                     continue
 
             if live_socket:
-                jumpstarter_env["JUMPSTARTER_HOST"] = str(
-                    live_socket
-                )
-                logger.info(
-                    f"[boot-time] Using live Jumpstarter "
-                    f"socket: {live_socket}"
-                )
+                jumpstarter_env["JUMPSTARTER_HOST"] = str(live_socket)
+                logger.info(f"[boot-time] Using live Jumpstarter socket: {live_socket}")
             else:
                 # No live socket — fall back to jmp shell
                 # which creates a new connection from the
@@ -1924,9 +1919,7 @@ async def execute_boot_time_test(
             ):
                 summary_lines.append(line.rstrip())
         if summary_lines:
-            response["output_summary"] = "\n".join(
-                summary_lines[-30:]
-            )
+            response["output_summary"] = "\n".join(summary_lines[-30:])
 
     # Save output_dir to ticket so the evaluate agent
     # can find artifacts. The LLM's submit_benchmark_result
@@ -1937,9 +1930,7 @@ async def execute_boot_time_test(
 
             import httpx
 
-            store_url = os.environ.get(
-                "STATE_STORE_URL", "http://localhost:8090"
-            )
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
             ticket_id = _ticket.get("id", "")
             if ticket_id:
                 httpx.patch(
@@ -1947,9 +1938,7 @@ async def execute_boot_time_test(
                     json={"fields": {"output_dir": response["output_dir"]}},
                     timeout=10.0,
                 )
-                logger.info(
-                    f"[boot-time] Saved output_dir to ticket {ticket_id}"
-                )
+                logger.info(f"[boot-time] Saved output_dir to ticket {ticket_id}")
         except Exception:
             logger.warning("Failed to save output_dir", exc_info=True)
 
