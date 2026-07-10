@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
@@ -77,9 +78,14 @@ class AgentMCPClient:
         if name is None:
             name = command
 
-        merged_env = None
-        if env is not None:
-            merged_env = {**os.environ, **env}
+        project_root = str(Path(__file__).resolve().parent.parent)
+        base_env = {**os.environ}
+        existing = base_env.get("PYTHONPATH", "")
+        if project_root not in existing.split(os.pathsep):
+            base_env["PYTHONPATH"] = (
+                f"{project_root}{os.pathsep}{existing}" if existing else project_root
+            )
+        merged_env = {**base_env, **(env or {})}
 
         params = StdioServerParameters(
             command=command,
