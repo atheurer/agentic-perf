@@ -407,6 +407,24 @@ class EvaluateAgent(AgentBase):
                     f"{notes}"
                 )
 
+        # Code-enforce fleet convergence: the LLM cannot
+        # declare convergence while the fleet is incomplete.
+        # Fleet exhaustion is determined by the resource
+        # provider, not by LLM confidence.
+        if decision == "converged" and det and "FLEET_NOT_COMPLETE" in det:
+            decision = "loop_provision"
+            gate = "fleet_not_complete"
+            logger.info(
+                f"[{self.agent_name}] Overriding 'converged' "
+                f"— fleet not exhausted, looping to next host"
+            )
+            notes = (
+                f"Fleet override: LLM declared converged "
+                f"at confidence {confidence} but fleet is "
+                f"not exhausted. Moving to next host. "
+                f"Original: {notes}"
+            )
+
         # Determine which plan steps this evaluation covers
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
