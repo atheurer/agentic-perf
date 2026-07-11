@@ -549,9 +549,7 @@ def cmd_cleanup(args):
         scope_label = "all deployments"
     else:
         instance_name = get_instance_name()
-        filters.append(
-            {"Name": "tag:agentic-perf-instance", "Values": [instance_name]}
-        )
+        filters.append({"Name": "tag:agentic-perf-instance", "Values": [instance_name]})
         scope_label = f"instance '{instance_name}'"
 
     response = ec2.describe_instances(Filters=filters)

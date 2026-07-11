@@ -129,7 +129,7 @@ def get_usage(ticket_id: str, request: Request):
             ba["output_tokens"] += out_tok
             ba["cache_read_input_tokens"] += cr
             ba["cache_creation_input_tokens"] += cc
-            ba["total_tokens"] += in_tok + out_tok
+            ba["total_tokens"] += in_tok + out_tok + cr + cc
             ba["llm_calls"] += 1
             ba["total_duration_ms"] += dur
             if model:
@@ -140,7 +140,7 @@ def get_usage(ticket_id: str, request: Request):
         "output_tokens": total_out,
         "cache_read_input_tokens": total_cache_read,
         "cache_creation_input_tokens": total_cache_create,
-        "total_tokens": total_in + total_out,
+        "total_tokens": total_in + total_out + total_cache_read + total_cache_create,
         "llm_calls": llm_calls,
         "total_duration_ms": total_duration,
         "models_used": sorted(models_seen),
@@ -199,7 +199,7 @@ def _compute_ticket_usage(
         "output_tokens": total_out,
         "cache_read_input_tokens": total_cache_read,
         "cache_creation_input_tokens": total_cache_create,
-        "total_tokens": total_in + total_out,
+        "total_tokens": total_in + total_out + total_cache_read + total_cache_create,
         "llm_calls": llm_calls,
         "models_used": sorted(models_seen),
     }
