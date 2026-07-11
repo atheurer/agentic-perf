@@ -853,6 +853,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "none",
+                "controller_only_install": True,
                 "install_target_path": "",
                 "verify_command": "podman --version",
                 "prerequisites": ["podman"],

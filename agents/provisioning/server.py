@@ -96,6 +96,36 @@ async def _gather_for_hosts(
     return results
 
 
+def _filter_controller_only(
+    hosts: list[str],
+    controller_host: str,
+    provisioning: dict,
+    harness_name: str = "",
+) -> tuple[list[str], dict[str, dict]]:
+    """Filter hosts when controller_only_install is set.
+
+    Returns (filtered_hosts, skipped_results).  Skipped hosts get a
+    ``status: skipped`` entry so the caller can merge them into the
+    final result dict.
+    """
+    if not provisioning.get("controller_only_install", True) or not controller_host:
+        return hosts, {}
+
+    filtered = [h for h in hosts if h == controller_host]
+    skipped: dict[str, dict] = {}
+    for h in hosts:
+        if h != controller_host:
+            skipped[h] = {
+                "host": h,
+                "harness": harness_name,
+                "status": "skipped",
+                "message": (
+                    "controller_only_install: harness only installed on controller"
+                ),
+            }
+    return filtered, skipped
+
+
 # ---------------------------------------------------------------------------
 # Helper functions — single-host logic
 # ---------------------------------------------------------------------------
@@ -1065,14 +1095,18 @@ async def install_harness(
     harness_name: str,
     user: str = "root",
     branch: str = "",
+    controller_host: str = "",
 ) -> str:
     """Install the benchmark harness on multiple hosts. Uses private skill config to determine the install method. Validates and deploys required secrets from the install_contract before running the installer."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
     constraints = private_config.get("constraints", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _install_harness_one,
         harness_name,
         private_config,
@@ -1080,6 +1114,7 @@ async def install_harness(
         constraints,
         branch,
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 
@@ -1089,18 +1124,23 @@ async def verify_harness_install(
     harness_name: str,
     user: str = "root",
     install_path: str = "",
+    controller_host: str = "",
 ) -> str:
     """Verify that the benchmark harness is correctly installed and functional on multiple hosts."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _verify_harness_install_one,
         harness_name,
         provisioning,
         install_path,
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 
@@ -1110,18 +1150,23 @@ async def check_existing_install(
     harness_name: str,
     install_path: str = "",
     user: str = "root",
+    controller_host: str = "",
 ) -> str:
     """Check if the benchmark harness is already installed on multiple hosts. Returns whether an installation exists and its version info per host."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _check_existing_install_one,
         harness_name,
         provisioning,
         install_path,
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 
@@ -1131,18 +1176,23 @@ async def update_install(
     harness_name: str,
     install_path: str = "",
     user: str = "root",
+    controller_host: str = "",
 ) -> str:
     """Update an existing benchmark harness installation on multiple hosts."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _update_install_one,
         harness_name,
         provisioning,
         install_path,
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 
@@ -1151,18 +1201,23 @@ async def uninstall_harness(
     hosts: list[str],
     harness_name: str,
     user: str = "root",
+    controller_host: str = "",
 ) -> str:
     """Remove an existing benchmark harness installation from multiple hosts. Must be called BEFORE install_harness when reinstalling."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _cleanup_harness_one,
         harness_name,
         provisioning.get("install_target_path"),
         provisioning.get("pre_uninstall_commands"),
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 
@@ -1199,14 +1254,18 @@ async def ensure_harness_installed(
     user: str = "root",
     branch: str = "",
     install_path: str = "",
+    controller_host: str = "",
 ) -> str:
     """Check if harness is installed on each host, install where missing, and verify all installations. Combines check_existing_install + install_harness + verify_harness_install into one batched call. Returns per-host status: already_installed, success, or failure details."""
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     provisioning = private_config.get("provisioning", {})
     constraints = private_config.get("constraints", {})
+    filtered, skipped = _filter_controller_only(
+        hosts, controller_host, provisioning, harness_name
+    )
     results = await _gather_for_hosts(
-        hosts,
+        filtered,
         _ensure_harness_one,
         harness_name,
         private_config,
@@ -1215,6 +1274,7 @@ async def ensure_harness_installed(
         branch,
         install_path,
     )
+    results.update(skipped)
     return json.dumps(_summarize(results))
 
 

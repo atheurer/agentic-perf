@@ -75,6 +75,34 @@ async def _gather_for_hosts(
     return results
 
 
+def _filter_controller_only(
+    hosts: list[str],
+    controller_host: str,
+    provisioning: dict,
+    harness_name: str = "",
+) -> tuple[list[str], dict[str, dict]]:
+    """Filter hosts when controller_only_install is set.
+
+    Returns (filtered_hosts, skipped_results).
+    """
+    if not provisioning.get("controller_only_install", True) or not controller_host:
+        return hosts, {}
+
+    filtered = [h for h in hosts if h == controller_host]
+    skipped: dict[str, dict] = {}
+    for h in hosts:
+        if h != controller_host:
+            skipped[h] = {
+                "host": h,
+                "harness": harness_name,
+                "status": "skipped",
+                "message": (
+                    "controller_only_install: harness only installed on controller"
+                ),
+            }
+    return filtered, skipped
+
+
 async def validate_platform_contract(
     ssh: SSHExecutor,
     host: str,
@@ -386,6 +414,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Specific git branch or release tag.",
                     },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets the harness."
+                        ),
+                    },
                 },
                 "required": ["hosts", "harness_name"],
             },
@@ -416,6 +451,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "install_path": {
                         "type": "string",
                         "description": "Install path override",
+                    },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets verified."
+                        ),
                     },
                 },
                 "required": ["hosts", "harness_name"],
@@ -448,6 +490,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets checked."
+                        ),
+                    },
                 },
                 "required": ["hosts", "harness_name"],
             },
@@ -478,6 +527,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "SSH user (default: root)",
                     },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets updated."
+                        ),
+                    },
                 },
                 "required": ["hosts", "harness_name"],
             },
@@ -503,6 +559,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "user": {
                         "type": "string",
                         "description": "SSH user (default: root)",
+                    },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets uninstalled."
+                        ),
                     },
                 },
                 "required": ["hosts", "harness_name"],
@@ -643,6 +706,13 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "install_path": {
                         "type": "string",
                         "description": "Install path override",
+                    },
+                    "controller_host": {
+                        "type": "string",
+                        "description": (
+                            "The controller IP — when controller_only_install "
+                            "is true, only this host gets the harness."
+                        ),
                     },
                 },
                 "required": ["hosts", "harness_name"],
@@ -1257,16 +1327,21 @@ def create_provisioning_tool_handlers(
         harness_name: str,
         install_path: str = "",
         user: str = "root",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results = await _gather_for_hosts(
-            hosts,
+            filtered,
             _check_existing_install_one,
             harness_name,
             provisioning,
             install_path,
         )
+        results.update(skipped)
         return _summarize(results)
 
     async def update_install(
@@ -1274,25 +1349,34 @@ def create_provisioning_tool_handlers(
         harness_name: str,
         install_path: str = "",
         user: str = "root",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results = await _gather_for_hosts(
-            hosts,
+            filtered,
             _update_install_one,
             harness_name,
             provisioning,
             install_path,
         )
+        results.update(skipped)
         return _summarize(results)
 
     async def uninstall_harness(
         hosts: list[str],
         harness_name: str,
         user: str = "root",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results: dict[str, dict] = {}
         coros = [
             cleanup_harness(
@@ -1302,14 +1386,15 @@ def create_provisioning_tool_handlers(
                 install_path=provisioning.get("install_target_path"),
                 pre_uninstall_commands=provisioning.get("pre_uninstall_commands"),
             )
-            for h in hosts
+            for h in filtered
         ]
         raw = await asyncio.gather(*coros, return_exceptions=True)
-        for host, result in zip(hosts, raw):
+        for host, result in zip(filtered, raw):
             if isinstance(result, Exception):
                 results[host] = {"status": "error", "message": str(result)}
             else:
                 results[host] = result
+        results.update(skipped)
         return _summarize(results)
 
     async def install_harness(
@@ -1317,12 +1402,16 @@ def create_provisioning_tool_handlers(
         harness_name: str,
         user: str = "root",
         branch: str = "",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
         constraints = private_config.get("constraints", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results = await _gather_for_hosts(
-            hosts,
+            filtered,
             _install_harness_one,
             harness_name,
             private_config,
@@ -1330,6 +1419,7 @@ def create_provisioning_tool_handlers(
             constraints,
             branch,
         )
+        results.update(skipped)
         return _summarize(results)
 
     async def install_k3s(hosts: list[str], user: str = "root") -> dict:
@@ -1341,16 +1431,21 @@ def create_provisioning_tool_handlers(
         harness_name: str,
         user: str = "root",
         install_path: str = "",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results = await _gather_for_hosts(
-            hosts,
+            filtered,
             _verify_harness_install_one,
             harness_name,
             provisioning,
             install_path,
         )
+        results.update(skipped)
         return _summarize(results)
 
     async def configure_host(targets: list[dict], user: str = "root") -> dict:
@@ -1373,12 +1468,16 @@ def create_provisioning_tool_handlers(
         user: str = "root",
         branch: str = "",
         install_path: str = "",
+        controller_host: str = "",
     ) -> dict:
         private_config = await skill_provider.get_all_private_config(harness_name)
         provisioning = private_config.get("provisioning", {})
         constraints = private_config.get("constraints", {})
+        filtered, skipped = _filter_controller_only(
+            hosts, controller_host, provisioning, harness_name
+        )
         results = await _gather_for_hosts(
-            hosts,
+            filtered,
             _ensure_harness_one,
             harness_name,
             private_config,
@@ -1387,6 +1486,7 @@ def create_provisioning_tool_handlers(
             branch,
             install_path,
         )
+        results.update(skipped)
         return _summarize(results)
 
     async def get_private_config(harness_name: str, key: str) -> Any:

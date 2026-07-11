@@ -281,6 +281,7 @@ class ForgeSkillProvider(SkillProvider):
         return {
             "provisioning": {
                 "install_method": "git_clone",
+                "controller_only_install": True,
                 "git_url": "https://github.com/openshift-psap/forge.git",
                 "install_target_path": "/opt/forge",
                 "post_install_commands": [
