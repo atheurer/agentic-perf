@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,7 @@ class EventBus:
         self._lock = threading.Lock()
         self._file_handles: dict[str, Any] = {}
         self._cumulative: dict[str, CumulativeUsage] = {}
+        self._last_event_time: dict[str, float] = {}
 
     def _next_seq(self, ticket_id: str) -> int:
         """Return the next sequence number for a ticket.
@@ -160,9 +162,18 @@ class EventBus:
             seq = self._next_seq(ticket_id)
             event = Event(seq, ticket_id, agent, event_type, data)
             self._events.setdefault(ticket_id, []).append(event)
+            self._last_event_time[ticket_id] = time.time()
 
         self._write_to_file(ticket_id, event)
         return event
+
+    def last_event_time(self, ticket_id: str) -> float | None:
+        """Return the wall-clock time of the last event for a ticket.
+
+        Returns None if no events have been emitted for this ticket
+        in the current process.
+        """
+        return self._last_event_time.get(ticket_id)
 
     def record_llm_usage(
         self,

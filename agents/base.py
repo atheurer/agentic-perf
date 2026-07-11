@@ -14,6 +14,7 @@ from providers.events import EventBus
 from providers.llm.base import (
     LLMProvider,
     LLMResponse,
+    LLMTimeoutError,
     ToolCall,
     ToolDefinition,
     ToolResult,
@@ -35,6 +36,12 @@ class AgentBase(ABC):
     # or API calls. Configurable via config.json:
     #   { "tool_rate_limit": { "min_interval_sec": 2.0 } }
     DEFAULT_TOOL_MIN_INTERVAL = 1.0
+
+    # Number of automatic retries on LLM timeout before
+    # escalating to awaiting_customer_guidance. Handles
+    # transient API or network issues without requiring
+    # human intervention.
+    LLM_TIMEOUT_RETRIES = 2
 
     def __init__(
         self,
@@ -158,6 +165,74 @@ class AgentBase(ABC):
                         messages=messages,
                         tools=(self.tools if self.tools else None),
                     )
+                except LLMTimeoutError as e:
+                    if tok is not None:
+                        context.detach(tok)
+                        tok = None
+                    retries = getattr(self, "_llm_timeout_retries", 0)
+                    self._llm_timeout_retries = retries + 1
+                    if retries < self.LLM_TIMEOUT_RETRIES:
+                        logger.warning(
+                            f"[{self.agent_name}] LLM timeout"
+                            f" on {ticket_id} (attempt"
+                            f" {retries + 1}/"
+                            f"{self.LLM_TIMEOUT_RETRIES}):"
+                            f" {e} — retrying"
+                        )
+                        self._emit(
+                            ticket_id,
+                            "agent_error",
+                            {
+                                "reason": "llm_timeout",
+                                "timeout_seconds": e.timeout,
+                                "provider": e.provider,
+                                "retry": retries + 1,
+                                "max_retries": (self.LLM_TIMEOUT_RETRIES),
+                            },
+                        )
+                        # Brief backoff before retry.
+                        await asyncio.sleep(2**retries)
+                        continue
+                    logger.error(
+                        f"[{self.agent_name}] LLM timeout"
+                        f" on {ticket_id} after"
+                        f" {self.LLM_TIMEOUT_RETRIES}"
+                        f" retries: {e}"
+                    )
+                    self._emit(
+                        ticket_id,
+                        "agent_error",
+                        {
+                            "reason": "llm_timeout",
+                            "timeout_seconds": e.timeout,
+                            "provider": e.provider,
+                            "retries_exhausted": True,
+                        },
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Agent {self.agent_name} LLM call"
+                        f" timed out** after {e.timeout}s"
+                        f" ({e.provider})."
+                        f" {self.LLM_TIMEOUT_RETRIES}"
+                        f" automatic retries were"
+                        f" attempted. This may indicate"
+                        f" sustained API overload or a"
+                        f" network issue. You can retry"
+                        f" by replying here.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=(
+                            f"{self.agent_name} LLM call"
+                            f" timed out after"
+                            f" {self.LLM_TIMEOUT_RETRIES}"
+                            f" retries — pausing for"
+                            f" guidance"
+                        ),
+                    )
+                    break
                 finally:
                     if tok is not None:
                         context.detach(tok)

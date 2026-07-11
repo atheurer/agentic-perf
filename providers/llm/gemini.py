@@ -10,13 +10,20 @@ on the way out. No changes to AgentBase or agent code required.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
 from typing import Any
 
-from .base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
+from .base import (
+    LLMProvider,
+    LLMResponse,
+    LLMTimeoutError,
+    ToolCall,
+    ToolDefinition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +121,7 @@ class GeminiLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
         max_tokens: int = 4096,
+        timeout: float | None = None,
     ) -> LLMResponse:
         from google.genai import types
 
@@ -129,11 +137,25 @@ class GeminiLLMProvider(LLMProvider):
                 types.AutomaticFunctionCallingConfig(disable=True)
             )
 
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=types.GenerateContentConfig(**config_kwargs),
-        )
+        effective_timeout = self._resolve_timeout(timeout)
+        if effective_timeout == 0:
+            response = await self._client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return self._parse_response(response, tool_call_names)
+        try:
+            response = await asyncio.wait_for(
+                self._client.aio.models.generate_content(
+                    model=self._model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs),
+                ),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise LLMTimeoutError(effective_timeout, f"gemini/{self._model}") from None
         return self._parse_response(response, tool_call_names)
 
     @staticmethod

@@ -108,6 +108,34 @@ class OrchestratorConfig:
         budget_cfg = cfg.get("llm_budget", {})
         self.budget_session_cost_usd: float = budget_cfg.get("session_cost_usd", 0.0)
 
+        # LLM request timeout (seconds). Applied to each
+        # individual LLM API call. 0 disables the timeout.
+        self.llm_timeout: float = _env_or_cfg(
+            "LLM_TIMEOUT",
+            llm_cfg,
+            "timeout",
+            120.0,
+        )
+
+        # Maximum wall-clock time (seconds) for an entire
+        # agent task. 0 disables. Catches agents stuck in
+        # tool loops or waiting on unresponsive services.
+        self.agent_task_timeout: float = _env_or_cfg(
+            "AGENT_TASK_TIMEOUT",
+            cfg,
+            "agent_task_timeout",
+            0,
+        )
+
+        # Stale-task watchdog: cancel active tasks with no
+        # events for this many seconds. 0 disables.
+        self.stale_task_timeout: float = _env_or_cfg(
+            "STALE_TASK_TIMEOUT",
+            cfg,
+            "stale_task_timeout",
+            900.0,
+        )
+
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 
@@ -118,6 +146,26 @@ class OrchestratorConfig:
         if "default" in self._agent_models:
             return dict(self._agent_models["default"])
         return {"provider": self.llm_provider, "model": self.llm_model}
+
+
+def _env_or_cfg(
+    env_key: str,
+    cfg: dict,
+    cfg_key: str,
+    default: float,
+) -> float:
+    """Resolve a float config value from env var or config dict.
+
+    Uses explicit None checks instead of ``or`` so that
+    legitimate zero values are not treated as missing.
+    """
+    env_val = os.environ.get(env_key)
+    if env_val is not None:
+        return float(env_val)
+    cfg_val = cfg.get(cfg_key)
+    if cfg_val is not None:
+        return float(cfg_val)
+    return float(default)
 
 
 def _env_float(key: str) -> float | None:

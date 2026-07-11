@@ -15,7 +15,13 @@ import json
 import logging
 from typing import Any
 
-from .base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
+from .base import (
+    LLMProvider,
+    LLMResponse,
+    LLMTimeoutError,
+    ToolCall,
+    ToolDefinition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,7 @@ class OpenAICompatLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
         max_tokens: int = 4096,
+        timeout: float | None = None,
     ) -> LLMResponse:
         oai_messages = self._convert_messages(system_prompt, messages)
 
@@ -60,9 +67,19 @@ class OpenAICompatLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
 
-        response = await asyncio.to_thread(
-            self._client.chat.completions.create, **kwargs
-        )
+        effective_timeout = self._resolve_timeout(timeout)
+        if effective_timeout == 0:
+            response = await asyncio.to_thread(
+                self._client.chat.completions.create, **kwargs
+            )
+            return self._parse_response(response)
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self._client.chat.completions.create, **kwargs),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise LLMTimeoutError(effective_timeout, f"openai/{self._model}") from None
         return self._parse_response(response)
 
     @staticmethod

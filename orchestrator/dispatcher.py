@@ -117,6 +117,14 @@ class Dispatcher:
                 return True
         return False
 
+    def active_tasks(self) -> dict[str, asyncio.Task]:
+        """Return a snapshot of ticket_id → Task for non-done tasks."""
+        # Clean up finished tasks while iterating.
+        done = [tid for tid, task in self._tasks.items() if task.done()]
+        for tid in done:
+            self._tasks.pop(tid, None)
+        return dict(self._tasks)
+
     def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
         self._agents.pop(ticket_id, None)

@@ -127,6 +127,7 @@ class MockLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
         max_tokens: int = 4096,
+        timeout: float | None = None,
     ) -> LLMResponse:
         if self._responses:
             resp = self._responses[min(self._call_count, len(self._responses) - 1)]

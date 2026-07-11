@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 from paths import LOCK_FILE
 from providers.events import EventBus
@@ -50,11 +51,13 @@ def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: st
 def _make_llm_factory(config: OrchestratorConfig):
     def factory(agent_type: str):
         agent_cfg = config.get_agent_llm_config(agent_type)
-        return _make_llm_provider(
+        provider = _make_llm_provider(
             config,
             provider=agent_cfg.get("provider", ""),
             model=agent_cfg.get("model", ""),
         )
+        provider.default_timeout = config.llm_timeout
+        return provider
 
     return factory
 
@@ -300,6 +303,7 @@ async def run_agent_task(
     status: str,
     ticket_id: str,
     config: OrchestratorConfig | None = None,
+    agent_task_timeout: float = 0,
 ):
     agent = None
     try:
@@ -349,7 +353,34 @@ async def run_agent_task(
         except Exception:
             pass  # proceed with default iterations
 
-        await agent.run(ticket_id)
+        if agent_task_timeout > 0:
+            try:
+                await asyncio.wait_for(
+                    agent.run(ticket_id),
+                    timeout=agent_task_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
+                )
+                if dispatcher.events:
+                    dispatcher.events.emit(
+                        ticket_id,
+                        "orchestrator",
+                        "agent_error",
+                        {
+                            "reason": "agent_task_timeout",
+                            "timeout_seconds": agent_task_timeout,
+                        },
+                    )
+                await _transition_to_guidance(
+                    dispatcher.store_url,
+                    ticket_id,
+                    f"Agent task timed out after {agent_task_timeout}s",
+                    event_bus=dispatcher.events,
+                )
+        else:
+            await agent.run(ticket_id)
 
         if config:
             try:
@@ -415,6 +446,93 @@ async def run_agent_task(
                 await agent.close()
             except Exception:
                 pass
+
+
+async def _transition_to_guidance(
+    store_url: str,
+    ticket_id: str,
+    comment: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Transition a ticket to awaiting_customer_guidance.
+
+    Used by orchestrator-level error handlers (stale watchdog,
+    task timeout) that operate outside an agent context.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": "awaiting_customer_guidance",
+                    "comment": comment,
+                },
+            )
+    except Exception:
+        logger.exception(
+            f"Failed to transition {ticket_id} to awaiting_customer_guidance"
+        )
+        return
+    if event_bus:
+        event_bus.emit(
+            ticket_id,
+            "orchestrator",
+            "transition",
+            {
+                "to": "awaiting_customer_guidance",
+                "comment": comment,
+                "ticket_id": ticket_id,
+            },
+        )
+
+
+async def _check_stale_tasks(
+    dispatcher: Dispatcher,
+    event_bus: EventBus,
+    stale_timeout: float,
+    store_url: str,
+) -> None:
+    """Cancel agent tasks with no events for too long.
+
+    Detects agents stuck on unresponsive LLM calls, hung SSH
+    connections, or infinite loops that don't emit events.
+    Uses the event bus timestamp of the last event for each
+    ticket to determine staleness.
+    """
+    now = time.time()
+    for tid, task in dispatcher.active_tasks().items():
+        last_event_time = event_bus.last_event_time(tid)
+        if last_event_time is None:
+            continue
+        idle_seconds = now - last_event_time
+        if idle_seconds > stale_timeout:
+            logger.warning(
+                f"Stale task detected for {tid}:"
+                f" no events for {idle_seconds:.0f}s"
+                f" (threshold: {stale_timeout:.0f}s)"
+                f" — cancelling task"
+            )
+            event_bus.emit(
+                tid,
+                "orchestrator",
+                "agent_error",
+                {
+                    "reason": "stale_task_cancelled",
+                    "idle_seconds": round(idle_seconds),
+                    "threshold_seconds": round(stale_timeout),
+                },
+            )
+            await _transition_to_guidance(
+                store_url,
+                tid,
+                f"Agent task cancelled: no activity for"
+                f" {round(idle_seconds)}s (threshold:"
+                f" {round(stale_timeout)}s)",
+                event_bus=event_bus,
+            )
+            task.cancel()
 
 
 async def _block_absent_suite(
@@ -569,6 +687,7 @@ async def _process_stop_requests(
 
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = _make_llm_provider(config)
+    llm.default_timeout = config.llm_timeout
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()
@@ -713,11 +832,27 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 dispatcher.mark_dispatched(tid, status)
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
                 task = asyncio.create_task(
-                    run_agent_task(dispatcher, status, tid, config=config)
+                    run_agent_task(
+                        dispatcher,
+                        status,
+                        tid,
+                        config=config,
+                        agent_task_timeout=config.agent_task_timeout,
+                    )
                 )
                 dispatcher.set_task(tid, task)
 
         await _process_stop_requests(dispatcher, config.state_store_url)
+
+        # Stale-task watchdog: cancel tasks with no events
+        # for longer than the configured threshold.
+        if config.stale_task_timeout > 0 and events is not None:
+            await _check_stale_tasks(
+                dispatcher,
+                events,
+                config.stale_task_timeout,
+                store_url=config.state_store_url,
+            )
 
         await asyncio.sleep(config.poll_interval)
 

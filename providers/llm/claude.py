@@ -6,7 +6,13 @@ from typing import Any
 
 import anthropic
 
-from .base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
+from .base import (
+    LLMProvider,
+    LLMResponse,
+    LLMTimeoutError,
+    ToolCall,
+    ToolDefinition,
+)
 
 
 class ClaudeLLMProvider(LLMProvider):
@@ -101,15 +107,29 @@ class ClaudeLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
         max_tokens: int = 4096,
+        timeout: float | None = None,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_tokens,
             "system": system_prompt,
             "messages": messages,
+            "cache_control": {"type": "ephemeral"},
         }
         if tools:
             kwargs["tools"] = [self._tool_def_to_dict(t) for t in tools]
 
-        response = await asyncio.to_thread(self._client.messages.create, **kwargs)
+        effective_timeout = self._resolve_timeout(timeout)
+        if effective_timeout == 0:
+            # Explicit 0 disables timeout.
+            response = await asyncio.to_thread(self._client.messages.create, **kwargs)
+            return self._parse_response(response)
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self._client.messages.create, **kwargs),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise LLMTimeoutError(effective_timeout, f"claude/{self._model}") from None
+
         return self._parse_response(response)
