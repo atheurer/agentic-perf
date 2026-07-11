@@ -1209,7 +1209,7 @@ function fmtCost(usd) {
 
 function fmtCachePct(usage) {
   var cached = (usage.cache_read_input_tokens || 0);
-  var total = (usage.input_tokens || 0);
+  var total = (usage.input_tokens || 0) + cached + (usage.cache_creation_input_tokens || 0);
   if (!total || !cached) return '';
   var pct = Math.round((cached / total) * 100);
   return pct + '% cached';
@@ -1233,15 +1233,15 @@ async function refreshHealth() {
     if (usage && usage.global && usage.global.total_tokens > 0) {
       var g = usage.global;
       var gCachePct = '';
-      var gCacheRead = 0, gCacheIn = 0;
+      var gCacheRead = 0, gTotalIn = 0;
       var bt = usage.by_ticket || {};
       for (var tid in bt) {
         gCacheRead += bt[tid].cache_read_input_tokens || 0;
-        gCacheIn += bt[tid].input_tokens || 0;
+        gTotalIn += (bt[tid].input_tokens || 0) + (bt[tid].cache_read_input_tokens || 0) + (bt[tid].cache_creation_input_tokens || 0);
       }
-      if (gCacheIn > 0 && gCacheRead > 0) {
+      if (gTotalIn > 0 && gCacheRead > 0) {
         gCachePct = ' <span style="color:var(--text-muted); font-size:11px">(' +
-          Math.round((gCacheRead / gCacheIn) * 100) + '% cached)</span>';
+          Math.round((gCacheRead / gTotalIn) * 100) + '% cached)</span>';
       }
       html +=
         '<span>Tokens: <span class="stat-val" style="color:var(--cyan)">' +
@@ -1679,7 +1679,7 @@ async function updateUsageSidebar(ticketId) {
         (uCachePct ? '<span style="color:var(--text-muted); font-size:11px; margin-left:6px">(' + uCachePct + ')</span>' : '') +
       '</div>' +
       '<div style="margin-bottom:4px; font-size:11px; font-family:var(--font-mono)">' +
-        u.input_tokens.toLocaleString() + ' in / ' +
+        ((u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)).toLocaleString() + ' in / ' +
         u.output_tokens.toLocaleString() + ' out' +
       '</div>' +
       '<div style="margin-bottom:4px">' +
@@ -1718,16 +1718,14 @@ async function updateUsageSidebar(ticketId) {
             '<span class="agent-cost-val">' + fmtCost(acost) + '</span>' +
           '</div>' +
           '<div class="agent-cost-detail">' +
+            ((au.models_used && au.models_used.length > 0) ?
+              au.models_used.join(', ') + ': ' : '') +
             au.total_tokens.toLocaleString() + 't' +
             (agentCache ? ' (' + agentCache + ')' : '') +
             ' &middot; ' +
             au.llm_calls + ' calls &middot; ' +
             (au.total_duration_ms / 1000).toFixed(1) + 's' +
-          '</div>' +
-          ((au.models_used && au.models_used.length > 0) ?
-            '<div style="font-size:9px; color:var(--text-muted); margin-left:4px; margin-bottom:4px">' +
-              au.models_used.join(', ') +
-            '</div>' : '');
+          '</div>';
       }
       agentHtml += '</div>';
       el.innerHTML += agentHtml;
