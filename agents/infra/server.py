@@ -488,6 +488,9 @@ async def execute_command(
     """
     ssh = _get_ssh()
 
+    # LLMs sometimes emit HTML entities in tool arguments (&amp; for &,
+    # &quot; for ", etc.). Decode before policy check so the policy sees
+    # and validates exactly what will be executed.
     command = html.unescape(command)
 
     stripped = command.rstrip()

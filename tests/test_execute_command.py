@@ -267,6 +267,86 @@ async def test_check_background_command_not_running():
         assert data["running"] is False
 
 
+class TestEntityEncodedSmuggling:
+    """Verify that HTML-entity-encoded shell operators are caught by the policy
+    after html.unescape decodes them."""
+
+    @pytest.mark.asyncio
+    async def test_entity_semicolon_blocked(self):
+        """&#59; decodes to ; — second command must be policy-checked."""
+        import agents.infra.server as infra
+        from agents.infra.command_policy import CommandPolicy
+
+        old_policy = infra._policy
+        old_ssh = infra._ssh
+        try:
+            infra._policy = CommandPolicy(
+                agent_name="test",
+                allowed_binaries={"echo"},
+            )
+            infra._ssh = AsyncMock()
+
+            result = await infra.execute_command(
+                "10.0.0.1",
+                "echo hi&#59; useradd attacker",
+            )
+            data = json.loads(result)
+            assert data["blocked"] is True
+        finally:
+            infra._policy = old_policy
+            infra._ssh = old_ssh
+
+    @pytest.mark.asyncio
+    async def test_entity_pipe_blocked(self):
+        """&#124; decodes to | — piped command must be policy-checked."""
+        import agents.infra.server as infra
+        from agents.infra.command_policy import CommandPolicy
+
+        old_policy = infra._policy
+        old_ssh = infra._ssh
+        try:
+            infra._policy = CommandPolicy(
+                agent_name="test",
+                allowed_binaries={"echo"},
+            )
+            infra._ssh = AsyncMock()
+
+            result = await infra.execute_command(
+                "10.0.0.1",
+                "echo hi &#124; useradd attacker",
+            )
+            data = json.loads(result)
+            assert data["blocked"] is True
+        finally:
+            infra._policy = old_policy
+            infra._ssh = old_ssh
+
+    @pytest.mark.asyncio
+    async def test_entity_amp_reboot_blocked(self):
+        """&amp;&amp; decodes to && — chained reboot must be caught."""
+        import agents.infra.server as infra
+        from agents.infra.command_policy import CommandPolicy
+
+        old_policy = infra._policy
+        old_ssh = infra._ssh
+        try:
+            infra._policy = CommandPolicy(
+                agent_name="test",
+                allowed_binaries={"echo"},
+            )
+            infra._ssh = AsyncMock()
+
+            result = await infra.execute_command(
+                "10.0.0.1",
+                "echo ok &amp;&amp; reboot",
+            )
+            data = json.loads(result)
+            assert data["blocked"] is True
+        finally:
+            infra._policy = old_policy
+            infra._ssh = old_ssh
+
+
 class TestNcInBenchmarkPolicy:
     """Verify nc and ncat are in the benchmark agent's command policy."""
 
