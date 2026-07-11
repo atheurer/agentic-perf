@@ -148,7 +148,11 @@ def get_benchmark_tools(
             ),
             ToolDefinition(
                 name="get_run_logs",
-                description="Retrieve logs from a benchmark run on the controller.",
+                description=(
+                    "Retrieve logs from a benchmark run on the controller. "
+                    "Use this to diagnose failures — especially when "
+                    "execute_benchmark reports a missing result-summary."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -167,6 +171,13 @@ def get_benchmark_tools(
                         "results_dir_pattern": {
                             "type": "string",
                             "description": "Pattern for finding results (from execution config)",
+                        },
+                        "max_kb": {
+                            "type": "integer",
+                            "description": (
+                                "Maximum log size in KB to return (default 50, max 200). "
+                                "Use a larger value when diagnosing failures."
+                            ),
                         },
                     },
                     "required": ["controller", "run_id"],
@@ -1357,6 +1368,22 @@ def create_benchmark_tool_handlers(
                     response["result_summary"] = json.loads(summary_result.stdout)
                 except json.JSONDecodeError:
                     pass
+            if "result_summary" not in response:
+                response["status"] = "failed"
+                response["message"] = (
+                    "Crucible exited with code 0 but result-summary.json "
+                    "is missing — the run did not produce results. "
+                    "Read the run logs with get_run_logs to diagnose."
+                )
+                log_result = await ssh.run(
+                    controller,
+                    f"test -f {run_dir}/crucible.log.xz"
+                    f" && xzcat {run_dir}/crucible.log.xz | tail -c 50000"
+                    f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c 50000",
+                    timeout=60,
+                )
+                if log_result.exit_code == 0 and log_result.stdout:
+                    response["run_log"] = log_result.stdout
         if result.exit_code != 0:
             response["output"] = result.stdout[-3000:] if result.stdout else ""
             response["error"] = result.stderr[-1000:] if result.stderr else ""
@@ -1367,7 +1394,10 @@ def create_benchmark_tool_handlers(
         run_id: str,
         harness: str | None = None,
         results_dir_pattern: str | None = None,
+        max_kb: int | None = None,
     ) -> dict:
+        byte_limit = min((max_kb or 50), 200) * 1024
+
         if run_id.startswith("/"):
             run_dir = run_id
         elif harness == "zathras":
@@ -1398,7 +1428,10 @@ def create_benchmark_tool_handlers(
         else:
             log_result = await ssh.run(
                 controller,
-                f"test -f {run_dir}/crucible.log.xz && xzcat {run_dir}/crucible.log.xz | tail -100 || cat {run_dir}/crucible.log 2>/dev/null | tail -100",
+                f"test -f {run_dir}/crucible.log.xz"
+                f" && xzcat {run_dir}/crucible.log.xz | tail -c {byte_limit}"
+                f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c {byte_limit}",
+                timeout=60,
             )
 
         return {

@@ -80,15 +80,26 @@ to construct a correct run file — getting the format right is critical.
    The controller validates the run-file during execution — if there are schema errors,
    they will appear in the execution output.
 
-8. **Submit result** — Call `submit_benchmark_result` with the outcome.
-   If the benchmark completed successfully (exit_code 0), submit with status "completed".
-   If it failed (non-zero exit code), you may retry once. If the retry also fails,
-   submit with status "failed" and include the error output.
+8. **Verify and submit result** — Check the `execute_benchmark` response carefully:
+   - If status is "completed" AND `result_summary` is present, submit with status "completed".
+   - If status is "failed" and the message mentions a missing `result-summary.json`,
+     the run did not produce usable results even though crucible exited cleanly.
+     The response includes a `run_log` field with the crucible log — read it to
+     understand what went wrong. Based on the log:
+     - If the failure is transient (network timeout, container pull error), retry once.
+     - If the failure indicates a configuration problem (bad parameters, missing
+       endpoints, schema errors), call `request_clarification` to escalate.
+     - If you cannot determine the cause, call `request_clarification` with the
+       relevant log excerpt so the user can investigate.
+   - If status is "failed" with a non-zero exit code, you may also call
+     `get_run_logs(controller, run_id, max_kb=100)` for more context before
+     deciding to retry or escalate.
+   - **Never submit status "completed" unless the result_summary is present.**
 
    **IMPORTANT: Your job ends here.** Do NOT analyze results, query metrics,
    check OpenSearch, or do any post-benchmark investigation. Result analysis
-   is the review agent's responsibility. After execute_benchmark returns,
-   call submit_benchmark_result immediately — do not run additional commands.
+   is the review agent's responsibility. After verifying and submitting,
+   do not run additional commands.
 
 ### Common pitfalls:
 - Use IP addresses, never hostnames (IPv6 link-local causes timeouts)

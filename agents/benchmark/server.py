@@ -1376,6 +1376,22 @@ async def execute_benchmark(
                 response["result_summary"] = json.loads(summary_result.stdout)
             except json.JSONDecodeError:
                 pass
+        if "result_summary" not in response:
+            response["status"] = "failed"
+            response["message"] = (
+                "Crucible exited with code 0 but result-summary.json "
+                "is missing — the run did not produce results. "
+                "Read the run logs with get_run_logs to diagnose."
+            )
+            log_result = await _ssh.run(
+                controller,
+                f"test -f {run_dir}/crucible.log.xz"
+                f" && xzcat {run_dir}/crucible.log.xz | tail -c 50000"
+                f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c 50000",
+                timeout=60,
+            )
+            if log_result.exit_code == 0 and log_result.stdout:
+                response["run_log"] = log_result.stdout
     if result.exit_code != 0:
         response["output"] = result.stdout[-3000:] if result.stdout else ""
         response["error"] = result.stderr[-1000:] if result.stderr else ""
@@ -1388,9 +1404,12 @@ async def get_run_logs(
     run_id: str,
     harness: str | None = None,
     results_dir_pattern: str | None = None,
+    max_kb: int = 50,
 ) -> str:
-    """Retrieve logs from a benchmark run on the controller."""
+    """Retrieve logs from a benchmark run on the controller. Use this to diagnose failures — especially when execute_benchmark reports a missing result-summary. max_kb controls how much log to return (default 50 KB, max 200 KB)."""
     await _ensure_init()
+
+    byte_limit = min(max_kb, 200) * 1024
 
     if run_id.startswith("/"):
         run_dir = run_id
@@ -1421,7 +1440,10 @@ async def get_run_logs(
     else:
         log_result = await _ssh.run(
             controller,
-            f"test -f {run_dir}/crucible.log.xz && xzcat {run_dir}/crucible.log.xz | tail -100 || cat {run_dir}/crucible.log 2>/dev/null | tail -100",
+            f"test -f {run_dir}/crucible.log.xz"
+            f" && xzcat {run_dir}/crucible.log.xz | tail -c {byte_limit}"
+            f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c {byte_limit}",
+            timeout=60,
         )
 
     return json.dumps(
