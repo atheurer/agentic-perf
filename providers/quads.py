@@ -30,14 +30,20 @@ class QuadsClient:
         owner: str,
         ssh_key_path: str,
         default_root_password: str,
+        api_scheme: str = "https",
     ) -> None:
         self.api_host = api_host
+        self._base_url = f"{api_scheme}://{api_host}"
         self.email = email
         self.password = password
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
         self._client = httpx.AsyncClient(timeout=30.0)
+        if api_scheme == "http":
+            logger.warning(
+                "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
+            )
 
     @classmethod
     async def from_secrets(cls, secrets_provider) -> QuadsClient:
@@ -63,6 +69,7 @@ class QuadsClient:
             owner=config["owner"],
             ssh_key_path=config["ssh_key_path"],
             default_root_password=config["default_root_password"],
+            api_scheme=config.get("api_scheme", "https"),
         )
 
     async def close(self) -> None:
@@ -70,7 +77,7 @@ class QuadsClient:
 
     async def _login(self) -> str:
         r = await self._client.post(
-            f"http://{self.api_host}/api/v3/login/",
+            f"{self._base_url}/api/v3/login/",
             auth=(self.email, self.password),
             headers={"Content-Type": "application/json"},
         )
@@ -86,7 +93,7 @@ class QuadsClient:
         headers.setdefault("Content-Type", "application/json")
         r = await self._client.request(
             method,
-            f"http://{self.api_host}{path}",
+            f"{self._base_url}{path}",
             headers=headers,
             **kwargs,
         )
@@ -111,7 +118,7 @@ class QuadsClient:
 
         end = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
         r = await self._client.get(
-            f"http://{self.api_host}/api/v3/available",
+            f"{self._base_url}/api/v3/available",
             params={
                 "can_self_schedule": "true",
                 "end": end.strftime("%Y-%m-%dT%H:%M"),
@@ -127,7 +134,7 @@ class QuadsClient:
         for hostname in hostnames:
             try:
                 detail_r = await self._client.get(
-                    f"http://{self.api_host}/api/v3/hosts/{hostname}"
+                    f"{self._base_url}/api/v3/hosts/{hostname}"
                 )
                 detail_r.raise_for_status()
                 details = detail_r.json()
@@ -235,7 +242,7 @@ class QuadsClient:
 
     async def get_assignment_status(self, assignment_id: int) -> dict[str, Any]:
         r = await self._client.get(
-            f"http://{self.api_host}/api/v3/assignments/{assignment_id}"
+            f"{self._base_url}/api/v3/assignments/{assignment_id}"
         )
         r.raise_for_status()
         data = r.json()
