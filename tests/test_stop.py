@@ -34,7 +34,9 @@ def app(store):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers["Authorization"] = f"Bearer {app.state.api_token}"
+    return c
 
 
 @pytest.fixture

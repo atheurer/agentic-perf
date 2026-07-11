@@ -140,7 +140,12 @@ async def build_ssh_from_ticket(
     if not ticket_id:
         return SSHExecutor(user="root"), {}
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    headers = {}
+    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
         r = await client.get(f"{state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -191,7 +196,11 @@ async def tool_progress(
     author = f"{agent_name}/{tool_name}"
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        headers = {}
+        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             await client.post(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={"author": author, "body": message},

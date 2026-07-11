@@ -28,7 +28,15 @@ def show_disclaimer():
 
 def get_client(args) -> tuple[httpx.Client, str]:
     url = args.store_url.rstrip("/")
-    return httpx.Client(base_url=url, timeout=10.0), url
+    headers = {}
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if not token:
+        from state_store.auth import read_token_from_file
+
+        token = read_token_from_file()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return httpx.Client(base_url=url, timeout=10.0, headers=headers), url
 
 
 def cmd_submit(args):

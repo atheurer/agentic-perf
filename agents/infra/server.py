@@ -53,6 +53,13 @@ _APPROVAL_TIMEOUT = 300
 _background_pids: dict[str, dict[str, Any]] = {}
 
 
+def _store_headers() -> dict[str, str]:
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def _get_ssh() -> SSHExecutor:
     if _ssh is None:
         raise RuntimeError("SSH context not set. Call set_ssh_context() first.")
@@ -90,7 +97,7 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     import httpx
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, headers=_store_headers()) as client:
         r = await client.get(f"{_state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -315,7 +322,7 @@ async def _get_ticket_approvals() -> list[str]:
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=_store_headers()) as client:
             r = await client.get(f"{_state_store_url}/api/v1/tickets/{_ticket_id}")
             r.raise_for_status()
             fields = r.json().get("custom_fields", {})

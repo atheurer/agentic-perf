@@ -91,7 +91,7 @@ cmd_start() {
         echo "State store already running (PID $(cat "$STORE_PID_FILE"))."
     else
         echo "Starting state store on port $STORE_PORT..."
-        nohup python3 -m uvicorn state_store.main:app \
+        STORE_PORT="$STORE_PORT" nohup python3 -m uvicorn state_store.main:app \
             --host 0.0.0.0 --port "$STORE_PORT" \
             --log-level warning \
             > "$STORE_LOG" 2>&1 &

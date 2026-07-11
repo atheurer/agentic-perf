@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -59,7 +60,11 @@ class AgentBase(ABC):
         self.tools = tools or []
         self._tool_handlers = tool_handlers or {}
         self._mcp = None
-        self._client = httpx.AsyncClient(timeout=30.0)
+        headers = {}
+        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
         self._events = event_bus
         self._last_tool_call_time: float = 0.0
         self._tool_min_interval = self._load_tool_rate_limit()

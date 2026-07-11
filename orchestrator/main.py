@@ -192,7 +192,7 @@ def _advance_plan(
     """
     import httpx
 
-    client = httpx.Client(timeout=10.0)
+    client = httpx.Client(timeout=10.0, headers=_auth_headers())
     try:
         r = client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
@@ -322,7 +322,9 @@ async def run_agent_task(
         try:
             import httpx
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(
+                timeout=10.0, headers=_auth_headers()
+            ) as client:
                 r = await client.get(
                     f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
                 )
@@ -386,7 +388,9 @@ async def run_agent_task(
             try:
                 import httpx
 
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with httpx.AsyncClient(
+                    timeout=10.0, headers=_auth_headers()
+                ) as client:
                     await client.patch(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
                         json={
@@ -403,7 +407,9 @@ async def run_agent_task(
         try:
             import httpx
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(
+                timeout=10.0, headers=_auth_headers()
+            ) as client:
                 await client.patch(
                     f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={"fields": {"interrupted": True}},
@@ -462,7 +468,7 @@ async def _transition_to_guidance(
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={
@@ -542,7 +548,7 @@ async def _block_absent_suite(
 ) -> None:
     import httpx
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
         suite = ""
         try:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
@@ -601,7 +607,7 @@ async def _block_handoff_failed(
 
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
@@ -662,7 +668,7 @@ async def _process_stop_requests(
     try:
         import httpx
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
             r = await client.get(f"{store_url}/api/v1/tickets")
             if r.status_code != 200:
                 return
@@ -899,6 +905,26 @@ def _release_lock() -> None:
         pass
 
 
+def _setup_api_token() -> None:
+    """Read the state store API token and set it in the environment.
+
+    All httpx clients and child processes (agent MCP servers)
+    inherit the env var so they can authenticate automatically.
+    """
+    from state_store.auth import read_token_from_file
+
+    token = read_token_from_file()
+    if token:
+        os.environ["AGENTIC_PERF_API_TOKEN"] = token
+
+
+def _auth_headers() -> dict[str, str]:
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def main():
     # Ignore SIGPIPE so broken stderr (e.g., parent shell exited)
     # doesn't kill the orchestrator. Python's logging handles the
@@ -910,6 +936,7 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _acquire_lock()
+    _setup_api_token()
     config = OrchestratorConfig()
     try:
         asyncio.run(poll_loop(config))

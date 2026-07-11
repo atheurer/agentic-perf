@@ -955,6 +955,9 @@ th.col-right { text-align: right; }
 
 <script>
 const API = '/api/v1';
+const AUTH_HEADERS = window.API_TOKEN
+  ? { 'Authorization': 'Bearer ' + window.API_TOKEN }
+  : {};
 
 // AI Safety Disclaimer
 function dismissDisclaimer() {
@@ -992,7 +995,7 @@ async function stopTicket(ticketId, mode) {
   try {
     var r = await fetch(API + '/tickets/' + ticketId + '/stop', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: Object.assign({'Content-Type': 'application/json'}, AUTH_HEADERS),
       body: JSON.stringify({mode: mode}),
     });
     if (r.status === 409) {
@@ -1062,6 +1065,7 @@ async function doAbort(ticketId, btn) {
     btn.textContent = 'Aborting...';
     var r = await fetch(API + '/tickets/' + ticketId + '/abort', {
       method: 'POST',
+      headers: AUTH_HEADERS,
     });
     if (r.status === 409) {
       var data = await r.json();
@@ -1105,7 +1109,7 @@ async function doStopAll(mode, btn) {
   try {
     var r = await fetch(API + '/stop-all', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: Object.assign({'Content-Type': 'application/json'}, AUTH_HEADERS),
       body: JSON.stringify({mode: mode}),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1120,7 +1124,7 @@ async function doStopAll(mode, btn) {
 }
 
 async function api(path) {
-  const r = await fetch(API + path);
+  const r = await fetch(API + path, { headers: AUTH_HEADERS });
   if (!r.ok) throw new Error(`API ${r.status}: ${path}`);
   return r.json();
 }

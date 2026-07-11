@@ -42,7 +42,7 @@ trap cleanup EXIT INT TERM
 
 # Start state store in background
 echo "Starting state store on port $STORE_PORT..."
-python3 -m uvicorn state_store.main:app --host 0.0.0.0 --port "$STORE_PORT" --log-level warning &
+STORE_PORT="$STORE_PORT" python3 -m uvicorn state_store.main:app --host 0.0.0.0 --port "$STORE_PORT" --log-level warning &
 STORE_PID=$!
 
 # Wait for it to be ready
