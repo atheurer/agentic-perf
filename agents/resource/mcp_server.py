@@ -265,6 +265,7 @@ FQDN_RE = re.compile(
 def create_resource_tool_handlers(
     registry=None,
     secrets_provider=None,
+    instance_name: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], SSHExecutor]:
     _registry = registry
     ssh = SSHExecutor(user="root")
@@ -276,7 +277,9 @@ def create_resource_tool_handlers(
                 raise ValueError("No secrets provider or registry configured")
             from providers.resource.registry import ResourceProviderRegistry
 
-            _registry = ResourceProviderRegistry(secrets_provider)
+            _registry = ResourceProviderRegistry(
+                secrets_provider, instance_name=instance_name
+            )
         return _registry
 
     async def parse_host_config(text: str) -> dict:

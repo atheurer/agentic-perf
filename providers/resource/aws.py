@@ -34,6 +34,7 @@ class AWSResourceProvider(ResourceProvider):
         ami_map: dict[str, str] | None = None,
         session_token: str | None = None,
         root_volume_gb: int = 50,
+        instance_name: str | None = None,
     ) -> None:
         self._region = region
         self._access_key_id = access_key_id
@@ -49,10 +50,15 @@ class AWSResourceProvider(ResourceProvider):
         self._instance_type_map = instance_type_map or {}
         self._ami_map = ami_map or {}
         self._default_root_volume_gb = root_volume_gb
+        self._instance_name = instance_name
         self._ec2_client = None
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> AWSResourceProvider:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        instance_name: str | None = None,
+    ) -> AWSResourceProvider:
         raw = await secrets_provider.get_secret("aws/config.json")
         if not raw:
             raise ValueError("AWS config not found at secrets/aws/config.json")
@@ -87,6 +93,7 @@ class AWSResourceProvider(ResourceProvider):
             ami_map=config.get("ami_map"),
             session_token=config.get("session_token"),
             root_volume_gb=config.get("root_volume_gb", 50),
+            instance_name=instance_name,
         )
 
     def _get_ec2_client(self):
@@ -429,18 +436,29 @@ class AWSResourceProvider(ResourceProvider):
             ami = self._default_ami
         root_volume_gb = selection.get("root_volume_gb", self._default_root_volume_gb)
 
+        iname = self._instance_name
         if ticket_id:
-            instance_name = f"agentic-perf-{ticket_id}"
+            ec2_name = (
+                f"agentic-perf-{iname}-{ticket_id}"
+                if iname
+                else f"agentic-perf-{ticket_id}"
+            )
         else:
-            instance_name = f"agentic-perf-{description[:50]}"
+            ec2_name = (
+                f"agentic-perf-{iname}-{description[:50]}"
+                if iname
+                else f"agentic-perf-{description[:50]}"
+            )
 
         base_tags = [
-            {"Key": "Name", "Value": instance_name},
+            {"Key": "Name", "Value": ec2_name},
             {"Key": "agentic-perf", "Value": "true"},
             {"Key": "Description", "Value": description[:255]},
         ]
         if ticket_id:
             base_tags.append({"Key": "ticket-id", "Value": ticket_id})
+        if iname:
+            base_tags.append({"Key": "agentic-perf-instance", "Value": iname})
 
         specs = self._build_specs(selection)
 
@@ -613,6 +631,34 @@ class AWSResourceProvider(ResourceProvider):
             "details": {"instance_states": states},
         }
 
+    async def _filter_by_instance_name(
+        self,
+        ec2,
+        instance_ids: list[str],
+    ) -> list[str]:
+        """Return only instance IDs tagged agentic-perf-instance == self._instance_name."""
+        response = await asyncio.to_thread(
+            ec2.describe_instances,
+            InstanceIds=instance_ids,
+            Filters=[
+                {
+                    "Name": "tag:agentic-perf-instance",
+                    "Values": [self._instance_name],
+                },
+            ],
+        )
+        matched = []
+        for reservation in response.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                matched.append(inst["InstanceId"])
+        skipped = set(instance_ids) - set(matched)
+        if skipped:
+            logger.warning(
+                f"[aws-provider] Skipping {len(skipped)} instance(s) not owned by "
+                f"'{self._instance_name}': {sorted(skipped)}"
+            )
+        return matched
+
     async def terminate(
         self,
         reservation_id: str,
@@ -620,6 +666,21 @@ class AWSResourceProvider(ResourceProvider):
     ) -> dict[str, Any]:
         ec2 = self._get_ec2_client()
         instance_ids = provider_metadata.get("instance_ids", reservation_id.split(","))
+
+        if self._instance_name:
+            instance_ids = await self._filter_by_instance_name(ec2, instance_ids)
+            if not instance_ids:
+                logger.warning(
+                    "[aws-provider] No instances with matching agentic-perf-instance "
+                    f"tag '{self._instance_name}' — skipping termination"
+                )
+                return {
+                    "provider": self.provider_name,
+                    "reservation_id": reservation_id,
+                    "status": "skipped",
+                    "details": {"instances": []},
+                }
+
         logger.info(f"[aws-provider] Terminating instances: {instance_ids}")
         result = await asyncio.to_thread(
             ec2.terminate_instances, InstanceIds=instance_ids
