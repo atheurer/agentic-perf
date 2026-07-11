@@ -89,9 +89,28 @@ class AgentBase(ABC):
             },
         )
         try:
+            if self.max_iterations > 0:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[SYSTEM] Resource limits: you have"
+                            f" {self.max_iterations} iterations"
+                            f" (each iteration = 1 LLM call +"
+                            f" tool executions). Plan your work"
+                            f" to finish within this budget."
+                        ),
+                    }
+                )
+
             iteration = 0
             self._budget_grace = False
-            while self.max_iterations == 0 or iteration < self.max_iterations:
+            self._iteration_grace = False
+            while (
+                self.max_iterations == 0
+                or iteration < self.max_iterations
+                or (self._iteration_grace and iteration == self.max_iterations)
+            ):
                 if self._stop_requested:
                     self._emit(
                         ticket_id,
@@ -224,6 +243,41 @@ class AgentBase(ABC):
                                 ),
                             }
                         )
+
+                if self.max_iterations > 0 and iteration > 1:
+                    remaining = self.max_iterations - iteration
+                    warn_at = max(1, self.max_iterations * 3 // 4)
+                    if iteration == warn_at:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"[SYSTEM] Iteration warning:"
+                                    f" you have used {iteration} of"
+                                    f" {self.max_iterations}"
+                                    f" iterations ({remaining}"
+                                    f" remaining). Begin wrapping"
+                                    f" up — finish critical work"
+                                    f" and submit your results."
+                                ),
+                            }
+                        )
+                    elif remaining == 0:
+                        if not self._iteration_grace:
+                            self._iteration_grace = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] This is your"
+                                        " FINAL iteration. Submit"
+                                        " your results NOW using"
+                                        " your submit_* tool,"
+                                        " even if incomplete."
+                                    ),
+                                }
+                            )
+                            continue
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
                     has_submit_tool = any(

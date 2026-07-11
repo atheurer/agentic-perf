@@ -173,8 +173,8 @@ async def test_iteration_limit_respected(tmp_path):
 
     await agent.run("PERF-TEST")
 
-    # Should have made exactly 3 LLM calls
-    assert llm.call_count == 3
+    # 3 normal iterations + 1 grace iteration to wrap up
+    assert llm.call_count == 4
 
     # Should have emitted max_iterations error
     events = event_bus.get_events("PERF-TEST")
