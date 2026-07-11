@@ -56,12 +56,15 @@ class ResourceAgent(AgentBase):
         mode: str = "create",
         secrets_provider: SecretsProvider | None = None,
         event_bus: EventBus | None = None,
+        instance_name: str | None = None,
     ) -> None:
         self._mode = mode
         self._ticket_id: str | None = None
         self._secrets = secrets_provider
         self._registry = (
-            ResourceProviderRegistry(secrets_provider) if secrets_provider else None
+            ResourceProviderRegistry(secrets_provider, instance_name=instance_name)
+            if secrets_provider
+            else None
         )
 
         self._ssh: SSHExecutor | None = None

@@ -756,6 +756,162 @@ class TestAWSResourceProvider:
         with pytest.raises(ValueError, match="missing required fields"):
             await AWSResourceProvider.from_secrets(mock_secrets)
 
+    @pytest.mark.asyncio
+    async def test_from_secrets_passes_instance_name(self):
+        from providers.resource.aws import AWSResourceProvider
+
+        mock_secrets = AsyncMock()
+        mock_secrets.get_secret.return_value = AWS_CONFIG
+        provider = await AWSResourceProvider.from_secrets(
+            mock_secrets, instance_name="myhost"
+        )
+        assert provider._instance_name == "myhost"
+
+    @pytest.mark.asyncio
+    async def test_reserve_tags_include_instance_name(self):
+        """When instance_name is set, Name tag and agentic-perf-instance tag are set."""
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = AWSResourceProvider(
+            region="us-east-1",
+            access_key_id="AKIATEST",
+            secret_access_key="secret",
+            ssh_key_name="test-key",
+            ssh_key_path="/tmp/test.pem",
+            ssh_user="ec2-user",
+            security_group_id="sg-123",
+            subnet_id="subnet-456",
+            default_ami="ami-abc",
+            default_instance_type="m5.xlarge",
+            instance_name="myhost",
+        )
+        mock_ec2 = self._mock_ec2_for_batch(["i-a"], [("1.2.3.4", "10.0.0.1")])
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        await provider.reserve(
+            selection={"instance_type": "m5.xlarge", "count": 1},
+            description="test",
+            ticket_id="PERF-99",
+        )
+
+        tags = mock_ec2.run_instances.call_args.kwargs["TagSpecifications"][0]["Tags"]
+        tag_map = {t["Key"]: t["Value"] for t in tags}
+        assert tag_map["Name"] == "agentic-perf-myhost-PERF-99"
+        assert tag_map["agentic-perf-instance"] == "myhost"
+
+    @pytest.mark.asyncio
+    async def test_reserve_tags_no_instance_name(self):
+        """Without instance_name, Name tag is legacy format and no agentic-perf-instance tag."""
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = AWSResourceProvider(
+            region="us-east-1",
+            access_key_id="AKIATEST",
+            secret_access_key="secret",
+            ssh_key_name="test-key",
+            ssh_key_path="/tmp/test.pem",
+            ssh_user="ec2-user",
+            security_group_id="sg-123",
+            subnet_id="subnet-456",
+            default_ami="ami-abc",
+            default_instance_type="m5.xlarge",
+        )
+        mock_ec2 = self._mock_ec2_for_batch(["i-a"], [("1.2.3.4", "10.0.0.1")])
+        provider._ec2_client = mock_ec2
+        provider.setup_ssh = AsyncMock(return_value={"status": "success"})
+
+        await provider.reserve(
+            selection={"instance_type": "m5.xlarge", "count": 1},
+            description="test",
+            ticket_id="PERF-99",
+        )
+
+        tags = mock_ec2.run_instances.call_args.kwargs["TagSpecifications"][0]["Tags"]
+        tag_map = {t["Key"]: t["Value"] for t in tags}
+        assert tag_map["Name"] == "agentic-perf-PERF-99"
+        assert "agentic-perf-instance" not in tag_map
+
+    @pytest.mark.asyncio
+    async def test_terminate_filters_by_instance_name(self):
+        """terminate() skips instances not tagged with own instance_name."""
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = AWSResourceProvider(
+            region="us-east-1",
+            access_key_id="AKIATEST",
+            secret_access_key="secret",
+            ssh_key_name="test-key",
+            ssh_key_path="/tmp/test.pem",
+            ssh_user="ec2-user",
+            security_group_id="sg-123",
+            subnet_id="subnet-456",
+            default_ami="ami-abc",
+            default_instance_type="m5.xlarge",
+            instance_name="myhost",
+        )
+        mock_ec2 = MagicMock()
+        # describe_instances (for tag filter) returns only i-own
+        mock_ec2.describe_instances.return_value = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {"InstanceId": "i-own"},
+                    ]
+                }
+            ]
+        }
+        mock_ec2.terminate_instances.return_value = {
+            "TerminatingInstances": [
+                {
+                    "InstanceId": "i-own",
+                    "PreviousState": {"Name": "running"},
+                    "CurrentState": {"Name": "shutting-down"},
+                }
+            ]
+        }
+        provider._ec2_client = mock_ec2
+
+        result = await provider.terminate(
+            reservation_id="i-own,i-foreign",
+            provider_metadata={"instance_ids": ["i-own", "i-foreign"]},
+        )
+
+        assert result["status"] == "terminated"
+        # Only i-own passed the filter
+        terminate_call = mock_ec2.terminate_instances.call_args
+        assert terminate_call.kwargs["InstanceIds"] == ["i-own"]
+
+    @pytest.mark.asyncio
+    async def test_terminate_all_filtered_skips(self):
+        """terminate() returns skipped when no instances pass the tag filter."""
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = AWSResourceProvider(
+            region="us-east-1",
+            access_key_id="AKIATEST",
+            secret_access_key="secret",
+            ssh_key_name="test-key",
+            ssh_key_path="/tmp/test.pem",
+            ssh_user="ec2-user",
+            security_group_id="sg-123",
+            subnet_id="subnet-456",
+            default_ami="ami-abc",
+            default_instance_type="m5.xlarge",
+            instance_name="myhost",
+        )
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_instances.return_value = {"Reservations": []}
+        provider._ec2_client = mock_ec2
+
+        result = await provider.terminate(
+            reservation_id="i-foreign",
+            provider_metadata={"instance_ids": ["i-foreign"]},
+        )
+
+        assert result["status"] == "skipped"
+        mock_ec2.terminate_instances.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tool handler tests

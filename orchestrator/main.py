@@ -750,6 +750,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         events,
         repo_cache=repo_cache,
         llm_factory=llm_factory,
+        instance_name=config.instance_name,
     )
 
     logger.info(

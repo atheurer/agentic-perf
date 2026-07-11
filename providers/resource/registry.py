@@ -29,8 +29,13 @@ PROVIDER_REGISTRY: dict[str, dict[str, str]] = {
 class ResourceProviderRegistry:
     """Discovers configured resource providers and lazy-loads them."""
 
-    def __init__(self, secrets_provider: SecretsProvider) -> None:
+    def __init__(
+        self,
+        secrets_provider: SecretsProvider,
+        instance_name: str | None = None,
+    ) -> None:
         self._secrets = secrets_provider
+        self._instance_name = instance_name
         self._providers: dict[str, ResourceProvider] = {}
 
     async def list_configured_providers(self) -> list[dict[str, Any]]:
@@ -70,7 +75,12 @@ class ResourceProviderRegistry:
         module_path, cls_name = entry["class"].rsplit(".", 1)
         module = importlib.import_module(module_path)
         cls = getattr(module, cls_name)
-        provider = await cls.from_secrets(self._secrets)
+        if name == "aws":
+            provider = await cls.from_secrets(
+                self._secrets, instance_name=self._instance_name
+            )
+        else:
+            provider = await cls.from_secrets(self._secrets)
         self._providers[name] = provider
         logger.info(f"[registry] Loaded resource provider: {name}")
         return provider

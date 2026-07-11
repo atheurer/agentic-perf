@@ -48,9 +48,10 @@ async def _ensure_init():
         return
     _ssh, _ticket = await build_ssh_from_ticket()
     secrets = build_secrets_provider()
+    from paths import get_instance_name
     from providers.resource.registry import ResourceProviderRegistry
 
-    _registry = ResourceProviderRegistry(secrets)
+    _registry = ResourceProviderRegistry(secrets, instance_name=get_instance_name())
     _initialized = True
 
 

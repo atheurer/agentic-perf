@@ -51,6 +51,7 @@ class Dispatcher:
         event_bus: EventBus | None = None,
         repo_cache: RepoCache | None = None,
         llm_factory: Any | None = None,
+        instance_name: str | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
@@ -59,6 +60,7 @@ class Dispatcher:
         self.events = event_bus
         self.repo_cache = repo_cache
         self._llm_factory = llm_factory
+        self._instance_name = instance_name
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._dispatched: set[tuple[str, str]] = set()
@@ -157,6 +159,7 @@ class Dispatcher:
                 mode="create",
                 secrets_provider=self.secrets,
                 event_bus=self.events,
+                instance_name=self._instance_name,
             )
         elif agent_type == "provisioning":
             return ProvisioningAgent(
@@ -190,6 +193,7 @@ class Dispatcher:
                 mode="teardown",
                 secrets_provider=self.secrets,
                 event_bus=self.events,
+                instance_name=self._instance_name,
             )
         elif agent_type == "retrospective":
             return RetrospectiveAgent(

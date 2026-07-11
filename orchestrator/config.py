@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from paths import CONFIG_PATH
+from paths import CONFIG_PATH, get_instance_name
 
 
 def _load_config_file() -> dict:
@@ -97,6 +97,7 @@ class OrchestratorConfig:
                 pass
         default_repos.update(cfg.get("harness_repos", {}))
         self.harness_repos: dict[str, str] = default_repos
+        self.instance_name: str = get_instance_name()
         self.ssh_key = os.environ.get("SSH_KEY") or cfg.get("ssh_key")
         self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
         self._openai_api_key = os.environ.get("OPENAI_API_KEY")

@@ -527,23 +527,34 @@ def _format_age(launch_time) -> str:
 def cmd_cleanup(args):
     import boto3
 
-    config = _load_aws_config()
+    from paths import get_instance_name
+
+    aws_config = _load_aws_config()
     kwargs = {
-        "region_name": config["region"],
-        "aws_access_key_id": config["access_key_id"],
-        "aws_secret_access_key": config["secret_access_key"],
+        "region_name": aws_config["region"],
+        "aws_access_key_id": aws_config["access_key_id"],
+        "aws_secret_access_key": aws_config["secret_access_key"],
     }
-    if config.get("session_token"):
-        kwargs["aws_session_token"] = config["session_token"]
+    if aws_config.get("session_token"):
+        kwargs["aws_session_token"] = aws_config["session_token"]
 
     ec2 = boto3.client("ec2", **kwargs)
 
-    response = ec2.describe_instances(
-        Filters=[
-            {"Name": "tag:agentic-perf", "Values": ["true"]},
-            {"Name": "instance-state-name", "Values": ["running", "stopped"]},
-        ]
-    )
+    filters = [
+        {"Name": "tag:agentic-perf", "Values": ["true"]},
+        {"Name": "instance-state-name", "Values": ["running", "stopped"]},
+    ]
+
+    if args.all_instances:
+        scope_label = "all deployments"
+    else:
+        instance_name = get_instance_name()
+        filters.append(
+            {"Name": "tag:agentic-perf-instance", "Values": [instance_name]}
+        )
+        scope_label = f"instance '{instance_name}'"
+
+    response = ec2.describe_instances(Filters=filters)
 
     instances = []
     for reservation in response["Reservations"]:
@@ -555,10 +566,13 @@ def cmd_cleanup(args):
         instances = [i for i in instances if i["LaunchTime"].timestamp() < cutoff]
 
     if not instances:
-        print("No matching agentic-perf instances found.")
+        print(f"No matching agentic-perf instances found ({scope_label}).")
         return
 
-    print(f"Found {len(instances)} agentic-perf instance(s) in {config['region']}:\n")
+    print(
+        f"Found {len(instances)} agentic-perf instance(s) in "
+        f"{aws_config['region']} ({scope_label}):\n"
+    )
     print(f"  {'Instance ID':<20} {'State':<10} {'Age':>6}  {'Ticket':<16} {'Name'}")
     print(f"  {'─' * 20} {'─' * 10} {'─' * 6}  {'─' * 16} {'─' * 30}")
     for inst in instances:
@@ -574,7 +588,6 @@ def cmd_cleanup(args):
         return
 
     if not args.yes:
-        [i["InstanceId"] for i in instances]
         answer = input(f"\nTerminate {len(instances)} instance(s)? [y/N] ")
         if answer.lower() not in ("y", "yes"):
             print("Aborted.")
@@ -937,6 +950,11 @@ def main():
     )
     p_cleanup.add_argument(
         "--yes", "-y", action="store_true", help="Skip confirmation prompt"
+    )
+    p_cleanup.add_argument(
+        "--all-instances",
+        action="store_true",
+        help="Include instances from all deployments, not just this one",
     )
 
     args = parser.parse_args()
