@@ -267,6 +267,43 @@ async def test_check_background_command_not_running():
         assert data["running"] is False
 
 
+class TestShellQuoting:
+    """Verify paths are shell-quoted with shlex.quote, not repr()."""
+
+    @pytest.mark.asyncio
+    async def test_write_remote_file_quotes_path(self):
+        """Paths with quotes must be shlex-quoted, not repr'd."""
+        import agents.infra.server as infra
+
+        mock_ssh = AsyncMock()
+        mock_ssh.run = AsyncMock(return_value=_make_ssh_result())
+        mock_ssh.copy_to = AsyncMock(return_value=_make_ssh_result())
+
+        with patch.object(infra, "_ssh", mock_ssh):
+            await infra.write_remote_file(
+                "10.0.0.1",
+                "/tmp/it's here/file.txt",
+                "content",
+            )
+            mkdir_cmd = mock_ssh.run.call_args[0][1]
+            assert "$(dirname" not in mkdir_cmd
+            assert mkdir_cmd.startswith("mkdir -p ")
+
+    @pytest.mark.asyncio
+    async def test_read_remote_file_quotes_path(self):
+        """read_remote_file must single-quote the path so backticks are literal."""
+        import agents.infra.server as infra
+
+        mock_ssh = AsyncMock()
+        mock_ssh.run = AsyncMock(return_value=_make_ssh_result(stdout="data"))
+
+        with patch.object(infra, "_ssh", mock_ssh):
+            await infra.read_remote_file("10.0.0.1", '/tmp/x"`id`".txt')
+            cmd = mock_ssh.run.call_args[0][1]
+            # shlex.quote wraps in single quotes — backticks are literal
+            assert "'/tmp/x\"`id`\".txt'" in cmd
+
+
 class TestEntityEncodedSmuggling:
     """Verify that HTML-entity-encoded shell operators are caught by the policy
     after html.unescape decodes them."""

@@ -15,10 +15,11 @@ import html
 import json
 import logging
 import os
+import shlex
 import sys
 import tempfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 _project_root = str(Path(__file__).resolve().parents[2])
@@ -198,9 +199,8 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
     """Write content to a file on a remote host. Creates parent directories."""
     ssh = _get_ssh()
 
-    mkdir_result = await ssh.run(
-        host, f"mkdir -p $(dirname {remote_path!r})", timeout=15
-    )
+    parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
+    mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
     if mkdir_result.exit_code != 0:
         return json.dumps(
             {
@@ -232,7 +232,9 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
 async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) -> str:
     """Read a file from a remote host. Truncates to max_bytes."""
     ssh = _get_ssh()
-    result = await ssh.run(host, f"head -c {max_bytes} {remote_path!r}", timeout=30)
+    result = await ssh.run(
+        host, f"head -c {max_bytes} {shlex.quote(remote_path)}", timeout=30
+    )
     return _format_result(result)
 
 
@@ -255,9 +257,8 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
             }
         )
 
-    mkdir_result = await ssh.run(
-        host, f"mkdir -p $(dirname {remote_path!r})", timeout=15
-    )
+    parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
+    mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
     if mkdir_result.exit_code != 0:
         return json.dumps(
             {
