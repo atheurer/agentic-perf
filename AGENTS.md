@@ -193,6 +193,18 @@ If ambiguous, prefer code over prompts, and skills over hardcoded
 values in either. Never put harness-specific knowledge in agent
 prompts — that is always a skill provider's job.
 
+### Token Efficiency
+
+Tool results accumulate in conversation history and are re-sent
+with every LLM call. Trim aggressively:
+
+- **Strip unused fields** from tool responses.
+- **Summarize large outputs** on success; keep full output on failure.
+- **Use on-demand tools** instead of returning everything upfront.
+- **Handle predictable errors in code** (e.g., stale SSH keys)
+  so the LLM never wastes iterations on them.
+- **Scope prompts** to the current harness/board type.
+
 ### Guardrails Checklist
 
 Every place where LLM output touches real infrastructure must have
