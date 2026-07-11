@@ -822,9 +822,7 @@ def test_filter_controller_only_skips_non_controller():
 
     hosts = ["ctrl", "target1", "target2"]
     provisioning = {"controller_only_install": True}
-    filtered, skipped = _filter_controller_only(
-        hosts, "ctrl", provisioning, "crucible"
-    )
+    filtered, skipped = _filter_controller_only(hosts, "ctrl", provisioning, "crucible")
     assert filtered == ["ctrl"]
     assert set(skipped.keys()) == {"target1", "target2"}
     for h in ["target1", "target2"]:
@@ -838,9 +836,7 @@ def test_filter_controller_only_false_installs_all():
 
     hosts = ["ctrl", "target1", "target2"]
     provisioning = {"controller_only_install": False}
-    filtered, skipped = _filter_controller_only(
-        hosts, "ctrl", provisioning, "crucible"
-    )
+    filtered, skipped = _filter_controller_only(hosts, "ctrl", provisioning, "crucible")
     assert filtered == hosts
     assert skipped == {}
 
@@ -851,9 +847,7 @@ def test_filter_controller_only_no_controller_host_passes_all():
 
     hosts = ["h1", "h2", "h3"]
     provisioning = {"controller_only_install": True}
-    filtered, skipped = _filter_controller_only(
-        hosts, "", provisioning, "crucible"
-    )
+    filtered, skipped = _filter_controller_only(hosts, "", provisioning, "crucible")
     assert filtered == hosts
     assert skipped == {}
 
@@ -877,9 +871,7 @@ def test_filter_controller_only_server_module():
 
     hosts = ["ctrl", "target1", "target2"]
     provisioning = {"controller_only_install": True}
-    filtered, skipped = _filter_controller_only(
-        hosts, "ctrl", provisioning, "crucible"
-    )
+    filtered, skipped = _filter_controller_only(hosts, "ctrl", provisioning, "crucible")
     assert filtered == ["ctrl"]
     assert set(skipped.keys()) == {"target1", "target2"}
 
