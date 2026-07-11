@@ -326,6 +326,13 @@ async def run_agent_task(
                     cf = r.json().get("custom_fields", {})
                     if cf.get("investigation_ledger") or cf.get("anomaly_context"):
                         agent.max_iterations = 0
+                    max_iter_override = cf.get("max_iterations_override")
+                    if max_iter_override is not None:
+                        agent.max_iterations = int(max_iter_override)
+                        logger.info(
+                            f"Max iterations override for {ticket_id}:"
+                            f" {max_iter_override}"
+                        )
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
                         override_llm = _make_llm_provider(
@@ -351,7 +358,12 @@ async def run_agent_task(
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     await client.patch(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={"fields": {"llm_override": None}},
+                        json={
+                            "fields": {
+                                "llm_override": None,
+                                "max_iterations_override": None,
+                            },
+                        },
                     )
             except Exception:
                 pass

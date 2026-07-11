@@ -298,6 +298,14 @@ def cmd_reply(args):
         )
         r.raise_for_status()
 
+    max_iter = getattr(args, "max_iterations", None)
+    if max_iter is not None:
+        r = client.patch(
+            f"/api/v1/tickets/{args.ticket_id}/fields",
+            json={"fields": {"max_iterations_override": max_iter}},
+        )
+        r.raise_for_status()
+
     previous = t.get("previous_status")
     if not previous:
         print("Warning: no previous_status recorded, cannot resume automatically.")
@@ -313,13 +321,15 @@ def cmd_reply(args):
     r.raise_for_status()
 
     msg = f"Reply added and ticket resumed to: {previous}"
-    if model or provider:
-        parts = []
-        if provider:
-            parts.append(f"provider={provider}")
-        if model:
-            parts.append(f"model={model}")
-        msg += f" (LLM override: {', '.join(parts)})"
+    overrides = []
+    if provider:
+        overrides.append(f"provider={provider}")
+    if model:
+        overrides.append(f"model={model}")
+    if max_iter is not None:
+        overrides.append(f"max_iterations={max_iter}")
+    if overrides:
+        msg += f" ({', '.join(overrides)})"
     print(msg)
 
 
@@ -833,6 +843,11 @@ def main():
     p_reply.add_argument(
         "--provider",
         help="Override LLM provider for the next agent (e.g., claude, gemini)",
+    )
+    p_reply.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Override max iterations for the next agent (e.g., 40)",
     )
 
     p_approve = sub.add_parser("approve", help="Approve a pending command execution")
