@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from paths import SECRETS_DIR as DEFAULT_SECRETS_DIR
@@ -29,12 +30,17 @@ class LocalSecretsProvider(SecretsProvider):
         self._dir = Path(secrets_dir) if secrets_dir else DEFAULT_SECRETS_DIR
 
     def _resolve_path(self, path: str) -> Path:
-        resolved = (self._dir / path).resolve()
+        candidate = (self._dir / path)
+        # Check containment without resolving symlinks — secrets are
+        # commonly symlinked from external repos/vaults and .resolve()
+        # would follow the link outside the secrets directory.
+        normalized = Path(os.path.normpath(candidate))
+        secrets_root = Path(os.path.normpath(self._dir))
         try:
-            resolved.relative_to(self._dir.resolve())
+            normalized.relative_to(secrets_root)
         except ValueError:
             raise ValueError(f"Secret path escapes secrets directory: {path}")
-        return resolved
+        return candidate
 
     async def get_secret(self, path: str) -> str | None:
         file_path = self._resolve_path(path)
