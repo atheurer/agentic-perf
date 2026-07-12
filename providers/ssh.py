@@ -130,9 +130,18 @@ class SSHExecutor:
 
         Returns the same SSHResult as run() with the full output.
         """
-        run_id = uuid.uuid4().hex[:8]
-        out_file = f"/tmp/run-{run_id}.out"
-        rc_file = f"/tmp/run-{run_id}.rc"
+        mkd = await self.run(
+            host, "mktemp -d /tmp/run-XXXXXXXX", timeout=10, key_path=key_path
+        )
+        if mkd.exit_code != 0 or not mkd.stdout.strip():
+            return SSHResult(
+                stdout=mkd.stdout or "",
+                stderr=mkd.stderr or "Failed to create temp directory",
+                exit_code=mkd.exit_code or 1,
+            )
+        run_dir = mkd.stdout.strip()
+        out_file = f"{run_dir}/out"
+        rc_file = f"{run_dir}/rc"
 
         escaped = command.replace("'", "'\\''")
         bg_cmd = (
@@ -199,7 +208,7 @@ class SSHExecutor:
 
         await self.run(
             host,
-            f"rm -f {out_file} {rc_file}",
+            f"rm -rf {run_dir}",
             timeout=5,
             key_path=key_path,
         )

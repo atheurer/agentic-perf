@@ -157,6 +157,8 @@ class TestRunWithProgress:
         async def mock_run(host, cmd, **kwargs):
             nonlocal call_count
             call_count += 1
+            if "mktemp -d" in cmd:
+                return SSHResult(stdout="/tmp/run-abcd1234\n", stderr="", exit_code=0)
             # 1: launch — return PID
             if "nohup" in cmd:
                 return SSHResult(stdout="__PID:12345\n", stderr="", exit_code=0)
@@ -180,17 +182,17 @@ class TestRunWithProgress:
                     exit_code=0,
                 )
             # 5: cat output
-            if "cat" in cmd and ".out" in cmd:
+            if "cat" in cmd and "/out" in cmd:
                 return SSHResult(
                     stdout="Starting sample 1\nBenchmark complete\n",
                     stderr="",
                     exit_code=0,
                 )
             # 6: cat rc
-            if "cat" in cmd and ".rc" in cmd:
+            if "cat" in cmd and "/rc" in cmd:
                 return SSHResult(stdout="0\n", stderr="", exit_code=0)
             # 7: cleanup
-            if "rm -f" in cmd:
+            if "rm -rf" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
             return SSHResult(stdout="", stderr="", exit_code=0)
 
@@ -217,15 +219,17 @@ class TestRunWithProgress:
         from providers.ssh import SSHResult
 
         async def mock_run(host, cmd, **kwargs):
+            if "mktemp -d" in cmd:
+                return SSHResult(stdout="/tmp/run-abcd1234\n", stderr="", exit_code=0)
             if "nohup" in cmd:
                 return SSHResult(stdout="__PID:99\n", stderr="", exit_code=0)
             if "test -f" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
-            if "cat" in cmd and ".out" in cmd:
+            if "cat" in cmd and "/out" in cmd:
                 return SSHResult(stdout="error output\n", stderr="", exit_code=0)
-            if "cat" in cmd and ".rc" in cmd:
+            if "cat" in cmd and "/rc" in cmd:
                 return SSHResult(stdout="42\n", stderr="", exit_code=0)
-            if "rm -f" in cmd:
+            if "rm -rf" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
             return SSHResult(stdout="", stderr="", exit_code=0)
 
@@ -256,6 +260,8 @@ class TestRunWithProgress:
 
         async def mock_run(host, cmd, **kwargs):
             nonlocal poll_count
+            if "mktemp -d" in cmd:
+                return SSHResult(stdout="/tmp/run-abcd1234\n", stderr="", exit_code=0)
             if "nohup" in cmd:
                 return SSHResult(stdout="__PID:1\n", stderr="", exit_code=0)
             if "test -f" in cmd:
@@ -270,11 +276,11 @@ class TestRunWithProgress:
                     stderr="",
                     exit_code=0,
                 )
-            if "cat" in cmd and ".out" in cmd:
+            if "cat" in cmd and "/out" in cmd:
                 return SSHResult(stdout="same line\n", stderr="", exit_code=0)
-            if "cat" in cmd and ".rc" in cmd:
+            if "cat" in cmd and "/rc" in cmd:
                 return SSHResult(stdout="0\n", stderr="", exit_code=0)
-            if "rm -f" in cmd:
+            if "rm -rf" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
             return SSHResult(stdout="", stderr="", exit_code=0)
 
@@ -315,6 +321,8 @@ class TestRunWithProgress:
         from providers.ssh import SSHResult
 
         async def mock_run(host, cmd, **kwargs):
+            if "mktemp -d" in cmd:
+                return SSHResult(stdout="/tmp/run-abcd1234\n", stderr="", exit_code=0)
             if "nohup" in cmd:
                 return SSHResult(
                     stdout="nohup: ignoring input\nsome motd line\n__PID:42\n",
@@ -323,11 +331,11 @@ class TestRunWithProgress:
                 )
             if "test -f" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
-            if "cat" in cmd and ".out" in cmd:
+            if "cat" in cmd and "/out" in cmd:
                 return SSHResult(stdout="done\n", stderr="", exit_code=0)
-            if "cat" in cmd and ".rc" in cmd:
+            if "cat" in cmd and "/rc" in cmd:
                 return SSHResult(stdout="0\n", stderr="", exit_code=0)
-            if "rm -f" in cmd:
+            if "rm -rf" in cmd:
                 return SSHResult(stdout="", stderr="", exit_code=0)
             return SSHResult(stdout="", stderr="", exit_code=0)
 

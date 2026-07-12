@@ -553,7 +553,19 @@ async def execute_command(
 
     if background:
         bg_id = f"bg-{uuid.uuid4().hex[:8]}"
-        bg_cmd = f"nohup {command} > /tmp/{bg_id}.out 2>&1 & echo {_PID_SENTINEL}$!"
+        mkd = await ssh.run(host, "mktemp -d /tmp/bg-XXXXXXXX", timeout=10)
+        if mkd.exit_code != 0 or not mkd.stdout.strip():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": mkd.exit_code,
+                    "stdout": mkd.stdout or "",
+                    "stderr": mkd.stderr or "Failed to create temp directory",
+                }
+            )
+        bg_dir = mkd.stdout.strip()
+        out_file = f"{bg_dir}/out"
+        bg_cmd = f"nohup {command} > {out_file} 2>&1 & echo {_PID_SENTINEL}$!"
         result = await ssh.run(host, bg_cmd, timeout=30)
         pid = parse_pid_sentinel(result.stdout or "")
         if result.exit_code == 0 and pid is not None:
@@ -561,6 +573,8 @@ async def execute_command(
                 "host": host,
                 "pid": pid,
                 "command": command,
+                "dir": bg_dir,
+                "out_file": out_file,
             }
             return json.dumps(
                 {
@@ -605,6 +619,10 @@ async def stop_background_command(bg_id: str) -> str:
     if check.exit_code == 0:
         await ssh.run(host, f"kill -9 {pid} 2>/dev/null", timeout=5)
 
+    bg_dir = entry.get("dir")
+    if bg_dir:
+        await ssh.run(host, f"rm -rf {bg_dir}", timeout=5)
+
     return json.dumps({"status": "stopped", "bg_id": bg_id, "pid": pid})
 
 
@@ -625,7 +643,8 @@ async def check_background_command(bg_id: str) -> str:
     check = await ssh.run(host, f"kill -0 {pid} 2>/dev/null", timeout=5)
     running = check.exit_code == 0
 
-    tail = await ssh.run(host, f"tail -20 /tmp/{bg_id}.out 2>/dev/null", timeout=5)
+    out_file = entry.get("out_file", f"/tmp/{bg_id}.out")
+    tail = await ssh.run(host, f"tail -20 {out_file} 2>/dev/null", timeout=5)
     output = tail.stdout.strip() if tail.stdout else ""
 
     return json.dumps(

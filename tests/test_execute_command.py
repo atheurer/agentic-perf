@@ -112,8 +112,13 @@ async def test_execute_command_background_explicit():
     """background=True parameter triggers background mode."""
     import agents.infra.server as infra
 
+    async def _mock_run(host, cmd, timeout=300):
+        if "mktemp -d" in cmd:
+            return _make_ssh_result(stdout="/tmp/bg-test1234\n")
+        return _make_ssh_result(stdout="__PID:99999\n")
+
     mock_ssh = AsyncMock()
-    mock_ssh.run = AsyncMock(return_value=_make_ssh_result(stdout="__PID:99999\n"))
+    mock_ssh.run = _mock_run
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
@@ -184,7 +189,8 @@ async def test_stop_background_command():
     mock_ssh.run = AsyncMock(return_value=_make_ssh_result(exit_code=1))
 
     bg_id = "bg-test1234"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 12345, "command": "nc -l"}}
+    pids = {bg_id: {"host": "10.0.0.1", "pid": 12345, "command": "nc -l",
+                     "dir": "/tmp/bg-test1234", "out_file": "/tmp/bg-test1234/out"}}
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
@@ -228,7 +234,8 @@ async def test_check_background_command():
     )
 
     bg_id = "bg-check123"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 67890, "command": "nc -l"}}
+    pids = {bg_id: {"host": "10.0.0.1", "pid": 67890, "command": "nc -l",
+                     "dir": "/tmp/bg-check123", "out_file": "/tmp/bg-check123/out"}}
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
@@ -255,7 +262,8 @@ async def test_check_background_command_not_running():
     )
 
     bg_id = "bg-dead1234"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 11111, "command": "nc -l"}}
+    pids = {bg_id: {"host": "10.0.0.1", "pid": 11111, "command": "nc -l",
+                     "dir": "/tmp/bg-dead1234", "out_file": "/tmp/bg-dead1234/out"}}
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
