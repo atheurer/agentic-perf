@@ -504,15 +504,41 @@ async def _check_stale_tasks(
 
     Detects agents stuck on unresponsive LLM calls, hung SSH
     connections, or infinite loops that don't emit events.
-    Uses the event bus timestamp of the last event for each
-    ticket to determine staleness.
+
+    Checks two staleness signals and uses the most recent:
+    1. EventBus last-event timestamp (in-process agent events)
+    2. Ticket updated_at from the state store (covers progress
+       comments posted by MCP subprocess tools like run_with_progress)
     """
+    import httpx
+    from datetime import datetime, timezone
+
     now = time.time()
     for tid, task in dispatcher.active_tasks().items():
         last_event_time = event_bus.last_event_time(tid)
         if last_event_time is None:
             continue
-        idle_seconds = now - last_event_time
+
+        # Check the ticket's updated_at as a secondary signal —
+        # tool_progress comments update this even though they
+        # don't go through the in-process EventBus.
+        last_activity = last_event_time
+        try:
+            async with httpx.AsyncClient(
+                timeout=5.0, headers=_auth_headers()
+            ) as client:
+                r = await client.get(f"{store_url}/api/v1/tickets/{tid}")
+                if r.status_code == 200:
+                    updated_at = r.json().get("updated_at", "")
+                    if updated_at:
+                        ticket_time = datetime.fromisoformat(updated_at)
+                        ticket_ts = ticket_time.timestamp()
+                        if ticket_ts > last_activity:
+                            last_activity = ticket_ts
+        except Exception:
+            pass
+
+        idle_seconds = now - last_activity
         if idle_seconds > stale_timeout:
             logger.warning(
                 f"Stale task detected for {tid}:"
