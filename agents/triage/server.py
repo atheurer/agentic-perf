@@ -35,29 +35,59 @@ def _get_provider():
     return _skill_provider
 
 
+# Non-arcaflow benchmarks available as standalone tools
+# on the benchmark agent's MCP server. This list enables
+# triage to discover benchmarks outside the arcaflow
+# plugin ecosystem. Each entry is surfaced in
+# list_benchmarks, resolve_benchmark, and
+# get_benchmark_details alongside arcaflow plugins.
+_STANDALONE_BENCHMARKS = [
+    {
+        "name": "boot-time",
+        "description": (
+            "Boot time analysis — reboots a remote system "
+            "multiple times and collects kernel, initrd, and "
+            "userspace timing metrics per cycle. Uses "
+            "boot-time-analysis-tools. NO provisioning "
+            "step — the benchmark tool installs "
+            "dependencies on the SUT automatically via SSH. "
+            "Do NOT tell provisioning to install any "
+            "boot-time packages."
+        ),
+        "roles": ["client"],
+        "min_hosts": 1,
+        "harness": "boot-time",
+    },
+]
+
+
 @mcp.tool()
 async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
     sp = _get_provider()
     benchmarks = await sp.list_benchmarks()
-    return json.dumps(
-        [
-            {
-                "name": b.name,
-                "description": b.description,
-                "roles": b.roles,
-                "min_hosts": b.min_hosts,
-                "harness": b.harness,
-            }
-            for b in benchmarks
-        ],
-        indent=2,
-    )
+    result = [
+        {
+            "name": b.name,
+            "description": b.description,
+            "roles": b.roles,
+            "min_hosts": b.min_hosts,
+            "harness": b.harness,
+        }
+        for b in benchmarks
+    ]
+    # Include standalone (non-arcaflow) benchmarks
+    result.extend(_STANDALONE_BENCHMARKS)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 async def get_benchmark_details(name: str) -> str:
     """Get detailed information about a specific benchmark suite including supported parameters and endpoint types."""
+    # Check standalone benchmarks first
+    for sb in _STANDALONE_BENCHMARKS:
+        if name == sb["name"]:
+            return json.dumps(sb, indent=2)
     sp = _get_provider()
     b = await sp.get_benchmark(name)
     if b is None:
@@ -89,6 +119,20 @@ async def resolve_benchmark(
     }
     if harness:
         reqs["harness"] = harness
+
+    # Check standalone benchmarks first
+    desc_lower = description.lower()
+    for sb in _STANDALONE_BENCHMARKS:
+        if sb["name"] in desc_lower or any(
+            kw in desc_lower for kw in ("boot time", "boot-time", "reboot")
+        ):
+            return json.dumps(
+                {
+                    "matched_suite": sb["name"],
+                    "harness": sb["harness"],
+                    "harnesses": [sb["harness"]],
+                }
+            )
 
     result = await sp.resolve_benchmark(reqs)
     if result is None:

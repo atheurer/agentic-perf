@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from typing import Any
 
 from paths import LOCK_FILE
 from providers.events import EventBus
@@ -306,6 +307,7 @@ async def run_agent_task(
     agent_task_timeout: float = 0,
 ):
     agent = None
+    _jumpstarter_lease_id = ""  # captured for cleanup in finally
     try:
         agent = dispatcher.create_agent(status)
         if agent is None:
@@ -352,8 +354,29 @@ async def run_agent_task(
                             f" provider={llm_override.get('provider', '')}"
                             f" model={llm_override.get('model', '')}"
                         )
+                    # Jumpstarter provisioning needs many tool
+                    # calls (flash, boot, IP discovery, SSH key
+                    # injection). Budget guardrails are the real
+                    # safety net, not iteration caps.
+                    elif (
+                        status == "awaiting_provision"
+                        and cf.get("resource_provider") == "jumpstarter"
+                    ):
+                        agent.max_iterations = 0
+                    # Capture lease ID for post-benchmark cleanup
+                    if cf.get("resource_provider") == "jumpstarter":
+                        _jumpstarter_lease_id = cf.get(
+                            "resource_reservation_id"
+                        ) or cf.get("resource_provider_metadata", {}).get(
+                            "lease_id", ""
+                        )
         except Exception:
             pass  # proceed with default iterations
+
+        # Jumpstarter: resolve image URLs before provisioning.
+        # This is a deterministic HTTP lookup — no LLM needed.
+        if status == "awaiting_provision":
+            await _resolve_jumpstarter_images(dispatcher.store_url, ticket_id)
 
         if agent_task_timeout > 0:
             try:
@@ -434,6 +457,33 @@ async def run_agent_task(
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
+
+        # Release Jumpstarter lease after benchmark completes.
+        # Uses pre-captured lease_id and subprocess (not async)
+        # so it can't hang or fail silently.
+        if status == "executing_benchmark" and _jumpstarter_lease_id:
+            import subprocess
+
+            try:
+                _r = subprocess.run(
+                    ["jmp", "delete", "lease", _jumpstarter_lease_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if _r.returncode == 0:
+                    logger.info(f"[lease-cleanup] Released {_jumpstarter_lease_id}")
+                else:
+                    logger.warning(
+                        f"[lease-cleanup] Failed to release "
+                        f"{_jumpstarter_lease_id}: {_r.stderr[:200]}"
+                    )
+            except Exception:
+                logger.warning(
+                    f"[lease-cleanup] Error releasing {_jumpstarter_lease_id}",
+                    exc_info=True,
+                )
+
         if status in PLAN_AGENT_STATUS.values():
             try:
                 _advance_plan(
@@ -612,6 +662,236 @@ async def _block_absent_suite(
                     "ticket_id": ticket_id,
                 },
             )
+
+
+async def _resolve_jumpstarter_images(
+    store_url: str,
+    ticket_id: str,
+) -> None:
+    """Resolve Jumpstarter image URLs before provisioning.
+
+    Fetches the build server manifest and resolves the flash
+    command for the board. Stores the result in
+    custom_fields.jumpstarter_flash so the provisioning agent
+    can flash without needing to resolve URLs itself.
+
+    This is deterministic code — no LLM reasoning needed.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+            if r.status_code != 200:
+                return
+            cf = r.json().get("custom_fields", {})
+
+        if cf.get("resource_provider") != "jumpstarter":
+            return
+
+        # Already resolved?
+        if cf.get("jumpstarter_flash"):
+            return
+
+        directives = cf.get("directives", {})
+        metadata = cf.get("resource_provider_metadata", {})
+
+        # Resolve image source. No hardcoded OS defaults
+        # — if the user didn't specify and there's no
+        # config, the provisioning agent must ask.
+        from orchestrator.config import _load_config_file
+
+        img_cfg = _load_config_file().get("jumpstarter_images", {})
+
+        base_url = directives.get(
+            "image_server",
+            img_cfg.get(
+                "server",
+                "https://autosd.sig.centos.org/",
+            ),
+        )
+        image_version = directives.get(
+            "image_version",
+            img_cfg.get("image_version", ""),
+        )
+        release = directives.get("release", "nightly")
+        image_name = directives.get("image_name", "ps")
+        image_type = directives.get("image_type", "regular")
+
+        if not image_version:
+            logger.info(
+                f"[jumpstarter-images] No image_version "
+                f"for {ticket_id} — provisioning agent "
+                f"will need to ask the user"
+            )
+            async with httpx.AsyncClient(
+                timeout=10.0, headers=_auth_headers()
+            ) as client:
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={
+                        "fields": {
+                            "jumpstarter_flash": {
+                                "error": (
+                                    "No OS image version"
+                                    " specified. Set "
+                                    "image_version in "
+                                    "ticket directives "
+                                    "(e.g., AutoSD-10, "
+                                    "RHIVOS-2) or "
+                                    "configure "
+                                    "jumpstarter_images."
+                                    "image_version in "
+                                    "config.json."
+                                ),
+                            },
+                        },
+                    },
+                )
+            return
+
+        # Board target from selector. The resource agent
+        # may store it as 'selector' or 'jumpstarter_selector'.
+        selector = (
+            directives.get("board_selector")
+            or metadata.get("selector", "")
+            or metadata.get("jumpstarter_selector", "")
+        )
+        board_target = selector.split("=", 1)[-1] if "=" in selector else selector
+
+        from providers.resource.jumpstarter_images import (
+            resolve_image_urls,
+        )
+
+        result = await resolve_image_urls(
+            base_url=base_url,
+            image_version=image_version,
+            release=release,
+            board_target=board_target,
+            image_name=image_name,
+            image_type=image_type,
+        )
+
+        # If exact match failed, try fallbacks
+        if result.get("error") and result.get("available_variants"):
+            variants = result["available_variants"]
+            # Try same image_name with other type
+            for v in variants:
+                if v["image_name"] == image_name:
+                    result = await resolve_image_urls(
+                        base_url=base_url,
+                        image_version=image_version,
+                        release=release,
+                        board_target=board_target,
+                        image_name=v["image_name"],
+                        image_type=v["image_type"],
+                    )
+                    if not result.get("error"):
+                        break
+
+        # Flash duration estimate by board type.
+        _FLASH_DURATION_MINS: dict[str, int] = {
+            "ride4_sa8775p_sx_r3": 8,
+            "ride4_sa8775p_sx": 8,
+            "ride4_sa8775p_sx_legacy": 8,
+            "ride4_sa8650p_sx_r3": 8,
+            "rcar_s4": 20,
+            "s32g_vnp_rdb3": 20,
+            "j784s4evm": 20,
+        }
+        result["expected_duration_mins"] = _FLASH_DURATION_MINS.get(board_target, 15)
+
+        # Include the orchestrator's SSH public key so
+        # the provisioning agent can inject it into the
+        # board without needing a local file-read tool.
+        try:
+            from pathlib import Path
+
+            pub_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+            if pub_key_path.exists():
+                result["ssh_public_key"] = pub_key_path.read_text().strip()
+                result["ssh_key_path"] = str(pub_key_path.with_suffix(""))
+        except Exception:
+            pass
+
+        # Store on ticket (after adding SSH key)
+        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "jumpstarter_flash": result,
+                    },
+                },
+            )
+
+        if result.get("error"):
+            logger.warning(
+                f"[jumpstarter-images] Resolution failed "
+                f"for {ticket_id}: {result['error']}"
+            )
+        else:
+            logger.info(
+                f"[jumpstarter-images] Resolved "
+                f"{len(result.get('flash_targets', []))} "
+                f"partition(s) for {ticket_id}"
+            )
+
+    except Exception:
+        logger.debug(
+            "[jumpstarter-images] Resolution skipped",
+            exc_info=True,
+        )
+
+
+async def _redirect_to_investigation(
+    store_url: str,
+    ticket_id: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Redirect a ticket from awaiting_hardware to gathering_context.
+
+    Code-enforced invariant: tickets with anomaly_context belong
+    on the investigation path. If triage routed to the ad-hoc
+    path, the orchestrator corrects it here.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={
+                "author": "orchestrator",
+                "body": (
+                    "**Investigation redirect:** Ticket has "
+                    "anomaly_context but was routed to the "
+                    "ad-hoc path. Redirecting to the "
+                    "investigation path (gathering_context) "
+                    "for proper convergence tracking."
+                ),
+            },
+        )
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": "gathering_context",
+                "comment": (
+                    "Code-enforced redirect: anomaly_context → investigation path"
+                ),
+            },
+        )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "investigation_redirect",
+                {
+                    "from": "awaiting_hardware",
+                    "to": "gathering_context",
+                    "reason": "anomaly_context present",
+                },
+            )
+    logger.info(f"[investigation-redirect] {ticket_id} redirected to gathering_context")
 
 
 HANDOFF_RETRY_STATUS = {
@@ -842,6 +1122,31 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     )
                     continue
 
+                # Code-enforce investigation routing.
+                # If triage routed to awaiting_hardware but
+                # the ticket has anomaly_context, redirect
+                # to gathering_context (investigation path).
+                # LLM decides intent; code enforces invariants.
+                if status == "awaiting_hardware":
+                    cf = ticket.get("custom_fields", {})
+                    fleet = cf.get("fleet_investigation", {})
+                    if cf.get("anomaly_context") and not fleet.get("enabled"):
+                        logger.info(
+                            f"Redirecting {tid} to "
+                            f"gathering_context "
+                            f"(anomaly_context present)"
+                        )
+                        try:
+                            await _redirect_to_investigation(
+                                config.state_store_url,
+                                tid,
+                                event_bus=dispatcher.events,
+                            )
+                        except Exception:
+                            logger.exception(f"Failed to redirect {tid}")
+                        dispatcher.mark_dispatched(tid, status)
+                        continue
+
                 ok, reason = check_handoff(status, ticket)
                 if not ok:
                     if not dispatcher.is_handoff_blocked(tid, status):
@@ -886,7 +1191,269 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 store_url=config.state_store_url,
             )
 
+        # Check async_wait tickets for completion or timeout
+        await _check_async_wait_tickets(
+            config.state_store_url,
+            event_bus=events,
+        )
+
         await asyncio.sleep(config.poll_interval)
+
+
+async def _check_async_wait_tickets(
+    store_url: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Monitor async_wait tickets for timeout.
+
+    Checks each async_wait ticket's elapsed time against its
+    timeout limit (2x expected_duration_mins).  If exceeded,
+    transitions to awaiting_customer_guidance.
+
+    Completion detection is handled by the CloudEvents signal
+    endpoint (POST /api/v1/tickets/{id}/signal).  External
+    systems (benchmark harnesses, Jumpstarter, Horreum, CI
+    pipelines) send CloudEvents to resume tickets.  The
+    orchestrator does not poll infrastructure directly —
+    that would violate the trust boundary between the
+    control plane and agent execution.
+    """
+    import httpx
+
+    try:
+        tickets = await fetch_tickets_by_status(
+            store_url,
+            "async_wait",
+        )
+    except Exception:
+        return
+
+    if not tickets:
+        return
+
+    from datetime import datetime, timezone
+
+    async with httpx.AsyncClient(timeout=30.0, headers=_auth_headers()) as client:
+        for ticket in tickets:
+            tid = ticket["id"]
+            cf = ticket.get("custom_fields", {})
+            ctx = cf.get("async_context", {})
+            if not ctx:
+                continue
+
+            started_at = ctx.get("started_at", "")
+            expected_mins = ctx.get(
+                "expected_duration_mins",
+                60,
+            )
+            timeout_mins = expected_mins * 2
+            if not started_at:
+                continue
+
+            try:
+                start = datetime.fromisoformat(started_at)
+                elapsed = datetime.now(timezone.utc) - start
+                elapsed_mins = elapsed.total_seconds() / 60
+            except (ValueError, TypeError):
+                continue
+
+            if elapsed_mins <= timeout_mins:
+                continue
+
+            logger.warning(
+                f"[async_wait] Ticket {tid} timed "
+                f"out after {elapsed_mins:.0f}m "
+                f"(limit {timeout_mins:.0f}m)"
+            )
+            ctx["timed_out"] = True
+            ctx["elapsed_mins"] = round(
+                elapsed_mins,
+                1,
+            )
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{tid}/fields",
+                json={
+                    "fields": {
+                        "async_context": ctx,
+                    },
+                },
+            )
+            await client.post(
+                f"{store_url}/api/v1/tickets/{tid}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Async timeout:** Operation "
+                        f"exceeded {timeout_mins:.0f}m "
+                        f"limit ({elapsed_mins:.0f}m "
+                        f"elapsed). Pausing for "
+                        f"guidance."
+                    ),
+                },
+            )
+            await client.post(
+                f"{store_url}/api/v1/tickets/{tid}/transition",
+                json={
+                    "status": ("awaiting_customer_guidance"),
+                    "comment": (f"Async operation timed out after {elapsed_mins:.0f}m"),
+                },
+            )
+            if event_bus:
+                event_bus.emit(
+                    tid,
+                    "orchestrator",
+                    "async_timeout",
+                    {
+                        "wait_type": ctx.get(
+                            "wait_type",
+                        ),
+                        "elapsed_mins": round(
+                            elapsed_mins,
+                            1,
+                        ),
+                    },
+                )
+
+            # Clean up Jumpstarter lease if ticket
+            # is being parked due to timeout.
+            await _cleanup_jumpstarter_lease(store_url, tid, client, event_bus)
+
+
+async def _cleanup_jumpstarter_lease(
+    store_url: str,
+    ticket_id: str,
+    client: Any = None,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Terminate a Jumpstarter lease for a parked ticket.
+
+    Called when a ticket with an active Jumpstarter lease is
+    entering a state where no agent will run (e.g.,
+    awaiting_customer_guidance after timeout). Without this,
+    the lease would sit open until it expires on the
+    controller.
+
+    This is a safety net — normal lease cleanup happens
+    through the resource teardown agent. This catches the
+    cases where teardown is bypassed.
+    """
+    import httpx
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=30.0, headers=_auth_headers())
+
+    try:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+        if r.status_code != 200:
+            logger.info(f"[jumpstarter-cleanup] Ticket {ticket_id} not found")
+            return
+        cf = r.json().get("custom_fields", {})
+
+        if cf.get("resource_provider") != "jumpstarter":
+            logger.info(f"[jumpstarter-cleanup] Not jumpstarter, skipping {ticket_id}")
+            return
+
+        lease_id = cf.get("resource_reservation_id") or cf.get(
+            "resource_provider_metadata", {}
+        ).get("lease_id")
+        if not lease_id:
+            logger.info(f"[jumpstarter-cleanup] No lease_id for {ticket_id}")
+            return
+
+        # Already cleaned up? Skip for fleet — each
+        # iteration has a different lease ID.
+        fleet = cf.get("fleet_investigation", {})
+        if cf.get("jumpstarter_lease_cleaned_up") and not fleet.get("enabled"):
+            logger.info(f"[jumpstarter-cleanup] Already cleaned up {ticket_id}")
+            return
+
+        logger.warning(
+            f"[jumpstarter-cleanup] Releasing lease "
+            f"{lease_id} for parked ticket {ticket_id}"
+        )
+
+        try:
+            from providers.resource.jumpstarter import (
+                JumpstarterResourceProvider,
+            )
+
+            # Attempt to load from secrets
+            try:
+                from providers.secrets.file import (
+                    FileSecretsProvider,
+                )
+
+                secrets = FileSecretsProvider()
+                provider = await JumpstarterResourceProvider.from_secrets(secrets)
+            except Exception:
+                # Fall back to default construction
+                from pathlib import Path
+
+                cli_config = (
+                    Path.home() / ".config" / "jumpstarter" / "clients" / "perf-ci.yaml"
+                )
+                provider = JumpstarterResourceProvider(
+                    client_name="perf-ci",
+                    config_path=(cli_config if cli_config.exists() else None),
+                )
+
+            result = await provider.terminate(lease_id)
+            await provider.close()
+
+            # Mark as cleaned up on the ticket
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "jumpstarter_lease_cleaned_up": True,
+                    },
+                },
+            )
+
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Jumpstarter lease cleanup:** "
+                        f"Lease {lease_id} terminated "
+                        f"(ticket parked without "
+                        f"reaching teardown). "
+                        f"Status: {result.get('status')}"
+                    ),
+                },
+            )
+
+            if event_bus:
+                event_bus.emit(
+                    ticket_id,
+                    "orchestrator",
+                    "jumpstarter_lease_cleanup",
+                    {
+                        "lease_id": lease_id,
+                        "result": result.get("status"),
+                    },
+                )
+
+            logger.info(
+                f"[jumpstarter-cleanup] Lease {lease_id} terminated for {ticket_id}"
+            )
+
+        except ImportError:
+            logger.warning(
+                "[jumpstarter-cleanup] jumpstarter package "
+                "not available — lease not cleaned up"
+            )
+        except Exception:
+            logger.exception(
+                f"[jumpstarter-cleanup] Failed to terminate "
+                f"lease {lease_id} for {ticket_id}"
+            )
+
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 _lock_fd: int | None = None

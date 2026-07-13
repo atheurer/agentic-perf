@@ -77,6 +77,40 @@ class BenchmarkAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Collect Jumpstarter diagnostics before any
+            # clarification or fleet redirect. Serial logs
+            # and tunnel data are critical for diagnosing
+            # node failures.
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            diag = ""
+            if cf.get("resource_provider") == "jumpstarter":
+                diag = await self._collect_jumpstarter_diagnostics()
+                if diag:
+                    # Store diagnostics on the ticket so
+                    # evaluate agent can see them.
+                    await self._update_fields(
+                        self._ticket_id,
+                        {"node_diagnostics": diag[:5000]},
+                    )
+                    question = f"{question}\n\n## Node Diagnostics\n{diag}"
+            # Fleet investigation: failures are data
+            # points. Submit failed result instead of
+            # parking. Diagnostics are already collected
+            # and attached above.
+            from providers.fleet import is_fleet_investigation
+
+            if is_fleet_investigation(cf):
+                return (
+                    "Fleet investigation: this failure is "
+                    "a critical data point, not a blocker. "
+                    "Submit your benchmark result with "
+                    "benchmark_status=failed and include "
+                    "the failure details and diagnostics "
+                    "in the notes. The system will record "
+                    "the failure and move to the next "
+                    "host."
+                )
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
@@ -97,10 +131,24 @@ class BenchmarkAgent(AgentBase):
             },
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
+        # Returns allowed tool names for filtering, or None.
+        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
+
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Get all tools, but if Jumpstarter is attached,
+        # exclude lease management tools (resource provider's
+        # job, not the agent's).
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
 
         try:
             ticket = await self._get_ticket(ticket_id)
@@ -184,8 +232,17 @@ class BenchmarkAgent(AgentBase):
 
         if cf.get("parsed_specs"):
             content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
-        if cf.get("benchmark_suite"):
-            content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
+        suite = cf.get("benchmark_suite", "")
+        harness = cf.get("directives", {}).get("harness", "")
+        if suite:
+            content += (
+                f"\n**Benchmark Suite:** {suite}\n"
+                f"Use this exact name in get_benchmark_params, "
+                f"get_example_runfile, and generate_runfile "
+                f"calls."
+            )
+            if harness:
+                content += f" Use harness='{harness}' in those calls.\n"
         if cf.get("absent_suite"):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
@@ -270,6 +327,117 @@ class BenchmarkAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
+    async def _collect_jumpstarter_diagnostics(
+        self,
+    ) -> str:
+        """Collect diagnostics via Jumpstarter tunnel.
+
+        Called deterministically when a fleet benchmark
+        fails. The tunnel may still work even when direct
+        SSH doesn't. Captures serial output, power state,
+        and tunnel SSH — the only data available to
+        diagnose node failures.
+        """
+        if self._mcp is None:
+            return "No MCP connection available"
+
+        import json as _json
+
+        diag: list[str] = []
+
+        try:
+            conns_raw = await self._mcp.call_tool("jmp_list_connections", {})
+            conns = _json.loads(conns_raw)
+            # Result may be a list or a dict with
+            # a "connections" key.
+            if isinstance(conns, list):
+                conn_list = conns
+            else:
+                conn_list = conns.get("connections", [])
+            if not conn_list:
+                # No active connection — establish one
+                # from the lease. This bypasses tool
+                # scoping since it's deterministic code.
+                if not self._ticket_id:
+                    return "No active Jumpstarter connection"
+                ticket = await self._get_ticket(self._ticket_id)
+                _cf = ticket.get("custom_fields", {})
+                _lid = _cf.get("resource_reservation_id") or _cf.get(
+                    "resource_provider_metadata", {}
+                ).get("lease_id", "")
+                if not _lid:
+                    return "No lease ID available"
+                conn_raw = await self._mcp.call_tool("jmp_connect", {"lease_id": _lid})
+                conn_data = _json.loads(conn_raw)
+                if conn_data.get("error"):
+                    return f"Connect failed: {conn_data['error'][:200]}"
+                conn_list = [conn_data]
+            conn_id = conn_list[0].get(
+                "connection_id",
+                conn_list[0].get("id", ""),
+            )
+        except Exception as exc:
+            return f"Could not list connections: {exc}"
+
+        # Serial capture — most critical diagnostic
+        try:
+            serial = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": ["serial", "pipe"],
+                    "timeout_seconds": 15,
+                },
+            )
+            sd = _json.loads(serial)
+            stdout = sd.get("stdout", "")
+            if stdout:
+                diag.append(f"Serial output:\n{stdout[:3000]}")
+            else:
+                diag.append("Serial: no output (board may be hung or powered off)")
+        except Exception as exc:
+            diag.append(f"Serial capture failed: {exc}")
+
+        # Power state
+        try:
+            power = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": ["power", "read"],
+                },
+            )
+            pd = _json.loads(power)
+            diag.append(f"Power: {pd.get('stdout', 'unknown').strip()}")
+        except Exception as exc:
+            diag.append(f"Power check failed: {exc}")
+
+        # SSH via tunnel
+        try:
+            ssh = await self._mcp.call_tool(
+                "jmp_run",
+                {
+                    "connection_id": conn_id,
+                    "command": [
+                        "ssh",
+                        "--",
+                        "uptime",
+                    ],
+                    "timeout_seconds": 15,
+                },
+            )
+            sd = _json.loads(ssh)
+            if sd.get("exit_code") == 0:
+                diag.append(f"Tunnel SSH: OK — {sd.get('stdout', '').strip()}")
+            else:
+                diag.append(
+                    f"Tunnel SSH: failed — {sd.get('stderr', '').strip()[:200]}"
+                )
+        except Exception as exc:
+            diag.append(f"Tunnel SSH failed: {exc}")
+
+        return "\n".join(diag)
+
     async def _handle_budget_pause(self, ticket_id: str) -> None:
         """Route budget-exhausted investigation tickets
         to evaluating_convergence so partial results can
@@ -306,12 +474,15 @@ class BenchmarkAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        fields = {
+        fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
+            "output_dir": result.get("output_dir", ""),
         }
+        if result.get("benchmark_results"):
+            fields["benchmark_results"] = result["benchmark_results"]
         await self._update_fields(ticket_id, fields)
 
         status = fields["benchmark_status"]
@@ -328,11 +499,27 @@ class BenchmarkAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
 
         if status == "failed":
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_customer_guidance",
-                comment="Benchmark failed — needs investigation",
-            )
+            # Fleet: failures are data points. Route to
+            # evaluate so the fleet loop can record the
+            # failure and move to the next host.
+            from providers.fleet import is_fleet_investigation
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if is_fleet_investigation(cf):
+                await self._transition_ticket(
+                    ticket_id,
+                    "evaluating_convergence",
+                    comment=(
+                        "Benchmark failed on this host, evaluating fleet progress"
+                    ),
+                )
+            else:
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment="Benchmark failed — needs investigation",
+                )
         else:
             # Route based on whether this is an investigation
             # ticket. Same code-enforced pattern as triage.

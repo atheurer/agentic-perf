@@ -57,8 +57,98 @@ class ProvisioningAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Fleet investigation: provisioning failure on
+            # one host should not stop the whole fleet.
+            # Record the failure and move to the next host.
+            if await self._handle_fleet_provision_failure(self._ticket_id, question):
+                return (
+                    "Fleet investigation: this host has "
+                    "been recorded as a provisioning "
+                    "failure. Submit your result and "
+                    "the system will move to the next "
+                    "host automatically."
+                )
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _handle_fleet_provision_failure(
+        self, ticket_id: str, reason: str
+    ) -> bool:
+        """Record provision failure for fleet investigations.
+
+        Returns True if this is a fleet investigation and the
+        failure was recorded (caller should skip clarification).
+        Returns False for non-fleet tickets (normal behavior).
+        """
+        from providers.fleet import (
+            build_tested_host_entry,
+            is_fleet_investigation,
+        )
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if not is_fleet_investigation(cf):
+            return False
+
+        fleet = cf.get("fleet_investigation", {})
+        tested = fleet.get("tested_hosts", [])
+
+        metadata = cf.get("resource_provider_metadata", {})
+        host_id = metadata.get("exporter_name") or metadata.get("exporter") or "unknown"
+
+        # Skip if already recorded
+        if any(h["host_id"] == host_id for h in tested):
+            return True
+
+        entry = build_tested_host_entry(
+            host_id=host_id,
+            lease_id=metadata.get("lease_id", ""),
+            status="provision_failed",
+            failure_reason=reason[:500],
+        )
+        tested.append(entry)
+        fleet["tested_hosts"] = tested
+        await self._update_fields(
+            ticket_id,
+            {"fleet_investigation": fleet},
+        )
+
+        await self._add_comment(
+            ticket_id,
+            f"**Fleet: provisioning failed for "
+            f"{host_id}**\n\n"
+            f"Reason: {reason[:300]}\n\n"
+            f"Recording failure and moving to next "
+            f"host.",
+        )
+
+        # Transition to awaiting_hardware so the
+        # resource agent picks the next board.
+        # Release the failed lease first.
+        lease_id = metadata.get("lease_id")
+        if lease_id:
+            try:
+                from providers.resource.registry import (
+                    get_resource_registry,
+                )
+
+                reg = get_resource_registry()
+                prov = await reg.get_provider("jumpstarter")
+                await prov.terminate(lease_id)
+                logger.info(f"[fleet] Released failed lease {lease_id}")
+            except Exception:
+                logger.debug(
+                    "[fleet] Failed to release lease",
+                    exc_info=True,
+                )
+
+        await self._transition_ticket(
+            ticket_id,
+            "awaiting_hardware",
+            comment=(f"Fleet: {host_id} failed provisioning, acquiring next host"),
+        )
+
+        return True
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
@@ -77,10 +167,32 @@ class ProvisioningAgent(AgentBase):
             },
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware
+        from agents.jumpstarter_mcp import (
+            attach_jumpstarter_mcp,
+        )
+
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Exclude lease management tools if Jumpstarter attached
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
+
+        # NOTE: Provisioning suspension is disabled.
+        # The provisioning agent itself performs the flash,
+        # so suspending before flashing creates a deadlock
+        # (nobody left to do the work or send the wake
+        # signal). Provisioning runs synchronously; the
+        # proper fix is tool-level async suspension
+        # (issue #25) where the flash tool suspends AFTER
+        # starting the operation.
 
         try:
             await super().run(ticket_id)
@@ -140,7 +252,49 @@ class ProvisioningAgent(AgentBase):
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("resource_provider_metadata"):
-            content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
+            metadata = cf["resource_provider_metadata"]
+            content += f"\n## Provider Metadata\n```json\n{json.dumps(metadata, indent=2)}\n```\n"
+
+            # Surface Jumpstarter lease info for the skill
+            if cf.get("resource_provider") == "jumpstarter":
+                lease_id = cf.get("resource_reservation_id") or metadata.get(
+                    "lease_id", ""
+                )
+                content += (
+                    f"\n## Jumpstarter Device\n"
+                    f"- **Lease ID:** {lease_id}\n"
+                    f"- **Board:** {metadata.get('exporter_name', 'unknown')}\n"
+                    f"- **Selector:** {metadata.get('selector', 'unknown')}\n"
+                    f"- This is a physical embedded board that needs\n"
+                    f"  flashing before use. Follow the Jumpstarter\n"
+                    f"  provisioning skill above.\n"
+                )
+
+                flash = cf.get("jumpstarter_flash", {})
+                if flash.get("flash_command"):
+                    content += (
+                        f"\n## Pre-Resolved Flash Command\n"
+                        f"```\n{flash['flash_command']}\n```\n"
+                        f"Run this via `jmp_run` with "
+                        f"timeout_seconds=600.\n"
+                    )
+                    if flash.get("ssh_public_key"):
+                        content += (
+                            f"\n## SSH Public Key "
+                            f"(for key injection)\n"
+                            f"```\n"
+                            f"{flash['ssh_public_key']}\n"
+                            f"```\n"
+                            f"**Key path:** "
+                            f"{flash.get('ssh_key_path', '/root/.ssh/id_rsa')}\n"
+                        )
+                elif flash.get("error"):
+                    content += f"\n## Image Resolution Error\n{flash['error']}\n"
+                    if flash.get("available_variants"):
+                        content += (
+                            f"Available variants: "
+                            f"{json.dumps(flash['available_variants'])}\n"
+                        )
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"
@@ -159,17 +313,101 @@ class ProvisioningAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
+        # Self-installing harnesses don't need
+        # provisioning to install them. If the LLM
+        # reports incomplete because install_harness
+        # failed, override when hosts were provisioned.
+        _SELF_INSTALLING = {"boot-time"}
+        harness = result.get("harness_name", "unknown")
+        prov_complete = result.get("provisioning_complete", False)
+        if (
+            not prov_complete
+            and harness in _SELF_INSTALLING
+            and result.get("hosts_provisioned")
+        ):
+            prov_complete = True
+            logger.info(
+                f"[provisioning] Overriding provisioning_complete "
+                f"for self-installing harness {harness}"
+            )
+
         fields = {
-            "provisioning_complete": result.get("provisioning_complete", False),
+            "provisioning_complete": prov_complete,
             "hosts_provisioned": result.get("hosts_provisioned", []),
             "harness_version": result.get("harness_version", "unknown"),
-            "harness_name": result.get("harness_name", "unknown"),
+            "harness_name": harness,
             "configuration_applied": result.get("configuration_applied", {}),
         }
         if result.get("k3s_installed"):
             fields["k3s_installed"] = True
             fields["k3s_version"] = result.get("k3s_version", "unknown")
+
+        # Jumpstarter: the provisioning agent discovers the
+        # SSH IP during flashing. Update ticket fields so
+        # downstream agents can SSH directly.
+        ssh_ips = result.get("ssh_hardware_ips")
+        if not ssh_ips and result.get("hosts_provisioned"):
+            # LLM didn't set ssh_hardware_ips explicitly.
+            # Derive from hosts_provisioned — single-host
+            # Jumpstarter boards use the same IP for
+            # controller and target.
+            hosts = result["hosts_provisioned"]
+            first_ip = str(hosts[0]) if hosts else ""
+            if first_ip:
+                ssh_ips = {
+                    "controller": first_ip,
+                    "targets": [first_ip],
+                }
+        if ssh_ips:
+            fields["ssh_hardware_ips"] = ssh_ips
+            fields["assigned_hardware_ips"] = result.get(
+                "assigned_hardware_ips",
+                ssh_ips,
+            )
+        if result.get("ssh_user"):
+            fields["ssh_user"] = result["ssh_user"]
+        if result.get("ssh_key_path"):
+            fields["ssh_key_path"] = result["ssh_key_path"]
+
+        # Update exporter_name in metadata so fleet
+        # failure recording can identify the board.
+        # The LLM discovers this from jmp_connect but
+        # doesn't reliably write it back.
+        config = fields.get("configuration_applied", {})
+        board_name = (
+            config.get("exporter")
+            or config.get("board")
+            or config.get("exporter_name")
+            or ""
+        )
+        if board_name:
+            ticket = await self._get_ticket(ticket_id)
+            meta = ticket.get("custom_fields", {}).get("resource_provider_metadata", {})
+            if not meta.get("exporter_name"):
+                meta["exporter_name"] = board_name
+                fields["resource_provider_metadata"] = meta
+
         await self._update_fields(ticket_id, fields)
+
+        # Clear stale SSH known_hosts entries for
+        # provisioned hosts. Flashing always changes
+        # host keys — clearing deterministically avoids
+        # wasting LLM iterations on host key errors.
+        for ip in fields.get("hosts_provisioned", []):
+            host = (
+                str(ip)
+                if not isinstance(ip, dict)
+                else ip.get("host", ip.get("ip", ""))
+            )
+            if host:
+                import subprocess
+
+                subprocess.run(
+                    ["ssh-keygen", "-R", host],
+                    capture_output=True,
+                    timeout=5,
+                )
+                logger.info(f"[provisioning] Cleared stale known_hosts for {host}")
 
         hosts = [
             str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))
@@ -194,6 +432,39 @@ class ProvisioningAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
         if await self._plan_controls_next_transition(ticket_id):
             return
+
+        # Fleet investigation: record failures and loop
+        # back for the next host instead of blocking.
+        from providers.fleet import is_fleet_investigation
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if is_fleet_investigation(cf):
+            if not fields["provisioning_complete"]:
+                await self._handle_fleet_provision_failure(
+                    ticket_id,
+                    result.get(
+                        "notes",
+                        "Provisioning submitted incomplete",
+                    ),
+                )
+                return
+            # Provisioned but no SSH IP — can't benchmark
+            if not cf.get("ssh_hardware_ips"):
+                await self._handle_fleet_provision_failure(
+                    ticket_id,
+                    (
+                        "Provisioning completed but no "
+                        "SSH IP was discovered. The "
+                        "board may not be reachable "
+                        "via direct SSH."
+                    ),
+                )
+                return
+        elif not fields["provisioning_complete"]:
+            # Non-fleet: pause for guidance
+            pass  # handoff validation will catch it
+
         await self._transition_ticket(
             ticket_id,
             "executing_benchmark",

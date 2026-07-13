@@ -101,23 +101,82 @@ class TriageAgent(AgentBase):
             )
             return
 
-        required_hosts = result.get("required_hosts", [])
+        roles = result.get("roles", [])
+        min_hosts = result.get("min_hosts", 1)
         directives = result.get("directives", {})
         # Backward compat: top-level host_cleanup moves into directives
         if "host_cleanup" in result and "host_cleanup" not in directives:
             directives["host_cleanup"] = result["host_cleanup"]
+        # Preserve user-provided directives that triage
+        # didn't set. The user may have specified
+        # image_version or other operational parameters
+        # in the ticket's custom_fields.directives.
+        ticket = await self._get_ticket(ticket_id)
+        user_directives = ticket.get("custom_fields", {}).get("directives", {})
+        if user_directives:
+            merged = dict(user_directives)
+            merged.update(directives)
+            directives = merged
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
             "benchmark_suite": result.get("benchmark_suite", ""),
             "absent_suite": result.get("absent_suite", False),
-            "required_hosts": required_hosts,
+            "required_roles": roles,
+            "min_hosts": min_hosts,
             "directives": directives,
         }
 
         scoped_context = result.get("scoped_context")
         if scoped_context and isinstance(scoped_context, dict):
             fields["scoped_context"] = scoped_context
+
+        # Detect anomaly context from the triage result or
+        # ticket description. This field drives code-enforced
+        # routing to the investigation path.
+        anomaly_ctx = result.get("anomaly_context")
+        if not anomaly_ctx:
+            # Check if the ticket description has anomaly
+            # indicators that triage recognized.
+            ticket = await self._get_ticket(ticket_id)
+            desc = ticket.get("description", "").lower()
+            hypothesis = fields.get("hypothesis", "").lower()
+            anomaly_markers = (
+                "regression",
+                "anomaly",
+                "watchdog",
+                "degradation",
+                "deviation",
+                "failure",
+                "isolate",
+                "intermittent",
+            )
+            if any(m in desc for m in anomaly_markers) and any(
+                m in hypothesis for m in anomaly_markers
+            ):
+                anomaly_ctx = {
+                    "source": "triage_detection",
+                    "hypothesis": fields.get("hypothesis", ""),
+                }
+        if anomaly_ctx:
+            fields["anomaly_context"] = anomaly_ctx
+
+        # Fleet investigation: test all available devices
+        # of a type and compare results. Requires
+        # investigation context (enforced by providers/fleet.py).
+        if result.get("fleet_investigation"):
+            if not anomaly_ctx:
+                # Fleet implies investigation — auto-set
+                # anomaly context if not already detected.
+                anomaly_ctx = {
+                    "source": "fleet_investigation",
+                    "hypothesis": fields.get("hypothesis", ""),
+                }
+                fields["anomaly_context"] = anomaly_ctx
+            fields["fleet_investigation"] = {
+                "enabled": True,
+                "tested_hosts": [],
+            }
 
         # Every ticket gets a full-lifecycle execution plan covering
         # resource allocation through teardown. The LLM should
@@ -213,7 +272,7 @@ class TriageAgent(AgentBase):
             f"**Triage Complete**\n\n"
             f"- **Hypothesis:** {fields['hypothesis']}\n"
             f"- **Benchmark Suite:** {fields['benchmark_suite']}\n"
-            f"- **Required Hosts:** {len(required_hosts)} ({', '.join('+'.join(h.get('roles', ['?'])) for h in required_hosts)})\n"
+            f"- **Required Hosts:** {min_hosts} ({', '.join(roles) if roles else 'unknown'})\n"
             f"- **Absent Suite:** {fields['absent_suite']}\n"
         )
         step_types = [s["agent_type"] for s in steps]

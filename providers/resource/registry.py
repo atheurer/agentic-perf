@@ -23,6 +23,10 @@ PROVIDER_REGISTRY: dict[str, dict[str, str]] = {
         "class": "providers.resource.psap_cc.PSAPCCResourceProvider",
         "secret": "psap-cc/config.json",
     },
+    "jumpstarter": {
+        "class": "providers.resource.jumpstarter.JumpstarterResourceProvider",
+        "secret": "jumpstarter/config.json",
+    },
 }
 
 
@@ -44,7 +48,7 @@ class ResourceProviderRegistry:
         for name, entry in PROVIDER_REGISTRY.items():
             raw = await self._secrets.get_secret(entry["secret"])
             if raw:
-                if name == "quads":
+                if name in ("quads", "jumpstarter"):
                     ptype = "bare_metal"
                 elif name == "psap-cc":
                     ptype = "gpu_cluster"

@@ -283,6 +283,18 @@ def get_triage_tools() -> list[ToolDefinition]:
                         },
                         "additionalProperties": True,
                     },
+                    "fleet_investigation": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true when the user wants to "
+                            "test ALL available devices of a type "
+                            "and compare results across the fleet "
+                            "(e.g., 'test all R-Car boards', "
+                            "'which hosts have failures'). Fleet "
+                            "investigations iterate through each "
+                            "device one at a time via loop-back."
+                        ),
+                    },
                     "notes": {
                         "type": "string",
                         "description": "Additional notes about the triage",

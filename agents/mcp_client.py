@@ -148,13 +148,70 @@ class AgentMCPClient:
                 )
         return tools
 
+    # Timeout for jmp_connect — prevents indefinite hang
+    # when all exporters are leased or offline. The
+    # Jumpstarter client config has acquisition_timeout
+    # (default 7200s) but we want to fail faster so the
+    # fleet loop can move to the next host.
+    _JMP_CONNECT_TIMEOUT = 180  # 3 minutes
+
+    # One connection per agent session. Fleet iterations
+    # provision one board at a time — the system handles
+    # iteration. Prevents the provisioning agent from
+    # calling jmp_connect repeatedly to flash all boards.
+    _jmp_connected = False
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
             raise RuntimeError(f"No server provides tool {name!r}")
 
         conn = self._servers[server_name]
-        result = await conn.session.call_tool(name, arguments)
+
+        # Apply timeout to jmp_connect to prevent hanging
+        # when no exporters are available.
+        if name == "jmp_connect":
+            if self._jmp_connected:
+                import json
+
+                return json.dumps(
+                    {
+                        "error": (
+                            "Already connected to a "
+                            "Jumpstarter device in this "
+                            "session. You are provisioning "
+                            "ONE board. Submit your result "
+                            "and the system will handle "
+                            "fleet iteration automatically."
+                        ),
+                    }
+                )
+            import asyncio
+
+            try:
+                result = await asyncio.wait_for(
+                    conn.session.call_tool(name, arguments),
+                    timeout=self._JMP_CONNECT_TIMEOUT,
+                )
+                self._jmp_connected = True
+            except asyncio.TimeoutError:
+                import json
+
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Failed to connect: lease "
+                            f"acquisition timed out after "
+                            f"{self._JMP_CONNECT_TIMEOUT} "
+                            f"seconds. No exporter was "
+                            f"assigned — the board may be "
+                            f"offline or leased by another "
+                            f"user."
+                        ),
+                    }
+                )
+        else:
+            result = await conn.session.call_tool(name, arguments)
         parts = []
         for block in result.content:
             if hasattr(block, "text"):
@@ -164,6 +221,66 @@ class AgentMCPClient:
         content = "\n".join(parts) if parts else ""
         if result.isError:
             raise RuntimeError(content)
+
+        # Trim verbose Jumpstarter responses to reduce
+        # token accumulation in conversation history.
+        content = self._trim_jumpstarter_response(name, content)
+
+        return content
+
+    @staticmethod
+    def _trim_jumpstarter_response(
+        tool_name: str,
+        content: str,
+    ) -> str:
+        """Trim verbose Jumpstarter tool responses.
+
+        jmp_connect returns cli_tree (~10K chars) and
+        drivers (~4K chars) that the agent never uses.
+        jmp_run for storage flash returns full progress
+        logs (~18K chars) on success.
+
+        These accumulate in conversation history across
+        every subsequent LLM call, consuming ~120K tokens
+        per provisioning session.
+        """
+        import json as _json
+
+        if tool_name == "jmp_connect":
+            try:
+                data = _json.loads(content)
+                if "connection_id" in data:
+                    # Keep only what the agent needs
+                    trimmed = {
+                        "connection_id": data["connection_id"],
+                        "lease_name": data.get("lease_name", ""),
+                        "exporter_name": data.get("exporter_name", ""),
+                        "socket_path": data.get("socket_path", ""),
+                    }
+                    return _json.dumps(trimmed, indent=2)
+            except (ValueError, KeyError):
+                pass
+
+        if tool_name == "jmp_run":
+            try:
+                data = _json.loads(content)
+                # Only trim successful commands with
+                # large stdout (flash logs, etc.)
+                stdout = data.get("stdout", "")
+                if data.get("exit_code") == 0 and len(stdout) > 2000:
+                    # Keep first and last lines for context
+                    lines = stdout.strip().split("\n")
+                    if len(lines) > 10:
+                        summary = (
+                            "\n".join(lines[:3]) + f"\n... ({len(lines) - 6} lines "
+                            f"trimmed) ...\n" + "\n".join(lines[-3:])
+                        )
+                        data["stdout"] = summary
+                        data["_trimmed"] = True
+                        return _json.dumps(data, indent=2)
+            except (ValueError, KeyError):
+                pass
+
         return content
 
     async def disconnect(self) -> None:

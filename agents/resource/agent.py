@@ -633,6 +633,11 @@ class ResourceAgent(AgentBase):
 
         await self._update_fields(ticket_id, fields)
 
+        # Fleet investigation: store total available count
+        # so the evaluate agent knows when all hosts are
+        # tested. Only activates on investigation path.
+        await self._update_fleet_total(ticket_id, provider_metadata)
+
         hw = fields["assigned_hardware_ips"]
         summary = (
             f"**Resource Allocation Complete**\n\n"
@@ -652,3 +657,30 @@ class ResourceAgent(AgentBase):
             "awaiting_provision",
             comment="Hardware validated, ready for provisioning",
         )
+
+    async def _update_fleet_total(
+        self,
+        ticket_id: str,
+        provider_metadata: dict[str, Any],
+    ) -> None:
+        """Update fleet investigation tracking.
+
+        Stores the target selector for loop-back exclusion.
+        Does NOT set a fixed total — device availability
+        changes as other users lease/release boards.
+        """
+        from providers.fleet import is_fleet_investigation
+
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if not is_fleet_investigation(cf):
+            return
+
+        fleet = cf.get("fleet_investigation", {})
+        selector = provider_metadata.get("selector", "")
+        if selector and not fleet.get("target_selector"):
+            fleet["target_selector"] = selector
+            await self._update_fields(
+                ticket_id,
+                {"fleet_investigation": fleet},
+            )

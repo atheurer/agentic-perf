@@ -867,7 +867,7 @@ class AgentBase(ABC):
             "transition",
             {
                 "to": new_status,
-                "comment": comment,
+                "comment": comment or "",
                 "ticket_id": ticket_id,
             },
         )
@@ -999,3 +999,95 @@ class AgentBase(ABC):
                 comment=f"HITL timeout — resuming from {prev}",
             )
         return "No response received within timeout. Proceed with best judgment."
+
+    async def _suspend_for_async(
+        self,
+        ticket_id: str,
+        wait_type: str,
+        operation_id: str,
+        resume_to_status: str,
+        resume_context: dict[str, Any] | None = None,
+        expected_duration_mins: int = 60,
+    ) -> None:
+        """Suspend the agent for a long-running async operation.
+
+        Writes execution context to the ticket and transitions
+        to ``async_wait``.  The agent exits cleanly (LLM session
+        ends, compute released).  The orchestrator monitors for
+        timeout; completion is signaled externally via the
+        CloudEvents signal endpoint
+        (``POST /api/v1/tickets/{id}/signal``).
+
+        This is the machine-signal equivalent of
+        ``_request_human_input`` — same park-and-resume pattern,
+        but the signal comes from hardware completion instead
+        of a human reply.
+
+        The external system that completes the operation sends
+        a CloudEvents POST with ``id`` matching ``operation_id``
+        to resume the ticket.
+
+        Args:
+            ticket_id: Ticket to suspend.
+            wait_type: What we're waiting for
+                (e.g., ``benchmark_execution``, ``provisioning``).
+            operation_id: Unique ID for the operation (run ID,
+                lease ID, etc.).  Must match the CloudEvent
+                ``id`` field in the completion signal.
+            resume_to_status: Status to transition to when the
+                operation completes.
+            resume_context: Dict of context the resumed agent
+                needs (what to analyze, harness, run ID, etc.).
+                Stored in ``custom_fields.async_context``.
+            expected_duration_mins: Estimated duration for
+                timeout detection (timeout = 2x this value).
+        """
+        from datetime import datetime, timezone
+
+        async_context: dict[str, Any] = {
+            "wait_type": wait_type,
+            "operation_id": operation_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "expected_duration_mins": expected_duration_mins,
+            "resume_to_status": resume_to_status,
+            "resume_context": resume_context or {},
+            "suspended_by": self.agent_name,
+        }
+
+        await self._update_fields(
+            ticket_id,
+            {"async_context": async_context},
+        )
+
+        self._emit(
+            ticket_id,
+            "async_suspend",
+            {
+                "wait_type": wait_type,
+                "operation_id": operation_id,
+                "resume_to_status": resume_to_status,
+                "expected_duration_mins": expected_duration_mins,
+            },
+        )
+
+        await self._add_comment(
+            ticket_id,
+            f"**Async suspension:** {self.agent_name} has "
+            f"started a long-running {wait_type} operation "
+            f"(~{expected_duration_mins} min expected). The "
+            f"LLM session is parked to save compute. The "
+            f"orchestrator will resume automatically when "
+            f"the operation completes.",
+        )
+
+        await self._transition_ticket(
+            ticket_id,
+            "async_wait",
+            comment=(f"Async suspend: {wait_type} (op={operation_id})"),
+        )
+
+        logger.info(
+            f"[{self.agent_name}] Suspended {ticket_id} for "
+            f"{wait_type} (op={operation_id}, "
+            f"resume_to={resume_to_status})"
+        )

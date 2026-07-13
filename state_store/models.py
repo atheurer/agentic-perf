@@ -25,6 +25,11 @@ class TicketStatus(str, Enum):
     EVALUATING_CONVERGENCE = "evaluating_convergence"
     SYNTHESIZING_RESULTS = "synthesizing_results"
 
+    # Async suspension — LLM parked while hardware
+    # operations run (provisioning, benchmark execution).
+    # The orchestrator monitors for completion and resumes.
+    ASYNC_WAIT = "async_wait"
+
 
 TERMINAL_STATUSES: set[TicketStatus] = {TicketStatus.CLOSED}
 PAUSED_STATUSES: set[TicketStatus] = {TicketStatus.AWAITING_CUSTOMER_GUIDANCE}
@@ -40,6 +45,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.AWAITING_HARDWARE: [
         TicketStatus.AWAITING_PROVISION,
+        TicketStatus.GATHERING_CONTEXT,  # investigation redirect
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_PROVISION: [
@@ -48,6 +54,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_TEARDOWN,  # plan-driven
         TicketStatus.AWAITING_REVIEW,  # plan-driven
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+        TicketStatus.ASYNC_WAIT,  # suspend during long provision
     ],
     TicketStatus.EXECUTING_BENCHMARK: [
         TicketStatus.AWAITING_REVIEW,
@@ -56,6 +63,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_TEARDOWN,  # plan-driven teardown after benchmark
         TicketStatus.AWAITING_HARDWARE,  # plan-driven infrastructure cycle
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+        TicketStatus.ASYNC_WAIT,  # suspend during long benchmark
     ],
     TicketStatus.AWAITING_REVIEW: [
         TicketStatus.AWAITING_TEARDOWN,
@@ -75,6 +83,15 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_CUSTOMER_GUIDANCE: [],  # filled dynamically
+    # Async wait can resume to any operational status.
+    # The target is stored in custom_fields.async_context.resume_to_status.
+    TicketStatus.ASYNC_WAIT: [
+        TicketStatus.AWAITING_PROVISION,
+        TicketStatus.EXECUTING_BENCHMARK,
+        TicketStatus.AWAITING_REVIEW,
+        TicketStatus.EVALUATING_CONVERGENCE,
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+    ],
     TicketStatus.RETROSPECTIVE_PENDING: [
         TicketStatus.CLOSED,
     ],
@@ -101,6 +118,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # the evaluate agent to sequence additional benchmark runs.
     TicketStatus.EVALUATING_CONVERGENCE: [
         TicketStatus.PLANNING_INVESTIGATION,  # refine params
+        TicketStatus.AWAITING_HARDWARE,  # fleet: next device
         TicketStatus.AWAITING_PROVISION,  # re-flash hardware
         TicketStatus.SYNTHESIZING_RESULTS,  # convergence gate met
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # manual interrupt

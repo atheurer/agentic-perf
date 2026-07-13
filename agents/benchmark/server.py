@@ -1540,6 +1540,17 @@ async def execute_boot_time_test(
             }
         )
 
+    # ── Clear stale host keys ─────────────────────────
+    # Flashing always changes host keys. Clear stale
+    # entries to prevent SSH "host key changed" errors.
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["ssh-keygen", "-R", sut_host],
+        capture_output=True,
+        timeout=5,
+    )
+
     # ── Wait for SSH readiness ─────────────────────────
     # Freshly provisioned boards may not have SSH ready
     # immediately. Wait up to 60s for port 22.
@@ -1612,13 +1623,55 @@ async def execute_boot_time_test(
     # Auto-enable Jumpstarter serial capture when a
     # Jumpstarter lease is active. Serial data is written
     # to files — it does NOT flow into LLM context.
+    #
+    # When the Jumpstarter MCP connection is active, the
+    # socket is at /tmp/jumpstarter-*/socket. Pass it as
+    # JUMPSTARTER_HOST so boot-timings-test.sh uses the
+    # existing connection instead of creating a new one
+    # via `jmp shell --lease` (which would conflict with
+    # the active MCP connection).
+    jumpstarter_env: dict[str, str] = {}
     if _ticket:
         fields = _ticket.get("custom_fields", {})
         metadata = fields.get("resource_provider_metadata", {})
         lease_id = metadata.get("lease_id", "")
         if lease_id and fields.get("resource_provider") == "jumpstarter":
             cmd.append("--jumpstarter-serial")
-            cmd.append(f"--jumpstarter-lease-name={lease_id}")
+            # Find an active Jumpstarter socket. The
+            # provisioning agent's MCP subprocess may
+            # have exited, leaving a dead socket file.
+            # Verify connectivity before using it.
+            import socket as _sock
+
+            jmp_sockets = sorted(
+                Path("/tmp").glob("jumpstarter-*/socket"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            live_socket = None
+            for sp in jmp_sockets:
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                try:
+                    s.connect(str(sp))
+                    s.close()
+                    live_socket = sp
+                    break
+                except (OSError, ConnectionRefusedError):
+                    s.close()
+                    continue
+
+            if live_socket:
+                jumpstarter_env["JUMPSTARTER_HOST"] = str(live_socket)
+                logger.info(f"[boot-time] Using live Jumpstarter socket: {live_socket}")
+            else:
+                # No live socket — fall back to jmp shell
+                # which creates a new connection from the
+                # lease.
+                cmd.append(f"--jumpstarter-lease-name={lease_id}")
+                logger.info(
+                    "[boot-time] No live Jumpstarter socket "
+                    "found, using --jumpstarter-lease-name"
+                )
 
     # Separator for boot-time-analysis-tools arguments
     cmd.append("--")
@@ -1634,11 +1687,16 @@ async def execute_boot_time_test(
     # Run from output_dir so boot-timings-test.sh creates
     # its results folder (and SCPs files) here, not relative
     # to the scripts repo.
+    # Merge Jumpstarter env vars with current environment
+    import os as _os
+
+    run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
     proc = await _asyncio.create_subprocess_exec(
         *cmd,
         stdout=_asyncio.subprocess.PIPE,
         stderr=_asyncio.subprocess.PIPE,
         cwd=str(output_dir),
+        env=run_env,
     )
     stdout_bytes, stderr_bytes = await proc.communicate()
     exit_code = proc.returncode or 0
@@ -1775,8 +1833,27 @@ async def execute_boot_time_test(
             "avg_userspace_s": _avg(sa_userspaces),
         }
 
+    # KPI pattern was requested but no matching data found.
+    # This indicates the board didn't produce expected boot
+    # metrics — treat as a node-level failure condition.
+    kpi_failure = False
+    if kpi_pattern and exit_code == 0:
+        has_kpi_data = bool(
+            kpis.get("avg_kernel_s")
+            or kpis.get("avg_initrd_s")
+            or kpis.get("avg_userspace_s")
+        )
+        if not has_kpi_data:
+            kpi_failure = True
+
+    status = "completed"
+    if exit_code != 0:
+        status = "failed"
+    elif kpi_failure:
+        status = "completed_no_kpi"
+
     response: dict[str, Any] = {
-        "status": "completed" if exit_code == 0 else "failed",
+        "status": status,
         "exit_code": exit_code,
         "run_id": f"boot-time-{run_uuid}",
         "harness": "boot-time",
@@ -1785,7 +1862,14 @@ async def execute_boot_time_test(
         "output_dir": str(output_dir),
         "message": (
             f"Boot time test completed ({len(boot_time_logs)}/{samples} samples)"
-            if exit_code in (0, 2)
+            if exit_code in (0, 2) and not kpi_failure
+            else (
+                "Boot time test completed but expected KPI "
+                "patterns not found (kernel/initrd/userspace). "
+                "The board may not be producing valid boot "
+                "metrics. This is a node-level issue."
+            )
+            if kpi_failure
             else f"Boot time test failed (exit {exit_code})"
         ),
     }
@@ -1811,6 +1895,52 @@ async def execute_boot_time_test(
     if exit_code not in (0, 2):
         response["output"] = stdout_str[-3000:]
         response["error"] = stderr_str[-1000:]
+    else:
+        # On success, include a compact summary so the
+        # evaluate agent can see serial capture status
+        # and key metrics without the full log.
+        summary_lines = []
+        for line in stdout_str.split("\n"):
+            ll = line.lower()
+            if any(
+                k in ll
+                for k in (
+                    "serial capture",
+                    "jumpstarter",
+                    "sample",
+                    "error",
+                    "\u2713",
+                    "\u2717",
+                    "boot_time",
+                    "kpi",
+                    "warning",
+                    "failed",
+                )
+            ):
+                summary_lines.append(line.rstrip())
+        if summary_lines:
+            response["output_summary"] = "\n".join(summary_lines[-30:])
+
+    # Save output_dir to ticket so the evaluate agent
+    # can find artifacts. The LLM's submit_benchmark_result
+    # doesn't include output_dir, so we write it directly.
+    if _ticket and response.get("output_dir"):
+        try:
+            import os
+
+            import httpx
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            ticket_id = _ticket.get("id", "")
+            if ticket_id:
+                httpx.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"output_dir": response["output_dir"]}},
+                    timeout=10.0,
+                )
+                logger.info(f"[boot-time] Saved output_dir to ticket {ticket_id}")
+        except Exception:
+            logger.warning("Failed to save output_dir", exc_info=True)
 
     return json.dumps(response)
 
