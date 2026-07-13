@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -26,10 +27,18 @@ class StubAgent:
         self.custom_fields = custom_fields or {}
         self.delay = delay
 
+    def _auth_headers(self) -> dict[str, str]:
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+        return {}
+
     async def run(self, ticket_id: str) -> None:
         logger.info(f"[{self.agent_name}] Processing ticket {ticket_id}")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0, headers=self._auth_headers()
+        ) as client:
             await asyncio.sleep(self.delay)
 
             if self.custom_fields:
