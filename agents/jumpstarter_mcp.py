@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -80,7 +81,9 @@ async def attach_jumpstarter_mcp(
         list_tools(include=...)), or None if not attached.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        _headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
             if r.status_code != 200:
                 return False
@@ -153,7 +156,9 @@ async def suspend_for_device_ready(
     return immediately), False otherwise.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        _headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
             if r.status_code != 200:
                 return False
