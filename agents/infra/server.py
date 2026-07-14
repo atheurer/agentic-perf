@@ -35,7 +35,7 @@ from agents.infra.command_policy import (
     load_policy,
 )
 from agents.server_utils import build_secrets_provider as _build_secrets
-from providers.ssh import SSHExecutor, SSHResult, _PID_SENTINEL, parse_pid_sentinel
+from providers.ssh import _PID_SENTINEL, SSHExecutor, SSHResult, parse_pid_sentinel
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,9 @@ def _emit_approval_event(
         with open(path, "a", encoding="utf-8") as f:
             f.write(_json.dumps(event, default=str) + "\n")
     except OSError:
-        logger.warning("Failed to write approval audit event for %s", _ticket_id, exc_info=True)
+        logger.warning(
+            "Failed to write approval audit event for %s", _ticket_id, exc_info=True
+        )
 
 
 def _get_ssh() -> SSHExecutor:
@@ -460,7 +462,9 @@ async def _request_approval(command: str, binary: str, host: str) -> str:
                     )
                     return status
             except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException):
-                logger.warning("Error polling for approval of %s", command[:80], exc_info=True)
+                logger.warning(
+                    "Error polling for approval of %s", command[:80], exc_info=True
+                )
 
     logger.warning("Approval timeout for: %s", command[:120])
     return "denied"
@@ -749,7 +753,9 @@ async def test_port_connectivity(
         listen_ip: str,
         label: str,
     ) -> dict[str, Any]:
-        bg_cmd = f"nohup nc -l {listen_ip} {port} > /dev/null 2>&1 & echo {_PID_SENTINEL}$!"
+        bg_cmd = (
+            f"nohup nc -l {listen_ip} {port} > /dev/null 2>&1 & echo {_PID_SENTINEL}$!"
+        )
         start = await ssh.run(listener_ssh, bg_cmd, timeout=10)
         pid = parse_pid_sentinel(start.stdout or "")
 

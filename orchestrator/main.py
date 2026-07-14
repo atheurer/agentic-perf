@@ -510,8 +510,9 @@ async def _check_stale_tasks(
     2. Ticket updated_at from the state store (covers progress
        comments posted by MCP subprocess tools like run_with_progress)
     """
+    from datetime import datetime
+
     import httpx
-    from datetime import datetime, timezone
 
     now = time.time()
     for tid, task in dispatcher.active_tasks().items():

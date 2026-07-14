@@ -16,6 +16,12 @@ def _load_config_file() -> dict:
 
 
 class OrchestratorConfig:
+    _BUILTIN_AGENT_MODELS: dict[str, dict[str, str]] = {
+        "triage": {"model": "claude-sonnet-4-6"},
+        "evaluating_convergence": {"model": "claude-sonnet-4-6"},
+        "retrospective": {"model": "claude-sonnet-4-6"},
+    }
+
     def __init__(
         self,
         state_store_url: str | None = None,
@@ -140,12 +146,22 @@ class OrchestratorConfig:
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 
-        Resolution order: agent_models.<type> → agent_models.default → top-level llm config.
+        Resolution order:
+        1. agent_models.<type>         — explicit per-agent config
+        2. agent_models.default        — explicit catch-all config
+        3. _BUILTIN_AGENT_MODELS.<type> — built-in defaults for
+           reasoning-heavy agents (e.g. Sonnet for triage)
+        4. top-level llm config        — global default
         """
         if agent_type in self._agent_models:
             return dict(self._agent_models[agent_type])
         if "default" in self._agent_models:
             return dict(self._agent_models["default"])
+        builtin = self._BUILTIN_AGENT_MODELS.get(agent_type)
+        if builtin:
+            base = {"provider": self.llm_provider, "model": self.llm_model}
+            base.update(builtin)
+            return base
         return {"provider": self.llm_provider, "model": self.llm_model}
 
 

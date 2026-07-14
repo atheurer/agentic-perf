@@ -357,12 +357,104 @@ class TestResponseParsing:
 class TestConfigResolution:
     """Test per-agent model config resolution."""
 
-    def test_default_config(self):
+    def test_default_config_non_builtin_agent(self):
         from orchestrator.config import OrchestratorConfig
 
         config = OrchestratorConfig(llm_provider="claude", llm_model="claude-haiku-4-5")
-        result = config.get_agent_llm_config("triage")
+        result = config.get_agent_llm_config("benchmark")
         assert result == {"provider": "claude", "model": "claude-haiku-4-5"}
+
+    def test_builtin_defaults_apply(self):
+        """Reasoning-heavy agents get Sonnet by default, others get global."""
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig(llm_provider="claude", llm_model="claude-haiku-4-5")
+        for agent in ("triage", "evaluating_convergence", "retrospective"):
+            result = config.get_agent_llm_config(agent)
+            assert result == {"provider": "claude", "model": "claude-sonnet-4-6"}, (
+                f"{agent} should default to Sonnet"
+            )
+        result = config.get_agent_llm_config("benchmark")
+        assert result["model"] == "claude-haiku-4-5", (
+            "benchmark should use global default"
+        )
+
+    def test_builtin_defaults_inherit_provider(self):
+        """Built-in defaults use the global provider, not a hardcoded one."""
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig(llm_provider="gemini", llm_model="gemini-2.5-flash")
+        result = config.get_agent_llm_config("triage")
+        assert result["provider"] == "gemini"
+        assert result["model"] == "claude-sonnet-4-6"
+
+    def test_explicit_config_overrides_builtin(self, tmp_path):
+        """User's agent_models.<type> takes priority over built-in defaults."""
+        import json
+
+        from orchestrator.config import OrchestratorConfig
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "agent_models": {
+                        "triage": {
+                            "provider": "anthropic",
+                            "model": "claude-opus-4-8",
+                        },
+                    },
+                }
+            )
+        )
+
+        import orchestrator.config as cfg_mod
+
+        original = cfg_mod.CONFIG_PATH
+        cfg_mod.CONFIG_PATH = config_file
+        try:
+            config = OrchestratorConfig()
+            assert config.get_agent_llm_config("triage")["model"] == "claude-opus-4-8"
+            assert (
+                config.get_agent_llm_config("evaluating_convergence")["model"]
+                == "claude-sonnet-4-6"
+            )
+        finally:
+            cfg_mod.CONFIG_PATH = original
+
+    def test_default_config_overrides_builtin(self, tmp_path):
+        """User's agent_models.default takes priority over built-in defaults."""
+        import json
+
+        from orchestrator.config import OrchestratorConfig
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "agent_models": {
+                        "default": {
+                            "provider": "gemini",
+                            "model": "gemini-2.5-flash",
+                        },
+                    },
+                }
+            )
+        )
+
+        import orchestrator.config as cfg_mod
+
+        original = cfg_mod.CONFIG_PATH
+        cfg_mod.CONFIG_PATH = config_file
+        try:
+            config = OrchestratorConfig()
+            assert config.get_agent_llm_config("triage")["model"] == "gemini-2.5-flash"
+            assert (
+                config.get_agent_llm_config("retrospective")["model"]
+                == "gemini-2.5-flash"
+            )
+        finally:
+            cfg_mod.CONFIG_PATH = original
 
     def test_agent_specific_override(self, tmp_path):
         import json

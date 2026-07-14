@@ -17,9 +17,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def ticket(store):
-    return store.create_ticket(
-        CreateTicketRequest(summary="test", description="test")
-    )
+    return store.create_ticket(CreateTicketRequest(summary="test", description="test"))
 
 
 class TestClaimTicket:

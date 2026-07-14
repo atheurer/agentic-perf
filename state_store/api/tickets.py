@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from ..models import ClaimRequest, CreateTicketRequest, TicketStatus, UpdateFieldsRequest
+from ..models import (
+    ClaimRequest,
+    CreateTicketRequest,
+    TicketStatus,
+    UpdateFieldsRequest,
+)
 from ..store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])

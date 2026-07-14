@@ -14,9 +14,7 @@ class TestParsePidSentinel:
         assert parse_pid_sentinel("__PID:12345\n") == 12345
 
     def test_noisy_output(self):
-        assert parse_pid_sentinel(
-            "nohup: ignoring input\nsome motd\n__PID:42\n"
-        ) == 42
+        assert parse_pid_sentinel("nohup: ignoring input\nsome motd\n__PID:42\n") == 42
 
     def test_trailing_text_after_pid(self):
         assert parse_pid_sentinel("__PID:99\nsome trailing line\n") == 99
@@ -345,8 +343,6 @@ class TestRunWithProgress:
             pass
 
         with patch("asyncio.sleep", noop_sleep):
-            result = await ssh.run_with_progress(
-                "10.0.0.1", "cmd", poll_interval=1
-            )
+            result = await ssh.run_with_progress("10.0.0.1", "cmd", poll_interval=1)
 
         assert result.exit_code == 0

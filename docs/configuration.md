@@ -137,9 +137,24 @@ cheaper model for triage and a more capable one for review.
 **Resolution order:**
 1. `agent_models.<agent_type>` — exact match for the agent
 2. `agent_models.default` — fallback if no exact match
-3. Top-level `llm.provider` / `llm.model` — global default
+3. Built-in agent defaults — reasoning-heavy agents default to Sonnet
+4. Top-level `llm.provider` / `llm.model` — global default
 
 Each override object supports `provider` and `model` keys.
+
+#### Built-in Agent Defaults
+
+Some agents perform reasoning-heavy work and default to a more capable
+model even when the global default is set to a cheaper model. These
+built-in defaults apply only when no `agent_models` configuration is
+present — any explicit `agent_models` entry (including `default`)
+takes priority.
+
+| Agent type | Built-in model |
+|---|---|
+| `triage` | `claude-sonnet-4-6` |
+| `evaluating_convergence` | `claude-sonnet-4-6` |
+| `retrospective` | `claude-sonnet-4-6` |
 
 #### Agent Type Names
 

@@ -237,7 +237,9 @@ def _emit_tool_progress_event(
         with open(path, "a", encoding="utf-8") as f:
             f.write(_json.dumps(event, default=str) + "\n")
     except OSError:
-        logger.debug("Failed to write tool_progress event for %s", ticket_id, exc_info=True)
+        logger.debug(
+            "Failed to write tool_progress event for %s", ticket_id, exc_info=True
+        )
 
 
 def build_investigation_provider():

@@ -171,7 +171,7 @@ async def test_execute_command_double_amp_preserved():
         patch.object(infra, "_ssh", mock_ssh),
         patch.object(infra, "_policy", None),
     ):
-        result = await infra.execute_command(
+        await infra.execute_command(
             host="10.0.0.1",
             command="echo ok &amp;&amp; echo done",
         )
@@ -189,8 +189,15 @@ async def test_stop_background_command():
     mock_ssh.run = AsyncMock(return_value=_make_ssh_result(exit_code=1))
 
     bg_id = "bg-test1234"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 12345, "command": "nc -l",
-                     "dir": "/tmp/bg-test1234", "out_file": "/tmp/bg-test1234/out"}}
+    pids = {
+        bg_id: {
+            "host": "10.0.0.1",
+            "pid": 12345,
+            "command": "nc -l",
+            "dir": "/tmp/bg-test1234",
+            "out_file": "/tmp/bg-test1234/out",
+        }
+    }
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
@@ -234,8 +241,15 @@ async def test_check_background_command():
     )
 
     bg_id = "bg-check123"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 67890, "command": "nc -l",
-                     "dir": "/tmp/bg-check123", "out_file": "/tmp/bg-check123/out"}}
+    pids = {
+        bg_id: {
+            "host": "10.0.0.1",
+            "pid": 67890,
+            "command": "nc -l",
+            "dir": "/tmp/bg-check123",
+            "out_file": "/tmp/bg-check123/out",
+        }
+    }
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
@@ -262,8 +276,15 @@ async def test_check_background_command_not_running():
     )
 
     bg_id = "bg-dead1234"
-    pids = {bg_id: {"host": "10.0.0.1", "pid": 11111, "command": "nc -l",
-                     "dir": "/tmp/bg-dead1234", "out_file": "/tmp/bg-dead1234/out"}}
+    pids = {
+        bg_id: {
+            "host": "10.0.0.1",
+            "pid": 11111,
+            "command": "nc -l",
+            "dir": "/tmp/bg-dead1234",
+            "out_file": "/tmp/bg-dead1234/out",
+        }
+    }
 
     with (
         patch.object(infra, "_ssh", mock_ssh),
