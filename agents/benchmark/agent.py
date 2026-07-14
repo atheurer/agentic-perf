@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -165,6 +166,23 @@ class BenchmarkAgent(AgentBase):
             return f"{BENCHMARK_BASE_PROMPT}\n\n{fragments}"
         return BENCHMARK_BASE_PROMPT
 
+    @staticmethod
+    def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
+        """SHA-256 fingerprint of the current execution plan step's mv_params."""
+        plan = cf.get("execution_plan")
+        if not plan:
+            return "no-plan"
+        steps = plan.get("steps", [])
+        idx = plan.get("current_step", 0)
+        if idx >= len(steps):
+            return "no-plan"
+        mv_params = steps[idx].get("params", {}).get("mv_params")
+        if not mv_params:
+            return "no-mv-params"
+        return hashlib.sha256(
+            json.dumps(mv_params, sort_keys=True).encode()
+        ).hexdigest()
+
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
         scoped = self._get_scoped_context(ticket, "benchmark")
@@ -261,6 +279,30 @@ class BenchmarkAgent(AgentBase):
                 content += (
                     f"\n**Previous run IDs from earlier steps:** "
                     f"{', '.join(plan['run_ids'])}\n"
+                )
+
+        validated = cf.get("validated_run_file")
+        if validated:
+            current_fp = self._compute_params_fingerprint(cf)
+            stored_fp = validated.get("params_fingerprint", "")
+            if current_fp == stored_fp:
+                content += (
+                    "\n## Previously Validated Run-File\n"
+                    "A prior agent run validated this run-file for the "
+                    "current parameters. You may reuse it as-is by "
+                    "passing it directly to `execute_benchmark`, or "
+                    "modify it if the ticket context has changed.\n\n"
+                    f"**Harness:** {validated.get('harness', 'unknown')}\n"
+                    f"```json\n"
+                    f"{json.dumps(validated.get('run_file', {}), indent=2)}"
+                    f"\n```\n"
+                )
+            else:
+                content += (
+                    "\n*Note: A previously validated run-file exists "
+                    "but its parameters fingerprint does not match the "
+                    "current execution plan step. Build a fresh "
+                    "run-file.*\n"
                 )
 
         if ticket.get("comments"):

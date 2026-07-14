@@ -91,6 +91,7 @@ class MockSkillProvider(SkillProvider):
         runfile_schema: dict[str, Any] | None = None,
         benchmark_params: dict[str, dict[str, Any]] | None = None,
         example_runfiles: dict[str, dict[str, Any]] | None = None,
+        validation_result: dict[str, Any] | None = None,
     ) -> None:
         self._benchmarks = benchmarks or []
         self._resolve_result = resolve_result
@@ -99,6 +100,7 @@ class MockSkillProvider(SkillProvider):
         self._runfile_schema = runfile_schema
         self._benchmark_params = benchmark_params or {}
         self._example_runfiles = example_runfiles or {}
+        self._validation_result = validation_result
 
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         return list(self._benchmarks)
@@ -136,6 +138,13 @@ class MockSkillProvider(SkillProvider):
 
     async def get_all_private_config(self, suite_name: str) -> dict[str, Any]:
         return dict(self._private_config.get(suite_name, {}))
+
+    async def validate_runfile(
+        self, run_file: dict[str, Any], harness: str | None = None
+    ) -> dict[str, Any]:
+        if self._validation_result is not None:
+            return self._validation_result
+        return {"valid": True, "errors": []}
 
 
 @dataclass
