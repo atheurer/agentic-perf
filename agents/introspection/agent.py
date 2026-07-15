@@ -23,6 +23,7 @@ from providers.events import EventBus
 
 from .server import (
     _detect_anomalies_from_events,
+    _is_tool_failure,
     _read_events,
     _truncate_event,
 )
@@ -180,9 +181,7 @@ class IntrospectionAgent:
                 agent_counts[agent] = agent_counts.get(agent, 0) + 1
             if evt.get("event_type") == "llm_request":
                 llm_call_count += 1
-            if evt.get("event_type") == "tool_result" and evt.get("data", {}).get(
-                "is_error"
-            ):
+            if _is_tool_failure(evt):
                 tool_error_count += 1
 
         # Build a concise status summary.

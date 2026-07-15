@@ -77,9 +77,21 @@ log review.
 
 | Anomaly | Severity | Description |
 |---|---|---|
-| Repeated tool errors | medium/high | Same tool failing 3+ times (high at 5+) |
+| Consecutive failures | medium/high | Same tool failing 2+ times in a row with similar errors, even when the agent changes input flags between retries |
+| Repeated tool errors | medium/high | Same tool failing 3+ times total (non-consecutive) |
 | Retry loops | medium/high | Same tool called with identical input 3+ times |
+| Wasted iterations | medium/high | 25%+ of an agent's LLM calls produced only failed tool results |
 | Max iterations | high | Agent exhausted its iteration budget |
+
+The detection also classifies errors:
+- **Infrastructure** (port conflict, disk full, permission denied) — retrying won't help
+- **Transient** (timeout, rate limit, connection reset) — retrying may help
+- **Logic** (wrong arguments, missing prerequisites) — agent needs a different approach
+
+Importantly, failures are detected from tool result *content*, not just
+the `is_error` flag. MCP tools that return `{"exit_code": 1, "error": "..."}`
+or `{"success": false}` are recognized as failures even when the tool
+handler itself didn't crash.
 
 ### Enabling
 
@@ -94,6 +106,35 @@ Globally in `~/.agentic-perf/config.json`:
 
 Or per-ticket via `custom_fields.introspection_enabled: true` at
 submission time.
+
+### Customizing Detection
+
+Detection parameters are loaded from skill files, not hardcoded.
+Tune for your environment:
+
+**Error patterns** (`skills/introspection/error-patterns.yaml`):
+Regex patterns for classifying errors as infrastructure, transient,
+or logic. Add org-specific patterns via private skills.
+
+**Detection thresholds** (`skills/introspection/detection-thresholds.yaml`):
+Consecutive failure count, similarity threshold, wasted iteration
+percentage, retry loop count, etc. Override via private skills.
+
+**Private overrides** (`~/.agentic-perf/private-skills/introspection.json`):
+```json
+{
+    "error_patterns": {
+        "infrastructure": ["our custom storage error"]
+    },
+    "thresholds": {
+        "consecutive_failure_min": 3,
+        "wasted_iterations_pct": 40
+    }
+}
+```
+
+Private error patterns are *appended* to the shipped defaults.
+Private thresholds *replace* matching shipped defaults.
 
 ### Viewing Results
 

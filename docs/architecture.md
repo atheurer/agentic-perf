@@ -469,10 +469,23 @@ The introspection agent:
   avoid missing early events
 - Polls the event stream every 5 seconds with incremental reads
 - Accumulates full event history for pattern detection
-- Detects: repeated tool errors (3+), retry loops (same tool/input 3+
-  times), and max iteration exhaustion
+- Detects content-based tool failures (not just `is_error` — also
+  non-zero exit codes, `success: false`, `status: failed` in tool
+  result JSON)
+- Detects consecutive tool failures with similar error output, even
+  when the agent changes input flags between retries
+- Classifies errors as infrastructure (retrying won't help), transient
+  (may resolve), or logic (agent needs a different approach)
+- Computes wasted iteration ratio per agent (LLM calls that produced
+  only failed tool results)
+- Detects retry loops and max iteration exhaustion
 - Stops automatically when the ticket reaches a terminal status
 - Never transitions ticket state or modifies agent behavior (Phase 1)
+
+Detection parameters (error patterns, thresholds, severity escalation)
+are loaded from skill files (`skills/introspection/`) with private-
+skills overrides (`~/.agentic-perf/private-skills/introspection.json`).
+See [Skill Documentation](#skill-documentation) for the pattern.
 
 Enabling introspection:
 - Globally: `introspection.enabled = true` in config.json or

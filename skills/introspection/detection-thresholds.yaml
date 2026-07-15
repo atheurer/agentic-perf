@@ -1,0 +1,48 @@
+# Anomaly detection thresholds for the introspection agent.
+#
+# These control when the introspection agent flags anomalies.
+# Tune for your environment — noisy infrastructure may need
+# higher thresholds; critical workloads may need lower ones.
+#
+# Private overrides: place in
+#   ~/.agentic-perf/private-skills/introspection.json
+# under the "thresholds" key (values merged at load).
+
+# --- Consecutive tool failures ---
+# Minimum consecutive failures of the same tool (with similar
+# error output) before flagging.
+consecutive_failure_min: 2
+
+# Severity escalation: "high" at this count, "medium" below.
+consecutive_failure_high: 4
+
+# Jaccard word-overlap threshold (0.0–1.0) for considering
+# two error messages as "same root cause." Lower = more
+# permissive grouping.
+error_similarity_threshold: 0.3
+
+# --- Repeated errors (non-consecutive) ---
+# Total failures of the same tool across the ticket before
+# flagging (when not already reported as consecutive).
+repeated_error_min: 3
+
+# Severity escalation threshold.
+repeated_error_high: 5
+
+# --- Retry loops (identical input) ---
+# Same tool called with identical input this many times.
+retry_loop_min: 3
+retry_loop_high: 5
+
+# --- Wasted iterations ---
+# Minimum LLM calls for an agent before computing waste ratio.
+wasted_iterations_min_calls: 4
+
+# Minimum wasted calls before flagging.
+wasted_iterations_min_wasted: 2
+
+# Percentage threshold — flag when this % of calls are wasted.
+wasted_iterations_pct: 25
+
+# Severity escalation percentage.
+wasted_iterations_high_pct: 50
