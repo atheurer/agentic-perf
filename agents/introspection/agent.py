@@ -1,171 +1,265 @@
-"""Introspection agent — real-time passive observer for running tickets.
+"""Introspection agent — continuous passive observer for running tickets.
 
 This agent is out-of-band: it does NOT participate in the normal
 agent execution chain and does NOT transition ticket state. It
-watches the event stream and provides analysis to the user.
+runs as a companion task alongside the active agents, continuously
+watching the event stream and updating its observations.
 
-Phase 1: Passive observer (read-only).
+Phase 1: Passive observer (read-only, continuous).
 Phase 2: Active monitor (soft-stop signals).
 Phase 3: Corralling (guidance injection).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from pathlib import Path
+import os
 from typing import Any
 
-from agents.base import AgentBase
-from agents.mcp_client import AgentMCPClient
-from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+import httpx
 
-from .mcp_server import get_introspection_tools
-from .prompts import INTROSPECTION_SYSTEM_PROMPT
+from providers.events import EventBus
+
+from .server import (
+    _detect_anomalies_from_events,
+    _read_events,
+    _truncate_event,
+)
 
 logger = logging.getLogger(__name__)
 
-# Tools served via MCP (everything except submit_observation)
-_MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_introspection_tools() if t.name != "submit_observation"
-)
+# Statuses where the ticket is done — stop watching.
+_TERMINAL_STATUSES = frozenset({"closed"})
+
+# How often to poll for new events (seconds).
+_POLL_INTERVAL = 5.0
+
+# How many events to fetch per poll cycle.
+_POLL_BATCH_SIZE = 200
 
 
-class IntrospectionAgent(AgentBase):
-    """Passive observer agent for monitoring ticket execution.
+class IntrospectionAgent:
+    """Continuous passive observer for a running ticket.
 
     Unlike other agents, the introspection agent:
+    - Does NOT extend AgentBase (no LLM loop)
     - Does NOT transition ticket state
     - Does NOT participate in the dispatch loop
-    - Is invoked on-demand (not by the orchestrator)
-    - Reads the event stream but does not write to it
-      (except its own observation events)
+    - Runs as a background asyncio task alongside real agents
+    - Polls the event stream and writes observations to
+      custom_fields.introspection
+
+    The agent runs until the ticket reaches a terminal status
+    or is explicitly stopped via cancellation.
     """
 
     def __init__(
         self,
-        llm_provider: LLMProvider,
         state_store_url: str,
         event_bus: EventBus | None = None,
     ) -> None:
-        # Only keep submit_observation as a local tool;
-        # the read-only tools are served via MCP.
-        local_tools = [
-            t for t in get_introspection_tools() if t.name not in _MCP_TOOL_NAMES
-        ]
+        self.store_url = state_store_url.rstrip("/")
+        self._events = event_bus
+        self._last_seq = 0
+        self._all_events: list[dict[str, Any]] = []
+        self._stop_requested = False
+        headers: dict[str, str] = {}
+        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
 
-        super().__init__(
-            agent_name="introspection-agent",
-            llm_provider=llm_provider,
-            state_store_url=state_store_url,
-            tools=local_tools,
-            tool_handlers={},
-            event_bus=event_bus,
-            # Introspection is lightweight — fewer iterations
-            # needed since it's summarizing, not executing.
-            max_iterations=10,
-        )
+    def request_stop(self) -> None:
+        """Request graceful shutdown of the observation loop."""
+        self._stop_requested = True
+
+    async def close(self) -> None:
+        """Clean up HTTP client."""
+        await self._client.aclose()
 
     async def run(self, ticket_id: str) -> None:
-        """Run introspection on a ticket.
+        """Continuously observe a ticket until it reaches a terminal state.
 
-        Connects to the MCP server for read-only event access,
-        then runs the standard LLM loop with observation tools.
+        Polls the JSONL event stream, detects anomalies, and writes
+        a summary to custom_fields.introspection on each cycle that
+        has new events.
         """
-        introspection_server = str(Path(__file__).with_name("server.py"))
+        logger.info(f"[introspection] Starting observation of {ticket_id}")
 
-        mcp = AgentMCPClient()
-        await mcp.connect(
-            introspection_server,
-            name="introspection",
-            env={
-                "TICKET_ID": ticket_id,
-                "STATE_STORE_URL": self.store_url,
-            },
-        )
-        self._mcp = mcp
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        if self._events:
+            self._events.emit(
+                ticket_id,
+                "introspection-agent",
+                "agent_started",
+                {"mode": "continuous_observer"},
+            )
 
         try:
-            await super().run(ticket_id)
+            while not self._stop_requested:
+                # Check if ticket has reached a terminal state.
+                try:
+                    ticket = await self._get_ticket(ticket_id)
+                    status = ticket.get("status", "")
+                    if status in _TERMINAL_STATUSES:
+                        logger.info(
+                            f"[introspection] Ticket {ticket_id}"
+                            f" reached {status}, stopping"
+                        )
+                        break
+                except Exception:
+                    logger.debug(
+                        f"[introspection] Failed to fetch"
+                        f" ticket {ticket_id}, will retry"
+                    )
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    continue
+
+                # Fetch new events since last poll.
+                new_events = _read_events(
+                    ticket_id,
+                    since=self._last_seq,
+                    limit=_POLL_BATCH_SIZE,
+                )
+
+                if new_events:
+                    self._all_events.extend(new_events)
+                    self._last_seq = new_events[-1].get(
+                        "seq",
+                        self._last_seq,
+                    )
+
+                    # Run anomaly detection on full history.
+                    anomalies = _detect_anomalies_from_events(
+                        self._all_events,
+                    )
+
+                    # Build observation summary.
+                    observation = self._build_observation(
+                        ticket,
+                        new_events,
+                        anomalies,
+                    )
+
+                    # Write to ticket custom_fields.
+                    await self._update_observation(
+                        ticket_id,
+                        observation,
+                    )
+
+                await asyncio.sleep(_POLL_INTERVAL)
+
+        except asyncio.CancelledError:
+            logger.info(f"[introspection] Observation of {ticket_id} cancelled")
+        except Exception:
+            logger.exception(f"[introspection] Error observing {ticket_id}")
         finally:
-            await mcp.disconnect()
-            self._mcp = None
+            if self._events:
+                self._events.emit(
+                    ticket_id,
+                    "introspection-agent",
+                    "agent_finished",
+                )
+            logger.info(f"[introspection] Stopped observing {ticket_id}")
 
-    def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return INTROSPECTION_SYSTEM_PROMPT
+    def _build_observation(
+        self,
+        ticket: dict[str, Any],
+        new_events: list[dict[str, Any]],
+        anomalies: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the observation dict for custom_fields.introspection."""
+        # Compute per-agent event counts.
+        agent_counts: dict[str, int] = {}
+        tool_error_count = 0
+        llm_call_count = 0
+        for evt in self._all_events:
+            agent = evt.get("agent", "")
+            if agent:
+                agent_counts[agent] = agent_counts.get(agent, 0) + 1
+            if evt.get("event_type") == "llm_request":
+                llm_call_count += 1
+            if evt.get("event_type") == "tool_result" and evt.get("data", {}).get(
+                "is_error"
+            ):
+                tool_error_count += 1
 
-    def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
-        content = (
-            f"## Introspection Request\n\n"
-            f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n"
-            f"**Current Status:** {ticket['status']}\n\n"
-            f"Observe the event stream for ticket {ticket['id']}. "
-            f"Use get_ticket_events to read the event log, "
-            f"detect_anomalies to check for problems, and "
-            f"get_token_usage to monitor resource consumption. "
-            f"Then submit your observation with submit_observation."
+        # Build a concise status summary.
+        status = ticket.get("status", "unknown")
+        status_summary = (
+            f"Ticket is in '{status}' with"
+            f" {len(self._all_events)} events observed"
+            f" ({llm_call_count} LLM calls,"
+            f" {tool_error_count} tool errors)."
         )
+        if anomalies:
+            high = sum(1 for a in anomalies if a.get("severity") == "high")
+            med = sum(1 for a in anomalies if a.get("severity") == "medium")
+            status_summary += (
+                f" {len(anomalies)} anomal"
+                f"{'y' if len(anomalies) == 1 else 'ies'}"
+                f" detected"
+                f" ({high} high, {med} medium)."
+            )
 
-        return [{"role": "user", "content": content}]
+        # Build narrative from recent events (last batch).
+        narrative_parts: list[str] = []
+        for evt in new_events:
+            trimmed = _truncate_event(evt)
+            etype = trimmed.get("event_type", "")
+            agent = trimmed.get("agent", "")
+            data = trimmed.get("data", {})
 
-    async def _handle_completion(
+            if etype == "agent_started":
+                narrative_parts.append(f"{agent} started")
+            elif etype == "agent_finished":
+                narrative_parts.append(f"{agent} finished")
+            elif etype == "transition":
+                to = data.get("to", "?")
+                narrative_parts.append(f"Transitioned to {to}")
+            elif etype == "tool_called":
+                tool = data.get("tool", "?")
+                narrative_parts.append(f"{agent} called {tool}")
+            elif etype == "tool_result" and data.get("is_error"):
+                tool = data.get("tool", "?")
+                narrative_parts.append(f"{agent}: {tool} returned error")
+            elif etype == "agent_error":
+                reason = data.get("reason", "unknown")
+                narrative_parts.append(f"{agent} error: {reason}")
+
+        narrative = "; ".join(narrative_parts) if narrative_parts else ""
+
+        return {
+            "narrative": narrative,
+            "anomalies": anomalies,
+            "status_summary": status_summary,
+            "total_events": len(self._all_events),
+            "agents_seen": agent_counts,
+        }
+
+    async def _update_observation(
         self,
         ticket_id: str,
-        response: LLMResponse,
+        observation: dict[str, Any],
     ) -> None:
-        """Handle the introspection result.
-
-        Unlike other agents, introspection does NOT transition
-        the ticket. It stores its observation in custom_fields
-        and adds a comment for visibility.
-        """
-        result = self._get_submit_result(response)
-        if not result:
-            result = self._parse_json_response(response.text)
-
-        narrative = result.get("narrative", "No narrative produced.")
-        anomalies = result.get("anomalies", [])
-        status_summary = result.get(
-            "status_summary",
-            "No status summary.",
-        )
-
-        # Store observation on the ticket without affecting
-        # its state machine position.
-        await self._update_fields(
-            ticket_id,
-            {
-                "introspection": {
-                    "narrative": narrative,
-                    "anomalies": anomalies,
-                    "status_summary": status_summary,
-                },
-            },
-        )
-
-        # Post a human-readable comment
-        if anomalies:
-            anomaly_lines = []
-            for a in anomalies:
-                severity = a.get("severity", "?")
-                desc = a.get("description", "")
-                anomaly_lines.append(f"  - [{severity}] {desc}")
-            anomaly_text = "\n".join(anomaly_lines)
-            comment = (
-                f"**Introspection Report**\n\n"
-                f"{status_summary}\n\n"
-                f"**Anomalies ({len(anomalies)}):**\n"
-                f"{anomaly_text}"
+        """Write observation to ticket custom_fields."""
+        try:
+            await self._client.patch(
+                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": {"introspection": observation}},
             )
-        else:
-            comment = (
-                f"**Introspection Report**\n\n"
-                f"{status_summary}\n\n"
-                f"No anomalies detected."
+        except Exception:
+            logger.debug(
+                f"[introspection] Failed to update observation for {ticket_id}"
             )
 
-        await self._add_comment(ticket_id, comment)
-        # NOTE: No state transition — introspection is out-of-band.
+    async def _get_ticket(
+        self,
+        ticket_id: str,
+    ) -> dict[str, Any]:
+        """Fetch current ticket state."""
+        r = await self._client.get(
+            f"{self.store_url}/api/v1/tickets/{ticket_id}",
+        )
+        r.raise_for_status()
+        return r.json()

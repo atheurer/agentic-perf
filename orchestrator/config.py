@@ -143,6 +143,14 @@ class OrchestratorConfig:
             900.0,
         )
 
+        # Introspection agent: continuous passive observer.
+        # Enable globally via config or env var. Can also be
+        # enabled per-ticket via custom_fields.introspection_enabled.
+        introspection_cfg = cfg.get("introspection", {})
+        self.introspection_enabled: bool = (
+            os.environ.get("INTROSPECTION_ENABLED", "").lower() in ("1", "true", "yes")
+        ) or introspection_cfg.get("enabled", False)
+
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 

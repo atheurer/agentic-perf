@@ -70,6 +70,8 @@ class Dispatcher:
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._handoff_blocked: set[tuple[str, str]] = set()
+        self._introspection_tasks: dict[str, asyncio.Task] = {}
+        self._introspection_agents: dict[str, Any] = {}
 
     def is_active(self, ticket_id: str) -> bool:
         task = self._tasks.get(ticket_id)
@@ -202,6 +204,78 @@ class Dispatcher:
         self.stop_renewal(ticket_id)
         self.release_claim(ticket_id)
         self.clear_handoff_blocked(ticket_id)
+
+    def start_introspection(
+        self,
+        ticket_id: str,
+    ) -> bool:
+        """Start the introspection agent for a ticket.
+
+        Returns True if started, False if already running.
+        The introspection agent runs as a companion task
+        alongside the real agents — it does not participate
+        in the dispatch loop or affect ticket state.
+        """
+        existing = self._introspection_tasks.get(ticket_id)
+        if existing is not None and not existing.done():
+            return False
+
+        from agents.introspection.agent import IntrospectionAgent
+
+        agent = IntrospectionAgent(
+            state_store_url=self.store_url,
+            event_bus=self.events,
+        )
+        self._introspection_agents[ticket_id] = agent
+
+        task = asyncio.ensure_future(
+            self._run_introspection(
+                ticket_id,
+                agent,
+            )
+        )
+        self._introspection_tasks[ticket_id] = task
+        return True
+
+    async def _run_introspection(
+        self,
+        ticket_id: str,
+        agent: Any,
+    ) -> None:
+        """Run the introspection agent and clean up on exit."""
+        try:
+            await agent.run(ticket_id)
+        except asyncio.CancelledError:
+            logger.info(f"Introspection cancelled for {ticket_id}")
+        except Exception:
+            logger.exception(f"Introspection failed for {ticket_id}")
+        finally:
+            self._introspection_agents.pop(ticket_id, None)
+            self._introspection_tasks.pop(ticket_id, None)
+            try:
+                await agent.close()
+            except Exception:
+                pass
+
+    def stop_introspection(self, ticket_id: str) -> None:
+        """Stop the introspection agent for a ticket."""
+        agent = self._introspection_agents.get(ticket_id)
+        if agent is not None:
+            agent.request_stop()
+        task = self._introspection_tasks.get(ticket_id)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def is_introspection_active(self, ticket_id: str) -> bool:
+        """Check if introspection is running for a ticket."""
+        task = self._introspection_tasks.get(ticket_id)
+        if task is None:
+            return False
+        if task.done():
+            self._introspection_tasks.pop(ticket_id, None)
+            self._introspection_agents.pop(ticket_id, None)
+            return False
+        return True
 
     def _get_llm(self, agent_type: str) -> LLMProvider:
         if self._llm_factory:

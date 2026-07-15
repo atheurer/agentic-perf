@@ -1,17 +1,20 @@
 """Tests for the introspection agent's observation engine.
 
 Covers: event reading, event truncation, anomaly detection
-(repeated errors, retry loops, max iterations), and token usage
-aggregation from the MCP server functions.
+(repeated errors, retry loops, max iterations), continuous
+agent observation loop, observation building, and orchestrator
+integration (config, dispatcher, startup ordering).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from agents.introspection.agent import IntrospectionAgent
 from agents.introspection.server import (
     _detect_anomalies_from_events,
     _read_events,
@@ -289,3 +292,246 @@ class TestDetectAnomalies:
         ]
         anomalies = _detect_anomalies_from_events(events)
         assert anomalies == []
+
+
+# --- Continuous agent ---
+
+
+class TestIntrospectionAgent:
+    def test_builds_observation_with_anomalies(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        agent._all_events = [
+            _make_event(1, "llm_request", data={"iteration": 0}),
+            _make_event(
+                2,
+                "tool_result",
+                data={
+                    "tool": "ssh",
+                    "is_error": True,
+                    "content": "fail",
+                },
+            ),
+            _make_event(
+                3,
+                "tool_result",
+                data={
+                    "tool": "ssh",
+                    "is_error": True,
+                    "content": "fail",
+                },
+            ),
+            _make_event(
+                4,
+                "tool_result",
+                data={
+                    "tool": "ssh",
+                    "is_error": True,
+                    "content": "fail",
+                },
+            ),
+        ]
+        ticket = {"status": "executing_benchmark"}
+        new_events = [_make_event(5, "agent_finished")]
+        anomalies = [
+            {
+                "type": "repeated_error",
+                "severity": "medium",
+                "description": "Tool 'ssh' failed 3 times",
+                "seq_range": [2, 4],
+            }
+        ]
+        obs = agent._build_observation(ticket, new_events, anomalies)
+        assert obs["total_events"] == 4
+        assert len(obs["anomalies"]) == 1
+        assert "1 anomaly" in obs["status_summary"]
+        assert "benchmark-agent finished" in obs["narrative"]
+
+    def test_builds_observation_clean(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        agent._all_events = [
+            _make_event(1, "agent_started"),
+            _make_event(2, "agent_finished"),
+        ]
+        ticket = {"status": "awaiting_review"}
+        obs = agent._build_observation(ticket, [], [])
+        assert obs["anomalies"] == []
+        assert "0 tool errors" in obs["status_summary"]
+        assert obs["narrative"] == ""
+
+    def test_narrative_includes_transitions(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        agent._all_events = []
+        ticket = {"status": "triage_pending"}
+        new_events = [
+            _make_event(
+                1,
+                "transition",
+                agent="system",
+                data={"to": "awaiting_hardware"},
+            ),
+        ]
+        obs = agent._build_observation(ticket, new_events, [])
+        assert "Transitioned to awaiting_hardware" in obs["narrative"]
+
+    async def test_stops_on_terminal_status(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "status": "closed",
+            "custom_fields": {},
+        }
+        mock_response.raise_for_status = MagicMock()
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(return_value=mock_response)
+        agent._client.aclose = AsyncMock()
+
+        # Should exit quickly since ticket is closed.
+        await asyncio.wait_for(
+            agent.run("PERF-CLOSED"),
+            timeout=3.0,
+        )
+
+    async def test_request_stop(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "status": "executing_benchmark",
+            "custom_fields": {},
+        }
+        mock_response.raise_for_status = MagicMock()
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(return_value=mock_response)
+        agent._client.aclose = AsyncMock()
+
+        # Request stop immediately so the loop exits.
+        agent.request_stop()
+        await asyncio.wait_for(
+            agent.run("PERF-STOP"),
+            timeout=3.0,
+        )
+
+
+# --- Orchestrator integration ---
+
+
+class TestIntrospectionConfig:
+    def test_default_disabled(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+
+        with patch.dict("os.environ", {}, clear=True):
+            config = OrchestratorConfig()
+
+        assert config.introspection_enabled is False
+
+    def test_enabled_via_config_file(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+
+        cfg = {"introspection": {"enabled": True}}
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "orchestrator.config._load_config_file",
+                return_value=cfg,
+            ),
+        ):
+            config = OrchestratorConfig()
+
+        assert config.introspection_enabled is True
+
+    def test_enabled_via_env_var(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+
+        with patch.dict(
+            "os.environ",
+            {"INTROSPECTION_ENABLED": "true"},
+            clear=True,
+        ):
+            config = OrchestratorConfig()
+
+        assert config.introspection_enabled is True
+
+
+class TestMaybeStartIntrospection:
+    def test_starts_when_globally_enabled(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = True
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = False
+        dispatcher.start_introspection.return_value = True
+        ticket = {"custom_fields": {}}
+
+        _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
+
+        dispatcher.start_introspection.assert_called_once_with("PERF-1")
+
+    def test_skips_when_globally_disabled(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = False
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = False
+        ticket = {"custom_fields": {}}
+
+        _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
+
+        dispatcher.start_introspection.assert_not_called()
+
+    def test_per_ticket_override_enables(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = False
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = False
+        dispatcher.start_introspection.return_value = True
+        ticket = {"custom_fields": {"introspection_enabled": True}}
+
+        _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
+
+        dispatcher.start_introspection.assert_called_once_with("PERF-1")
+
+    def test_per_ticket_override_disables(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = True
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = False
+        ticket = {"custom_fields": {"introspection_enabled": False}}
+
+        _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
+
+        dispatcher.start_introspection.assert_not_called()
+
+    def test_skips_when_already_active(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = True
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = True
+        ticket = {"custom_fields": {}}
+
+        _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
+
+        dispatcher.start_introspection.assert_not_called()
