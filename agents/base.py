@@ -386,6 +386,11 @@ class AgentBase(ABC):
                             continue
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
+                    logger.info(
+                        f"[{self.agent_name}] end_turn/no_tools at iter "
+                        f"{iteration}, stop_reason={response.stop_reason}, "
+                        f"tool_calls={len(response.tool_calls or [])}"
+                    )
                     has_submit_tool = any(
                         t.name.startswith("submit_") for t in (self.tools or [])
                     )
@@ -432,6 +437,38 @@ class AgentBase(ABC):
                     None,
                 )
                 if submit_call:
+                    logger.info(
+                        f"[{self.agent_name}] submit_* call detected: "
+                        f"{submit_call.name} (iter {iteration})"
+                    )
+                    block_msg = self._should_block_submit(ticket_id)
+                    if block_msg:
+                        self._emit(
+                            ticket_id,
+                            "tool_called",
+                            {
+                                "tool": submit_call.name,
+                                "input_keys": list(submit_call.input.keys()),
+                                "blocked": True,
+                            },
+                        )
+                        messages.append(
+                            {"role": "assistant", "content": response.raw_content}
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": submit_call.id,
+                                        "content": block_msg,
+                                        "is_error": True,
+                                    }
+                                ],
+                            }
+                        )
+                        continue
                     self._emit(
                         ticket_id,
                         "tool_called",
@@ -597,6 +634,11 @@ class AgentBase(ABC):
                         start = None
 
         return {}
+
+    def _should_block_submit(self, ticket_id: str) -> str | None:
+        """Override to block submit_* calls. Return a rejection message
+        string to block, or None to allow the submit to proceed."""
+        return None
 
     @staticmethod
     def _get_submit_result(response: LLMResponse) -> dict[str, Any] | None:
@@ -999,8 +1041,14 @@ class AgentBase(ABC):
         )
 
         logger.info(f"[{self.agent_name}] Waiting for human input on {ticket_id}")
+        directives = ticket.get("custom_fields", {}).get("directives", {})
+        timeout = (
+            float("inf")
+            if directives.get("disable_hitl_timeout")
+            else self._HITL_TIMEOUT
+        )
         elapsed = 0.0
-        while elapsed < self._HITL_TIMEOUT:
+        while elapsed < timeout:
             await asyncio.sleep(self._HITL_POLL_INTERVAL)
             elapsed += self._HITL_POLL_INTERVAL
             ticket = await self._get_ticket(ticket_id)

@@ -64,6 +64,62 @@ For **tool metrics** (e.g., mpstat Busy-CPU, sar):
 - Map tool instances to OS pairs using the run file's
   remote ordering
 
+## Time-resolved queries with resolution
+
+By default, CDM returns one aggregated value per period. Use
+the `resolution` parameter to get multiple data points over
+the period, revealing changes over time.
+
+```json
+{
+  "run": "<run-id>",
+  "period": "<period-id>",
+  "source": "procstat",
+  "type": "Busy-CPU",
+  "breakout": ["hostname", "cpu"],
+  "resolution": 10
+}
+```
+
+- `resolution` = total number of data points in the period
+- For a 30-second test, resolution=10 gives ~3s intervals
+- Sample collection interval is rarely under 3 seconds
+- Use this to detect CPU saturation that averages hide
+  (e.g., 100% for 24s then 0% for 6s averages to 80%)
+- Use this to detect irqbalance migrating IRQ destinations
+
+## Per-CPU and interrupt analysis
+
+For network performance investigation, key query patterns:
+
+**Per-CPU utilization:**
+```json
+{
+  "source": "procstat",
+  "type": "Busy-CPU",
+  "breakout": ["hostname", "cpu"]
+}
+```
+
+**Interrupt rate per CPU:**
+```json
+{
+  "source": "procstat",
+  "type": "interrupts-sec",
+  "breakout": ["hostname", "irq", "cpu"]
+}
+```
+
+**NUMA node mapping (via package breakout):**
+```json
+{
+  "source": "procstat",
+  "type": "interrupts-sec",
+  "breakout": ["hostname", "package", "cpu"]
+}
+```
+The `package` breakout maps to NUMA node / CPU socket.
+
 ## Workflow for comparative analysis
 
 1. Get the run summary to find iteration IDs and

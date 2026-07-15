@@ -531,6 +531,15 @@ class ResourceAgent(AgentBase):
         if reservation_metadata.get("ssh_key_path"):
             fields["ssh_key_path"] = reservation_metadata["ssh_key_path"]
 
+        if self._mcp:
+            try:
+                raw = await self._mcp.call_tool("get_host_inventory", {})
+                host_inventory = json.loads(raw) if raw else {}
+                if host_inventory:
+                    fields["host_inventory"] = host_inventory
+            except Exception:
+                logger.debug("get_host_inventory unavailable, skipping")
+
         if result.get("fresh_host"):
             fields["fresh_host"] = True
 

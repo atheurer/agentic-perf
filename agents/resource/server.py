@@ -40,6 +40,9 @@ _registry = None
 # (e.g., separate calls for controller and endpoints).
 _last_reservation: dict[str, Any] = {}
 
+# Accumulates validate_host results keyed by host IP/hostname.
+_host_inventory: dict[str, dict[str, Any]] = {}
+
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
@@ -74,11 +77,18 @@ FQDN_RE = re.compile(
 @mcp.tool()
 async def parse_host_config(text: str) -> str:
     """Extract structured host configuration from free-form text. Parses IP addresses, hostnames, roles (controller/target/client/server), SSH user, and SSH key path."""
+    default_key = "~/.ssh/id_ed25519"
+    config_path = Path.home() / ".agentic-perf" / "config.json"
+    if config_path.exists():
+        with open(config_path) as _f:
+            _cfg = json.load(_f)
+        default_key = _cfg.get("ssh_key_path", _cfg.get("ssh_key", default_key))
+
     result: dict[str, Any] = {
         "controller": None,
         "targets": [],
         "ssh_user": "root",
-        "ssh_key_path": "~/.ssh/id_rsa",
+        "ssh_key_path": default_key,
     }
 
     lines = text.split("\n")
@@ -277,29 +287,65 @@ async def validate_host(
         "{print $2}'); do "
         'speed=$(ethtool "$iface" 2>/dev/null '
         "| awk '/Speed:/{print $2}'); "
-        'echo "${iface}:${speed:-unknown}"; '
+        "numa=$(cat /sys/class/net/$iface/device/numa_node "
+        "2>/dev/null || echo -1); "
+        'echo "${iface}:${speed:-unknown}:${numa}"; '
         "done"
     )
     nic_result = await ssh.run(host, nic_cmd, timeout=15)
     nic_info = []
     if nic_result.exit_code == 0 and nic_result.stdout.strip():
         for nic_line in nic_result.stdout.strip().splitlines():
-            parts = nic_line.split(":", 1)
-            if len(parts) == 2:
-                nic_info.append({"name": parts[0], "speed": parts[1]})
+            parts = nic_line.split(":", 2)
+            if len(parts) >= 2:
+                entry: dict[str, Any] = {
+                    "name": parts[0],
+                    "speed": parts[1],
+                }
+                if len(parts) == 3:
+                    try:
+                        entry["numa_node"] = int(parts[2])
+                    except ValueError:
+                        entry["numa_node"] = -1
+                nic_info.append(entry)
 
-    return json.dumps(
-        {
-            "host": host,
-            "fqdn": fqdn,
-            "reachable": True,
-            "os": os_info,
-            "cpu_count": cpu_count,
-            "ram_gb": ram_gb,
-            "nic_info": nic_info,
-            "message": f"Host {host} validated via SSH",
-        }
+    numa_cmd = (
+        "for node in /sys/devices/system/node/node[0-9]*; do "
+        "n=${node##*node}; "
+        "cpus=$(cat $node/cpulist); "
+        'echo "${n}:${cpus}"; '
+        "done"
     )
+    numa_result = await ssh.run(host, numa_cmd, timeout=15)
+    numa_topology = []
+    if numa_result.exit_code == 0 and numa_result.stdout.strip():
+        for numa_line in numa_result.stdout.strip().splitlines():
+            parts = numa_line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    numa_topology.append({"node": int(parts[0]), "cpus": parts[1]})
+                except ValueError:
+                    pass
+
+    inventory = {
+        "host": host,
+        "fqdn": fqdn,
+        "reachable": True,
+        "os": os_info,
+        "cpu_count": cpu_count,
+        "ram_gb": ram_gb,
+        "nic_info": nic_info,
+        "numa_topology": numa_topology,
+        "message": f"Host {host} validated via SSH",
+    }
+    _host_inventory[host] = inventory
+    return json.dumps(inventory)
+
+
+@mcp.tool()
+async def get_host_inventory() -> str:
+    """Return accumulated host inventory from prior validate_host calls. Keyed by host IP/hostname, includes OS, CPU, RAM, NIC info with NUMA mapping, and NUMA topology."""
+    return json.dumps(_host_inventory)
 
 
 @mcp.tool()

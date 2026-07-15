@@ -69,6 +69,12 @@ Your job is to analyze a performance test request ticket and:
    - "test the 25G NICs" / "use the Intel interfaces" / "not the management network"
      → test_interfaces: "<description of which NICs>" (the benchmark agent will
      discover the actual interface names and IPs on the hosts)
+   - "no timeout on user responses" / "wait indefinitely for my input" /
+     "disable HITL timeout" / "I may take a long time to respond"
+     → disable_hitl_timeout: true
+   - "flush firewall" / "disable firewall" → firewall_policy: "flush"
+   - "skip teardown" / "don't clean up hosts" / "keep hosts after review"
+     → skip_teardown: true
 
    If the user does not mention a directive, omit it — downstream agents will use
    their own defaults. Do NOT invent directives the user didn't ask for.

@@ -1117,7 +1117,8 @@ class TestHandleCompletionIPSplit:
 
         await agent._handle_completion("PERF-TEST", response)
 
-        agent._mcp.call_tool.assert_called_once_with("get_accumulated_metadata", {})
+        agent._mcp.call_tool.assert_any_call("get_accumulated_metadata", {})
+        agent._mcp.call_tool.assert_any_call("get_host_inventory", {})
 
         patch_calls = agent._client.patch.call_args_list
         fields_call = [c for c in patch_calls if "/fields" in str(c)]

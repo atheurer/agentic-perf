@@ -12,9 +12,11 @@ Use batch tools to minimize iterations:
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
   (not check_host per host)
 - **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**
-  — verify TCP port reachability between hosts in one call, handling nc
-  listener lifecycle automatically. Read the connectivity-diagnostic skill
-  doc for details.
+  — verify TCP port reachability between hosts. This tool actively starts a
+  listener (nc) on the specified port on the server, then attempts to connect
+  from the client. A failure means there is a real networking problem (firewall,
+  routing) on the exact path the benchmark will use. Read the
+  connectivity-diagnostic skill doc for details.
 
 ## Reading Harness Documentation
 
@@ -54,7 +56,31 @@ to construct a correct run file — getting the format right is critical.
    their SSH-reachable IPs, then verifies the controller can reach each endpoint
    on the private IPs. Do NOT use execute_command to set up SSH keys manually.
 
-5. **Construct the run-file** — You are responsible for building a correct run-file.
+5. **Validate network path (network benchmarks only)** — For network benchmarks
+   (uperf, trafficgen, iperf, k8s-netperf, etc.), you MUST verify that the
+   benchmark traffic port is reachable between the test hosts BEFORE constructing
+   the run-file. Use `test_port_connectivity` with the test IPs (not management
+   IPs) and the benchmark's listener port (e.g., 30002 for uperf).
+
+   This tool starts a real listener on the server and connects from the client —
+   it is NOT a passive port scan. If it returns `all_reachable: false`, there is
+   a blocking network problem (typically a firewall) that WILL cause the benchmark
+   to fail. Do NOT proceed to run-file construction or execution.
+
+   **When port connectivity fails, follow this cascade to resolve:**
+   a. Check the ticket's `directives` or `custom_fields` for a `firewall_policy`
+      (e.g., `"flush"`, `"add_rules"`, `"disable"`). If present, execute it.
+   b. If no policy in the ticket, check `get_private_config(harness, "firewall")`
+      for an org-level default policy. If present, execute it.
+   c. If no policy found anywhere, call `request_clarification` explaining that
+      a firewall is blocking the benchmark port and offer concrete options:
+      - Flush all firewall rules (nftables/iptables)
+      - Add targeted allow rules for the benchmark port
+      - Abort the benchmark
+   d. After applying the fix, re-run `test_port_connectivity` to confirm the
+      port is now reachable before proceeding.
+
+6. **Construct the run-file** — You are responsible for building a correct run-file.
    Follow these sub-steps IN ORDER:
 
    a. **MANDATORY — Call `get_runfile_schema()` FIRST.** Read the schema carefully
@@ -84,16 +110,16 @@ to construct a correct run file — getting the format right is critical.
       management IPs are correct for benchmark traffic when the user specified
       different interfaces.
 
-6. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
+7. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
    Do NOT ask for approval when the user explicitly said not to.
    If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
 
-7. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
+8. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
    The controller validates the run-file during execution — if there are schema errors,
    they will appear in the execution output.
 
-8. **Verify and submit result** — Check the `execute_benchmark` response carefully:
+9. **Verify and submit result** — Check the `execute_benchmark` response carefully:
    - If status is "completed" AND `result_summary` is present, submit with status "completed".
    - If status is "failed" and the message mentions a missing `result-summary.json`,
      the run did not produce usable results even though crucible exited cleanly.

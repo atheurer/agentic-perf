@@ -35,6 +35,7 @@ class ReviewAgent(AgentBase):
         self._skill_provider = skill_provider
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
+        self._user_approved_submit: bool = False
 
         local_tools = [
             t
@@ -43,7 +44,17 @@ class ReviewAgent(AgentBase):
         ]
 
         async def _request_clarification(question: str) -> str:
-            return await self._do_request_clarification(question)
+            reply = await self._do_request_clarification(question)
+            lower = reply.strip().lower()
+            if lower in (
+                "done",
+                "submit",
+                "submit the review",
+                "that's enough",
+                "wrap it up",
+            ) or lower.startswith("done"):
+                self._user_approved_submit = True
+            return reply
 
         local_handlers = {
             "request_clarification": _request_clarification,
@@ -56,6 +67,7 @@ class ReviewAgent(AgentBase):
             tools=local_tools,
             tool_handlers=local_handlers,
             event_bus=event_bus,
+            max_iterations=50,
         )
 
     async def _do_request_clarification(self, question: str) -> str:
@@ -63,10 +75,25 @@ class ReviewAgent(AgentBase):
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
+    def _should_block_submit(self, ticket_id: str) -> str | None:
+        if self._user_approved_submit:
+            return None
+        return (
+            "REJECTED: You cannot submit a review yet. The user has not "
+            "approved submission. You MUST call request_clarification to "
+            "present your findings and ask the user for guidance. The "
+            "iterative investigation loop requires you to present findings, "
+            "receive user direction, investigate further, and repeat until "
+            "the user explicitly says 'done' or 'submit the review'. Only "
+            "then will submit_review_result be accepted. Call "
+            "request_clarification now with your current findings."
+        )
+
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
 
         review_server = str(Path(__file__).with_name("server.py"))
+        infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
         mcp = AgentMCPClient()
         await mcp.connect(
@@ -74,6 +101,7 @@ class ReviewAgent(AgentBase):
             name="review",
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
+        await mcp.connect(infra_server, name="infra")
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
@@ -156,6 +184,36 @@ class ReviewAgent(AgentBase):
             if cf.get("ssh_key_path"):
                 content += f"**SSH Key:** {cf['ssh_key_path']}\n"
 
+        host_inventory = cf.get("host_inventory")
+        if host_inventory:
+            content += "\n## Host Inventory\n"
+            content += (
+                "This data was collected during host validation. "
+                "Use it for NUMA locality analysis.\n"
+            )
+            for host_ip, inv in host_inventory.items():
+                content += f"\n### {inv.get('fqdn', host_ip)} ({host_ip})\n"
+                content += (
+                    f"- **OS:** {inv.get('os', 'unknown')}\n"
+                    f"- **CPUs:** {inv.get('cpu_count', '?')}\n"
+                    f"- **RAM:** {inv.get('ram_gb', '?')} GB\n"
+                )
+                numa = inv.get("numa_topology", [])
+                if numa:
+                    content += f"- **NUMA nodes:** {len(numa)}\n"
+                    for node in numa:
+                        content += f"  - Node {node['node']}: CPUs {node['cpus']}\n"
+                nics = inv.get("nic_info", [])
+                if nics:
+                    content += "- **NICs:**\n"
+                    for nic in nics:
+                        numa_str = ""
+                        if "numa_node" in nic:
+                            numa_str = f", NUMA node {nic['numa_node']}"
+                        content += (
+                            f"  - {nic['name']}: {nic.get('speed', '?')}{numa_str}\n"
+                        )
+
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
@@ -196,6 +254,32 @@ class ReviewAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
+        if not self._user_approved_submit:
+            logger.info(
+                f"[review-agent] Completion called without user approval "
+                f"on {ticket_id} — escalating to HITL"
+            )
+            question = (
+                "The review agent attempted to submit results without "
+                "presenting findings for your review first. The agent's "
+                "analysis so far:\n\n"
+                f"{response.text[:2000] if response.text else 'No analysis text.'}"
+                "\n\nPlease provide guidance on what to investigate, "
+                "or reply 'done' to accept and submit."
+            )
+            reply = await self._request_human_input(ticket_id, question)
+            lower = reply.strip().lower()
+            if lower in (
+                "done",
+                "submit",
+                "submit the review",
+                "that's enough",
+                "wrap it up",
+            ) or lower.startswith("done"):
+                self._user_approved_submit = True
+            else:
+                return
+
         result = self._get_submit_result(response)
         if not result:
             result = self._parse_json_response(response.text)

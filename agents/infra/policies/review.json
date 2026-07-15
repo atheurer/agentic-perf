@@ -5,7 +5,10 @@
         "grep", "wc", "sort",
         "curl",
         "test", "echo",
-        "xzcat"
+        "xzcat",
+        "numactl", "lscpu",
+        "ethtool", "ip",
+        "sysctl", "nproc"
     ],
     "blocked_patterns": [],
     "max_timeout": 120

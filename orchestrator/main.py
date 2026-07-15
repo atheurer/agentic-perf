@@ -510,6 +510,10 @@ async def _check_stale_tasks(
     1. EventBus last-event timestamp (in-process agent events)
     2. Ticket updated_at from the state store (covers progress
        comments posted by MCP subprocess tools like run_with_progress)
+
+    Always skips tickets in awaiting_customer_guidance — the
+    agent is waiting for user input which can take arbitrarily
+    long.
     """
     from datetime import datetime
 
@@ -542,6 +546,23 @@ async def _check_stale_tasks(
 
         idle_seconds = now - last_activity
         if idle_seconds > stale_timeout:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=10.0,
+                    headers=_auth_headers(),
+                ) as client:
+                    r = await client.get(f"{store_url}/api/v1/tickets/{tid}")
+                    ticket = r.json()
+                    status = ticket.get("status", "")
+                    if status == "awaiting_customer_guidance":
+                        logger.debug(
+                            f"Skipping stale check for {tid}:"
+                            f" ticket is awaiting user input"
+                        )
+                        continue
+            except Exception:
+                pass
+
             logger.warning(
                 f"Stale task detected for {tid}:"
                 f" no events for {idle_seconds:.0f}s"
