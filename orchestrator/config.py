@@ -20,6 +20,10 @@ class OrchestratorConfig:
         "triage": {"model": "claude-sonnet-4-6"},
         "evaluating_convergence": {"model": "claude-sonnet-4-6"},
         "retrospective": {"model": "claude-sonnet-4-6"},
+        # Introspection is a lightweight observer — default to
+        # a cheap model since it makes periodic narrative calls
+        # across the full ticket lifecycle.
+        "introspection": {"model": "claude-haiku-4-5"},
     }
 
     def __init__(

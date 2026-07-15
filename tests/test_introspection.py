@@ -830,13 +830,18 @@ class TestIntrospectionAgent:
         mock_response.raise_for_status = MagicMock()
         agent._client = AsyncMock()
         agent._client.get = AsyncMock(return_value=mock_response)
+        agent._client.patch = AsyncMock(return_value=mock_response)
         agent._client.aclose = AsyncMock()
 
-        # Should exit quickly since ticket is closed.
-        await asyncio.wait_for(
-            agent.run("PERF-CLOSED"),
-            timeout=3.0,
-        )
+        # Should exit after detecting closed + final flush.
+        with patch(
+            "agents.introspection.agent._POLL_INTERVAL",
+            0.1,
+        ):
+            await asyncio.wait_for(
+                agent.run("PERF-CLOSED"),
+                timeout=3.0,
+            )
 
     async def test_request_stop(self) -> None:
         agent = IntrospectionAgent(
@@ -862,6 +867,153 @@ class TestIntrospectionAgent:
 
 
 # --- Orchestrator integration ---
+
+
+class TestLLMIntegration:
+    """Tests for LLM narrative and final summary."""
+
+    async def test_maybe_narrate_skips_without_llm(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+
+        result = await agent._maybe_narrate(
+            "PERF-1",
+            {"status": "executing_benchmark"},
+            [],
+            [],
+        )
+        assert result is None
+
+    async def test_maybe_narrate_triggers_on_anomaly(self) -> None:
+        from providers.llm.base import LLMResponse
+
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(
+            return_value=LLMResponse(
+                text="The agent is retrying a failing operation.",
+                tool_calls=[],
+                stop_reason="end_turn",
+                raw_content="",
+                usage=None,
+            )
+        )
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+            llm_provider=mock_llm,
+        )
+        agent._prev_anomaly_count = 0
+        agent._prev_status = "executing_benchmark"
+        agent._all_events = [_make_event(1, "agent_started")]
+
+        result = await agent._maybe_narrate(
+            "PERF-1",
+            {"status": "executing_benchmark"},
+            [],
+            [{"type": "consecutive_failure", "severity": "high"}],
+        )
+        assert result is not None
+        assert "retrying" in result
+        mock_llm.complete.assert_called_once()
+
+    async def test_maybe_narrate_triggers_on_transition(self) -> None:
+        from providers.llm.base import LLMResponse
+
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(
+            return_value=LLMResponse(
+                text="Ticket transitioned to review.",
+                tool_calls=[],
+                stop_reason="end_turn",
+                raw_content="",
+                usage=None,
+            )
+        )
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+            llm_provider=mock_llm,
+        )
+        agent._prev_anomaly_count = 0
+        agent._prev_status = "executing_benchmark"
+        agent._all_events = [_make_event(1, "agent_started")]
+
+        result = await agent._maybe_narrate(
+            "PERF-1",
+            {"status": "awaiting_review"},
+            [],
+            [],
+        )
+        assert result is not None
+        mock_llm.complete.assert_called_once()
+
+    async def test_maybe_narrate_skips_when_no_trigger(self) -> None:
+        mock_llm = AsyncMock()
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+            llm_provider=mock_llm,
+        )
+        agent._prev_anomaly_count = 0
+        agent._prev_status = "executing_benchmark"
+
+        result = await agent._maybe_narrate(
+            "PERF-1",
+            {"status": "executing_benchmark"},
+            [],
+            [],
+        )
+        assert result is None
+        mock_llm.complete.assert_not_called()
+
+    async def test_observation_includes_llm_narrative(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        agent._all_events = [_make_event(1, "agent_started")]
+        ticket = {"status": "executing_benchmark"}
+
+        obs = agent._build_observation(
+            ticket,
+            [],
+            [],
+            llm_narrative="The pipeline is progressing normally.",
+        )
+        assert any("[observation]" in line for line in obs["narrative"])
+        assert any("progressing normally" in line for line in obs["narrative"])
+
+    async def test_deterministic_final_summary_without_llm(self) -> None:
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+        )
+        agent._all_events = [
+            _make_event(1, "agent_started"),
+            _make_event(2, "agent_finished"),
+        ]
+        summary = agent._deterministic_final_summary([], agent._compute_stats())
+        assert summary["verdict"] == "clean"
+        assert summary["stats"]["total_events"] == 2
+
+    async def test_usage_recording(self) -> None:
+        from providers.events import EventBus
+
+        bus = EventBus()
+        agent = IntrospectionAgent(
+            state_store_url="http://localhost:8090",
+            event_bus=bus,
+        )
+        mock_response = MagicMock()
+        mock_response.usage = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "model": "claude-haiku-4-5",
+        }
+        agent._record_usage("PERF-1", mock_response)
+
+        usage = bus.get_cumulative_usage("PERF-1")
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 50
+
+        agent_usage = bus.get_agent_usage("PERF-1")
+        assert "introspection-agent" in agent_usage
 
 
 class TestIntrospectionConfig:

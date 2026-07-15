@@ -1,43 +1,18 @@
-"""FastMCP server for introspection agent tools.
+"""Introspection detection engine.
 
-Exposes read-only observation tools over stdio. The introspection
-agent uses these to watch a ticket's event stream, check token
-usage, and detect anomalies — all without modifying ticket state.
-
-Run directly:  python agents/introspection/server.py
-Connected via: AgentMCPClient (agents/mcp_client.py)
+Provides deterministic anomaly detection, tool failure parsing,
+event reading, and error classification for the introspection
+agent.  All detection parameters are loaded from skill files
+(skills/introspection/) with private-skills overrides.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import sys
-from pathlib import Path
 from typing import Any
 
-_project_root = str(Path(__file__).resolve().parents[2])
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
-import httpx
-from fastmcp import FastMCP
-
 from paths import LOG_DIR as DEFAULT_LOG_DIR
-
-mcp = FastMCP("introspection")
-
-
-def _auth_headers() -> dict[str, str]:
-    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
-
-
-def _state_store_url() -> str:
-    return os.environ.get("STATE_STORE_URL", "http://localhost:8080")
 
 
 def _read_events(
@@ -447,129 +422,3 @@ def _detect_anomalies_from_events(
             )
 
     return anomalies
-
-
-@mcp.tool()
-async def get_ticket_events(
-    ticket_id: str,
-    since: int = 0,
-    limit: int = 100,
-) -> str:
-    """Fetch recent events from a ticket's event stream.
-
-    Returns truncated events for token efficiency. Use 'since'
-    to poll incrementally for new events.
-    """
-    events = _read_events(ticket_id, since=since, limit=limit)
-    trimmed = [_truncate_event(e) for e in events]
-    return json.dumps(trimmed, indent=2, default=str)
-
-
-@mcp.tool()
-async def get_ticket_status(ticket_id: str) -> str:
-    """Get the current status and metadata of a ticket."""
-    url = f"{_state_store_url()}/api/v1/tickets/{ticket_id}"
-    async with httpx.AsyncClient(
-        timeout=10.0,
-        headers=_auth_headers(),
-    ) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            return json.dumps({"error": f"Ticket {ticket_id} not found"})
-        ticket = r.json()
-
-    # Return a trimmed view — don't send the full ticket
-    # (which may contain large custom_fields) to the LLM.
-    cf = ticket.get("custom_fields", {})
-    return json.dumps(
-        {
-            "id": ticket.get("id"),
-            "summary": ticket.get("summary"),
-            "status": ticket.get("status"),
-            "created_at": ticket.get("created_at"),
-            "updated_at": ticket.get("updated_at"),
-            "benchmark_suite": cf.get("benchmark_suite"),
-            "harness_name": cf.get("harness_name"),
-            "resource_provider": cf.get("resource_provider"),
-            "hypothesis": cf.get("hypothesis"),
-            "comment_count": len(ticket.get("comments", [])),
-        },
-        indent=2,
-        default=str,
-    )
-
-
-@mcp.tool()
-async def get_token_usage(ticket_id: str) -> str:
-    """Get cumulative LLM token usage for a ticket.
-
-    Reads usage data from the event stream (llm_usage events)
-    and aggregates by agent.
-    """
-    events = _read_events(ticket_id, since=0, limit=10000)
-    per_agent: dict[str, dict[str, int]] = {}
-    total = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "llm_calls": 0,
-    }
-
-    for evt in events:
-        if evt.get("event_type") != "llm_usage":
-            continue
-        data = evt.get("data", {})
-        agent = evt.get("agent", "unknown")
-
-        input_tok = data.get("input_tokens", 0)
-        output_tok = data.get("output_tokens", 0)
-
-        if agent not in per_agent:
-            per_agent[agent] = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "llm_calls": 0,
-            }
-        per_agent[agent]["input_tokens"] += input_tok
-        per_agent[agent]["output_tokens"] += output_tok
-        per_agent[agent]["llm_calls"] += 1
-
-        total["input_tokens"] += input_tok
-        total["output_tokens"] += output_tok
-        total["llm_calls"] += 1
-
-    return json.dumps(
-        {
-            "ticket_id": ticket_id,
-            "total": total,
-            "by_agent": per_agent,
-        },
-        indent=2,
-    )
-
-
-@mcp.tool()
-async def detect_anomalies(ticket_id: str) -> str:
-    """Analyze a ticket's event stream for anomalous patterns."""
-    events = _read_events(ticket_id, since=0, limit=10000)
-    if not events:
-        return json.dumps(
-            {
-                "ticket_id": ticket_id,
-                "anomalies": [],
-                "note": "No events found",
-            }
-        )
-
-    anomalies = _detect_anomalies_from_events(events)
-    return json.dumps(
-        {
-            "ticket_id": ticket_id,
-            "total_events": len(events),
-            "anomalies": anomalies,
-        },
-        indent=2,
-    )
-
-
-if __name__ == "__main__":
-    mcp.run()

@@ -222,9 +222,11 @@ class Dispatcher:
 
         from agents.introspection.agent import IntrospectionAgent
 
+        llm = self._get_llm("introspection")
         agent = IntrospectionAgent(
             state_store_url=self.store_url,
             event_bus=self.events,
+            llm_provider=llm,
         )
         self._introspection_agents[ticket_id] = agent
 

@@ -158,6 +158,7 @@ takes priority.
 | `triage` | `claude-sonnet-4-6` |
 | `evaluating_convergence` | `claude-sonnet-4-6` |
 | `retrospective` | `claude-sonnet-4-6` |
+| `introspection` | `claude-haiku-4-5` |
 
 #### Agent Type Names
 
@@ -172,6 +173,7 @@ These are the agent types that can be used as keys in `agent_models`:
 | `review` | `awaiting_review` | Analyzes benchmark results |
 | `resource_teardown` | `awaiting_teardown` | Releases hardware resources |
 | `retrospective` | `retrospective_pending` | Post-mortem analysis |
+| `introspection` | *(out-of-band)* | Continuous ticket observer |
 | `gathering_context` | `gathering_context` | Collects investigation data |
 | `planning_investigation` | `planning_investigation` | Plans investigation steps |
 | `evaluating_convergence` | `evaluating_convergence` | Checks if investigation is complete |

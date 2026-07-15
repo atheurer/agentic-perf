@@ -457,12 +457,13 @@ with key metrics and recommendations. Harness-agnostic: discovers how to
 retrieve results through skill providers.
 
 **Introspection Agent** — Continuous passive observer that runs alongside
-the pipeline agents without participating in the state machine. Unlike
-other agents, it does not extend `AgentBase` or use an LLM loop — it is
-a simple async poll loop that reads the JSONL event stream, detects
-anomalies, and writes structured observations to
-`custom_fields.introspection`. The web dashboard renders these
-observations in a dedicated card below the LLM Usage section.
+the pipeline agents without participating in the state machine. Uses a
+hybrid architecture: a deterministic poll loop handles anomaly detection
+(code enforces invariants), while periodic LLM calls produce human-useful
+narrative and the final summary (LLM interprets the signals). The web
+dashboard renders observations in a dedicated card below the LLM Usage
+section, with LLM-generated narrative entries visually distinguished
+from mechanical log entries.
 
 The introspection agent:
 - Is started by the orchestrator BEFORE the first pipeline agent to
@@ -493,6 +494,19 @@ Enabling introspection:
 - Per-ticket: `custom_fields.introspection_enabled = true` (overrides
   global setting in either direction)
 - Disabled by default
+
+The introspection agent defaults to `claude-haiku-4-5` (lightweight,
+cheap) since it makes periodic LLM calls across the full ticket
+lifecycle. This can be overridden via `agent_models.introspection`
+in config.json. Token usage is tracked per-ticket and per-agent
+through the standard EventBus accounting, appearing in the LLM
+Usage card alongside pipeline agents.
+
+When the ticket closes, the agent writes a final LLM-driven summary
+to `custom_fields.introspection_summary` with verdict, observations,
+and actionable recommendations. This persists separately from the
+live observation field. Without an LLM provider, it falls back to
+deterministic stats.
 
 Future phases will add active monitoring (Phase 2: soft-stop signals
 when anomalies are detected) and corralling (Phase 3: guidance

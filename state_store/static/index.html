@@ -1669,7 +1669,7 @@ function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
 
-  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis', 'evaluation_result', 'synthesis_result', 'dedup_result', 'introspection'];
+  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis', 'evaluation_result', 'synthesis_result', 'dedup_result', 'introspection', 'introspection_summary'];
   var items = '';
   for (var k in fields) {
     if (promoted.indexOf(k) !== -1) continue;
@@ -1742,7 +1742,16 @@ function updateIntrospectionCard(ticketId) {
 
   api('/tickets/' + ticketId).then(function(ticket) {
     var cf = ticket.custom_fields || {};
+    var summary = cf.introspection_summary;
     var intro = cf.introspection;
+
+    // Final summary takes precedence when present.
+    if (summary) {
+      card.classList.remove('introspection-hidden');
+      content.innerHTML = renderIntrospectionSummary(summary);
+      return;
+    }
+
     if (!intro) {
       card.classList.add('introspection-hidden');
       return;
@@ -1806,8 +1815,17 @@ function renderIntrospectionContent(intro) {
   if (narrativeLines.length > 0) {
     var narrativeHtml = '';
     for (var ni = 0; ni < narrativeLines.length; ni++) {
-      narrativeHtml += '<div style="padding:2px 0; border-bottom:1px solid var(--border);">' +
-        escHtml(narrativeLines[ni]) + '</div>';
+      var line = narrativeLines[ni];
+      var isObservation = typeof line === 'string' && line.indexOf('[observation]') === 0;
+      if (isObservation) {
+        var obsText = line.substring('[observation] '.length);
+        narrativeHtml += '<div style="padding:4px 6px; margin:2px 0; border-left:3px solid var(--purple);' +
+          ' background:rgba(187,154,247,0.08); border-radius:0 4px 4px 0; font-size:12px;' +
+          ' color:var(--text-bright)">' + escHtml(obsText) + '</div>';
+      } else {
+        narrativeHtml += '<div style="padding:2px 0; border-bottom:1px solid var(--border);">' +
+          escHtml(line) + '</div>';
+      }
     }
     html += '<details id="introspection-narrative-details" style="margin-top:8px; border:none;">' +
       '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
@@ -1819,6 +1837,94 @@ function renderIntrospectionContent(intro) {
   // Status summary
   if (intro.status_summary) {
     html += '<div class="introspection-status">' + escHtml(intro.status_summary) + '</div>';
+  }
+
+  return html;
+}
+
+function renderIntrospectionSummary(summary) {
+  var html = '';
+  var verdict = summary.verdict || 'unknown';
+  var verdictCls = verdict === 'clean' ? 'pass'
+    : verdict === 'needs_attention' ? 'fail' : 'inconclusive';
+  var verdictLabel = verdict === 'clean' ? 'CLEAN RUN'
+    : verdict === 'needs_attention' ? 'NEEDS ATTENTION'
+    : verdict === 'minor_issues' ? 'MINOR ISSUES' : verdict.toUpperCase();
+
+  html += '<div class="result-verdict ' + verdictCls + '" style="font-size:13px; margin-bottom:8px">' +
+    verdictLabel + '</div>';
+
+  // Stats
+  var stats = summary.stats || {};
+  html += '<div style="font-size:12px; color:var(--text-muted); margin-bottom:8px">' +
+    (stats.total_events || 0) + ' events' +
+    ' \u2022 ' + (stats.total_llm_calls || 0) + ' LLM calls' +
+    ' \u2022 ' + (stats.total_tool_errors || 0) + ' tool errors' +
+    '</div>';
+
+  // Observations (LLM-generated)
+  var obs = summary.observations || [];
+  if (obs.length > 0) {
+    for (var i = 0; i < obs.length; i++) {
+      html += '<div style="font-size:12px; margin:4px 0; color:var(--text)">' +
+        escHtml(obs[i]) + '</div>';
+    }
+  }
+
+  // Recommendations
+  var recs = summary.recommendations || [];
+  if (recs.length > 0) {
+    html += '<div style="margin-top:8px; margin-bottom:6px; font-size:12px; font-weight:600; color:var(--text-muted);' +
+      ' text-transform:uppercase; letter-spacing:0.3px">Recommendations</div>';
+    for (var i = 0; i < recs.length; i++) {
+      var r = recs[i];
+      var areaColor = r.area === 'infrastructure' ? 'var(--red)'
+        : r.area === 'efficiency' ? 'var(--yellow)'
+        : r.area === 'convergence' ? 'var(--orange)'
+        : 'var(--cyan)';
+      html += '<div style="margin:4px 0; font-size:12px">' +
+        '<span style="color:' + areaColor + '; font-weight:600">' +
+        escHtml(r.area || '?') + ':</span> ' +
+        escHtml(r.suggestion || '') + '</div>';
+    }
+  }
+
+  // Anomalies (collapsible)
+  var anomalies = summary.anomalies || [];
+  if (anomalies.length > 0) {
+    html += '<details style="margin-top:8px; border:none;">' +
+      '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+        'Anomalies (' + anomalies.length + ')</summary><div>';
+    for (var i = 0; i < anomalies.length; i++) {
+      var a = anomalies[i];
+      var sevCls = 'sev-' + (a.severity || 'low').toLowerCase();
+      html += '<div class="introspection-anomaly">' +
+        '<span class="anomaly-severity ' + sevCls + '">' + escHtml(a.severity || '?') + '</span>' +
+        '<span class="anomaly-desc">' + escHtml(a.description || '') + '</span>' +
+      '</div>';
+    }
+    html += '</div></details>';
+  }
+
+  // Per-agent breakdown (collapsible)
+  var agents = (stats.per_agent) || {};
+  var agentNames = Object.keys(agents);
+  if (agentNames.length > 0) {
+    html += '<details style="margin-top:8px; border:none;">' +
+      '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+        'Per-Agent Stats (' + agentNames.length + ')</summary><div>';
+    for (var i = 0; i < agentNames.length; i++) {
+      var name = agentNames[i];
+      var s = agents[name];
+      var short = name.replace(/-agent$/, '');
+      html += '<div style="font-size:11px; margin:4px 0; font-family:var(--font-mono)">' +
+        '<span style="color:var(--cyan); font-weight:600">' + escHtml(short) + '</span>: ' +
+        (s.llm_calls || 0) + ' LLM / ' +
+        (s.tool_calls || 0) + ' tools / ' +
+        (s.tool_errors || 0) + ' errors' +
+        '</div>';
+    }
+    html += '</div></details>';
   }
 
   return html;
