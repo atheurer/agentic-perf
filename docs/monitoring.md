@@ -136,6 +136,11 @@ percentage, retry loop count, etc. Override via private skills.
 Private error patterns are *appended* to the shipped defaults.
 Private thresholds *replace* matching shipped defaults.
 
+**Observer prompt** (`skills/introspection/observer-prompt.md`):
+The system prompt that guides the LLM's narrative style, scope
+(pipeline operations, not benchmark results), and final summary
+format. Customizable for different verbosity levels or focus areas.
+
 ### Viewing Results
 
 The web dashboard shows introspection observations in a dedicated card
@@ -144,7 +149,30 @@ every poll cycle and shows:
 - Anomaly count with severity breakdown
 - Individual anomaly descriptions
 - Status summary (events, LLM calls, tool errors)
-- Collapsible narrative of recent activity
+- Collapsible narrative with two entry types: mechanical event
+  descriptions and LLM-generated observations (purple-highlighted)
+  triggered on new anomalies or agent transitions
+
+When the ticket closes, the card switches to a **final summary**
+(`custom_fields.introspection_summary`) with:
+- Verdict: clean / minor issues / needs attention
+- LLM-generated key observations about pipeline operations
+- Actionable recommendations categorized by area:
+  - **infrastructure** — pre-flight checks, environment fixes
+  - **agent_logic** — prompt or skill updates for better strategies
+  - **efficiency** — error-handling code for predictable failures
+  - **convergence** — budget or strategy adjustments
+- Per-agent breakdown (LLM calls, tool calls, errors)
+- Ticket duration (first to last event timestamp)
+
+The final summary is written to a separate persistent field so it
+survives after the live observation stops updating. Without an LLM
+provider, it falls back to deterministic stats only.
+
+Introspection agent token usage is tracked through the standard
+EventBus accounting and appears in the LLM Usage card alongside
+pipeline agents. The agent defaults to `claude-haiku-4-5` to
+minimize cost across the full ticket lifecycle.
 
 ### Relationship to Other Monitoring
 

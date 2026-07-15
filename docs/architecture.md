@@ -947,6 +947,10 @@ skills/
   vstorm/
     config-guide.md         # Configuration reference
     workloads.md            # VM stress workloads
+  introspection/
+    error-patterns.yaml         # Error classification regexes
+    detection-thresholds.yaml   # Anomaly detection thresholds
+    observer-prompt.md          # LLM system prompt for narrative
 ```
 
 This is the "skills" layer from the design philosophy: agents learn what a
