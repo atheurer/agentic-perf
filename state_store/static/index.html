@@ -2173,6 +2173,10 @@ function renderEvent(evt) {
   var ts = fmtTimeShort(evt.timestamp);
   var agent = evt.agent || '';
 
+  // Introspection agent events are shown in the dedicated
+  // introspection card, not in the main event stream.
+  if (agent === 'introspection-agent') return '';
+
   switch (etype) {
     case 'agent_started':
       return renderAgentStarted(evt, ts, agent, data);
