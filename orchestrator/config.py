@@ -20,6 +20,10 @@ class OrchestratorConfig:
         "triage": {"model": "claude-sonnet-4-6"},
         "evaluating_convergence": {"model": "claude-sonnet-4-6"},
         "retrospective": {"model": "claude-sonnet-4-6"},
+        # Introspection is a lightweight observer — default to
+        # a cheap model since it makes periodic narrative calls
+        # across the full ticket lifecycle.
+        "introspection": {"model": "claude-haiku-4-5"},
     }
 
     def __init__(
@@ -142,6 +146,14 @@ class OrchestratorConfig:
             "stale_task_timeout",
             900.0,
         )
+
+        # Introspection agent: continuous passive observer.
+        # Enable globally via config or env var. Can also be
+        # enabled per-ticket via custom_fields.introspection_enabled.
+        introspection_cfg = cfg.get("introspection", {})
+        self.introspection_enabled: bool = (
+            os.environ.get("INTROSPECTION_ENABLED", "").lower() in ("1", "true", "yes")
+        ) or introspection_cfg.get("enabled", False)
 
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.

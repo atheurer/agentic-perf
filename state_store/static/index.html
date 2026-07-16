@@ -885,6 +885,61 @@ th.col-right { text-align: right; }
   font-family: var(--font-mono);
 }
 
+/* Introspection card */
+.introspection-hidden { display: none; }
+
+.introspection-narrative {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  margin-top: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.introspection-anomaly {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 4px 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.anomaly-severity {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+
+.anomaly-severity.sev-high { background: rgba(247, 118, 142, 0.2); color: var(--red); }
+.anomaly-severity.sev-medium { background: rgba(224, 175, 104, 0.2); color: var(--yellow); }
+.anomaly-severity.sev-low { background: rgba(192, 202, 245, 0.1); color: var(--text-muted); }
+
+.anomaly-desc { color: var(--text); }
+
+.introspection-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-style: italic;
+}
+
+.introspection-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 @media (max-width: 900px) {
   .container { padding: 0 12px; }
   .ticket-summary { max-width: 250px; }
@@ -990,6 +1045,14 @@ let renderedEvents = [];
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
+
+// Ticket-level terminal statuses from the state machine.
+// Loaded from the /health API; used for introspection summary
+// pending indicator. Distinct from TERMINAL_STATUSES above,
+// which is a UI concept (includes paused states like
+// awaiting_customer_guidance for disabling controls).
+var ticketTerminalStatuses = new Set(['closed']);
+function isTicketTerminal(s) { return ticketTerminalStatuses.has(s); }
 
 async function stopTicket(ticketId, mode) {
   try {
@@ -1225,6 +1288,11 @@ async function refreshHealth() {
     var usage = results[1];
     var el = document.getElementById('health-stats');
     if (!el) return;
+    // Update ticket-terminal statuses from the state machine.
+    var ts = data.terminal_statuses;
+    if (ts && Array.isArray(ts) && ts.length > 0) {
+      ticketTerminalStatuses = new Set(ts);
+    }
     var counts = data.ticket_counts || {};
     var active = data.total - (counts.closed || 0);
     var html =
@@ -1411,6 +1479,10 @@ async function renderDetail(ticketId) {
               '<div id="llm-usage" style="font-size:12px; color:var(--text-muted);">' +
                 'Waiting for data...' +
               '</div>' +
+            '</div>' +
+            '<div class="left-panel-section introspection-hidden" id="introspection-card">' +
+              '<h4 style="color:var(--purple)">Introspection</h4>' +
+              '<div id="introspection-content"></div>' +
             '</div>' +
           '</div>' +
           '<div class="panel-divider" id="panel-divider"></div>' +
@@ -1610,7 +1682,7 @@ function renderCustomFields(ticket) {
   var fields = ticket.custom_fields;
   if (!fields || Object.keys(fields).length === 0) return '';
 
-  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis', 'evaluation_result', 'synthesis_result', 'dedup_result'];
+  var promoted = ['verdict', 'review_summary', 'detailed_analysis', 'chart_data', 'results_url', 'hypothesis', 'evaluation_result', 'synthesis_result', 'dedup_result', 'introspection', 'introspection_summary'];
   var items = '';
   for (var k in fields) {
     if (promoted.indexOf(k) !== -1) continue;
@@ -1643,6 +1715,36 @@ async function refreshResultSection(ticketId) {
     if (hypo) {
       hypo.innerHTML = renderHypothesisCard(ticket);
     }
+    // Also refresh introspection on transitions
+    var cf = ticket.custom_fields || {};
+    var card = document.getElementById('introspection-card');
+    var introContent = document.getElementById('introspection-content');
+    if (card && introContent && cf.introspection_summary) {
+      // Final summary: render once, then stop.
+      card.classList.remove('introspection-hidden');
+      if (!introContent.dataset.summaryRendered) {
+        introContent.innerHTML = renderIntrospectionSummary(cf.introspection_summary);
+        introContent.dataset.summaryRendered = '1';
+      }
+    } else if (card && introContent && cf.introspection) {
+      card.classList.remove('introspection-hidden');
+      var rsPending = '';
+      if (isTicketTerminal(ticket.status || '')) {
+        rsPending = '<div style="margin-top:8px; font-size:12px; color:var(--purple);">' +
+          '<span class="spinner" style="width:12px; height:12px; border-width:1.5px; margin-right:4px;"></span>' +
+          'Final summary pending\u2026</div>';
+      }
+      var narrativeDetails = introContent.querySelector('#introspection-narrative-details');
+      var wasOpen = narrativeDetails ? narrativeDetails.open : false;
+      var savedScroll = _saveNarrativeScroll(introContent);
+      introContent.innerHTML = renderIntrospectionContent(cf.introspection) + rsPending;
+      if (wasOpen) {
+        var newDetails = introContent.querySelector('#introspection-narrative-details');
+        if (newDetails) newDetails.open = true;
+      }
+      _restoreNarrativeScroll(introContent, savedScroll);
+      _attachNarrativeOpenClick(introContent);
+    }
   } catch {}
 }
 
@@ -1656,7 +1758,255 @@ async function pollEvents(ticketId) {
       renderNewEvents(newEvents);
     }
     updateUsageSidebar(ticketId);
+    updateIntrospectionCard(ticketId);
   } catch {}
+}
+
+function updateIntrospectionCard(ticketId) {
+  if (!ticketId) return;
+  var card = document.getElementById('introspection-card');
+  var content = document.getElementById('introspection-content');
+  if (!card || !content) return;
+
+  api('/tickets/' + ticketId).then(function(ticket) {
+    var cf = ticket.custom_fields || {};
+    var summary = cf.introspection_summary;
+    var intro = cf.introspection;
+
+    // Final summary takes precedence when present.
+    // Once rendered, skip re-renders — closed tickets are
+    // static and re-rendering collapses open <details>.
+    if (summary) {
+      card.classList.remove('introspection-hidden');
+      if (!content.dataset.summaryRendered) {
+        content.innerHTML = renderIntrospectionSummary(summary);
+        content.dataset.summaryRendered = '1';
+      }
+      return;
+    }
+
+    if (!intro) {
+      card.classList.add('introspection-hidden');
+      return;
+    }
+    card.classList.remove('introspection-hidden');
+
+    // Terminal status but no summary yet — the introspection
+    // agent is writing its final summary. Show an indicator.
+    var status = ticket.status || '';
+    var pendingHtml = '';
+    if (isTicketTerminal(status)) {
+      pendingHtml = '<div style="margin-top:8px; font-size:12px; color:var(--purple);">' +
+        '<span class="spinner" style="width:12px; height:12px; border-width:1.5px; margin-right:4px;"></span>' +
+        'Final summary pending…</div>';
+    }
+
+    // Preserve <details> open state and scroll position across re-renders.
+    var narrativeDetails = content.querySelector('#introspection-narrative-details');
+    var wasOpen = narrativeDetails ? narrativeDetails.open : false;
+    var savedScroll = _saveNarrativeScroll(content);
+
+    content.innerHTML = renderIntrospectionContent(intro) + pendingHtml;
+
+    if (wasOpen) {
+      var newDetails = content.querySelector('#introspection-narrative-details');
+      if (newDetails) newDetails.open = true;
+    }
+    _restoreNarrativeScroll(content, savedScroll);
+    _attachNarrativeOpenClick(content);
+  }).catch(function() {});
+}
+
+function renderIntrospectionContent(intro) {
+  var html = '';
+  var anomalies = intro.anomalies || [];
+
+  // Anomaly summary
+  if (anomalies.length > 0) {
+    var high = 0, med = 0, low = 0;
+    for (var i = 0; i < anomalies.length; i++) {
+      var s = (anomalies[i].severity || '').toLowerCase();
+      if (s === 'high') high++;
+      else if (s === 'medium') med++;
+      else low++;
+    }
+    var countParts = [];
+    if (high) countParts.push('<span style="color:var(--red)">' + high + ' high</span>');
+    if (med) countParts.push('<span style="color:var(--yellow)">' + med + ' medium</span>');
+    if (low) countParts.push('<span style="color:var(--text-muted)">' + low + ' low</span>');
+    html += '<div style="font-size:13px; margin-bottom:6px">' +
+      '<span style="color:var(--text-bright); font-weight:600">' + anomalies.length + '</span>' +
+      ' anomal' + (anomalies.length === 1 ? 'y' : 'ies') +
+      ' <span style="font-size:11px">(' + countParts.join(', ') + ')</span></div>';
+
+    for (var i = 0; i < anomalies.length; i++) {
+      var a = anomalies[i];
+      var sevCls = 'sev-' + (a.severity || 'low').toLowerCase();
+      html += '<div class="introspection-anomaly">' +
+        '<span class="anomaly-severity ' + sevCls + '">' + escHtml(a.severity || '?') + '</span>' +
+        '<span class="anomaly-desc">' + escHtml(a.description || '') + '</span>' +
+      '</div>';
+    }
+  } else {
+    html += '<div style="font-size:13px; color:var(--green)">No anomalies detected</div>';
+  }
+
+  // Narrative (collapsible, scrollable log)
+  var narrativeLines = intro.narrative || [];
+  if (typeof narrativeLines === 'string') {
+    // Backward compat: old format was a single string.
+    narrativeLines = narrativeLines ? [narrativeLines] : [];
+  }
+  if (narrativeLines.length > 0) {
+    var narrativeHtml = '';
+    for (var ni = 0; ni < narrativeLines.length; ni++) {
+      var line = narrativeLines[ni];
+      var isObservation = typeof line === 'string' && line.indexOf('[observation]') === 0;
+      if (isObservation) {
+        var obsText = line.substring('[observation] '.length);
+        narrativeHtml += '<div style="padding:4px 6px; margin:2px 0; border-left:3px solid var(--purple);' +
+          ' background:rgba(187,154,247,0.08); border-radius:0 4px 4px 0; font-size:12px;' +
+          ' color:var(--text-bright)">' + escHtml(obsText) + '</div>';
+      } else {
+        narrativeHtml += '<div style="padding:2px 0; border-bottom:1px solid var(--border);">' +
+          escHtml(line) + '</div>';
+      }
+    }
+    html += '<details id="introspection-narrative-details" style="margin-top:8px; border:none;">' +
+      '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+        'Narrative (' + narrativeLines.length + ' entries)</summary>' +
+      '<div class="introspection-narrative" id="introspection-narrative-scroll">' + narrativeHtml + '</div>' +
+    '</details>';
+  }
+
+  // Status summary
+  if (intro.status_summary) {
+    html += '<div class="introspection-status">' + escHtml(intro.status_summary) + '</div>';
+  }
+
+  return html;
+}
+
+function renderIntrospectionSummary(summary) {
+  var html = '';
+  var verdict = summary.verdict || 'unknown';
+  var verdictCls = verdict === 'clean' ? 'pass'
+    : verdict === 'needs_attention' ? 'fail' : 'inconclusive';
+  var verdictLabel = verdict === 'clean' ? 'CLEAN RUN'
+    : verdict === 'needs_attention' ? 'NEEDS ATTENTION'
+    : verdict === 'minor_issues' ? 'MINOR ISSUES' : verdict.toUpperCase();
+
+  html += '<div class="result-verdict ' + verdictCls + '" style="font-size:13px; margin-bottom:8px">' +
+    verdictLabel + '</div>';
+
+  // Stats
+  var stats = summary.stats || {};
+  html += '<div style="font-size:12px; color:var(--text-muted); margin-bottom:8px">' +
+    (stats.total_events || 0) + ' events' +
+    ' \u2022 ' + (stats.total_llm_calls || 0) + ' LLM calls' +
+    ' \u2022 ' + (stats.total_tool_errors || 0) + ' tool errors' +
+    '</div>';
+
+  // Observations (LLM-generated)
+  var obs = summary.observations || [];
+  if (obs.length > 0) {
+    for (var i = 0; i < obs.length; i++) {
+      html += '<div style="font-size:12px; margin:4px 0; color:var(--text)">' +
+        escHtml(obs[i]) + '</div>';
+    }
+  }
+
+  // Recommendations
+  var recs = summary.recommendations || [];
+  if (recs.length > 0) {
+    html += '<div style="margin-top:8px; margin-bottom:6px; font-size:12px; font-weight:600; color:var(--text-muted);' +
+      ' text-transform:uppercase; letter-spacing:0.3px">Recommendations</div>';
+    for (var i = 0; i < recs.length; i++) {
+      var r = recs[i];
+      var areaColor = r.area === 'infrastructure' ? 'var(--red)'
+        : r.area === 'efficiency' ? 'var(--yellow)'
+        : r.area === 'convergence' ? 'var(--orange)'
+        : 'var(--cyan)';
+      html += '<div style="margin:4px 0; font-size:12px">' +
+        '<span style="color:' + areaColor + '; font-weight:600">' +
+        escHtml(r.area || '?') + ':</span> ' +
+        escHtml(r.suggestion || '') + '</div>';
+    }
+  }
+
+  // Anomalies (collapsible)
+  var anomalies = summary.anomalies || [];
+  if (anomalies.length > 0) {
+    html += '<details style="margin-top:8px; border:none;">' +
+      '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+        'Anomalies (' + anomalies.length + ')</summary><div>';
+    for (var i = 0; i < anomalies.length; i++) {
+      var a = anomalies[i];
+      var sevCls = 'sev-' + (a.severity || 'low').toLowerCase();
+      html += '<div class="introspection-anomaly">' +
+        '<span class="anomaly-severity ' + sevCls + '">' + escHtml(a.severity || '?') + '</span>' +
+        '<span class="anomaly-desc">' + escHtml(a.description || '') + '</span>' +
+      '</div>';
+    }
+    html += '</div></details>';
+  }
+
+  // Per-agent breakdown (collapsible)
+  var agents = (stats.per_agent) || {};
+  var agentNames = Object.keys(agents);
+  if (agentNames.length > 0) {
+    html += '<details style="margin-top:8px; border:none;">' +
+      '<summary style="font-size:12px; color:var(--text-muted); background:none; padding:4px 0;">' +
+        'Per-Agent Stats (' + agentNames.length + ')</summary><div>';
+    for (var i = 0; i < agentNames.length; i++) {
+      var name = agentNames[i];
+      var s = agents[name];
+      var short = name.replace(/-agent$/, '');
+      html += '<div style="font-size:11px; margin:4px 0; font-family:var(--font-mono)">' +
+        '<span style="color:var(--cyan); font-weight:600">' + escHtml(short) + '</span>: ' +
+        (s.llm_calls || 0) + ' LLM / ' +
+        (s.tool_calls || 0) + ' tools / ' +
+        (s.tool_errors || 0) + ' errors' +
+        '</div>';
+    }
+    html += '</div></details>';
+  }
+
+  return html;
+}
+
+function _saveNarrativeScroll(container) {
+  var scrollEl = container.querySelector('#introspection-narrative-scroll');
+  if (!scrollEl) return null;
+  return scrollEl.scrollTop;
+}
+
+function _restoreNarrativeScroll(container, savedScroll) {
+  if (savedScroll == null) return;
+  var scrollEl = container.querySelector('#introspection-narrative-scroll');
+  if (scrollEl) scrollEl.scrollTop = savedScroll;
+}
+
+function _attachNarrativeOpenClick(container) {
+  // Listen for clicks on the <summary> element to detect
+  // user-initiated opens. Unlike the 'toggle' event, 'click'
+  // only fires on user interaction — never on programmatic
+  // .open = true — so we don't need guard flags.
+  var details = container.querySelector('#introspection-narrative-details');
+  if (!details) return;
+  var summary = details.querySelector('summary');
+  if (!summary || summary.dataset.listenersAttached) return;
+  summary.dataset.listenersAttached = '1';
+  summary.addEventListener('click', function() {
+    // At click time, details.open reflects the state BEFORE
+    // the toggle, so !details.open means it's about to open.
+    if (!details.open) {
+      requestAnimationFrame(function() {
+        var scrollEl = details.querySelector('#introspection-narrative-scroll');
+        if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+      });
+    }
+  });
 }
 
 async function updateUsageSidebar(ticketId) {
@@ -1851,6 +2201,10 @@ function renderEvent(evt) {
   var data = evt.data || {};
   var ts = fmtTimeShort(evt.timestamp);
   var agent = evt.agent || '';
+
+  // Introspection agent events are shown in the dedicated
+  // introspection card, not in the main event stream.
+  if (agent === 'introspection-agent') return '';
 
   switch (etype) {
     case 'agent_started':

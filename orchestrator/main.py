@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from typing import Any
 
 from paths import LOCK_FILE
 from providers.events import EventBus
@@ -718,6 +719,38 @@ async def _process_stop_requests(
         logger.exception("Failed to process stop requests")
 
 
+def _maybe_start_introspection(
+    dispatcher: Dispatcher,
+    config: OrchestratorConfig,
+    ticket: dict[str, Any],
+    ticket_id: str,
+) -> None:
+    """Start introspection for a ticket if enabled and not already running.
+
+    Introspection is enabled when either:
+    1. Global config: introspection.enabled = true (or env var), OR
+    2. Per-ticket: custom_fields.introspection_enabled = true
+
+    Per-ticket custom_fields.introspection_enabled = false explicitly
+    disables introspection even when globally enabled.
+    """
+    if dispatcher.is_introspection_active(ticket_id):
+        return
+
+    cf = ticket.get("custom_fields", {})
+    per_ticket = cf.get("introspection_enabled")
+
+    # Per-ticket override takes precedence.
+    if per_ticket is False:
+        return
+    if per_ticket is not True and not config.introspection_enabled:
+        return
+
+    started = dispatcher.start_introspection(ticket_id)
+    if started:
+        logger.info(f"Introspection started for {ticket_id}")
+
+
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = _make_llm_provider(config)
     llm.default_timeout = config.llm_timeout
@@ -863,6 +896,16 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     logger.info(f"Skipping {tid} at {status}: claim held")
                     continue
                 dispatcher.start_renewal(tid)
+
+                # Start introspection BEFORE the pipeline agent
+                # so no events are missed in a startup race.
+                _maybe_start_introspection(
+                    dispatcher,
+                    config,
+                    ticket,
+                    tid,
+                )
+
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
                 task = asyncio.create_task(
                     run_agent_task(

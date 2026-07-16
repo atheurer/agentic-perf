@@ -35,6 +35,11 @@ Agentic-perf has four major subsystems:
    └───────┘ └────────┘ └──────────┘ └────────┘ └────────┘
 ```
 
+A sixth agent, the **Introspection Agent**, runs as an optional companion
+alongside the pipeline agents. It does not participate in the state machine
+— it continuously watches the event stream and writes observations to
+`custom_fields.introspection` for the web dashboard to display.
+
 All communication between components goes through the state store's REST API.
 Agents never talk to each other directly — they read and write the shared
 ticket document.
@@ -164,6 +169,15 @@ Terminal statuses (`closed`, `awaiting_customer_guidance`) do not dispatch
 agents. `awaiting_customer_guidance` resumes to the previous status when the
 user replies. The `planning_investigation` agent is a stub that auto-advances;
 all other investigation loop agents are fully implemented.
+
+### Introspection Agent (Out-of-Band)
+
+The introspection agent is a continuous background observer that runs
+alongside the pipeline agents. It does NOT participate in the status-to-agent
+mapping or the state machine — it is started by the orchestrator as a
+companion task before the first pipeline agent dispatches.
+
+See [Introspection](#introspection-agent) for details.
 
 ### Special Transitions
 
@@ -441,6 +455,68 @@ harness schema. Handles both remotehosts and Kubernetes endpoint types.
 metrics, and produces a verdict (hypothesis confirmed/refuted/inconclusive)
 with key metrics and recommendations. Harness-agnostic: discovers how to
 retrieve results through skill providers.
+
+**Introspection Agent** — Continuous passive observer that runs alongside
+the pipeline agents without participating in the state machine. Uses a
+hybrid architecture: a deterministic poll loop handles anomaly detection
+(code enforces invariants), while periodic LLM calls produce human-useful
+narrative and the final summary (LLM interprets the signals). The web
+dashboard renders observations in a dedicated card below the LLM Usage
+section, with LLM-generated narrative entries visually distinguished
+from mechanical log entries.
+
+The introspection agent:
+- Is started by the orchestrator BEFORE the first pipeline agent to
+  avoid missing early events
+- Polls the event stream every 5 seconds with incremental reads
+- Accumulates full event history for pattern detection
+- Detects content-based tool failures (not just `is_error` — also
+  non-zero exit codes, `success: false`, `status: failed` in tool
+  result JSON)
+- Detects consecutive tool failures with similar error output, even
+  when the agent changes input flags between retries. Detection is
+  per-tool — interleaved diagnostic calls do not reset streaks
+- Classifies errors as infrastructure (retrying won't help), transient
+  (may resolve), or logic (agent needs a different approach)
+- Computes wasted iteration ratio per agent (LLM calls that produced
+  only failed tool results)
+- Detects retry loops (per-tool, survives interleaved diagnostics)
+  and max iteration exhaustion
+- Detects tool bypass patterns: agents using generic tools (e.g.,
+  `execute_command`) instead of purpose-built tools (e.g.,
+  `execute_benchmark`), manual schema exploration via SSH, and
+  manual container orchestration via SSH
+- Stops automatically when the ticket reaches a terminal status
+- Never transitions ticket state or modifies agent behavior (Phase 1)
+
+Detection parameters (error patterns, thresholds, severity escalation)
+are loaded from skill files (`skills/introspection/`) with private-
+skills overrides (`~/.agentic-perf/private-skills/introspection.json`).
+See [Skill Documentation](#skill-documentation) for the pattern.
+
+Enabling introspection:
+- Globally: `introspection.enabled = true` in config.json or
+  `INTROSPECTION_ENABLED=true` env var
+- Per-ticket: `custom_fields.introspection_enabled = true` (overrides
+  global setting in either direction)
+- Disabled by default
+
+The introspection agent defaults to `claude-haiku-4-5` (lightweight,
+cheap) since it makes periodic LLM calls across the full ticket
+lifecycle. This can be overridden via `agent_models.introspection`
+in config.json. Token usage is tracked per-ticket and per-agent
+through the standard EventBus accounting, appearing in the LLM
+Usage card alongside pipeline agents.
+
+When the ticket closes, the agent writes a final LLM-driven summary
+to `custom_fields.introspection_summary` with verdict, observations,
+and actionable recommendations. This persists separately from the
+live observation field. Without an LLM provider, it falls back to
+deterministic stats.
+
+Future phases will add active monitoring (Phase 2: soft-stop signals
+when anomalies are detected) and corralling (Phase 3: guidance
+injection to redirect off-track agents).
 
 ## Provider System
 
@@ -877,6 +953,11 @@ skills/
   vstorm/
     config-guide.md         # Configuration reference
     workloads.md            # VM stress workloads
+  introspection/
+    error-patterns.yaml         # Error classification regexes
+    detection-thresholds.yaml   # Anomaly detection thresholds
+    observer-prompt.md          # LLM system prompt for narrative
+    tool-bypass-patterns.yaml   # Tool misuse detection patterns
 ```
 
 This is the "skills" layer from the design philosophy: agents learn what a

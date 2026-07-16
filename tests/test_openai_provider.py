@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
@@ -357,14 +358,16 @@ class TestResponseParsing:
 class TestConfigResolution:
     """Test per-agent model config resolution."""
 
-    def test_default_config_non_builtin_agent(self):
+    @patch("orchestrator.config._load_config_file", return_value={})
+    def test_default_config_non_builtin_agent(self, _mock_cfg):
         from orchestrator.config import OrchestratorConfig
 
         config = OrchestratorConfig(llm_provider="claude", llm_model="claude-haiku-4-5")
         result = config.get_agent_llm_config("benchmark")
         assert result == {"provider": "claude", "model": "claude-haiku-4-5"}
 
-    def test_builtin_defaults_apply(self):
+    @patch("orchestrator.config._load_config_file", return_value={})
+    def test_builtin_defaults_apply(self, _mock_cfg):
         """Reasoning-heavy agents get Sonnet by default, others get global."""
         from orchestrator.config import OrchestratorConfig
 
@@ -379,7 +382,8 @@ class TestConfigResolution:
             "benchmark should use global default"
         )
 
-    def test_builtin_defaults_inherit_provider(self):
+    @patch("orchestrator.config._load_config_file", return_value={})
+    def test_builtin_defaults_inherit_provider(self, _mock_cfg):
         """Built-in defaults use the global provider, not a hardcoded one."""
         from orchestrator.config import OrchestratorConfig
 

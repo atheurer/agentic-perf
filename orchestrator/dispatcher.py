@@ -70,6 +70,8 @@ class Dispatcher:
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._handoff_blocked: set[tuple[str, str]] = set()
+        self._introspection_tasks: dict[str, asyncio.Task] = {}
+        self._introspection_agents: dict[str, Any] = {}
 
     def is_active(self, ticket_id: str) -> bool:
         task = self._tasks.get(ticket_id)
@@ -144,7 +146,7 @@ class Dispatcher:
 
     def start_renewal(self, ticket_id: str) -> None:
         """Start the background claim renewal task for a ticket."""
-        task = asyncio.ensure_future(self._renewal_loop(ticket_id))
+        task = asyncio.create_task(self._renewal_loop(ticket_id))
         self._renewal_tasks[ticket_id] = task
 
     def stop_renewal(self, ticket_id: str) -> None:
@@ -174,6 +176,7 @@ class Dispatcher:
         }
 
     def stop_agent(self, ticket_id: str, mode: str = "graceful") -> bool:
+        self.stop_introspection(ticket_id)
         if mode == "graceful":
             agent = self._agents.get(ticket_id)
             if agent is not None and hasattr(agent, "request_stop"):
@@ -202,6 +205,83 @@ class Dispatcher:
         self.stop_renewal(ticket_id)
         self.release_claim(ticket_id)
         self.clear_handoff_blocked(ticket_id)
+        # Note: introspection is NOT stopped here. It runs
+        # across the full ticket lifecycle and self-stops on
+        # terminal status. Stopping it on every agent handoff
+        # would lose narrative history and prevent the final
+        # summary from being written. Only stop_agent (explicit
+        # user action) forces introspection shutdown.
+
+    def start_introspection(
+        self,
+        ticket_id: str,
+    ) -> bool:
+        """Start the introspection agent for a ticket.
+
+        Returns True if started, False if already running.
+        The introspection agent runs as a companion task
+        alongside the real agents — it does not participate
+        in the dispatch loop or affect ticket state.
+        """
+        existing = self._introspection_tasks.get(ticket_id)
+        if existing is not None and not existing.done():
+            return False
+
+        from agents.introspection.agent import IntrospectionAgent
+
+        llm = self._get_llm("introspection")
+        agent = IntrospectionAgent(
+            state_store_url=self.store_url,
+            event_bus=self.events,
+            llm_provider=llm,
+        )
+        self._introspection_agents[ticket_id] = agent
+
+        task = asyncio.create_task(
+            self._run_introspection(
+                ticket_id,
+                agent,
+            )
+        )
+        self._introspection_tasks[ticket_id] = task
+        return True
+
+    async def _run_introspection(
+        self,
+        ticket_id: str,
+        agent: Any,
+    ) -> None:
+        """Run the introspection agent and clean up on exit."""
+        try:
+            async with agent:
+                await agent.run(ticket_id)
+        except asyncio.CancelledError:
+            logger.info(f"Introspection cancelled for {ticket_id}")
+        except Exception:
+            logger.exception(f"Introspection failed for {ticket_id}")
+        finally:
+            self._introspection_agents.pop(ticket_id, None)
+            self._introspection_tasks.pop(ticket_id, None)
+
+    def stop_introspection(self, ticket_id: str) -> None:
+        """Stop the introspection agent for a ticket."""
+        agent = self._introspection_agents.get(ticket_id)
+        if agent is not None:
+            agent.request_stop()
+        task = self._introspection_tasks.get(ticket_id)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def is_introspection_active(self, ticket_id: str) -> bool:
+        """Check if introspection is running for a ticket."""
+        task = self._introspection_tasks.get(ticket_id)
+        if task is None:
+            return False
+        if task.done():
+            self._introspection_tasks.pop(ticket_id, None)
+            self._introspection_agents.pop(ticket_id, None)
+            return False
+        return True
 
     def _get_llm(self, agent_type: str) -> LLMProvider:
         if self._llm_factory:

@@ -1,0 +1,36 @@
+# Error classification patterns for the introspection agent.
+#
+# Each pattern maps a regex to an error class:
+#   infrastructure — retrying won't help (port conflict, disk full)
+#   transient      — retrying may help (timeout, rate limit)
+#   logic          — agent needs a different approach
+#
+# Patterns are matched case-insensitively against error messages
+# extracted from tool_result content.
+#
+# Private overrides: place additional patterns in
+#   ~/.agentic-perf/private-skills/introspection.json
+# under the "error_patterns" key (same structure, merged at load).
+
+infrastructure:
+  - "address already in use"
+  - "no space left on device"
+  - "permission denied"
+  - "disk quota exceeded"
+  - "read-only file system"
+  - "cannot allocate memory"
+  - "connection refused"
+  - "host is down"
+  - "no route to host"
+  - "network is unreachable"
+
+transient:
+  - "timed? ?out"
+  - "rate limit"
+  - "temporarily unavailable"
+  - "429|503|502|504"
+  - "connection reset"
+  - "broken pipe"
+  - "try again"
+  - "resource temporarily unavailable"
+  - "service unavailable"

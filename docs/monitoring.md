@@ -66,6 +66,160 @@ Agentic-perf is a complex system with multiple agents, external integrations, an
 
 ---
 
+## Introspection Agent
+
+The introspection agent provides automated, continuous monitoring of
+individual tickets. When enabled, it runs alongside the pipeline agents
+and detects anomalous patterns in real time without requiring manual
+log review.
+
+### What It Detects
+
+| Anomaly | Severity | Description |
+|---|---|---|
+| Consecutive failures | medium/high | Same tool failing 2+ times in a row with similar errors, even when the agent changes input flags between retries. Tracked per-tool — interleaved diagnostic calls (e.g., `get_status`, `check_os`) do not reset the streak. |
+| Repeated tool errors | medium/high | Same tool failing 3+ times total (non-consecutive) |
+| Retry loops | medium/high | Same tool called with identical input 3+ times. Tracked per-tool — interleaved calls to other tools do not break loop detection. |
+| Wasted iterations | medium/high | 25%+ of an agent's LLM calls produced only failed tool results |
+| Max iterations | high | Agent exhausted its iteration budget |
+| Tool bypass | medium/high | Agent uses a generic tool (e.g., `execute_command`) for tasks a specialized tool handles (e.g., `execute_benchmark`). Includes detection of manual schema exploration (`--schema`, `--help` via SSH) and manual container orchestration (`podman run` via SSH). |
+
+The detection also classifies errors:
+- **Infrastructure** (port conflict, disk full, permission denied) — retrying won't help
+- **Transient** (timeout, rate limit, connection reset) — retrying may help
+- **Logic** (wrong arguments, missing prerequisites) — agent needs a different approach
+
+Importantly, failures are detected from tool result *content*, not just
+the `is_error` flag. MCP tools that return `{"exit_code": 1, "error": "..."}`
+or `{"success": false}` are recognized as failures even when the tool
+handler itself didn't crash.
+
+### Enabling
+
+Globally in `~/.agentic-perf/config.json`:
+```json
+{
+    "introspection": {
+        "enabled": true
+    }
+}
+```
+
+Or per-ticket via `custom_fields.introspection_enabled: true` at
+submission time.
+
+### Customizing Detection
+
+Detection parameters are loaded from skill files, not hardcoded.
+Tune for your environment:
+
+**Error patterns** (`skills/introspection/error-patterns.yaml`):
+Regex patterns for classifying errors as infrastructure, transient,
+or logic. Add org-specific patterns via private skills.
+
+**Detection thresholds** (`skills/introspection/detection-thresholds.yaml`):
+Consecutive failure count, similarity threshold, wasted iteration
+percentage, retry loop count, tool bypass minimum calls, etc.
+Override via private skills.
+
+**Tool bypass patterns** (`skills/introspection/tool-bypass-patterns.yaml`):
+Detects when agents use generic tools instead of purpose-built ones.
+Contains two sections:
+- `tool_mappings` — generic-to-specialized tool relationships per
+  agent (e.g., benchmark agent using `execute_command` instead of
+  `execute_benchmark`)
+- `command_patterns` — regex patterns matched against tool input
+  to detect specific bypass behaviors (e.g., manual schema
+  exploration via `podman run --schema`, manual container
+  orchestration via `podman run`)
+
+**Private overrides** (`~/.agentic-perf/private-skills/introspection.json`):
+```json
+{
+    "error_patterns": {
+        "infrastructure": ["our custom storage error"]
+    },
+    "thresholds": {
+        "consecutive_failure_min": 3,
+        "wasted_iterations_pct": 40
+    },
+    "tool_bypass": {
+        "tool_mappings": [
+            {
+                "agent": "provisioning",
+                "generic_tool": "execute_command",
+                "specialized_tool": "jmp_run",
+                "description": "running commands directly instead of via Jumpstarter"
+            }
+        ],
+        "command_patterns": [
+            {
+                "agent": "benchmark",
+                "tool": "execute_command",
+                "pattern": "our-internal-tool --manual-mode",
+                "description": "manual invocation of internal tool",
+                "severity": "medium"
+            }
+        ]
+    }
+}
+```
+
+Private error patterns and tool bypass patterns are *appended* to
+the shipped defaults. Private thresholds *replace* matching shipped
+defaults.
+
+**Observer prompt** (`skills/introspection/observer-prompt.md`):
+The system prompt that guides the LLM's narrative style, scope
+(pipeline operations, not benchmark results), and final summary
+format. Customizable for different verbosity levels or focus areas.
+
+### Viewing Results
+
+The web dashboard shows introspection observations in a dedicated card
+below the LLM Usage section in the ticket detail view. The card updates
+every poll cycle and shows:
+- Anomaly count with severity breakdown
+- Individual anomaly descriptions
+- Status summary (events, LLM calls, tool errors)
+- Collapsible narrative with two entry types: mechanical event
+  descriptions and LLM-generated observations (purple-highlighted)
+  triggered on new anomalies or agent transitions
+
+When the ticket closes, the card switches to a **final summary**
+(`custom_fields.introspection_summary`) with:
+- Verdict: clean / minor issues / needs attention
+- LLM-generated key observations about pipeline operations
+- Actionable recommendations categorized by area:
+  - **infrastructure** — pre-flight checks, environment fixes
+  - **agent_logic** — prompt or skill updates for better strategies
+  - **efficiency** — error-handling code for predictable failures
+  - **convergence** — budget or strategy adjustments
+- Per-agent breakdown (LLM calls, tool calls, errors)
+- Ticket duration (first to last event timestamp)
+
+The final summary is written to a separate persistent field so it
+survives after the live observation stops updating. Without an LLM
+provider, it falls back to deterministic stats only.
+
+Introspection agent token usage is tracked through the standard
+EventBus accounting and appears in the LLM Usage card alongside
+pipeline agents. The agent defaults to `claude-haiku-4-5` to
+minimize cost across the full ticket lifecycle.
+
+### Relationship to Other Monitoring
+
+Introspection complements the other monitoring tools:
+- **Retrospective agent** analyzes tickets *after* completion;
+  introspection watches *during* execution
+- **Budget guardrails** enforce cost limits; introspection detects
+  *behavioral* waste (retry loops, repeated errors) that may not
+  trigger budget alerts
+- **Stale task watchdog** catches agents with no events;
+  introspection catches agents that are *active but unproductive*
+
+---
+
 ## Monitoring Dashboard Setup
 
 ### Real-Time Web UI Metrics
@@ -74,6 +228,7 @@ The web dashboard at `http://localhost:8090` shows:
 - **System health** (orchestrator uptime, LLM API status)
 - **Cost summary** (total spend, remaining budget)
 - **Agent activity** (current active agents, recent completions)
+- **Introspection** (anomaly detection, when enabled)
 
 View on a persistent monitor in your NOC/war room:
 ```bash

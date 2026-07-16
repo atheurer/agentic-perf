@@ -51,14 +51,43 @@ to the investigation context.
   agent's section in the event stream
 - Event counter
 - LLM usage summary with per-agent cost breakdown
+- Introspection card (when enabled) — see below
 
-**Transaction log event types:**
+**Transaction log event types** (introspection agent events are
+filtered out — they appear in the dedicated introspection card instead):
 - `agent_started` — collapsible section header with agent name; contains collapsible system prompt and initial messages
 - `llm_response` — shows response text and tool calls; long content auto-collapsed
 - `tool_called` / `tool_result` — shows tool name, input, output with collapsible long content
 - `transition` — highlighted banner showing the new status
 - `comment` — comment body with author
 - `agent_finished` / `agent_error` — completion or error markers
+
+**Introspection card:** Appears below the LLM Usage section when
+introspection is enabled for the ticket (globally or per-ticket).
+Displays the introspection agent's continuous observations:
+- Anomaly count with severity breakdown (high/medium/low, color-coded)
+- Individual anomaly descriptions with severity badges
+- Collapsible narrative log with two entry types:
+  - **Mechanical entries** — lightweight event descriptions (agent
+    started, tool called, transitioned to status)
+  - **LLM observations** — purple-highlighted entries with the
+    introspection agent's interpretation of what's happening
+    (patterns, root causes, operational concerns), triggered on
+    new anomalies or agent transitions
+- Status summary (event count, LLM calls, tool errors)
+- Narrative auto-scrolls to bottom following the toolbar's Scroll
+  toggle; scrolls to bottom when first expanded
+
+The card is hidden until the introspection agent writes its first
+observation to `custom_fields.introspection`, then updates on every
+poll cycle. When the ticket closes, the card switches to the **final
+summary** (`custom_fields.introspection_summary`) with verdict badge,
+LLM-generated observations, actionable recommendations by area, and
+collapsible anomaly/per-agent detail. Both fields are excluded from
+the generic Custom Fields section.
+
+Introspection agent token usage appears in the LLM Usage card
+alongside pipeline agents.
 
 **Live polling:** fetches `/api/v1/tickets/{id}/events?since={lastSeq}` every 2 seconds. New events are appended to the event stream container. Auto-scroll keeps the event stream at the bottom unless the user disables it. The context header remains fixed regardless of scroll position.
 

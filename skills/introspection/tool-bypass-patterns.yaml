@@ -1,0 +1,46 @@
+# Tool bypass detection patterns for the introspection agent.
+#
+# Detects when agents use general-purpose tools (like execute_command)
+# for tasks that purpose-built tools handle better. This is not about
+# tool failures — it's about tool misuse that wastes LLM iterations.
+#
+# Private overrides: place additional patterns in
+#   ~/.agentic-perf/private-skills/introspection.json
+#   under the "tool_bypass" key (merged at load).
+
+# --- Generic-to-specialized tool mappings ---
+#
+# When an agent calls a generic tool many times without calling
+# the specialized tool for that domain, flag it as a possible
+# tool bypass.
+#
+# Format: list of {agent, generic_tool, specialized_tool, description}
+# "agent" can be a prefix match (e.g., "benchmark" matches
+# "benchmark-agent").
+
+tool_mappings:
+  - agent: "benchmark"
+    generic_tool: "execute_command"
+    specialized_tool: "execute_benchmark"
+    description: "manually orchestrating benchmark execution instead of using execute_benchmark"
+
+# --- Command content patterns ---
+#
+# When a tool_called event's input matches these regex patterns,
+# flag specific bypass behaviors. Patterns are matched against
+# the serialized input JSON (case-insensitive).
+#
+# Format: list of {agent, tool, pattern, description, severity}
+
+command_patterns:
+  - agent: "benchmark"
+    tool: "execute_command"
+    pattern: "podman run.*--schema|podman run.*--help|podman run.*--json-schema"
+    description: "manual schema exploration via SSH — use get_runfile_schema instead"
+    severity: "medium"
+
+  - agent: "benchmark"
+    tool: "execute_command"
+    pattern: "podman run(?!.*--schema|.*--help|.*--json-schema)"
+    description: "manual container orchestration via SSH — use execute_benchmark instead"
+    severity: "high"
