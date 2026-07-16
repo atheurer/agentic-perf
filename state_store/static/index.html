@@ -1046,6 +1046,14 @@ let renderedEvents = [];
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
 
+// Ticket-level terminal statuses from the state machine.
+// Loaded from the /health API; used for introspection summary
+// pending indicator. Distinct from TERMINAL_STATUSES above,
+// which is a UI concept (includes paused states like
+// awaiting_customer_guidance for disabling controls).
+var ticketTerminalStatuses = new Set(['closed']);
+function isTicketTerminal(s) { return ticketTerminalStatuses.has(s); }
+
 async function stopTicket(ticketId, mode) {
   try {
     var r = await fetch(API + '/tickets/' + ticketId + '/stop', {
@@ -1280,6 +1288,11 @@ async function refreshHealth() {
     var usage = results[1];
     var el = document.getElementById('health-stats');
     if (!el) return;
+    // Update ticket-terminal statuses from the state machine.
+    var ts = data.terminal_statuses;
+    if (ts && Array.isArray(ts) && ts.length > 0) {
+      ticketTerminalStatuses = new Set(ts);
+    }
     var counts = data.ticket_counts || {};
     var active = data.total - (counts.closed || 0);
     var html =
@@ -1716,7 +1729,7 @@ async function refreshResultSection(ticketId) {
     } else if (card && introContent && cf.introspection) {
       card.classList.remove('introspection-hidden');
       var rsPending = '';
-      if (isTerminalStatus(ticket.status || '')) {
+      if (isTicketTerminal(ticket.status || '')) {
         rsPending = '<div style="margin-top:8px; font-size:12px; color:var(--purple);">' +
           '<span class="spinner" style="width:12px; height:12px; border-width:1.5px; margin-right:4px;"></span>' +
           'Final summary pending\u2026</div>';
@@ -1782,7 +1795,7 @@ function updateIntrospectionCard(ticketId) {
     // agent is writing its final summary. Show an indicator.
     var status = ticket.status || '';
     var pendingHtml = '';
-    if (isTerminalStatus(status)) {
+    if (isTicketTerminal(status)) {
       pendingHtml = '<div style="margin-top:8px; font-size:12px; color:var(--purple);">' +
         '<span class="spinner" style="width:12px; height:12px; border-width:1.5px; margin-right:4px;"></span>' +
         'Final summary pending…</div>';

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from ..models import TicketStatus
+from ..models import TERMINAL_STATUSES, TicketStatus
 
 router = APIRouter(tags=["health"])
 
@@ -14,7 +14,12 @@ def health(request: Request):
     counts = {}
     for status in TicketStatus:
         counts[status.value] = sum(1 for t in all_tickets if t.status == status)
-    return {"status": "ok", "ticket_counts": counts, "total": len(all_tickets)}
+    return {
+        "status": "ok",
+        "ticket_counts": counts,
+        "total": len(all_tickets),
+        "terminal_statuses": [s.value for s in TERMINAL_STATUSES],
+    }
 
 
 @router.get("/tickets/since/{seq}")
