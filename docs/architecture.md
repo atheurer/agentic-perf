@@ -474,12 +474,14 @@ The introspection agent:
   non-zero exit codes, `success: false`, `status: failed` in tool
   result JSON)
 - Detects consecutive tool failures with similar error output, even
-  when the agent changes input flags between retries
+  when the agent changes input flags between retries. Detection is
+  per-tool — interleaved diagnostic calls do not reset streaks
 - Classifies errors as infrastructure (retrying won't help), transient
   (may resolve), or logic (agent needs a different approach)
 - Computes wasted iteration ratio per agent (LLM calls that produced
   only failed tool results)
-- Detects retry loops and max iteration exhaustion
+- Detects retry loops (per-tool, survives interleaved diagnostics)
+  and max iteration exhaustion
 - Stops automatically when the ticket reaches a terminal status
 - Never transitions ticket state or modifies agent behavior (Phase 1)
 

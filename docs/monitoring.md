@@ -77,9 +77,9 @@ log review.
 
 | Anomaly | Severity | Description |
 |---|---|---|
-| Consecutive failures | medium/high | Same tool failing 2+ times in a row with similar errors, even when the agent changes input flags between retries |
+| Consecutive failures | medium/high | Same tool failing 2+ times in a row with similar errors, even when the agent changes input flags between retries. Tracked per-tool — interleaved diagnostic calls (e.g., `get_status`, `check_os`) do not reset the streak. |
 | Repeated tool errors | medium/high | Same tool failing 3+ times total (non-consecutive) |
-| Retry loops | medium/high | Same tool called with identical input 3+ times |
+| Retry loops | medium/high | Same tool called with identical input 3+ times. Tracked per-tool — interleaved calls to other tools do not break loop detection. |
 | Wasted iterations | medium/high | 25%+ of an agent's LLM calls produced only failed tool results |
 | Max iterations | high | Agent exhausted its iteration budget |
 

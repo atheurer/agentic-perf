@@ -53,7 +53,8 @@ to the investigation context.
 - LLM usage summary with per-agent cost breakdown
 - Introspection card (when enabled) — see below
 
-**Transaction log event types:**
+**Transaction log event types** (introspection agent events are
+filtered out — they appear in the dedicated introspection card instead):
 - `agent_started` — collapsible section header with agent name; contains collapsible system prompt and initial messages
 - `llm_response` — shows response text and tool calls; long content auto-collapsed
 - `tool_called` / `tool_result` — shows tool name, input, output with collapsible long content
