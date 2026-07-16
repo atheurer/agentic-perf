@@ -58,9 +58,10 @@ func (m *Model) handleWizardInput() tea.Cmd {
 		}
 
 		m.client = api.New(cfg.URL, cfg.Token)
+		m.conn = connConnecting
 		m.input.Blur()
 		m.input.Placeholder = "Type / for commands, Esc to interject..."
-		return m.connectCmd()
+		return connectCmd(m.client)
 	}
 
 	return nil

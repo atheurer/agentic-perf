@@ -391,7 +391,7 @@ func (m *Model) cmdConnect() tea.Cmd {
 		m.source = nil
 	}
 	m.conn = connConnecting
-	return m.connectCmd()
+	return connectCmd(m.client)
 }
 
 func (m *Model) cmdConfig(args []string) tea.Cmd {

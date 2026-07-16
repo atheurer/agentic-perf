@@ -105,25 +105,27 @@ func New(opts Options) Model {
 	}
 }
 
+type startWizardMsg struct{}
+
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		tea.EnterAltScreen,
 		tickCmd(),
 	}
 	if m.needsWizard {
-		m.startWizard()
+		cmds = append(cmds, func() tea.Msg { return startWizardMsg{} })
 	} else {
-		cmds = append(cmds, m.connectCmd())
+		cmds = append(cmds, connectCmd(m.client))
 	}
 	return tea.Batch(cmds...)
 }
 
-func (m Model) connectCmd() tea.Cmd {
+func connectCmd(client *api.Client) tea.Cmd {
 	return func() tea.Msg {
-		if m.client == nil {
+		if client == nil {
 			return connMsg(connDisconnected)
 		}
-		err := m.client.Health()
+		err := client.Health()
 		if err != nil {
 			return connMsg(connDisconnected)
 		}
@@ -143,6 +145,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.updateLayout()
 
+	case startWizardMsg:
+		m.startWizard()
+
 	case tickMsg:
 		cmds = append(cmds, tickCmd())
 		cmds = append(cmds, m.drainEvents())
@@ -150,7 +155,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reconnectTicks++
 			if m.reconnectTicks >= 5 {
 				m.reconnectTicks = 0
-				cmds = append(cmds, m.connectCmd())
+				cmds = append(cmds, connectCmd(m.client))
 			}
 		}
 
@@ -166,19 +171,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connMsg:
 		prev := m.conn
 		m.conn = connState(msg)
-		if m.conn == connConnected && m.source == nil {
+		if m.conn == connConnected {
 			if prev == connDisconnected {
 				m.addSystemLine("Connection restored")
 			}
 			m.reconnectTicks = 0
-			if m.ticketID == "" {
-				cmds = append(cmds, m.autoFollowCmd())
-			} else {
-				m.source = stream.NewSSE(m.client, m.ticketID)
+			if m.source == nil {
+				if m.ticketID == "" {
+					cmds = append(cmds, m.autoFollowCmd())
+				} else {
+					m.source = stream.NewSSE(m.client, m.ticketID)
+				}
 			}
 		}
-		if m.conn == connDisconnected && prev == connConnected {
-			m.addSystemLine("⚠ Connection lost — reconnecting...")
+		if m.conn == connDisconnected && prev != connDisconnected {
+			if prev == connConnected {
+				m.addSystemLine("⚠ Connection lost — reconnecting...")
+			} else {
+				m.addSystemLine("Connection failed — retrying...")
+			}
 			if m.source != nil {
 				m.source.Close()
 				m.source = nil
