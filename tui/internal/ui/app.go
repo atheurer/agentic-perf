@@ -150,14 +150,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case eventMsg:
 		line := events.Line(msg)
-		m.lines = append(m.lines, line)
-		m.updateViewportContent()
-		if line.Type == "transition" {
-			to := strData(line.Data, "to")
-			m.checkHITLTrigger(line.TicketID, to)
-		}
-		if line.Type == "comment" {
-			m.checkHITLFromEvent(strData(line.Data, "body"))
+		m.appendEvent(line)
+
+	case batchEventsMsg:
+		for _, line := range msg {
+			m.appendEvent(line)
 		}
 
 	case connMsg:
@@ -355,6 +352,18 @@ func (m *Model) autoFollowCmd() tea.Cmd {
 	}
 }
 
+func (m *Model) appendEvent(line events.Line) {
+	m.lines = append(m.lines, line)
+	m.updateViewportContent()
+	if line.Type == "transition" {
+		to := strData(line.Data, "to")
+		m.checkHITLTrigger(line.TicketID, to)
+	}
+	if line.Type == "comment" {
+		m.checkHITLFromEvent(strData(line.Data, "body"))
+	}
+}
+
 func (m *Model) addSystemLine(text string) {
 	m.lines = append(m.lines, events.Line{
 		Type: "system",
@@ -363,19 +372,31 @@ func (m *Model) addSystemLine(text string) {
 	m.updateViewportContent()
 }
 
+type batchEventsMsg []events.Line
+
 func (m *Model) drainEvents() tea.Cmd {
 	if m.source == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		select {
-		case evt, ok := <-m.source.Events():
-			if !ok {
-				return connMsg(connDisconnected)
+		ch := m.source.Events()
+		var batch []events.Line
+		for {
+			select {
+			case evt, ok := <-ch:
+				if !ok {
+					if len(batch) > 0 {
+						return batchEventsMsg(batch)
+					}
+					return connMsg(connDisconnected)
+				}
+				batch = append(batch, events.Normalize(evt))
+			default:
+				if len(batch) > 0 {
+					return batchEventsMsg(batch)
+				}
+				return nil
 			}
-			return eventMsg(events.Normalize(evt))
-		default:
-			return nil
 		}
 	}
 }
