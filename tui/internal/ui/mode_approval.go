@@ -106,6 +106,19 @@ func (m *Model) checkApprovalTrigger(cf map[string]interface{}) {
 	m.enterApproval(pa)
 }
 
+func (m *Model) clearApprovalIfResolved(eventType string) {
+	if m.mode != ModeApproval {
+		return
+	}
+	// A transition or new tool call means the approval was
+	// handled externally (web UI, cli.py) and the agent moved on.
+	if eventType == "transition" || eventType == "tool_called" {
+		m.mode = ModeNormal
+		m.pendingApproval = nil
+		m.addSystemLine("Approval resolved externally")
+	}
+}
+
 func strFromMap(m map[string]interface{}, key string) string {
 	if v, ok := m[key]; ok {
 		if s, ok := v.(string); ok {

@@ -362,6 +362,7 @@ func (m *Model) appendEvent(line events.Line) {
 	if line.Type == "comment" {
 		m.checkHITLFromEvent(strData(line.Data, "body"))
 	}
+	m.clearApprovalIfResolved(line.Type)
 }
 
 func (m *Model) addSystemLine(text string) {

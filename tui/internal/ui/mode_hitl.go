@@ -49,10 +49,21 @@ func (m *Model) sendHITLReply(text string) tea.Cmd {
 }
 
 func (m *Model) checkHITLTrigger(ticketID, status string) {
-	if status == "awaiting_customer_guidance" && ticketID == m.ticketID {
+	if ticketID != m.ticketID {
+		return
+	}
+	if status == "awaiting_customer_guidance" {
 		if m.mode != ModeHITL {
 			m.enterHITL(ticketID)
 		}
+		return
+	}
+	// Ticket left guidance — someone else replied (web UI, cli.py).
+	if m.mode == ModeHITL {
+		m.mode = ModeNormal
+		m.input.Blur()
+		m.input.Placeholder = "Type / for commands, Esc to interject..."
+		m.addSystemLine(fmt.Sprintf("HITL resolved externally → %s", status))
 	}
 }
 
