@@ -24,3 +24,7 @@ docs/.claude/
 # Test caches
 .pytest_cache/
 .coverage
+
+# TUI build artifacts
+tui/aptui
+tui/dist/

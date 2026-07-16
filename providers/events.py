@@ -26,6 +26,8 @@ EVENT_TYPES = {
     "tool_progress",
     "llm_usage",
     "agent_stopped",
+    "user_interjection",
+    "escalation",
 }
 
 

@@ -150,6 +150,17 @@ class AgentBase(ABC):
                     )
                     break
 
+                interject_msg = await self._check_interject(
+                    ticket_id,
+                )
+                if interject_msg:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (f"[USER INTERJECTION] {interject_msg}"),
+                        }
+                    )
+
                 iteration += 1
                 self._emit(
                     ticket_id,
@@ -940,6 +951,33 @@ class AgentBase(ABC):
         )
         ticket_status = ticket.get("status", "")
         return expected_status == ticket_status
+
+    async def _check_interject(self, ticket_id: str) -> str | None:
+        """Check for and consume a pending user interjection.
+
+        Returns the interjection message if one was queued,
+        otherwise None. Clears the field after pickup so the
+        same interjection is never delivered twice.
+        """
+        try:
+            ticket = await self._get_ticket(ticket_id)
+        except Exception:
+            return None
+        cf = ticket.get("custom_fields", {})
+        interject = cf.get("pending_interject")
+        if not interject:
+            return None
+        message = interject.get("message", "")
+        await self._update_fields(
+            ticket_id,
+            {"pending_interject": None},
+        )
+        self._emit(
+            ticket_id,
+            "user_interjection",
+            {"message": message},
+        )
+        return message
 
     _HITL_POLL_INTERVAL = 5.0
     _HITL_TIMEOUT = 1800.0
