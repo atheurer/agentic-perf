@@ -88,6 +88,11 @@ func New(opts Options) Model {
 		noColor = true
 	}
 
+	wStep := wizardDone
+	if opts.NeedsWizard {
+		wStep = wizardURL
+	}
+
 	return Model{
 		client:      opts.Client,
 		viewport:    vp,
@@ -95,6 +100,7 @@ func New(opts Options) Model {
 		ticketID:    opts.TicketID,
 		plain:       opts.Plain,
 		needsWizard: opts.NeedsWizard,
+		wizardStep:  wStep,
 		conn:        connConnecting,
 	}
 }
