@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,36 @@ func readSecretsFile() string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// Write persists the config to the TOML file at 0600.
+func Write(cfg Config) error {
+	path := configFilePath()
+	if path == "" {
+		return fmt.Errorf("cannot determine config path")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	if cfg.URL != "" {
+		sb.WriteString(fmt.Sprintf("url = %q\n", cfg.URL))
+	}
+	if cfg.Token != "" {
+		sb.WriteString(fmt.Sprintf("token = %q\n", cfg.Token))
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0600)
+}
+
+// Path returns the resolved config file path.
+func Path() string {
+	return configFilePath()
+}
+
+// NeedsSetup returns true if no token is configured from any source.
+func NeedsSetup(cfg Config) bool {
+	return cfg.Token == ""
 }
 
 func firstNonEmpty(vals ...string) string {

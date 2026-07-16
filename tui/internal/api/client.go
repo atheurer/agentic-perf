@@ -273,6 +273,10 @@ func (c *Client) GetUsageSummary() (*UsageSummary, error) {
 	return &u, nil
 }
 
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
 func (c *Client) StreamURL(ticketID, eventType string, since int) string {
 	path := c.baseURL + "/api/v1/events/stream"
 	sep := "?"

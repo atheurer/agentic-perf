@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/atheurer/agentic-perf/tui/internal/api"
+	"github.com/atheurer/agentic-perf/tui/internal/config"
 )
 
 func (m *Model) dispatchCommand(text string) tea.Cmd {
@@ -30,7 +31,7 @@ func (m *Model) dispatchCommand(text string) tea.Cmd {
 		m.updateViewportContent()
 
 	case "/help":
-		m.addSystemLine("Commands: /submit /tickets /ticket ID /follow ID /abort ID /retry ID /stop ID /logs ID /usage [ID] /verbose /quit /help")
+		m.addSystemLine("Commands: /submit /tickets /ticket ID /follow ID /abort ID /retry ID /stop ID /logs ID /usage [ID] /connect /config [key val] /verbose /quit /help")
 
 	case "/tickets":
 		filter := ""
@@ -100,6 +101,12 @@ func (m *Model) dispatchCommand(text string) tea.Cmd {
 			return m.cmdUsageTicket(args[0])
 		}
 		return m.cmdUsageSummary()
+
+	case "/connect":
+		return m.cmdConnect()
+
+	case "/config":
+		return m.cmdConfig(args)
 
 	default:
 		m.addSystemLine(fmt.Sprintf("Unknown command: %s — type /help for a list", cmd))
@@ -375,6 +382,55 @@ func (m *Model) switchFollow(id string) {
 	m.lines = nil
 	m.source = nil
 	m.addSystemLine(fmt.Sprintf("Following %s", id))
+}
+
+func (m *Model) cmdConnect() tea.Cmd {
+	m.addSystemLine("Reconnecting...")
+	if m.source != nil {
+		m.source.Close()
+		m.source = nil
+	}
+	m.conn = connConnecting
+	return m.connectCmd()
+}
+
+func (m *Model) cmdConfig(args []string) tea.Cmd {
+	if len(args) == 0 {
+		m.addSystemLine(fmt.Sprintf("Config file: %s", config.Path()))
+		m.addSystemLine(fmt.Sprintf("  url: %s", m.client.BaseURL()))
+		m.addSystemLine("  token: ****")
+		return nil
+	}
+
+	if len(args) < 2 {
+		m.addSystemLine("Usage: /config <key> <value>")
+		m.addSystemLine("  Keys: url, token")
+		return nil
+	}
+
+	key := args[0]
+	value := strings.Join(args[1:], " ")
+
+	cfg := config.Load("", "")
+	switch key {
+	case "url":
+		cfg.URL = value
+	case "token":
+		cfg.Token = value
+	default:
+		m.addSystemLine(fmt.Sprintf("Unknown config key: %s (valid: url, token)", key))
+		return nil
+	}
+
+	if err := config.Write(cfg); err != nil {
+		m.addSystemLine(fmt.Sprintf("Failed to save config: %v", err))
+		return nil
+	}
+
+	m.client = api.New(cfg.URL, cfg.Token)
+	m.addSystemLine(fmt.Sprintf("Config updated: %s = %s", key, value))
+	m.addSystemLine("Use /connect to apply the new settings")
+	return nil
 }
 
 func truncate(s string, n int) string {

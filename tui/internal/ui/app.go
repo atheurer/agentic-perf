@@ -45,9 +45,15 @@ type Model struct {
 	conn            connState
 	ticketID        string
 	verbose         bool
+	plain           bool
 	quitting        bool
 	confirmQuit     bool
 	pendingApproval *pendingApproval
+	wizardStep      wizardStep
+	wizardURL       string
+	wizardToken     string
+	needsWizard     bool
+	reconnectTicks  int
 	err             error
 }
 
@@ -63,7 +69,14 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func New(client *api.Client, ticketID string) Model {
+type Options struct {
+	Client      *api.Client
+	TicketID    string
+	Plain       bool
+	NeedsWizard bool
+}
+
+func New(opts Options) Model {
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 
@@ -71,21 +84,32 @@ func New(client *api.Client, ticketID string) Model {
 	ti.Placeholder = "Type / for commands, Esc to interject..."
 	ti.CharLimit = 4096
 
+	if opts.Plain {
+		noColor = true
+	}
+
 	return Model{
-		client:   client,
-		viewport: vp,
-		input:    ti,
-		ticketID: ticketID,
-		conn:     connConnecting,
+		client:      opts.Client,
+		viewport:    vp,
+		input:       ti,
+		ticketID:    opts.TicketID,
+		plain:       opts.Plain,
+		needsWizard: opts.NeedsWizard,
+		conn:        connConnecting,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		tea.EnterAltScreen,
 		tickCmd(),
-		m.connectCmd(),
-	)
+	}
+	if m.needsWizard {
+		m.startWizard()
+	} else {
+		cmds = append(cmds, m.connectCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) connectCmd() tea.Cmd {
@@ -116,6 +140,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		cmds = append(cmds, tickCmd())
 		cmds = append(cmds, m.drainEvents())
+		if m.conn == connDisconnected {
+			m.reconnectTicks++
+			if m.reconnectTicks >= 5 {
+				m.reconnectTicks = 0
+				cmds = append(cmds, m.connectCmd())
+			}
+		}
 
 	case eventMsg:
 		line := events.Line(msg)
@@ -130,12 +161,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case connMsg:
+		prev := m.conn
 		m.conn = connState(msg)
 		if m.conn == connConnected && m.source == nil {
+			if prev == connDisconnected {
+				m.addSystemLine("Connection restored")
+			}
+			m.reconnectTicks = 0
 			if m.ticketID == "" {
 				cmds = append(cmds, m.autoFollowCmd())
 			} else {
 				m.source = stream.NewSSE(m.client, m.ticketID)
+			}
+		}
+		if m.conn == connDisconnected && prev == connConnected {
+			m.addSystemLine("⚠ Connection lost — reconnecting...")
+			if m.source != nil {
+				m.source.Close()
+				m.source = nil
 			}
 		}
 
@@ -199,6 +242,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "enter":
+		if m.wizardStep < wizardDone {
+			cmd := m.handleWizardInput()
+			return m, cmd
+		}
 		if m.mode == ModeInterject {
 			text := m.input.Value()
 			if text != "" {

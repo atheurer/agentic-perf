@@ -62,6 +62,44 @@ func TestLoadFromTOML(t *testing.T) {
 	}
 }
 
+func TestWriteAndReload(t *testing.T) {
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "client.toml")
+	t.Setenv("APTUI_CONFIG", tomlPath)
+	t.Setenv("AGENTIC_PERF_URL", "")
+	t.Setenv("AGENTIC_PERF_API_TOKEN", "")
+
+	cfg := Config{URL: "http://written:7777", Token: "written-tok"}
+	if err := Write(cfg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	info, err := os.Stat(tomlPath)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("expected 0600 perms, got %o", info.Mode().Perm())
+	}
+
+	loaded := Load("", "")
+	if loaded.URL != "http://written:7777" {
+		t.Errorf("reloaded URL: %q", loaded.URL)
+	}
+	if loaded.Token != "written-tok" {
+		t.Errorf("reloaded token: %q", loaded.Token)
+	}
+}
+
+func TestNeedsSetup(t *testing.T) {
+	if !NeedsSetup(Config{URL: "http://x", Token: ""}) {
+		t.Error("expected NeedsSetup=true with empty token")
+	}
+	if NeedsSetup(Config{URL: "http://x", Token: "tok"}) {
+		t.Error("expected NeedsSetup=false with token set")
+	}
+}
+
 func TestLoadSecretsFile(t *testing.T) {
 	dir := t.TempDir()
 	secretsDir := filepath.Join(dir, "secrets")
