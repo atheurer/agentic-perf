@@ -529,7 +529,7 @@ class TestOrchestratorConfig:
             config = OrchestratorConfig()
             assert config.llm_timeout == 120.0
             assert config.agent_task_timeout == 0
-            assert config.stale_task_timeout == 900.0
+            assert config.stale_task_timeout == 3600.0
 
     def test_env_override(self):
         from orchestrator.config import OrchestratorConfig

@@ -88,6 +88,41 @@ the period, revealing changes over time.
   (e.g., 100% for 24s then 0% for 6s averages to 80%)
 - Use this to detect irqbalance migrating IRQ destinations
 
+## Filtering results to reduce response size
+
+Use the `filter` parameter to exclude irrelevant data points.
+This is critical on many-core systems where per-CPU queries
+return hundreds of entries, most near zero.
+
+**Syntax:** `"filter": ["gt:<value>"]` — return only values
+greater than the threshold.
+
+```json
+{
+  "run": "<run-id>",
+  "period": "<period-id>",
+  "source": "procstat",
+  "type": "Busy-CPU",
+  "breakout": ["hostname", "cpu"],
+  "filter": ["gt:0.03"]
+}
+```
+
+This returns only CPUs with >0.03% utilization, eliminating
+hundreds of idle-CPU entries on a 768-thread system.
+
+**Common filter patterns:**
+- `"filter": ["gt:0.03"]` — exclude idle/noise-level CPUs
+  (good default for Busy-CPU on many-core systems)
+- `"filter": ["gt:0"]` — exclude exact zeros (useful for
+  interrupts-sec to find only CPUs handling interrupts)
+- `"filter": ["gt:100"]` — find only high-rate interrupt
+  sources
+
+Always use filters when querying per-CPU or per-IRQ data
+on many-core systems. Without filtering, a 768-CPU system
+returns ~768 entries per metric, most of which are noise.
+
 ## Per-CPU and interrupt analysis
 
 For network performance investigation, key query patterns:

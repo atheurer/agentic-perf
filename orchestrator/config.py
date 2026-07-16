@@ -140,11 +140,14 @@ class OrchestratorConfig:
 
         # Stale-task watchdog: cancel active tasks with no
         # events for this many seconds. 0 disables.
+        # Default 3600s (1 hour) to accommodate long benchmark
+        # runs with post-processing (e.g., procstat on 768-CPU
+        # systems can take 40+ minutes).
         self.stale_task_timeout: float = _env_or_cfg(
             "STALE_TASK_TIMEOUT",
             cfg,
             "stale_task_timeout",
-            900.0,
+            3600.0,
         )
 
         # Introspection agent: continuous passive observer.
