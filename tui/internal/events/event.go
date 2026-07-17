@@ -54,6 +54,9 @@ func renderText(l Line) string {
 		return fmt.Sprintf("⊘ %s: %s", tool, reason)
 	case "tool_progress":
 		msg := str(l.Data, "message")
+		if msg == "" {
+			msg = str(l.Data, "body")
+		}
 		return fmt.Sprintf("⏳ %s", msg)
 	case "transition":
 		to := str(l.Data, "to")

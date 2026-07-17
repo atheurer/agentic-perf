@@ -94,7 +94,11 @@ func renderStyled(l events.Line, verbose bool) string {
 		return dimStyle.Render(fmt.Sprintf("⊘ %s: %s", tool, reason))
 
 	case "tool_progress":
-		return progressStyle.Render(fmt.Sprintf("⏳ %s", strData(l.Data, "message")))
+		msg := strData(l.Data, "message")
+		if msg == "" {
+			msg = strData(l.Data, "body")
+		}
+		return progressStyle.Render(fmt.Sprintf("⏳ %s", msg))
 
 	case "transition":
 		to := strData(l.Data, "to")
