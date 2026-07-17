@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from providers.events import EventBus
-from state_store.api.events import _compute_ticket_usage, get_usage_summary
+from state_store.api.events import _compute_ticket_usage, get_usage, get_usage_summary
 from state_store.models import CreateTicketRequest
 from state_store.store import TicketStore
 
@@ -169,3 +169,166 @@ class TestGetUsageSummary:
         result = get_usage_summary(request)
         assert len(result["by_ticket"]) == 1
         assert t1.id in result["by_ticket"]
+
+
+class TestMultiModelCost:
+    """Regression tests for #327: total cost must equal sum of per-agent costs.
+
+    When agents use different models (e.g., haiku for triage, sonnet for
+    provisioning), the total cost was computed using only the first model
+    alphabetically, making it lower than the sum of per-agent costs.
+    """
+
+    def test_total_equals_agent_sum(self, event_bus: EventBus):
+        """Total cost should be the sum of per-agent costs, not a
+        re-estimate using a single model."""
+        tid = "PERF-MULTI"
+        # Triage uses the cheaper haiku model
+        _emit_usage(
+            event_bus,
+            tid,
+            1000,
+            200,
+            500,
+            model="claude-haiku-4-5",
+            agent="triage-agent",
+        )
+        # Provisioning uses the more expensive sonnet model
+        _emit_usage(
+            event_bus,
+            tid,
+            5000,
+            800,
+            2000,
+            model="claude-sonnet-4-6",
+            agent="provisioning-agent",
+        )
+
+        request = MagicMock()
+        request.app.state.event_bus = event_bus
+        result = get_usage(tid, request)
+
+        agent_cost_sum = sum(
+            a["estimated_cost_usd"] for a in result["by_agent"].values()
+        )
+        # Total must match the sum of per-agent costs
+        assert result["estimated_cost_usd"] == pytest.approx(
+            agent_cost_sum,
+            abs=1e-6,
+        ), (
+            f"Total ${result['estimated_cost_usd']:.6f} != "
+            f"agent sum ${agent_cost_sum:.6f}"
+        )
+        # Sanity: sonnet agent should cost more than haiku agent
+        agents = result["by_agent"]
+        assert (
+            agents["provisioning-agent"]["estimated_cost_usd"]
+            > agents["triage-agent"]["estimated_cost_usd"]
+        )
+
+    def test_total_ge_max_agent(
+        self,
+        event_bus: EventBus,
+    ):
+        """Total cost must be >= the most expensive single agent."""
+        tid = "PERF-GE"
+        _emit_usage(
+            event_bus,
+            tid,
+            500,
+            100,
+            300,
+            model="claude-haiku-4-5",
+            agent="triage-agent",
+        )
+        _emit_usage(
+            event_bus,
+            tid,
+            8000,
+            2000,
+            5000,
+            model="claude-sonnet-4-6",
+            agent="provisioning-agent",
+        )
+
+        request = MagicMock()
+        request.app.state.event_bus = event_bus
+        result = get_usage(tid, request)
+
+        max_agent_cost = max(
+            a["estimated_cost_usd"] for a in result["by_agent"].values()
+        )
+        assert result["estimated_cost_usd"] >= max_agent_cost
+
+    def test_single_model_unchanged(self, event_bus: EventBus):
+        """When all agents use the same model, per-event and aggregate
+        cost estimation should produce the same result."""
+        tid = "PERF-SINGLE"
+        _emit_usage(
+            event_bus,
+            tid,
+            1000,
+            200,
+            500,
+            model="claude-sonnet-4-6",
+            agent="triage-agent",
+        )
+        _emit_usage(
+            event_bus,
+            tid,
+            2000,
+            400,
+            800,
+            model="claude-sonnet-4-6",
+            agent="benchmark-agent",
+        )
+
+        request = MagicMock()
+        request.app.state.event_bus = event_bus
+        result = get_usage(tid, request)
+
+        agent_cost_sum = sum(
+            a["estimated_cost_usd"] for a in result["by_agent"].values()
+        )
+        assert result["estimated_cost_usd"] == pytest.approx(
+            agent_cost_sum,
+            abs=1e-6,
+        )
+
+    def test_compute_ticket_usage_multi_model(
+        self,
+        event_bus: EventBus,
+    ):
+        """_compute_ticket_usage (used by /usage/summary) should also
+        compute per-event costs correctly with mixed models."""
+        tid = "PERF-SUMMARY"
+        _emit_usage(
+            event_bus,
+            tid,
+            1000,
+            200,
+            500,
+            model="claude-haiku-4-5",
+            agent="triage-agent",
+        )
+        _emit_usage(
+            event_bus,
+            tid,
+            5000,
+            800,
+            2000,
+            model="claude-sonnet-4-6",
+            agent="provisioning-agent",
+        )
+
+        result = _compute_ticket_usage(event_bus, tid)
+
+        # Should match the per-ticket detail endpoint
+        request = MagicMock()
+        request.app.state.event_bus = event_bus
+        detail = get_usage(tid, request)
+
+        assert result["estimated_cost_usd"] == pytest.approx(
+            detail["estimated_cost_usd"],
+            abs=1e-6,
+        )

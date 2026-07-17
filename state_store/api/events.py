@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 
-from providers.cost import estimate_cumulative_cost
+from providers.cost import estimate_cost
 
 router = APIRouter(prefix="/tickets", tags=["events"])
 usage_router = APIRouter(prefix="/usage", tags=["usage"])
@@ -85,6 +85,7 @@ def get_usage(ticket_id: str, request: Request):
     total_cache_create = 0
     llm_calls = 0
     total_duration = 0
+    total_cost = 0.0
     by_agent: dict[str, dict] = {}
 
     models_seen: set[str] = set()
@@ -111,6 +112,18 @@ def get_usage(ticket_id: str, request: Request):
         if model:
             models_seen.add(model)
 
+        # Cost per event using its actual model, so mixed-model
+        # tickets get correct totals instead of pricing all
+        # tokens at whichever model sorts first alphabetically.
+        evt_cost = estimate_cost(
+            model,
+            in_tok,
+            out_tok,
+            cache_read_input_tokens=cr,
+            cache_creation_input_tokens=cc,
+        )
+        total_cost += evt_cost
+
         agent = evt.get("agent", "")
         if agent and agent != "system":
             if agent not in by_agent:
@@ -122,6 +135,7 @@ def get_usage(ticket_id: str, request: Request):
                     "total_tokens": 0,
                     "llm_calls": 0,
                     "total_duration_ms": 0,
+                    "estimated_cost_usd": 0.0,
                     "models_used": set(),
                 }
             ba = by_agent[agent]
@@ -132,6 +146,7 @@ def get_usage(ticket_id: str, request: Request):
             ba["total_tokens"] += in_tok + out_tok + cr + cc
             ba["llm_calls"] += 1
             ba["total_duration_ms"] += dur
+            ba["estimated_cost_usd"] += evt_cost
             if model:
                 ba["models_used"].add(model)
 
@@ -152,13 +167,13 @@ def get_usage(ticket_id: str, request: Request):
         au["models_used"] = sorted(au.get("models_used", set()))
         agent_costs[agent] = {
             **au,
-            "estimated_cost_usd": round(estimate_cumulative_cost(au), 6),
+            "estimated_cost_usd": round(au["estimated_cost_usd"], 6),
         }
 
     return {
         "ticket_id": ticket_id,
         "usage": usage,
-        "estimated_cost_usd": round(estimate_cumulative_cost(usage), 6),
+        "estimated_cost_usd": round(total_cost, 6),
         "by_agent": agent_costs,
     }
 
@@ -174,6 +189,7 @@ def _compute_ticket_usage(
     total_out = 0
     total_cache_read = 0
     total_cache_create = 0
+    total_cost = 0.0
     llm_calls = 0
     models_seen: set[str] = set()
 
@@ -185,14 +201,23 @@ def _compute_ticket_usage(
         out_tok = data.get("output_tokens", 0) or 0
         if not in_tok and not out_tok:
             continue
+        cr = data.get("cache_read_input_tokens", 0) or 0
+        cc = data.get("cache_creation_input_tokens", 0) or 0
+        model = data.get("model", "")
         total_in += in_tok
         total_out += out_tok
-        total_cache_read += data.get("cache_read_input_tokens", 0) or 0
-        total_cache_create += data.get("cache_creation_input_tokens", 0) or 0
+        total_cache_read += cr
+        total_cache_create += cc
         llm_calls += 1
-        model = data.get("model", "")
         if model:
             models_seen.add(model)
+        total_cost += estimate_cost(
+            model,
+            in_tok,
+            out_tok,
+            cache_read_input_tokens=cr,
+            cache_creation_input_tokens=cc,
+        )
 
     usage = {
         "input_tokens": total_in,
@@ -205,7 +230,7 @@ def _compute_ticket_usage(
     }
     return {
         **usage,
-        "estimated_cost_usd": round(estimate_cumulative_cost(usage), 6),
+        "estimated_cost_usd": round(total_cost, 6),
     }
 
 
