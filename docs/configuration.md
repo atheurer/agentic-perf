@@ -280,6 +280,33 @@ stops automatically when the ticket reaches a terminal status. See
 
 ---
 
+### `jumpstarter_images` — Jumpstarter Image Resolution
+
+Configuration for the Jumpstarter image resolution system, which
+pre-resolves OS image URLs from the build server before
+provisioning.
+
+```json
+{
+    "jumpstarter_images": {
+        "server": "https://autosd.sig.centos.org/",
+        "provisioning_max_iterations": 30
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `server` | string | `"https://autosd.sig.centos.org/"` | Base URL of the OS image build server |
+| `image_version` | string | — | Default OS image version (e.g., `AutoSD-10`). If not set, must be specified per-ticket via `directives.image_version`. |
+| `provisioning_max_iterations` | int | `30` | Maximum LLM iterations for the provisioning agent on Jumpstarter tickets. |
+
+Jumpstarter also requires:
+- **Secrets:** `~/.agentic-perf/secrets/jumpstarter/config.json` with `{"client_name": "<name>"}` matching the jmp CLI client config.
+- **CLI config:** `~/.config/jumpstarter/clients/<name>.yaml` with controller endpoint and token.
+
+---
+
 ### `harness_repos` — Benchmark Harness Repositories
 
 Override or extend the default set of harness Git repositories used

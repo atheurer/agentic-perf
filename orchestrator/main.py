@@ -381,9 +381,7 @@ async def run_agent_task(
                 dispatcher.store_url,
                 ticket_id,
                 auth_headers=_auth_headers(),
-                image_config=_load_config_file().get(
-                    "jumpstarter_images", {}
-                ),
+                image_config=_load_config_file().get("jumpstarter_images", {}),
             )
 
         if agent_task_timeout > 0:
