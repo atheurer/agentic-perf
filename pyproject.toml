@@ -35,6 +35,29 @@ telemetry = [
 telemetry-export = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
 ]
+vertex = [
+    "anthropic[vertex]>=0.40.0",
+    "google-auth>=2.0.0",
+]
+jumpstarter = [
+    "jumpstarter-cli>=0.8.0",
+    "jumpstarter-driver-power>=0.8.0",
+    "jumpstarter-driver-pyserial>=0.8.0",
+    "jumpstarter-driver-composite>=0.8.0",
+    "jumpstarter-driver-flashers>=0.8.0",
+    "jumpstarter-driver-network>=0.8.0",
+    "jumpstarter-driver-ssh>=0.8.0",
+    "jumpstarter-driver-opendal>=0.8.0",
+    "jumpstarter-driver-uboot>=0.8.0",
+    "jumpstarter-driver-tftp>=0.8.0",
+    "jumpstarter-driver-http>=0.8.0",
+    "jumpstarter-driver-gpiod>=0.8.0",
+    "jumpstarter-driver-can>=0.8.0",
+    "jumpstarter-driver-dutlink>=0.8.0",
+    "jumpstarter-driver-sdwire>=0.8.0",
+    "jumpstarter-driver-tmt>=0.8.0",
+    "jumpstarter-driver-vnc>=0.8.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",

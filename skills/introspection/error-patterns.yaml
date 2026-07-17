@@ -24,6 +24,11 @@ infrastructure:
   - "no route to host"
   - "network is unreachable"
 
+  - "doesn't match any of the allowed"
+  - "driver.*not.*found"
+  - "driver.*mismatch"
+  - "exporter.*version"
+
 transient:
   - "timed? ?out"
   - "rate limit"

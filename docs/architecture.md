@@ -546,6 +546,7 @@ Interface: `ResourceProvider` (`providers/resource/base.py`)
 | `QuadsResourceProvider` | bare_metal | `~/.agentic-perf/secrets/quads/config.json` |
 | `AWSResourceProvider` | cloud | `~/.agentic-perf/secrets/aws/config.json` |
 | `PSAPCCResourceProvider` | gpu_cluster | `~/.agentic-perf/secrets/psap-cc/config.json` |
+| `JumpstarterResourceProvider` | bare_metal | `~/.agentic-perf/secrets/jumpstarter/config.json` |
 
 Providers are lazy-loaded by `ResourceProviderRegistry` — a provider is
 only instantiated when its secrets file exists. The registry maps provider
@@ -557,6 +558,99 @@ Each provider implements:
 - `get_reservation_status(reservation_id)` — Poll status
 - `terminate(reservation_id)` — Release resources
 - `setup_ssh(hosts)` / `cleanup_ssh_keys(hosts)` — SSH key management
+
+#### Jumpstarter
+
+The [Jumpstarter](https://jumpstarter.dev) provider manages lab
+devices — physical boards and virtual machines — from a
+Jumpstarter controller. Devices are leased via label selectors
+(e.g., `target=ride4_sa8775p_sx_r3`).
+
+Configuration requires both secrets (`~/.agentic-perf/secrets/
+jumpstarter/config.json`) and the `jmp` CLI config
+(`~/.config/jumpstarter/clients/<name>.yaml`) which handles gRPC
+channel creation and TLS. Set `tls.insecure: true` in the CLI
+config for internal deployments with self-signed certificates.
+
+The provider uses the `jumpstarter` Python package for the
+resource lifecycle (Layer 1). Device-level operations (power
+cycling, serial console, firmware) use the Jumpstarter MCP
+server (`jmp mcp serve`) attached to agents via
+`connect_command()` (Layer 2).
+
+Required Python packages:
+
+- `jumpstarter` — core client and CLI
+- `jumpstarter-driver-can` — CAN bus communication
+- `jumpstarter-driver-composite` — composite exporter support
+- `jumpstarter-driver-flashers` — board-agnostic flash orchestration
+- `jumpstarter-driver-gpiod` — GPIO control (R-Car S4, S32G)
+- `jumpstarter-driver-http` — HTTP image fetching (flasher dep)
+- `jumpstarter-driver-network` — TCP forwarding and SSH tunnels
+- `jumpstarter-driver-opendal` — storage backend abstraction
+- `jumpstarter-driver-power` — power control base
+- `jumpstarter-driver-pyserial` — serial console access
+- `jumpstarter-driver-ridesx` — Qualcomm RideSX4 storage/power
+- `jumpstarter-driver-shell` — shell command execution
+- `jumpstarter-driver-snmp` — SNMP-based external power control
+- `jumpstarter-driver-ssh` — SSH wrapper for board access
+- `jumpstarter-driver-tftp` — TFTP image serving (flasher dep)
+- `jumpstarter-driver-tmt` — TMT test framework integration
+- `jumpstarter-driver-uboot` — U-Boot serial interaction
+- `jumpstarter-driver-ustreamer` — video streaming
+- `jumpstarter-driver-vnc` — VNC remote display
+
+Install all drivers to support the full range of board types:
+
+```bash
+pip install jumpstarter \
+  jumpstarter-driver-can \
+  jumpstarter-driver-composite \
+  jumpstarter-driver-flashers \
+  jumpstarter-driver-gpiod \
+  jumpstarter-driver-http \
+  jumpstarter-driver-network \
+  jumpstarter-driver-opendal \
+  jumpstarter-driver-power \
+  jumpstarter-driver-pyserial \
+  jumpstarter-driver-ridesx \
+  jumpstarter-driver-shell \
+  jumpstarter-driver-snmp \
+  jumpstarter-driver-ssh \
+  jumpstarter-driver-tftp \
+  jumpstarter-driver-tmt \
+  jumpstarter-driver-uboot \
+  jumpstarter-driver-ustreamer \
+  jumpstarter-driver-vnc
+```
+
+When a ticket uses Jumpstarter hardware (`resource_provider =
+"jumpstarter"`), the benchmark and provisioning agents
+automatically attach the Jumpstarter MCP server via
+`attach_jumpstarter_mcp()`. Tool filtering ensures agents see
+device interaction tools (`jmp_run`, `jmp_connect`, `jmp_explore`)
+but not lease management tools (`jmp_create_lease`,
+`jmp_delete_lease`) which are the resource provider's job.
+
+**Orchestrator lifecycle for Jumpstarter tickets:**
+
+- **Image resolution:** Before the provisioning agent runs, the
+  orchestrator fetches `test_images_info.json` from the build
+  server and resolves the flash command deterministically. The
+  result (including `flash_command`, partition URLs, and the
+  orchestrator's SSH public key) is stored in
+  `custom_fields.jumpstarter_flash`. Agents never touch the
+  image server.
+- **Pre-dispatch lease release:** When a ticket enters
+  `awaiting_hardware`, any existing Jumpstarter lease is
+  released. This handles the case where a user sends a ticket
+  back to resource acquisition after a provisioning failure.
+- **Lease sweep:** Each poll cycle, the orchestrator checks for
+  orphaned leases whose tickets have reached a terminal status.
+  This is a failsafe for leases not cleaned up by teardown
+  (crashed orchestrators, skipped teardown, manual closure).
+  The normal lease release path is the resource agent's
+  `terminate()` during teardown.
 
 ### Skill Providers
 

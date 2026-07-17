@@ -78,6 +78,19 @@ class BenchmarkAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Collect Jumpstarter diagnostics before
+            # clarification. Serial logs and tunnel data
+            # are critical for diagnosing node failures.
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if cf.get("resource_provider") == "jumpstarter":
+                diag = await self._collect_jumpstarter_diagnostics()
+                if diag:
+                    await self._update_fields(
+                        self._ticket_id,
+                        {"node_diagnostics": diag[:5000]},
+                    )
+                    question = f"{question}\n\n## Node Diagnostics\n{diag}"
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
@@ -98,10 +111,24 @@ class BenchmarkAgent(AgentBase):
             },
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
+        # Returns allowed tool names for filtering, or None.
+        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
+
+        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
+
         self._mcp = mcp
 
-        mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        # Get all tools, but if Jumpstarter is attached,
+        # exclude lease management tools (resource provider's
+        # job, not the agent's).
+        all_tools = await mcp.list_tools()
+        if jmp_tools is not None:
+            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
+
+            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
+        self.tools = all_tools + self.tools
 
         try:
             ticket = await self._get_ticket(ticket_id)
@@ -133,6 +160,17 @@ class BenchmarkAgent(AgentBase):
             "set_ssh_context",
             "check_host",
             "execute_boot_time_test",
+            "submit_benchmark_result",
+            "request_clarification",
+        },
+        "arcaflow-plugins": {
+            "read_skill",
+            "set_ssh_context",
+            "check_host",
+            "get_execution_config",
+            "get_runfile_schema",
+            "get_benchmark_params",
+            "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",
         },
@@ -312,6 +350,18 @@ class BenchmarkAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
+    async def _collect_jumpstarter_diagnostics(self) -> str:
+        """Collect diagnostics via Jumpstarter tunnel."""
+        if self._mcp is None:
+            return "No MCP connection available"
+        from agents.jumpstarter_mcp import collect_diagnostics
+
+        return await collect_diagnostics(
+            self._mcp,
+            ticket_id=self._ticket_id or "",
+            get_ticket=self._get_ticket,
+        )
+
     async def _handle_budget_pause(self, ticket_id: str) -> None:
         """Route budget-exhausted investigation tickets
         to evaluating_convergence so partial results can
@@ -353,6 +403,7 @@ class BenchmarkAgent(AgentBase):
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
+            "output_dir": result.get("output_dir", ""),
         }
         await self._update_fields(ticket_id, fields)
 
@@ -370,6 +421,8 @@ class BenchmarkAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
 
         if status == "failed":
+            # Failed benchmarks need human review to
+            # determine next steps.
             await self._transition_ticket(
                 ticket_id,
                 "awaiting_customer_guidance",

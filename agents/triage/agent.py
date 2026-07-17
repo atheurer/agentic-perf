@@ -106,6 +106,16 @@ class TriageAgent(AgentBase):
         # Backward compat: top-level host_cleanup moves into directives
         if "host_cleanup" in result and "host_cleanup" not in directives:
             directives["host_cleanup"] = result["host_cleanup"]
+        # Preserve user-provided directives that triage
+        # didn't set. The user may have specified
+        # image_version or other operational parameters
+        # in the ticket's custom_fields.directives.
+        ticket = await self._get_ticket(ticket_id)
+        user_directives = ticket.get("custom_fields", {}).get("directives", {})
+        if user_directives:
+            merged = dict(user_directives)
+            merged.update(directives)
+            directives = merged
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),

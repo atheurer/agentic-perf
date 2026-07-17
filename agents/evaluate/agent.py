@@ -152,12 +152,20 @@ class EvaluateAgent(AgentBase):
         # Latest benchmark results
         run_id = cf.get("run_id", "")
         bench_status = cf.get("benchmark_status", "")
+        output_dir = cf.get("output_dir", "")
         if run_id:
             content += (
                 f"**Latest Benchmark Result:**\n"
                 f"- Run ID: {run_id}\n"
-                f"- Status: {bench_status}\n\n"
+                f"- Status: {bench_status}\n"
             )
+            if output_dir:
+                content += (
+                    f"- Output Dir: {output_dir}\n"
+                    f"  (use this path with list_benchmark_artifacts "
+                    f"and read_benchmark_artifact)\n"
+                )
+            content += "\n"
 
         content += (
             "Evaluate the convergence gates and submit your "

@@ -34,6 +34,14 @@ class AgentMCPClient:
     def __init__(self) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
+        # Optional hook for provider-specific call_tool
+        # behavior (e.g., Jumpstarter connect guards).
+        # Signature: async (name, arguments) -> str | None
+        # Return a string to short-circuit; None to proceed.
+        self.pre_call_hook: Any = None
+        # Optional hook for post-processing tool results.
+        # Signature: (name, content) -> str
+        self.post_call_hook: Any = None
 
     async def connect(
         self,
@@ -153,6 +161,13 @@ class AgentMCPClient:
         if server_name is None:
             raise RuntimeError(f"No server provides tool {name!r}")
 
+        # Pre-call hook: provider-specific guards
+        # (e.g., Jumpstarter one-connect, timeout).
+        if self.pre_call_hook is not None:
+            short_circuit = await self.pre_call_hook(name, arguments)
+            if short_circuit is not None:
+                return short_circuit
+
         conn = self._servers[server_name]
         result = await conn.session.call_tool(name, arguments)
         parts = []
@@ -164,16 +179,33 @@ class AgentMCPClient:
         content = "\n".join(parts) if parts else ""
         if result.isError:
             raise RuntimeError(content)
+
+        # Post-call hook: provider-specific response
+        # trimming (e.g., Jumpstarter verbose output).
+        if self.post_call_hook is not None:
+            content = self.post_call_hook(name, content)
+
         return content
 
     async def disconnect(self) -> None:
+        import asyncio as _aio
+
         for conn in list(self._servers.values()):
+            # Timeout each disconnect to prevent hanging
+            # on unresponsive MCP subprocesses (e.g.,
+            # jmp mcp serve with a released lease).
             try:
-                await conn.session_cm.__aexit__(None, None, None)
-            except Exception:
+                await _aio.wait_for(
+                    conn.session_cm.__aexit__(None, None, None),
+                    timeout=10,
+                )
+            except (Exception, BaseException):
                 logger.debug("Error closing session for %s", conn.name)
             try:
-                await conn.stdio_cm.__aexit__(None, None, None)
+                await _aio.wait_for(
+                    conn.stdio_cm.__aexit__(None, None, None),
+                    timeout=10,
+                )
             except (Exception, BaseException):
                 logger.debug("Error closing stdio for %s", conn.name)
         self._servers.clear()

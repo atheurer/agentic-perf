@@ -158,7 +158,11 @@ async def build_ssh_from_ticket(
     # not the runtime user for harness operations.
     ssh_user = "root"
 
-    return SSHExecutor(user=ssh_user, key_path=ssh_key), ticket
+    # Jumpstarter boards get reflashed constantly —
+    # host keys change every time. Disable strict
+    # checking to avoid stale key errors.
+    strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
+    return SSHExecutor(user=ssh_user, key_path=ssh_key, strict_host_key=strict), ticket
 
 
 async def tool_progress(

@@ -31,10 +31,12 @@ class SSHExecutor:
         user: str = "root",
         key_path: str | None = None,
         connect_timeout: int = 10,
+        strict_host_key: str = "accept-new",
     ) -> None:
         self.user = user
         self.key_path = key_path
         self.connect_timeout = connect_timeout
+        self.strict_host_key = strict_host_key
 
     def _ssh_args(
         self,
@@ -49,12 +51,20 @@ class SSHExecutor:
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            f"StrictHostKeyChecking={self.strict_host_key}",
             "-o",
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=3",
         ]
+        # When strict checking is disabled (Jumpstarter
+        # boards get reflashed constantly), also ignore
+        # the known_hosts file. Otherwise a stale entry
+        # from a previous flash causes BatchMode=yes to
+        # reject the connection even with
+        # StrictHostKeyChecking=no.
+        if self.strict_host_key == "no":
+            args.extend(["-o", "UserKnownHostsFile=/dev/null"])
         if allocate_pty:
             args.append("-tt")
         effective_key = key_path or self.key_path
@@ -234,8 +244,10 @@ class SSHExecutor:
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            f"StrictHostKeyChecking={self.strict_host_key}",
         ]
+        if self.strict_host_key == "no":
+            args.extend(["-o", "UserKnownHostsFile=/dev/null"])
         effective_key = key_path or self.key_path
         if effective_key:
             args.extend(["-i", effective_key])

@@ -146,7 +146,10 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     ssh_key = fields.get("ssh_key_path")
     ssh_user = fields.get("ssh_user", "root")
 
-    _ssh = SSHExecutor(user=ssh_user, key_path=ssh_key)
+    # Jumpstarter boards get reflashed — host keys
+    # change every time. Disable strict checking.
+    strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
+    _ssh = SSHExecutor(user=ssh_user, key_path=ssh_key, strict_host_key=strict)
 
     if agent_name:
         _agent_name = agent_name
@@ -598,6 +601,7 @@ async def execute_command(
         )
 
     result = await ssh.run(host, command, timeout=timeout)
+
     return _format_result(result)
 
 
