@@ -204,9 +204,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case followMsg:
 		m.switchFollow(string(msg))
-		if m.conn == connConnected {
-			m.source = stream.NewSSE(m.client, m.ticketID)
-		}
 	}
 
 	return m, tea.Batch(cmds...)

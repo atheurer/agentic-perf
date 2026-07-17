@@ -8,6 +8,7 @@ import (
 
 	"github.com/atheurer/agentic-perf/tui/internal/api"
 	"github.com/atheurer/agentic-perf/tui/internal/config"
+	"github.com/atheurer/agentic-perf/tui/internal/stream"
 )
 
 func (m *Model) dispatchCommand(text string) tea.Cmd {
@@ -382,6 +383,9 @@ func (m *Model) switchFollow(id string) {
 	m.lines = nil
 	m.source = nil
 	m.addSystemLine(fmt.Sprintf("Following %s", id))
+	if m.conn == connConnected && m.client != nil {
+		m.source = stream.NewSSE(m.client, m.ticketID)
+	}
 }
 
 func (m *Model) cmdConnect() tea.Cmd {
