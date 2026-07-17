@@ -307,6 +307,7 @@ async def run_agent_task(
     agent_task_timeout: float = 0,
 ):
     agent = None
+
     try:
         agent = dispatcher.create_agent(status)
         if agent is None:
@@ -353,8 +354,37 @@ async def run_agent_task(
                             f" provider={llm_override.get('provider', '')}"
                             f" model={llm_override.get('model', '')}"
                         )
+                    # Jumpstarter provisioning: flash + boot +
+                    # key injection should complete in ~15 tool
+                    # calls with structured context. Default
+                    # cap of 30 catches runaway loops.
+                    elif (
+                        status == "awaiting_provision"
+                        and cf.get("resource_provider") == "jumpstarter"
+                    ):
+                        from orchestrator.config import _load_config_file
+
+                        _jmp_cfg = _load_config_file().get("jumpstarter_images", {})
+                        agent.max_iterations = _jmp_cfg.get(
+                            "provisioning_max_iterations", 30
+                        )
+
         except Exception:
             pass  # proceed with default iterations
+
+        # Jumpstarter: resolve image URLs before provisioning.
+        # This is a deterministic HTTP lookup — no LLM needed.
+        if status == "awaiting_provision":
+            from orchestrator.config import _load_config_file
+
+            await _resolve_jumpstarter_images(
+                dispatcher.store_url,
+                ticket_id,
+                auth_headers=_auth_headers(),
+                image_config=_load_config_file().get(
+                    "jumpstarter_images", {}
+                ),
+            )
 
         if agent_task_timeout > 0:
             try:
@@ -435,6 +465,7 @@ async def run_agent_task(
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
+
         if status in PLAN_AGENT_STATUS.values():
             try:
                 _advance_plan(
@@ -635,6 +666,69 @@ async def _block_absent_suite(
                     "ticket_id": ticket_id,
                 },
             )
+
+
+# Jumpstarter lifecycle functions extracted to
+# providers/resource/jumpstarter_lifecycle.py
+from providers.resource.jumpstarter_lifecycle import (
+    release_lease_for_ticket as _release_jumpstarter_lease,
+)
+from providers.resource.jumpstarter_lifecycle import (
+    resolve_images as _resolve_jumpstarter_images,
+)
+from providers.resource.jumpstarter_lifecycle import (
+    sweep_orphaned_leases as _sweep_orphaned_leases,
+)
+
+
+async def _redirect_to_investigation(
+    store_url: str,
+    ticket_id: str,
+    event_bus: EventBus | None = None,
+) -> None:
+    """Redirect a ticket from awaiting_hardware to gathering_context.
+
+    Code-enforced invariant: tickets with anomaly_context belong
+    on the investigation path. If triage routed to the ad-hoc
+    path, the orchestrator corrects it here.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={
+                "author": "orchestrator",
+                "body": (
+                    "**Investigation redirect:** Ticket has "
+                    "anomaly_context but was routed to the "
+                    "ad-hoc path. Redirecting to the "
+                    "investigation path (gathering_context) "
+                    "for proper convergence tracking."
+                ),
+            },
+        )
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": "gathering_context",
+                "comment": (
+                    "Code-enforced redirect: anomaly_context → investigation path"
+                ),
+            },
+        )
+        if event_bus:
+            event_bus.emit(
+                ticket_id,
+                "orchestrator",
+                "investigation_redirect",
+                {
+                    "from": "awaiting_hardware",
+                    "to": "gathering_context",
+                    "reason": "anomaly_context present",
+                },
+            )
+    logger.info(f"[investigation-redirect] {ticket_id} redirected to gathering_context")
 
 
 HANDOFF_RETRY_STATUS = {
@@ -897,6 +991,40 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     )
                     continue
 
+                # Code-enforce investigation routing.
+                # If triage routed to awaiting_hardware but
+                # the ticket has anomaly_context, redirect
+                # to gathering_context (investigation path).
+                # LLM decides intent; code enforces invariants.
+                if status == "awaiting_hardware":
+                    cf = ticket.get("custom_fields", {})
+                    if cf.get("anomaly_context"):
+                        logger.info(
+                            f"Redirecting {tid} to "
+                            f"gathering_context "
+                            f"(anomaly_context present)"
+                        )
+                        try:
+                            await _redirect_to_investigation(
+                                config.state_store_url,
+                                tid,
+                                event_bus=dispatcher.events,
+                            )
+                        except Exception:
+                            logger.exception(f"Failed to redirect {tid}")
+                        dispatcher.mark_dispatched(tid, status)
+                        continue
+
+                # Jumpstarter: release any existing lease
+                # before acquiring a new board. This
+                # handles the case where a user sends a
+                # ticket back to awaiting_hardware after
+                # a provisioning failure.
+                if status == "awaiting_hardware":
+                    await _release_jumpstarter_lease(
+                        ticket,
+                    )
+
                 ok, reason = check_handoff(status, ticket)
                 if not ok:
                     if not dispatcher.is_handoff_blocked(tid, status):
@@ -940,6 +1068,13 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 dispatcher.set_task(tid, task)
 
         await _process_stop_requests(dispatcher, config.state_store_url)
+
+        # Jumpstarter: release orphaned leases whose
+        # tickets are closed or no longer active.
+        await _sweep_orphaned_leases(
+            config.state_store_url,
+            auth_headers=_auth_headers(),
+        )
 
         # Stale-task watchdog: cancel tasks with no events
         # for longer than the configured threshold.

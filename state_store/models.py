@@ -40,6 +40,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.AWAITING_HARDWARE: [
         TicketStatus.AWAITING_PROVISION,
+        TicketStatus.GATHERING_CONTEXT,  # investigation redirect
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_PROVISION: [
