@@ -563,4 +563,127 @@ def _detect_anomalies_from_events(
                 }
             )
 
+    # --- Missing precondition: action taken after failed lookup ---
+    # Detects when a required lookup returned a negative result
+    # and the agent proceeded with the dependent action instead
+    # of escalating.  Precondition pairs are loaded from the
+    # thresholds skill file.
+    precondition_pairs = thresholds.get("precondition_pairs", [])
+    for pair in precondition_pairs:
+        if not isinstance(pair, dict):
+            continue
+        lookup_tool = pair.get("lookup_tool", "")
+        failure_field = pair.get("failure_field", "found")
+        failure_value = pair.get("failure_value", False)
+        action_tool = pair.get("action_tool", "")
+        desc_template = pair.get(
+            "description",
+            "'{action}' called after '{lookup}' indicated failure",
+        )
+        if not lookup_tool or not action_tool:
+            continue
+
+        # Walk events: track whether the lookup succeeded.
+        lookup_failed = False
+        lookup_seq = 0
+        for evt in events:
+            etype = evt.get("event_type", "")
+            data = evt.get("data", {})
+            tool = data.get("tool", "")
+
+            if etype == "tool_result" and tool == lookup_tool:
+                content = data.get("content", "")
+                try:
+                    parsed = (
+                        json.loads(content) if isinstance(content, str) else content
+                    )
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get(failure_field) == failure_value
+                    ):
+                        lookup_failed = True
+                        lookup_seq = evt.get("seq", 0)
+                    else:
+                        lookup_failed = False
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+
+            elif etype == "tool_called" and tool == action_tool and lookup_failed:
+                anomalies.append(
+                    {
+                        "type": "missing_precondition",
+                        "severity": "high",
+                        "description": desc_template.format(
+                            action=action_tool,
+                            lookup=lookup_tool,
+                        ),
+                        "seq_range": [
+                            lookup_seq,
+                            evt.get("seq", 0),
+                        ],
+                    }
+                )
+                # Only flag once per lookup→action sequence.
+                lookup_failed = False
+                break
+
     return anomalies
+
+
+def _detect_stale_progress(
+    events: list[dict[str, Any]],
+    ticket_status: str,
+    stale_threshold_minutes: float = 5.0,
+) -> dict[str, Any] | None:
+    """Detect when an active ticket has no new events.
+
+    Returns an anomaly dict if the most recent event is older
+    than *stale_threshold_minutes* and the ticket is in an
+    active (non-terminal, non-paused) status.  Returns None
+    otherwise.
+
+    This is distinct from the orchestrator's stale-task watchdog:
+    introspection reports it as an observation, not a cancellation.
+    """
+    from datetime import datetime, timezone
+
+    from state_store.models import (
+        PAUSED_STATUSES as _PAUSED,
+    )
+    from state_store.models import (
+        TERMINAL_STATUSES as _TERMINAL,
+    )
+
+    paused_values = frozenset(s.value for s in _PAUSED)
+    terminal_values = frozenset(s.value for s in _TERMINAL)
+
+    if ticket_status in terminal_values or ticket_status in paused_values:
+        return None
+
+    if not events:
+        return None
+
+    last_ts = events[-1].get("timestamp", "")
+    if not last_ts:
+        return None
+
+    try:
+        last_time = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        elapsed = (now - last_time).total_seconds() / 60.0
+    except (ValueError, TypeError):
+        return None
+
+    if elapsed >= stale_threshold_minutes:
+        return {
+            "type": "stale_progress",
+            "severity": "medium",
+            "description": (
+                f"No activity for {elapsed:.0f} minutes while"
+                f" ticket is at {ticket_status}."
+                f" The agent or tool may be hung."
+            ),
+            "seq_range": [events[-1].get("seq", 0)],
+        }
+
+    return None

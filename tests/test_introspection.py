@@ -20,6 +20,7 @@ from agents.introspection.agent import IntrospectionAgent
 from agents.introspection.server import (
     _classify_error,
     _detect_anomalies_from_events,
+    _detect_stale_progress,
     _error_similarity,
     _extract_error_message,
     _is_tool_failure,
@@ -1840,3 +1841,220 @@ class TestLLMFinalSummary:
         )
         assert summary["verdict"] == "needs_attention"
         assert summary["stats"]["total_events"] == 1
+
+
+class TestMissingPrecondition:
+    """Tests for missing precondition detection (#343)."""
+
+    _PRECONDITION_THRESHOLDS = {
+        **_DEFAULT_THRESHOLDS,
+        "precondition_pairs": [
+            {
+                "lookup_tool": "get_runfile_schema",
+                "failure_field": "found",
+                "failure_value": False,
+                "action_tool": "execute_benchmark",
+                "description": (
+                    "Benchmark executed without schema"
+                    " \u2014 '{lookup}' returned not-found"
+                ),
+            },
+        ],
+    }
+
+    def test_detects_action_after_failed_lookup(self) -> None:
+        events = [
+            _make_event(
+                1,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": False}),
+                },
+            ),
+            _make_event(
+                2,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+        ]
+        anomalies = _detect_anomalies_from_events(
+            events,
+            error_patterns=_EMPTY_PATTERNS,
+            thresholds=self._PRECONDITION_THRESHOLDS,
+        )
+        precond = [a for a in anomalies if a["type"] == "missing_precondition"]
+        assert len(precond) == 1
+        assert precond[0]["severity"] == "high"
+        assert "get_runfile_schema" in precond[0]["description"]
+
+    def test_no_anomaly_when_lookup_succeeds(self) -> None:
+        events = [
+            _make_event(
+                1,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": True, "schema": {}}),
+                },
+            ),
+            _make_event(
+                2,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+        ]
+        anomalies = _detect_anomalies_from_events(
+            events,
+            error_patterns=_EMPTY_PATTERNS,
+            thresholds=self._PRECONDITION_THRESHOLDS,
+        )
+        precond = [a for a in anomalies if a["type"] == "missing_precondition"]
+        assert len(precond) == 0
+
+    def test_no_anomaly_without_precondition_config(self) -> None:
+        """No precondition_pairs in thresholds = no detection."""
+        events = [
+            _make_event(
+                1,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": False}),
+                },
+            ),
+            _make_event(
+                2,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+        ]
+        anomalies = _detect_anomalies_from_events(
+            events,
+            error_patterns=_EMPTY_PATTERNS,
+            thresholds=_DEFAULT_THRESHOLDS,
+        )
+        precond = [a for a in anomalies if a["type"] == "missing_precondition"]
+        assert len(precond) == 0
+
+    def test_retry_after_success_clears_flag(self) -> None:
+        """A successful lookup between failure and action clears the flag."""
+        events = [
+            _make_event(
+                1,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": False}),
+                },
+            ),
+            _make_event(
+                2,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": True, "schema": {}}),
+                },
+            ),
+            _make_event(
+                3,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+        ]
+        anomalies = _detect_anomalies_from_events(
+            events,
+            error_patterns=_EMPTY_PATTERNS,
+            thresholds=self._PRECONDITION_THRESHOLDS,
+        )
+        precond = [a for a in anomalies if a["type"] == "missing_precondition"]
+        assert len(precond) == 0
+
+
+class TestStaleProgress:
+    """Tests for stale progress detection (#343)."""
+
+    def test_detects_stale_active_ticket(self) -> None:
+        """Flag when no events for longer than threshold."""
+        # Event from 10 minutes ago.
+        from datetime import datetime, timedelta, timezone
+
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        events = [
+            {
+                "seq": 1,
+                "timestamp": old_time.isoformat(),
+                "event_type": "tool_called",
+            },
+        ]
+        result = _detect_stale_progress(
+            events,
+            "executing_benchmark",
+            stale_threshold_minutes=5,
+        )
+        assert result is not None
+        assert result["type"] == "stale_progress"
+        assert result["severity"] == "medium"
+        assert "executing_benchmark" in result["description"]
+
+    def test_no_stale_when_recent_activity(self) -> None:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        events = [
+            {
+                "seq": 1,
+                "timestamp": now.isoformat(),
+                "event_type": "tool_called",
+            },
+        ]
+        result = _detect_stale_progress(
+            events,
+            "executing_benchmark",
+            stale_threshold_minutes=5,
+        )
+        assert result is None
+
+    def test_no_stale_for_terminal_status(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        events = [
+            {
+                "seq": 1,
+                "timestamp": old_time.isoformat(),
+                "event_type": "tool_called",
+            },
+        ]
+        result = _detect_stale_progress(
+            events,
+            "closed",
+            stale_threshold_minutes=5,
+        )
+        assert result is None
+
+    def test_no_stale_for_paused_status(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        events = [
+            {
+                "seq": 1,
+                "timestamp": old_time.isoformat(),
+                "event_type": "tool_called",
+            },
+        ]
+        result = _detect_stale_progress(
+            events,
+            "awaiting_customer_guidance",
+            stale_threshold_minutes=5,
+        )
+        assert result is None
+
+    def test_no_stale_for_empty_events(self) -> None:
+        result = _detect_stale_progress(
+            [],
+            "executing_benchmark",
+            stale_threshold_minutes=5,
+        )
+        assert result is None

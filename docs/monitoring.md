@@ -83,6 +83,8 @@ log review.
 | Wasted iterations | medium/high | 25%+ of an agent's LLM calls produced only failed tool results |
 | Max iterations | high | Agent exhausted its iteration budget |
 | Tool bypass | medium/high | Agent uses a generic tool (e.g., `execute_command`) for tasks a specialized tool handles (e.g., `execute_benchmark`). Includes detection of manual schema exploration (`--schema`, `--help` via SSH) and manual container orchestration (`podman run` via SSH). |
+| Missing precondition | high | A required lookup returned a negative result (e.g., `get_runfile_schema` returned `found: false`) and the agent proceeded with the dependent action (`execute_benchmark`) instead of escalating. Precondition pairs are configurable. |
+| Stale progress | medium | No new events for a configurable threshold (default 5 minutes) while the ticket is in an active status. Distinct from the orchestrator's stale-task watchdog — reported as an observation, not a cancellation. |
 
 The detection also classifies errors:
 - **Infrastructure** (port conflict, disk full, permission denied) — retrying won't help
@@ -119,8 +121,10 @@ or logic. Add org-specific patterns via private skills.
 
 **Detection thresholds** (`skills/introspection/detection-thresholds.yaml`):
 Consecutive failure count, similarity threshold, wasted iteration
-percentage, retry loop count, tool bypass minimum calls, etc.
-Override via private skills.
+percentage, retry loop count, tool bypass minimum calls,
+`stale_progress_minutes` (default 5), and `precondition_pairs`
+(lookup→action tool pairs where proceeding after a failed lookup
+is flagged). Override via private skills.
 
 **Tool bypass patterns** (`skills/introspection/tool-bypass-patterns.yaml`):
 Detects when agents use generic tools instead of purpose-built ones.

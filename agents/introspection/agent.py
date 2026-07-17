@@ -37,6 +37,7 @@ from state_store.models import TERMINAL_STATUSES as _MODEL_TERMINAL
 
 from .server import (
     _detect_anomalies_from_events,
+    _detect_stale_progress,
     _is_tool_failure,
     _read_events,
     _truncate_event,
@@ -200,14 +201,29 @@ class IntrospectionAgent:
                         self._last_seq,
                     )
 
-                    # Deterministic anomaly detection.
-                    anomalies = _detect_anomalies_from_events(
-                        self._all_events,
-                        error_patterns=self._error_patterns,
-                        thresholds=self._thresholds,
-                        bypass_patterns=self._bypass_patterns,
-                    )
+                # Deterministic anomaly detection (runs even
+                # without new events so stale progress is caught).
+                anomalies = _detect_anomalies_from_events(
+                    self._all_events,
+                    error_patterns=self._error_patterns,
+                    thresholds=self._thresholds,
+                    bypass_patterns=self._bypass_patterns,
+                )
 
+                # Stale progress: no new events while active.
+                stale_minutes = self._thresholds.get(
+                    "stale_progress_minutes",
+                    5,
+                )
+                stale = _detect_stale_progress(
+                    self._all_events,
+                    status,
+                    stale_threshold_minutes=stale_minutes,
+                )
+                if stale:
+                    anomalies.append(stale)
+
+                if new_events or stale:
                     # Check if LLM narrative is warranted.
                     llm_narrative = await self._maybe_narrate(
                         ticket_id,

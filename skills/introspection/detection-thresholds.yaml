@@ -51,3 +51,23 @@ wasted_iterations_high_pct: 50
 # Minimum calls to a generic tool (with zero calls to the
 # specialized tool) before flagging as a bypass.
 tool_bypass_min_calls: 3
+
+# --- Stale progress ---
+# Minutes of no new events in an active (non-terminal,
+# non-paused) status before flagging.  Distinct from the
+# orchestrator's stale-task watchdog — introspection reports
+# this as an observation to the human, not a cancellation.
+stale_progress_minutes: 5
+
+# --- Missing precondition ---
+# Pairs of lookup → action tools where proceeding after a
+# failed lookup is likely to produce wrong results.  Each
+# entry defines which result field indicates failure.
+precondition_pairs:
+  - lookup_tool: get_runfile_schema
+    failure_field: found
+    failure_value: false
+    action_tool: execute_benchmark
+    description: >
+      Benchmark executed without schema — '{lookup}' returned
+      not-found so the agent is guessing the input format
