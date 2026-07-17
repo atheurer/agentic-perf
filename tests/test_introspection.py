@@ -1970,6 +1970,46 @@ class TestMissingPrecondition:
         precond = [a for a in anomalies if a["type"] == "missing_precondition"]
         assert len(precond) == 0
 
+    def test_detects_multiple_action_sequences(self) -> None:
+        """Multiple distinct failed lookup -> action sequences are all flagged."""
+        events = [
+            _make_event(
+                1,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": False}),
+                },
+            ),
+            _make_event(
+                2,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+            _make_event(
+                3,
+                "tool_result",
+                data={
+                    "tool": "get_runfile_schema",
+                    "content": json.dumps({"found": False}),
+                },
+            ),
+            _make_event(
+                4,
+                "tool_called",
+                data={"tool": "execute_benchmark", "input": {}},
+            ),
+        ]
+        anomalies = _detect_anomalies_from_events(
+            events,
+            error_patterns=_EMPTY_PATTERNS,
+            thresholds=self._PRECONDITION_THRESHOLDS,
+        )
+        precond = [a for a in anomalies if a["type"] == "missing_precondition"]
+        assert len(precond) == 2
+        assert precond[0]["seq_range"] == [1, 2]
+        assert precond[1]["seq_range"] == [3, 4]
+
 
 class TestStaleProgress:
     """Tests for stale progress detection (#343)."""

@@ -593,6 +593,7 @@ def _detect_anomalies_from_events(
 
             if etype == "tool_result" and tool == lookup_tool:
                 content = data.get("content", "")
+                lookup_failed = False
                 try:
                     parsed = (
                         json.loads(content) if isinstance(content, str) else content
@@ -603,8 +604,6 @@ def _detect_anomalies_from_events(
                     ):
                         lookup_failed = True
                         lookup_seq = evt.get("seq", 0)
-                    else:
-                        lookup_failed = False
                 except (json.JSONDecodeError, TypeError, ValueError):
                     pass
 
@@ -625,7 +624,6 @@ def _detect_anomalies_from_events(
                 )
                 # Only flag once per lookup→action sequence.
                 lookup_failed = False
-                break
 
     return anomalies
 
