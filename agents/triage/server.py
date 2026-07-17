@@ -35,44 +35,79 @@ def _get_provider():
     return _skill_provider
 
 
+# Benchmarks provided by standalone tools on the benchmark
+# agent's MCP server, not by any harness skill provider.
+# Surfaced in list_benchmarks, resolve_benchmark, and
+# get_benchmark_details alongside harness-backed benchmarks.
+_STANDALONE_BENCHMARKS = [
+    {
+        "name": "boot-time",
+        "description": (
+            "Boot time analysis — reboots a remote system "
+            "multiple times and collects kernel, initrd, and "
+            "userspace timing metrics per cycle. Uses "
+            "boot-time-analysis-tools. NO provisioning "
+            "step — the benchmark tool installs "
+            "dependencies on the SUT automatically via SSH. "
+            "Do NOT tell provisioning to install any "
+            "boot-time packages."
+        ),
+        "roles": ["client"],
+        "min_hosts": 1,
+        "harness": "boot-time",
+    },
+]
+
+
 @mcp.tool()
 async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
     sp = _get_provider()
     benchmarks = await sp.list_benchmarks()
-    return json.dumps(
-        [
-            {
-                "name": b.name,
-                "description": b.description,
-                "roles": b.roles,
-                "min_hosts": b.min_hosts,
-                "harness": b.harness,
-            }
-            for b in benchmarks
-        ],
-        indent=2,
-    )
+    result = [
+        {
+            "name": b.name,
+            "description": b.description,
+            "roles": b.roles,
+            "min_hosts": b.min_hosts,
+            "harness": b.harness,
+        }
+        for b in benchmarks
+    ]
+    result.extend(_STANDALONE_BENCHMARKS)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 async def get_benchmark_details(name: str) -> str:
     """Get detailed information about a specific benchmark suite including supported parameters and endpoint types."""
+    # Check standalone benchmarks first
+    for sb in _STANDALONE_BENCHMARKS:
+        if sb["name"] == name:
+            return json.dumps(sb, indent=2)
     sp = _get_provider()
     b = await sp.get_benchmark(name)
     if b is None:
         return json.dumps({"error": f"Benchmark '{name}' not found"})
-    return json.dumps(
-        {
-            "name": b.name,
-            "description": b.description,
-            "supported_params": b.supported_params,
-            "roles": b.roles,
-            "min_hosts": b.min_hosts,
-            "harness": b.harness,
-        },
-        indent=2,
-    )
+    detail: dict[str, Any] = {
+        "name": b.name,
+        "description": b.description,
+        "supported_params": b.supported_params,
+        "roles": b.roles,
+        "min_hosts": b.min_hosts,
+        "harness": b.harness,
+    }
+    # Arcaflow plugins: include the container image ref
+    if b.harness == "arcaflow-plugins":
+        repo_name = f"arcaflow-plugin-{name.replace('arcaflow-', '')}"
+        detail["container_image"] = f"quay.io/arcalot/{repo_name}"
+        detail["execution_note"] = (
+            "Runs as a container via podman. Community "
+            "plugins from quay.io/arcalot are typically "
+            "multi-arch (amd64 + arm64). Do NOT install "
+            "the workload binary on the host."
+        )
+    return json.dumps(detail, indent=2)
 
 
 @mcp.tool()
@@ -82,6 +117,19 @@ async def resolve_benchmark(
     harness: str = "",
 ) -> str:
     """Given a natural language description of what the user wants to test, find the best matching benchmark suite. Returns the suite name or null if no match."""
+    # Check standalone benchmarks first
+    desc_lower = description.lower()
+    for sb in _STANDALONE_BENCHMARKS:
+        if sb["name"] in desc_lower or (harness and harness == sb["harness"]):
+            return json.dumps(
+                {
+                    "matched_suite": sb["name"],
+                    "harness": sb["harness"],
+                    "harnesses": [sb["harness"]],
+                    "note": (f"Only '{sb['harness']}' provides this benchmark"),
+                }
+            )
+
     sp = _get_provider()
     reqs: dict[str, Any] = {
         "description": description,
