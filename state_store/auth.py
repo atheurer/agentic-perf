@@ -24,6 +24,7 @@ from paths import SECRETS_DIR
 
 if TYPE_CHECKING:
     from .identity import UserStore
+    from .models import Ticket
 
 logger = logging.getLogger(__name__)
 
@@ -161,4 +162,37 @@ def require_self_or_admin(principal: Principal, username: str) -> None:
     raise HTTPException(
         status_code=403,
         detail="You can only perform this action on your own account",
+    )
+
+
+def require_write_access(
+    principal: Principal,
+    ticket: Ticket,
+    multi_user: bool,
+) -> None:
+    """Raise 403 if the principal may not mutate this ticket.
+
+    Access is granted when any of these hold:
+    - multi_user is disabled (legacy mode)
+    - principal is a service (orchestrator / agents)
+    - principal is an admin
+    - principal's username is in the ticket's owners list
+    - ticket has no owners (unclaimed — any user can write)
+    """
+    if not multi_user:
+        return
+    if principal.kind == "service":
+        return
+    if principal.is_admin:
+        return
+    if not ticket.owners:
+        return
+    if principal.username in ticket.owners:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"You are not an owner of ticket {ticket.id}; "
+            f"owners: {', '.join(ticket.owners)}"
+        ),
     )

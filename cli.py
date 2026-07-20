@@ -42,13 +42,15 @@ def get_client(args) -> tuple[httpx.Client, str]:
 def cmd_submit(args):
     client, url = get_client(args)
     description = args.description or args.summary
-    r = client.post(
-        "/api/v1/tickets",
-        json={
-            "summary": args.summary,
-            "description": description,
-        },
-    )
+    body: dict = {
+        "summary": args.summary,
+        "description": description,
+    }
+    owners = getattr(args, "owners", None)
+    if owners:
+        body["owners"] = [o.strip() for o in owners.split(",")]
+
+    r = client.post("/api/v1/tickets", json=body)
     r.raise_for_status()
     ticket = r.json()
     tid = ticket["id"]
@@ -61,6 +63,10 @@ def cmd_submit(args):
     print(f"Created ticket: {tid}")
     print("Status: triage_pending")
     print(f"Summary: {args.summary}")
+    if ticket.get("created_by"):
+        print(f"Created by: {ticket['created_by']}")
+    if ticket.get("owners"):
+        print(f"Owners: {', '.join(ticket['owners'])}")
 
 
 def cmd_list(args):
@@ -94,6 +100,10 @@ def cmd_show(args):
     print("=" * 80)
     print()
     print(f"  Summary: {t['summary']}")
+    if t.get("created_by"):
+        print(f"  Created by: {t['created_by']}")
+    if t.get("owners"):
+        print(f"  Owners: {', '.join(t['owners'])}")
     print()
 
     cf = t.get("custom_fields", {})
@@ -952,6 +962,65 @@ def cmd_whoami(args):
     print(f"{kind}: {username}{admin}")
 
 
+def cmd_handoff(args):
+    """Add or remove ticket owners."""
+    client, _url = get_client(args)
+    ticket_id = args.ticket_id
+
+    if args.add:
+        r = client.put(f"/api/v1/tickets/{ticket_id}/owners/{args.add}")
+        if r.status_code == 403:
+            print(f"Error: {r.json().get('detail', 'permission denied')}")
+            sys.exit(1)
+        if r.status_code == 404:
+            print(f"Error: {r.json().get('detail', 'not found')}")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Added {args.add} as owner of {ticket_id}")
+
+    if args.remove:
+        r = client.delete(f"/api/v1/tickets/{ticket_id}/owners/{args.remove}")
+        if r.status_code == 403:
+            print(f"Error: {r.json().get('detail', 'permission denied')}")
+            sys.exit(1)
+        if r.status_code == 409:
+            print(f"Error: {r.json().get('detail', 'cannot remove last owner')}")
+            sys.exit(1)
+        if r.status_code == 404:
+            print(f"Error: {r.json().get('detail', 'not found')}")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Removed {args.remove} from owners of {ticket_id}")
+
+    r = client.get(f"/api/v1/tickets/{ticket_id}/owners")
+    r.raise_for_status()
+    owners = r.json().get("owners", [])
+    print(f"Current owners: {', '.join(owners) if owners else '(none)'}")
+
+
+def cmd_claim_ticket(args):
+    """Claim an unclaimed ticket (add yourself as owner)."""
+    client, _url = get_client(args)
+    ticket_id = args.ticket_id
+
+    r = client.get("/api/v1/whoami")
+    r.raise_for_status()
+    me = r.json()
+    if me["kind"] != "user":
+        print("Error: claim requires a user token, not the deployment token")
+        sys.exit(1)
+
+    r = client.put(f"/api/v1/tickets/{ticket_id}/owners/{me['username']}")
+    if r.status_code == 403:
+        print(f"Error: {r.json().get('detail', 'permission denied')}")
+        sys.exit(1)
+    if r.status_code == 404:
+        print(f"Error: {r.json().get('detail', 'not found')}")
+        sys.exit(1)
+    r.raise_for_status()
+    print(f"Claimed ticket {ticket_id} as {me['username']}")
+
+
 def main():
     show_disclaimer()
 
@@ -970,6 +1039,10 @@ def main():
     p_submit.add_argument("summary", help="Test request summary")
     p_submit.add_argument(
         "-d", "--description", help="Detailed description (defaults to summary)"
+    )
+    p_submit.add_argument(
+        "--owners",
+        help="Comma-separated list of owners (multi-user mode)",
     )
 
     p_list = sub.add_parser("list", help="List tickets")
@@ -1120,6 +1193,28 @@ def main():
 
     sub.add_parser("whoami", help="Show your identity")
 
+    p_handoff = sub.add_parser(
+        "handoff",
+        help="Add or remove ticket owners",
+    )
+    p_handoff.add_argument("ticket_id", help="Ticket ID")
+    p_handoff.add_argument(
+        "--add",
+        metavar="USER",
+        help="Add a user as owner",
+    )
+    p_handoff.add_argument(
+        "--remove",
+        metavar="USER",
+        help="Remove a user from owners",
+    )
+
+    p_claim = sub.add_parser(
+        "claim",
+        help="Claim an unclaimed ticket (add yourself as owner)",
+    )
+    p_claim.add_argument("ticket_id", help="Ticket ID")
+
     p_cleanup = sub.add_parser("cleanup", help="Find/terminate orphaned AWS instances")
     p_cleanup.add_argument(
         "--older-than",
@@ -1161,6 +1256,8 @@ def main():
         "user": cmd_user,
         "group": cmd_group,
         "whoami": cmd_whoami,
+        "handoff": cmd_handoff,
+        "claim": cmd_claim_ticket,
     }
     commands[args.command](args)
 

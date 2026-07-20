@@ -38,7 +38,13 @@ class TicketStore:
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._load_from_disk()
 
-    def create_ticket(self, request: CreateTicketRequest) -> Ticket:
+    def create_ticket(
+        self,
+        request: CreateTicketRequest,
+        *,
+        created_by: str = "",
+        owners: list[str] | None = None,
+    ) -> Ticket:
         with self._lock:
             self._global_seq += 1
             ticket = Ticket(
@@ -48,6 +54,8 @@ class TicketStore:
                 custom_fields=request.custom_fields,
                 status=TicketStatus.NEW,
                 transition_seq=self._global_seq,
+                created_by=created_by,
+                owners=list(owners) if owners else [],
             )
             self._tickets[ticket.id] = ticket
             self._persist_ticket(ticket)
@@ -138,6 +146,16 @@ class TicketStore:
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             ticket.custom_fields.update(fields)
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            return ticket.model_copy()
+
+    def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket.owners = list(owners)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
             return ticket.model_copy()

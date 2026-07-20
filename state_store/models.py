@@ -133,12 +133,15 @@ class Ticket(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     previous_status: TicketStatus | None = None
     transition_seq: int = 0
+    created_by: str = ""
+    owners: list[str] = Field(default_factory=list)
 
 
 class CreateTicketRequest(BaseModel):
     summary: str
     description: str
     custom_fields: dict[str, Any] = Field(default_factory=dict)
+    owners: list[str] | None = None
 
 
 class TransitionRequest(BaseModel):

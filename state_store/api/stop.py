@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
+from ..auth import Principal, require_admin, require_write_access
 from ..models import (
     NON_DISPATCHABLE_STATUSES,
     TERMINAL_STATUSES,
@@ -17,6 +18,14 @@ from ..store import TicketNotFound
 router = APIRouter(tags=["stop"])
 
 
+def _get_principal(request: Request) -> Principal:
+    return request.state.principal
+
+
+def _is_multi_user(request: Request) -> bool:
+    return getattr(request.app.state, "multi_user", False)
+
+
 @router.post("/tickets/{ticket_id}/stop")
 def stop_ticket(ticket_id: str, body: StopRequest, request: Request):
     store = request.app.state.store
@@ -24,6 +33,8 @@ def stop_ticket(ticket_id: str, body: StopRequest, request: Request):
         ticket = store.get_ticket(ticket_id)
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     if ticket.status in NON_DISPATCHABLE_STATUSES:
         kind = "terminal" if ticket.status in TERMINAL_STATUSES else "paused"
@@ -55,6 +66,8 @@ def abort_ticket(ticket_id: str, request: Request):
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+
     if ticket.status != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
         raise HTTPException(
             status_code=409,
@@ -83,6 +96,11 @@ def abort_ticket(ticket_id: str, request: Request):
 
 @router.post("/stop-all")
 def stop_all(body: StopRequest, request: Request):
+    principal = _get_principal(request)
+    multi_user = _is_multi_user(request)
+    if multi_user:
+        require_admin(principal)
+
     store = request.app.state.store
     tickets = store.list_tickets()
     affected = []

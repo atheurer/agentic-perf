@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from state_store.auth import require_write_access
 from state_store.models import (
     PAUSED_STATUSES,
     TERMINAL_STATUSES,
@@ -35,6 +36,10 @@ def interject(
             status_code=404,
             content={"detail": f"Ticket {ticket_id} not found"},
         )
+
+    principal = request.state.principal
+    multi_user = getattr(request.app.state, "multi_user", False)
+    require_write_access(principal, ticket, multi_user)
 
     if ticket.status in TERMINAL_STATUSES:
         return JSONResponse(

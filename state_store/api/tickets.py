@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from ..auth import Principal, require_write_access
 from ..models import (
     ClaimRequest,
     CreateTicketRequest,
@@ -17,10 +18,36 @@ def _get_store(request: Request):
     return request.app.state.store
 
 
+def _get_principal(request: Request) -> Principal:
+    return request.state.principal
+
+
+def _is_multi_user(request: Request) -> bool:
+    return getattr(request.app.state, "multi_user", False)
+
+
 @router.post("")
 def create_ticket(body: CreateTicketRequest, request: Request):
     store = _get_store(request)
-    ticket = store.create_ticket(body)
+    principal = _get_principal(request)
+    multi_user = _is_multi_user(request)
+
+    created_by = ""
+    owners: list[str] = []
+
+    if multi_user and principal.kind == "user":
+        created_by = principal.username
+        owners = list(body.owners) if body.owners else [principal.username]
+        if principal.username not in owners:
+            owners.append(principal.username)
+    elif body.owners:
+        owners = list(body.owners)
+
+    ticket = store.create_ticket(
+        body,
+        created_by=created_by,
+        owners=owners,
+    )
     return ticket
 
 
@@ -43,9 +70,13 @@ def get_ticket(ticket_id: str, request: Request):
 def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     store = _get_store(request)
     try:
-        return store.update_fields(ticket_id, body.fields)
+        ticket = store.get_ticket(ticket_id)
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+
+    return store.update_fields(ticket_id, body.fields)
 
 
 @router.post("/{ticket_id}/claim")
