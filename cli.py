@@ -39,6 +39,15 @@ def get_client(args) -> tuple[httpx.Client, str]:
     return httpx.Client(base_url=url, timeout=10.0, headers=headers), url
 
 
+def _check_403(r: httpx.Response) -> bool:
+    """Handle 403 responses with a friendly message. Returns True if 403."""
+    if r.status_code != 403:
+        return False
+    detail = r.json().get("detail", "Access denied")
+    print(f"Permission denied: {detail}", file=sys.stderr)
+    return True
+
+
 def cmd_submit(args):
     client, url = get_client(args)
     description = args.description or args.summary
@@ -459,6 +468,8 @@ def cmd_abort(args):
             "body": f"**Abort requested:** {reason}",
         },
     )
+    if _check_403(r):
+        return
     r.raise_for_status()
 
     r = client.post(
@@ -468,6 +479,8 @@ def cmd_abort(args):
             "comment": "User requested abort, skipping to cleanup",
         },
     )
+    if _check_403(r):
+        return
     r.raise_for_status()
 
     print(f"Ticket {args.ticket_id} aborted — moving to teardown.")
@@ -483,6 +496,8 @@ def cmd_stop(args):
     )
     if r.status_code == 404:
         print(f"Ticket {args.ticket_id} not found.")
+        return
+    if _check_403(r):
         return
     if r.status_code == 409:
         print(r.json().get("detail", "Ticket is already in a terminal state."))
@@ -511,6 +526,8 @@ def cmd_stop_all(args):
             return
 
     r = client.post("/api/v1/stop-all", json={"mode": mode})
+    if _check_403(r):
+        return
     r.raise_for_status()
     data = r.json()
     count = data.get("count", 0)
