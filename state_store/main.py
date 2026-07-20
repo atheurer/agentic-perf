@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from orchestrator.config import _load_config_file
 from providers.events import EventBus
 
 from .api.router import api_router, health_router
@@ -34,7 +35,24 @@ def create_app() -> FastAPI:
 
     token = load_or_generate_token()
     app.state.api_token = token
-    auth = make_auth_dependency(token)
+
+    cfg = _load_config_file()
+    multi_user = cfg.get("auth", {}).get("multi_user", False)
+    app.state.multi_user = multi_user
+
+    user_store = None
+    if multi_user:
+        from .identity import UserStore
+
+        user_store = UserStore()
+    app.state.user_store = user_store
+
+    auth = make_auth_dependency(
+        token,
+        multi_user=multi_user,
+        user_store=user_store,
+    )
+    app.state.auth_dependency = auth
 
     app.state.store = TicketStore()
     app.state.event_bus = EventBus()
@@ -48,7 +66,8 @@ def create_app() -> FastAPI:
         def serve_dashboard():
             index_path = STATIC_DIR / "index.html"
             html = index_path.read_text()
-            token_script = f'<script>window.API_TOKEN="{token}";</script>'
+            inject_token = "" if multi_user else token
+            token_script = f'<script>window.API_TOKEN="{inject_token}";</script>'
             html = html.replace("</head>", f"{token_script}</head>", 1)
             return HTMLResponse(
                 content=html,

@@ -348,6 +348,25 @@ to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
 
 ---
 
+### `auth` — Multi-User Authentication
+
+```json
+{
+    "auth": {
+        "multi_user": false
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `multi_user` | bool | `false` | Enable per-user authentication. When `true`, each API caller needs a personal bearer token (created via the admin API). The existing deployment token becomes the service principal used by the orchestrator and agents. When `false`, behavior is identical to a single-token deployment. |
+
+See [Multi-User Guide](multi-user.md) for bootstrap instructions and
+the full feature walkthrough.
+
+---
+
 ### Data Retention
 
 | Field | Type | Default | Description |

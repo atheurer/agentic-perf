@@ -827,6 +827,131 @@ def cmd_health(args):
             print(f"  {status}: {count}")
 
 
+# ------------------------------------------------------------------
+# Identity management commands
+# ------------------------------------------------------------------
+
+
+def cmd_user(args):
+    """Dispatch user subcommands."""
+    client, _url = get_client(args)
+    action = args.user_action
+    if action == "create":
+        body = {"username": args.username, "is_admin": args.admin}
+        r = client.post("/api/v1/users", json=body)
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        data = r.json()
+        print(f"Created user: {data['user']['username']}")
+        if data["user"].get("is_admin"):
+            print("  Role: admin")
+        print(f"  Token: {data['token']}")
+        print("  (Save this token — it will not be shown again)")
+    elif action == "list":
+        r = client.get("/api/v1/users")
+        r.raise_for_status()
+        users = r.json()
+        if not users:
+            print("No users")
+            return
+        for u in users:
+            flags = []
+            if u.get("is_admin"):
+                flags.append("admin")
+            if u.get("disabled"):
+                flags.append("disabled")
+            flag_str = f" ({', '.join(flags)})" if flags else ""
+            groups = ", ".join(u.get("groups", [])) or "none"
+            print(f"  {u['username']}{flag_str}  groups: {groups}")
+    elif action == "disable":
+        r = client.post(f"/api/v1/users/{args.username}/disable")
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Disabled user: {args.username}")
+    elif action == "enable":
+        r = client.post(f"/api/v1/users/{args.username}/enable")
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Enabled user: {args.username}")
+    elif action == "rotate-token":
+        r = client.post(f"/api/v1/users/{args.username}/rotate-token")
+        if r.status_code == 403:
+            print("Error: you can only rotate your own token (or use an admin account)")
+            sys.exit(1)
+        r.raise_for_status()
+        data = r.json()
+        print(f"New token for {args.username}: {data['token']}")
+        print("(Save this token — it will not be shown again)")
+
+
+def cmd_group(args):
+    """Dispatch group subcommands."""
+    client, _url = get_client(args)
+    action = args.group_action
+    if action == "create":
+        body = {"name": args.name}
+        if args.description:
+            body["description"] = args.description
+        r = client.post("/api/v1/groups", json=body)
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Created group: {r.json()['name']}")
+    elif action == "list":
+        r = client.get("/api/v1/groups")
+        r.raise_for_status()
+        groups = r.json()
+        if not groups:
+            print("No groups")
+            return
+        for g in groups:
+            desc = f" — {g['description']}" if g.get("description") else ""
+            print(f"  {g['name']}{desc}")
+    elif action == "delete":
+        r = client.delete(f"/api/v1/groups/{args.name}")
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Deleted group: {args.name}")
+    elif action == "add-member":
+        r = client.put(
+            f"/api/v1/groups/{args.name}/members/{args.username}",
+        )
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Added {args.username} to group {args.name}")
+    elif action == "remove-member":
+        r = client.delete(
+            f"/api/v1/groups/{args.name}/members/{args.username}",
+        )
+        if r.status_code == 403:
+            print("Error: admin privileges required")
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Removed {args.username} from group {args.name}")
+
+
+def cmd_whoami(args):
+    client, _url = get_client(args)
+    r = client.get("/api/v1/whoami")
+    r.raise_for_status()
+    data = r.json()
+    kind = data["kind"]
+    username = data["username"]
+    admin = " (admin)" if data.get("is_admin") else ""
+    print(f"{kind}: {username}{admin}")
+
+
 def main():
     show_disclaimer()
 
@@ -947,6 +1072,54 @@ def main():
 
     sub.add_parser("health", help="Check state store health")
 
+    # Identity management
+    p_user = sub.add_parser("user", help="Manage users (multi-user mode)")
+    user_sub = p_user.add_subparsers(dest="user_action")
+    p_user_create = user_sub.add_parser("create", help="Create a user")
+    p_user_create.add_argument("username", help="Username")
+    p_user_create.add_argument(
+        "--admin",
+        action="store_true",
+        help="Grant admin privileges",
+    )
+    user_sub.add_parser("list", help="List users")
+    p_user_disable = user_sub.add_parser("disable", help="Disable a user")
+    p_user_disable.add_argument("username", help="Username")
+    p_user_enable = user_sub.add_parser("enable", help="Enable a user")
+    p_user_enable.add_argument("username", help="Username")
+    p_user_rotate = user_sub.add_parser(
+        "rotate-token",
+        help="Rotate a user's token",
+    )
+    p_user_rotate.add_argument("username", help="Username")
+
+    p_group = sub.add_parser("group", help="Manage groups (multi-user mode)")
+    group_sub = p_group.add_subparsers(dest="group_action")
+    p_group_create = group_sub.add_parser("create", help="Create a group")
+    p_group_create.add_argument("name", help="Group name")
+    p_group_create.add_argument(
+        "-d",
+        "--description",
+        help="Group description",
+    )
+    group_sub.add_parser("list", help="List groups")
+    p_group_delete = group_sub.add_parser("delete", help="Delete a group")
+    p_group_delete.add_argument("name", help="Group name")
+    p_group_add = group_sub.add_parser(
+        "add-member",
+        help="Add a user to a group",
+    )
+    p_group_add.add_argument("name", help="Group name")
+    p_group_add.add_argument("username", help="Username")
+    p_group_rm = group_sub.add_parser(
+        "remove-member",
+        help="Remove a user from a group",
+    )
+    p_group_rm.add_argument("name", help="Group name")
+    p_group_rm.add_argument("username", help="Username")
+
+    sub.add_parser("whoami", help="Show your identity")
+
     p_cleanup = sub.add_parser("cleanup", help="Find/terminate orphaned AWS instances")
     p_cleanup.add_argument(
         "--older-than",
@@ -985,6 +1158,9 @@ def main():
         "transcript": cmd_transcript,
         "health": cmd_health,
         "cleanup": cmd_cleanup,
+        "user": cmd_user,
+        "group": cmd_group,
+        "whoami": cmd_whoami,
     }
     commands[args.command](args)
 
