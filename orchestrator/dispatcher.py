@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -22,6 +23,9 @@ from providers.llm.base import LLMProvider
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
 from providers.skills.repo_cache import RepoCache
+
+if TYPE_CHECKING:
+    from state_store.identity import UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,8 @@ class Dispatcher:
         llm_factory: Any | None = None,
         instance_name: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        user_store: UserStore | None = None,
+        secrets_root: Path | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
@@ -66,6 +72,8 @@ class Dispatcher:
         self._llm_factory = llm_factory
         self._instance_name = instance_name or "unknown"
         self.lease_seconds = lease_seconds
+        self._user_store = user_store
+        self._secrets_root = secrets_root
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
@@ -288,12 +296,56 @@ class Dispatcher:
             return self._llm_factory(agent_type)
         return self.llm
 
-    def create_agent(self, status: str) -> Any:
+    def _get_secrets_for_ticket(
+        self,
+        ticket_data: dict | None,
+    ) -> SecretsProvider | None:
+        """Resolve secrets provider for a ticket.
+
+        If multi-user is configured and the ticket has a ``created_by``
+        user, builds a per-user cascade (user → groups → shared).
+        Otherwise returns the shared deployment secrets.
+        """
+        if self._user_store is None or self._secrets_root is None:
+            return self.secrets
+
+        if ticket_data is None:
+            return self.secrets
+
+        created_by = ticket_data.get("created_by", "")
+        if not created_by:
+            return self.secrets
+
+        from state_store.identity import UserNotFound
+
+        try:
+            user = self._user_store.get_user(created_by)
+        except UserNotFound:
+            logger.warning(
+                "Ticket creator '%s' not found; using shared secrets",
+                created_by,
+            )
+            return self.secrets
+
+        from providers.secrets.cascade import build_cascade_for_user
+
+        return build_cascade_for_user(
+            username=user.username,
+            groups=user.groups,
+            secrets_root=self._secrets_root,
+        )
+
+    def create_agent(
+        self,
+        status: str,
+        ticket_data: dict | None = None,
+    ) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
             return None
 
         llm = self._get_llm(agent_type)
+        ticket_secrets = self._get_secrets_for_ticket(ticket_data)
 
         if agent_type == "triage":
             return TriageAgent(
@@ -307,7 +359,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="create",
-                secrets_provider=self.secrets,
+                secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 instance_name=self._instance_name,
             )
@@ -316,7 +368,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
-                secrets_provider=self.secrets,
+                secrets_provider=ticket_secrets,
                 event_bus=self.events,
             )
         elif agent_type == "benchmark":
@@ -324,7 +376,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
-                secrets_provider=self.secrets,
+                secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 repo_cache=self.repo_cache,
             )
@@ -341,7 +393,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="teardown",
-                secrets_provider=self.secrets,
+                secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 instance_name=self._instance_name,
             )

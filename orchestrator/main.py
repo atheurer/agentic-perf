@@ -305,11 +305,12 @@ async def run_agent_task(
     ticket_id: str,
     config: OrchestratorConfig | None = None,
     agent_task_timeout: float = 0,
+    ticket_data: dict | None = None,
 ):
     agent = None
 
     try:
-        agent = dispatcher.create_agent(status)
+        agent = dispatcher.create_agent(status, ticket_data=ticket_data)
         if agent is None:
             return
 
@@ -915,6 +916,17 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     except ImportError:
         logger.info("OpenTelemetry not installed — LLM token tracking disabled")
 
+    multi_user = config.raw.get("auth", {}).get("multi_user", False)
+    user_store = None
+    secrets_root = None
+    if multi_user:
+        from state_store.identity import UserStore
+
+        user_store = UserStore()
+        from paths import SECRETS_DIR
+
+        secrets_root = SECRETS_DIR
+
     dispatcher = Dispatcher(
         config.state_store_url,
         llm,
@@ -924,6 +936,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         repo_cache=repo_cache,
         llm_factory=llm_factory,
         instance_name=config.instance_name,
+        user_store=user_store,
+        secrets_root=secrets_root,
     )
 
     logger.info(
@@ -1064,6 +1078,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         tid,
                         config=config,
                         agent_task_timeout=config.agent_task_timeout,
+                        ticket_data=ticket,
                     )
                 )
                 dispatcher.set_task(tid, task)
