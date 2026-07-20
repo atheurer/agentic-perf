@@ -826,9 +826,69 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             },
         )
 
+    def _lookup(self, benchmark: str) -> dict[str, Any] | None:
+        """Look up a benchmark in the catalog.
+
+        Handles name aliasing: 'uperf' → 'arcaflow-uperf'.
+        """
+        info = self._catalog.get(benchmark)
+        if info is None and not benchmark.startswith("arcaflow-"):
+            info = self._catalog.get(f"arcaflow-{benchmark}")
+        return info
+
+    async def get_runfile_schema(self) -> dict[str, Any] | None:
+        """Return the arcaflow-plugins run-file schema.
+
+        Describes the envelope format for execute_benchmark.
+        For per-step input schemas, use get_benchmark_params
+        which returns step_schemas from the plugin container.
+        """
+        return {
+            "type": "object",
+            "description": (
+                "Arcaflow plugin run-file. The plugin_image "
+                "and plugin_step are required. The input "
+                "dict is passed to the plugin via stdin. "
+                "Use get_benchmark_params to discover the "
+                "input schema for a specific plugin step."
+            ),
+            "required": ["plugin_image", "plugin_step", "input"],
+            "properties": {
+                "plugin_image": {
+                    "type": "string",
+                    "description": (
+                        "Full container image reference "
+                        "(e.g., quay.io/arcalot/"
+                        "arcaflow-plugin-stressng:latest)"
+                    ),
+                },
+                "plugin_step": {
+                    "type": "string",
+                    "description": (
+                        "Step name to execute "
+                        "(e.g., 'workload', 'uperf', "
+                        "'uperf_server'). Use "
+                        "get_benchmark_params to see "
+                        "available steps."
+                    ),
+                    "default": "workload",
+                },
+                "input": {
+                    "type": "object",
+                    "description": (
+                        "Plugin input parameters. Schema "
+                        "varies by plugin — use "
+                        "get_benchmark_params to get the "
+                        "JSON schema for the chosen step."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        }
+
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         await self._refresh_catalog()
-        info = self._catalog.get(benchmark)
+        info = self._lookup(benchmark)
         if info is None:
             return None
 
@@ -854,7 +914,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         self, benchmark: str, endpoint_type: str = "remotehosts"
     ) -> dict[str, Any] | None:
         await self._refresh_catalog()
-        info = self._catalog.get(benchmark)
+        info = self._lookup(benchmark)
         if info is None:
             return None
         return {

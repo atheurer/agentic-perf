@@ -441,3 +441,41 @@ async def test_cache_prevents_repeated_quay_calls():
     with patch.object(provider, "_discover_from_quay") as mock_discover:
         await provider.list_benchmarks()
         mock_discover.assert_not_called()
+
+
+class TestGetRunfileSchema:
+    @pytest.mark.asyncio
+    async def test_returns_schema(self):
+        """get_runfile_schema returns the envelope schema."""
+        provider = ArcaflowPluginSkillProvider(discover_schemas=False)
+        schema = await provider.get_runfile_schema()
+        assert schema is not None
+        assert schema["type"] == "object"
+        assert "plugin_image" in schema["properties"]
+        assert "plugin_step" in schema["properties"]
+        assert "input" in schema["properties"]
+        assert schema["required"] == ["plugin_image", "plugin_step", "input"]
+        assert schema["additionalProperties"] is False
+
+
+class TestLookupAliasing:
+    @pytest.mark.asyncio
+    async def test_direct_name(self):
+        """_lookup finds by exact catalog key."""
+        provider = ArcaflowPluginSkillProvider(discover_schemas=False)
+        provider._catalog = {"arcaflow-stressng": {"image": "test"}}
+        assert provider._lookup("arcaflow-stressng") is not None
+
+    @pytest.mark.asyncio
+    async def test_short_name(self):
+        """_lookup finds 'stressng' via 'arcaflow-stressng'."""
+        provider = ArcaflowPluginSkillProvider(discover_schemas=False)
+        provider._catalog = {"arcaflow-stressng": {"image": "test"}}
+        assert provider._lookup("stressng") is not None
+
+    @pytest.mark.asyncio
+    async def test_missing_name(self):
+        """_lookup returns None for unknown benchmarks."""
+        provider = ArcaflowPluginSkillProvider(discover_schemas=False)
+        provider._catalog = {"arcaflow-stressng": {"image": "test"}}
+        assert provider._lookup("unknown") is None
