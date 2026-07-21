@@ -70,11 +70,11 @@ class TestAttachment:
             )
 
         assert result is True
-        mcp.connect_command.assert_called_once_with(
-            command="jmp",
-            args=["mcp", "serve"],
-            name="jumpstarter",
-        )
+        mcp.connect_command.assert_called_once()
+        call_kwargs = mcp.connect_command.call_args[1]
+        assert call_kwargs["command"] == "jmp"
+        assert call_kwargs["args"] == ["mcp", "serve"]
+        assert call_kwargs["name"] == "jumpstarter"
 
     @pytest.mark.asyncio
     async def test_skips_when_not_jumpstarter(self):

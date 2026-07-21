@@ -15,7 +15,7 @@ If `jumpstarter_flash` has an `error` field, call
 `request_clarification` with the error and available variants.
 
 If flashing fails with a TLS/SSL certificate error, retry with
-`--insecure-tls` added after `j storage flash`.
+`--insecure-tls` added after `storage flash` in the command array.
 
 If flashing fails for any other reason, retry once. If it fails
 a second time, submit `provisioning_complete=false` with a note
@@ -26,20 +26,24 @@ cannot fix.
 ## Post-Flash
 
 After flashing (which includes a power cycle), wait ~60 seconds
-for the board to boot, then run `j tcp address` to discover the
-IP address.
+for the board to boot, then use `jmp_run` with
+`command=["tcp", "address"]` to discover the IP address.
 
-If `j tcp address` returns no result, try `j power cycle` first,
-wait 60s, and retry.
+If `tcp address` returns no result, try `jmp_run` with
+`command=["power", "cycle"]`, wait 60s, and retry.
 
 ## SSH Key Injection
 
 The orchestrator's SSH public key is in
-`jumpstarter_flash.ssh_public_key`. Inject it via the tunnel:
+`jumpstarter_flash.ssh_public_key`. Inject it via `jmp_run`:
 
 ```
-j ssh -- "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '<key>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
+jmp_run command=["ssh", "--", "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '<key>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"]
 ```
+
+All device commands go through `jmp_run` with the appropriate
+driver path as the command array. Do NOT use `j` CLI directly —
+it is not available in the MCP context.
 
 ## Completion
 

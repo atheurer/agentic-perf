@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -178,11 +179,24 @@ async def attach_jumpstarter_mcp(
         # blocks waiting for exporter assignment with no
         # built-in timeout.
         try:
+            # Ensure the Jumpstarter venv bin is on PATH
+            # so jmp_run can find the `j` CLI binary.
+            import shutil
+
+            jmp_path = shutil.which("jmp")
+            jmp_env: dict[str, str] = {}
+            if jmp_path:
+                venv_bin = str(Path(jmp_path).resolve().parent)
+                current_path = os.environ.get("PATH", "")
+                if venv_bin not in current_path:
+                    jmp_env["PATH"] = f"{venv_bin}{os.pathsep}{current_path}"
+
             await asyncio.wait_for(
                 mcp_client.connect_command(
                     command="jmp",
                     args=["mcp", "serve"],
                     name="jumpstarter",
+                    env=jmp_env,
                 ),
                 timeout=120,  # 2 min to connect
             )
