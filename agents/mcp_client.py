@@ -101,32 +101,49 @@ class AgentMCPClient:
             env=merged_env,
         )
         stdio_cm = stdio_client(params)
-        read_stream, write_stream = await stdio_cm.__aenter__()
-        session_cm = ClientSession(read_stream, write_stream)
-        session = await session_cm.__aenter__()
-        await session.initialize()
+        session_cm = None
+        try:
+            read_stream, write_stream = await stdio_cm.__aenter__()
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            await session.initialize()
 
-        result = await session.list_tools()
-        for t in result.tools:
-            if t.name in self._tool_routing:
-                existing = self._tool_routing[t.name]
-                raise ValueError(
-                    f"Tool {t.name!r} from server {name!r} conflicts "
-                    f"with server {existing!r}"
-                )
-            self._tool_routing[t.name] = name
+            result = await session.list_tools()
+            for t in result.tools:
+                if t.name in self._tool_routing:
+                    existing = self._tool_routing[t.name]
+                    raise ValueError(
+                        f"Tool {t.name!r} from server {name!r} conflicts "
+                        f"with server {existing!r}"
+                    )
+                self._tool_routing[t.name] = name
 
-        self._servers[name] = _ServerConnection(
-            name=name,
-            session=session,
-            stdio_cm=stdio_cm,
-            session_cm=session_cm,
-        )
-        logger.info(
-            "MCP client connected to %s (%d tools)",
-            name,
-            len(result.tools),
-        )
+            self._servers[name] = _ServerConnection(
+                name=name,
+                session=session,
+                stdio_cm=stdio_cm,
+                session_cm=session_cm,
+            )
+            logger.info(
+                "MCP client connected to %s (%d tools)",
+                name,
+                len(result.tools),
+            )
+        except (Exception, BaseException):
+            # Clean up in the same task that entered the
+            # context managers. Prevents anyio cancel scope
+            # mismatches (modelcontextprotocol/python-sdk#577)
+            # when the agent task is cancelled during setup.
+            if session_cm is not None:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except (Exception, BaseException):
+                    pass
+            try:
+                await stdio_cm.__aexit__(None, None, None)
+            except (Exception, BaseException):
+                pass
+            raise
 
     async def list_tools(
         self,
