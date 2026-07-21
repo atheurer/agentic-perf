@@ -1010,7 +1010,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                             )
                         except Exception:
                             logger.exception(f"Failed to redirect {tid}")
-                        dispatcher.mark_dispatched(tid, status)
+                        dispatcher.mark_done(tid)
                         continue
 
                 # Jumpstarter: release any existing lease
