@@ -940,6 +940,136 @@ th.col-right { text-align: right; }
   font-style: italic;
 }
 
+/* Identity and token settings (multi-user) */
+.identity-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.identity-info .identity-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.identity-info .identity-role {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.toolbar-btn.btn-settings {
+  font-size: 14px;
+  padding: 3px 6px;
+}
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.settings-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 480px;
+  width: 90%;
+}
+
+.settings-dialog h3 {
+  margin-bottom: 12px;
+  color: var(--text-bright);
+}
+
+.settings-dialog label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.settings-dialog input[type="text"] {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  margin-bottom: 12px;
+}
+
+.settings-dialog input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.settings-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.settings-actions button {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.settings-actions button:hover {
+  background: var(--bg-hover);
+}
+
+.settings-actions .btn-save {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.settings-actions .btn-clear {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.settings-msg {
+  font-size: 12px;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+.settings-msg.error {
+  background: rgba(247, 118, 142, 0.15);
+  color: var(--red);
+}
+
+.settings-msg.success {
+  background: rgba(158, 206, 106, 0.15);
+  color: var(--green);
+}
+
+.ticket-owners {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.toolbar-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 @media (max-width: 900px) {
   .container { padding: 0 12px; }
   .ticket-summary { max-width: 250px; }
@@ -993,6 +1123,8 @@ th.col-right { text-align: right; }
   <div class="container">
     <h1><a href="#/" style="color: inherit; text-decoration: none;"><span>Agentic</span> Perf</a></h1>
     <div class="health-stats" id="health-stats"></div>
+    <div class="identity-info" id="identity-info"></div>
+    <button class="toolbar-btn btn-settings" id="btn-settings" title="Token settings" style="display:none">&#9881;</button>
     <button class="toolbar-btn btn-stop-all" id="btn-stop-all-header" title="Stop all running agents">Stop All Tickets</button>
   </div>
 </header>
@@ -1010,9 +1142,142 @@ th.col-right { text-align: right; }
 
 <script>
 const API = '/api/v1';
-const AUTH_HEADERS = window.API_TOKEN
-  ? { 'Authorization': 'Bearer ' + window.API_TOKEN }
-  : {};
+var _userToken = localStorage.getItem('agentic_perf_token') || '';
+var _serverToken = window.API_TOKEN || '';
+var _isMultiUser = !_serverToken;
+
+function getAuthToken() {
+  return _userToken || _serverToken;
+}
+
+function getAuthHeaders() {
+  var tok = getAuthToken();
+  return tok ? { 'Authorization': 'Bearer ' + tok } : {};
+}
+
+var AUTH_HEADERS = getAuthHeaders();
+
+var _currentIdentity = null;
+
+async function refreshIdentity() {
+  var el = document.getElementById('identity-info');
+  var settingsBtn = document.getElementById('btn-settings');
+  if (!el) return;
+
+  if (_isMultiUser) {
+    if (settingsBtn) settingsBtn.style.display = '';
+  }
+
+  if (!getAuthToken()) {
+    if (_isMultiUser) {
+      el.innerHTML = '<span style="color:var(--yellow)">No token set</span>';
+    }
+    _currentIdentity = null;
+    return;
+  }
+
+  try {
+    var r = await fetch(API + '/whoami', { headers: getAuthHeaders() });
+    if (r.status === 401) {
+      _currentIdentity = null;
+      if (_isMultiUser) {
+        el.innerHTML = '<span style="color:var(--red)">Invalid token</span>';
+      }
+      return;
+    }
+    if (!r.ok) return;
+    var data = await r.json();
+    _currentIdentity = data;
+    var name = data.username || 'unknown';
+    var role = data.is_admin ? ' (admin)' : '';
+    var kind = data.kind === 'service' ? 'service' : '';
+    if (data.kind === 'service') {
+      el.innerHTML = '<span class="identity-name">' + escHtml(name) + '</span>' +
+        '<span class="identity-role">service principal</span>';
+    } else {
+      el.innerHTML = '<span class="identity-name">' + escHtml(name) + '</span>' +
+        '<span class="identity-role">' + escHtml(role) + '</span>';
+    }
+  } catch {
+    _currentIdentity = null;
+  }
+}
+
+function showSettingsDialog() {
+  var overlay = document.createElement('div');
+  overlay.className = 'settings-overlay';
+  overlay.innerHTML =
+    '<div class="settings-dialog">' +
+      '<h3>Token Settings</h3>' +
+      '<div id="settings-msg"></div>' +
+      '<label for="settings-token-input">API Token</label>' +
+      '<input type="text" id="settings-token-input" placeholder="Paste your API token here" value="' +
+        escHtml(_userToken) + '">' +
+      '<div class="settings-actions">' +
+        '<button class="btn-clear" id="btn-settings-clear">Clear</button>' +
+        '<button onclick="this.closest(\'.settings-overlay\').remove()">Cancel</button>' +
+        '<button class="btn-save" id="btn-settings-save">Save</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.getElementById('btn-settings-save').addEventListener('click', async function() {
+    var input = document.getElementById('settings-token-input');
+    var msg = document.getElementById('settings-msg');
+    var token = (input.value || '').trim();
+    if (!token) {
+      msg.className = 'settings-msg error';
+      msg.textContent = 'Token cannot be empty';
+      return;
+    }
+    try {
+      var r = await fetch(API + '/whoami', {
+        headers: { 'Authorization': 'Bearer ' + token },
+      });
+      if (r.status === 401) {
+        msg.className = 'settings-msg error';
+        msg.textContent = 'Invalid token — authentication failed';
+        return;
+      }
+      if (!r.ok) {
+        msg.className = 'settings-msg error';
+        msg.textContent = 'Server error: HTTP ' + r.status;
+        return;
+      }
+      var data = await r.json();
+      _userToken = token;
+      localStorage.setItem('agentic_perf_token', token);
+      AUTH_HEADERS = getAuthHeaders();
+      msg.className = 'settings-msg success';
+      msg.textContent = 'Saved — logged in as ' + (data.username || 'unknown');
+      refreshIdentity();
+      setTimeout(function() { overlay.remove(); }, 1000);
+    } catch (err) {
+      msg.className = 'settings-msg error';
+      msg.textContent = 'Connection error: ' + err.message;
+    }
+  });
+  document.getElementById('btn-settings-clear').addEventListener('click', function() {
+    _userToken = '';
+    localStorage.removeItem('agentic_perf_token');
+    AUTH_HEADERS = getAuthHeaders();
+    _currentIdentity = null;
+    refreshIdentity();
+    overlay.remove();
+  });
+}
+
+function canWriteTicket(ticket) {
+  if (!_isMultiUser) return true;
+  if (!_currentIdentity) return false;
+  if (_currentIdentity.kind === 'service') return true;
+  if (_currentIdentity.is_admin) return true;
+  var owners = ticket.owners || [];
+  if (owners.length === 0) return true;
+  return owners.indexOf(_currentIdentity.username) !== -1;
+}
 
 // AI Safety Disclaimer
 function dismissDisclaimer() {
@@ -1032,6 +1297,11 @@ window.addEventListener('DOMContentLoaded', () => {
   if (stopAllBtn) {
     stopAllBtn.addEventListener('click', showStopAllConfirm);
   }
+  var settingsBtn = document.getElementById('btn-settings');
+  if (settingsBtn) {
+    settingsBtn.addEventListener('click', showSettingsDialog);
+  }
+  refreshIdentity();
 });
 
 let currentView = 'list';
@@ -1058,7 +1328,7 @@ async function stopTicket(ticketId, mode) {
   try {
     var r = await fetch(API + '/tickets/' + ticketId + '/stop', {
       method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, AUTH_HEADERS),
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
       body: JSON.stringify({mode: mode}),
     });
     if (r.status === 409) {
@@ -1077,15 +1347,26 @@ async function stopTicket(ticketId, mode) {
   }
 }
 
-function actionButtonsHtml(status) {
+var _currentDetailTicket = null;
+
+function actionButtonsHtml(status, ticket) {
+  var disabled = '';
+  var disabledTitle = '';
+  if (_isMultiUser && ticket && !canWriteTicket(ticket)) {
+    disabled = ' disabled';
+    disabledTitle = ' title="You are not an owner of this ticket"';
+  }
   if (status === 'awaiting_customer_guidance') {
     return '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
-      '<button class="toolbar-btn btn-abort" id="btn-abort" title="Abort ticket and tear down resources">Abort</button>';
+      '<button class="toolbar-btn btn-abort" id="btn-abort"' + disabled + disabledTitle +
+      (!disabled ? ' title="Abort ticket and tear down resources"' : '') + '>Abort</button>';
   }
   if (isTerminalStatus(status)) return '';
   return '<span style="border-left:1px solid var(--border); height:16px; margin:0 4px;"></span>' +
-    '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful" title="Finish current action, then pause">Pause</button>' +
-    '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard" title="Kill agent immediately">Stop</button>';
+    '<button class="toolbar-btn btn-stop-graceful" id="btn-stop-graceful"' + disabled +
+    (!disabled ? ' title="Finish current action, then pause"' : disabledTitle) + '>Pause</button>' +
+    '<button class="toolbar-btn btn-stop-hard" id="btn-stop-hard"' + disabled +
+    (!disabled ? ' title="Kill agent immediately"' : disabledTitle) + '>Stop</button>';
 }
 
 function bindActionButtons(ticketId) {
@@ -1128,7 +1409,7 @@ async function doAbort(ticketId, btn) {
     btn.textContent = 'Aborting...';
     var r = await fetch(API + '/tickets/' + ticketId + '/abort', {
       method: 'POST',
-      headers: AUTH_HEADERS,
+      headers: getAuthHeaders(),
     });
     if (r.status === 409) {
       var data = await r.json();
@@ -1172,7 +1453,7 @@ async function doStopAll(mode, btn) {
   try {
     var r = await fetch(API + '/stop-all', {
       method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, AUTH_HEADERS),
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
       body: JSON.stringify({mode: mode}),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1187,7 +1468,11 @@ async function doStopAll(mode, btn) {
 }
 
 async function api(path) {
-  const r = await fetch(API + path, { headers: AUTH_HEADERS });
+  const r = await fetch(API + path, { headers: getAuthHeaders() });
+  if (r.status === 401 && _isMultiUser) {
+    refreshIdentity();
+    throw new Error('Authentication failed — check your token in settings');
+  }
   if (!r.ok) throw new Error(`API ${r.status}: ${path}`);
   return r.json();
 }
@@ -1398,11 +1683,13 @@ async function loadTickets() {
           (cachePct ? ' <span style="color:var(--text-muted); font-size:11px">(' + cachePct + ')</span>' : '')
         : '&mdash;';
       var costHtml = tu ? fmtCost(tu.estimated_cost_usd) : '&mdash;';
+      var ownersHtml = (t.owners || []).join(', ') || '&mdash;';
       rows +=
         '<tr class="ticket-row" data-id="' + escHtml(t.id) + '">' +
           '<td class="ticket-id">' + escHtml(t.id) + '</td>' +
           '<td class="ticket-summary">' + escHtml(t.summary) + '</td>' +
           '<td>' + statusBadge(t.status) + '</td>' +
+          (_isMultiUser ? '<td class="ticket-owners">' + escHtml(ownersHtml.replace(/&mdash;/g, '—')) + '</td>' : '') +
           '<td class="ticket-tokens">' + tokHtml + '</td>' +
           '<td class="ticket-cost">' + costHtml + '</td>' +
           '<td class="ticket-time">' + fmtTime(t.created_at) + '</td>' +
@@ -1414,6 +1701,7 @@ async function loadTickets() {
       '<table>' +
         '<thead><tr>' +
           '<th>Ticket</th><th>Summary</th><th>Status</th>' +
+          (_isMultiUser ? '<th>Owners</th>' : '') +
           '<th class="col-right">Tokens</th><th class="col-right">Cost</th>' +
           '<th>Created</th><th>Updated</th>' +
         '</tr></thead>' +
@@ -1443,6 +1731,25 @@ async function renderDetail(ticketId) {
     renderedEvents = [];
     trailStates = [];
 
+    var ownershipHtml = '';
+    if (_isMultiUser) {
+      var owners = ticket.owners || [];
+      var createdBy = ticket.created_by || '';
+      ownershipHtml = '<div class="left-panel-section">' +
+        '<h4>Ownership</h4>' +
+        (createdBy ? '<div style="font-size:12px; margin-bottom:4px">' +
+          '<span style="color:var(--text-muted)">Created by:</span> ' +
+          '<span style="color:var(--accent)">' + escHtml(createdBy) + '</span></div>' : '') +
+        '<div style="font-size:12px">' +
+          '<span style="color:var(--text-muted)">Owners:</span> ' +
+          (owners.length > 0
+            ? '<span style="color:var(--text-bright)">' + escHtml(owners.join(', ')) + '</span>'
+            : '<span style="color:var(--yellow)">unclaimed</span>') +
+        '</div>' +
+      '</div>';
+    }
+    _currentDetailTicket = ticket;
+
     app.innerHTML =
       '<div class="detail-view">' +
         '<div class="detail-toolbar">' +
@@ -1461,12 +1768,13 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
-            '<span id="action-buttons">' + actionButtonsHtml(ticket.status) + '</span>' +
+            '<span id="action-buttons">' + actionButtonsHtml(ticket.status, ticket) + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="detail-panels" id="detail-panels">' +
           '<div class="detail-left-panel" id="detail-left-panel">' +
             renderDescription(ticket) +
+            ownershipHtml +
             '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
             '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
             '<div class="left-panel-section">' +
@@ -2120,7 +2428,7 @@ function trackAgentPhase(evt) {
       refreshResultSection(currentTicketId);
       var actionEl = document.getElementById('action-buttons');
       if (actionEl) {
-        actionEl.innerHTML = actionButtonsHtml(evt.data.to);
+        actionEl.innerHTML = actionButtonsHtml(evt.data.to, _currentDetailTicket);
         bindActionButtons(currentTicketId);
       }
     }
