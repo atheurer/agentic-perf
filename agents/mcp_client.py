@@ -188,26 +188,28 @@ class AgentMCPClient:
         return content
 
     async def disconnect(self) -> None:
-        import asyncio as _aio
-
         for conn in list(self._servers.values()):
-            # Timeout each disconnect to prevent hanging
-            # on unresponsive MCP subprocesses (e.g.,
-            # jmp mcp serve with a released lease).
-            try:
-                await _aio.wait_for(
-                    conn.session_cm.__aexit__(None, None, None),
-                    timeout=10,
-                )
-            except (Exception, BaseException):
-                logger.debug("Error closing session for %s", conn.name)
-            try:
-                await _aio.wait_for(
-                    conn.stdio_cm.__aexit__(None, None, None),
-                    timeout=10,
-                )
-            except (Exception, BaseException):
-                logger.debug("Error closing stdio for %s", conn.name)
+            # Close session and transport. Catches all
+            # exceptions including RuntimeError from
+            # anyio cancel scope mismatches (MCP SDK
+            # python-sdk#577). This occurs when the
+            # agent task is cancelled externally and
+            # cleanup runs from a different task context.
+            # The connection is already dead at that
+            # point — logging and moving on is correct.
+            for cm_name, cm in [
+                ("session", conn.session_cm),
+                ("transport", conn.stdio_cm),
+            ]:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except (Exception, BaseException) as exc:
+                    logger.debug(
+                        "Error closing %s for %s: %s",
+                        cm_name,
+                        conn.name,
+                        type(exc).__name__,
+                    )
         self._servers.clear()
         self._tool_routing.clear()
         logger.info("MCP client disconnected all servers")
