@@ -81,6 +81,11 @@ else
         ln -sf "$JMP_VENV/bin/jmp" /usr/local/bin/jmp
         echo "  Symlinked jmp to /usr/local/bin/jmp"
     fi
+    # j CLI is needed by jmp_run MCP tool (shutil.which("j"))
+    if [ -f "$JMP_VENV/bin/j" ] && [ ! -f /usr/local/bin/j ]; then
+        ln -sf "$JMP_VENV/bin/j" /usr/local/bin/j
+        echo "  Symlinked j to /usr/local/bin/j"
+    fi
 
     # Make jumpstarter packages importable by system Python
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
