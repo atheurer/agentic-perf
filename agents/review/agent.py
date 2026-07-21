@@ -92,6 +92,13 @@ class ReviewAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
 
+        # Auto-approve submission when the ticket doesn't
+        # require human-in-the-loop review.
+        ticket = await self._get_ticket(ticket_id)
+        directives = ticket.get("custom_fields", {}).get("directives", {})
+        if not directives.get("user_pre_run_approval", True):
+            self._user_approved_submit = True
+
         review_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
@@ -114,7 +121,21 @@ class ReviewAgent(AgentBase):
             self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return REVIEW_SYSTEM_PROMPT
+        cf = ticket.get("custom_fields", {})
+        directives = cf.get("directives", {})
+        prompt = REVIEW_SYSTEM_PROMPT
+        if not directives.get("user_pre_run_approval", True):
+            prompt += (
+                "\n\n## Automated Review Mode\n\n"
+                "This ticket has user_pre_run_approval=false. "
+                "Do NOT wait for user approval. Analyze the "
+                "results and call submit_review_result "
+                "immediately with your findings. Skip the "
+                "iterative investigation loop (Step 5) — go "
+                "directly from analysis (Step 4) to "
+                "submission (Step 6)."
+            )
+        return prompt
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
