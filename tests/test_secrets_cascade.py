@@ -386,3 +386,24 @@ class TestDispatcherSecrets:
         dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
         secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
         assert isinstance(secrets, CascadingSecretsProvider)
+
+    async def test_shared_layer_excludes_users_and_groups(self, secrets_root):
+        from state_store.identity import UserStore
+
+        _write_secret(secrets_root / "users" / "bob", "user-secret", "bob-value")
+        _write_secret(secrets_root / "groups" / "gpu-team", "group-secret", "gpu-value")
+
+        user_store = UserStore(persist_path=secrets_root / "users.json")
+        user_store.create_user("alice")
+
+        dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
+        secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
+
+        # Try to read Bob's user secret or the GPU team's secret via the cascade's shared fallback layer.
+        # Since 'alice' does not have these, the cascade falls back to the 'shared' layer.
+        # But 'shared' excludes 'users' and 'groups' subfolders, so it should raise a ValueError.
+        with pytest.raises(ValueError, match="restricted"):
+            await secrets.get_secret("users/bob/user-secret")
+
+        with pytest.raises(ValueError, match="restricted"):
+            await secrets.get_secret("groups/gpu-team/group-secret")

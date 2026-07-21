@@ -103,6 +103,14 @@ def build_cascade_for_user(
         if group_dir.is_dir():
             layers.append((f"group:{group}", LocalSecretsProvider(group_dir)))
 
-    layers.append(("shared", LocalSecretsProvider(secrets_root)))
+    layers.append(
+        (
+            "shared",
+            LocalSecretsProvider(
+                secrets_root,
+                exclude_prefixes=["users", "groups"],
+            ),
+        )
+    )
 
     return CascadingSecretsProvider(layers)

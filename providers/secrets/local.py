@@ -26,8 +26,13 @@ class LocalSecretsProvider(SecretsProvider):
     with the same interface.
     """
 
-    def __init__(self, secrets_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        secrets_dir: str | Path | None = None,
+        exclude_prefixes: list[str] | None = None,
+    ) -> None:
         self._dir = Path(secrets_dir) if secrets_dir else DEFAULT_SECRETS_DIR
+        self._exclude_prefixes = {p.lower() for p in exclude_prefixes} if exclude_prefixes else set()
 
     def _resolve_path(self, path: str) -> Path:
         candidate = (self._dir / path)
@@ -37,9 +42,16 @@ class LocalSecretsProvider(SecretsProvider):
         normalized = Path(os.path.normpath(candidate))
         secrets_root = Path(os.path.normpath(self._dir))
         try:
-            normalized.relative_to(secrets_root)
+            rel = normalized.relative_to(secrets_root)
         except ValueError:
             raise ValueError(f"Secret path escapes secrets directory: {path}")
+
+        # Block traversal into excluded sub-folders (e.g. users/ or groups/ from shared root)
+        if rel.parts:
+            first_part = rel.parts[0].lower()
+            if first_part in self._exclude_prefixes:
+                raise ValueError(f"Access to path '{path}' is restricted")
+
         return candidate
 
     async def get_secret(self, path: str) -> str | None:
