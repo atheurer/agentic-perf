@@ -264,7 +264,7 @@ async def resolve_images(
         # Check both old (target) and new (board-type)
         # label keys, plus common LLM variants.
         board_target = ""
-        for key in ("target", "board-type", "board"):
+        for key in ("target", "board-type", "board", "device"):
             for part in selector.split(","):
                 if part.strip().startswith(f"{key}="):
                     board_target = part.strip().split("=", 1)[1]
@@ -273,6 +273,12 @@ async def resolve_images(
                 break
         if not board_target:
             board_target = selector.split(",")[0] if selector else ""
+        # Device names include an instance suffix
+        # (e.g., nxp-s32g-vnp-rdb3-01). Strip the
+        # trailing -NN to get the board type.
+        import re
+
+        board_target = re.sub(r"-\d+$", "", board_target)
         # Normalize: manifest keys use underscores
         # (rcar_s4), labels may use hyphens and vendor
         # prefixes (renesas-rcar-s4).
