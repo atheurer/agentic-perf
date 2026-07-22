@@ -184,7 +184,16 @@ async def attach_jumpstarter_mcp(
             import shutil
 
             jmp_path = shutil.which("jmp")
-            jmp_env: dict[str, str] = {}
+            jmp_env: dict[str, str] = {
+                # The j CLI via JUMPSTARTER_HOST socket
+                # ignores the client config's driver
+                # settings, defaulting to unsafe=False
+                # with an empty allow list. This rejects
+                # drivers like SNMP power on QC8775.
+                # Pass the env var so j honors our
+                # client config's drivers.unsafe=true.
+                "JMP_DRIVERS_UNSAFE": "true",
+            }
             if jmp_path:
                 venv_bin = str(Path(jmp_path).resolve().parent)
                 current_path = os.environ.get("PATH", "")
