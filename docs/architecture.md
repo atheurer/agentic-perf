@@ -644,7 +644,11 @@ but not lease management tools (`jmp_create_lease`,
 - **Image resolution:** Before the provisioning agent runs, the
   orchestrator fetches `test_images_info.json` from the build
   server and resolves the flash command deterministically. The
-  result (including `flash_command`, partition URLs, and the
+  board target for manifest lookup comes from the exporter's
+  `target` label (stored in `resource_provider_metadata` during
+  lease creation), which matches the manifest keys exactly
+  (e.g., `rcar_s4`, `ride4_sa8775p_sx_r3`). The result
+  (including `flash_command`, partition URLs, and the
   orchestrator's SSH public key) is stored in
   `custom_fields.jumpstarter_flash`. Agents never touch the
   image server.

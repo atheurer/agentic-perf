@@ -502,10 +502,30 @@ class JumpstarterResourceProvider(ResourceProvider):
         elif hasattr(lease, "status") and hasattr(lease.status, "exporter_name"):
             exporter_name = lease.status.exporter_name
 
+        # Look up the exporter's target label for image
+        # resolution. This is the manifest-compatible
+        # name (e.g., ride4_sa8775p_sx_r3) — no alias
+        # tables or prefix stripping needed.
+        board_target = ""
+        if exporter_name:
+            try:
+                exporter = await self._service.GetExporter(
+                    name=exporter_name,
+                )
+                labels = dict(exporter.labels)
+                board_target = labels.get("target", "")
+            except Exception:
+                logger.debug(
+                    "[jumpstarter] Could not look up exporter labels for %s",
+                    exporter_name,
+                    exc_info=True,
+                )
+
         return {
             "provider": "jumpstarter",
             "lease_id": lease_name,
             "exporter_name": exporter_name,
+            "board_target": board_target,
             "selector": selector,
             "duration_seconds": duration_sec,
             "ssh_user": self._ssh_user,
