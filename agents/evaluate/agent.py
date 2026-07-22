@@ -269,10 +269,15 @@ class EvaluateAgent(AgentBase):
         # (e.g., domain knowledge for baseline comparison).
         from agents.mcp_client import connect_external_servers
 
-        await connect_external_servers(mcp, "evaluating_convergence")
+        _, ext_tools = await connect_external_servers(mcp, "evaluating_convergence")
 
         self._mcp = mcp
         mcp_tools = await mcp.list_tools()
+        if ext_tools is not None:
+            builtin = {t.name for t in self.tools}
+            mcp_tools = [
+                t for t in mcp_tools if t.name in ext_tools or t.name in builtin
+            ]
         self.tools = mcp_tools
 
         try:

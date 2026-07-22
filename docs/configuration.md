@@ -311,7 +311,7 @@ Jumpstarter also requires:
 
 Connect agents to remote MCP servers via SSE or StreamableHTTP.
 Each entry defines a named server with URL, transport, and
-which agents should auto-attach it.
+per-agent tool scoping.
 
 ```json
 {
@@ -320,7 +320,23 @@ which agents should auto-attach it.
             "name": "domain-mcp",
             "url": "http://domain-mcp.lab:8080/mcp",
             "transport": "streamable_http",
-            "agents": ["gathering_context", "evaluating_convergence"],
+            "agents": {
+                "gathering_context": {
+                    "enabled_tools": "all"
+                },
+                "review": {
+                    "enabled_tools": [
+                        "get_baseline_stats",
+                        "compare_run_to_baseline"
+                    ]
+                },
+                "evaluating_convergence": {
+                    "enabled_tools": [
+                        "get_baseline_stats",
+                        "compare_run_to_baseline"
+                    ]
+                }
+            },
             "secret": "domain-mcp/token"
         }
     ]
@@ -332,9 +348,15 @@ which agents should auto-attach it.
 | `name` | string | yes | Display name for logging and tool routing |
 | `url` | string | yes | MCP server endpoint URL |
 | `transport` | string | yes | `"sse"` or `"streamable_http"` |
-| `agents` | list | no | Agent types that auto-attach this server. If omitted, no auto-attach (manual connection only). |
+| `agents` | dict | yes | Maps agent type keys to their config. Only listed agents connect. |
 | `secret` | string | no | Path within `~/.agentic-perf/secrets/` to a file containing the auth token |
 | `trust` | bool | no | If `true`, disable SSL certificate verification (for self-signed certs) |
+
+**Per-agent config:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled_tools` | `"all"` or list | `"all"` | Which tools from this server the agent's LLM can see. `"all"` exposes every tool. A list of tool names restricts visibility. Tools not listed are hidden from the LLM but remain callable by code. |
 
 The auth token (if configured) is sent as `Authorization: Bearer <token>`
 in the HTTP headers.

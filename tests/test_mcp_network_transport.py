@@ -219,7 +219,11 @@ class TestConnectExternalServers:
                     "name": "domain-mcp",
                     "url": "http://test:8080/sse",
                     "transport": "sse",
-                    "agents": ["gathering_context"],
+                    "agents": {
+                        "gathering_context": {
+                            "enabled_tools": "all"
+                        }
+                    },
                 }
             ]
         }
@@ -234,12 +238,13 @@ class TestConnectExternalServers:
             from agents.mcp_client import connect_external_servers
 
             client = AgentMCPClient()
-            connected = await connect_external_servers(
+            connected, enabled = await connect_external_servers(
                 client, "gathering_context", config=config
             )
 
         assert connected == ["domain-mcp"]
         assert "domain_tool" in client._tool_routing
+        assert enabled is None  # "all" means no filtering
 
     @pytest.mark.asyncio
     async def test_skips_non_matching_agent(self):
@@ -250,7 +255,11 @@ class TestConnectExternalServers:
                     "name": "domain-mcp",
                     "url": "http://test:8080/sse",
                     "transport": "sse",
-                    "agents": ["gathering_context"],
+                    "agents": {
+                        "gathering_context": {
+                            "enabled_tools": "all"
+                        }
+                    },
                 }
             ]
         }
@@ -258,17 +267,16 @@ class TestConnectExternalServers:
         from agents.mcp_client import connect_external_servers
 
         client = AgentMCPClient()
-        connected = await connect_external_servers(client, "benchmark", config=config)
+        connected, enabled = await connect_external_servers(
+            client, "benchmark", config=config
+        )
 
         assert connected == []
         assert len(client._servers) == 0
 
     @pytest.mark.asyncio
-    async def test_connects_all_when_no_agents_filter(self):
-        """Connects to all servers when agents list is empty."""
-        transport = _make_mock_transport()
-        cs = _make_mock_session(["tool1"])
-
+    async def test_skips_server_with_no_agents_field(self):
+        """Skips servers with no agents field."""
         config = {
             "external_mcp_servers": [
                 {
@@ -279,21 +287,15 @@ class TestConnectExternalServers:
             ]
         }
 
-        with (
-            patch("agents.mcp_client.ClientSession", cs),
-            patch(
-                "mcp.client.streamable_http.streamablehttp_client",
-                return_value=transport,
-            ),
-        ):
-            from agents.mcp_client import connect_external_servers
+        from agents.mcp_client import connect_external_servers
 
-            client = AgentMCPClient()
-            connected = await connect_external_servers(
-                client, "any_agent", config=config
-            )
+        client = AgentMCPClient()
+        connected, enabled = await connect_external_servers(
+            client, "any_agent", config=config
+        )
 
-        assert connected == ["global-mcp"]
+        assert connected == []
+        assert enabled is None
 
     @pytest.mark.asyncio
     async def test_reads_auth_from_secrets(self, tmp_path):
@@ -310,6 +312,7 @@ class TestConnectExternalServers:
                     "name": "authed",
                     "url": "http://test:8080/sse",
                     "transport": "sse",
+                    "agents": {"any_agent": {"enabled_tools": "all"}},
                     "secret": "domain-mcp/token",
                 }
             ]
@@ -327,7 +330,7 @@ class TestConnectExternalServers:
             client = AgentMCPClient()
             await connect_external_servers(
                 client,
-                "any",
+                "any_agent",
                 config=config,
                 secrets_dir=str(tmp_path),
             )
@@ -356,6 +359,51 @@ class TestConnectExternalServers:
             from agents.mcp_client import connect_external_servers
 
             client = AgentMCPClient()
-            connected = await connect_external_servers(client, "any", config=config)
+            connected, _ = await connect_external_servers(
+                client, "any_agent", config=config
+            )
 
         assert connected == []
+
+    @pytest.mark.asyncio
+    async def test_tool_scoping_returns_enabled_set(self):
+        """Returns enabled tool set when configured."""
+        transport = _make_mock_transport()
+        cs = _make_mock_session(["get_baseline_stats", "get_key_metrics", "compare"])
+
+        config = {
+            "external_mcp_servers": [
+                {
+                    "name": "domain-mcp",
+                    "url": "http://test:8080/mcp",
+                    "transport": "streamable_http",
+                    "agents": {
+                        "review": {
+                            "enabled_tools": [
+                                "get_baseline_stats",
+                                "compare",
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+
+        with (
+            patch("agents.mcp_client.ClientSession", cs),
+            patch(
+                "mcp.client.streamable_http.streamablehttp_client",
+                return_value=transport,
+            ),
+        ):
+            from agents.mcp_client import connect_external_servers
+
+            client = AgentMCPClient()
+            connected, enabled = await connect_external_servers(
+                client, "review", config=config
+            )
+
+        assert connected == ["domain-mcp"]
+        assert enabled == {"get_baseline_stats", "compare"}
+        # get_key_metrics is connected but not in enabled set
+        assert "get_key_metrics" in client._tool_routing

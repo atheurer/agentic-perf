@@ -358,13 +358,38 @@ async def connect_external_servers(
     agent_type: str,
     config: dict[str, Any] | None = None,
     secrets_dir: str = "",
-) -> list[str]:
+) -> tuple[list[str], set[str] | None]:
     """Connect an MCP client to external servers configured
     for the given agent type.
 
     Reads ``external_mcp_servers`` from config and connects
-    to each server whose ``agents`` list includes the given
-    agent_type. Returns the list of server names connected.
+    to each server whose ``agents`` dict includes the given
+    agent_type. Returns the list of server names connected
+    and a set of enabled tool names (or None for all tools).
+
+    The ``agents`` field is a dict mapping agent type keys to
+    their configuration::
+
+        "agents": {
+            "gathering_context": {
+                "enabled_tools": "all"
+            },
+            "review": {
+                "enabled_tools": [
+                    "get_baseline_stats",
+                    "compare_run_to_baseline"
+                ]
+            }
+        }
+
+    ``enabled_tools`` controls which tools from this server
+    the agent's LLM can see:
+
+    - ``"all"`` or omitted: all tools visible
+    - list of names: only those tools visible
+
+    Tools not in ``enabled_tools`` are hidden from the LLM
+    but remain callable via ``call_tool()`` in code.
 
     Args:
         client: The agent's MCP client.
@@ -374,17 +399,24 @@ async def connect_external_servers(
             Defaults to ~/.agentic-perf/secrets/.
 
     Returns:
-        List of connected server names.
+        Tuple of (connected server names, enabled tool names).
+        The tool set is None if all tools are enabled, or a
+        set of tool name strings if filtering is configured.
 
     Example:
         .. code-block:: python
 
             mcp = AgentMCPClient()
             await mcp.connect(agent_server, name="agent")
-            connected = await connect_external_servers(
+            connected, enabled = await connect_external_servers(
                 mcp, "gathering_context"
             )
-            # connected == ["domain-mcp"] if configured
+            # Filter tools for LLM visibility
+            if enabled is not None:
+                self.tools = [
+                    t for t in self.tools
+                    if t.name in enabled
+                ]
     """
     from pathlib import Path
 
@@ -410,15 +442,32 @@ async def connect_external_servers(
 
     servers = config.get("external_mcp_servers", [])
     connected: list[str] = []
+    # Collect enabled tools across all connected servers.
+    # None means "all tools" (no filtering). A set means
+    # only those tools are visible to the LLM.
+    enabled_tools: set[str] | None = None
+    _has_scoping = False
 
     for entry in servers:
         name = entry.get("name", "")
         url = entry.get("url", "")
         transport = entry.get("transport", "")
-        agents = entry.get("agents", [])
+        agents = entry.get("agents", {})
 
-        # Skip if this server isn't for this agent type
-        if agents and agent_type not in agents:
+        # agents is a dict mapping agent types to config.
+        # Skip if this agent type isn't listed.
+        if isinstance(agents, dict):
+            if agent_type not in agents:
+                continue
+            agent_config = agents[agent_type]
+            if not isinstance(agent_config, dict):
+                agent_config = {}
+        elif isinstance(agents, list):
+            # Legacy list format — all tools enabled.
+            if agents and agent_type not in agents:
+                continue
+            agent_config = {}
+        else:
             continue
 
         if not url or not transport:
@@ -466,10 +515,26 @@ async def connect_external_servers(
 
             connected.append(name)
             logger.info(f"[mcp] Connected to external server {name!r} ({transport})")
+
+            # Collect tool scoping for this agent.
+            tools_cfg = agent_config.get("enabled_tools", "all")
+            if isinstance(tools_cfg, list):
+                _has_scoping = True
+                if enabled_tools is None:
+                    enabled_tools = set(tools_cfg)
+                else:
+                    enabled_tools.update(tools_cfg)
+            # "all" or omitted — no filtering for
+            # this server (but other servers may
+            # still add scoping).
         except Exception:
             logger.warning(
                 f"[mcp] Failed to connect to {name!r} at {url}",
                 exc_info=True,
             )
 
-    return connected
+    # If any server specified a tool list, return the
+    # union. If all servers used "all", return None.
+    if not _has_scoping:
+        enabled_tools = None
+    return connected, enabled_tools

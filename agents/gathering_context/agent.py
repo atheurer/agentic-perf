@@ -93,11 +93,22 @@ class GatheringContextAgent(AgentBase):
         # (e.g., domain knowledge, historical data).
         from agents.mcp_client import connect_external_servers
 
-        await connect_external_servers(mcp, "gathering_context")
+        _, ext_tools = await connect_external_servers(mcp, "gathering_context")
 
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
+        if ext_tools is not None:
+            mcp_tools = [
+                t
+                for t in mcp_tools
+                if t.name in ext_tools
+                or t.name
+                in {
+                    "query_investigation_records",
+                    "submit_gathering_context_result",
+                }
+            ]
         self.tools = mcp_tools
 
         try:
