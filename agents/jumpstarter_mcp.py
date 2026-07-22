@@ -60,6 +60,30 @@ _PROVIDER_ONLY_TOOLS = frozenset(
 _JMP_CONNECT_TIMEOUT = 180  # 3 minutes
 
 
+# Fatal error patterns in jmp_run results. When detected,
+# the post-call hook returns a structured FATAL message
+# so the LLM does not waste iterations retrying.
+_FATAL_PATTERNS: list[tuple[str, str]] = [
+    (
+        "doesn't match any of the allowed patterns",
+        "Jumpstarter driver import blocked by allowlist. "
+        "Set JMP_DRIVERS_UNSAFE=true or add the driver "
+        "to drivers.allow in the client config.",
+    ),
+    (
+        "No module named",
+        "Required Jumpstarter driver package is not "
+        "installed. Run setup-jumpstarter.sh to install "
+        "all drivers.",
+    ),
+    (
+        "ExporterUnreachableError",
+        "The Jumpstarter exporter is not responding. "
+        "The board may be offline or the lease expired.",
+    ),
+]
+
+
 class _JmpCallHook:
     """Pre-call hook for Jumpstarter-specific tool behavior.
 
@@ -223,6 +247,19 @@ async def attach_jumpstarter_mcp(
         mcp_client.pre_call_hook = _hook.pre_call
         mcp_client.post_call_hook = trim_response
 
+        # Pre-flight: verify drivers load correctly.
+        # Catches allowlist/import errors before the
+        # LLM wastes iterations on broken commands.
+        preflight_ok = await _preflight_check(mcp_client)
+        if not preflight_ok:
+            logger.error(
+                "[jumpstarter-mcp] Pre-flight failed for %s — drivers not loading",
+                ticket_id,
+            )
+            # Don't return False — the MCP is attached
+            # and the LLM will see the FATAL error in
+            # the pre-flight comment on the ticket.
+
         return True
 
     except Exception:
@@ -231,6 +268,63 @@ async def attach_jumpstarter_mcp(
             exc_info=True,
         )
         return None
+
+
+async def _preflight_check(
+    mcp_client: AgentMCPClient,
+) -> bool:
+    """Verify Jumpstarter drivers load correctly.
+
+    Runs a lightweight probe (jmp_explore or --help) to
+    detect driver import errors before the LLM starts.
+    Returns True if healthy, False if fatal errors found.
+    """
+    try:
+        # List connections to find the active one.
+        conns_raw = await mcp_client.call_tool("jmp_list_connections", {})
+        conns = json.loads(conns_raw)
+        conn_list = conns if isinstance(conns, list) else conns.get("connections", [])
+        if not conn_list:
+            # No connection yet — pre-flight runs
+            # before jmp_connect, so this is normal.
+            # The fatal check will fire on the first
+            # jmp_run call instead.
+            return True
+
+        conn_id = conn_list[0].get(
+            "connection_id",
+            conn_list[0].get("id", ""),
+        )
+
+        # Probe with a lightweight command.
+        raw = await mcp_client.call_tool(
+            "jmp_run",
+            {
+                "connection_id": conn_id,
+                "command": ["--help"],
+                "timeout_seconds": 15,
+            },
+        )
+
+        # Check for fatal patterns in the result.
+        for pattern, _ in _FATAL_PATTERNS:
+            if pattern in raw:
+                logger.error(
+                    "[jumpstarter] Pre-flight detected fatal error: %s",
+                    pattern,
+                )
+                return False
+
+        return True
+    except Exception:
+        logger.warning(
+            "[jumpstarter] Pre-flight check failed",
+            exc_info=True,
+        )
+        # Don't block on pre-flight errors — the
+        # fatal detection in trim_response is the
+        # backstop.
+        return True
 
 
 async def collect_diagnostics(
@@ -361,7 +455,32 @@ def trim_response(tool_name: str, content: str) -> str:
     if tool_name == "jmp_run":
         try:
             data = json.loads(content)
+            # Check for fatal errors before trimming.
+            # These indicate infrastructure problems
+            # that retrying cannot fix.
+            stderr = data.get("stderr", "")
             stdout = data.get("stdout", "")
+            combined = f"{stdout} {stderr}"
+            for pattern, explanation in _FATAL_PATTERNS:
+                if pattern in combined:
+                    logger.error(
+                        "[jumpstarter] Fatal error in jmp_run: %s",
+                        pattern,
+                    )
+                    return json.dumps(
+                        {
+                            "FATAL": True,
+                            "error": explanation,
+                            "detail": stderr[:200] or stdout[:200],
+                            "do_not_retry": True,
+                            "action": (
+                                "Stop retrying and call "
+                                "request_clarification "
+                                "with this error."
+                            ),
+                        },
+                        indent=2,
+                    )
             if data.get("exit_code") == 0 and len(stdout) > 2000:
                 lines = stdout.strip().split("\n")
                 if len(lines) > 10:
