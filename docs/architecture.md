@@ -563,8 +563,15 @@ Each provider implements:
 
 The [Jumpstarter](https://jumpstarter.dev) provider manages lab
 devices — physical boards and virtual machines — from a
-Jumpstarter controller. Devices are leased via label selectors
-(e.g., `target=ride4_sa8775p_sx_r3`).
+Jumpstarter controller. Devices are leased via label selectors:
+
+- `board-type=renesas-rcar-s4` — any board of this type (preferred)
+- `device=nxp-s32g-vnp-rdb3-03` — a specific board by name
+- `target=ride4_sa8775p_sx_r3` — legacy target label
+
+The `board_selector` directive is passed verbatim to the
+Jumpstarter lease API. Code guardrails prevent the LLM from
+substituting a different selector at reserve time.
 
 Configuration requires both secrets (`~/.agentic-perf/secrets/
 jumpstarter/config.json`) and the `jmp` CLI config
