@@ -219,6 +219,11 @@ a guardrail. Existing examples to follow:
 - PID lock files against duplicate orchestrators
 - `submit_*` structured tool calls as the mandatory agent output
   format (never parse free-text for structured results)
+- Jumpstarter board selector passthrough (code overrides LLM
+  selector substitution with directive's `board_selector`)
+- Jumpstarter IP validation (provisioning rejects completion
+  when `hosts_provisioned` contains non-IP entries or when
+  `j tcp address` resolution fails)
 
 ### Security Model & Current Limitations
 

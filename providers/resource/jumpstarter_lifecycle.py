@@ -253,40 +253,47 @@ async def resolve_images(
                 )
             return
 
-        # Board target from selector. The resource agent
-        # may store it as 'selector' or 'jumpstarter_selector'.
-        selector = (
-            directives.get("board_selector")
-            or metadata.get("selector", "")
-            or metadata.get("jumpstarter_selector", "")
-        )
-        # Extract the board target from the selector.
-        # Check both old (target) and new (board-type)
-        # label keys, plus common LLM variants.
-        board_target = ""
-        for key in ("target", "board-type", "board"):
-            for part in selector.split(","):
-                if part.strip().startswith(f"{key}="):
-                    board_target = part.strip().split("=", 1)[1]
-                    break
-            if board_target:
-                break
+        # Board target for manifest lookup. Prefer the
+        # exporter's `target` label (set by reserve()),
+        # which matches the manifest key exactly. Fall
+        # back to selector parsing only for legacy paths.
+        board_target = metadata.get("board_target", "")
         if not board_target:
-            board_target = selector.split(",")[0] if selector else ""
-        # Normalize: manifest keys use underscores
-        # (rcar_s4), labels may use hyphens and vendor
-        # prefixes (renesas-rcar-s4).
-        board_target = board_target.replace("-", "_")
-        # Strip common vendor prefixes added in the
-        # board-type label migration.
-        for prefix in ("renesas_", "nxp_", "ti_jacinto_"):
-            if board_target.startswith(prefix):
-                stripped = board_target[len(prefix) :]
-                # Only strip if the result is a known
-                # pattern (contains letters + numbers)
-                if stripped:
-                    board_target = stripped
+            # Fallback: derive from selector.
+            selector = (
+                directives.get("board_selector")
+                or metadata.get("selector", "")
+                or metadata.get("jumpstarter_selector", "")
+            )
+            board_target = ""
+            for key in ("target", "board-type", "board", "device"):
+                for part in selector.split(","):
+                    if part.strip().startswith(f"{key}="):
+                        board_target = part.strip().split("=", 1)[1]
+                        break
+                if board_target:
                     break
+            if not board_target:
+                board_target = selector.split(",")[0] if selector else ""
+            # Device names include an instance suffix.
+            import re
+
+            board_target = re.sub(r"-\d+$", "", board_target)
+            # Normalize hyphens and vendor prefixes.
+            board_target = board_target.replace("-", "_")
+            _BOARD_ALIASES: dict[str, str] = {
+                "qc8775": "ride4_sa8775p_sx_r3",
+                "qc8650": "ride4_sa8650p_sx_r3",
+            }
+            if board_target in _BOARD_ALIASES:
+                board_target = _BOARD_ALIASES[board_target]
+            else:
+                for prefix in ("renesas_", "nxp_", "ti_jacinto_"):
+                    if board_target.startswith(prefix):
+                        stripped = board_target[len(prefix) :]
+                        if stripped:
+                            board_target = stripped
+                            break
 
         from providers.resource.jumpstarter_images import (
             resolve_image_urls,

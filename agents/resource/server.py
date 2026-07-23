@@ -203,6 +203,23 @@ async def reserve_resources(
         if os_name:
             selection = dict(selection)
             selection["os"] = os_name
+    # Code-enforce the directive's board_selector for
+    # Jumpstarter. The LLM may substitute a different
+    # (broader) selector; the directive is authoritative.
+    if provider == "jumpstarter":
+        directives = _ticket.get("custom_fields", {}).get("directives", {})
+        directive_selector = directives.get("board_selector", "")
+        if directive_selector:
+            llm_selector = selection.get("jumpstarter_selector", "")
+            if llm_selector != directive_selector:
+                logger.warning(
+                    "Overriding LLM selector %r with directive %r",
+                    llm_selector,
+                    directive_selector,
+                )
+                selection = dict(selection)
+                selection["jumpstarter_selector"] = directive_selector
+
     prov = await _registry.get_provider(provider)
     result = await prov.reserve(
         selection, description, duration_hours, ticket_id=ticket_id

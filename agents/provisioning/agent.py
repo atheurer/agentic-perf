@@ -289,7 +289,7 @@ class ProvisioningAgent(AgentBase):
             elif stdout:
                 return stdout
         except Exception:
-            logger.debug(
+            logger.warning(
                 "[provisioning] j tcp address failed",
                 exc_info=True,
             )
@@ -335,14 +335,43 @@ class ProvisioningAgent(AgentBase):
 
         # Jumpstarter: resolve the board's IP address
         # deterministically via j tcp address. This is
-        # mandatory — the agent may submit a selector
-        # label instead of an IP.
+        # mandatory — the agent may submit a board name
+        # or selector label instead of an IP.
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
         if cf.get("resource_provider") == "jumpstarter" and self._mcp is not None:
             resolved_ip = await self._resolve_jumpstarter_ip()
             if resolved_ip:
                 fields["hosts_provisioned"] = [resolved_ip]
+            elif prov_complete:
+                # IP resolution failed but agent claims
+                # provisioning is complete. Reject —
+                # without an IP, benchmark can't SSH.
+                logger.warning(
+                    "[provisioning] Rejecting "
+                    "provisioning_complete: IP "
+                    "resolution failed for %s",
+                    ticket_id,
+                )
+                prov_complete = False
+                fields["provisioning_complete"] = False
+
+        # Validate hosts_provisioned entries are IPs,
+        # not hostnames or board names.
+        import re as _re
+
+        _ip_pattern = _re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+        if prov_complete and fields.get("hosts_provisioned"):
+            invalid = [
+                h for h in fields["hosts_provisioned"] if not _ip_pattern.match(str(h))
+            ]
+            if invalid:
+                logger.warning(
+                    "[provisioning] Rejecting provisioning_complete: non-IP hosts %s",
+                    invalid,
+                )
+                prov_complete = False
+                fields["provisioning_complete"] = False
 
         # Derive ssh_hardware_ips from hosts_provisioned.
         ssh_ips = result.get("ssh_hardware_ips")
