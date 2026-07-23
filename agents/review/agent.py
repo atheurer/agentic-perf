@@ -109,9 +109,23 @@ class ReviewAgent(AgentBase):
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
         await mcp.connect(infra_server, name="infra")
+
+        # Connect any configured external MCP servers
+        # (e.g., historical baselines for comparison).
+        from agents.mcp_client import connect_external_servers
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "review")
+
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
+        if ext_tools is not None:
+            mcp_tools = [
+                t
+                for t in mcp_tools
+                if mcp._tool_routing.get(t.name) not in connected_ext
+                or t.name in ext_tools
+            ]
         self.tools = mcp_tools + self.tools
 
         try:

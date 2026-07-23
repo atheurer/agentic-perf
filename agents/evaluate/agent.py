@@ -265,8 +265,23 @@ class EvaluateAgent(AgentBase):
                 "— working with ticket data only"
             )
 
+        # Connect any configured external MCP servers
+        # (e.g., domain knowledge for baseline comparison).
+        from agents.mcp_client import connect_external_servers
+
+        connected_ext, ext_tools = await connect_external_servers(
+            mcp, "evaluating_convergence"
+        )
+
         self._mcp = mcp
         mcp_tools = await mcp.list_tools()
+        if ext_tools is not None:
+            mcp_tools = [
+                t
+                for t in mcp_tools
+                if mcp._tool_routing.get(t.name) not in connected_ext
+                or t.name in ext_tools
+            ]
         self.tools = mcp_tools
 
         try:

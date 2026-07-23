@@ -813,17 +813,32 @@ relevant to their role.
 
 ### External MCP Servers
 
-`AgentMCPClient` supports both Python and non-Python MCP servers:
+`AgentMCPClient` supports multiple transport modes:
 
+**Subprocess (stdio):**
 - `connect(server_script)` — launches a Python MCP server script
   with the current interpreter (used for all built-in agents)
 - `connect_command(command, args)` — launches an arbitrary binary
   that speaks MCP over stdio (for external tools like Jumpstarter's
   `jmp mcp serve`)
 
-Both methods share the same session management, tool routing, and
-disconnect logic. `connect()` delegates to `connect_command()`
-internally.
+**Network (remote servers):**
+- `connect_sse(url, headers)` — connects to a remote MCP server
+  via Server-Sent Events
+- `connect_streamable_http(url, headers)` — connects to a remote
+  MCP server via StreamableHTTP
+
+All transport modes share the same session management, tool
+routing, hooks, and disconnect logic.
+
+**Config-driven auto-connection:**
+
+The `connect_external_servers()` helper reads `external_mcp_servers`
+from `config.json` and auto-connects servers configured for the
+calling agent's type. The gathering_context, evaluate, and review
+agents call this in their `run()` method. See
+[Configuration](configuration.md#external_mcp_servers) for the
+config schema.
 
 ### SSH Executor
 

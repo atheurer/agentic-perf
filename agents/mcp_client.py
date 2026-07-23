@@ -19,16 +19,23 @@ logger = logging.getLogger(__name__)
 class _ServerConnection:
     name: str
     session: ClientSession
-    stdio_cm: Any
+    transport_cm: Any  # stdio_client, sse_client, or streamablehttp_client
     session_cm: Any
 
 
 class AgentMCPClient:
-    """MCP client that connects to one or more FastMCP servers over stdio.
+    """MCP client that connects to one or more MCP servers.
 
-    Call connect() once per server. list_tools() merges tools from all
-    servers. call_tool() routes to the server that provides the tool.
-    Tool name conflicts across servers raise ValueError at connect time.
+    Supports three transport modes:
+    - stdio: connect() / connect_command() for subprocess servers
+    - SSE: connect_sse() for remote servers via Server-Sent Events
+    - StreamableHTTP: connect_streamable_http() for remote servers
+      via HTTP with streaming
+
+    Call any connect method once per server. list_tools() merges
+    tools from all servers. call_tool() routes to the server that
+    provides the tool. Tool name conflicts across servers raise
+    ValueError at connect time.
     """
 
     def __init__(self) -> None:
@@ -100,10 +107,127 @@ class AgentMCPClient:
             args=args or [],
             env=merged_env,
         )
-        stdio_cm = stdio_client(params)
+        transport_cm = stdio_client(params)
+        await self._connect_transport(name, transport_cm)
+
+    async def connect_sse(
+        self,
+        url: str,
+        name: str | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30,
+        sse_read_timeout: float = 300,
+        trust: bool = False,
+    ) -> None:
+        """Connect to a remote MCP server via SSE transport.
+
+        The server must expose an SSE endpoint (typically at
+        /sse or /mcp). The client maintains a persistent
+        connection for server-to-client messages.
+
+        Args:
+            url: SSE endpoint URL (e.g.,
+                "http://domain-mcp.lab:8080/mcp").
+            name: Display name for logging and tool routing.
+            headers: HTTP headers (e.g., Authorization).
+            timeout: Connection timeout in seconds.
+            sse_read_timeout: Read timeout for SSE stream.
+            trust: If True, disable SSL certificate
+                verification (for self-signed certs).
+        """
+        from mcp.client.sse import sse_client
+
+        if name is None:
+            name = url
+
+        kwargs: dict[str, Any] = {
+            "url": url,
+            "headers": headers,
+            "timeout": timeout,
+            "sse_read_timeout": sse_read_timeout,
+        }
+        if trust:
+            import httpx
+
+            def _insecure_factory(*args: Any, **kw: Any) -> httpx.AsyncClient:
+                return httpx.AsyncClient(verify=False, *args, **kw)  # nosec B501 — user explicitly set trust=True
+
+            kwargs["httpx_client_factory"] = _insecure_factory
+
+        transport_cm = sse_client(**kwargs)
+        await self._connect_transport(name, transport_cm)
+
+    async def connect_streamable_http(
+        self,
+        url: str,
+        name: str | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30,
+        sse_read_timeout: float = 300,
+        trust: bool = False,
+    ) -> None:
+        """Connect to a remote MCP server via StreamableHTTP.
+
+        The server must expose an MCP endpoint that supports
+        the StreamableHTTP protocol (typically at /mcp/http).
+
+        Args:
+            url: MCP endpoint URL (e.g.,
+                "http://domain-mcp.lab:8080/mcp/http").
+            name: Display name for logging and tool routing.
+            headers: HTTP headers (e.g., Authorization).
+            timeout: Request timeout in seconds.
+            sse_read_timeout: Read timeout for streaming.
+            trust: If True, disable SSL certificate
+                verification (for self-signed certs).
+        """
+        from mcp.client.streamable_http import (
+            streamablehttp_client,
+        )
+
+        if name is None:
+            name = url
+
+        kwargs: dict[str, Any] = {
+            "url": url,
+            "headers": headers,
+            "timeout": timeout,
+            "sse_read_timeout": sse_read_timeout,
+        }
+        if trust:
+            import httpx
+
+            def _insecure_factory(*args: Any, **kw: Any) -> httpx.AsyncClient:
+                return httpx.AsyncClient(verify=False, *args, **kw)  # nosec B501 — user explicitly set trust=True
+
+            kwargs["httpx_client_factory"] = _insecure_factory
+
+        transport_cm = streamablehttp_client(**kwargs)
+        await self._connect_transport(name, transport_cm)
+
+    async def _connect_transport(
+        self,
+        name: str,
+        transport_cm: Any,
+    ) -> None:
+        """Shared connection logic for all transports.
+
+        Enters the transport context manager, creates a
+        ClientSession, initializes it, registers tools,
+        and stores the connection.
+
+        If any step fails (error, cancellation), cleans
+        up partially-entered context managers in the same
+        task to avoid anyio cancel scope mismatches
+        (modelcontextprotocol/python-sdk#577).
+        """
         session_cm = None
         try:
-            read_stream, write_stream = await stdio_cm.__aenter__()
+            streams = await transport_cm.__aenter__()
+            # SSE yields (read, write), StreamableHTTP
+            # yields (read, write, get_session_id).
+            read_stream = streams[0]
+            write_stream = streams[1]
             session_cm = ClientSession(read_stream, write_stream)
             session = await session_cm.__aenter__()
             await session.initialize()
@@ -111,17 +235,18 @@ class AgentMCPClient:
             result = await session.list_tools()
             for t in result.tools:
                 if t.name in self._tool_routing:
-                    existing = self._tool_routing[t.name]
+                    existing_server = self._tool_routing[t.name]
                     raise ValueError(
-                        f"Tool {t.name!r} from server {name!r} conflicts "
-                        f"with server {existing!r}"
+                        f"Tool {t.name!r} from server "
+                        f"{name!r} conflicts with server "
+                        f"{existing_server!r}"
                     )
                 self._tool_routing[t.name] = name
 
             self._servers[name] = _ServerConnection(
                 name=name,
                 session=session,
-                stdio_cm=stdio_cm,
+                transport_cm=transport_cm,
                 session_cm=session_cm,
             )
             logger.info(
@@ -130,17 +255,15 @@ class AgentMCPClient:
                 len(result.tools),
             )
         except (Exception, BaseException):
-            # Clean up in the same task that entered the
-            # context managers. Prevents anyio cancel scope
-            # mismatches (modelcontextprotocol/python-sdk#577)
-            # when the agent task is cancelled during setup.
+            # Clean up in the same task that entered
+            # the context managers.
             if session_cm is not None:
                 try:
                     await session_cm.__aexit__(None, None, None)
                 except (Exception, BaseException):
                     pass
             try:
-                await stdio_cm.__aexit__(None, None, None)
+                await transport_cm.__aexit__(None, None, None)
             except (Exception, BaseException):
                 pass
             raise
@@ -212,11 +335,9 @@ class AgentMCPClient:
             # python-sdk#577). This occurs when the
             # agent task is cancelled externally and
             # cleanup runs from a different task context.
-            # The connection is already dead at that
-            # point — logging and moving on is correct.
             for cm_name, cm in [
                 ("session", conn.session_cm),
-                ("transport", conn.stdio_cm),
+                ("transport", conn.transport_cm),
             ]:
                 try:
                     await cm.__aexit__(None, None, None)
@@ -230,3 +351,190 @@ class AgentMCPClient:
         self._servers.clear()
         self._tool_routing.clear()
         logger.info("MCP client disconnected all servers")
+
+
+async def connect_external_servers(
+    client: AgentMCPClient,
+    agent_type: str,
+    config: dict[str, Any] | None = None,
+    secrets_dir: str = "",
+) -> tuple[list[str], set[str] | None]:
+    """Connect an MCP client to external servers configured
+    for the given agent type.
+
+    Reads ``external_mcp_servers`` from config and connects
+    to each server whose ``agents`` dict includes the given
+    agent_type. Returns the list of server names connected
+    and a set of enabled tool names (or None for all tools).
+
+    The ``agents`` field is a dict mapping agent type keys to
+    their configuration::
+
+        "agents": {
+            "gathering_context": {
+                "enabled_tools": "all"
+            },
+            "review": {
+                "enabled_tools": [
+                    "get_baseline_stats",
+                    "compare_run_to_baseline"
+                ]
+            }
+        }
+
+    ``enabled_tools`` controls which tools from this server
+    the agent's LLM can see:
+
+    - ``"all"`` or omitted: all tools visible
+    - list of names: only those tools visible
+
+    Tools not in ``enabled_tools`` are hidden from the LLM
+    but remain callable via ``call_tool()`` in code.
+
+    Args:
+        client: The agent's MCP client.
+        agent_type: Agent type key (e.g., "gathering_context").
+        config: Config dict. If None, reads from config file.
+        secrets_dir: Base directory for secrets files.
+            Defaults to ~/.agentic-perf/secrets/.
+
+    Returns:
+        Tuple of (connected server names, enabled tool names).
+        The tool set is None if all tools are enabled, or a
+        set of tool name strings if filtering is configured.
+
+    Example:
+        .. code-block:: python
+
+            mcp = AgentMCPClient()
+            await mcp.connect(agent_server, name="agent")
+            connected, enabled = await connect_external_servers(
+                mcp, "gathering_context"
+            )
+            # Filter tools for LLM visibility
+            if enabled is not None:
+                self.tools = [
+                    t for t in self.tools
+                    if t.name in enabled
+                ]
+    """
+    from pathlib import Path
+
+    if config is None:
+        import json
+
+        config_path = (
+            Path(
+                os.environ.get(
+                    "AGENTIC_PERF_HOME",
+                    str(Path.home() / ".agentic-perf"),
+                )
+            )
+            / "config.json"
+        )
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            config = {}
+
+    if not secrets_dir:
+        secrets_dir = str(Path.home() / ".agentic-perf" / "secrets")
+
+    servers = config.get("external_mcp_servers", [])
+    connected: list[str] = []
+    # Collect enabled tools across all connected servers.
+    # None means "all tools" (no filtering). A set means
+    # only those tools are visible to the LLM.
+    enabled_tools: set[str] | None = None
+    _has_scoping = False
+
+    for entry in servers:
+        name = entry.get("name", "")
+        url = entry.get("url", "")
+        transport = entry.get("transport", "")
+        agents = entry.get("agents", {})
+
+        # agents is a dict mapping agent types to config.
+        # Skip if this agent type isn't listed.
+        if isinstance(agents, dict):
+            if agent_type not in agents:
+                continue
+            agent_config = agents[agent_type]
+            if not isinstance(agent_config, dict):
+                agent_config = {}
+        elif isinstance(agents, list):
+            # Legacy list format — all tools enabled.
+            if agents and agent_type not in agents:
+                continue
+            agent_config = {}
+        else:
+            continue
+
+        if not url or not transport:
+            logger.warning(
+                f"[mcp] Skipping external server {name!r}: missing url or transport"
+            )
+            continue
+
+        # Resolve auth token from secrets
+        headers: dict[str, str] = {}
+        secret_path = entry.get("secret", "")
+        if secret_path:
+            token_file = Path(secrets_dir) / secret_path
+            if token_file.exists():
+                token = token_file.read_text().strip()
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            else:
+                logger.warning(
+                    f"[mcp] Secret {secret_path} not found for server {name!r}"
+                )
+
+        try:
+            trust = entry.get("trust", False)
+
+            if transport == "sse":
+                await client.connect_sse(
+                    url=url,
+                    name=name,
+                    headers=headers or None,
+                    trust=trust,
+                )
+            elif transport == "streamable_http":
+                await client.connect_streamable_http(
+                    url=url,
+                    name=name,
+                    headers=headers or None,
+                    trust=trust,
+                )
+            else:
+                logger.warning(
+                    f"[mcp] Unknown transport {transport!r} for server {name!r}"
+                )
+                continue
+
+            connected.append(name)
+            logger.info(f"[mcp] Connected to external server {name!r} ({transport})")
+
+            # Collect tool scoping for this agent.
+            tools_cfg = agent_config.get("enabled_tools", "all")
+            if isinstance(tools_cfg, list):
+                _has_scoping = True
+                if enabled_tools is None:
+                    enabled_tools = set(tools_cfg)
+                else:
+                    enabled_tools.update(tools_cfg)
+            # "all" or omitted — no filtering for
+            # this server (but other servers may
+            # still add scoping).
+        except Exception:
+            logger.warning(
+                f"[mcp] Failed to connect to {name!r} at {url}",
+                exc_info=True,
+            )
+
+    # If any server specified a tool list, return the
+    # union. If all servers used "all", return None.
+    if not _has_scoping:
+        enabled_tools = None
+    return connected, enabled_tools
