@@ -171,6 +171,39 @@ Minimum:
 ]
 ```
 
+## Tool-params: exact format for parameterized tools
+
+Tools that accept arguments (like `bpf` with its `--subtools`
+flag) MUST use the `params` array with `arg`/`val` objects.
+Crucible passes these as `--arg val` to the tool's start
+script. Do NOT invent custom top-level fields.
+
+**CORRECT — bpf tool with tcp-window subtool:**
+```json
+"tool-params": [
+  {"tool": "sysstat"},
+  {"tool": "procstat"},
+  {
+    "tool": "bpf",
+    "params": [
+      {"arg": "subtools", "val": "tcp-window"}
+    ]
+  }
+]
+```
+
+**WRONG — invented fields that crucible ignores:**
+```json
+{"tool": "bpf", "subtool": "tcp-window"}
+{"tool": "bpf", "subtools": "tcp-window"}
+{"tool": "bpf", "bpf_subtools": "tcp-window"}
+```
+
+Only `params: [{arg, val}]` entries are passed to the start
+script. Any other top-level fields on the tool-params object
+are silently ignored by crucible, so the tool starts with no
+arguments and does nothing.
+
 ## mv-params is mandatory
 
 Every benchmark object in the `benchmarks` array MUST include
