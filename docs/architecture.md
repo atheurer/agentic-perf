@@ -563,8 +563,15 @@ Each provider implements:
 
 The [Jumpstarter](https://jumpstarter.dev) provider manages lab
 devices — physical boards and virtual machines — from a
-Jumpstarter controller. Devices are leased via label selectors
-(e.g., `target=ride4_sa8775p_sx_r3`).
+Jumpstarter controller. Devices are leased via label selectors:
+
+- `board-type=renesas-rcar-s4` — any board of this type (preferred)
+- `device=nxp-s32g-vnp-rdb3-03` — a specific board by name
+- `target=ride4_sa8775p_sx_r3` — legacy target label
+
+The `board_selector` directive is passed verbatim to the
+Jumpstarter lease API. Code guardrails prevent the LLM from
+substituting a different selector at reserve time.
 
 Configuration requires both secrets (`~/.agentic-perf/secrets/
 jumpstarter/config.json`) and the `jmp` CLI config
@@ -637,7 +644,11 @@ but not lease management tools (`jmp_create_lease`,
 - **Image resolution:** Before the provisioning agent runs, the
   orchestrator fetches `test_images_info.json` from the build
   server and resolves the flash command deterministically. The
-  result (including `flash_command`, partition URLs, and the
+  board target for manifest lookup comes from the exporter's
+  `target` label (stored in `resource_provider_metadata` during
+  lease creation), which matches the manifest keys exactly
+  (e.g., `rcar_s4`, `ride4_sa8775p_sx_r3`). The result
+  (including `flash_command`, partition URLs, and the
   orchestrator's SSH public key) is stored in
   `custom_fields.jumpstarter_flash`. Agents never touch the
   image server.

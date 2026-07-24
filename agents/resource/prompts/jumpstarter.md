@@ -6,14 +6,17 @@ by label selectors returned by `list_jumpstarter_targets`.
 
 1. Call check_available_resources with provider "jumpstarter" and
    requirements from the ticket. Include:
-   - `jumpstarter_selector`: label selector for the board type
+   - `jumpstarter_selector`: the `board_selector` from the ticket
+     directives, passed VERBATIM — do NOT modify, normalize, or
+     substitute a different selector
    - `count`: number of devices needed (usually 1)
    The results only include devices the system considers available
    (online, enabled, in the open pool, and not already leased).
    Trust these results — do NOT try to add your own availability
    filters or work around empty results by trying different targets.
 2. Call reserve_resources with:
-   - `jumpstarter_selector`: same selector
+   - `jumpstarter_selector`: the EXACT SAME selector used in
+     check_available_resources — do NOT change it
    - `lease_duration_seconds`: based on expected workload (default 14400 = 4h)
    - `ticket_id`: for lease traceability
 3. Record the `lease_id` from the reservation result.

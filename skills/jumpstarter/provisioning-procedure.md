@@ -35,10 +35,21 @@ If `tcp address` returns no result, try `jmp_run` with
 ## SSH Key Injection
 
 The orchestrator's SSH public key is in
-`jumpstarter_flash.ssh_public_key`. Inject it via `jmp_run`:
+`jumpstarter_flash.ssh_public_key`. Inject it via `jmp_run`.
+
+**CRITICAL: All SSH commands MUST use the `bash -c` pattern.**
+Shell operators (`&&`, `>>`, `|`) are NOT interpreted when
+passed as separate array elements. Always wrap the full remote
+command in a single `bash -c` string:
 
 ```
-jmp_run command=["ssh", "--", "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '<key>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"]
+jmp_run command=["ssh", "--", "bash", "-c", "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '<key>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"]
+```
+
+Do NOT split shell commands into separate array elements:
+```
+# WRONG — && is passed as a literal argument, not a shell operator
+jmp_run command=["ssh", "--", "mkdir", "-p", "/root/.ssh", "&&", ...]
 ```
 
 All device commands go through `jmp_run` with the appropriate

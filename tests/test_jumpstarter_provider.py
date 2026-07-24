@@ -158,13 +158,18 @@ class TestReserve:
         mock_lease.name = "lease-abc123"
         mock_lease.exporter_name = "device-01"
 
+        mock_exporter = MagicMock()
+        mock_exporter.labels = {"target": "ride4_sa8775p_sx_r3"}
+
         mock_svc = AsyncMock()
         mock_svc.CreateLease = AsyncMock(return_value=mock_lease)
+        mock_svc.GetExporter = AsyncMock(return_value=mock_exporter)
         provider._service = mock_svc
 
         result = await provider.reserve({}, description="test", ticket_id="PERF-TEST")
         assert result["provider"] == "jumpstarter"
         assert result["lease_id"] == "lease-abc123"
+        assert result["board_target"] == "ride4_sa8775p_sx_r3"
         assert result["status"] == "active"
         assert result["ssh_user"] == "root"
 

@@ -5,14 +5,22 @@
 **Error:** `doesn't match any of the allowed patterns`
 or `driver not found`
 
-**Cause:** Version mismatch between the Jumpstarter client
-and the exporter. The exporter runs a driver class that the
-client doesn't recognize (e.g., exporter on 0.9, client on
-0.8.1).
+**Cause:** The `j` CLI via socket does not read the client
+config's `drivers.unsafe` setting. It defaults to
+`unsafe=False` with an empty allow list, rejecting drivers
+like `jumpstarter_driver_snmp` (used by QC8775 boards).
+Can also indicate a version mismatch between client and
+exporter.
 
-**Fix:** Upgrade the Jumpstarter client and all driver
-packages to match the exporter version. Run
-`scripts/setup-jumpstarter.sh` to reinstall.
+**Fix:** Ensure `JMP_DRIVERS_UNSAFE=true` is set in the
+environment when launching `jmp mcp serve`. The
+`attach_jumpstarter_mcp()` function does this
+automatically. If the error persists, run
+`scripts/setup-jumpstarter.sh` to reinstall drivers.
+
+**IMPORTANT:** This error is FATAL — do not retry. Every
+subsequent `jmp_run` call will fail the same way. Call
+`request_clarification` immediately.
 
 ## Port 8080 Already In Use
 
