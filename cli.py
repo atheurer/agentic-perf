@@ -382,8 +382,13 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
-        _resume_ticket(client, ticket, ticket_id)
-        print(f"Model switched to {cmd_arg} — ticket resumed.")
+        resumed = _resume_ticket(client, ticket, ticket_id)
+        if resumed:
+            print(f"Model switched to {cmd_arg} — ticket resumed.")
+        else:
+            print(
+                f"Model switched to {cmd_arg} — ticket has no previous status, still paused."
+            )
         return True
 
     if cmd == "/extend-iterations":
@@ -403,24 +408,34 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
-        _resume_ticket(client, ticket, ticket_id)
-        print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
+        resumed = _resume_ticket(client, ticket, ticket_id)
+        if resumed:
+            print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
+        else:
+            print(
+                f"Iterations extended by {n} (new max: {new_max}) — ticket has no previous status, still paused."
+            )
         return True
 
     # Agent-specific command (e.g. /submit) — fall through to normal reply
     return False
 
 
-def _resume_ticket(client, ticket, ticket_id: str) -> None:
-    """Transition the ticket back to its previous status."""
+def _resume_ticket(client, ticket, ticket_id: str) -> bool:
+    """Transition the ticket back to its previous status.
+
+    Returns True if the ticket was successfully resumed, False if there was
+    no previous_status to resume to (ticket remains paused).
+    """
     previous = ticket.get("previous_status")
     if not previous:
-        return
+        return False
     r = client.post(
         f"/api/v1/tickets/{ticket_id}/transition",
         json={"status": previous, "comment": "User slash command — resuming pipeline"},
     )
     r.raise_for_status()
+    return True
 
 
 def cmd_reply(args):
