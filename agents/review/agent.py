@@ -75,6 +75,30 @@ class ReviewAgent(AgentBase):
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
+    async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
+        """Handle review-agent slash commands.
+
+        /submit — unlock the submission gate and instruct the LLM to submit
+                  immediately without further clarification.
+        """
+        cmd = command.split()[0].lower()
+
+        if cmd == "/submit":
+            self._user_approved_submit = True
+            logger.info(
+                f"[review-agent] /submit command received for {ticket_id} "
+                "— submission gate unlocked"
+            )
+            return (
+                "SLASH COMMAND /submit received. The user has force-approved "
+                "submission. You MUST immediately call submit_review_result with "
+                "your current findings. Do NOT call request_clarification again. "
+                "Submit now."
+            )
+
+        # Delegate everything else to the base class (unknown-command guard etc.)
+        return await super()._handle_slash_command(ticket_id, command)
+
     def _should_block_submit(self, ticket_id: str) -> str | None:
         if self._user_approved_submit:
             return None

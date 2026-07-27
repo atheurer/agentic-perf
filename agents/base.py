@@ -1073,6 +1073,13 @@ class AgentBase(ABC):
                     "\n".join(user_replies) if user_replies else "User resumed ticket."
                 )
                 logger.info(f"[{self.agent_name}] Human input received on {ticket_id}")
+
+                # Intercept slash commands before returning to the LLM loop
+                if reply.strip().startswith("/"):
+                    handled = await self._handle_slash_command(ticket_id, reply.strip())
+                    if handled is not None:
+                        return handled
+
                 return reply
 
         logger.warning(f"[{self.agent_name}] HITL timeout on {ticket_id}")
@@ -1085,3 +1092,37 @@ class AgentBase(ABC):
                 comment=f"HITL timeout — resuming from {prev}",
             )
         return "No response received within timeout. Proceed with best judgment."
+
+    async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
+        """Handle a slash command issued by the user during HITL.
+
+        Called when _request_human_input() receives a reply starting with '/'.
+        The return value is passed directly back to the LLM as the HITL reply;
+        return None to fall through and pass the raw command text to the LLM.
+
+        Subclasses should override to add agent-specific commands.  Always call
+        super() first so generic handling and the unknown-command guard fire.
+
+        Generic commands (/abort, /model, /extend-iterations) are fully handled
+        by the CLI before the agent sees them and will never reach here.
+        """
+        parts = command.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        # Known agent-specific commands not handled here (subclass responsibility)
+        _agent_specific = {"/submit"}
+        if cmd in _agent_specific:
+            return None  # let subclass handle it
+
+        # Reject any other unrecognised slash command so it doesn't confuse the LLM
+        known = {"/abort", "/close", "/model", "/extend-iterations"} | _agent_specific
+        if cmd not in known:
+            logger.warning(f"[{self.agent_name}] Unknown slash command: {cmd}")
+            return (
+                f"ERROR: '{cmd}' is not a recognised slash command. "
+                f"Available commands: /abort, /close, /model <id>, "
+                f"/extend-iterations <n>, /submit (review only). "
+                f"Please send a normal message or a valid command."
+            )
+
+        return None

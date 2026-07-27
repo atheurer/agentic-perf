@@ -279,6 +279,165 @@ def cmd_watch(args):
         print("\n  Stopped watching.")
 
 
+# Slash commands handled directly by the CLI without LLM involvement.
+# Agent-specific commands (e.g. /submit) are passed through to the agent
+# via the normal reply path, where _request_human_input() intercepts them.
+_CLI_SLASH_COMMANDS = {
+    "/abort": "Move to teardown (retrospective still runs).",
+    "/close": "Skip teardown and retrospective — close immediately.",
+    "/model": "/model <model-id>  — Switch the LLM model for this ticket.",
+    "/extend-iterations": "/extend-iterations <n>  — Add N more LLM iterations.",
+}
+
+# Commands that require an argument
+_CLI_SLASH_COMMANDS_WITH_ARGS = {"/model", "/extend-iterations"}
+
+# All known slash commands across CLI and agents (for validation)
+_ALL_KNOWN_SLASH_COMMANDS = {
+    "/abort",
+    "/close",
+    "/model",
+    "/extend-iterations",
+    "/submit",  # review agent: force submission
+}
+
+
+def _print_slash_help():
+    print("Available slash commands:")
+    for cmd, desc in _CLI_SLASH_COMMANDS.items():
+        print(f"  {cmd:<30} {desc}")
+    print("  /submit                        (review agent) Force-submit the review.")
+    print("\nUnknown commands are rejected rather than passed to the agent.")
+
+
+def _handle_cli_slash_command(args, client, ticket) -> bool:
+    """Handle slash commands that are resolved directly by the CLI.
+
+    Returns True if the command was fully handled (caller should return),
+    False if the message should be passed through as a normal reply.
+    Prints an error and returns True for unrecognised commands.
+    """
+    message = args.message.strip()
+    if not message.startswith("/"):
+        return False
+
+    parts = message.split(maxsplit=1)
+    cmd = parts[0].lower()
+    cmd_arg = parts[1] if len(parts) > 1 else ""
+    ticket_id = args.ticket_id
+
+    if cmd not in _ALL_KNOWN_SLASH_COMMANDS:
+        print(f"Unknown slash command: {cmd}")
+        _print_slash_help()
+        return True
+
+    if cmd == "/abort":
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "user", "body": message},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={"status": "awaiting_teardown", "comment": "User /abort command"},
+        )
+        r.raise_for_status()
+        print("Ticket aborted — moving to teardown.")
+        return True
+
+    if cmd == "/close":
+        # Skip teardown and retrospective — transition directly to closed.
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "user", "body": message},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={"status": "awaiting_teardown", "comment": "User /close command"},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": "closed",
+                "comment": "User /close — skipping retrospective",
+            },
+        )
+        r.raise_for_status()
+        print("Ticket closed (teardown and retrospective skipped).")
+        return True
+
+    if cmd == "/model":
+        if not cmd_arg:
+            print("Usage: /model <model-id>")
+            return True
+        r = client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"llm_override": {"model": cmd_arg}}},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "user", "body": message},
+        )
+        r.raise_for_status()
+        resumed = _resume_ticket(client, ticket, ticket_id)
+        if resumed:
+            print(f"Model switched to {cmd_arg} — ticket resumed.")
+        else:
+            print(
+                f"Model switched to {cmd_arg} — ticket has no previous status, still paused."
+            )
+        return True
+
+    if cmd == "/extend-iterations":
+        if not cmd_arg or not cmd_arg.strip().isdigit():
+            print("Usage: /extend-iterations <n>")
+            return True
+        n = int(cmd_arg.strip())
+        current = ticket.get("custom_fields", {}).get("max_iterations_override") or 0
+        new_max = (current or 0) + n
+        r = client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"max_iterations_override": new_max}},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "user", "body": message},
+        )
+        r.raise_for_status()
+        resumed = _resume_ticket(client, ticket, ticket_id)
+        if resumed:
+            print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
+        else:
+            print(
+                f"Iterations extended by {n} (new max: {new_max}) — ticket has no previous status, still paused."
+            )
+        return True
+
+    # Agent-specific command (e.g. /submit) — fall through to normal reply
+    return False
+
+
+def _resume_ticket(client, ticket, ticket_id: str) -> bool:
+    """Transition the ticket back to its previous status.
+
+    Returns True if the ticket was successfully resumed, False if there was
+    no previous_status to resume to (ticket remains paused).
+    """
+    previous = ticket.get("previous_status")
+    if not previous:
+        return False
+    r = client.post(
+        f"/api/v1/tickets/{ticket_id}/transition",
+        json={"status": previous, "comment": "User slash command — resuming pipeline"},
+    )
+    r.raise_for_status()
+    return True
+
+
 def cmd_reply(args):
     client, url = get_client(args)
 
@@ -289,6 +448,11 @@ def cmd_reply(args):
     if t["status"] != "awaiting_customer_guidance":
         print(f"Ticket is not waiting for input (status: {t['status']})")
         return
+
+    # Handle CLI-resolved slash commands before posting the message
+    if args.message.strip().startswith("/"):
+        if _handle_cli_slash_command(args, client, t):
+            return
 
     r = client.post(
         f"/api/v1/tickets/{args.ticket_id}/comments",
