@@ -1117,14 +1117,14 @@ class AgentBase(ABC):
             return None  # let subclass handle it
 
         # Reject any other unrecognised slash command so it doesn't confuse the LLM
-        known = {"/abort", "/model", "/extend-iterations"} | _agent_specific
+        known = {"/abort", "/close", "/model", "/extend-iterations"} | _agent_specific
         if cmd not in known:
             logger.warning(
                 f"[{self.agent_name}] Unknown slash command: {cmd}"
             )
             return (
                 f"ERROR: '{cmd}' is not a recognised slash command. "
-                f"Available commands: /abort, /model <id>, "
+                f"Available commands: /abort, /close, /model <id>, "
                 f"/extend-iterations <n>, /submit (review only). "
                 f"Please send a normal message or a valid command."
             )

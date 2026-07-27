@@ -283,7 +283,8 @@ def cmd_watch(args):
 # Agent-specific commands (e.g. /submit) are passed through to the agent
 # via the normal reply path, where _request_human_input() intercepts them.
 _CLI_SLASH_COMMANDS = {
-    "/abort": "Abort the ticket and move to teardown.",
+    "/abort": "Move to teardown (retrospective still runs).",
+    "/close": "Skip teardown and retrospective — close immediately.",
     "/model": "/model <model-id>  — Switch the LLM model for this ticket.",
     "/extend-iterations": "/extend-iterations <n>  — Add N more LLM iterations.",
 }
@@ -294,6 +295,7 @@ _CLI_SLASH_COMMANDS_WITH_ARGS = {"/model", "/extend-iterations"}
 # All known slash commands across CLI and agents (for validation)
 _ALL_KNOWN_SLASH_COMMANDS = {
     "/abort",
+    "/close",
     "/model",
     "/extend-iterations",
     "/submit",  # review agent: force submission
@@ -341,6 +343,26 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
         )
         r.raise_for_status()
         print("Ticket aborted — moving to teardown.")
+        return True
+
+    if cmd == "/close":
+        # Skip teardown and retrospective — transition directly to closed.
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "user", "body": message},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={"status": "awaiting_teardown", "comment": "User /close command"},
+        )
+        r.raise_for_status()
+        r = client.post(
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={"status": "closed", "comment": "User /close — skipping retrospective"},
+        )
+        r.raise_for_status()
+        print("Ticket closed (teardown and retrospective skipped).")
         return True
 
     if cmd == "/model":
