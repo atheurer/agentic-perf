@@ -75,9 +75,7 @@ class ReviewAgent(AgentBase):
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
-    async def _handle_slash_command(
-        self, ticket_id: str, command: str
-    ) -> str | None:
+    async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
         """Handle review-agent slash commands.
 
         /submit — unlock the submission gate and instruct the LLM to submit

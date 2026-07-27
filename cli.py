@@ -359,7 +359,10 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
         r.raise_for_status()
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/transition",
-            json={"status": "closed", "comment": "User /close — skipping retrospective"},
+            json={
+                "status": "closed",
+                "comment": "User /close — skipping retrospective",
+            },
         )
         r.raise_for_status()
         print("Ticket closed (teardown and retrospective skipped).")

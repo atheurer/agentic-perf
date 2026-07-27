@@ -1093,9 +1093,7 @@ class AgentBase(ABC):
             )
         return "No response received within timeout. Proceed with best judgment."
 
-    async def _handle_slash_command(
-        self, ticket_id: str, command: str
-    ) -> str | None:
+    async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
         """Handle a slash command issued by the user during HITL.
 
         Called when _request_human_input() receives a reply starting with '/'.
@@ -1119,9 +1117,7 @@ class AgentBase(ABC):
         # Reject any other unrecognised slash command so it doesn't confuse the LLM
         known = {"/abort", "/close", "/model", "/extend-iterations"} | _agent_specific
         if cmd not in known:
-            logger.warning(
-                f"[{self.agent_name}] Unknown slash command: {cmd}"
-            )
+            logger.warning(f"[{self.agent_name}] Unknown slash command: {cmd}")
             return (
                 f"ERROR: '{cmd}' is not a recognised slash command. "
                 f"Available commands: /abort, /close, /model <id>, "
