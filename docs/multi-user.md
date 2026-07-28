@@ -190,7 +190,10 @@ network access to the state store.
 - The state store binds to `0.0.0.0` — anyone on the network can
   reach it. Place behind a firewall on untrusted networks.
 - Tokens are shared deployment secrets, not per-session credentials.
-  There is no token expiry, refresh, or revocation log.
+  Token expiry is available via `token_ttl_days` (see
+  [Configuration](configuration.md#auth--multi-user-authentication)).
+  There is no automatic refresh or revocation log. Expired tokens
+  require admin-assisted rotation.
 - Users can read all tickets (only writes are gated). Read isolation
   is not a goal.
 - The secrets cascade trusts filesystem permissions. A user with

@@ -427,6 +427,7 @@ to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `multi_user` | bool | `false` | Enable per-user authentication. When `true`, each API caller needs a personal bearer token (created via the admin API). The existing deployment token becomes the service principal used by the orchestrator and agents. When `false`, behavior is identical to a single-token deployment. |
+| `token_ttl_days` | int | `0` | Maximum age (in days) for user tokens. `0` disables expiry. Applies only in multi-user mode. The deployment token is always exempt. When a token older than this value is presented, the server returns `401 Unauthorized`. Expired users must have their token rotated by an admin. |
 
 See [Multi-User Guide](multi-user.md) for bootstrap instructions and
 the full feature walkthrough.

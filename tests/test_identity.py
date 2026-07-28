@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from unittest.mock import patch
+
 import pytest
 
 from state_store.identity import (
@@ -142,6 +145,77 @@ class TestUserStore:
         safe = UserStore.to_safe_dict(user)
         assert "token_hash" not in safe
         assert safe["username"] == "alice"
+
+    def test_create_user_sets_token_issued_at(self, store):
+        user, _ = store.create_user("alice")
+        assert user.token_issued_at is not None
+
+    def test_rotate_token_resets_token_issued_at(self, store):
+        user, _ = store.create_user("alice")
+        original = user.token_issued_at
+        store.rotate_token("alice")
+        user = store.get_user("alice")
+        assert user.token_issued_at is not None
+        assert user.token_issued_at >= original
+
+    def test_touch_last_used_updates_in_memory(self, store):
+        store.create_user("alice")
+        store.touch_last_used("alice")
+        user = store.get_user("alice")
+        assert user.last_used_at is not None
+
+    def test_touch_last_used_debounce(self, store):
+        store.create_user("alice")
+        with patch.object(store, "_save") as mock_save:
+            store.touch_last_used("alice")
+            assert mock_save.call_count == 1
+            store.touch_last_used("alice")
+            assert mock_save.call_count == 1
+
+    def test_touch_last_used_nonexistent_user(self, store):
+        store.touch_last_used("ghost")
+
+    def test_touch_last_used_save_failure_is_nonfatal(self, store):
+        """Persistence failure in touch_last_used must not crash auth."""
+        store.create_user("alice")
+        with patch.object(store, "_save", side_effect=OSError("disk full")):
+            store.touch_last_used("alice")
+        user = store.get_user("alice")
+        assert user.last_used_at is not None
+
+    def test_persistence_includes_new_fields(self, tmp_path):
+        path = tmp_path / "users.json"
+        store1 = UserStore(persist_path=path)
+        store1.create_user("alice")
+        store1.touch_last_used("alice")
+
+        store2 = UserStore(persist_path=path)
+        user = store2.get_user("alice")
+        assert user.token_issued_at is not None
+        assert user.last_used_at is not None
+
+    def test_forward_compat_load_without_new_fields(self, tmp_path):
+        """Users persisted before TTL feature load with None defaults."""
+        path = tmp_path / "users.json"
+        data = {
+            "users": {
+                "alice": {
+                    "username": "alice",
+                    "token_hash": "abc123",
+                    "is_admin": False,
+                    "groups": [],
+                    "disabled": False,
+                    "created_at": "2025-01-01T00:00:00+00:00",
+                },
+            },
+            "groups": {},
+        }
+        path.write_text(json.dumps(data))
+        store = UserStore(persist_path=path)
+        user = store.get_user("alice")
+        assert user.username == "alice"
+        assert user.token_issued_at is None
+        assert user.last_used_at is None
 
     def test_persistence_survives_reload(self, tmp_path):
         path = tmp_path / "users.json"

@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException, Request
@@ -83,6 +84,7 @@ def make_auth_dependency(
     *,
     multi_user: bool = False,
     user_store: UserStore | None = None,
+    token_ttl_days: int = 0,
 ):
     """Create a FastAPI dependency that validates bearer tokens.
 
@@ -91,6 +93,8 @@ def make_auth_dependency(
 
     In multi-user mode, checks the deployment token first, then
     hashes the presented token and looks up the user in the store.
+    When ``token_ttl_days`` > 0, user tokens older than that many
+    days are rejected with 401.  The deployment token is exempt.
     """
 
     async def verify_token(request: Request) -> Principal:
@@ -130,6 +134,19 @@ def make_auth_dependency(
                         status_code=401,
                         detail="User account is disabled",
                     )
+                if token_ttl_days > 0:
+                    issued = user.token_issued_at or user.created_at
+                    if issued.tzinfo is None:
+                        issued = issued.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - issued
+                    if age.days >= token_ttl_days:
+                        raise HTTPException(
+                            status_code=401,
+                            detail=(
+                                "Token expired — contact an admin to rotate your token"
+                            ),
+                        )
+                user_store.touch_last_used(user.username)
                 principal = Principal(
                     kind="user",
                     username=user.username,

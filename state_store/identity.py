@@ -15,6 +15,7 @@ import re
 import secrets
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +38,8 @@ class User(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )
+    token_issued_at: datetime | None = None
+    last_used_at: datetime | None = None
 
 
 class Group(BaseModel):
@@ -80,11 +83,14 @@ class DuplicateGroup(Exception):
 class UserStore:
     """Thread-safe identity store backed by a JSON file."""
 
+    _DEBOUNCE_SECONDS: float = 300.0
+
     def __init__(self, persist_path: str | Path | None = None) -> None:
         self._path = Path(persist_path) if persist_path else DEFAULT_USERS_PATH
         self._users: dict[str, User] = {}
         self._groups: dict[str, Group] = {}
         self._lock = threading.Lock()
+        self._last_persisted: dict[str, float] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -110,6 +116,7 @@ class UserStore:
                 username=normalized,
                 token_hash=token_h,
                 is_admin=is_admin,
+                token_issued_at=datetime.now(timezone.utc),
             )
             self._users[normalized] = user
             self._save()
@@ -177,6 +184,7 @@ class UserStore:
             if user is None:
                 raise UserNotFound(f"User '{username}' not found")
             user.token_hash = token_h
+            user.token_issued_at = datetime.now(timezone.utc)
             self._save()
         return raw_token
 
@@ -190,6 +198,26 @@ class UserStore:
                 ):
                     return user.model_copy()
         return None
+
+    def touch_last_used(self, username: str) -> None:
+        """Update last_used_at in-memory; persist at most once per debounce interval."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            user = self._users.get(username)
+            if user is None:
+                return
+            user.last_used_at = now
+            last = self._last_persisted.get(username)
+            if last is None or (time.monotonic() - last) >= self._DEBOUNCE_SECONDS:
+                try:
+                    self._save()
+                    self._last_persisted[username] = time.monotonic()
+                except Exception:
+                    logger.warning(
+                        "Failed to persist last_used_at for %s",
+                        username,
+                        exc_info=True,
+                    )
 
     # ------------------------------------------------------------------
     # Group operations

@@ -9,7 +9,7 @@ from state_store.identity import UserStore
 from state_store.main import create_app
 
 
-def _make_multi_user_app(tmp_path):
+def _make_multi_user_app(tmp_path, *, token_ttl_days: int = 0):
     """Create an app with multi-user mode enabled."""
     user_store = UserStore(persist_path=tmp_path / "users.json")
 
@@ -28,6 +28,7 @@ def _make_multi_user_app(tmp_path):
         token,
         multi_user=True,
         user_store=user_store,
+        token_ttl_days=token_ttl_days,
     )
     app.state.auth_dependency = auth
 
@@ -342,3 +343,47 @@ class TestMultiUserAuth:
         )
         assert r.status_code == 200
         assert r.json()["user"]["is_admin"] is True
+
+
+class TestTokenTTLIntegration:
+    """API-level tests for token TTL enforcement."""
+
+    @pytest.fixture()
+    def ttl_env(self, tmp_path):
+        return _make_multi_user_app(tmp_path, token_ttl_days=90)
+
+    def test_expired_user_cannot_self_rotate(self, tmp_path):
+        """An expired user gets 401 before reaching the rotate endpoint."""
+        from datetime import datetime, timedelta, timezone
+
+        app, user_store, deploy_token = _make_multi_user_app(
+            tmp_path,
+            token_ttl_days=30,
+        )
+        r = TestClient(app).post(
+            "/api/v1/users",
+            json={"username": "alice"},
+            headers={"Authorization": f"Bearer {deploy_token}"},
+        )
+        user_token = r.json()["token"]
+
+        with user_store._lock:
+            u = user_store._users["alice"]
+            u.token_issued_at = datetime.now(timezone.utc) - timedelta(
+                days=60,
+            )
+
+        c = TestClient(app)
+        c.headers["Authorization"] = f"Bearer {user_token}"
+        r = c.post("/api/v1/users/alice/rotate-token")
+        assert r.status_code == 401
+        assert "expired" in r.json()["detail"].lower()
+
+    def test_deployment_token_exempt_with_ttl(self, ttl_env):
+        """Deployment token works regardless of TTL setting."""
+        app, _, deploy_token = ttl_env
+        c = TestClient(app)
+        c.headers["Authorization"] = f"Bearer {deploy_token}"
+        r = c.get("/api/v1/whoami")
+        assert r.status_code == 200
+        assert r.json()["kind"] == "service"
