@@ -831,6 +831,36 @@ async def _process_stop_requests(
                 if dispatcher.is_active(tid):
                     dispatcher.stop_agent(tid, mode)
                     logger.info(f"Processed stop request for {tid} (mode={mode})")
+                else:
+                    # Ticket has no active agent — transition it
+                    # to a non-dispatchable state so it doesn't
+                    # get picked up on the next poll cycle.
+                    if mode == "hard":
+                        resp = await client.post(
+                            f"{store_url}/api/v1/tickets/{tid}/force-close",
+                        )
+                        resp.raise_for_status()
+                        logger.info(f"Force-closed non-active ticket {tid}")
+                    else:
+                        resp = await client.post(
+                            f"{store_url}/api/v1/tickets/{tid}/transition",
+                            json={
+                                "status": "awaiting_customer_guidance",
+                                "comment": ("Graceful stop requested — ticket paused"),
+                            },
+                        )
+                        if resp.status_code == 409:
+                            resp = await client.post(
+                                f"{store_url}/api/v1/tickets/{tid}/force-close",
+                            )
+                            resp.raise_for_status()
+                            logger.info(
+                                f"Force-closed non-active ticket {tid}"
+                                " (transition not allowed)"
+                            )
+                        else:
+                            resp.raise_for_status()
+                            logger.info(f"Paused non-active ticket {tid}")
                 await client.patch(
                     f"{store_url}/api/v1/tickets/{tid}/fields",
                     json={"fields": {"stop_requested": None}},
@@ -1016,12 +1046,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 # the ticket has anomaly_context, redirect
                 # to gathering_context (investigation path).
                 # LLM decides intent; code enforces invariants.
-                # Skip if gathering_context already ran —
-                # prevents loop when planning_investigation
-                # stub transitions back to awaiting_hardware.
                 if status == "awaiting_hardware":
                     cf = ticket.get("custom_fields", {})
-                    if cf.get("anomaly_context") and not cf.get("dedup_result"):
+                    if cf.get("anomaly_context"):
                         logger.info(
                             f"Redirecting {tid} to "
                             f"gathering_context "
@@ -1035,7 +1062,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                             )
                         except Exception:
                             logger.exception(f"Failed to redirect {tid}")
-                        dispatcher.mark_done(tid)
+                        dispatcher.mark_dispatched(tid, status)
                         continue
 
                 # Jumpstarter: release any existing lease
