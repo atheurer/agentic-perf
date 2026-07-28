@@ -279,6 +279,42 @@ def cmd_watch(args):
         print("\n  Stopped watching.")
 
 
+def cmd_archive(args):
+    client, url = get_client(args)
+
+    if not args.ticket_ids and not args.all_closed:
+        print("Specify ticket IDs or use --all-closed.")
+        return
+
+    ids = list(args.ticket_ids)
+    if args.all_closed:
+        r = client.get("/api/v1/tickets")
+        r.raise_for_status()
+        ids += [t["id"] for t in r.json() if t.get("status") == "closed"]
+        ids = list(dict.fromkeys(ids))  # deduplicate, preserve order
+
+    if not ids:
+        print("No tickets to archive.")
+        return
+
+    archived = failed = 0
+    for tid in ids:
+        r = client.delete(f"/api/v1/tickets/{tid}")
+        if r.status_code == 200:
+            result = r.json()
+            files = ", ".join(result.get("archived_files", []))
+            print(f"  Archived {tid} → {files or '(no files moved)'}")
+            archived += 1
+        elif r.status_code == 409:
+            print(f"  Skipped {tid}: {r.json().get('detail', 'not closed')}")
+            failed += 1
+        else:
+            print(f"  Failed  {tid}: {r.status_code} {r.text[:60]}")
+            failed += 1
+
+    print(f"\nArchived: {archived}  Skipped/failed: {failed}")
+
+
 def cmd_reply(args):
     client, url = get_client(args)
 
@@ -1232,6 +1268,22 @@ def main():
     )
     p_claim.add_argument("ticket_id", help="Ticket ID")
 
+    p_archive = sub.add_parser(
+        "archive",
+        help="Archive closed tickets (remove from active service, move files to archive dir)",
+    )
+    p_archive.add_argument(
+        "ticket_ids",
+        nargs="*",
+        metavar="TICKET_ID",
+        help="Ticket IDs to archive (omit to use --all-closed)",
+    )
+    p_archive.add_argument(
+        "--all-closed",
+        action="store_true",
+        help="Archive all closed tickets",
+    )
+
     p_cleanup = sub.add_parser("cleanup", help="Find/terminate orphaned AWS instances")
     p_cleanup.add_argument(
         "--older-than",
@@ -1269,6 +1321,7 @@ def main():
         "stop-all": cmd_stop_all,
         "transcript": cmd_transcript,
         "health": cmd_health,
+        "archive": cmd_archive,
         "cleanup": cmd_cleanup,
         "user": cmd_user,
         "group": cmd_group,

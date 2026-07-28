@@ -95,6 +95,24 @@ def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     return result
 
 
+@router.delete("/{ticket_id}")
+def archive_ticket(ticket_id: str, request: Request):
+    """Archive a closed ticket: remove from active memory and move files to archive dir."""
+    store = _get_store(request)
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+    try:
+        result = store.archive_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return result
+
+
 @router.delete("/{ticket_id}/claim")
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)

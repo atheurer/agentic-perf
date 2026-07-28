@@ -250,6 +250,48 @@ class TicketStore:
             self._persist_ticket(ticket)
             return existing
 
+    def archive_ticket(self, ticket_id: str) -> dict:
+        """Remove a ticket from active memory and move its files to the archive.
+
+        The ticket JSON and event log are moved to <persist_dir>/../archive/.
+        Only closed tickets may be archived unless force=True.
+        Returns a summary dict with the archived file paths.
+        """
+        with self._lock:
+            if ticket_id not in self._tickets:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._tickets[ticket_id]
+            if ticket.status != TicketStatus.CLOSED:
+                raise ValueError(
+                    f"Ticket {ticket_id} is {ticket.status.value}, not closed. "
+                    "Only closed tickets can be archived."
+                )
+            del self._tickets[ticket_id]
+
+        archive_dir = self._persist_dir.parent / "archive" / "tickets"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = []
+
+        ticket_path = self._persist_dir / f"{ticket_id}.json"
+        if ticket_path.exists():
+            dest = archive_dir / f"{ticket_id}.json"
+            ticket_path.rename(dest)
+            archived.append(str(dest))
+
+        # Move event log if present
+        from paths import LOG_DIR
+
+        log_path = LOG_DIR / f"{ticket_id}.jsonl"
+        if log_path.exists():
+            log_archive_dir = self._persist_dir.parent / "archive" / "logs"
+            log_archive_dir.mkdir(parents=True, exist_ok=True)
+            dest = log_archive_dir / f"{ticket_id}.jsonl"
+            log_path.rename(dest)
+            archived.append(str(dest))
+
+        logger.info(f"Archived ticket {ticket_id}: {archived}")
+        return {"ticket_id": ticket_id, "archived_files": archived}
+
     def _persist_ticket(self, ticket: Ticket) -> None:
         path = self._persist_dir / f"{ticket.id}.json"
         try:
