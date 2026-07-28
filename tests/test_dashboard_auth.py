@@ -12,7 +12,7 @@ from state_store.identity import UserStore
 from state_store.main import STATIC_DIR, create_app
 
 
-def _make_multi_user_app(tmp_path):
+def _make_multi_user_app(tmp_path, *, token_ttl_days: int = 0):
     from state_store.api.router import api_router, health_router
     from state_store.auth import make_auth_dependency
 
@@ -29,6 +29,7 @@ def _make_multi_user_app(tmp_path):
         token,
         multi_user=True,
         user_store=user_store,
+        token_ttl_days=token_ttl_days,
     )
     app.state.auth_dependency = auth
 
