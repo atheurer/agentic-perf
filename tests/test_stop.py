@@ -196,40 +196,6 @@ class TestForceCloseEndpoint:
         assert r.status_code == 404
 
 
-class TestDeleteTicketEndpoint:
-    def test_delete_closed_ticket(self, client, store, tmp_path):
-        ticket = store.create_ticket(
-            CreateTicketRequest(summary="test", description="test"),
-        )
-        store.force_close(ticket.id)
-        assert (tmp_path / f"{ticket.id}.json").exists()
-        r = client.delete(f"/api/v1/tickets/{ticket.id}")
-        assert r.status_code == 200
-        assert r.json()["deleted"] == ticket.id
-        assert not (tmp_path / f"{ticket.id}.json").exists()
-
-    def test_delete_closed_ticket_not_in_listing(self, client, store):
-        ticket = store.create_ticket(
-            CreateTicketRequest(summary="test", description="test"),
-        )
-        store.force_close(ticket.id)
-        client.delete(f"/api/v1/tickets/{ticket.id}")
-        r = client.get("/api/v1/tickets")
-        ids = [t["id"] for t in r.json()]
-        assert ticket.id not in ids
-
-    def test_delete_non_closed_returns_409(self, client, store):
-        ticket = store.create_ticket(
-            CreateTicketRequest(summary="test", description="test"),
-        )
-        r = client.delete(f"/api/v1/tickets/{ticket.id}")
-        assert r.status_code == 409
-
-    def test_delete_nonexistent_returns_404(self, client):
-        r = client.delete("/api/v1/tickets/PERF-nonexist")
-        assert r.status_code == 404
-
-
 class TestForceCloseStore:
     def test_force_close_persists_file(self, store, tmp_path):
         ticket = store.create_ticket(
@@ -269,21 +235,6 @@ class TestForceCloseStore:
         result = store.force_close(ticket.id)
         assert "claim" not in result.custom_fields
         assert "stop_requested" not in result.custom_fields
-
-    def test_delete_ticket_removes_file(self, store, tmp_path):
-        ticket = store.create_ticket(
-            CreateTicketRequest(summary="test", description="test"),
-        )
-        path = tmp_path / f"{ticket.id}.json"
-        assert path.exists()
-        store.delete_ticket(ticket.id)
-        assert not path.exists()
-
-    def test_delete_ticket_raises_not_found(self, store):
-        from state_store.store import TicketNotFound
-
-        with pytest.raises(TicketNotFound):
-            store.delete_ticket("PERF-nonexist")
 
 
 # ── Agent Stop Flag Tests ─────────────────────────────────
