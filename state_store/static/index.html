@@ -1190,7 +1190,6 @@ async function refreshIdentity() {
     _currentIdentity = data;
     var name = data.username || 'unknown';
     var role = data.is_admin ? ' (admin)' : '';
-    var kind = data.kind === 'service' ? 'service' : '';
     if (data.kind === 'service') {
       el.innerHTML = '<span class="identity-name">' + escHtml(name) + '</span>' +
         '<span class="identity-role">service principal</span>';
@@ -1470,7 +1469,7 @@ async function doStopAll(mode, btn) {
 async function api(path) {
   const r = await fetch(API + path, { headers: getAuthHeaders() });
   if (r.status === 401 && _isMultiUser) {
-    refreshIdentity();
+    await refreshIdentity();
     throw new Error('Authentication failed — check your token in settings');
   }
   if (!r.ok) throw new Error(`API ${r.status}: ${path}`);
@@ -1683,13 +1682,14 @@ async function loadTickets() {
           (cachePct ? ' <span style="color:var(--text-muted); font-size:11px">(' + cachePct + ')</span>' : '')
         : '&mdash;';
       var costHtml = tu ? fmtCost(tu.estimated_cost_usd) : '&mdash;';
-      var ownersHtml = (t.owners || []).join(', ') || '&mdash;';
+      var ownersList = t.owners || [];
+      var ownersHtml = ownersList.length > 0 ? escHtml(ownersList.join(', ')) : '—';
       rows +=
         '<tr class="ticket-row" data-id="' + escHtml(t.id) + '">' +
           '<td class="ticket-id">' + escHtml(t.id) + '</td>' +
           '<td class="ticket-summary">' + escHtml(t.summary) + '</td>' +
           '<td>' + statusBadge(t.status) + '</td>' +
-          (_isMultiUser ? '<td class="ticket-owners">' + escHtml(ownersHtml.replace(/&mdash;/g, '—')) + '</td>' : '') +
+          (_isMultiUser ? '<td class="ticket-owners">' + ownersHtml + '</td>' : '') +
           '<td class="ticket-tokens">' + tokHtml + '</td>' +
           '<td class="ticket-cost">' + costHtml + '</td>' +
           '<td class="ticket-time">' + fmtTime(t.created_at) + '</td>' +

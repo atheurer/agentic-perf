@@ -286,15 +286,6 @@ class TicketStore:
             self._persist_ticket(ticket)
             return ticket.model_copy()
 
-    def delete_ticket(self, ticket_id: str) -> None:
-        """Remove a ticket's backing file, then drop it from memory."""
-        with self._lock:
-            if ticket_id not in self._tickets:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
-            path = self._persist_dir / f"{ticket_id}.json"
-            path.unlink(missing_ok=True)
-            self._tickets.pop(ticket_id, None)
-
     def _persist_ticket(self, ticket: Ticket) -> None:
         path = self._persist_dir / f"{ticket.id}.json"
         try:
