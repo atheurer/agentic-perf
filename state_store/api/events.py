@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from providers.cost import estimate_cost
+
+from ..store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["events"])
 usage_router = APIRouter(prefix="/usage", tags=["usage"])
@@ -33,22 +35,25 @@ def get_transcript(
     ),
 ):
     """Return all events for a ticket as a full transcript."""
+    store = request.app.state.store
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    ticket_data = {
+        "summary": ticket.summary,
+        "description": ticket.description,
+        "status": ticket.status.value,
+    }
+
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
-        return {"ticket_id": ticket_id, "events": []}
-    events = event_bus.get_events(ticket_id, since=0, limit=10000)
-    if agent:
-        events = [e for e in events if e.get("agent") == agent]
-
-    store = request.app.state.store
-    ticket = store.get(ticket_id)
-    ticket_data = {}
-    if ticket:
-        ticket_data = {
-            "summary": ticket.summary,
-            "description": ticket.description,
-            "status": ticket.status.value,
-        }
+        events = []
+    else:
+        events = event_bus.get_events(ticket_id, since=0, limit=10000)
+        if agent:
+            events = [e for e in events if e.get("agent") == agent]
 
     return {
         "ticket_id": ticket_id,

@@ -242,6 +242,103 @@ class TestEventStreamLive:
         assert t2.id in ticket_ids
 
 
+class TestTranscriptEndpoint:
+    """Tests for GET /tickets/{id}/transcript."""
+
+    @pytest.fixture
+    def client(self, app):
+        from fastapi.testclient import TestClient
+
+        c = TestClient(app)
+        c.headers["Authorization"] = f"Bearer {app.state.api_token}"
+        return c
+
+    def test_transcript_returns_ticket_and_events(
+        self,
+        client,
+        ticket_with_events,
+        store,
+    ):
+        tid = ticket_with_events
+        r = client.get(f"/api/v1/tickets/{tid}/transcript")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ticket_id"] == tid
+        assert data["ticket"]["summary"] == "test"
+        assert data["ticket"]["status"] == "new"
+        assert len(data["events"]) == 4
+
+    def test_transcript_filters_by_agent(
+        self,
+        client,
+        store,
+        event_bus,
+    ):
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="multi", description="multi"),
+        )
+        event_bus.emit(ticket.id, "triage", "agent_started", {})
+        event_bus.emit(ticket.id, "benchmark", "agent_started", {})
+        event_bus.emit(ticket.id, "triage", "agent_finished", {})
+
+        r = client.get(
+            f"/api/v1/tickets/{ticket.id}/transcript?agent=benchmark",
+        )
+        assert r.status_code == 200
+        events = r.json()["events"]
+        assert len(events) == 1
+        assert events[0]["agent"] == "benchmark"
+
+    def test_transcript_nonexistent_ticket_returns_404(self, client):
+        r = client.get("/api/v1/tickets/PERF-NOTREAL/transcript")
+        assert r.status_code == 404
+
+    def test_transcript_no_event_bus_returns_ticket_and_empty_events(
+        self,
+        store,
+    ):
+        from fastapi.testclient import TestClient
+
+        application = create_app()
+        application.state.store = store
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="no-bus", description="no-bus"),
+        )
+        c = TestClient(application)
+        c.headers["Authorization"] = f"Bearer {application.state.api_token}"
+        r = c.get(f"/api/v1/tickets/{ticket.id}/transcript")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["events"] == []
+        assert data["ticket"]["summary"] == "no-bus"
+        assert data["ticket"]["status"] == "new"
+
+    def test_transcript_no_event_bus_nonexistent_returns_404(self, store):
+        from fastapi.testclient import TestClient
+
+        application = create_app()
+        application.state.store = store
+        c = TestClient(application)
+        c.headers["Authorization"] = f"Bearer {application.state.api_token}"
+        r = c.get("/api/v1/tickets/PERF-NOTREAL/transcript")
+        assert r.status_code == 404
+
+    def test_transcript_existing_ticket_zero_events(
+        self,
+        client,
+        store,
+        event_bus,
+    ):
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="quiet", description="quiet"),
+        )
+        r = client.get(f"/api/v1/tickets/{ticket.id}/transcript")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["events"] == []
+        assert data["ticket"]["summary"] == "quiet"
+
+
 class TestPollEventsInternal:
     """Unit tests for the internal _poll_events function."""
 
