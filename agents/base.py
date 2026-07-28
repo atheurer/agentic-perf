@@ -24,6 +24,14 @@ from providers.llm.base import (
 logger = logging.getLogger(__name__)
 
 
+class HITLTimeoutError(Exception):
+    """Raised when the HITL wait loop times out twice consecutively.
+
+    The agent stops cleanly and leaves the ticket in awaiting_customer_guidance
+    rather than returning a "proceed with best judgment" message to the LLM.
+    """
+
+
 class AgentBase(ABC):
     # Default inner-loop iteration budget. Agents can override
     # via constructor. Set to 0 for unlimited iterations —
@@ -577,6 +585,12 @@ class AgentBase(ABC):
                         f"{self.agent_name} hit max iterations — pausing for guidance"
                     ),
                 )
+        except HITLTimeoutError as e:
+            # Clean stop after two consecutive HITL timeouts.  The ticket is
+            # already in awaiting_customer_guidance — just log and exit without
+            # emitting an error event, since this is expected/intentional.
+            logger.info(f"[{self.agent_name}] Stopped cleanly after HITL timeout: {e}")
+            return
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
             raise
@@ -1083,15 +1097,77 @@ class AgentBase(ABC):
                 return reply
 
         logger.warning(f"[{self.agent_name}] HITL timeout on {ticket_id}")
-        ticket = await self._get_ticket(ticket_id)
-        prev = ticket.get("previous_status")
-        if prev:
-            await self._transition_ticket(
-                ticket_id,
-                prev,
-                comment=f"HITL timeout — resuming from {prev}",
+
+        # Track consecutive timeouts on this agent instance.  On the first
+        # timeout we re-ask and keep waiting; on the second we stop entirely
+        # and leave the ticket paused for human input.  This prevents the LLM
+        # from autonomously "proceeding with best judgment" when the user has
+        # not responded — which leads to unguided analysis and wasted iterations.
+        self._hitl_timeout_count = getattr(self, "_hitl_timeout_count", 0) + 1
+
+        if self._hitl_timeout_count == 1:
+            # First timeout: add a warning comment and re-enter the wait loop
+            # for one more full timeout period.
+            logger.info(
+                f"[{self.agent_name}] First HITL timeout on {ticket_id} "
+                "— re-asking and waiting one more period"
             )
-        return "No response received within timeout. Proceed with best judgment."
+            await self._add_comment(
+                ticket_id,
+                "⏱️ No response received within the timeout window. "
+                "Still waiting for your guidance — please reply to continue. "
+                "The agent will pause permanently if there is no response.",
+            )
+            elapsed = 0.0
+            while elapsed < timeout:
+                await asyncio.sleep(self._HITL_POLL_INTERVAL)
+                elapsed += self._HITL_POLL_INTERVAL
+                ticket = await self._get_ticket(ticket_id)
+                if ticket.get("status") != "awaiting_customer_guidance":
+                    new_comments = ticket.get("comments", [])[comment_count:]
+                    user_replies = [
+                        c["body"]
+                        for c in new_comments
+                        if c.get("author") not in ("system", self.agent_name)
+                    ]
+                    reply = (
+                        "\n".join(user_replies)
+                        if user_replies
+                        else "User resumed ticket."
+                    )
+                    logger.info(
+                        f"[{self.agent_name}] Human input received after re-ask "
+                        f"on {ticket_id}"
+                    )
+                    if reply.strip().startswith("/"):
+                        handled = await self._handle_slash_command(
+                            ticket_id, reply.strip()
+                        )
+                        if handled is not None:
+                            return handled
+                    self._hitl_timeout_count = 0
+                    return reply
+
+            # Second timeout — fall through to the permanent-pause path below
+            self._hitl_timeout_count += 1
+
+        # Second (or subsequent) consecutive timeout: stop the agent and leave
+        # the ticket in awaiting_customer_guidance.  Raise an exception so the
+        # LLM loop exits cleanly without receiving a "proceed" message.
+        logger.warning(
+            f"[{self.agent_name}] Second HITL timeout on {ticket_id} "
+            "— stopping agent, ticket remains paused for human input"
+        )
+        await self._add_comment(
+            ticket_id,
+            "⏸️ No response received after two timeout periods. "
+            "The agent has stopped and is waiting for your reply. "
+            "Please respond to resume the investigation.",
+        )
+        raise HITLTimeoutError(
+            f"Agent {self.agent_name} stopped after two consecutive HITL "
+            f"timeouts on {ticket_id}. Ticket remains paused for human input."
+        )
 
     async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
         """Handle a slash command issued by the user during HITL.
