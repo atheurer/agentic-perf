@@ -184,7 +184,10 @@ class UserStore:
         """Find a user by their token hash.  Returns None if not found."""
         with self._lock:
             for user in self._users.values():
-                if user.token_hash == token_h:
+                if user.token_hash and secrets.compare_digest(
+                    user.token_hash.encode("utf-8", errors="replace"),
+                    token_h.encode("utf-8", errors="replace"),
+                ):
                     return user.model_copy()
         return None
 

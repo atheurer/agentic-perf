@@ -59,7 +59,11 @@ def _make_multi_user_app(tmp_path):
 
 class TestDashboardTokenInjection:
     @pytest.fixture()
-    def legacy_app(self):
+    def legacy_app(self, monkeypatch):
+        monkeypatch.setattr(
+            "state_store.main._load_config_file",
+            lambda: {},
+        )
         app = (
             create_app.__wrapped__()
             if hasattr(create_app, "__wrapped__")
