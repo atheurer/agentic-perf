@@ -118,3 +118,70 @@ def stop_all(body: StopRequest, request: Request):
         )
         affected.append(updated)
     return {"affected": affected, "count": len(affected)}
+
+
+@router.post("/tickets/{ticket_id}/force-close")
+def force_close_ticket(ticket_id: str, request: Request):
+    """Close a ticket regardless of current status.
+
+    Administrative endpoint for cancelling tickets that cannot
+    reach CLOSED through normal transitions (e.g., NEW or
+    TRIAGE_PENDING). Requires admin in multi-user mode.
+    """
+    principal = _get_principal(request)
+    multi_user = _is_multi_user(request)
+    if multi_user:
+        require_admin(principal)
+    else:
+        store = request.app.state.store
+        try:
+            ticket = store.get_ticket(ticket_id)
+        except TicketNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        require_write_access(principal, ticket, multi_user)
+
+    store = request.app.state.store
+    try:
+        return store.force_close(
+            ticket_id,
+            comment="Force-closed by admin",
+        )
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/tickets/{ticket_id}")
+def delete_ticket(ticket_id: str, request: Request):
+    """Delete a ticket and its backing file.
+
+    Permanently removes a ticket from the store. Only closed
+    tickets may be deleted. Requires admin in multi-user mode.
+    """
+    principal = _get_principal(request)
+    multi_user = _is_multi_user(request)
+    store = request.app.state.store
+
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if ticket.status != TicketStatus.CLOSED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Ticket {ticket_id} must be closed before deletion"
+                f" (current status: {ticket.status.value})"
+            ),
+        )
+
+    if multi_user:
+        require_admin(principal)
+    else:
+        require_write_access(principal, ticket, multi_user)
+
+    try:
+        store.delete_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"deleted": ticket_id}
