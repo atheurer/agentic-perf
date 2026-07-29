@@ -121,10 +121,9 @@ class OrchestratorConfig:
 
         # LLM reasoning effort. Controls how much "thinking"
         # models do. None uses the model's default behavior.
-        self.llm_reasoning_effort: str | None = (
-            os.environ.get("LLM_REASONING_EFFORT")
-            or llm_cfg.get("reasoning_effort")
-        )
+        self.llm_reasoning_effort: str | None = os.environ.get(
+            "LLM_REASONING_EFFORT"
+        ) or llm_cfg.get("reasoning_effort")
 
         # LLM request timeout (seconds). Applied to each
         # individual LLM API call. 0 disables the timeout.
