@@ -130,12 +130,27 @@ class ProvisioningAgent(AgentBase):
             mcp_tools = [t for t in mcp_tools if t.name not in _PROVIDER_ONLY_TOOLS]
         self.tools = mcp_tools + self.tools
 
-        # Scope tools based on harness type when using
-        # Jumpstarter. Self-installing harnesses need
-        # only flash + boot + key injection — hiding
-        # install/config tools prevents exploration.
+        # Scope tools based on harness and provider.
+        # For Jumpstarter: deny install tools unless the
+        # harness explicitly requires installation (i.e.,
+        # is NOT self-installing). Most Jumpstarter
+        # harnesses (boot-time, arcaflow-plugins) are
+        # self-installing — the OS image or container
+        # runtime provides everything. Default to deny
+        # when harness is unknown to prevent the agent
+        # from wasting iterations on package installs.
+        ticket = await self._get_ticket(ticket_id)
         if jmp_tools is not None:
-            ticket = await self._get_ticket(ticket_id)
+            harness = (
+                ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+            )
+            # Only keep install tools if the harness is
+            # known AND not self-installing.
+            if not harness or harness in self._SELF_INSTALLING:
+                self.tools = [
+                    t for t in self.tools if t.name not in self._PROVISIONING_DENY_TOOLS
+                ]
+        else:
             self._apply_tool_scoping(ticket)
 
         try:
