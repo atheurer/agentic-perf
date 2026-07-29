@@ -46,7 +46,7 @@ class ReviewAgent(AgentBase):
         self._skill_provider = skill_provider
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
-        self._user_approved_submit: bool = False
+        self._user_approved_submit: bool = True
 
         local_tools = [
             t
@@ -120,12 +120,12 @@ class ReviewAgent(AgentBase):
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
 
-        # Auto-approve submission when the ticket doesn't
-        # require human-in-the-loop review.
+        # Block auto-submit only when the ticket
+        # explicitly requests interactive review.
         ticket = await self._get_ticket(ticket_id)
         directives = ticket.get("custom_fields", {}).get("directives", {})
-        if not directives.get("user_pre_run_approval", True):
-            self._user_approved_submit = True
+        if directives.get("review_mode") == "interactive":
+            self._user_approved_submit = False
 
         review_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -166,16 +166,28 @@ class ReviewAgent(AgentBase):
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
         prompt = REVIEW_SYSTEM_PROMPT
-        if not directives.get("user_pre_run_approval", True):
+        if directives.get("review_mode") == "interactive":
             prompt += (
-                "\n\n## Automated Review Mode\n\n"
-                "This ticket has user_pre_run_approval=false. "
-                "Do NOT wait for user approval. Analyze the "
-                "results and call submit_review_result "
-                "immediately with your findings. Skip the "
-                "iterative investigation loop (Step 5) — go "
-                "directly from analysis (Step 4) to "
-                "submission (Step 6)."
+                "\n\n## Interactive Review Mode\n\n"
+                "This ticket has review_mode=interactive. "
+                "OVERRIDE the default auto-submit behavior. "
+                "Instead:\n\n"
+                "1. Present your initial findings to the "
+                "user via request_clarification. Include: "
+                "the primary metric result, any apparent "
+                "bottlenecks, and what you'd like to "
+                "investigate next.\n"
+                "2. The user provides direction (e.g., "
+                "'check per-CPU usage', 'look at TCP "
+                "tuning').\n"
+                "3. Perform the requested analysis and "
+                "present findings via "
+                "request_clarification.\n"
+                "4. Repeat until the user says 'done', "
+                "'submit', or 'wrap it up'.\n\n"
+                "Do NOT call submit_review_result until "
+                "the user explicitly ends the "
+                "investigation."
             )
         return prompt
 

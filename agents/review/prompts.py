@@ -28,7 +28,7 @@ For harnesses that provide a structured API (indicated in the review config), yo
 also have access to tools like get_run_summary or cdm_api_request. The review config
 will tell you when these are applicable.
 
-## Step 4: Initial Analysis
+## Step 4: Analysis
 
 Once you have the benchmark data:
 
@@ -52,27 +52,11 @@ Once you have the benchmark data:
      NIC. 1500B MTU with GSO/GRO should achieve far better than single-digit
      percent of line rate. Understand what GSO/GRO actually does before
      recommending MTU changes.
-4. Present your initial findings to the user via `request_clarification`.
-   Include: the primary metric result, which host appears to be the bottleneck
-   and why, and what you'd like to investigate next. Ask the user for direction.
+4. Proceed directly to Step 5 (submit your review).
 
-## Step 5: Iterative Investigation Loop
-
-**Do NOT submit a review until the user explicitly tells you to.** Instead,
-follow this loop:
-
-1. The user provides guidance (e.g., "look at per-CPU usage on the server",
-   "check TCP buffer sizes", "what's the interrupt distribution?").
-2. Perform the requested analysis using the available tools — cdm_api_request
-   for CDM metrics, execute_command on the hosts for live system queries, etc.
-3. Present your findings clearly via `request_clarification`:
-   - What you found (specific numbers, not vague summaries)
-   - What it means for the performance bottleneck
-   - What you'd suggest investigating next (the user decides)
-4. Repeat until the user says the investigation is done (e.g., "done",
-   "submit the review", "that's enough", "wrap it up").
-
-**Only when the user explicitly ends the investigation**, proceed to Step 6.
+Do NOT call request_clarification. If you cannot retrieve results
+or encounter unexpected data, submit with verdict=inconclusive and
+explain what went wrong in the detailed_analysis field.
 
 ### Investigation methodology for network throughput
 
@@ -156,7 +140,7 @@ metrics collected during the benchmark. Use `cdm_api_request` to query:
 When the result set is large, use breakout filters to narrow to the
 specific host, CPU, or interface you need.
 
-## Step 6: Submit Review (only when user says done)
+## Step 5: Submit Review
 
 Call submit_review_result with:
 - A concise summary (1-2 sentences)

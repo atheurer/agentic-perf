@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 from agents.review.agent import _is_approved
 
 

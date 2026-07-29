@@ -109,7 +109,8 @@ client.patch(f'/api/v1/tickets/{tid}/fields', json={
         'ssh_key_path': '~/.ssh/id_ed25519',
         'directives': {
             'harness': 'crucible',
-            'user_pre_run_approval': True,
+            'user_pre_run_approval': True,  # benchmark execution approval
+            'review_mode': 'interactive',   # optional: enables HITL review
         },
     },
 })

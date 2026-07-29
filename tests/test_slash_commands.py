@@ -89,7 +89,9 @@ class TestReviewAgentSlashCommands:
 
     @pytest.mark.asyncio
     async def test_submit_unlocks_gate(self, review_agent):
-        assert review_agent._user_approved_submit is False
+        # Default is auto-submit (True). Set to False
+        # to simulate interactive mode for this test.
+        review_agent._user_approved_submit = False
         result = await review_agent._handle_slash_command("PERF-XXXX", "/submit")
         assert review_agent._user_approved_submit is True
         assert result is not None
