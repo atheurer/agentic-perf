@@ -29,12 +29,14 @@ environment variable (defaults to `~/.agentic-perf`).
         "region": "us-east5",
         "base_url": null,
         "gemini_api_key": null,
-        "timeout": 120
+        "timeout": 120,
+        "reasoning_effort": "medium"
     },
     "agent_models": {
         "review": {
             "provider": "anthropic",
-            "model": "claude-sonnet-4-6"
+            "model": "claude-sonnet-4-6",
+            "reasoning_effort": "high"
         },
         "benchmark": {
             "provider": "gemini",
@@ -94,6 +96,7 @@ overridden by `agent_models`.
 | `base_url` | string | — | `OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoints |
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
+| `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). |
 
 #### Supported Providers
 
@@ -127,7 +130,12 @@ cheaper model for triage and a more capable one for review.
     "agent_models": {
         "review": {
             "provider": "anthropic",
-            "model": "claude-sonnet-4-6"
+            "model": "claude-sonnet-4-6",
+            "reasoning_effort": "high"
+        },
+        "introspection": {
+            "model": "claude-haiku-4-5",
+            "reasoning_effort": "low"
         },
         "default": {
             "provider": "gemini",
@@ -143,7 +151,8 @@ cheaper model for triage and a more capable one for review.
 3. Built-in agent defaults — reasoning-heavy agents default to Sonnet
 4. Top-level `llm.provider` / `llm.model` — global default
 
-Each override object supports `provider` and `model` keys.
+Each override object supports `provider`, `model`, and `reasoning_effort`
+keys.
 
 #### Built-in Agent Defaults
 
@@ -188,7 +197,8 @@ Individual tickets can override the LLM at runtime via
 {
     "llm_override": {
         "provider": "anthropic",
-        "model": "claude-opus-4-8"
+        "model": "claude-opus-4-8",
+        "reasoning_effort": "high"
     }
 }
 ```
@@ -444,6 +454,7 @@ variable overrides, which take precedence over the file.
 | `LLM_MODEL` | `llm.model` |
 | `LLM_BACKEND` | `llm.backend` |
 | `LLM_TIMEOUT` | `llm.timeout` |
+| `LLM_REASONING_EFFORT` | `llm.reasoning_effort` |
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `ANTHROPIC_VERTEX_PROJECT_ID` | `llm.project_id` |
 | `CLOUD_ML_REGION` | `llm.region` |

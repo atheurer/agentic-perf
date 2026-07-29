@@ -58,6 +58,9 @@ def _make_llm_factory(config: OrchestratorConfig):
             model=agent_cfg.get("model", ""),
         )
         provider.default_timeout = config.llm_timeout
+        effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
+        if effort:
+            provider.reasoning_effort = effort
         return provider
 
     return factory
@@ -349,6 +352,9 @@ async def run_agent_task(
                             provider=llm_override.get("provider", ""),
                             model=llm_override.get("model", ""),
                         )
+                        override_effort = llm_override.get("reasoning_effort")
+                        if override_effort:
+                            override_llm.reasoning_effort = override_effort
                         agent.llm = override_llm
                         logger.info(
                             f"LLM override for {ticket_id}:"
@@ -868,6 +874,8 @@ def _maybe_start_introspection(
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = _make_llm_provider(config)
     llm.default_timeout = config.llm_timeout
+    if config.llm_reasoning_effort:
+        llm.reasoning_effort = config.llm_reasoning_effort
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()

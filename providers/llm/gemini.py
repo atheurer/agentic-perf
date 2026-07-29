@@ -136,6 +136,10 @@ class GeminiLLMProvider(LLMProvider):
             config_kwargs["automatic_function_calling"] = (
                 types.AutomaticFunctionCallingConfig(disable=True)
             )
+        if self.reasoning_effort is not None:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=self.reasoning_effort,
+            )
 
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:

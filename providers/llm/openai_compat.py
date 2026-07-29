@@ -66,6 +66,8 @@ class OpenAICompatLLMProvider(LLMProvider):
         }
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
 
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:
