@@ -357,11 +357,15 @@ class ProvisioningAgent(AgentBase):
                 fields["provisioning_complete"] = False
 
         # Validate hosts_provisioned entries are IPs,
-        # not hostnames or board names.
+        # not hostnames or board names (only for Jumpstarter).
         import re as _re
 
         _ip_pattern = _re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
-        if prov_complete and fields.get("hosts_provisioned"):
+        if (
+            prov_complete
+            and cf.get("resource_provider") == "jumpstarter"
+            and fields.get("hosts_provisioned")
+        ):
             invalid = [
                 h for h in fields["hosts_provisioned"] if not _ip_pattern.match(str(h))
             ]
