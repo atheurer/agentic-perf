@@ -23,6 +23,17 @@ _MCP_TOOL_NAMES = frozenset(
 ) | {"list_harness_docs", "read_harness_doc"}
 
 
+def _is_approved(reply: str) -> bool:
+    cleaned = reply.strip().lower().lstrip("/")
+    return cleaned in (
+        "done",
+        "submit",
+        "submit the review",
+        "that's enough",
+        "wrap it up",
+    ) or cleaned.startswith("done")
+
+
 class ReviewAgent(AgentBase):
     def __init__(
         self,
@@ -45,14 +56,7 @@ class ReviewAgent(AgentBase):
 
         async def _request_clarification(question: str) -> str:
             reply = await self._do_request_clarification(question)
-            lower = reply.strip().lower()
-            if lower in (
-                "done",
-                "submit",
-                "submit the review",
-                "that's enough",
-                "wrap it up",
-            ) or lower.startswith("done"):
+            if _is_approved(reply):
                 self._user_approved_submit = True
             return reply
 
@@ -303,14 +307,7 @@ class ReviewAgent(AgentBase):
                 "or reply 'done' to accept and submit."
             )
             reply = await self._request_human_input(ticket_id, question)
-            lower = reply.strip().lower()
-            if lower in (
-                "done",
-                "submit",
-                "submit the review",
-                "that's enough",
-                "wrap it up",
-            ) or lower.startswith("done"):
+            if _is_approved(reply):
                 self._user_approved_submit = True
             else:
                 return
