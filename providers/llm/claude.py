@@ -118,6 +118,9 @@ class ClaudeLLMProvider(LLMProvider):
         }
         if tools:
             kwargs["tools"] = [self._tool_def_to_dict(t) for t in tools]
+        if self.reasoning_effort is not None:
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": self.reasoning_effort}
 
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:
