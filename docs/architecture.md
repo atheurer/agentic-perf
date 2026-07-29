@@ -454,7 +454,8 @@ harness schema. Handles both remotehosts and Kubernetes endpoint types.
 **Review Agent** — Retrieves results from the benchmark harness, analyzes
 metrics, and produces a verdict (hypothesis confirmed/refuted/inconclusive)
 with key metrics and recommendations. Harness-agnostic: discovers how to
-retrieve results through skill providers.
+retrieve results through skill providers. Defaults to auto-submit — set
+`review_mode: interactive` in directives for iterative HITL investigation.
 
 **Introspection Agent** — Continuous passive observer that runs alongside
 the pipeline agents without participating in the state machine. Uses a
