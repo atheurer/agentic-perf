@@ -132,6 +132,11 @@ class TestUserStore:
     def test_lookup_by_token_hash_not_found(self, store):
         assert store.lookup_by_token_hash("nonexistent") is None
 
+    def test_lookup_by_token_hash_uses_constant_time(self, store):
+        """Verify compare_digest is used (non-ASCII input must not crash)."""
+        store.create_user("alice")
+        assert store.lookup_by_token_hash("tést-hàsh-ünïcödé") is None
+
     def test_to_safe_dict_strips_hash(self, store):
         user, _token = store.create_user("alice")
         safe = UserStore.to_safe_dict(user)

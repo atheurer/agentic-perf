@@ -102,9 +102,18 @@ def make_auth_dependency(
             )
         presented = auth_header[7:]
 
+        if not presented:
+            raise HTTPException(
+                status_code=401,
+                detail="Empty bearer token",
+            )
+
         principal: Principal | None = None
 
-        if presented == token:
+        if token and secrets.compare_digest(
+            presented.encode("utf-8", errors="replace"),
+            token.encode("utf-8", errors="replace"),
+        ):
             principal = Principal(
                 kind="service",
                 username="deployment",
