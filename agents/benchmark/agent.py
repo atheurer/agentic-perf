@@ -112,22 +112,9 @@ class BenchmarkAgent(AgentBase):
         )
         await mcp.connect(infra_server, name="infra")
 
-        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
-        # Returns allowed tool names for filtering, or None.
-        from agents.jumpstarter_mcp import attach_jumpstarter_mcp
-
-        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
-
         self._mcp = mcp
 
-        # Get all tools, but if Jumpstarter is attached,
-        # exclude lease management tools (resource provider's
-        # job, not the agent's).
         all_tools = await mcp.list_tools()
-        if jmp_tools is not None:
-            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
-
-            all_tools = [t for t in all_tools if t.name not in _PROVIDER_ONLY_TOOLS]
         self.tools = all_tools + self.tools
 
         try:
@@ -351,16 +338,33 @@ class BenchmarkAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def _collect_jumpstarter_diagnostics(self) -> str:
-        """Collect diagnostics via Jumpstarter tunnel."""
-        if self._mcp is None:
-            return "No MCP connection available"
-        from agents.jumpstarter_mcp import collect_diagnostics
+        """Collect diagnostics for Jumpstarter boards.
 
-        return await collect_diagnostics(
-            self._mcp,
-            ticket_id=self._ticket_id or "",
-            get_ticket=self._get_ticket,
-        )
+        The platform agent uses the Jumpstarter Python SDK
+        which doesn't leave a persistent socket. Board-level
+        diagnostics (serial, power state) are captured by
+        the platform agent during provisioning and stored
+        in ticket fields. The benchmark agent reports what
+        is available from the ticket.
+        """
+        if not self._ticket_id:
+            return "No ticket context for diagnostics"
+        try:
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            diag = []
+            hosts = cf.get("hosts_provisioned", [])
+            if hosts:
+                diag.append(f"Hosts: {', '.join(str(h) for h in hosts)}")
+            board = cf.get("platform_board", "")
+            if board:
+                diag.append(f"Board: {board}")
+            flash_dur = cf.get("platform_flash_duration_s")
+            if flash_dur:
+                diag.append(f"Flash duration: {flash_dur:.0f}s")
+            return "\n".join(diag) if diag else "No diagnostics available"
+        except Exception:
+            return "Could not retrieve diagnostics from ticket"
 
     async def _handle_budget_pause(self, ticket_id: str) -> None:
         """Route budget-exhausted investigation tickets
