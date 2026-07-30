@@ -6,10 +6,12 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from providers.secrets.base import SecretsBackendError
+from providers.secrets.bitwarden import BitwardenSecretsProvider
 from providers.secrets.cascade import (
     CascadingSecretsProvider,
     build_cascade_for_user,
@@ -21,6 +23,31 @@ def _write_secret(base, path, content="secret-value"):
     full = base / path
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(content)
+
+
+def _make_fake_vault(
+    secrets: dict[str, str],
+    project_id: str = "proj-1",
+    org_id: str = "org-1",
+    error_on_list: Exception | None = None,
+) -> BitwardenSecretsProvider:
+    """Build a BitwardenSecretsProvider with fake client for cascade tests."""
+    from tests.test_bitwarden_secrets import _FakeClient, _FakeSecretsAPI
+
+    api = _FakeSecretsAPI(
+        secrets,
+        project_id=project_id,
+        org_id=org_id,
+        error_on_list=error_on_list,
+    )
+    client = _FakeClient(api)
+    return BitwardenSecretsProvider(
+        organization_id=org_id,
+        project_id=project_id,
+        access_token="fake-token",
+        _client=client,
+        _clock=lambda: 1000.0,
+    )
 
 
 class TestCascadingSecretsProvider:
@@ -549,6 +576,40 @@ class _EphemeralProvider(LocalSecretsProvider):
             self.exited.append(path)
 
 
+class TestBinaryFileProbe:
+    """Binary files should be found by cascade secret_file() via get_secret_file() fallback."""
+
+    async def test_binary_file_found_through_cascade(self, tmp_path):
+        root = tmp_path / "secrets"
+        root.mkdir()
+        binary_path = root / "cert.p12"
+        binary_path.write_bytes(b"\x00\x01\x02\x03\xff\xfe")
+
+        cascade = CascadingSecretsProvider([("shared", LocalSecretsProvider(root))])
+
+        async with cascade.secret_file("cert.p12") as path:
+            assert path is not None
+            assert path.read_bytes() == b"\x00\x01\x02\x03\xff\xfe"
+
+    async def test_binary_local_beats_vault(self, tmp_path):
+        """Local binary file should win over vault text secret."""
+        root = tmp_path / "secrets"
+        root.mkdir()
+        (root / "cert.p12").write_bytes(b"\x00\x01\x02\xff")
+
+        vault = _make_fake_vault({"cert.p12": "vault-text-version"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        async with cascade.secret_file("cert.p12") as path:
+            assert path is not None
+            assert path.read_bytes() == b"\x00\x01\x02\xff"
+
+
 class TestSecretFileEphemeralProvider:
     """Tests demonstrating the vault-like ephemeral provider pattern.
 
@@ -596,17 +657,12 @@ class TestSecretFileEphemeralProvider:
         assert not materialized_path.exists()
         assert provider.exited == ["token"]
 
-    async def test_cascade_probe_limitation_documented(
+    async def test_cascade_secret_file_finds_ephemeral_layers(
         self,
         secrets_root,
         tmp_path,
     ):
-        """Cascade probing via get_secret_file misses ephemeral layers.
-
-        This is the known limitation documented in the cascade's
-        secret_file() docstring — PR 3 updates the probing when
-        vault layers are wired into the cascade.
-        """
+        """Cascade probes via get_secret() so vault-like layers win."""
         ephemeral = _EphemeralProvider(
             secrets_root,
             tmp_root=tmp_path / "eph",
@@ -615,7 +671,383 @@ class TestSecretFileEphemeralProvider:
         cascade = CascadingSecretsProvider([("vault:shared", ephemeral)])
 
         async with cascade.secret_file("token") as path:
-            assert path is None
-
-        async with ephemeral.secret_file("token") as path:
             assert path is not None
+            assert path.read_text() == "ephemeral-value"
+
+        assert ephemeral.entered == ["token"]
+        assert ephemeral.exited == ["token"]
+
+
+# ---------------------------------------------------------------------------
+# PR 3 — vault layer wiring tests
+# ---------------------------------------------------------------------------
+
+
+class TestCascadeWithVaultLayers:
+    """Cascade with mixed local + vault (Bitwarden) layers."""
+
+    async def test_local_beats_vault_within_tier(self, tmp_path):
+        """Local file on disk takes precedence over vault in same tier."""
+        root = tmp_path / "secrets"
+        _write_secret(root, "token", "local-value")
+
+        vault = _make_fake_vault({"token": "vault-value"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        result = await cascade.get_secret("token")
+        assert result == "local-value"
+
+    async def test_vault_fills_in_for_missing_local(self, tmp_path):
+        """Vault provides secrets that don't exist on disk."""
+        root = tmp_path / "secrets"
+        root.mkdir(parents=True)
+
+        vault = _make_fake_vault({"cloud/api-key": "vault-key"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        assert await cascade.get_secret("cloud/api-key") == "vault-key"
+
+    async def test_vault_shadow_logging(self, tmp_path, caplog):
+        """Shadow detection fires when local masks vault."""
+        root = tmp_path / "secrets"
+        _write_secret(root, "token", "local-value")
+
+        vault = _make_fake_vault({"token": "vault-value"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        with caplog.at_level(logging.INFO):
+            await cascade.get_secret("token")
+
+        assert "shadowed" in caplog.text
+        assert "vault:shared" in caplog.text
+
+    async def test_vault_secret_file_materializes(self, tmp_path):
+        """Vault secrets are materialized via secret_file() in cascade."""
+        root = tmp_path / "secrets"
+        root.mkdir(parents=True)
+
+        vault = _make_fake_vault({"ssh/id_rsa": "key-material"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        async with cascade.secret_file("ssh/id_rsa") as path:
+            assert path is not None
+            assert path.read_text() == "key-material"
+            assert path.stat().st_mode & 0o777 == 0o600
+
+        assert not path.exists()
+
+    async def test_local_secret_file_wins_over_vault(self, tmp_path):
+        """When local has the file, secret_file() yields local's path."""
+        root = tmp_path / "secrets"
+        _write_secret(root, "token", "local-value")
+
+        vault = _make_fake_vault({"token": "vault-value"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        async with cascade.secret_file("token") as path:
+            assert path is not None
+            assert path.read_text() == "local-value"
+            assert path == root / "token"
+
+    async def test_vault_error_propagates_through_cascade(self, tmp_path):
+        """SecretsBackendError from vault propagates, not silently masked."""
+        root = tmp_path / "secrets"
+        root.mkdir(parents=True)
+
+        vault = _make_fake_vault(
+            {},
+            error_on_list=ConnectionError("vault down"),
+        )
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        with pytest.raises(SecretsBackendError, match="vault down"):
+            await cascade.get_secret("anything")
+
+    async def test_list_secrets_includes_vault(self, tmp_path):
+        """list_secrets() merges local and vault keys."""
+        root = tmp_path / "secrets"
+        _write_secret(root, "local-key", "v1")
+
+        vault = _make_fake_vault({"vault-key": "v2"})
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(root)),
+                ("vault:shared", vault),
+            ]
+        )
+
+        result = await cascade.list_secrets()
+        assert "local-key" in result
+        assert "vault-key" in result
+
+
+class TestBuildCascadeWithVault:
+    """Tests for build_cascade_for_user with vault_config.
+
+    Mocks ``_create_vault_layer`` to inject fake Bitwarden providers
+    so tests don't need the real SDK or access token.
+    """
+
+    @pytest.fixture()
+    def secrets_root(self, tmp_path):
+        root = tmp_path / "secrets"
+        root.mkdir()
+        _write_secret(root, "shared-token", "shared-val")
+        return root
+
+    @pytest.fixture()
+    def _mock_vault_layer(self):
+        """Replace _create_vault_layer with one that returns fake vaults."""
+        created: list[tuple[str, str]] = []
+
+        def _fake_create(bw_config, project_id):
+            created.append((bw_config.get("organization_id", ""), project_id))
+            return _make_fake_vault(
+                {"vault-secret": "vault-val"},
+                project_id=project_id,
+                org_id=bw_config.get("organization_id", "org-1"),
+            )
+
+        with patch(
+            "providers.secrets.cascade._create_vault_layer",
+            side_effect=_fake_create,
+        ):
+            yield created
+
+    def test_no_vault_config_unchanged(self, secrets_root):
+        """Without vault_config, cascade is local-only (backward compat)."""
+        cascade = build_cascade_for_user("alice", [], secrets_root)
+        labels = [label for label, _ in cascade._layers]
+        assert labels == ["shared"]
+
+    def test_vault_shared_layer_added(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        """vault:shared appears after shared local when configured."""
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+            },
+        }
+        cascade = build_cascade_for_user(
+            "alice",
+            [],
+            secrets_root,
+            vault_config=vault_config,
+        )
+        labels = [label for label, _ in cascade._layers]
+        assert labels == ["shared", "vault:shared"]
+
+    def test_vault_group_layer_ordering(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        """vault:group:<name> appears after local group layer."""
+        group_dir = secrets_root / "groups" / "devs"
+        group_dir.mkdir(parents=True)
+        _write_secret(group_dir, "key", "group-local")
+
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+                "group_project_ids": {"devs": "proj-devs"},
+            },
+        }
+        cascade = build_cascade_for_user(
+            "alice",
+            ["devs"],
+            secrets_root,
+            vault_config=vault_config,
+        )
+        labels = [label for label, _ in cascade._layers]
+        assert labels == [
+            "group:devs",
+            "vault:group:devs",
+            "shared",
+            "vault:shared",
+        ]
+
+    def test_vault_group_without_local_dir(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        """Vault group layer added even when local group dir is absent."""
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+                "group_project_ids": {"devs": "proj-devs"},
+            },
+        }
+        cascade = build_cascade_for_user(
+            "alice",
+            ["devs"],
+            secrets_root,
+            vault_config=vault_config,
+        )
+        labels = [label for label, _ in cascade._layers]
+        assert "vault:group:devs" in labels
+        assert "group:devs" not in labels
+
+    def test_unconfigured_group_skipped(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        """Groups not in group_project_ids get no vault layer."""
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+                "group_project_ids": {"devs": "proj-devs"},
+            },
+        }
+        cascade = build_cascade_for_user(
+            "alice",
+            ["devs", "ops"],
+            secrets_root,
+            vault_config=vault_config,
+        )
+        labels = [label for label, _ in cascade._layers]
+        assert "vault:group:devs" in labels
+        assert "vault:group:ops" not in labels
+
+    def test_create_vault_layer_receives_correct_project_ids(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        """Verify the correct project IDs are passed to vault creation."""
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+                "group_project_ids": {"devs": "proj-devs"},
+            },
+        }
+        build_cascade_for_user(
+            "alice",
+            ["devs"],
+            secrets_root,
+            vault_config=vault_config,
+        )
+        created_ids = [pid for _, pid in _mock_vault_layer]
+        assert "proj-devs" in created_ids
+        assert "proj-shared" in created_ids
+
+
+class TestDispatcherVaultConfig:
+    """Dispatcher passes vault_config to build_cascade_for_user."""
+
+    @pytest.fixture()
+    def secrets_root(self, tmp_path):
+        root = tmp_path / "secrets"
+        root.mkdir()
+        _write_secret(root, "token", "shared-val")
+        return root
+
+    @pytest.fixture()
+    def _mock_vault_layer(self):
+        def _fake_create(bw_config, project_id):
+            return _make_fake_vault(
+                {},
+                project_id=project_id,
+                org_id=bw_config.get("organization_id", "org-1"),
+            )
+
+        with patch(
+            "providers.secrets.cascade._create_vault_layer",
+            side_effect=_fake_create,
+        ):
+            yield
+
+    def test_vault_config_forwarded(
+        self,
+        secrets_root,
+        _mock_vault_layer,
+    ):
+        from orchestrator.dispatcher import Dispatcher
+        from state_store.identity import UserStore
+
+        user_store = UserStore(persist_path=secrets_root / "users.json")
+        user_store.create_user("alice")
+
+        vault_config = {
+            "bitwarden": {
+                "organization_id": "org-1",
+                "shared_project_id": "proj-shared",
+            },
+        }
+        dispatcher = Dispatcher(
+            state_store_url="http://localhost:8090",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+            secrets_provider=LocalSecretsProvider(secrets_root),
+            user_store=user_store,
+            secrets_root=secrets_root,
+            vault_config=vault_config,
+        )
+        cascade = dispatcher._get_secrets_for_ticket(
+            {"created_by": "alice"},
+        )
+        assert isinstance(cascade, CascadingSecretsProvider)
+        labels = [label for label, _ in cascade._layers]
+        assert "vault:shared" in labels
+
+    def test_no_vault_config_backward_compat(self, secrets_root):
+        from orchestrator.dispatcher import Dispatcher
+        from state_store.identity import UserStore
+
+        user_store = UserStore(persist_path=secrets_root / "users.json")
+        user_store.create_user("alice")
+
+        dispatcher = Dispatcher(
+            state_store_url="http://localhost:8090",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+            secrets_provider=LocalSecretsProvider(secrets_root),
+            user_store=user_store,
+            secrets_root=secrets_root,
+        )
+        cascade = dispatcher._get_secrets_for_ticket(
+            {"created_by": "alice"},
+        )
+        assert isinstance(cascade, CascadingSecretsProvider)
+        labels = [label for label, _ in cascade._layers]
+        assert "vault:shared" not in labels

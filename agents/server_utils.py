@@ -71,7 +71,12 @@ def build_skill_provider():
 
 
 def build_secrets_provider():
-    """Construct a SecretsProvider from environment variables."""
+    """Construct a SecretsProvider from environment and config.
+
+    Builds a local provider from env vars, then wraps it in a cascade
+    with a vault layer when Bitwarden Secrets Manager is configured
+    in ``~/.agentic-perf/config.json``.
+    """
     from providers.secrets.factory import create_secrets_provider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
@@ -79,7 +84,49 @@ def build_secrets_provider():
     secrets_path = os.environ.get("SECRETS_PATH")
     if secrets_path:
         config["path"] = secrets_path
-    return create_secrets_provider(backend, **config)
+    local = create_secrets_provider(backend, **config)
+
+    vault_config = _load_vault_config()
+    bw_config = (vault_config or {}).get("bitwarden", {})
+    shared_project_id = bw_config.get("shared_project_id")
+    if shared_project_id and bw_config.get("organization_id"):
+        try:
+            from providers.secrets.cascade import CascadingSecretsProvider
+            from providers.secrets.factory import create_bitwarden_provider
+
+            vault = create_bitwarden_provider(
+                organization_id=bw_config["organization_id"],
+                project_id=shared_project_id,
+                server_url=bw_config.get("server_url"),
+                cache_ttl_seconds=bw_config.get("cache_ttl_seconds", 60),
+            )
+            return CascadingSecretsProvider(
+                [
+                    ("shared", local),
+                    ("vault:shared", vault),
+                ]
+            )
+        except ImportError:
+            logger.info(
+                "bitwarden-sdk not installed; using local secrets only",
+            )
+
+    return local
+
+
+def _load_vault_config() -> dict | None:
+    """Load vault config from ``~/.agentic-perf/config.json``."""
+    import json
+
+    from paths import CONFIG_PATH
+
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return cfg.get("secrets")
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def build_repo_cache():

@@ -438,3 +438,48 @@ class TestCascadeErrorPropagation:
 
         with pytest.raises(SecretsBackendError, match="vault unreachable"):
             await cascade.get_secret("token")
+
+
+# ---------------------------------------------------------------------------
+# Factory tests
+# ---------------------------------------------------------------------------
+
+
+class TestFactory:
+    """Tests for create_secrets_provider and create_bitwarden_provider."""
+
+    def test_factory_creates_local(self):
+        from providers.secrets.factory import create_secrets_provider
+
+        provider = create_secrets_provider("local")
+        assert isinstance(provider, LocalSecretsProvider)
+
+    def test_factory_unknown_backend_raises(self):
+        from providers.secrets.factory import create_secrets_provider
+
+        with pytest.raises(ValueError, match="Unknown"):
+            create_secrets_provider("unknown")
+
+    def test_factory_bitwarden_not_standalone_backend(self):
+        """Bitwarden is a vault overlay, not a standalone backend."""
+        from providers.secrets.factory import create_secrets_provider
+
+        with pytest.raises(ValueError, match="Unknown"):
+            create_secrets_provider("bitwarden")
+
+    def test_factory_bitwarden_with_fake_token(self, tmp_path):
+        from providers.secrets.factory import create_bitwarden_provider
+
+        token_file = tmp_path / "access-token"
+        token_file.write_text("fake-factory-token")
+
+        with patch(
+            "providers.secrets.bitwarden._ACCESS_TOKEN_FILE",
+            token_file,
+        ):
+            with patch.dict("sys.modules", {"bitwarden_sdk": None}):
+                with pytest.raises(ImportError, match="bitwarden-sdk"):
+                    create_bitwarden_provider(
+                        organization_id="org-1",
+                        project_id="proj-1",
+                    )
