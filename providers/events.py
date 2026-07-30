@@ -130,26 +130,93 @@ class EventBus:
         self._cumulative: dict[str, CumulativeUsage] = {}
         self._last_event_time: dict[str, float] = {}
 
-    def _next_seq(self, ticket_id: str) -> int:
-        """Return the next sequence number for a ticket.
+    def _ensure_loaded_locked(self, ticket_id: str) -> None:
+        """Restore ticket sequence number and cumulative usage from jsonl.
 
-        On first call for a given ticket, counts lines in the existing
-        JSONL file so that sequence numbers survive restarts. Uses line
-        count (not embedded seq values) to stay consistent with
-        _read_from_file which renumbers events by line position.
+        MUST be called with self._lock held.
         """
-        if ticket_id not in self._seq:
-            line_count = 0
-            path = self._log_dir / f"{ticket_id}.jsonl"
-            if path.exists():
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        for line in f:
-                            if line.strip():
-                                line_count += 1
-                except Exception:
-                    logger.exception(f"Failed to count lines in {path}")
-            self._seq[ticket_id] = line_count
+        if ticket_id in self._seq:
+            return
+
+        self._seq[ticket_id] = 0
+        path = self._log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return
+
+        line_count = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    line_count += 1
+                    try:
+                        evt = json.loads(line)
+                        if evt.get("event_type") == "llm_usage":
+                            data = evt.get("data", {})
+                            agent_name = evt.get("agent", "")
+                            input_tokens = data.get("input_tokens", 0)
+                            output_tokens = data.get("output_tokens", 0)
+                            duration_ms = (
+                                data.get("duration_ms", 0)
+                                or data.get("total_duration_ms", 0)
+                                or 0
+                            )
+                            model = data.get("model", "")
+                            cache_read = data.get("cache_read_input_tokens", 0)
+                            cache_creation = data.get("cache_creation_input_tokens", 0)
+
+                            self._record_cumulative_in_memory(
+                                ticket_id,
+                                input_tokens,
+                                output_tokens,
+                                duration_ms,
+                                model,
+                                cache_read,
+                                cache_creation,
+                            )
+                            if agent_name:
+                                self._record_cumulative_in_memory(
+                                    f"{ticket_id}:{agent_name}",
+                                    input_tokens,
+                                    output_tokens,
+                                    duration_ms,
+                                    model,
+                                    cache_read,
+                                    cache_creation,
+                                )
+                    except Exception:
+                        continue
+        except Exception:
+            logger.exception(f"Failed to load ticket events from {path}")
+
+        self._seq[ticket_id] = line_count
+
+    def _record_cumulative_in_memory(
+        self,
+        key: str,
+        input_tokens: int,
+        output_tokens: int,
+        duration_ms: int,
+        model: str,
+        cache_read_input_tokens: int,
+        cache_creation_input_tokens: int,
+    ) -> None:
+        if key not in self._cumulative:
+            self._cumulative[key] = CumulativeUsage()
+        self._cumulative[key].record(
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            model,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+        )
+
+    def _next_seq(self, ticket_id: str) -> int:
+        """Return the next sequence number for a ticket."""
+        self._ensure_loaded_locked(ticket_id)
         self._seq[ticket_id] += 1
         return self._seq[ticket_id]
 
@@ -198,35 +265,34 @@ class EventBus:
         agent within the ticket.
         """
         with self._lock:
+            self._ensure_loaded_locked(ticket_id)
             # Ticket-level accumulation
-            if ticket_id not in self._cumulative:
-                self._cumulative[ticket_id] = CumulativeUsage()
-            self._cumulative[ticket_id].record(
+            self._record_cumulative_in_memory(
+                ticket_id,
                 input_tokens,
                 output_tokens,
                 duration_ms,
                 model,
-                cache_read_input_tokens=cache_read_input_tokens,
-                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
             )
 
             # Per-agent accumulation
             if agent_name:
-                agent_key = f"{ticket_id}:{agent_name}"
-                if agent_key not in self._cumulative:
-                    self._cumulative[agent_key] = CumulativeUsage()
-                self._cumulative[agent_key].record(
+                self._record_cumulative_in_memory(
+                    f"{ticket_id}:{agent_name}",
                     input_tokens,
                     output_tokens,
                     duration_ms,
                     model,
-                    cache_read_input_tokens=cache_read_input_tokens,
-                    cache_creation_input_tokens=cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
                 )
 
     def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
         """Get accumulated LLM usage for a ticket."""
         with self._lock:
+            self._ensure_loaded_locked(ticket_id)
             usage = self._cumulative.get(ticket_id)
             if usage is None:
                 return CumulativeUsage().to_dict()
@@ -239,6 +305,7 @@ class EventBus:
         includes agents that have recorded usage.
         """
         with self._lock:
+            self._ensure_loaded_locked(ticket_id)
             result = {}
             prefix = f"{ticket_id}:"
             for key, usage in self._cumulative.items():

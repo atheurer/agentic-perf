@@ -24,6 +24,14 @@ from providers.llm.base import (
 logger = logging.getLogger(__name__)
 
 
+class HITLTimeoutError(Exception):
+    """Raised when the HITL wait loop times out twice consecutively.
+
+    The agent stops cleanly and leaves the ticket in awaiting_customer_guidance
+    rather than returning a "proceed with best judgment" message to the LLM.
+    """
+
+
 class AgentBase(ABC):
     # Default inner-loop iteration budget. Agents can override
     # via constructor. Set to 0 for unlimited iterations —
@@ -81,6 +89,38 @@ class AgentBase(ABC):
     async def close(self) -> None:
         await self._client.aclose()
 
+    def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
+        """Count previous iterations (llm_request events) from the ticket's jsonl log file."""
+        import json
+
+        log_dir = self._events._log_dir if self._events else None
+        if not log_dir:
+            from paths import LOG_DIR
+
+            log_dir = LOG_DIR
+        path = log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return 0, 0
+        agent_iters = 0
+        global_iters = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if evt.get("event_type") == "llm_request":
+                            global_iters += 1
+                            if evt.get("agent") == self.agent_name:
+                                agent_iters += 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"Failed to read previous iteration counts from {path}: {e}")
+        return agent_iters, global_iters
+
     def _emit(
         self, ticket_id: str, event_type: str, data: dict[str, Any] | None = None
     ) -> None:
@@ -115,21 +155,34 @@ class AgentBase(ABC):
             },
         )
         try:
+            try:
+                previous_agent_iterations, previous_global_iterations = (
+                    self._get_previous_iteration_counts(ticket_id)
+                )
+            except Exception:
+                previous_agent_iterations, previous_global_iterations = 0, 0
+            iteration = previous_agent_iterations
+
             if self.max_iterations > 0:
+                remaining_agent = max(
+                    0, self.max_iterations - previous_agent_iterations
+                )
+                global_max = cf.get("global_max_iterations_override", 100)
+                remaining_global = max(0, global_max - previous_global_iterations)
                 messages.append(
                     {
                         "role": "user",
                         "content": (
                             f"[SYSTEM] Resource limits: you have"
-                            f" {self.max_iterations} iterations"
-                            f" (each iteration = 1 LLM call +"
-                            f" tool executions). Plan your work"
-                            f" to finish within this budget."
+                            f" {self.max_iterations} total iterations allowed for this agent phase"
+                            f" (already consumed: {previous_agent_iterations}, remaining: {remaining_agent})."
+                            f" Global ticket iteration limit: {global_max}"
+                            f" (already consumed across all agents: {previous_global_iterations}, remaining globally: {remaining_global})."
+                            f" Plan your work to finish within these budgets."
                         ),
                     }
                 )
 
-            iteration = 0
             self._budget_grace = False
             self._iteration_grace = False
             while (
@@ -167,6 +220,34 @@ class AgentBase(ABC):
                     "llm_request",
                     {"iteration": iteration - 1},
                 )
+
+                # Check global ticket max iterations
+                global_max = cf.get("global_max_iterations_override", 100)
+                global_iterations = previous_global_iterations + (
+                    iteration - previous_agent_iterations
+                )
+                if global_max > 0 and global_iterations > global_max:
+                    logger.warning(
+                        f"[{self.agent_name}] Hit global ticket max iterations"
+                        f" ({global_max}) on {ticket_id}"
+                    )
+                    await self._save_messages(ticket_id, messages)
+                    self._emit(
+                        ticket_id,
+                        "agent_error",
+                        {"reason": "global_max_iterations"},
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Ticket reached global maximum iteration limit ({global_max}).**"
+                        f" The execution across all agents has exhausted the global budget. Pausing for customer guidance.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=f"Global iteration limit ({global_max}) reached",
+                    )
+                    break
 
                 # Set ticket context for OTLP span
                 # correlation so the span processor
@@ -577,6 +658,12 @@ class AgentBase(ABC):
                         f"{self.agent_name} hit max iterations — pausing for guidance"
                     ),
                 )
+        except HITLTimeoutError as e:
+            # Clean stop after two consecutive HITL timeouts.  The ticket is
+            # already in awaiting_customer_guidance — just log and exit without
+            # emitting an error event, since this is expected/intentional.
+            logger.info(f"[{self.agent_name}] Stopped cleanly after HITL timeout: {e}")
+            return
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
             raise
@@ -1083,15 +1170,77 @@ class AgentBase(ABC):
                 return reply
 
         logger.warning(f"[{self.agent_name}] HITL timeout on {ticket_id}")
-        ticket = await self._get_ticket(ticket_id)
-        prev = ticket.get("previous_status")
-        if prev:
-            await self._transition_ticket(
-                ticket_id,
-                prev,
-                comment=f"HITL timeout — resuming from {prev}",
+
+        # Track consecutive timeouts on this agent instance.  On the first
+        # timeout we re-ask and keep waiting; on the second we stop entirely
+        # and leave the ticket paused for human input.  This prevents the LLM
+        # from autonomously "proceeding with best judgment" when the user has
+        # not responded — which leads to unguided analysis and wasted iterations.
+        self._hitl_timeout_count = getattr(self, "_hitl_timeout_count", 0) + 1
+
+        if self._hitl_timeout_count == 1:
+            # First timeout: add a warning comment and re-enter the wait loop
+            # for one more full timeout period.
+            logger.info(
+                f"[{self.agent_name}] First HITL timeout on {ticket_id} "
+                "— re-asking and waiting one more period"
             )
-        return "No response received within timeout. Proceed with best judgment."
+            await self._add_comment(
+                ticket_id,
+                "⏱️ No response received within the timeout window. "
+                "Still waiting for your guidance — please reply to continue. "
+                "The agent will pause permanently if there is no response.",
+            )
+            elapsed = 0.0
+            while elapsed < timeout:
+                await asyncio.sleep(self._HITL_POLL_INTERVAL)
+                elapsed += self._HITL_POLL_INTERVAL
+                ticket = await self._get_ticket(ticket_id)
+                if ticket.get("status") != "awaiting_customer_guidance":
+                    new_comments = ticket.get("comments", [])[comment_count:]
+                    user_replies = [
+                        c["body"]
+                        for c in new_comments
+                        if c.get("author") not in ("system", self.agent_name)
+                    ]
+                    reply = (
+                        "\n".join(user_replies)
+                        if user_replies
+                        else "User resumed ticket."
+                    )
+                    logger.info(
+                        f"[{self.agent_name}] Human input received after re-ask "
+                        f"on {ticket_id}"
+                    )
+                    if reply.strip().startswith("/"):
+                        handled = await self._handle_slash_command(
+                            ticket_id, reply.strip()
+                        )
+                        if handled is not None:
+                            return handled
+                    self._hitl_timeout_count = 0
+                    return reply
+
+            # Second timeout — fall through to the permanent-pause path below
+            self._hitl_timeout_count += 1
+
+        # Second (or subsequent) consecutive timeout: stop the agent and leave
+        # the ticket in awaiting_customer_guidance.  Raise an exception so the
+        # LLM loop exits cleanly without receiving a "proceed" message.
+        logger.warning(
+            f"[{self.agent_name}] Second HITL timeout on {ticket_id} "
+            "— stopping agent, ticket remains paused for human input"
+        )
+        await self._add_comment(
+            ticket_id,
+            "⏸️ No response received after two timeout periods. "
+            "The agent has stopped and is waiting for your reply. "
+            "Please respond to resume the investigation.",
+        )
+        raise HITLTimeoutError(
+            f"Agent {self.agent_name} stopped after two consecutive HITL "
+            f"timeouts on {ticket_id}. Ticket remains paused for human input."
+        )
 
     async def _handle_slash_command(self, ticket_id: str, command: str) -> str | None:
         """Handle a slash command issued by the user during HITL.

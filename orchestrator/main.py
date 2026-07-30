@@ -311,6 +311,7 @@ async def run_agent_task(
     ticket_data: dict | None = None,
 ):
     agent = None
+    success = False
 
     try:
         agent = dispatcher.create_agent(status, ticket_data=ticket_data)
@@ -397,6 +398,7 @@ async def run_agent_task(
                     agent.run(ticket_id),
                     timeout=agent_task_timeout,
                 )
+                success = True
             except asyncio.TimeoutError:
                 logger.error(
                     f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
@@ -419,6 +421,7 @@ async def run_agent_task(
                 )
         else:
             await agent.run(ticket_id)
+            success = True
 
         if config:
             try:
@@ -466,12 +469,32 @@ async def run_agent_task(
                 "agent_stopped",
                 {"mode": "hard"},
             )
-    except Exception:
+    except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
+        err_msg = str(e).lower()
+        if (
+            "resource_exhausted" in err_msg
+            or "rate limit" in err_msg
+            or "429" in err_msg
+        ):
+            reason = "Agent encountered sustained API rate limits (RESOURCE_EXHAUSTED). Pausing ticket for guidance."
+        else:
+            reason = f"Agent failed with an unhandled exception: {e}"
+        try:
+            await _transition_to_guidance(
+                dispatcher.store_url,
+                ticket_id,
+                reason,
+                event_bus=dispatcher.events,
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to transition failed ticket {ticket_id} to guidance"
+            )
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        if status in PLAN_AGENT_STATUS.values():
+        if success and status in PLAN_AGENT_STATUS.values():
             try:
                 _advance_plan(
                     dispatcher.store_url,
