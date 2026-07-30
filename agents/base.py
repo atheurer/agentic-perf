@@ -92,9 +92,11 @@ class AgentBase(ABC):
     def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
         """Count previous iterations (llm_request events) from the ticket's jsonl log file."""
         import json
+
         log_dir = self._events._log_dir if self._events else None
         if not log_dir:
             from paths import LOG_DIR
+
             log_dir = LOG_DIR
         path = log_dir / f"{ticket_id}.jsonl"
         if not path.exists():
@@ -154,13 +156,17 @@ class AgentBase(ABC):
         )
         try:
             try:
-                previous_agent_iterations, previous_global_iterations = self._get_previous_iteration_counts(ticket_id)
+                previous_agent_iterations, previous_global_iterations = (
+                    self._get_previous_iteration_counts(ticket_id)
+                )
             except Exception:
                 previous_agent_iterations, previous_global_iterations = 0, 0
             iteration = previous_agent_iterations
 
             if self.max_iterations > 0:
-                remaining_agent = max(0, self.max_iterations - previous_agent_iterations)
+                remaining_agent = max(
+                    0, self.max_iterations - previous_agent_iterations
+                )
                 global_max = cf.get("global_max_iterations_override", 100)
                 remaining_global = max(0, global_max - previous_global_iterations)
                 messages.append(
@@ -217,7 +223,9 @@ class AgentBase(ABC):
 
                 # Check global ticket max iterations
                 global_max = cf.get("global_max_iterations_override", 100)
-                global_iterations = previous_global_iterations + (iteration - previous_agent_iterations)
+                global_iterations = previous_global_iterations + (
+                    iteration - previous_agent_iterations
+                )
                 if global_max > 0 and global_iterations > global_max:
                     logger.warning(
                         f"[{self.agent_name}] Hit global ticket max iterations"

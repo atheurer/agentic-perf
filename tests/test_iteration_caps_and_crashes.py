@@ -70,12 +70,17 @@ async def test_cumulative_iteration_limit_respected(tmp_path):
     jsonl_path = log_dir / f"{ticket_id}.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for i in range(3):
-            f.write(json.dumps({
-                "seq": i + 1,
-                "agent": "test-agent",
-                "event_type": "llm_request",
-                "data": {"iteration": i}
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "seq": i + 1,
+                        "agent": "test-agent",
+                        "event_type": "llm_request",
+                        "data": {"iteration": i},
+                    }
+                )
+                + "\n"
+            )
 
     event_bus = EventBus(log_dir=log_dir)
     llm = _InfiniteToolLLM()
@@ -125,12 +130,17 @@ async def test_global_iteration_limit_respected(tmp_path):
     jsonl_path = log_dir / f"{ticket_id}.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for i in range(98):
-            f.write(json.dumps({
-                "seq": i + 1,
-                "agent": "some-other-agent",
-                "event_type": "llm_request",
-                "data": {"iteration": i}
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "seq": i + 1,
+                        "agent": "some-other-agent",
+                        "event_type": "llm_request",
+                        "data": {"iteration": i},
+                    }
+                )
+                + "\n"
+            )
 
     event_bus = EventBus(log_dir=log_dir)
     llm = _InfiniteToolLLM()
@@ -169,11 +179,15 @@ async def test_global_iteration_limit_respected(tmp_path):
             posted_comments.append(data.get("body", ""))
         elif "transition" in url:
             transitions.append(data.get("status", ""))
-        return AsyncMock(status_code=200, json=lambda: {}, raise_for_status=lambda: None)
+        return AsyncMock(
+            status_code=200, json=lambda: {}, raise_for_status=lambda: None
+        )
 
     agent._client.post = mock_post
     agent._client.patch = AsyncMock(
-        return_value=AsyncMock(status_code=200, json=lambda: {}, raise_for_status=lambda: None)
+        return_value=AsyncMock(
+            status_code=200, json=lambda: {}, raise_for_status=lambda: None
+        )
     )
 
     await agent.run(ticket_id)
@@ -196,29 +210,39 @@ def test_event_bus_loads_cumulative_from_file(tmp_path):
     jsonl_path = log_dir / f"{ticket_id}.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
         # First event: test-agent usage
-        f.write(json.dumps({
-            "seq": 1,
-            "agent": "test-agent",
-            "event_type": "llm_usage",
-            "data": {
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "duration_ms": 1000,
-                "model": "model-a",
-            }
-        }) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "seq": 1,
+                    "agent": "test-agent",
+                    "event_type": "llm_usage",
+                    "data": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                        "model": "model-a",
+                    },
+                }
+            )
+            + "\n"
+        )
         # Second event: other-agent usage
-        f.write(json.dumps({
-            "seq": 2,
-            "agent": "other-agent",
-            "event_type": "llm_usage",
-            "data": {
-                "input_tokens": 200,
-                "output_tokens": 80,
-                "duration_ms": 2000,
-                "model": "model-b",
-            }
-        }) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "seq": 2,
+                    "agent": "other-agent",
+                    "event_type": "llm_usage",
+                    "data": {
+                        "input_tokens": 200,
+                        "output_tokens": 80,
+                        "duration_ms": 2000,
+                        "model": "model-b",
+                    },
+                }
+            )
+            + "\n"
+        )
 
     event_bus = EventBus(log_dir=log_dir)
 

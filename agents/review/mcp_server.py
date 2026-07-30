@@ -555,7 +555,11 @@ def create_review_tool_handlers(
                 timeout=20,
                 key_path=ssh_key_path,
             )
-            files = find_files.stdout.strip().split("\n") if find_files.exit_code == 0 else []
+            files = (
+                find_files.stdout.strip().split("\n")
+                if find_files.exit_code == 0
+                else []
+            )
             files = [f for f in files if f]
 
             return {

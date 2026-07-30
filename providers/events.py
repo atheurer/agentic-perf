@@ -158,7 +158,11 @@ class EventBus:
                             agent_name = evt.get("agent", "")
                             input_tokens = data.get("input_tokens", 0)
                             output_tokens = data.get("output_tokens", 0)
-                            duration_ms = data.get("duration_ms", 0) or data.get("total_duration_ms", 0) or 0
+                            duration_ms = (
+                                data.get("duration_ms", 0)
+                                or data.get("total_duration_ms", 0)
+                                or 0
+                            )
                             model = data.get("model", "")
                             cache_read = data.get("cache_read_input_tokens", 0)
                             cache_creation = data.get("cache_creation_input_tokens", 0)

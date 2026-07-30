@@ -472,7 +472,11 @@ async def run_agent_task(
     except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
         err_msg = str(e).lower()
-        if "resource_exhausted" in err_msg or "rate limit" in err_msg or "429" in err_msg:
+        if (
+            "resource_exhausted" in err_msg
+            or "rate limit" in err_msg
+            or "429" in err_msg
+        ):
             reason = "Agent encountered sustained API rate limits (RESOURCE_EXHAUSTED). Pausing ticket for guidance."
         else:
             reason = f"Agent failed with an unhandled exception: {e}"
@@ -484,7 +488,9 @@ async def run_agent_task(
                 event_bus=dispatcher.events,
             )
         except Exception:
-            logger.exception(f"Failed to transition failed ticket {ticket_id} to guidance")
+            logger.exception(
+                f"Failed to transition failed ticket {ticket_id} to guidance"
+            )
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
