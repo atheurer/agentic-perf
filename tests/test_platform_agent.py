@@ -206,9 +206,20 @@ class TestProvisionJumpstarterSDK:
         result = ProvisionResult(board_name="test-board")
         diag = []
 
-        with patch(
-            "providers.resource.jumpstarter_provision.asyncio.sleep",
-            return_value=None,
+        with (
+            patch(
+                "providers.resource.jumpstarter_provision.asyncio.sleep",
+                return_value=None,
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "jumpstarter_driver_ssh": MagicMock(),
+                    "jumpstarter_driver_ssh.client": MagicMock(
+                        SSHCommandRunOptions=MagicMock(),
+                    ),
+                },
+            ),
         ):
             r = await _run_provision_steps(
                 client,
@@ -343,9 +354,20 @@ class TestProvisionJumpstarterSDK:
         result = ProvisionResult(board_name="test-board")
         diag = []
 
-        with patch(
-            "providers.resource.jumpstarter_provision.asyncio.sleep",
-            return_value=None,
+        with (
+            patch(
+                "providers.resource.jumpstarter_provision.asyncio.sleep",
+                return_value=None,
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "jumpstarter_driver_ssh": MagicMock(),
+                    "jumpstarter_driver_ssh.client": MagicMock(
+                        SSHCommandRunOptions=MagicMock(),
+                    ),
+                },
+            ),
         ):
             r = await _run_provision_steps(
                 client,
