@@ -151,3 +151,126 @@ class TestResumeTicket:
         result = _resume_ticket(client, ticket, "PERF-XXXX")
         assert result is False
         client.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# HITL timeout two-strike policy tests
+# ---------------------------------------------------------------------------
+
+
+class TestAgentBaseHITLTimeout:
+    """Tests for the HITL timeout two-strike policy."""
+
+    @pytest.fixture()
+    def agent(self):
+        """AgentBase subclass for testing _request_human_input."""
+        from agents.base import AgentBase
+        from providers.llm.base import LLMProvider
+
+        class _TimeoutTestAgent(AgentBase):
+            def _system_prompt(self, ticket):
+                return "stub"
+
+            def _build_messages(self, ticket):
+                return []
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        llm = MagicMock(spec=LLMProvider)
+        agent = _TimeoutTestAgent(
+            agent_name="timeout-agent",
+            llm_provider=llm,
+            state_store_url="http://localhost:8090",
+        )
+        # Use short intervals/timeout for fast tests
+        agent._HITL_POLL_INTERVAL = 0.01
+        agent._HITL_TIMEOUT = 0.02
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_successful_input_on_first_try(self, agent):
+        from unittest.mock import AsyncMock
+
+        # First check returns awaiting_customer_guidance, second check is modified
+        # (leaves the status), returning comments
+        agent._get_ticket = AsyncMock(
+            side_effect=[
+                {
+                    "status": "some_other_status",
+                    "comments": [],
+                },  # initial call in _request_human_input
+                {
+                    "status": "awaiting_customer_guidance",
+                    "comments": [],
+                },  # first poll loop entry status
+                {
+                    "status": "resumed",
+                    "comments": [{"author": "alice", "body": "hello user reply"}],
+                },  # resumed
+            ]
+        )
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._emit = MagicMock()
+
+        reply = await agent._request_human_input("PERF-123", "question?")
+        assert reply == "hello user reply"
+        agent._transition_ticket.assert_called_with(
+            "PERF-123",
+            "awaiting_customer_guidance",
+            comment="Agent timeout-agent needs clarification",
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_timeout_retries_second_timeout_raises_hitl_timeout_error(
+        self, agent
+    ):
+        from unittest.mock import AsyncMock
+
+        from agents.base import HITLTimeoutError
+
+        # Continuous status of awaiting_customer_guidance
+        ticket = {"status": "awaiting_customer_guidance", "comments": []}
+        agent._get_ticket = AsyncMock(return_value=ticket)
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._emit = MagicMock()
+
+        with pytest.raises(HITLTimeoutError) as exc_info:
+            await agent._request_human_input("PERF-123", "question?")
+
+        assert "stopped after two consecutive" in str(exc_info.value)
+        assert agent._hitl_timeout_count == 2
+        # Verify both warning and final comments were added
+        assert (
+            agent._add_comment.call_count == 3
+        )  # initial "Input needed" + 1st warning + final comment
+
+    @pytest.mark.asyncio
+    async def test_resumes_on_retry_wait_loop(self, agent):
+        from unittest.mock import AsyncMock
+
+        # Times out on first period, but gets reply during the second period (re-ask)
+        agent._get_ticket = AsyncMock(
+            side_effect=[
+                {"status": "awaiting_customer_guidance", "comments": []},  # initial
+                # 1st wait loop (times out, so stays awaiting_customer_guidance)
+                {"status": "awaiting_customer_guidance", "comments": []},
+                {"status": "awaiting_customer_guidance", "comments": []},
+                {"status": "awaiting_customer_guidance", "comments": []},
+                # 2nd wait loop after warning (resumes)
+                {
+                    "status": "resumed",
+                    "comments": [{"author": "alice", "body": "hello after warning"}],
+                },
+            ]
+        )
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._emit = MagicMock()
+
+        reply = await agent._request_human_input("PERF-123", "question?")
+        assert reply == "hello after warning"
+        assert agent._hitl_timeout_count == 0
+        assert agent._add_comment.call_count == 2  # initial + warning comment
