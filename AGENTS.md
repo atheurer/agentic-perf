@@ -221,9 +221,11 @@ a guardrail. Existing examples to follow:
   format (never parse free-text for structured results)
 - Jumpstarter board selector passthrough (code overrides LLM
   selector substitution with directive's `board_selector`)
-- Jumpstarter IP validation (provisioning rejects completion
-  when `hosts_provisioned` contains non-IP entries or when
-  `j tcp address` resolution fails)
+- Jumpstarter IP validation (platform agent rejects non-IP
+  results from `tcp.address()`)
+- Jumpstarter deterministic provisioning (platform agent runs
+  flash/boot/verify via Python SDK — no LLM reasoning on the
+  provisioning steps themselves, only on what to provision)
 
 ### Security Model & Current Limitations
 

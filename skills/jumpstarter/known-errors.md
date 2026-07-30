@@ -12,15 +12,11 @@ like `jumpstarter_driver_snmp` (used by QC8775 boards).
 Can also indicate a version mismatch between client and
 exporter.
 
-**Fix:** Ensure `JMP_DRIVERS_UNSAFE=true` is set in the
-environment when launching `jmp mcp serve`. The
-`attach_jumpstarter_mcp()` function does this
-automatically. If the error persists, run
+**Fix:** The platform agent sets `drivers.unsafe=True`
+via the client config. If the error persists, run
 `scripts/setup-jumpstarter.sh` to reinstall drivers.
 
-**IMPORTANT:** This error is FATAL — do not retry. Every
-subsequent `jmp_run` call will fail the same way. Call
-`request_clarification` immediately.
+**IMPORTANT:** This error is FATAL — do not retry.
 
 ## Port 8080 Already In Use
 
