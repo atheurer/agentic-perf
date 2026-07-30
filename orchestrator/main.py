@@ -242,6 +242,15 @@ def _advance_plan(
         if next_idx < len(steps):
             next_step = steps[next_idx]
             next_status = PLAN_AGENT_STATUS.get(next_step["agent_type"])
+            # Insert preparing_platform before provision
+            # so the platform agent can run system
+            # provisioning (flash, kickstart) before
+            # harness installation.
+            if (
+                next_status == "awaiting_provision"
+                and completed_status == "awaiting_hardware"
+            ):
+                next_status = "preparing_platform"
             if next_status:
                 next_step["status"] = "in_progress"
 
@@ -379,9 +388,11 @@ async def run_agent_task(
         except Exception:
             pass  # proceed with default iterations
 
-        # Jumpstarter: resolve image URLs before provisioning.
-        # This is a deterministic HTTP lookup — no LLM needed.
-        if status == "awaiting_provision":
+        # Jumpstarter: resolve image URLs before platform
+        # setup. This is a deterministic HTTP lookup — no
+        # LLM needed. Runs for both preparing_platform
+        # (new path) and awaiting_provision (legacy/direct).
+        if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 
             await _resolve_jumpstarter_images(
