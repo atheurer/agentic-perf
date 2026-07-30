@@ -158,6 +158,41 @@ def get_review_tools(
             },
         ),
         ToolDefinition(
+            name="read_run_results",
+            description=(
+                "Read Crucible benchmark run result files and raw tool logs from the controller. "
+                "If only run_id is provided, it automatically lists all available raw metric "
+                "and tool logs in the run directory. If a file_path is specified, it retrieves "
+                "its contents, automatically decompressing .xz (lzma) files on the fly."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "Benchmark run ID (UUID)",
+                    },
+                    "controller": {
+                        "type": "string",
+                        "description": "Controller hostname or IP",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional absolute path of a specific result file to read.",
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to read from the file (default: 20000, max: 50000).",
+                    },
+                    "ssh_key_path": {
+                        "type": "string",
+                        "description": "SSH key path",
+                    },
+                },
+                "required": ["run_id", "controller"],
+            },
+        ),
+        ToolDefinition(
             name="cdm_api_request",
             description=(
                 "Make an HTTP request to the CDM query server on the controller. "
@@ -487,6 +522,90 @@ def create_review_tool_handlers(
                 "raw": result.stdout[:2000],
             }
 
+    async def read_run_results(
+        run_id: str,
+        controller: str,
+        file_path: str | None = None,
+        max_bytes: int = 20000,
+        ssh_key_path: str | None = None,
+    ) -> dict:
+        find_result = await ssh.run(
+            controller,
+            f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
+            timeout=15,
+            key_path=ssh_key_path,
+        )
+        run_dir = find_result.stdout.strip() if find_result.exit_code == 0 else ""
+        if not run_dir:
+            return {
+                "run_id": run_id,
+                "status": "not_found",
+                "message": f"No run directory found matching {run_id}",
+            }
+
+        if not file_path:
+            find_cmd = (
+                f"find {run_dir} -type f "
+                f"\\( -name '*.xz' -o -name '*.csv' -o -name '*.json' -o -name '*.txt' -o -name 'result*' \\) "
+                f"2>/dev/null | grep -v '/roadblock/' | grep -v '/msgs/' | head -50"
+            )
+            find_files = await ssh.run(
+                controller,
+                find_cmd,
+                timeout=20,
+                key_path=ssh_key_path,
+            )
+            files = find_files.stdout.strip().split("\n") if find_files.exit_code == 0 else []
+            files = [f for f in files if f]
+            
+            return {
+                "status": "ok",
+                "run_id": run_id,
+                "run_dir": run_dir,
+                "message": (
+                    "Available raw metric and tool files found. Call read_run_results "
+                    "with a specific path in 'file_path' to view its decompressed contents."
+                ),
+                "files": files,
+            }
+
+        if not file_path.startswith("/var/lib/crucible/run"):
+            return {
+                "status": "error",
+                "message": "Access denied. Only paths under /var/lib/crucible/run are permitted.",
+            }
+
+        limit_bytes = min(max(max_bytes, 100), 50000)
+        is_xz = file_path.endswith(".xz")
+        if is_xz:
+            cmd = f"xzcat '{file_path}' 2>/dev/null | head -c {limit_bytes}"
+        else:
+            cmd = f"head -c {limit_bytes} '{file_path}'"
+
+        read_result = await ssh.run(
+            controller,
+            cmd,
+            timeout=30,
+            key_path=ssh_key_path,
+        )
+
+        if read_result.exit_code != 0:
+            return {
+                "status": "error",
+                "file_path": file_path,
+                "message": f"Failed to read file {file_path}",
+                "stderr": read_result.stderr[:500] if read_result.stderr else "",
+            }
+
+        return {
+            "status": "ok",
+            "run_id": run_id,
+            "file_path": file_path,
+            "is_compressed": is_xz,
+            "bytes_read": len(read_result.stdout),
+            "content": read_result.stdout,
+        }
+
     async def cdm_api_request(
         controller: str,
         method: str,
@@ -564,6 +683,7 @@ def create_review_tool_handlers(
         "retrieve_results": retrieve_results,
         "read_skill": read_skill,
         "get_run_summary": get_run_summary,
+        "read_run_results": read_run_results,
         "cdm_api_request": cdm_api_request,
         "compare_results": compare_results,
         "request_clarification": request_clarification,

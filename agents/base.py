@@ -89,6 +89,36 @@ class AgentBase(ABC):
     async def close(self) -> None:
         await self._client.aclose()
 
+    def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
+        """Count previous iterations (llm_request events) from the ticket's jsonl log file."""
+        import json
+        log_dir = self._events._log_dir if self._events else None
+        if not log_dir:
+            from paths import LOG_DIR
+            log_dir = LOG_DIR
+        path = log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return 0, 0
+        agent_iters = 0
+        global_iters = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if evt.get("event_type") == "llm_request":
+                            global_iters += 1
+                            if evt.get("agent") == self.agent_name:
+                                agent_iters += 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"Failed to read previous iteration counts from {path}: {e}")
+        return agent_iters, global_iters
+
     def _emit(
         self, ticket_id: str, event_type: str, data: dict[str, Any] | None = None
     ) -> None:
@@ -123,21 +153,30 @@ class AgentBase(ABC):
             },
         )
         try:
+            try:
+                previous_agent_iterations, previous_global_iterations = self._get_previous_iteration_counts(ticket_id)
+            except Exception:
+                previous_agent_iterations, previous_global_iterations = 0, 0
+            iteration = previous_agent_iterations
+
             if self.max_iterations > 0:
+                remaining_agent = max(0, self.max_iterations - previous_agent_iterations)
+                global_max = cf.get("global_max_iterations_override", 100)
+                remaining_global = max(0, global_max - previous_global_iterations)
                 messages.append(
                     {
                         "role": "user",
                         "content": (
                             f"[SYSTEM] Resource limits: you have"
-                            f" {self.max_iterations} iterations"
-                            f" (each iteration = 1 LLM call +"
-                            f" tool executions). Plan your work"
-                            f" to finish within this budget."
+                            f" {self.max_iterations} total iterations allowed for this agent phase"
+                            f" (already consumed: {previous_agent_iterations}, remaining: {remaining_agent})."
+                            f" Global ticket iteration limit: {global_max}"
+                            f" (already consumed across all agents: {previous_global_iterations}, remaining globally: {remaining_global})."
+                            f" Plan your work to finish within these budgets."
                         ),
                     }
                 )
 
-            iteration = 0
             self._budget_grace = False
             self._iteration_grace = False
             while (
@@ -175,6 +214,32 @@ class AgentBase(ABC):
                     "llm_request",
                     {"iteration": iteration - 1},
                 )
+
+                # Check global ticket max iterations
+                global_max = cf.get("global_max_iterations_override", 100)
+                global_iterations = previous_global_iterations + (iteration - previous_agent_iterations)
+                if global_max > 0 and global_iterations > global_max:
+                    logger.warning(
+                        f"[{self.agent_name}] Hit global ticket max iterations"
+                        f" ({global_max}) on {ticket_id}"
+                    )
+                    await self._save_messages(ticket_id, messages)
+                    self._emit(
+                        ticket_id,
+                        "agent_error",
+                        {"reason": "global_max_iterations"},
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Ticket reached global maximum iteration limit ({global_max}).**"
+                        f" The execution across all agents has exhausted the global budget. Pausing for customer guidance.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=f"Global iteration limit ({global_max}) reached",
+                    )
+                    break
 
                 # Set ticket context for OTLP span
                 # correlation so the span processor
