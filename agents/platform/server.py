@@ -120,10 +120,7 @@ async def _provision_jumpstarter(
             return json.dumps(
                 {
                     "success": False,
-                    "error": (
-                        "No flash_targets or flash_command "
-                        "in jumpstarter_flash"
-                    ),
+                    "error": ("No flash_targets or flash_command in jumpstarter_flash"),
                 }
             )
         # Fallback: extract URL from command string
@@ -133,9 +130,7 @@ async def _provision_jumpstarter(
                 flash_url = part
                 break
         if not flash_url:
-            flash_url = flash_command.replace(
-                "j storage flash ", ""
-            ).strip()
+            flash_url = flash_command.replace("j storage flash ", "").strip()
 
     ssh_public_key = flash_info.get("ssh_public_key", "")
     ssh_key_path = flash_info.get("ssh_key_path", "")
