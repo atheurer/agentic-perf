@@ -9,6 +9,8 @@ from __future__ import annotations
 EXTERNAL_PERF_TOOL_NAMES = {
     "get_baseline_stats",
     "compare_run_to_baseline",
+    "find_similar_anomalies",
+    "get_distribution",
 }
 
 EVALUATE_SYSTEM_PROMPT = """\
@@ -139,6 +141,31 @@ After reviewing benchmark results from the current iteration:
      time window, this may be an intentional change rather than
      a regression. Widen the time window (e.g. '90d') to find
      the pre-regression norm.
+
+### Pattern analysis
+
+4. Call `find_similar_anomalies` to check if the observed
+   anomaly has occurred before. Pass the metric and a
+   threshold condition (e.g., '>35000' or '>3sigma').
+
+   - **"recurring"**: the anomaly is a known pattern.
+     Consider whether it correlates with specific builds
+     or time periods.
+   - **"rare"**: few prior occurrences — may be an
+     intermittent issue.
+   - **"unprecedented"**: never seen before — likely a
+     new regression.
+
+5. Call `get_distribution` to understand the metric's
+   distribution shape.
+
+   - **"bimodal"**: two distinct modes — suggests an
+     intermittent issue (e.g., sometimes 26s, sometimes
+     42s). More samples needed to determine the trigger.
+   - **"normal"**: single mode, consistent behavior.
+     An outlier is likely noise or a one-time event.
+   - **"skewed_high"**: occasional high values — may
+     indicate a resource contention pattern.
 
 ### Token efficiency
 
