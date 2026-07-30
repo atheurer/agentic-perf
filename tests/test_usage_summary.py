@@ -12,9 +12,21 @@ from unittest.mock import MagicMock
 import pytest
 
 from providers.events import EventBus
-from state_store.api.events import _compute_ticket_usage, get_usage, get_usage_summary
+from state_store.api.events import (
+    _compute_ticket_usage,
+    get_usage,
+    get_usage_summary,
+    invalidate_summary_cache,
+)
 from state_store.models import CreateTicketRequest
 from state_store.store import TicketStore
+
+
+@pytest.fixture(autouse=True)
+def _clear_summary_cache():
+    invalidate_summary_cache()
+    yield
+    invalidate_summary_cache()
 
 
 @pytest.fixture

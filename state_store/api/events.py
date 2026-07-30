@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from providers.cost import estimate_cost
@@ -15,7 +17,7 @@ def get_events(
     ticket_id: str,
     request: Request,
     since: int = Query(0, description="Return events with seq > this value"),
-    limit: int = Query(200, description="Max events to return"),
+    limit: int = Query(200, description="Max events to return", ge=1, le=1000),
 ):
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
@@ -239,9 +241,31 @@ def _compute_ticket_usage(
     }
 
 
+_summary_cache: dict = {}
+_summary_cache_ts: float = 0.0
+_SUMMARY_TTL: float = 5.0
+
+
+def invalidate_summary_cache() -> None:
+    """Reset the usage-summary cache (called by tests)."""
+    global _summary_cache, _summary_cache_ts
+    _summary_cache = {}
+    _summary_cache_ts = 0.0
+
+
 @usage_router.get("/summary")
 def get_usage_summary(request: Request):
-    """Get usage summary across all tickets."""
+    """Get usage summary across all tickets.
+
+    Results are cached for 5 s to avoid repeated full JSONL
+    scans — the dashboard polls this every 5 s AND 10 s.
+    """
+    global _summary_cache, _summary_cache_ts
+
+    now = time.monotonic()
+    if _summary_cache and (now - _summary_cache_ts) < _SUMMARY_TTL:
+        return _summary_cache
+
     event_bus = getattr(request.app.state, "event_bus", None)
     store = request.app.state.store
     tickets = store.list_tickets()
@@ -253,7 +277,10 @@ def get_usage_summary(request: Request):
     }
 
     if event_bus is None:
-        return {"global": empty_global, "by_ticket": {}}
+        result = {"global": empty_global, "by_ticket": {}}
+        _summary_cache = result
+        _summary_cache_ts = now
+        return result
 
     by_ticket = {}
     g_tokens = 0
@@ -268,7 +295,7 @@ def get_usage_summary(request: Request):
             g_calls += tu["llm_calls"]
             g_cost += tu["estimated_cost_usd"]
 
-    return {
+    result = {
         "global": {
             "total_tokens": g_tokens,
             "llm_calls": g_calls,
@@ -276,3 +303,6 @@ def get_usage_summary(request: Request):
         },
         "by_ticket": by_ticket,
     }
+    _summary_cache = result
+    _summary_cache_ts = now
+    return result
