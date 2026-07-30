@@ -109,13 +109,16 @@ ticket has owners, only current owners or admins can add more.
 
 When multi-user mode is enabled, secrets resolve through a cascade:
 
-1. `~/.agentic-perf/secrets/users/<username>/` — user-private
-2. `~/.agentic-perf/secrets/groups/<group>/` — group-shared (alphabetical)
-3. `~/.agentic-perf/secrets/` — deployment-shared
+1. `~/.agentic-perf/secrets/users/<username>/` — user-private (local)
+2. `~/.agentic-perf/secrets/groups/<group>/` — group-shared (local, alphabetical)
+3. Bitwarden group project — vault group secrets (if configured)
+4. `~/.agentic-perf/secrets/` — deployment-shared (local)
+5. Bitwarden shared project — vault shared secrets (if configured)
 
-The first layer that contains the requested secret wins. Shadow
-detection logs when an earlier layer masks a later one, so
-administrators can audit overrides.
+The first layer that contains the requested secret wins. Within each
+tier, **local files beat vault** — a file on disk is an explicit
+operator override. Shadow detection logs when an earlier layer masks
+a later one, so administrators can audit overrides.
 
 **The ticket creator determines the secrets cascade.** When a user
 submits a ticket, agents processing that ticket use the creator's
@@ -125,9 +128,13 @@ cascade. This means:
 - A shared Crucible token in `secrets/` is available to everyone
 - If Alice overrides the Crucible token in `secrets/users/alice/`,
   only her tickets use the override
+- Vault secrets fill in where no local file exists
 
 Unclaimed tickets (created by service principals) use the shared
 deployment secrets.
+
+See [Secrets Management](secrets.md) for vault configuration and
+bootstrap token setup.
 
 ## Bootstrap Walkthrough
 
@@ -196,8 +203,10 @@ network access to the state store.
   require admin-assisted rotation.
 - Users can read all tickets (only writes are gated). Read isolation
   is not a goal.
-- The secrets cascade trusts filesystem permissions. A user with
-  shell access to the host can read any secret directory.
+- The secrets cascade trusts filesystem permissions for local layers.
+  A user with shell access to the host can read any secret directory.
+  Vault-backed secrets avoid this limitation — they are materialized
+  as ephemeral files only during the operation that needs them.
 - Command execution on remote hosts runs as root over SSH with no
   per-user confinement.
 

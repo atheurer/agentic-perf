@@ -414,6 +414,45 @@ to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
 
 ---
 
+### `secrets` — Vault-Backed Secrets
+
+Connect the secrets cascade to a Bitwarden Secrets Manager project.
+Vault layers are added behind local file layers — a file on disk
+always overrides the vault within the same tier.
+
+```json
+{
+    "secrets": {
+        "bitwarden": {
+            "organization_id": "<org-uuid>",
+            "shared_project_id": "<project-uuid>",
+            "group_project_ids": {
+                "gpu-team": "<project-uuid>"
+            },
+            "server_url": "https://vault.example.com",
+            "cache_ttl_seconds": 60
+        }
+    }
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `organization_id` | string | yes | Bitwarden organization UUID |
+| `shared_project_id` | string | yes | SM project for deployment-shared secrets |
+| `group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
+| `server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
+| `cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
+
+Requires `pip install agentic-perf[bitwarden]` and a machine account
+access token (env `AGENTIC_PERF_BWS_TOKEN` or file
+`~/.agentic-perf/secrets/bitwarden/access-token`).
+
+When this section is absent, vault layers are never constructed.
+See [Secrets Management](secrets.md) for full details.
+
+---
+
 ### `auth` — Multi-User Authentication
 
 ```json
@@ -471,3 +510,6 @@ variable overrides, which take precedence over the file.
 | `AGENT_TASK_TIMEOUT` | `agent_task_timeout` |
 | `STALE_TASK_TIMEOUT` | `stale_task_timeout` |
 | `INTROSPECTION_ENABLED` | `introspection.enabled` |
+| `AGENTIC_PERF_BWS_TOKEN` | Bitwarden SM access token (no config.json equivalent) |
+| `SECRETS_BACKEND` | `"local"` (default; only supported value) |
+| `SECRETS_PATH` | Override secrets directory path |
