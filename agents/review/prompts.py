@@ -24,6 +24,8 @@ read_harness_doc to learn about result formats and interpretation.
 Use retrieve_results to fetch benchmark output from the controller. Pass the harness
 name, run ID, and any results directory information from the ticket or review config.
 
+**DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results directory on the controller (e.g., `/var/lib/crucible/run/uperf...`) **exactly once** at the beginning of the review phase. Once located, cache it in your memory and reuse it for all subsequent tools and actions. Running expensive `find` or directory search commands repeatedly is highly inefficient and strictly prohibited.
+
 For harnesses that provide a structured API (indicated in the review config), you may
 also have access to tools like get_run_summary or cdm_api_request. The review config
 will tell you when these are applicable.
