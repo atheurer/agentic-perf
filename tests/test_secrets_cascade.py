@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -407,3 +410,212 @@ class TestDispatcherSecrets:
 
         with pytest.raises(ValueError, match="restricted"):
             await secrets.get_secret("groups/gpu-team/group-secret")
+
+
+class TestSecretFileContract:
+    """Tests for the secret_file() async context manager contract."""
+
+    @pytest.fixture()
+    def secrets_root(self, tmp_path):
+        return tmp_path / "secrets"
+
+    async def test_local_secret_file_yields_same_as_get_secret_file(
+        self,
+        secrets_root,
+    ):
+        _write_secret(secrets_root, "ssh/id_rsa", "key-content")
+        provider = LocalSecretsProvider(secrets_root)
+
+        expected = await provider.get_secret_file("ssh/id_rsa")
+        async with provider.secret_file("ssh/id_rsa") as actual:
+            assert actual == expected
+            assert actual is not None
+            assert actual.exists()
+
+    async def test_local_secret_file_yields_none_for_missing(self, secrets_root):
+        secrets_root.mkdir(parents=True, exist_ok=True)
+        provider = LocalSecretsProvider(secrets_root)
+
+        async with provider.secret_file("nonexistent") as path:
+            assert path is None
+
+    async def test_cascade_secret_file_first_layer_wins(self, secrets_root):
+        user_dir = secrets_root / "user"
+        shared_dir = secrets_root / "shared"
+        _write_secret(user_dir, "ssh/id_rsa", "user-key")
+        _write_secret(shared_dir, "ssh/id_rsa", "shared-key")
+
+        cascade = CascadingSecretsProvider(
+            [
+                ("user:alice", LocalSecretsProvider(user_dir)),
+                ("shared", LocalSecretsProvider(shared_dir)),
+            ]
+        )
+
+        async with cascade.secret_file("ssh/id_rsa") as path:
+            assert path is not None
+            assert "user" in str(path)
+
+    async def test_cascade_secret_file_fallback(self, secrets_root):
+        user_dir = secrets_root / "user"
+        shared_dir = secrets_root / "shared"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        _write_secret(shared_dir, "ssh/id_rsa", "shared-key")
+
+        cascade = CascadingSecretsProvider(
+            [
+                ("user:alice", LocalSecretsProvider(user_dir)),
+                ("shared", LocalSecretsProvider(shared_dir)),
+            ]
+        )
+
+        async with cascade.secret_file("ssh/id_rsa") as path:
+            assert path is not None
+            assert "shared" in str(path)
+
+    async def test_cascade_secret_file_missing(self, secrets_root):
+        shared_dir = secrets_root / "shared"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+
+        cascade = CascadingSecretsProvider(
+            [
+                ("shared", LocalSecretsProvider(shared_dir)),
+            ]
+        )
+
+        async with cascade.secret_file("nonexistent") as path:
+            assert path is None
+
+    async def test_cascade_secret_file_shadow_logged(
+        self,
+        secrets_root,
+        caplog,
+    ):
+        user_dir = secrets_root / "user"
+        group_dir = secrets_root / "group"
+        _write_secret(user_dir, "ssh/id_rsa", "user-key")
+        _write_secret(group_dir, "ssh/id_rsa", "group-key")
+
+        cascade = CascadingSecretsProvider(
+            [
+                ("user:alice", LocalSecretsProvider(user_dir)),
+                ("group:devs", LocalSecretsProvider(group_dir)),
+            ]
+        )
+
+        with caplog.at_level(logging.INFO, logger="providers.secrets.cascade"):
+            async with cascade.secret_file("ssh/id_rsa") as path:
+                assert path is not None
+
+        assert "shadowed" in caplog.text
+        assert "group:devs" in caplog.text
+        assert "user:alice" in caplog.text
+
+
+class _EphemeralProvider(LocalSecretsProvider):
+    """Fake provider simulating a non-file-backed backend (like a vault).
+
+    ``get_secret_file()`` always returns None (no persistent file).
+    ``secret_file()`` materializes a temporary file inside the context.
+    Tracks enter/exit calls for lifecycle assertions.
+    """
+
+    def __init__(self, secrets_dir, tmp_root: Path, **kwargs):
+        super().__init__(secrets_dir, **kwargs)
+        self._tmp_root = tmp_root
+        self.entered: list[str] = []
+        self.exited: list[str] = []
+
+    async def get_secret_file(self, path: str) -> Path | None:
+        return None
+
+    @asynccontextmanager
+    async def secret_file(self, path: str) -> AsyncIterator[Path | None]:
+        content = await self.get_secret(path)
+        if content is None:
+            yield None
+            return
+        self.entered.append(path)
+        tmp_dir = self._tmp_root / f"ephemeral-{len(self.entered)}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = tmp_dir / path.replace("/", "_")
+        try:
+            tmp_file.write_text(content)
+            tmp_file.chmod(0o600)
+            yield tmp_file
+        finally:
+            tmp_file.unlink(missing_ok=True)
+            tmp_dir.rmdir()
+            self.exited.append(path)
+
+
+class TestSecretFileEphemeralProvider:
+    """Tests demonstrating the vault-like ephemeral provider pattern.
+
+    These tests document the known limitation that the current cascade
+    probes with get_secret_file() — ephemeral providers whose
+    get_secret_file() returns None cannot win cascade selection.
+    PR 3 updates the cascade probing when vault layers are wired in.
+    """
+
+    @pytest.fixture()
+    def secrets_root(self, tmp_path):
+        root = tmp_path / "secrets"
+        _write_secret(root, "token", "ephemeral-value")
+        return root
+
+    async def test_ephemeral_provider_direct_use(self, secrets_root, tmp_path):
+        provider = _EphemeralProvider(secrets_root, tmp_root=tmp_path / "eph")
+
+        assert await provider.get_secret_file("token") is None
+
+        async with provider.secret_file("token") as path:
+            assert path is not None
+            assert path.exists()
+            assert path.read_text() == "ephemeral-value"
+            assert path.stat().st_mode & 0o777 == 0o600
+
+        assert not path.exists()
+        assert provider.entered == ["token"]
+        assert provider.exited == ["token"]
+
+    async def test_ephemeral_provider_cleans_up_on_exception(
+        self,
+        secrets_root,
+        tmp_path,
+    ):
+        provider = _EphemeralProvider(secrets_root, tmp_root=tmp_path / "eph")
+        materialized_path = None
+
+        with pytest.raises(RuntimeError, match="deliberate"):
+            async with provider.secret_file("token") as path:
+                materialized_path = path
+                assert path is not None
+                raise RuntimeError("deliberate")
+
+        assert not materialized_path.exists()
+        assert provider.exited == ["token"]
+
+    async def test_cascade_probe_limitation_documented(
+        self,
+        secrets_root,
+        tmp_path,
+    ):
+        """Cascade probing via get_secret_file misses ephemeral layers.
+
+        This is the known limitation documented in the cascade's
+        secret_file() docstring — PR 3 updates the probing when
+        vault layers are wired into the cascade.
+        """
+        ephemeral = _EphemeralProvider(
+            secrets_root,
+            tmp_root=tmp_path / "eph",
+        )
+
+        cascade = CascadingSecretsProvider([("vault:shared", ephemeral)])
+
+        async with cascade.secret_file("token") as path:
+            assert path is None
+
+        async with ephemeral.secret_file("token") as path:
+            assert path is not None

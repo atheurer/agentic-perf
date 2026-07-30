@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -454,65 +455,75 @@ async def _validate_and_deploy_contract(host: str, private_config: dict) -> dict
     missing = []
     resolved = []
 
-    for entry in secret_files:
-        secret_key = entry["secret_key"]
-        secret_path = secrets_map.get(secret_key)
-        required = entry.get("required", True)
-        description = entry.get("description", secret_key)
+    async with AsyncExitStack() as stack:
+        for entry in secret_files:
+            secret_key = entry["secret_key"]
+            secret_path = secrets_map.get(secret_key)
+            required = entry.get("required", True)
+            description = entry.get("description", secret_key)
 
-        if not secret_path:
-            if required:
-                missing.append(f"{secret_key}: no path in secrets config")
-            continue
+            if not secret_path:
+                if required:
+                    missing.append(f"{secret_key}: no path in secrets config")
+                continue
 
-        if _secrets_provider is None:
-            if required:
-                missing.append(f"{secret_key}: no secrets provider configured")
-            continue
+            if _secrets_provider is None:
+                if required:
+                    missing.append(
+                        f"{secret_key}: no secrets provider configured",
+                    )
+                continue
 
-        local_path = await _secrets_provider.get_secret_file(secret_path)
-        if local_path is None:
-            if required:
-                missing.append(
-                    f"{description} ({secret_path}): not found in secrets store"
-                )
-            continue
+            local_path = await stack.enter_async_context(
+                _secrets_provider.secret_file(secret_path),
+            )
+            if local_path is None:
+                if required:
+                    missing.append(
+                        f"{description} ({secret_path}): not found in secrets store",
+                    )
+                continue
 
-        resolved.append(
-            {
-                "secret_key": secret_key,
-                "local_path": str(local_path),
-                "remote_path": entry["remote_path"],
-                "description": description,
-            }
-        )
+            resolved.append(
+                {
+                    "secret_key": secret_key,
+                    "local_path": str(local_path),
+                    "remote_path": entry["remote_path"],
+                    "description": description,
+                }
+            )
 
-    if missing:
-        return {
-            "status": "failed",
-            "message": (
-                f"Install contract validation failed. "
-                f"Missing {len(missing)} required input(s):\n"
-                + "\n".join(f"  - {m}" for m in missing)
-            ),
-            "missing": missing,
-        }
-
-    deployed = []
-    for item in resolved:
-        scp_result = await _ssh.copy_to(host, item["local_path"], item["remote_path"])
-        if scp_result.exit_code != 0:
+        if missing:
             return {
                 "status": "failed",
                 "message": (
-                    f"Failed to deploy {item['description']} to "
-                    f"{host}:{item['remote_path']}: {scp_result.stderr}"
+                    f"Install contract validation failed. "
+                    f"Missing {len(missing)} required input(s):\n"
+                    + "\n".join(f"  - {m}" for m in missing)
                 ),
+                "missing": missing,
             }
-        deployed.append(f"{item['secret_key']} -> {item['remote_path']}")
-        logger.info(
-            f"[provision] Deployed {item['secret_key']} to {host}:{item['remote_path']}"
-        )
+
+        deployed = []
+        for item in resolved:
+            scp_result = await _ssh.copy_to(
+                host,
+                item["local_path"],
+                item["remote_path"],
+            )
+            if scp_result.exit_code != 0:
+                return {
+                    "status": "failed",
+                    "message": (
+                        f"Failed to deploy {item['description']} to "
+                        f"{host}:{item['remote_path']}: {scp_result.stderr}"
+                    ),
+                }
+            deployed.append(f"{item['secret_key']} -> {item['remote_path']}")
+            logger.info(
+                f"[provision] Deployed {item['secret_key']} to "
+                f"{host}:{item['remote_path']}",
+            )
 
     for cmd in contract.get("pre_install_commands", []):
         logger.info(f"[provision] Contract pre-install on {host}: {cmd}")

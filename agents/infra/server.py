@@ -254,34 +254,34 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     ssh = _get_ssh()
     sp = _get_secrets()
 
-    local_path = await sp.get_secret_file(secret_path)
-    if local_path is None:
+    async with sp.secret_file(secret_path) as local_path:
+        if local_path is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Secret not found: {secret_path}",
+                }
+            )
+
+        parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
+        mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
+        if mkdir_result.exit_code != 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"mkdir failed: {mkdir_result.stderr}",
+                }
+            )
+
+        result = await ssh.copy_to(host, str(local_path), remote_path)
         return json.dumps(
             {
-                "success": False,
-                "error": f"Secret not found: {secret_path}",
+                "success": result.exit_code == 0,
+                "secret_path": secret_path,
+                "remote_path": remote_path,
+                "error": result.stderr if result.exit_code != 0 else None,
             }
         )
-
-    parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
-    mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
-    if mkdir_result.exit_code != 0:
-        return json.dumps(
-            {
-                "success": False,
-                "error": f"mkdir failed: {mkdir_result.stderr}",
-            }
-        )
-
-    result = await ssh.copy_to(host, str(local_path), remote_path)
-    return json.dumps(
-        {
-            "success": result.exit_code == 0,
-            "secret_path": secret_path,
-            "remote_path": remote_path,
-            "error": result.stderr if result.exit_code != 0 else None,
-        }
-    )
 
 
 @mcp.tool()

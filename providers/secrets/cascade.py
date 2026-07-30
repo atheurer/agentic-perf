@@ -8,6 +8,8 @@ detection logs when an earlier layer masks a later one.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from .base import SecretsProvider
@@ -66,6 +68,39 @@ class CascadingSecretsProvider(SecretsProvider):
                         winner_label,
                     )
         return winner_path
+
+    @asynccontextmanager
+    async def secret_file(self, path: str) -> AsyncIterator[Path | None]:
+        """Yield a file path for the winning layer's secret.
+
+        Probes layers via ``get_secret_file()`` to find the winner and
+        log shadows, then delegates to the winner's ``secret_file()``
+        context manager.  For file-backed layers the probe is a cheap
+        existence check; non-file-backed layers (vault) will need the
+        cascade probing updated when they are wired in (PR 3).
+        """
+        winner_label: str | None = None
+        winner_provider: SecretsProvider | None = None
+
+        for label, provider in self._layers:
+            file_path = await provider.get_secret_file(path)
+            if file_path is not None:
+                if winner_provider is None:
+                    winner_label = label
+                    winner_provider = provider
+                else:
+                    logger.info(
+                        "Secret file '%s' in layer '%s' shadowed by '%s'",
+                        path,
+                        label,
+                        winner_label,
+                    )
+
+        if winner_provider is None:
+            yield None
+        else:
+            async with winner_provider.secret_file(path) as p:
+                yield p
 
     async def list_secrets(self, prefix: str = "") -> list[str]:
         seen: set[str] = set()
