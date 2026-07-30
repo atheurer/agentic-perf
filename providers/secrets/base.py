@@ -6,6 +6,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 
+class SecretsBackendError(Exception):
+    """Raised when a secrets backend fails (network, auth, rate limit).
+
+    Distinct from a "not found" result (which returns None).  Cascade
+    providers do not catch this — it propagates to the caller so that a
+    vault outage is never silently masked by a lower-priority layer.
+    """
+
+
 class SecretsProvider(ABC):
     @abstractmethod
     async def get_secret(self, path: str) -> str | None:
