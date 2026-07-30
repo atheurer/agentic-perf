@@ -132,7 +132,7 @@ class EventBus:
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
-        
+
         MUST be called with self._lock held.
         """
         if ticket_id in self._seq:

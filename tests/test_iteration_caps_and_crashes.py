@@ -65,7 +65,7 @@ async def test_cumulative_iteration_limit_respected(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     ticket_id = "PERF-TEST"
-    
+
     # Pre-write 3 llm_request events for this agent
     jsonl_path = log_dir / f"{ticket_id}.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
@@ -159,7 +159,7 @@ async def test_global_iteration_limit_respected(tmp_path):
             raise_for_status=lambda: None,
         ),
     )
-    
+
     posted_comments = []
     transitions = []
 

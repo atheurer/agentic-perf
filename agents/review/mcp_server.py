@@ -557,7 +557,7 @@ def create_review_tool_handlers(
             )
             files = find_files.stdout.strip().split("\n") if find_files.exit_code == 0 else []
             files = [f for f in files if f]
-            
+
             return {
                 "status": "ok",
                 "run_id": run_id,
