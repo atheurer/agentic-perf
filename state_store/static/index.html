@@ -1466,11 +1466,21 @@ async function doStopAll(mode, btn) {
   }
 }
 
+var _rateLimitedUntil = 0;
+
 async function api(path) {
+  if (Date.now() < _rateLimitedUntil) {
+    throw new Error('Rate limited — waiting for backoff');
+  }
   const r = await fetch(API + path, { headers: getAuthHeaders() });
   if (r.status === 401 && _isMultiUser) {
     await refreshIdentity();
     throw new Error('Authentication failed — check your token in settings');
+  }
+  if (r.status === 429) {
+    var retryAfter = parseInt(r.headers.get('Retry-After') || '5', 10);
+    _rateLimitedUntil = Date.now() + retryAfter * 1000;
+    throw new Error('Rate limited — retrying in ' + retryAfter + 's');
   }
   if (!r.ok) throw new Error(`API ${r.status}: ${path}`);
   return r.json();

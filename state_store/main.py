@@ -4,6 +4,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI
@@ -16,9 +17,47 @@ from providers.events import EventBus
 
 from .api.router import api_router, health_router
 from .auth import load_or_generate_token, make_auth_dependency
+from .ratelimit import (
+    AuthFailureLimiter,
+    RateLimiter,
+    make_rate_limit_dependency,
+)
 from .store import TicketStore
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_positive_int(
+    value: Any,
+    name: str,
+    *,
+    allow_zero: bool = True,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if not allow_zero and value == 0:
+        raise ValueError(f"{name} must be > 0, got 0")
+    return value
+
+
+def mount_routers(
+    app: FastAPI,
+    auth: Any,
+    rate_limit: Any = None,
+) -> None:
+    """Mount API and health routers with dependencies.
+
+    Factored out so test helpers (which clear and re-mount routers)
+    can use the same wiring as production. ``rate_limit`` may be
+    ``None`` to skip the rate-limit dependency.
+    """
+    deps: list = [Depends(auth)]
+    if rate_limit is not None:
+        deps.append(Depends(rate_limit))
+    app.include_router(api_router, dependencies=deps)
+    app.include_router(health_router)
 
 
 def create_app() -> FastAPI:
@@ -41,12 +80,10 @@ def create_app() -> FastAPI:
     cfg = _load_config_file()
     auth_cfg = cfg.get("auth", {})
     multi_user = auth_cfg.get("multi_user", False)
-    raw_ttl = auth_cfg.get("token_ttl_days", 0)
-    if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int) or raw_ttl < 0:
-        raise ValueError(
-            f"auth.token_ttl_days must be a non-negative integer, got {raw_ttl!r}"
-        )
-    token_ttl_days: int = raw_ttl
+    token_ttl_days = _validate_positive_int(
+        auth_cfg.get("token_ttl_days", 0),
+        "auth.token_ttl_days",
+    )
     app.state.multi_user = multi_user
 
     user_store = None
@@ -57,7 +94,6 @@ def create_app() -> FastAPI:
     app.state.user_store = user_store
 
     if token_ttl_days > 0 and multi_user and user_store is not None:
-        _log = logging.getLogger(__name__)
         now = datetime.now(timezone.utc)
 
         def _token_age_days(u) -> int:
@@ -72,25 +108,74 @@ def create_app() -> FastAPI:
             if _token_age_days(u) >= token_ttl_days
         ]
         if expired:
-            _log.warning(
+            logger.warning(
                 "Token TTL is %d days — %d user(s) have already-expired tokens: %s",
                 token_ttl_days,
                 len(expired),
                 ", ".join(sorted(expired)),
             )
 
+    # ── Rate limiting ────────────────────────────────────────
+    rl_cfg = cfg.get("rate_limit", {})
+    rl_enabled = rl_cfg.get("enabled", True)
+    rl_per_user_rpm = _validate_positive_int(
+        rl_cfg.get("per_user_rpm", 600),
+        "rate_limit.per_user_rpm",
+        allow_zero=not rl_enabled,
+    )
+    rl_burst = _validate_positive_int(
+        rl_cfg.get("burst", 30),
+        "rate_limit.burst",
+        allow_zero=not rl_enabled,
+    )
+    rl_exempt_service = rl_cfg.get("exempt_service", True)
+    rl_auth_failures_per_min = _validate_positive_int(
+        rl_cfg.get("auth_failures_per_min", 30),
+        "rate_limit.auth_failures_per_min",
+        allow_zero=not rl_enabled,
+    )
+
+    auth_failure_limiter: AuthFailureLimiter | None = None
+    rate_limiter: RateLimiter | None = None
+    rate_limit_dep = None
+
+    if rl_enabled:
+        auth_failure_limiter = AuthFailureLimiter(
+            failures_per_min=rl_auth_failures_per_min,
+        )
+        if multi_user:
+            rate_limiter = RateLimiter(
+                rpm=rl_per_user_rpm,
+                burst=rl_burst,
+                exempt_service=rl_exempt_service,
+            )
+            rate_limit_dep = make_rate_limit_dependency(rate_limiter)
+            logger.info(
+                "Rate limiting enabled: %d rpm, burst %d, service exempt=%s",
+                rl_per_user_rpm,
+                rl_burst,
+                rl_exempt_service,
+            )
+        logger.info(
+            "Auth failure limiting enabled: %d failures/min",
+            rl_auth_failures_per_min,
+        )
+
+    app.state.rate_limiter = rate_limiter
+    app.state.auth_failure_limiter = auth_failure_limiter
+
     auth = make_auth_dependency(
         token,
         multi_user=multi_user,
         user_store=user_store,
         token_ttl_days=token_ttl_days,
+        auth_failure_limiter=auth_failure_limiter,
     )
     app.state.auth_dependency = auth
 
     app.state.store = TicketStore()
     app.state.event_bus = EventBus()
-    app.include_router(api_router, dependencies=[Depends(auth)])
-    app.include_router(health_router)
+    mount_routers(app, auth, rate_limit_dep)
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

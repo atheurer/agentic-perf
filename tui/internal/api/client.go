@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -344,6 +345,18 @@ func (c *Client) doRequest(method, path string, body interface{}) ([]byte, error
 
 		if resp.StatusCode >= 500 {
 			lastErr = &APIError{StatusCode: resp.StatusCode, Detail: string(data)}
+			continue
+		}
+
+		if resp.StatusCode == 429 {
+			retryAfter := 5
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if v, err := strconv.Atoi(ra); err == nil && v > 0 {
+					retryAfter = v
+				}
+			}
+			lastErr = &APIError{StatusCode: 429, Detail: "rate limited"}
+			time.Sleep(time.Duration(retryAfter) * time.Second)
 			continue
 		}
 
