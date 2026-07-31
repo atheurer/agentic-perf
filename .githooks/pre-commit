@@ -1,14 +1,109 @@
 #!/usr/bin/env bash
+# Pre-commit hook: scoped lint + targeted tests.
+#
+# Only lints and tests files affected by the commit.
+# CI (scripts/validate.sh) still runs the full suite.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
-validate_script="${repo_root}/scripts/validate.sh"
+# Collect staged Python files
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
-if [[ ! -x "${validate_script}" ]]; then
-    echo "ERROR: Missing ${validate_script}. Run scripts/dev-setup.sh." >&2
-    exit 1
+# If no Python files changed, only check for format issues
+# in any staged files and skip tests entirely.
+if [[ -z "$STAGED_PY" ]]; then
+    echo "No Python files staged — skipping lint and tests"
+    exit 0
 fi
 
-echo "Running pre-commit validation..."
-"${validate_script}"
+echo "Running pre-commit validation (scoped)..."
+
+# ── Scoped lint ──────────────────────────────────
+# Lint only staged files (fast). CI lints everything.
+echo ""
+echo "=== Ruff lint check (staged files) ==="
+echo "$STAGED_PY" | xargs ruff check
+
+echo "=== Ruff format check (staged files) ==="
+echo "$STAGED_PY" | xargs ruff format --check
+
+echo "✓ Lint passed"
+
+# ── Targeted tests ───────────────────────────────
+# Map changed source files to test files using
+# naming conventions. Falls back to running the
+# full suite if no mapping is found.
+
+collect_tests() {
+    local tests=""
+
+    for f in $STAGED_PY; do
+        case "$f" in
+            # Agent modules → agent-specific tests
+            agents/benchmark/*)    tests="$tests tests/test_benchmark_tools.py tests/test_benchmark_artifacts.py tests/test_boot_time.py" ;;
+            agents/evaluate/*)     tests="$tests tests/test_evaluate_agent.py" ;;
+            agents/gathering_context/*) tests="$tests tests/test_gathering_context.py" ;;
+            agents/introspection/*) tests="$tests tests/test_introspection.py" ;;
+            agents/investigation/*) tests="$tests tests/test_investigation_tools.py" ;;
+            agents/platform/*)     tests="$tests tests/test_platform_agent.py" ;;
+            agents/provisioning/*) tests="$tests tests/test_provisioning_tools.py" ;;
+            agents/resource/*)     tests="$tests tests/test_resource_providers.py" ;;
+            agents/review/*)       tests="$tests tests/test_slash_commands.py" ;;
+            agents/synthesis/*)    tests="$tests tests/test_synthesis_agent.py" ;;
+            agents/triage/*)       tests="$tests tests/test_triage_mcp.py" ;;
+            agents/infra/*)        tests="$tests tests/test_infra_mcp.py tests/test_command_policy.py" ;;
+            agents/base.py)        tests="$tests tests/test_agent_iterations.py tests/test_budget_guardrails.py" ;;
+            agents/mcp_client.py)  tests="$tests tests/test_external_mcp.py tests/test_mcp_network_transport.py" ;;
+            agents/jumpstarter_mcp.py) tests="$tests tests/test_jumpstarter_mcp.py" ;;
+            agents/stub.py)        tests="$tests tests/test_tool_scoping.py" ;;
+
+            # Orchestrator
+            orchestrator/dispatcher.py) tests="$tests tests/test_dispatcher_claim.py" ;;
+            orchestrator/handoff.py)    tests="$tests tests/test_handoff.py" ;;
+            orchestrator/main.py)       tests="$tests tests/test_execution_plan.py" ;;
+
+            # State store
+            state_store/models.py)  tests="$tests tests/test_state_machine.py" ;;
+            state_store/store.py)   tests="$tests tests/test_state_store.py" ;;
+            state_store/auth.py)    tests="$tests tests/test_state_store_auth.py" ;;
+            state_store/api/*)      tests="$tests tests/test_state_store.py tests/test_event_stream.py" ;;
+
+            # Providers
+            providers/resource/jumpstarter*.py) tests="$tests tests/test_jumpstarter_provider.py tests/test_platform_agent.py" ;;
+            providers/resource/aws.py)   tests="$tests tests/test_resource_providers.py" ;;
+            providers/skills/arcaflow*) tests="$tests tests/test_arcaflow_plugins_provider.py" ;;
+            providers/llm/*)        tests="$tests tests/test_llm_timeout.py" ;;
+            providers/convergence.py) tests="$tests tests/test_convergence_criteria.py" ;;
+            providers/budget.py)    tests="$tests tests/test_budget_guardrails.py" ;;
+            providers/events.py)    tests="$tests tests/test_event_stream.py" ;;
+            providers/ssh.py)       tests="$tests tests/test_execute_command.py" ;;
+
+            # Test files themselves
+            tests/*)               tests="$tests $f" ;;
+        esac
+    done
+
+    # Deduplicate and filter to existing files
+    echo "$tests" | tr ' ' '\n' | sort -u | while read -r t; do
+        [[ -n "$t" && -f "$t" ]] && echo "$t"
+    done
+}
+
+TEST_FILES=$(collect_tests)
+
+if [[ -z "$TEST_FILES" ]]; then
+    echo ""
+    echo "=== No test mapping for changed files — running full suite ==="
+    python3 -m pytest tests/ -q --tb=short
+else
+    echo ""
+    echo "=== Running targeted tests ==="
+    echo "$TEST_FILES" | tr '\n' ' '
+    echo ""
+    python3 -m pytest $TEST_FILES -q --tb=short
+fi
+
+echo ""
+echo "✓ Pre-commit validation passed"
