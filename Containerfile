@@ -53,6 +53,9 @@ USER 0
 RUN dnf install -y --setopt=install_weak_deps=False \
         openssh-clients \
         git \
+        jq \
+        sshpass \
+        curl \
     && dnf clean all
 
 # Copy installed Python packages from builder
