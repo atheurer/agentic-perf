@@ -172,6 +172,64 @@ installed and vault is configured, a warning is logged and the vault
 layer is omitted. This allows the same config.json to work on
 machines with and without the optional dependency.
 
+## SSH Key Resolution
+
+SSH keys on tickets are filesystem paths
+(`custom_fields.ssh_key_path`). When the file doesn't exist on
+disk — because the real key lives in a Bitwarden vault — the
+system falls back to vault resolution automatically.
+
+### Configuration
+
+Set `ssh_key_vault_secret` in config.json to the vault secret name:
+
+```json
+{
+    "ssh_key_vault_secret": "ssh/id_ed25519"
+}
+```
+
+Per-ticket override: resource agents can set
+`custom_fields.ssh_key_secret` on the ticket to use a different
+vault secret for a specific machine or provider.
+
+### Resolution Sites
+
+The vault fallback is applied at all SSH key resolution points:
+
+1. **`build_ssh_from_ticket()`** — used by provisioning, resource,
+   review, and benchmark MCP servers at subprocess startup.
+2. **`set_ssh_context()`** — infra MCP tool called by the LLM.
+3. **`_run_selective_teardown()`** — resource agent teardown.
+4. **`_run_host_cleanup()`** — resource agent host cleanup.
+
+### Precedence
+
+1. File exists at `ssh_key_path` → use it directly (no vault call)
+2. `custom_fields.ssh_key_secret` → per-ticket vault secret name
+3. `SSH_KEY_VAULT_SECRET` env var → deployment override
+4. `ssh_key_vault_secret` in config.json → global default
+
+### Ephemeral Materialization
+
+When the key is resolved from the vault, `secret_file()` creates
+a temporary file (mode 0600 inside a mode 0700 directory) that
+exists only for the duration of the SSH operation:
+
+- MCP server subprocesses: key persists for the subprocess
+  lifetime via an `AsyncExitStack`.
+- Resource agent teardown: key persists for the cleanup block
+  via `async with resolve_ssh_key(...)`.
+
+### Error Handling
+
+If a vault secret name is configured but the secret is not found,
+`SSHKeyResolutionError` is raised. This is intentional fail-closed
+behavior — falling back to no key would let SSH try default
+identity files, which could use an unintended credential.
+
+---
+
 ## Threat Model
 
 Honest accounting of the security boundaries:

@@ -10,6 +10,7 @@ from agents.base import AgentBase
 from agents.infra.server import cleanup_passwordless_ssh
 from agents.mcp_client import AgentMCPClient
 from agents.provisioning.mcp_server import cleanup_harness
+from agents.server_utils import _resolve_vault_secret_name, resolve_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 from providers.resource.registry import ResourceProviderRegistry
@@ -246,25 +247,35 @@ class ResourceAgent(AgentBase):
         if host_cleanup == "required" and teardown_hosts:
             ssh_key_path = fields.get("ssh_key_path")
             harness_name = fields.get("harness_name")
-            ssh = SSHExecutor(user="root", key_path=ssh_key_path)
-            cleanup_summary = []
-            if harness_name:
-                for host in teardown_hosts:
-                    try:
-                        result = await cleanup_harness(ssh, host, harness_name)
-                        cleanup_summary.append(
-                            f"Harness on {host}: {result['status']}",
-                        )
-                    except Exception as e:
-                        cleanup_summary.append(
-                            f"Harness on {host}: failed ({e})",
-                        )
-            if cleanup_summary:
-                await self._add_comment(
-                    ticket_id,
-                    "**Host Cleanup (selective)**\n\n"
-                    + "\n".join(f"- {s}" for s in cleanup_summary),
-                )
+            vault_secret = _resolve_vault_secret_name(fields)
+            async with resolve_ssh_key(
+                ssh_key_path,
+                self._secrets,
+                vault_secret,
+            ) as resolved_key:
+                ssh = SSHExecutor(user="root", key_path=resolved_key)
+                cleanup_summary = []
+                if harness_name:
+                    for host in teardown_hosts:
+                        try:
+                            result = await cleanup_harness(
+                                ssh,
+                                host,
+                                harness_name,
+                            )
+                            cleanup_summary.append(
+                                f"Harness on {host}: {result['status']}",
+                            )
+                        except Exception as e:
+                            cleanup_summary.append(
+                                f"Harness on {host}: failed ({e})",
+                            )
+                if cleanup_summary:
+                    await self._add_comment(
+                        ticket_id,
+                        "**Host Cleanup (selective)**\n\n"
+                        + "\n".join(f"- {s}" for s in cleanup_summary),
+                    )
 
         # Terminate only the non-preserved instances
         provider_name = fields.get("resource_provider")
@@ -385,52 +396,92 @@ class ResourceAgent(AgentBase):
             logger.info("[resource-agent] No hosts to clean up")
             return
 
-        ssh = SSHExecutor(user="root", key_path=ssh_key_path)
-        cleanup_summary = []
+        vault_secret = _resolve_vault_secret_name(fields)
+        async with resolve_ssh_key(
+            ssh_key_path,
+            self._secrets,
+            vault_secret,
+        ) as resolved_key:
+            ssh = SSHExecutor(user="root", key_path=resolved_key)
+            cleanup_summary = []
 
-        if controller and targets:
-            try:
-                result = await cleanup_passwordless_ssh(ssh, controller, targets)
-                cleanup_summary.append(f"Controller SSH keys: {result['status']}")
-                logger.info(f"[resource-agent] Controller key cleanup: {result}")
-            except Exception as e:
-                cleanup_summary.append(f"Controller SSH keys: failed ({e})")
-                logger.exception("[resource-agent] Controller key cleanup failed")
-
-        if harness_name:
-            for host in all_hosts:
+            if controller and targets:
                 try:
-                    result = await cleanup_harness(ssh, host, harness_name)
-                    cleanup_summary.append(f"Harness on {host}: {result['status']}")
-                    logger.info(f"[resource-agent] Harness cleanup on {host}: {result}")
+                    result = await cleanup_passwordless_ssh(
+                        ssh,
+                        controller,
+                        targets,
+                    )
+                    cleanup_summary.append(
+                        f"Controller SSH keys: {result['status']}",
+                    )
+                    logger.info(
+                        "[resource-agent] Controller key cleanup: %s",
+                        result,
+                    )
                 except Exception as e:
-                    cleanup_summary.append(f"Harness on {host}: failed ({e})")
+                    cleanup_summary.append(
+                        f"Controller SSH keys: failed ({e})",
+                    )
                     logger.exception(
-                        f"[resource-agent] Harness cleanup on {host} failed"
+                        "[resource-agent] Controller key cleanup failed",
                     )
 
-        # Provider-specific SSH key cleanup
-        provider_name = fields.get("resource_provider")
-        if not provider_name and fields.get("quads_assignment_id"):
-            provider_name = "quads"
+            if harness_name:
+                for host in all_hosts:
+                    try:
+                        result = await cleanup_harness(ssh, host, harness_name)
+                        cleanup_summary.append(
+                            f"Harness on {host}: {result['status']}",
+                        )
+                        logger.info(
+                            "[resource-agent] Harness cleanup on %s: %s",
+                            host,
+                            result,
+                        )
+                    except Exception as e:
+                        cleanup_summary.append(
+                            f"Harness on {host}: failed ({e})",
+                        )
+                        logger.exception(
+                            "[resource-agent] Harness cleanup on %s failed",
+                            host,
+                        )
 
-        if provider_name and provider_name != "user_provided" and self._registry:
-            try:
-                provider = await self._registry.get_provider(provider_name)
-                result = await provider.cleanup_ssh_keys(all_hosts)
-                cleanup_summary.append(
-                    f"{provider_name} SSH keys: {result.get('status', 'done')}"
+            # Provider-specific SSH key cleanup
+            provider_name = fields.get("resource_provider")
+            if not provider_name and fields.get("quads_assignment_id"):
+                provider_name = "quads"
+
+            if provider_name and provider_name != "user_provided" and self._registry:
+                try:
+                    provider = await self._registry.get_provider(
+                        provider_name,
+                    )
+                    result = await provider.cleanup_ssh_keys(all_hosts)
+                    cleanup_summary.append(
+                        f"{provider_name} SSH keys: {result.get('status', 'done')}",
+                    )
+                    logger.info(
+                        "[resource-agent] %s key cleanup: %s",
+                        provider_name,
+                        result,
+                    )
+                except Exception as e:
+                    cleanup_summary.append(
+                        f"{provider_name} SSH keys: failed ({e})",
+                    )
+                    logger.exception(
+                        "[resource-agent] %s key cleanup failed",
+                        provider_name,
+                    )
+
+            if cleanup_summary:
+                await self._add_comment(
+                    ticket_id,
+                    "**Host Cleanup**\n\n"
+                    + "\n".join(f"- {s}" for s in cleanup_summary),
                 )
-                logger.info(f"[resource-agent] {provider_name} key cleanup: {result}")
-            except Exception as e:
-                cleanup_summary.append(f"{provider_name} SSH keys: failed ({e})")
-                logger.exception(f"[resource-agent] {provider_name} key cleanup failed")
-
-        if cleanup_summary:
-            await self._add_comment(
-                ticket_id,
-                "**Host Cleanup**\n\n" + "\n".join(f"- {s}" for s in cleanup_summary),
-            )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})

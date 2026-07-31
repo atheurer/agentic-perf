@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +131,97 @@ def _load_vault_config() -> dict | None:
         return None
 
 
+def _resolve_vault_secret_name(
+    ticket_fields: dict[str, Any] | None = None,
+) -> str | None:
+    """Determine the vault secret name for SSH key resolution.
+
+    Precedence:
+    1. ``ticket_fields["ssh_key_secret"]`` — per-ticket override
+    2. ``SSH_KEY_VAULT_SECRET`` env var — deployment override
+    3. ``config.json`` → ``ssh_key_vault_secret`` — global default
+    """
+    if ticket_fields:
+        ticket_val = ticket_fields.get("ssh_key_secret")
+        if ticket_val:
+            return ticket_val
+
+    env_val = os.environ.get("SSH_KEY_VAULT_SECRET")
+    if env_val:
+        return env_val
+
+    vault_cfg = _load_config_value("ssh_key_vault_secret")
+    if vault_cfg:
+        return vault_cfg
+
+    return None
+
+
+def _load_config_value(key: str) -> Any | None:
+    """Read a single top-level key from ``~/.agentic-perf/config.json``."""
+    import json
+
+    from paths import CONFIG_PATH
+
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return cfg.get(key)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+@asynccontextmanager
+async def resolve_ssh_key(
+    ssh_key_path: str | None,
+    secrets_provider: Any | None,
+    vault_secret_name: str | None,
+) -> AsyncIterator[str | None]:
+    """Resolve an SSH key path, falling back to the secrets cascade.
+
+    Yields a filesystem path to the SSH private key. When the key
+    comes from a vault provider, it is materialized as an ephemeral
+    file (mode 0600) that is removed when the context exits.
+
+    Rules:
+    1. ``ssh_key_path`` exists on disk → yield it (no vault call).
+    2. ``vault_secret_name`` + provider → materialize from vault.
+    3. Vault configured but secret missing → raise
+       ``SSHKeyResolutionError`` (fail closed).
+    4. Nothing configured → yield original ``ssh_key_path``.
+    """
+    from providers.ssh import SSHKeyResolutionError
+
+    if ssh_key_path:
+        try:
+            expanded = Path(ssh_key_path).expanduser()
+        except RuntimeError:
+            expanded = Path(ssh_key_path)
+        if expanded.is_file():
+            yield str(expanded)
+            return
+
+    if vault_secret_name and secrets_provider:
+        async with secrets_provider.secret_file(vault_secret_name) as path:
+            if path is not None:
+                logger.info(
+                    "SSH key resolved from vault secret '%s'",
+                    vault_secret_name,
+                )
+                yield str(path)
+                return
+        raise SSHKeyResolutionError(
+            f"Vault secret '{vault_secret_name}' configured for SSH key "
+            f"but not found in secrets provider",
+        )
+
+    yield ssh_key_path
+
+
+_ssh_key_stack: AsyncExitStack | None = None
+
+
 def build_repo_cache():
     """Construct a RepoCache with harness repos from environment variables."""
     import json
@@ -209,7 +302,22 @@ async def build_ssh_from_ticket(
     # host keys change every time. Disable strict
     # checking to avoid stale key errors.
     strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
-    return SSHExecutor(user=ssh_user, key_path=ssh_key, strict_host_key=strict), ticket
+
+    vault_secret_name = _resolve_vault_secret_name(fields)
+    resolved_key = ssh_key
+    if vault_secret_name:
+        global _ssh_key_stack
+        if _ssh_key_stack is not None:
+            await _ssh_key_stack.aclose()
+        _ssh_key_stack = AsyncExitStack()
+        sp = build_secrets_provider()
+        resolved_key = await _ssh_key_stack.enter_async_context(
+            resolve_ssh_key(ssh_key, sp, vault_secret_name),
+        )
+
+    return SSHExecutor(
+        user=ssh_user, key_path=resolved_key, strict_host_key=strict
+    ), ticket
 
 
 async def tool_progress(

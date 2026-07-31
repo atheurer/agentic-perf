@@ -109,6 +109,9 @@ class OrchestratorConfig:
         self.harness_repos: dict[str, str] = default_repos
         self.instance_name: str = get_instance_name()
         self.ssh_key = os.environ.get("SSH_KEY") or cfg.get("ssh_key")
+        self.ssh_key_vault_secret = os.environ.get("SSH_KEY_VAULT_SECRET") or cfg.get(
+            "ssh_key_vault_secret"
+        )
         self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
         self._openai_api_key = os.environ.get("OPENAI_API_KEY")
         self._openai_base_url = os.environ.get("OPENAI_BASE_URL") or llm_cfg.get(
