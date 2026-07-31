@@ -33,6 +33,7 @@ STATUS_AGENT_MAP = {
     # Original linear pipeline
     "triage_pending": "triage",
     "awaiting_hardware": "resource_create",
+    "preparing_platform": "platform",
     "awaiting_provision": "provisioning",
     "executing_benchmark": "benchmark",
     "awaiting_review": "review",
@@ -362,6 +363,14 @@ class Dispatcher:
                 secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 instance_name=self._instance_name,
+            )
+        elif agent_type == "platform":
+            from agents.platform import PlatformAgent
+
+            return PlatformAgent(
+                llm_provider=llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
             )
         elif agent_type == "provisioning":
             return ProvisioningAgent(

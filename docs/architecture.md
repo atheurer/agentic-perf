@@ -441,10 +441,19 @@ endpoint type, pre-run approval).
 
 Runs in two modes: `create` (acquire) and `teardown` (release).
 
-**Provisioning Agent** — Prepares hosts for benchmarks. Checks platform
-contracts (OS compatibility, required packages), handles existing harness
-installations (reinstall/update/skip per directives), installs the harness,
-and optionally deploys K3s for Kubernetes endpoints.
+**Platform Agent** — Prepares allocated hardware for use by getting the
+OS running and SSH accessible. For Jumpstarter boards: flashes the OS
+image, boots, discovers the IP, and injects SSH keys using the
+Jumpstarter Python SDK deterministically. For providers that return
+ready hosts (AWS, QUADS): verifies and passes through. The LLM calls
+a `provision_platform` MCP tool which runs deterministic code
+internally — zero wasted iterations on the happy path.
+
+**Provisioning Agent** — Installs benchmark harnesses on provisioned
+hosts. For self-installing harnesses on Jumpstarter (boot-time,
+arcaflow-plugins), auto-completes immediately since the platform agent
+already prepared the board. For other harnesses, checks platform
+contracts, installs packages, and deploys K3s if needed.
 
 **Benchmark Agent** — Constructs the run configuration by reading harness
 documentation, schemas, and example run-files through its tools. The LLM

@@ -759,7 +759,7 @@ def test_advance_plan_full_six_step_cycle():
     expected_transitions = [
         ("executing_benchmark", "awaiting_teardown"),
         ("awaiting_teardown", "awaiting_hardware"),
-        ("awaiting_hardware", "awaiting_provision"),
+        ("awaiting_hardware", "preparing_platform"),
         ("awaiting_provision", "executing_benchmark"),
         ("executing_benchmark", "awaiting_review"),
     ]

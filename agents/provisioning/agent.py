@@ -86,6 +86,50 @@ class ProvisioningAgent(AgentBase):
         }
     )
 
+    async def _auto_complete_jumpstarter(
+        self,
+        ticket_id: str,
+        cf: dict[str, Any],
+    ) -> None:
+        """Auto-complete provisioning for Jumpstarter boards.
+
+        When the platform agent has already flashed and
+        verified the board, and the harness is self-
+        installing, there's nothing for the provisioning
+        agent to do. Set provisioning_complete and advance.
+        """
+        hosts = cf.get("hosts_provisioned", [])
+        harness = cf.get("directives", {}).get("harness", "unknown")
+        fields = {
+            "provisioning_complete": True,
+            "harness_name": harness,
+            "harness_version": "platform-provisioned",
+        }
+        if cf.get("ssh_user"):
+            fields["ssh_user"] = cf["ssh_user"]
+        if cf.get("ssh_key_path"):
+            fields["ssh_key_path"] = cf["ssh_key_path"]
+
+        await self._update_fields(ticket_id, fields)
+
+        summary = (
+            "**Provisioning Complete** "
+            "(platform-provisioned)\n\n"
+            f"- **Hosts:** {', '.join(str(h) for h in hosts)}\n"
+            f"- **Harness:** {harness}\n"
+            "- **Note:** Board flashed and verified by "
+            "platform agent. Self-installing harness "
+            "requires no additional provisioning.\n"
+        )
+        await self._add_comment(ticket_id, summary)
+
+        if not await self._plan_controls_next_transition(ticket_id):
+            await self._transition_ticket(
+                ticket_id,
+                "executing_benchmark",
+                comment="Provisioning complete (auto)",
+            )
+
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Hide install/config tools for self-installing harnesses."""
         harness = (
@@ -114,29 +158,40 @@ class ProvisioningAgent(AgentBase):
         )
         await mcp.connect(infra_server, name="infra")
 
-        # Attach Jumpstarter MCP if ticket uses Jumpstarter hardware.
-        from agents.jumpstarter_mcp import (
-            attach_jumpstarter_mcp,
-        )
-
-        jmp_tools = await attach_jumpstarter_mcp(mcp, ticket_id, self.store_url)
-
         self._mcp = mcp
 
+        # Check if this is a Jumpstarter ticket with a
+        # self-installing harness. The platform agent
+        # already handled flash/boot/verify — the
+        # provisioning agent just needs to confirm
+        # and advance.
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        harness = cf.get("directives", {}).get("harness", "")
+        is_jumpstarter = cf.get("resource_provider") == "jumpstarter"
+
+        if is_jumpstarter and (not harness or harness in self._SELF_INSTALLING):
+            # Platform agent already provisioned the
+            # board. For self-installing harnesses,
+            # there's nothing more to do.
+            if cf.get("platform_ready") and cf.get("hosts_provisioned"):
+                await self._auto_complete_jumpstarter(ticket_id, cf)
+                await mcp.disconnect()
+                self._mcp = None
+                return
+
         mcp_tools = await mcp.list_tools()
-        if jmp_tools is not None:
-            from agents.jumpstarter_mcp import _PROVIDER_ONLY_TOOLS
 
-            mcp_tools = [t for t in mcp_tools if t.name not in _PROVIDER_ONLY_TOOLS]
-        self.tools = mcp_tools + self.tools
-
-        # Scope tools based on harness type when using
-        # Jumpstarter. Self-installing harnesses need
-        # only flash + boot + key injection — hiding
-        # install/config tools prevents exploration.
-        if jmp_tools is not None:
-            ticket = await self._get_ticket(ticket_id)
+        # For Jumpstarter with non-self-installing
+        # harnesses, keep install tools but don't
+        # attach Jumpstarter MCP (platform agent
+        # handled device operations).
+        # For non-Jumpstarter, apply harness-based
+        # scoping as before.
+        if not is_jumpstarter:
             self._apply_tool_scoping(ticket)
+
+        self.tools = mcp_tools + self.tools
 
         try:
             await super().run(ticket_id)
@@ -247,54 +302,6 @@ class ProvisioningAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
-    async def _resolve_jumpstarter_ip(self) -> str:
-        """Resolve the board's IP via j tcp address.
-
-        Uses the active MCP connection. Returns the IP
-        string or empty string on failure.
-        """
-        if self._mcp is None:
-            return ""
-        try:
-            import json as _json
-
-            # Get the active connection ID.
-            conns_raw = await self._mcp.call_tool("jmp_list_connections", {})
-            conns = _json.loads(conns_raw)
-            conn_list = (
-                conns if isinstance(conns, list) else conns.get("connections", [])
-            )
-            if not conn_list:
-                return ""
-            conn_id = conn_list[0].get(
-                "connection_id",
-                conn_list[0].get("id", ""),
-            )
-
-            raw = await self._mcp.call_tool(
-                "jmp_run",
-                {
-                    "connection_id": conn_id,
-                    "command": ["tcp", "address"],
-                    "timeout_seconds": 30,
-                },
-            )
-            data = _json.loads(raw)
-            stdout = data.get("stdout", "").strip()
-            if stdout and ":" in stdout:
-                # Format: "10.26.28.129:22"
-                ip = stdout.split(":")[0]
-                logger.info(f"[provisioning] Resolved IP: {ip}")
-                return ip
-            elif stdout:
-                return stdout
-        except Exception:
-            logger.warning(
-                "[provisioning] j tcp address failed",
-                exc_info=True,
-            )
-        return ""
-
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
         result = self._get_submit_result(response)
         if not result:
@@ -332,50 +339,6 @@ class ProvisioningAgent(AgentBase):
         if result.get("k3s_installed"):
             fields["k3s_installed"] = True
             fields["k3s_version"] = result.get("k3s_version", "unknown")
-
-        # Jumpstarter: resolve the board's IP address
-        # deterministically via j tcp address. This is
-        # mandatory — the agent may submit a board name
-        # or selector label instead of an IP.
-        ticket = await self._get_ticket(ticket_id)
-        cf = ticket.get("custom_fields", {})
-        if cf.get("resource_provider") == "jumpstarter" and self._mcp is not None:
-            resolved_ip = await self._resolve_jumpstarter_ip()
-            if resolved_ip:
-                fields["hosts_provisioned"] = [resolved_ip]
-            elif prov_complete:
-                # IP resolution failed but agent claims
-                # provisioning is complete. Reject —
-                # without an IP, benchmark can't SSH.
-                logger.warning(
-                    "[provisioning] Rejecting "
-                    "provisioning_complete: IP "
-                    "resolution failed for %s",
-                    ticket_id,
-                )
-                prov_complete = False
-                fields["provisioning_complete"] = False
-
-        # Validate hosts_provisioned entries are IPs,
-        # not hostnames or board names (only for Jumpstarter).
-        import re as _re
-
-        _ip_pattern = _re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
-        if (
-            prov_complete
-            and cf.get("resource_provider") == "jumpstarter"
-            and fields.get("hosts_provisioned")
-        ):
-            invalid = [
-                h for h in fields["hosts_provisioned"] if not _ip_pattern.match(str(h))
-            ]
-            if invalid:
-                logger.warning(
-                    "[provisioning] Rejecting provisioning_complete: non-IP hosts %s",
-                    invalid,
-                )
-                prov_complete = False
-                fields["provisioning_complete"] = False
 
         # Derive ssh_hardware_ips from hosts_provisioned.
         ssh_ips = result.get("ssh_hardware_ips")
