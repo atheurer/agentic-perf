@@ -1,14 +1,101 @@
 #!/usr/bin/env bash
+# Pre-commit hook: scoped lint + auto-discovered tests.
+#
+# Only lints staged Python files and runs tests that match
+# the changed source by naming convention. CI still runs
+# the full suite (scripts/validate.sh).
+#
+# Test discovery convention:
+#   source: agents/platform/agent.py
+#   search: tests/test_*platform*.py (dir name)
+#   search: tests/test_*agent*.py    (file name, skipped
+#           for generic names like agent, server, prompts)
+#
+# If no tests are discovered, the full suite runs as a
+# safety fallback.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
-validate_script="${repo_root}/scripts/validate.sh"
+# Collect staged Python files
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
-if [[ ! -x "${validate_script}" ]]; then
-    echo "ERROR: Missing ${validate_script}. Run scripts/dev-setup.sh." >&2
-    exit 1
+if [[ -z "$STAGED_PY" ]]; then
+    echo "No Python files staged — skipping lint and tests"
+    exit 0
 fi
 
-echo "Running pre-commit validation..."
-"${validate_script}"
+echo "Running pre-commit validation (scoped)..."
+
+# ── Scoped lint ──────────────────────────────────
+echo ""
+echo "=== Ruff lint check (staged files) ==="
+echo "$STAGED_PY" | xargs ruff check
+
+echo "=== Ruff format check (staged files) ==="
+echo "$STAGED_PY" | xargs ruff format --check
+
+echo "✓ Lint passed"
+
+# ── Auto-discover tests ──────────────────────────
+# Names that are too generic for file-name matching.
+# When these are the basename, we fall back to the
+# directory name only.
+GENERIC_NAMES="agent server prompts base registry factory __init__ models"
+
+discover_tests() {
+    local all_tests=""
+
+    for f in $STAGED_PY; do
+        local name dir matches
+        name=$(basename "$f" .py)
+        dir=$(basename "$(dirname "$f")")
+
+        matches=""
+
+        # Try file name first (unless generic)
+        if ! echo " $GENERIC_NAMES " | grep -q " $name "; then
+            matches=$(ls tests/test_*"${name}"*.py 2>/dev/null || true)
+        fi
+
+        # Fall back to directory name
+        if [[ -z "$matches" ]]; then
+            matches=$(ls tests/test_*"${dir}"*.py 2>/dev/null || true)
+        fi
+
+        # Test files map to themselves
+        if [[ "$f" == tests/*.py ]]; then
+            matches="$f"
+        fi
+
+        if [[ -n "$matches" ]]; then
+            all_tests="$all_tests $matches"
+        fi
+    done
+
+    # Deduplicate and filter to existing files
+    if [[ -n "$all_tests" ]]; then
+        echo "$all_tests" | tr ' ' '\n' | sort -u | while read -r t; do
+            [[ -n "$t" && -f "$t" ]] && echo "$t"
+        done
+    fi
+}
+
+TEST_FILES=$(discover_tests)
+
+if [[ -z "$TEST_FILES" ]]; then
+    echo ""
+    echo "=== No test mapping found — running full suite ==="
+    python3 -m pytest tests/ -q --tb=short
+else
+    COUNT=$(echo "$TEST_FILES" | wc -l)
+    echo ""
+    echo "=== Running $COUNT targeted test file(s) ==="
+    echo "$TEST_FILES"
+    echo ""
+    python3 -m pytest $TEST_FILES -q --tb=short
+fi
+
+echo ""
+echo "✓ Pre-commit validation passed"
