@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Pre-commit hook: scoped lint + targeted tests.
+# Pre-commit hook: scoped lint + auto-discovered tests.
 #
-# Only lints and tests files affected by the commit.
-# CI (scripts/validate.sh) still runs the full suite.
+# Only lints staged Python files and runs tests that match
+# the changed source by naming convention. CI still runs
+# the full suite (scripts/validate.sh).
+#
+# Test discovery convention:
+#   source: agents/platform/agent.py
+#   search: tests/test_*platform*.py (dir name)
+#   search: tests/test_*agent*.py    (file name, skipped
+#           for generic names like agent, server, prompts)
+#
+# If no tests are discovered, the full suite runs as a
+# safety fallback.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,8 +21,6 @@ cd "$repo_root"
 # Collect staged Python files
 STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
-# If no Python files changed, only check for format issues
-# in any staged files and skip tests entirely.
 if [[ -z "$STAGED_PY" ]]; then
     echo "No Python files staged — skipping lint and tests"
     exit 0
@@ -21,7 +29,6 @@ fi
 echo "Running pre-commit validation (scoped)..."
 
 # ── Scoped lint ──────────────────────────────────
-# Lint only staged files (fast). CI lints everything.
 echo ""
 echo "=== Ruff lint check (staged files) ==="
 echo "$STAGED_PY" | xargs ruff check
@@ -31,76 +38,61 @@ echo "$STAGED_PY" | xargs ruff format --check
 
 echo "✓ Lint passed"
 
-# ── Targeted tests ───────────────────────────────
-# Map changed source files to test files using
-# naming conventions. Falls back to running the
-# full suite if no mapping is found.
+# ── Auto-discover tests ──────────────────────────
+# Names that are too generic for file-name matching.
+# When these are the basename, we fall back to the
+# directory name only.
+GENERIC_NAMES="agent server prompts base registry factory __init__ models"
 
-collect_tests() {
-    local tests=""
+discover_tests() {
+    local all_tests=""
 
     for f in $STAGED_PY; do
-        case "$f" in
-            # Agent modules → agent-specific tests
-            agents/benchmark/*)    tests="$tests tests/test_benchmark_tools.py tests/test_benchmark_artifacts.py tests/test_boot_time.py" ;;
-            agents/evaluate/*)     tests="$tests tests/test_evaluate_agent.py" ;;
-            agents/gathering_context/*) tests="$tests tests/test_gathering_context.py" ;;
-            agents/introspection/*) tests="$tests tests/test_introspection.py" ;;
-            agents/investigation/*) tests="$tests tests/test_investigation_tools.py" ;;
-            agents/platform/*)     tests="$tests tests/test_platform_agent.py" ;;
-            agents/provisioning/*) tests="$tests tests/test_provisioning_tools.py" ;;
-            agents/resource/*)     tests="$tests tests/test_resource_providers.py" ;;
-            agents/review/*)       tests="$tests tests/test_slash_commands.py" ;;
-            agents/synthesis/*)    tests="$tests tests/test_synthesis_agent.py" ;;
-            agents/triage/*)       tests="$tests tests/test_triage_mcp.py" ;;
-            agents/infra/*)        tests="$tests tests/test_infra_mcp.py tests/test_command_policy.py" ;;
-            agents/base.py)        tests="$tests tests/test_agent_iterations.py tests/test_budget_guardrails.py" ;;
-            agents/mcp_client.py)  tests="$tests tests/test_external_mcp.py tests/test_mcp_network_transport.py" ;;
-            agents/jumpstarter_mcp.py) tests="$tests tests/test_jumpstarter_mcp.py" ;;
-            agents/stub.py)        tests="$tests tests/test_tool_scoping.py" ;;
+        local name dir matches
+        name=$(basename "$f" .py)
+        dir=$(basename "$(dirname "$f")")
 
-            # Orchestrator
-            orchestrator/dispatcher.py) tests="$tests tests/test_dispatcher_claim.py" ;;
-            orchestrator/handoff.py)    tests="$tests tests/test_handoff.py" ;;
-            orchestrator/main.py)       tests="$tests tests/test_execution_plan.py" ;;
+        matches=""
 
-            # State store
-            state_store/models.py)  tests="$tests tests/test_state_machine.py" ;;
-            state_store/store.py)   tests="$tests tests/test_state_store.py" ;;
-            state_store/auth.py)    tests="$tests tests/test_state_store_auth.py" ;;
-            state_store/api/*)      tests="$tests tests/test_state_store.py tests/test_event_stream.py" ;;
+        # Try file name first (unless generic)
+        if ! echo " $GENERIC_NAMES " | grep -q " $name "; then
+            matches=$(ls tests/test_*"${name}"*.py 2>/dev/null || true)
+        fi
 
-            # Providers
-            providers/resource/jumpstarter*.py) tests="$tests tests/test_jumpstarter_provider.py tests/test_platform_agent.py" ;;
-            providers/resource/aws.py)   tests="$tests tests/test_resource_providers.py" ;;
-            providers/skills/arcaflow*) tests="$tests tests/test_arcaflow_plugins_provider.py" ;;
-            providers/llm/*)        tests="$tests tests/test_llm_timeout.py" ;;
-            providers/convergence.py) tests="$tests tests/test_convergence_criteria.py" ;;
-            providers/budget.py)    tests="$tests tests/test_budget_guardrails.py" ;;
-            providers/events.py)    tests="$tests tests/test_event_stream.py" ;;
-            providers/ssh.py)       tests="$tests tests/test_execute_command.py" ;;
+        # Fall back to directory name
+        if [[ -z "$matches" ]]; then
+            matches=$(ls tests/test_*"${dir}"*.py 2>/dev/null || true)
+        fi
 
-            # Test files themselves
-            tests/*)               tests="$tests $f" ;;
-        esac
+        # Test files map to themselves
+        if [[ "$f" == tests/*.py ]]; then
+            matches="$f"
+        fi
+
+        if [[ -n "$matches" ]]; then
+            all_tests="$all_tests $matches"
+        fi
     done
 
     # Deduplicate and filter to existing files
-    echo "$tests" | tr ' ' '\n' | sort -u | while read -r t; do
-        [[ -n "$t" && -f "$t" ]] && echo "$t"
-    done
+    if [[ -n "$all_tests" ]]; then
+        echo "$all_tests" | tr ' ' '\n' | sort -u | while read -r t; do
+            [[ -n "$t" && -f "$t" ]] && echo "$t"
+        done
+    fi
 }
 
-TEST_FILES=$(collect_tests)
+TEST_FILES=$(discover_tests)
 
 if [[ -z "$TEST_FILES" ]]; then
     echo ""
-    echo "=== No test mapping for changed files — running full suite ==="
+    echo "=== No test mapping found — running full suite ==="
     python3 -m pytest tests/ -q --tb=short
 else
+    COUNT=$(echo "$TEST_FILES" | wc -l)
     echo ""
-    echo "=== Running targeted tests ==="
-    echo "$TEST_FILES" | tr '\n' ' '
+    echo "=== Running $COUNT targeted test file(s) ==="
+    echo "$TEST_FILES"
     echo ""
     python3 -m pytest $TEST_FILES -q --tb=short
 fi

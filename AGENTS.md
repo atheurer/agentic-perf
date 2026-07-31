@@ -147,10 +147,23 @@ Always include `AI-assisted-by: <model>` when AI was used.
 - **Scripts:** `./scripts/test.sh`, `./scripts/lint.sh`,
   `./scripts/validate.sh` (CI and debugging use only)
 
+**Test file naming convention:** Test files are auto-discovered
+by the pre-commit hook using source file/directory name matching.
+When naming test files, include the source module or directory
+name so the hook can find them:
+
+- `agents/platform/*.py` → `tests/test_platform*.py`
+- `providers/budget.py` → `tests/test_budget*.py`
+- `orchestrator/handoff.py` → `tests/test_handoff*.py`
+
+Generic source names (`agent.py`, `server.py`, `prompts.py`)
+fall back to matching on the parent directory name.
+
 ### Git Hooks
 
-Hooks are the primary quality gate — they run `scripts/validate.sh`
-automatically on every commit (ruff check, ruff format, pytest).
+The pre-commit hook runs **scoped validation** — lint and tests
+are limited to staged files and their auto-discovered tests.
+CI (`scripts/validate.sh`) runs the full suite.
 
 **Setup:** `./scripts/dev-setup.sh` (one-time after clone)
 
