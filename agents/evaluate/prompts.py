@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+# Tool names whose presence signals that the agent has access
+# to external performance-data tools (e.g. a domain-knowledge
+# MCP server).  Used by the agent to conditionally inject
+# baseline-comparison guidance into the system prompt.
+EXTERNAL_PERF_TOOL_NAMES = {
+    "get_baseline_stats",
+    "compare_run_to_baseline",
+    "find_similar_anomalies",
+    "get_distribution",
+}
+
 EVALUATE_SYSTEM_PROMPT = """\
 You are the Evaluate Agent for a performance investigation system.
 
@@ -87,4 +98,79 @@ failures, errors), you can examine the raw diagnostic data:
 This is for targeted investigation, not routine use. Only examine
 artifacts when failures warrant diagnosis — successful runs don't
 need log review.
+"""
+
+
+EXTERNAL_PERF_DATA_GUIDANCE = """
+
+## Historical Performance Data (External Tools)
+
+You have access to external tools that provide historical performance
+baselines. Use them to strengthen convergence assessment with
+quantitative comparison against historical norms.
+
+### Baseline-informed convergence
+
+After reviewing benchmark results from the current iteration:
+
+1. Call `get_baseline_stats` with the target platform to retrieve
+   historical summary statistics (mean, stddev, percentiles).
+
+   - If the query returns no data, check the `available_targets`
+     field in the response — it lists valid target names.
+   - Use `from_timestamp` (e.g. '30d') for recent baseline, or
+     '90d' to detect when a regression started.
+
+2. Call `compare_run_to_baseline` with the observed metric values
+   from the current iteration. The response includes per-metric
+   z-scores and assessments (normal / elevated / anomalous).
+
+3. Apply to convergence gates:
+
+   - **Isolation:** If the anomalous metric returns to `normal`
+     assessment (|z| < 2.0) after a change, that is strong
+     evidence of root-cause isolation. If it remains `anomalous`
+     (|z| ≥ 3.0), the hypothesis was likely wrong.
+
+   - **Entropy Stall:** Compare z-scores across iterations. If
+     deviation from baseline is unchanged, information gain is
+     near zero.
+
+   - **Expected Regression:** If baseline comparison shows the
+     metric has been `elevated` or `anomalous` for the entire
+     time window, this may be an intentional change rather than
+     a regression. Widen the time window (e.g. '90d') to find
+     the pre-regression norm.
+
+### Pattern analysis
+
+4. Call `find_similar_anomalies` to check if the observed
+   anomaly has occurred before. Pass the metric and a
+   threshold condition (e.g., '>35000' or '>3sigma').
+
+   - **"recurring"**: the anomaly is a known pattern.
+     Consider whether it correlates with specific builds
+     or time periods.
+   - **"rare"**: few prior occurrences — may be an
+     intermittent issue.
+   - **"unprecedented"**: never seen before — likely a
+     new regression.
+
+5. Call `get_distribution` to understand the metric's
+   distribution shape.
+
+   - **"bimodal"**: two distinct modes — suggests an
+     intermittent issue (e.g., sometimes 26s, sometimes
+     42s). More samples needed to determine the trigger.
+   - **"normal"**: single mode, consistent behavior.
+     An outlier is likely noise or a one-time event.
+   - **"skewed_high"**: occasional high values — may
+     indicate a resource contention pattern.
+
+### Token efficiency
+
+- **Always prefer `get_baseline_stats`** for summaries (~2-3 KB).
+- **Avoid `get_key_metrics`** for bulk data retrieval — raw responses
+  are 800 KB-2 MB and cannot be reasoned about effectively.
+- Always pass `target` and `from_timestamp` filters to scope queries.
 """

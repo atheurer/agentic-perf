@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+# Tool names whose presence signals that the agent has access
+# to external performance-data tools (e.g. a domain-knowledge
+# MCP server).  Used by the agent to conditionally inject
+# grounding guidance into the system prompt.
+EXTERNAL_PERF_TOOL_NAMES = {
+    "get_baseline_stats",
+    "compare_run_to_baseline",
+}
+
 GATHERING_CONTEXT_SYSTEM_PROMPT = """\
 You are the Gathering Context Agent for a performance investigation system.
 
@@ -54,4 +63,46 @@ record exists, skip the full investigation; if not, proceed.
   regression again than to skip an investigation of a new one.
 - Do NOT create new Investigation Records — that happens at the end of
   the investigation, not at the beginning.
+"""
+
+
+EXTERNAL_PERF_DATA_GUIDANCE = """
+
+## Historical Performance Data (External Tools)
+
+You have access to external tools that provide historical performance
+baselines. Use them to ground your assessment with quantitative context
+before submitting your result.
+
+### Grounding workflow
+
+After completing the dedup check (steps 1-5 above), and when the ticket
+has anomaly context with a platform identifier:
+
+1. Call `get_baseline_stats` with the platform from
+   `anomaly_context.platform` as the `target` parameter.
+   This returns summary statistics (mean, stddev, percentiles,
+   sample count) for historical performance on this platform.
+
+   - If the query returns no data, check the `available_targets`
+     field in the response — it lists valid target names. Use
+     the closest match and retry.
+   - Use `from_timestamp` (e.g. '30d') to scope to recent history.
+
+2. If specific metric values from the anomalous run are available
+   (e.g. from the anomaly context or a run ID), call
+   `compare_run_to_baseline` with those values. This returns
+   per-metric z-scores, deviation percentages, and assessments
+   (normal / elevated / anomalous).
+
+3. Include the baseline context and any deviation analysis in your
+   `submit_gathering_context_result` call so downstream agents
+   have quantitative grounding for the investigation.
+
+### Token efficiency
+
+- **Always prefer `get_baseline_stats`** for summaries (~2-3 KB).
+- **Avoid `get_key_metrics`** for bulk data retrieval — raw responses
+  are 800 KB-2 MB and cannot be reasoned about effectively.
+- Always pass `target` and `from_timestamp` filters to scope queries.
 """

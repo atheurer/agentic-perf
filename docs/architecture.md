@@ -852,6 +852,24 @@ agents call this in their `run()` method. See
 [Configuration](configuration.md#external_mcp_servers) for the
 config schema.
 
+**Conditional prompt guidance:**
+
+When external performance data tools (e.g., `get_baseline_stats`,
+`find_similar_anomalies`, `get_distribution`) are detected in the
+agent's tool list, tailored guidance is injected into the system
+prompt. Each agent gets role-specific guidance:
+
+- **gathering_context**: grounding workflow — establish baselines
+  and characterize anomaly deviation
+- **evaluate**: convergence assessment — use z-scores, anomaly
+  search, and distribution shape to strengthen gate decisions
+- **review**: quantitative context — compare results against
+  historical baselines
+
+Deployments without an external performance data server see
+zero behavioral change — the guidance is only injected when
+the tools are present.
+
 ### SSH Executor
 
 `SSHExecutor` (`providers/ssh.py`) provides async SSH command execution
