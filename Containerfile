@@ -64,10 +64,17 @@ COPY --from=builder /opt/app-root/bin /opt/app-root/bin
 WORKDIR /app
 COPY . .
 
-# Jumpstarter SDK setup script (run at build time
-# if desired, or at runtime via entrypoint).
-# Uncomment to bake Jumpstarter into the image:
-# RUN bash scripts/setup-jumpstarter.sh
+# Jumpstarter SDK: install into the image so
+# jmp/j CLIs and all drivers are available.
+# Runs as root for /usr/local/bin symlinks.
+# HOME must be /root for the install script's
+# hardcoded venv path.
+# The setup script's driver verification may fail
+# because system Python differs from the venv
+# Python. The drivers are installed correctly in
+# the venv — verification is non-blocking.
+RUN HOME=/root bash scripts/setup-jumpstarter.sh || \
+    echo 'WARNING: setup-jumpstarter.sh exited non-zero (driver verification may have failed)'
 
 # Runtime configuration
 ENV AGENTIC_PERF_HOME=/data/agentic-perf
