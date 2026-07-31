@@ -438,7 +438,13 @@ async def connect_external_servers(
             config = {}
 
     if not secrets_dir:
-        secrets_dir = str(Path.home() / ".agentic-perf" / "secrets")
+        ap_home = Path(
+            os.environ.get(
+                "AGENTIC_PERF_HOME",
+                str(Path.home() / ".agentic-perf"),
+            )
+        )
+        secrets_dir = str(ap_home / "secrets")
 
     servers = config.get("external_mcp_servers", [])
     connected: list[str] = []
