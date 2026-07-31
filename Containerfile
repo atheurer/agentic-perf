@@ -76,6 +76,19 @@ COPY . .
 RUN HOME=/root bash scripts/setup-jumpstarter.sh || \
     echo 'WARNING: setup-jumpstarter.sh exited non-zero (driver verification may have failed)'
 
+# Fix the .pth file: the Jumpstarter install script
+# detects the venv's Python version (may differ from
+# the app Python). Rewrite to match the actual venv
+# site-packages layout.
+RUN PTH=$(find /opt/app-root -name 'jumpstarter.pth' 2>/dev/null | head -1) && \
+    if [ -n "$PTH" ]; then \
+        VENV=/root/.local/jumpstarter/venv && \
+        PYVER=$(ls "$VENV/lib64/" 2>/dev/null | grep python | head -1) && \
+        echo "$VENV/lib64/$PYVER/site-packages" > "$PTH" && \
+        echo "$VENV/lib/$PYVER/site-packages" >> "$PTH" && \
+        echo "Fixed .pth to $PYVER"; \
+    fi
+
 # Runtime configuration
 ENV AGENTIC_PERF_HOME=/data/agentic-perf
 ENV PYTHONUNBUFFERED=1
