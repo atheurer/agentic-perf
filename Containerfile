@@ -55,6 +55,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         git \
         jq \
         sshpass \
+        iputils \
     && dnf clean all
 
 # Copy installed Python packages from builder
