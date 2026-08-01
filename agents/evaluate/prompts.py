@@ -82,22 +82,28 @@ After analysis, call submit_evaluation_result with your decision:
 - Always provide a params_rationale explaining WHY you chose the next
   experiment's parameters, informed by what prior iterations showed.
 
-## Diagnostic Artifacts
+## Benchmark Artifacts
 
-When benchmark results indicate failures (partial samples, boot
-failures, errors), you can examine the raw diagnostic data:
+You can examine raw benchmark data using the artifact tools:
 
 1. Call `list_benchmark_artifacts` with the `output_dir` from the
-   benchmark results to see what logs, serial captures, and traces
-   are available.
-2. Call `read_benchmark_artifact` to read specific files — start
-   with serial captures or journal logs from failed samples.
+   benchmark results to see what files are available (timing data,
+   serial captures, merged results, per-sample summaries).
+2. Call `read_benchmark_artifact` to read specific files.
 3. Use pagination (offset/limit) for large files — don't try to
    read the entire file at once.
 
-This is for targeted investigation, not routine use. Only examine
-artifacts when failures warrant diagnosis — successful runs don't
-need log review.
+**Always read the per-sample data for statistical analysis.** The
+KPI summary in the benchmark comment only shows averages — you need
+per-sample values to assess variance, detect outliers, and evaluate
+statistical confidence. Look for:
+- `*_summary.json` files for per-sample timing breakdowns
+- `*boot_time_logs.json` for raw timing data
+- `merged-results.json` for the Horreum-compatible combined result
+- `collection_status.json` for partial-run diagnostics
+
+For failed runs, also examine serial captures and journal logs to
+diagnose the root cause.
 """
 
 
