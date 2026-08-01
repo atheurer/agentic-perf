@@ -107,11 +107,15 @@ RUN mkdir -p /data/agentic-perf && \
 VOLUME ["/data/agentic-perf"]
 
 # Use the default UBI non-root user (1001)
-USER 1001
+# Generate SSH keypair for board access.
+# Create as root so OpenShift's arbitrary UID
+# (which shares group 0) can read the key.
+RUN mkdir -p /opt/app-root/src/.ssh && \
+    ssh-keygen -t ed25519 -f /opt/app-root/src/.ssh/id_ed25519 -N "" -q && \
+    chmod 770 /opt/app-root/src/.ssh && \
+    chmod 660 /opt/app-root/src/.ssh/* && \
+    chown -R 1001:0 /opt/app-root/src/.ssh
 
-# Generate SSH key if not mounted
-RUN mkdir -p ~/.ssh && \
-    chmod 700 ~/.ssh && \
-    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+USER 1001
 
 ENTRYPOINT ["/app/start.sh"]
