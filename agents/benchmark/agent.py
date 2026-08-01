@@ -144,8 +144,6 @@ class BenchmarkAgent(AgentBase):
     _HARNESS_TOOLS: dict[str, set[str]] = {
         "boot-time": {
             "read_skill",
-            "set_ssh_context",
-            "check_host",
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",
