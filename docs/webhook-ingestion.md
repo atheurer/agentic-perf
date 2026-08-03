@@ -172,7 +172,8 @@ Dedup key: `horreum:change:{change.id}`
 
 The gathering_context agent uses the `run_id` and `test_name` from
 `anomaly_context` to query the Domain MCP for full context — baseline
-stats, metric values, and historical comparisons.
+stats, metric values, and historical comparisons. See
+[Agent Grounding](#agent-grounding) below.
 
 ## Adding a New Translator
 
@@ -206,12 +207,50 @@ _TRANSLATORS: dict[str, str] = {
 
 3. Add tests in `tests/test_webhooks.py`.
 
+## Agent Grounding
+
+Webhook tickets arrive without hardware directives (`board_selector`,
+`image_version`, `harness`). Unlike manually submitted tickets where
+the user provides these, the gathering_context agent must resolve
+them from the alert data.
+
+### How it works
+
+1. The gathering_context agent detects webhook tickets via
+   `trigger_source` or `anomaly_context.source` on the ticket.
+2. If the `get_run_info` Domain MCP tool is available, the agent
+   calls it with the `run_id` or `dataset_id` from the anomaly
+   context to get the target/board type, OS version, and labels.
+3. The agent maps the metadata to directives:
+   - `target` → `board_selector` (e.g., `board-type=renesas-rcar-s4`)
+   - `os_id` or labels → `image_version` (e.g., `AutoSD-10`)
+   - `test_name` / description → `harness` (e.g., `boot-time`)
+4. The resolved directives are included in the
+   `submit_gathering_context_result` call and written to the ticket
+   for downstream agents (resource, platform, benchmark).
+
+### Fallback
+
+If `get_run_info` is not available or returns no data, the agent
+infers what it can from the anomaly context (e.g., `test_name` may
+indicate the harness) and notes the missing fields. The
+investigation will request human guidance for unresolved directives.
+
+### Prerequisite
+
+The Domain MCP server must expose a `get_run_info` tool that returns
+metadata for a Horreum run or dataset by ID. Add `get_run_info` to
+the `enabled_tools` list for `gathering_context` in `config.json`.
+
 ## Dedup
 
 Before creating a ticket, the endpoint checks all open tickets
 for a matching `trigger_source` + `dedup_key`. If a match is found,
 the webhook returns the existing ticket ID with `status: "duplicate"`
 instead of creating a new one.
+
+A `duplicate_suppressed` event is emitted on the existing ticket so
+the dedup is visible in the dashboard timeline.
 
 This prevents alert storms from creating duplicate investigations
 when the same anomaly triggers multiple webhooks.
@@ -232,5 +271,7 @@ The rate limit counter is in-memory and resets on service restart.
   can appear in reverse proxy logs. For internal deployments,
   use a cluster-internal service (no external Route) to avoid
   exposure. The token provides defense-in-depth, not sole auth.
-- **Service accounts cannot be admins**: Code-enforced invariant
-  prevents privilege escalation via service accounts.
+- **Service accounts cannot be admins**: Enforced at three levels:
+  creation (rejects `is_admin=True`), promotion (`set_admin` raises
+  error), and runtime (auth middleware strips admin even if
+  `users.json` is tampered).
