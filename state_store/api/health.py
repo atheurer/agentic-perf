@@ -20,9 +20,3 @@ def health(request: Request):
         "total": len(all_tickets),
         "terminal_statuses": [s.value for s in TERMINAL_STATUSES],
     }
-
-
-@router.get("/tickets/since/{seq}")
-def tickets_since(seq: int, request: Request):
-    store = request.app.state.store
-    return store.get_tickets_since(seq)

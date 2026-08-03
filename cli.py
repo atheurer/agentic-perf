@@ -48,6 +48,15 @@ def _check_403(r: httpx.Response) -> bool:
     return True
 
 
+def _check_429(r: httpx.Response) -> bool:
+    """Handle 429 responses with Retry-After. Returns True if 429."""
+    if r.status_code != 429:
+        return False
+    retry = r.headers.get("retry-after", "5")
+    print(f"Rate limited — retry after {retry}s", file=sys.stderr)
+    return True
+
+
 def cmd_submit(args):
     client, url = get_client(args)
     description = args.description or args.summary
@@ -236,6 +245,13 @@ def cmd_watch(args):
     try:
         while True:
             r = client.get(f"/api/v1/tickets/{args.ticket_id}")
+            if _check_429(r):
+                try:
+                    retry = min(int(r.headers.get("retry-after", "5")), 60)
+                except (ValueError, OverflowError):
+                    retry = 5
+                time.sleep(max(retry, 1))
+                continue
             r.raise_for_status()
             t = r.json()
 

@@ -1,0 +1,18 @@
+# Container build ignore — works with podman (.containerignore)
+# and docker (.dockerignore via symlink)
+.git
+.github
+.pi
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.ruff_cache
+coverage/
+htmlcov/
+*.log
+.env
+.venv
+venv/
+node_modules/

@@ -285,8 +285,42 @@ stops automatically when the ticket reaches a terminal status. See
 |---|---|---|---|---|
 | `poll_interval` | float | `3.0` | `POLL_INTERVAL` | Seconds between orchestrator dispatch cycles |
 | `ssh_key` | string | — | `SSH_KEY` | Path to SSH private key for remote host access |
+| `ssh_key_vault_secret` | string | — | `SSH_KEY_VAULT_SECRET` | Vault secret name for SSH key fallback (see below) |
 | `crucible_home` | string | `"/opt/crucible"` | `CRUCIBLE_HOME` | Path to crucible installation |
 | `zathras_home` | string | `""` | `ZATHRAS_HOME` | Path to zathras installation |
+
+---
+
+### SSH Key Vault Fallback
+
+When SSH keys are stored in Bitwarden Secrets Manager instead of
+on the local filesystem, configure `ssh_key_vault_secret` to enable
+automatic fallback:
+
+```json
+{
+    "ssh_key_vault_secret": "ssh/id_ed25519"
+}
+```
+
+**Resolution order:**
+
+1. Ticket `custom_fields.ssh_key_path` — if the file exists on
+   disk, it is used directly (no vault lookup).
+2. Ticket `custom_fields.ssh_key_secret` — per-ticket vault secret
+   name override (set by the resource agent).
+3. `SSH_KEY_VAULT_SECRET` env var — deployment-level override.
+4. `ssh_key_vault_secret` in config.json — global default.
+
+The system materializes the vault secret to a temporary file (mode
+0600) for the duration of the agent operation, then removes it.
+
+If a vault secret name is configured but the secret is not found,
+the operation fails with `SSHKeyResolutionError` — this fail-closed
+design prevents SSH from falling back to default identity files.
+
+See [Secrets Management](secrets.md) for vault configuration and
+bootstrap token setup.
 
 ---
 
@@ -414,6 +448,45 @@ to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
 
 ---
 
+### `secrets` — Vault-Backed Secrets
+
+Connect the secrets cascade to a Bitwarden Secrets Manager project.
+Vault layers are added behind local file layers — a file on disk
+always overrides the vault within the same tier.
+
+```json
+{
+    "secrets": {
+        "bitwarden": {
+            "organization_id": "<org-uuid>",
+            "shared_project_id": "<project-uuid>",
+            "group_project_ids": {
+                "gpu-team": "<project-uuid>"
+            },
+            "server_url": "https://vault.example.com",
+            "cache_ttl_seconds": 60
+        }
+    }
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `organization_id` | string | yes | Bitwarden organization UUID |
+| `shared_project_id` | string | yes | SM project for deployment-shared secrets |
+| `group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
+| `server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
+| `cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
+
+Requires `pip install agentic-perf[bitwarden]` and a machine account
+access token (env `AGENTIC_PERF_BWS_TOKEN` or file
+`~/.agentic-perf/secrets/bitwarden/access-token`).
+
+When this section is absent, vault layers are never constructed.
+See [Secrets Management](secrets.md) for full details.
+
+---
+
 ### `auth` — Multi-User Authentication
 
 ```json
@@ -431,6 +504,44 @@ to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
 
 See [Multi-User Guide](multi-user.md) for bootstrap instructions and
 the full feature walkthrough.
+
+---
+
+### `rate_limit` — API Rate Limiting
+
+```json
+{
+    "rate_limit": {
+        "enabled": true,
+        "per_user_rpm": 600,
+        "burst": 30,
+        "exempt_service": true,
+        "auth_failures_per_min": 30
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable rate limiting. When `false`, no request or auth-failure limiting is applied. |
+| `per_user_rpm` | int | `600` | Maximum requests per minute per user principal. Only enforced in multi-user mode — in legacy (single-token) mode, all callers share the service principal, so per-principal limiting would throttle the entire system. |
+| `burst` | int | `30` | Token bucket burst capacity. Allows short bursts above the sustained RPM rate (e.g., dashboard page loads that fire several requests simultaneously). |
+| `exempt_service` | bool | `true` | Exempt the service principal (deployment token) from rate limiting. **Strongly recommended.** A 429 to an agent triggers error paths that skip budget guardrails, and agent crash leads to paid re-dispatch loops. |
+| `auth_failures_per_min` | int | `30` | Maximum authentication failures per IP per minute before returning 429 instead of 401. Also enforces a global failure ceiling (4× per-IP rate) as a backstop against distributed brute-force from localhost. Active in both legacy and multi-user modes. |
+
+**Algorithm:** Token bucket with refill. Each principal gets an
+independent bucket that refills at `per_user_rpm / 60` tokens per
+second, capped at `burst` tokens. When empty, the server returns
+`429 Too Many Requests` with a `Retry-After` header (seconds until
+a token is available). The dashboard, CLI, and TUI all honor this
+header automatically.
+
+**Bounded state:** Per-principal buckets are evicted LRU when the
+table exceeds 4096 entries, preventing memory exhaustion from
+token-spray attacks.
+
+**Health endpoint:** `/api/v1/health` is never rate-limited (it has
+no auth dependency).
 
 ---
 
@@ -465,9 +576,13 @@ variable overrides, which take precedence over the file.
 | `STATE_STORE_URL` | `state_store.url` |
 | `POLL_INTERVAL` | `poll_interval` |
 | `SSH_KEY` | `ssh_key` |
+| `SSH_KEY_VAULT_SECRET` | `ssh_key_vault_secret` |
 | `CRUCIBLE_HOME` | `crucible_home` |
 | `ZATHRAS_HOME` | `zathras_home` |
 | `HARNESS_REPOS` | `harness_repos` (JSON string) |
 | `AGENT_TASK_TIMEOUT` | `agent_task_timeout` |
 | `STALE_TASK_TIMEOUT` | `stale_task_timeout` |
 | `INTROSPECTION_ENABLED` | `introspection.enabled` |
+| `AGENTIC_PERF_BWS_TOKEN` | Bitwarden SM access token (no config.json equivalent) |
+| `SECRETS_BACKEND` | `"local"` (default; only supported value) |
+| `SECRETS_PATH` | Override secrets directory path |

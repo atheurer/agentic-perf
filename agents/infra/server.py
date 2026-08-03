@@ -19,6 +19,7 @@ import shlex
 import sys
 import tempfile
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -34,7 +35,13 @@ from agents.infra.command_policy import (
     extract_binary,
     load_policy,
 )
-from agents.server_utils import build_secrets_provider as _build_secrets
+from agents.server_utils import (
+    _resolve_vault_secret_name,
+    resolve_ssh_key,
+)
+from agents.server_utils import (
+    build_secrets_provider as _build_secrets,
+)
 from providers.ssh import _PID_SENTINEL, SSHExecutor, SSHResult, parse_pid_sentinel
 
 logger = logging.getLogger(__name__)
@@ -44,6 +51,7 @@ mcp = FastMCP("infra")
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _ssh: SSHExecutor | None = None
+_ssh_key_stack: AsyncExitStack | None = None
 _agent_name: str | None = None
 _policy: CommandPolicy | None = None
 _secrets_provider = None
@@ -130,7 +138,7 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     Must be called before any SSH operations. Resolves ssh_key_path and
     ssh_user from the ticket so credentials never appear in tool inputs.
     """
-    global _ssh, _agent_name, _policy, _state_store_url, _ticket_id
+    global _ssh, _ssh_key_stack, _agent_name, _policy, _state_store_url, _ticket_id
 
     _ticket_id = ticket_id
 
@@ -149,7 +157,19 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
     # Jumpstarter boards get reflashed — host keys
     # change every time. Disable strict checking.
     strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
-    _ssh = SSHExecutor(user=ssh_user, key_path=ssh_key, strict_host_key=strict)
+
+    vault_secret_name = _resolve_vault_secret_name(fields)
+    resolved_key = ssh_key
+    if vault_secret_name:
+        if _ssh_key_stack is not None:
+            await _ssh_key_stack.aclose()
+        _ssh_key_stack = AsyncExitStack()
+        sp = _get_secrets()
+        resolved_key = await _ssh_key_stack.enter_async_context(
+            resolve_ssh_key(ssh_key, sp, vault_secret_name),
+        )
+
+    _ssh = SSHExecutor(user=ssh_user, key_path=resolved_key, strict_host_key=strict)
 
     if agent_name:
         _agent_name = agent_name
@@ -254,34 +274,34 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     ssh = _get_ssh()
     sp = _get_secrets()
 
-    local_path = await sp.get_secret_file(secret_path)
-    if local_path is None:
+    async with sp.secret_file(secret_path) as local_path:
+        if local_path is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Secret not found: {secret_path}",
+                }
+            )
+
+        parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
+        mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
+        if mkdir_result.exit_code != 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"mkdir failed: {mkdir_result.stderr}",
+                }
+            )
+
+        result = await ssh.copy_to(host, str(local_path), remote_path)
         return json.dumps(
             {
-                "success": False,
-                "error": f"Secret not found: {secret_path}",
+                "success": result.exit_code == 0,
+                "secret_path": secret_path,
+                "remote_path": remote_path,
+                "error": result.stderr if result.exit_code != 0 else None,
             }
         )
-
-    parent_dir = shlex.quote(str(PurePosixPath(remote_path).parent))
-    mkdir_result = await ssh.run(host, f"mkdir -p {parent_dir}", timeout=15)
-    if mkdir_result.exit_code != 0:
-        return json.dumps(
-            {
-                "success": False,
-                "error": f"mkdir failed: {mkdir_result.stderr}",
-            }
-        )
-
-    result = await ssh.copy_to(host, str(local_path), remote_path)
-    return json.dumps(
-        {
-            "success": result.exit_code == 0,
-            "secret_path": secret_path,
-            "remote_path": remote_path,
-            "error": result.stderr if result.exit_code != 0 else None,
-        }
-    )
 
 
 @mcp.tool()

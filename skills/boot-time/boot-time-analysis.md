@@ -56,6 +56,24 @@ The provisioning agent should only ensure the board is flashed
 and SSH-reachable — do NOT tell provisioning to install any
 boot-time packages.
 
+## SSH Connectivity
+
+The `execute_boot_time_test` tool handles its own SSH connectivity.
+It uses `sshpass` with password-based authentication (default
+password: "password"), NOT SSH key-based authentication. Set
+`ssh_password` in the ticket's custom_fields to override the
+default.
+
+**Do NOT** perform manual SSH checks (`check_host`, `check_hosts`,
+or `set_ssh_context`) before calling the tool — they use key-based
+SSH which will fail on boards provisioned with password auth.
+The tool waits up to 60 seconds for the SUT to become SSH-reachable
+before starting.
+
+**Note:** The boot-time harness currently requires password-based
+SSH access. Targets that only support key-based SSH auth are not
+yet supported.
+
 ## What the Tool Does NOT Do
 
 - **No analysis** — submit the raw KPIs; analysis belongs in the

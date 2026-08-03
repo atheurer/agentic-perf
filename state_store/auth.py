@@ -26,6 +26,7 @@ from paths import SECRETS_DIR
 if TYPE_CHECKING:
     from .identity import UserStore
     from .models import Ticket
+    from .ratelimit import AuthFailureLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +80,19 @@ def read_token_from_file() -> str:
     return ""
 
 
+def _get_client_ip(request: Request) -> str:
+    if request.client is not None:
+        return request.client.host
+    return "unknown"
+
+
 def make_auth_dependency(
     token: str,
     *,
     multi_user: bool = False,
     user_store: UserStore | None = None,
     token_ttl_days: int = 0,
+    auth_failure_limiter: AuthFailureLimiter | None = None,
 ):
     """Create a FastAPI dependency that validates bearer tokens.
 
@@ -95,22 +103,46 @@ def make_auth_dependency(
     hashes the presented token and looks up the user in the store.
     When ``token_ttl_days`` > 0, user tokens older than that many
     days are rejected with 401.  The deployment token is exempt.
+
+    When ``auth_failure_limiter`` is provided, repeated auth
+    failures from the same IP are rate-limited (429).
     """
 
+    def _fail(
+        request: Request,
+        detail: str,
+    ) -> HTTPException:
+        """Record auth failure and return the appropriate exception."""
+        if auth_failure_limiter is not None:
+            ip = _get_client_ip(request)
+            auth_failure_limiter.record_failure(ip)
+        return HTTPException(status_code=401, detail=detail)
+
     async def verify_token(request: Request) -> Principal:
+        if auth_failure_limiter is not None:
+            from .ratelimit import _clamp_retry_after
+
+            ip = _get_client_ip(request)
+            wait = auth_failure_limiter.is_blocked(ip)
+            if wait is not None:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many authentication failures",
+                    headers={
+                        "Retry-After": _clamp_retry_after(wait),
+                    },
+                )
+
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=401,
-                detail="Missing or invalid Authorization header",
+            raise _fail(
+                request,
+                "Missing or invalid Authorization header",
             )
         presented = auth_header[7:]
 
         if not presented:
-            raise HTTPException(
-                status_code=401,
-                detail="Empty bearer token",
-            )
+            raise _fail(request, "Empty bearer token")
 
         principal: Principal | None = None
 
@@ -130,9 +162,9 @@ def make_auth_dependency(
             user = user_store.lookup_by_token_hash(token_h)
             if user is not None:
                 if user.disabled:
-                    raise HTTPException(
-                        status_code=401,
-                        detail="User account is disabled",
+                    raise _fail(
+                        request,
+                        "User account is disabled",
                     )
                 if token_ttl_days > 0:
                     issued = user.token_issued_at or user.created_at
@@ -140,11 +172,9 @@ def make_auth_dependency(
                         issued = issued.replace(tzinfo=timezone.utc)
                     age = datetime.now(timezone.utc) - issued
                     if age.days >= token_ttl_days:
-                        raise HTTPException(
-                            status_code=401,
-                            detail=(
-                                "Token expired — contact an admin to rotate your token"
-                            ),
+                        raise _fail(
+                            request,
+                            "Token expired — contact an admin to rotate your token",
                         )
                 # Service accounts cannot be admins — enforce
                 # at runtime in case users.json was tampered.
@@ -157,10 +187,7 @@ def make_auth_dependency(
                 )
 
         if principal is None:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid API token",
-            )
+            raise _fail(request, "Invalid API token")
 
         request.state.principal = principal
         return principal

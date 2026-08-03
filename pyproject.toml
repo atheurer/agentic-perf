@@ -39,6 +39,9 @@ vertex = [
     "anthropic[vertex]>=0.40.0",
     "google-auth>=2.0.0",
 ]
+bitwarden = [
+    "bitwarden-sdk>=1.0.0",
+]
 jumpstarter = [
     "jumpstarter-cli>=0.8.0",
     "jumpstarter-driver-power>=0.8.0",

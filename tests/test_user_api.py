@@ -14,6 +14,7 @@ def _make_multi_user_app(tmp_path, *, token_ttl_days: int = 0):
     user_store = UserStore(persist_path=tmp_path / "users.json")
 
     from state_store.auth import make_auth_dependency
+    from state_store.main import mount_routers
 
     app = (
         create_app.__wrapped__() if hasattr(create_app, "__wrapped__") else create_app()
@@ -32,13 +33,8 @@ def _make_multi_user_app(tmp_path, *, token_ttl_days: int = 0):
     )
     app.state.auth_dependency = auth
 
-    from fastapi import Depends
-
-    from state_store.api.router import api_router, health_router
-
     app.router.routes.clear()
-    app.include_router(api_router, dependencies=[Depends(auth)])
-    app.include_router(health_router)
+    mount_routers(app, auth)
 
     return app, user_store, token
 

@@ -256,9 +256,11 @@ should understand what is enforced today and what is not.
   requires a token generated on first run and shared via env var.
 - **Dispatch claims** — ticket-level leases prevent duplicate agent
   dispatch on orchestrator restart.
-- **Secrets isolation** — secrets live in `~/.agentic-perf/secrets/`
-  and are served to agents via the infra MCP server; the LLM never
-  sees raw credentials.
+- **Secrets isolation** — secrets resolve through a cascading provider
+  (local files + optional Bitwarden Secrets Manager vault). Secrets
+  are served to agents via the infra MCP server; the LLM never sees
+  raw credentials. Vault secrets are materialized as ephemeral files
+  (0600/0700) only during the operation that needs them.
 
 **What is NOT enforced (known limitations):**
 

@@ -115,3 +115,10 @@ def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     if result is None:
         raise HTTPException(status_code=409, detail="Claim not owned by this owner")
     return result
+
+
+@router.get("/since/{seq}")
+def tickets_since(seq: int, request: Request):
+    """Return tickets modified after the given sequence number."""
+    store = _get_store(request)
+    return store.get_tickets_since(seq)

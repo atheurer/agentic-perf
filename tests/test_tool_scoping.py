@@ -49,8 +49,6 @@ class TestHarnessToolScoping:
         names = {t.name for t in agent.tools}
         assert names == {
             "read_skill",
-            "set_ssh_context",
-            "check_host",
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",

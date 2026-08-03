@@ -831,3 +831,55 @@ class TestDispatcherIntegration:
         assert isinstance(agent, EvaluateAgent)
         assert agent.agent_name == "evaluate-agent"
         assert agent.max_iterations == 0
+
+
+class TestArtifactGuidance:
+    """Verify the evaluate agent directs the LLM to read artifacts."""
+
+    def test_message_includes_artifact_guidance_when_output_dir_present(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            state_store_url="http://localhost:8090",
+            llm_provider=MockLLMProvider(),
+        )
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "evaluating_convergence",
+            "custom_fields": {
+                "run_id": "boot-time-abc123",
+                "benchmark_status": "completed",
+                "output_dirs": [
+                    "/tmp/boot-time-abc123",
+                    "/tmp/boot-time-def456",
+                ],
+                "output_dir": "/tmp/boot-time-def456",
+            },
+        }
+        messages = agent._build_messages(ticket)
+        content = messages[0]["content"]
+        assert "list_benchmark_artifacts" in content
+        assert "/tmp/boot-time-abc123" in content
+        assert "/tmp/boot-time-def456" in content
+        assert "per-sample" in content.lower()
+
+    def test_message_omits_artifact_path_when_no_output_dir(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            state_store_url="http://localhost:8090",
+            llm_provider=MockLLMProvider(),
+        )
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "evaluating_convergence",
+            "custom_fields": {
+                "run_id": "boot-time-abc123",
+                "benchmark_status": "completed",
+            },
+        }
+        messages = agent._build_messages(ticket)
+        content = messages[0]["content"]
+        assert "list_benchmark_artifacts" not in content
