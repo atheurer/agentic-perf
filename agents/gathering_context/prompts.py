@@ -176,7 +176,13 @@ Target-to-board-selector mapping:
 - `ebbr` → NOT a board type; it is a shared image type
   (UEFI/EBBR boot) used across multiple boards. Use other
   metadata (labels, test description) to identify the
-  actual board.
+  actual board. When the target is an EBBR-compatible board
+  (e.g., R-Car S4, S32G), the image manifest key is `ebbr`,
+  not the board-specific target name.
+
+EBBR-compatible boards (use `ebbr` as the image target):
+- `rcar_s4` / `renesas-rcar-s4`
+- `s32g_vnp_rdb3` / `nxp-s32g-vnp-rdb3`
 
 Image version derivation:
 - Use `labels["RHIVOS Release"]` (e.g., `latest-RHIVOS-2-...` → `RHIVOS-2`)
