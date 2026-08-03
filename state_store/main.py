@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +16,7 @@ from orchestrator.config import _load_config_file
 from providers.events import EventBus
 
 from .api.router import api_router, health_router, webhook_router
+from .audit import AuditLog, set_actor
 from .auth import load_or_generate_token, make_auth_dependency
 from .ratelimit import (
     AuthFailureLimiter,
@@ -42,6 +43,13 @@ def _validate_positive_int(
     return value
 
 
+async def _set_audit_actor(request: Request) -> None:
+    principal = getattr(request.state, "principal", None)
+    ip = request.client.host if request.client else "unknown"
+    if principal:
+        set_actor(principal.kind, principal.username, ip)
+
+
 def mount_routers(
     app: FastAPI,
     auth: Any,
@@ -53,7 +61,7 @@ def mount_routers(
     can use the same wiring as production. ``rate_limit`` may be
     ``None`` to skip the rate-limit dependency.
     """
-    deps: list = [Depends(auth)]
+    deps: list = [Depends(auth), Depends(_set_audit_actor)]
     if rate_limit is not None:
         deps.append(Depends(rate_limit))
     app.include_router(api_router, dependencies=deps)
@@ -174,7 +182,9 @@ def create_app() -> FastAPI:
     )
     app.state.auth_dependency = auth
 
-    app.state.store = TicketStore()
+    audit_log = AuditLog()
+    app.state.audit_log = audit_log
+    app.state.store = TicketStore(audit_log=audit_log)
     app.state.event_bus = EventBus()
     mount_routers(app, auth, rate_limit_dep)
 

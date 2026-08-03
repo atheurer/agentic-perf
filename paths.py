@@ -11,6 +11,7 @@ AGENTIC_PERF_HOME = Path(
 
 CONFIG_PATH = AGENTIC_PERF_HOME / "config.json"
 LOG_DIR = AGENTIC_PERF_HOME / "logs"
+AUDIT_LOG = LOG_DIR / "store-audit.jsonl"
 TICKET_DIR = AGENTIC_PERF_HOME / "tickets"
 LOCK_FILE = AGENTIC_PERF_HOME / "orchestrator.pid"
 SKILL_CACHE_DIR = AGENTIC_PERF_HOME / "skill-cache"
