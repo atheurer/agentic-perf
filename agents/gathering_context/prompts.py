@@ -137,10 +137,24 @@ alert data before submitting your result.
      the alert's `anomaly_context.test_name`
      (e.g., `boot-time-verbose` → `boot-time`)
 
-3. **Include directives in your result:** When you call
-   `submit_gathering_context_result`, include a `directives`
-   dict in your result with the resolved values. These will
-   be written to the ticket for downstream agents.
+3. **Include directives in your result:** You MUST pass a
+   `directives` dict to `submit_gathering_context_result` with
+   the resolved values. Without these, downstream agents cannot
+   provision hardware or run benchmarks. Required fields:
+   - `board_selector` (REQUIRED) — e.g., `board-type=renesas-rcar-s4`
+   - `image_version` (REQUIRED) — e.g., `RHIVOS-2` or `AutoSD-10`
+   - `harness` — e.g., `boot-time`
+
+   Example:
+   ```json
+   {
+     "directives": {
+       "board_selector": "board-type=qc8775",
+       "image_version": "RHIVOS-2",
+       "harness": "boot-time"
+     }
+   }
+   ```
 
 4. **Fallback:** If `get_run_info` is not available or returns
    no data, include what you can infer from the anomaly context
@@ -151,7 +165,18 @@ alert data before submitting your result.
 
 | Run metadata field | Directive field | Example |
 |---|---|---|
-| `target` | `board_selector` | `board-type=renesas-rcar-s4` |
-| `os_id` or labels | `image_version` | `AutoSD-10` |
+| `target` | `board_selector` | `board-type=qc8775` |
+| `os_id` or labels["RHIVOS Release"] | `image_version` | `RHIVOS-2` |
 | `test_name` / `description` | `harness` | `boot-time` |
+
+Target-to-board-selector mapping:
+- `ride4_sa8775p_sx_r3` → `board-type=qc8775`
+- `rcar_s4` → `board-type=renesas-rcar-s4`
+- `ebbr` → `board-type=virtual`
+- `s32g_vnp_rdb3` → `board-type=nxp-s32g-vnp-rdb3`
+
+Image version derivation:
+- Use `labels["RHIVOS Release"]` (e.g., `latest-RHIVOS-2-...` → `RHIVOS-2`)
+- Or use `os_id` + `mode` (e.g., `rhivos` + `bootc` → `RHIVOS-2`)
+- For AutoSD images, look for `labels["OS Release"]`
 """
