@@ -134,6 +134,18 @@ async def _provision_jumpstarter(
 
     ssh_public_key = flash_info.get("ssh_public_key", "")
     ssh_key_path = flash_info.get("ssh_key_path", "")
+
+    # Derive public key from private key path if not
+    # explicitly provided — the resource agent sets
+    # ssh_key_path but not ssh_public_key.
+    if not ssh_public_key and ssh_key_path:
+        pub_path = (
+            Path(ssh_key_path)
+            .expanduser()
+            .with_suffix(Path(ssh_key_path).suffix + ".pub")
+        )
+        if pub_path.exists():
+            ssh_public_key = pub_path.read_text().strip()
     board_name = metadata.get("exporter_name", "")
     lease_id = metadata.get("lease_id", "")
 
