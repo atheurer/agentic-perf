@@ -146,11 +146,14 @@ def make_auth_dependency(
                                 "Token expired — contact an admin to rotate your token"
                             ),
                         )
+                # Service accounts cannot be admins — enforce
+                # at runtime in case users.json was tampered.
+                effective_admin = user.is_admin and not user.service_account
                 user_store.touch_last_used(user.username)
                 principal = Principal(
                     kind="user",
                     username=user.username,
-                    is_admin=user.is_admin,
+                    is_admin=effective_admin,
                 )
 
         if principal is None:

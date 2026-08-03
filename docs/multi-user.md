@@ -203,3 +203,32 @@ network access to the state store.
 
 For environments requiring stronger isolation, consider running
 separate deployments per team rather than relying on multi-user mode.
+
+## Service Accounts
+
+Service accounts are special users for machine-to-machine
+authentication, primarily for [webhook ingestion](webhook-ingestion.md).
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "webhook-horreum",
+    "service_account": true,
+    "allowed_sources": ["10.128.0.0/14"],
+    "max_requests_per_hour": 60
+  }' \
+  $AP_URL/api/v1/users
+```
+
+Service accounts differ from regular users:
+
+| Property | Regular user | Service account |
+|---|---|---|
+| Can be admin | Yes | **No** (code-enforced) |
+| Source IP check | No | **Yes** (required) |
+| Rate limiting | No | Optional |
+| Dashboard access | Yes | No (token only) |
+
+See [Webhook Ingestion](webhook-ingestion.md) for full details.

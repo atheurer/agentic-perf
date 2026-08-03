@@ -26,6 +26,9 @@ router = APIRouter(prefix="/users", tags=["users"])
 class CreateUserRequest(BaseModel):
     username: str
     is_admin: bool = False
+    service_account: bool = False
+    allowed_sources: list[str] = []
+    max_requests_per_hour: int | None = None
 
 
 def _get_store(request: Request) -> UserStore:
@@ -51,6 +54,9 @@ def create_user(body: CreateUserRequest, request: Request):
         user, raw_token = store.create_user(
             body.username,
             is_admin=body.is_admin,
+            service_account=body.service_account,
+            allowed_sources=body.allowed_sources,
+            max_requests_per_hour=body.max_requests_per_hour,
         )
     except DuplicateUser as exc:
         raise HTTPException(status_code=409, detail=str(exc))

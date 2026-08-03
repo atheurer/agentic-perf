@@ -40,6 +40,9 @@ class User(BaseModel):
     )
     token_issued_at: datetime | None = None
     last_used_at: datetime | None = None
+    service_account: bool = False
+    allowed_sources: list[str] = Field(default_factory=list)  # IP/CIDR
+    max_requests_per_hour: int | None = None
 
 
 class Group(BaseModel):
@@ -101,12 +104,23 @@ class UserStore:
         self,
         username: str,
         is_admin: bool = False,
+        *,
+        service_account: bool = False,
+        allowed_sources: list[str] | None = None,
+        max_requests_per_hour: int | None = None,
     ) -> tuple[User, str]:
         """Create a user and return (user, raw_token).
 
         The raw token is returned exactly once — store it immediately.
         """
         normalized = validate_username(username)
+        if service_account:
+            if is_admin:
+                raise ValueError("Service accounts cannot be admins")
+            if not allowed_sources:
+                raise ValueError(
+                    "Service accounts require at least one allowed_sources entry"
+                )
         raw_token = secrets.token_hex(32)
         token_h = hash_token(raw_token)
         with self._lock:
@@ -117,6 +131,9 @@ class UserStore:
                 token_hash=token_h,
                 is_admin=is_admin,
                 token_issued_at=datetime.now(timezone.utc),
+                service_account=service_account,
+                allowed_sources=list(allowed_sources) if allowed_sources else [],
+                max_requests_per_hour=max_requests_per_hour,
             )
             self._users[normalized] = user
             self._save()
@@ -160,6 +177,8 @@ class UserStore:
             user = self._users.get(normalized)
             if user is None:
                 raise UserNotFound(f"User '{username}' not found")
+            if user.service_account:
+                raise ValueError("Service accounts cannot be granted admin privileges")
             user.is_admin = True
             self._save()
             return user.model_copy()
