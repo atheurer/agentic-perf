@@ -76,12 +76,6 @@ class PlatformAgent(AgentBase):
         finally:
             await mcp.disconnect()
             self._mcp = None
-            # Store jmp shell PID for teardown cleanup
-            if self._jmp_proc and self._jmp_proc.returncode is None:
-                await self._update_fields(
-                    ticket_id,
-                    {"jmp_shell_pid": self._jmp_proc.pid},
-                )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return PLATFORM_SYSTEM_PROMPT
