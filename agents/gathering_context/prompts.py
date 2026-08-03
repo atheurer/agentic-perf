@@ -161,31 +161,34 @@ alert data before submitting your result.
    (e.g., `test_name` may indicate the harness) and note the
    missing fields. The investigation will request guidance.
 
-### Field mapping reference
+### Horreum label reference
 
-| Run metadata field | Directive field | Example |
+The `get_run_info` response includes a `labels` dict with all
+Horreum dataset labels. Use these labels directly to populate
+directives — do NOT maintain hardcoded mappings.
+
+| Label | Purpose | Example |
 |---|---|---|
-| `target` | `board_selector` | `board-type=qc8775` |
-| `os_id` or labels["RHIVOS Release"] | `image_version` | `RHIVOS-2` |
-| `test_name` / `description` | `harness` | `boot-time` |
+| `RHIVOS Target` | Image target for provisioning. Pass through as-is. | `ride4_sa8775p_sx_r3`, `ebbr` |
+| `RHIVOS OS ID` | OS type (rhivos vs autosd) | `rhivos`, `autosd` |
+| `RHIVOS Mode` | Image build type | `bootc`, `ostree`, `raw` |
+| `RHIVOS Release` | Version/release identifier | `latest-RHIVOS-2-202607240103` |
+| `RHIVOS Build` | Build number | `16609661.875426a8` |
+| `RHIVOS image name` | Build variant (optional) | `ps`, `qe` |
 
-Target-to-board-selector mapping:
-- `ride4_sa8775p_sx_r3` → `board-type=qc8775`
-- `rcar_s4` → `board-type=renesas-rcar-s4`
-- `s32g_vnp_rdb3` → `board-type=nxp-s32g-vnp-rdb3`
-- `ebbr` → NOT a board type; it is a shared image type
-  (UEFI/EBBR boot) used across multiple boards. Use other
-  metadata (labels, test description) to identify the
-  actual board. When the target is an EBBR-compatible board
-  (e.g., R-Car S4, S32G), the image manifest key is `ebbr`,
-  not the board-specific target name.
+### Directive resolution from labels
 
-EBBR-compatible boards (use `ebbr` as the image target):
-- `rcar_s4` / `renesas-rcar-s4`
-- `s32g_vnp_rdb3` / `nxp-s32g-vnp-rdb3`
+- **`harness`**: Infer from `anomaly_context.test_name` or the
+  Horreum test name (e.g., `boot-time-verbose` → `boot-time`).
+- **`board_selector`**: Use the Jumpstarter board-type label
+  that corresponds to the `RHIVOS Target`. The `get_run_info`
+  `target` field may help, but the board selector label is
+  a Jumpstarter concept — check available boards if unsure.
+- **`image_version`**: Derive from `RHIVOS Release` or
+  `RHIVOS OS ID`. Examples:
+  - `latest-RHIVOS-2-...` → `RHIVOS-2`
+  - `autosd` OS ID → `AutoSD-10` (check release label)
 
-Image version derivation:
-- Use `labels["RHIVOS Release"]` (e.g., `latest-RHIVOS-2-...` → `RHIVOS-2`)
-- Or use `os_id` + `mode` (e.g., `rhivos` + `bootc` → `RHIVOS-2`)
-- For AutoSD images, look for `labels["OS Release"]`
+Pass all resolved values through the `directives` dict in
+your `submit_gathering_context_result` call.
 """
