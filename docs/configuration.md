@@ -434,6 +434,44 @@ the full feature walkthrough.
 
 ---
 
+### `rate_limit` — API Rate Limiting
+
+```json
+{
+    "rate_limit": {
+        "enabled": true,
+        "per_user_rpm": 600,
+        "burst": 30,
+        "exempt_service": true,
+        "auth_failures_per_min": 30
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable rate limiting. When `false`, no request or auth-failure limiting is applied. |
+| `per_user_rpm` | int | `600` | Maximum requests per minute per user principal. Only enforced in multi-user mode — in legacy (single-token) mode, all callers share the service principal, so per-principal limiting would throttle the entire system. |
+| `burst` | int | `30` | Token bucket burst capacity. Allows short bursts above the sustained RPM rate (e.g., dashboard page loads that fire several requests simultaneously). |
+| `exempt_service` | bool | `true` | Exempt the service principal (deployment token) from rate limiting. **Strongly recommended.** A 429 to an agent triggers error paths that skip budget guardrails, and agent crash leads to paid re-dispatch loops. |
+| `auth_failures_per_min` | int | `30` | Maximum authentication failures per IP per minute before returning 429 instead of 401. Also enforces a global failure ceiling (4× per-IP rate) as a backstop against distributed brute-force from localhost. Active in both legacy and multi-user modes. |
+
+**Algorithm:** Token bucket with refill. Each principal gets an
+independent bucket that refills at `per_user_rpm / 60` tokens per
+second, capped at `burst` tokens. When empty, the server returns
+`429 Too Many Requests` with a `Retry-After` header (seconds until
+a token is available). The dashboard, CLI, and TUI all honor this
+header automatically.
+
+**Bounded state:** Per-principal buckets are evicted LRU when the
+table exceeds 4096 entries, preventing memory exhaustion from
+token-spray attacks.
+
+**Health endpoint:** `/api/v1/health` is never rate-limited (it has
+no auth dependency).
+
+---
+
 ### Data Retention
 
 | Field | Type | Default | Description |
