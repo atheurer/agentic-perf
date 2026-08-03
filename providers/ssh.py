@@ -18,6 +18,17 @@ def parse_pid_sentinel(stdout: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+class SSHKeyResolutionError(Exception):
+    """Raised when vault-fallback SSH key resolution is configured but fails.
+
+    This is a fail-closed error: the vault secret name was specified
+    (via ticket ``ssh_key_secret``, env ``SSH_KEY_VAULT_SECRET``, or
+    config ``ssh_key_vault_secret``) but the secret was not found in
+    the provider.  Silently falling back to no key would let SSH try
+    default identity files, which is a security risk.
+    """
+
+
 @dataclass
 class SSHResult:
     stdout: str

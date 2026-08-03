@@ -969,7 +969,50 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     skills = MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
-    secrets = LocalSecretsProvider()
+    local_secrets = LocalSecretsProvider()
+    vault_config = config.raw.get("secrets")
+
+    # Build shared secrets provider — local + vault (when configured).
+    # Vault providers are constructed once here and reused in all
+    # per-ticket cascades via vault_config passthrough.
+    bw_shared = (
+        (vault_config or {})
+        .get("bitwarden", {})
+        .get(
+            "shared_project_id",
+        )
+    )
+    if bw_shared and (vault_config or {}).get("bitwarden", {}).get(
+        "organization_id",
+    ):
+        try:
+            from providers.secrets.cascade import (
+                CascadingSecretsProvider,
+                _create_vault_layer,
+            )
+
+            vault_layer = _create_vault_layer(
+                vault_config["bitwarden"],
+                bw_shared,
+            )
+            if vault_layer is not None:
+                secrets = CascadingSecretsProvider(
+                    [
+                        ("shared", local_secrets),
+                        ("vault:shared", vault_layer),
+                    ]
+                )
+                logger.info("Vault-aware shared secrets provider enabled")
+            else:
+                secrets = local_secrets
+        except ImportError:
+            logger.info(
+                "bitwarden-sdk not installed; using local secrets only",
+            )
+            secrets = local_secrets
+    else:
+        secrets = local_secrets
+
     events = EventBus()
 
     # Initialize OpenTelemetry LLM instrumentation.
@@ -1010,6 +1053,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         instance_name=config.instance_name,
         user_store=user_store,
         secrets_root=secrets_root,
+        vault_config=vault_config,
     )
 
     logger.info(

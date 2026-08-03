@@ -32,10 +32,12 @@ class LocalSecretsProvider(SecretsProvider):
         exclude_prefixes: list[str] | None = None,
     ) -> None:
         self._dir = Path(secrets_dir) if secrets_dir else DEFAULT_SECRETS_DIR
-        self._exclude_prefixes = {p.lower() for p in exclude_prefixes} if exclude_prefixes else set()
+        self._exclude_prefixes = (
+            {p.lower() for p in exclude_prefixes} if exclude_prefixes else set()
+        )
 
     def _resolve_path(self, path: str) -> Path:
-        candidate = (self._dir / path)
+        candidate = self._dir / path
         # Check containment without resolving symlinks — secrets are
         # commonly symlinked from external repos/vaults and .resolve()
         # would follow the link outside the secrets directory.
@@ -61,7 +63,7 @@ class LocalSecretsProvider(SecretsProvider):
             return None
         try:
             return file_path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             logger.exception(f"Failed to read secret: {path}")
             return None
 

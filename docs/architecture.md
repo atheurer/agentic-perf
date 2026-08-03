@@ -713,10 +713,25 @@ Additional methods for LLM-driven run-file construction:
 
 Interface: `SecretsProvider` (`providers/secrets/base.py`)
 
-`LocalSecretsProvider` reads credentials from JSON files under
-`~/.agentic-perf/secrets/`. Secrets are scoped by provider name (e.g.,
-`quads/config.json`, `aws/config.json`) and injected only into the
-agents that need them.
+Secrets are resolved through a cascading provider that checks multiple
+layers in priority order (first hit wins). Two provider types exist:
+
+| Provider | Backend | Install |
+|---|---|---|
+| `LocalSecretsProvider` | Files under `~/.agentic-perf/secrets/` | Built-in |
+| `BitwardenSecretsProvider` | Bitwarden Secrets Manager SDK | `pip install .[bitwarden]` |
+
+In single-user mode, secrets resolve through local files with an
+optional vault overlay. In multi-user mode, a per-ticket cascade adds
+user-private and group layers (see [Multi-User](multi-user.md)).
+
+Within each tier, local files take precedence over vault — a file on
+disk is an explicit operator override. Vault secrets are materialized
+as ephemeral files (0600 in 0700 tmpdir) via the `secret_file()`
+context manager and deleted after use.
+
+See [Secrets Management](secrets.md) for configuration, bootstrap
+token setup, caching behavior, and error semantics.
 
 ### Investigation Record Provider
 

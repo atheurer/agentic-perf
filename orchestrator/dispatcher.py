@@ -63,6 +63,7 @@ class Dispatcher:
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         user_store: UserStore | None = None,
         secrets_root: Path | None = None,
+        vault_config: dict | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
@@ -75,6 +76,7 @@ class Dispatcher:
         self.lease_seconds = lease_seconds
         self._user_store = user_store
         self._secrets_root = secrets_root
+        self._vault_config = vault_config
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
@@ -334,6 +336,7 @@ class Dispatcher:
             username=user.username,
             groups=user.groups,
             secrets_root=self._secrets_root,
+            vault_config=self._vault_config,
         )
 
     def create_agent(
