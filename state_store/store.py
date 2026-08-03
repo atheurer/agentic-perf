@@ -250,6 +250,42 @@ class TicketStore:
             self._persist_ticket(ticket)
             return existing
 
+    def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
+        """Close a ticket regardless of current status.
+
+        Administrative action that bypasses the state machine.
+        Used by stop-all (hard mode) for tickets that have no
+        active agent — normal transitions cannot reach CLOSED
+        from early-pipeline statuses like NEW or TRIAGE_PENDING.
+        """
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            if ticket.status == TicketStatus.CLOSED:
+                return ticket.model_copy()
+
+            ticket.previous_status = ticket.status
+            ticket.status = TicketStatus.CLOSED
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._global_seq += 1
+            ticket.transition_seq = self._global_seq
+            ticket.custom_fields.pop("claim", None)
+            ticket.custom_fields.pop("stop_requested", None)
+
+            if comment:
+                ticket.comments.append(
+                    Comment(
+                        id=uuid.uuid4().hex[:8],
+                        author="system",
+                        body=comment,
+                    )
+                )
+
+            self._persist_ticket(ticket)
+            return ticket.model_copy()
+
     def _persist_ticket(self, ticket: Ticket) -> None:
         path = self._persist_dir / f"{ticket.id}.json"
         try:

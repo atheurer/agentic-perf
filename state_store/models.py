@@ -11,6 +11,7 @@ class TicketStatus(str, Enum):
     NEW = "new"
     TRIAGE_PENDING = "triage_pending"
     AWAITING_HARDWARE = "awaiting_hardware"
+    PREPARING_PLATFORM = "preparing_platform"
     AWAITING_PROVISION = "awaiting_provision"
     EXECUTING_BENCHMARK = "executing_benchmark"
     AWAITING_REVIEW = "awaiting_review"
@@ -39,8 +40,13 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_HARDWARE: [
-        TicketStatus.AWAITING_PROVISION,
+        TicketStatus.PREPARING_PLATFORM,
+        TicketStatus.AWAITING_PROVISION,  # providers that return ready hosts
         TicketStatus.GATHERING_CONTEXT,  # investigation redirect
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+    ],
+    TicketStatus.PREPARING_PLATFORM: [
+        TicketStatus.AWAITING_PROVISION,
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_PROVISION: [
@@ -102,7 +108,8 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # the evaluate agent to sequence additional benchmark runs.
     TicketStatus.EVALUATING_CONVERGENCE: [
         TicketStatus.PLANNING_INVESTIGATION,  # refine params
-        TicketStatus.AWAITING_PROVISION,  # re-flash hardware
+        TicketStatus.PREPARING_PLATFORM,  # re-provision hardware
+        TicketStatus.AWAITING_PROVISION,  # re-install harness only
         TicketStatus.SYNTHESIZING_RESULTS,  # convergence gate met
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # manual interrupt
     ],

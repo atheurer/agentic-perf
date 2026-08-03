@@ -54,6 +54,12 @@ class LLMProvider(ABC):
     # None means use DEFAULT_LLM_TIMEOUT; 0 means no timeout.
     default_timeout: float | None = None
 
+    # Per-instance reasoning effort. Controls how much "thinking"
+    # the model does. None means use the model's default behavior.
+    # Standard levels: "low", "medium", "high". Providers may
+    # accept additional values (e.g. Claude's "xhigh"/"max").
+    reasoning_effort: str | None = None
+
     def _resolve_timeout(self, timeout: float | None) -> float:
         """Resolve effective timeout from call, instance, and global defaults.
 

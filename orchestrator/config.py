@@ -119,6 +119,12 @@ class OrchestratorConfig:
         budget_cfg = cfg.get("llm_budget", {})
         self.budget_session_cost_usd: float = budget_cfg.get("session_cost_usd", 0.0)
 
+        # LLM reasoning effort. Controls how much "thinking"
+        # models do. None uses the model's default behavior.
+        self.llm_reasoning_effort: str | None = os.environ.get(
+            "LLM_REASONING_EFFORT"
+        ) or llm_cfg.get("reasoning_effort")
+
         # LLM request timeout (seconds). Applied to each
         # individual LLM API call. 0 disables the timeout.
         self.llm_timeout: float = _env_or_cfg(

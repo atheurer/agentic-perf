@@ -25,7 +25,11 @@ from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
-from .prompts import EVALUATE_SYSTEM_PROMPT
+from .prompts import (
+    EVALUATE_SYSTEM_PROMPT,
+    EXTERNAL_PERF_DATA_GUIDANCE,
+    EXTERNAL_PERF_TOOL_NAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,11 @@ class EvaluateAgent(AgentBase):
         self._deterministic_outcome: str = ""
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return EVALUATE_SYSTEM_PROMPT
+        prompt = EVALUATE_SYSTEM_PROMPT
+        tool_names = {t.name for t in self.tools} if self.tools else set()
+        if tool_names & EXTERNAL_PERF_TOOL_NAMES:
+            prompt += EXTERNAL_PERF_DATA_GUIDANCE
+        return prompt
 
     def _build_messages(
         self,

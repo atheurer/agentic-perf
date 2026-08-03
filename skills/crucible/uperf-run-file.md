@@ -26,9 +26,10 @@ guarantee the others work:
 
 3. **Benchmark data-plane (uperf ports):** How the uperf
    client reaches the uperf server during the actual test.
-   This uses the IP set in the `remotehost` mv-param.
-   Crucible's uperf server listens on specific TCP ports,
-   so ping or SSH connectivity does NOT prove this works.
+   The server binds to the IP of the `ifname` interface and
+   sends that IP to the client via roadblock. Crucible's
+   uperf server listens on specific TCP ports, so ping or
+   SSH connectivity does NOT prove this works.
 
 **You must verify layer 3 before constructing the run-file.**
 Layers 1 and 2 may use different IPs than layer 3,
@@ -49,29 +50,6 @@ default csid is 1, so the ports are **30002** (control) and
 
 For multiple pairs, pair 2 uses 30004/30005, pair 3 uses
 30006/30007, etc.
-
-### Choosing the remotehost IP
-
-When hosts have multiple IPs (common in cloud — public IP,
-private management IP, possibly additional private IPs on
-different subnets), you must pick the IP pair where the
-uperf ports are reachable:
-
-1. List candidate IPs on both client and server hosts.
-2. For each candidate server IP, test port connectivity
-   from the client using `test_port_connectivity` or
-   manual `nc` — test on the actual uperf ports (30002
-   and 30003 for a single pair), not just ping.
-3. Use the server IP that passes the port test as the
-   `remotehost` value.
-
-See `general/connectivity-diagnostic.md` for the full
-connectivity testing procedure.
-
-**Do NOT assume** that the management/SSH IP is the right
-choice for `remotehost`. In cloud environments, the private
-subnet IPs often work while public IPs have security group
-rules blocking the uperf port range.
 
 ### Discovering test interfaces
 
@@ -98,19 +76,27 @@ ethtool <interface> | grep Speed
 
 ### Choosing remotehost vs ifname
 
-Once you know the test interfaces:
+**Use `ifname` on the server.  Do NOT use `remotehost`.**
 
-- If the test NICs have IPv4 addresses on a shared subnet,
-  use `remotehost` with the server's test-network IP (not
-  the management IP).
-- If you want to specify the interface by name, use
-  `ifname` with the server's interface name. The
-  uperf-server-start script resolves the IP from the
-  interface automatically.
-- If the test NICs have no IP addresses, you cannot
-  proceed without network configuration. Use
-  `request_clarification` to tell the user which
-  interfaces you found and ask how to proceed.
+How the roadblock mechanism works:
+1. Server: `ifname=ens1f0np0` → uperf-server-start resolves
+   the IP of that interface (e.g. `172.18.38.68`), starts
+   uperf listening on it, and sends that IP to the client via
+   crucible roadblock messaging at `server-start-end`.
+2. Client: reads the server IP from the roadblock message
+   automatically. No `remotehost` param is needed or wanted.
+
+**Never set `remotehost` in mv-params when `ifname` is used.**
+If `remotehost` is present, crucible injects it directly into
+the client bench-start-cmds, bypassing the roadblock IP
+exchange entirely. The hostname in `remotehost` almost always
+resolves to the management NIC (not the test NIC), so all
+traffic flows over the wrong interface at a fraction of the
+intended speed.
+
+If the test NICs have no IP addresses, use
+`request_clarification` to tell the user which interfaces you
+found and ask how to proceed.
 
 ### Matching user intent to interfaces
 
@@ -126,23 +112,17 @@ description to actual interface names on the hosts.
 
 ## Required mv-params
 
-The client must know where the server is. Use one of:
+Use **`ifname`** (role: server) to select the test NIC.
+Do NOT use `remotehost` — the server sends its resolved IP
+to the client via roadblock automatically.
 
-- **`remotehost`** (role: client) — hostname or IP of the
-  server host. Use this when you know the server's address.
-  When testing specific NICs, use the IP on the test network,
-  not the management IP.
-- **`ifname`** (role: server) — network interface name on
-  the server. The server-start script finds the IP from the
-  interface and sends it to the client via roadblock. Use
-  this when the server has multiple interfaces and you want
-  to target a specific one.
-
-Use ONE of these, not both — they are mutually exclusive.
-For most cases, use `remotehost` with the server's hostname
-or IP address. When testing specific NICs, prefer
-`remotehost` with the test-network IP if available, or
-`ifname` with the server's interface name.
+- **`ifname`** (role: server) — the network interface name
+  on the server host (e.g. `ens1f0np0`). uperf-server-start
+  resolves the IP of that interface and passes it to the
+  client via roadblock. This is the only correct way to
+  target a specific NIC.
+- **`remotehost`** — do not use. It bypasses the roadblock
+  mechanism and will cause traffic to flow on the wrong NIC.
 
 ## Typical uperf mv-params
 
@@ -156,12 +136,15 @@ or IP address. When testing specific NICs, prefer
         {"arg": "wsize", "vals": ["16384"], "role": "client"},
         {"arg": "duration", "vals": ["30"], "role": "client"},
         {"arg": "nthreads", "vals": ["1"], "role": "client"},
-        {"arg": "remotehost", "vals": ["<server-hostname-or-ip>"], "role": "client"}
+        {"arg": "ifname", "vals": ["ens1f0np0"], "role": "server"}
       ]
     }
   ]
 }
 ```
+
+Note: there is no `remotehost` param. The server resolves
+the IP of `ifname` and sends it to the client via roadblock.
 
 ## Engine IDs
 
@@ -193,5 +176,4 @@ From multiplex.json:
 - **protocol**: tcp, udp
 - **ipv**: 4, 6
 - **wsize/rsize/nthreads/duration**: positive integers
-- **remotehost**: any hostname or IP
-- **ifname**: any network interface name
+- **ifname**: network interface name on the server (use this, not remotehost)

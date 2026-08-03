@@ -47,6 +47,21 @@ def _resolve_unique_hosts(
     return hosts
 
 
+def _check_preparing_platform(ticket: dict[str, Any]) -> tuple[bool, str]:
+    """Validate resource allocation before platform setup.
+
+    Only checks that a resource provider and reservation exist.
+    IPs are not expected yet — the platform-agent discovers them.
+    """
+    cf = ticket.get("custom_fields", {})
+    if not cf.get("resource_provider"):
+        return False, "No resource provider set"
+    meta = cf.get("resource_provider_metadata", {})
+    if not meta:
+        return False, "No resource provider metadata"
+    return True, ""
+
+
 def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
     """Validate resource allocation before provisioning."""
     cf = ticket.get("custom_fields", {})
@@ -171,6 +186,7 @@ def _check_evaluating_convergence(
 
 
 _CHECKS: dict[str, Any] = {
+    "preparing_platform": _check_preparing_platform,
     "awaiting_provision": _check_awaiting_provision,
     "executing_benchmark": _check_executing_benchmark,
     "awaiting_review": _check_awaiting_review,

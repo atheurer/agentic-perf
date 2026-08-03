@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -37,7 +39,14 @@ def create_app() -> FastAPI:
     app.state.api_token = token
 
     cfg = _load_config_file()
-    multi_user = cfg.get("auth", {}).get("multi_user", False)
+    auth_cfg = cfg.get("auth", {})
+    multi_user = auth_cfg.get("multi_user", False)
+    raw_ttl = auth_cfg.get("token_ttl_days", 0)
+    if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int) or raw_ttl < 0:
+        raise ValueError(
+            f"auth.token_ttl_days must be a non-negative integer, got {raw_ttl!r}"
+        )
+    token_ttl_days: int = raw_ttl
     app.state.multi_user = multi_user
 
     user_store = None
@@ -47,10 +56,34 @@ def create_app() -> FastAPI:
         user_store = UserStore()
     app.state.user_store = user_store
 
+    if token_ttl_days > 0 and multi_user and user_store is not None:
+        _log = logging.getLogger(__name__)
+        now = datetime.now(timezone.utc)
+
+        def _token_age_days(u) -> int:
+            issued = u.token_issued_at or u.created_at
+            if issued.tzinfo is None:
+                issued = issued.replace(tzinfo=timezone.utc)
+            return (now - issued).days
+
+        expired = [
+            u.username
+            for u in user_store.list_users()
+            if _token_age_days(u) >= token_ttl_days
+        ]
+        if expired:
+            _log.warning(
+                "Token TTL is %d days — %d user(s) have already-expired tokens: %s",
+                token_ttl_days,
+                len(expired),
+                ", ".join(sorted(expired)),
+            )
+
     auth = make_auth_dependency(
         token,
         multi_user=multi_user,
         user_store=user_store,
+        token_ttl_days=token_ttl_days,
     )
     app.state.auth_dependency = auth
 

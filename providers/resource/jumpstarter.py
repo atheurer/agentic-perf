@@ -520,6 +520,25 @@ class JumpstarterResourceProvider(ResourceProvider):
                     exporter_name,
                     exc_info=True,
                 )
+        if not board_target:
+            # Exporter name not available yet (lease
+            # pending) or GetExporter failed. Resolve
+            # from exporters matching the selector.
+            try:
+                exporters = await self._service.ListExporters()
+                key, _, val = selector.partition("=")
+                val = val.split(",")[0]
+                for e in exporters.exporters:
+                    elabels = dict(e.labels)
+                    if elabels.get(key) == val:
+                        board_target = elabels.get("target", "")
+                        if board_target:
+                            break
+            except Exception:
+                logger.debug(
+                    "[jumpstarter] Could not resolve target from exporters",
+                    exc_info=True,
+                )
 
         return {
             "provider": "jumpstarter",

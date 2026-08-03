@@ -678,6 +678,6 @@ class ResourceAgent(AgentBase):
             return
         await self._transition_ticket(
             ticket_id,
-            "awaiting_provision",
-            comment="Hardware validated, ready for provisioning",
+            "preparing_platform",
+            comment="Hardware allocated, preparing platform",
         )

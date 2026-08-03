@@ -118,3 +118,33 @@ def stop_all(body: StopRequest, request: Request):
         )
         affected.append(updated)
     return {"affected": affected, "count": len(affected)}
+
+
+@router.post("/tickets/{ticket_id}/force-close")
+def force_close_ticket(ticket_id: str, request: Request):
+    """Close a ticket regardless of current status.
+
+    Administrative endpoint for cancelling tickets that cannot
+    reach CLOSED through normal transitions (e.g., NEW or
+    TRIAGE_PENDING). Requires admin in multi-user mode.
+    """
+    principal = _get_principal(request)
+    multi_user = _is_multi_user(request)
+    store = request.app.state.store
+
+    if multi_user:
+        require_admin(principal)
+    else:
+        try:
+            ticket = store.get_ticket(ticket_id)
+        except TicketNotFound as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        require_write_access(principal, ticket, multi_user)
+
+    try:
+        return store.force_close(
+            ticket_id,
+            comment="Force-closed by admin",
+        )
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))

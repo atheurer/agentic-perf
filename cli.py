@@ -477,12 +477,15 @@ def cmd_reply(args):
 
     model = getattr(args, "model", None)
     provider = getattr(args, "provider", None)
-    if model or provider:
-        override = {}
+    effort = getattr(args, "effort", None)
+    if model or provider or effort:
+        override = t.get("custom_fields", {}).get("llm_override") or {}
         if provider:
             override["provider"] = provider
         if model:
             override["model"] = model
+        if effort:
+            override["reasoning_effort"] = effort
         r = client.patch(
             f"/api/v1/tickets/{args.ticket_id}/fields",
             json={"fields": {"llm_override": override}},
@@ -1272,6 +1275,11 @@ def main():
         "--remember",
         action="store_true",
         help="Resume with conversation context from the previous attempt",
+    )
+    p_reply.add_argument(
+        "--effort",
+        choices=["low", "medium", "high"],
+        help="Override LLM reasoning effort for the next agent",
     )
 
     p_approve = sub.add_parser("approve", help="Approve a pending command execution")

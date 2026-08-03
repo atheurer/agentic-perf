@@ -441,10 +441,19 @@ endpoint type, pre-run approval).
 
 Runs in two modes: `create` (acquire) and `teardown` (release).
 
-**Provisioning Agent** — Prepares hosts for benchmarks. Checks platform
-contracts (OS compatibility, required packages), handles existing harness
-installations (reinstall/update/skip per directives), installs the harness,
-and optionally deploys K3s for Kubernetes endpoints.
+**Platform Agent** — Prepares allocated hardware for use by getting the
+OS running and SSH accessible. For Jumpstarter boards: flashes the OS
+image, boots, discovers the IP, and injects SSH keys using the
+Jumpstarter Python SDK deterministically. For providers that return
+ready hosts (AWS, QUADS): verifies and passes through. The LLM calls
+a `provision_platform` MCP tool which runs deterministic code
+internally — zero wasted iterations on the happy path.
+
+**Provisioning Agent** — Installs benchmark harnesses on provisioned
+hosts. For self-installing harnesses on Jumpstarter (boot-time,
+arcaflow-plugins), auto-completes immediately since the platform agent
+already prepared the board. For other harnesses, checks platform
+contracts, installs packages, and deploys K3s if needed.
 
 **Benchmark Agent** — Constructs the run configuration by reading harness
 documentation, schemas, and example run-files through its tools. The LLM
@@ -454,7 +463,8 @@ harness schema. Handles both remotehosts and Kubernetes endpoint types.
 **Review Agent** — Retrieves results from the benchmark harness, analyzes
 metrics, and produces a verdict (hypothesis confirmed/refuted/inconclusive)
 with key metrics and recommendations. Harness-agnostic: discovers how to
-retrieve results through skill providers.
+retrieve results through skill providers. Defaults to auto-submit — set
+`review_mode: interactive` in directives for iterative HITL investigation.
 
 **Introspection Agent** — Continuous passive observer that runs alongside
 the pipeline agents without participating in the state machine. Uses a
@@ -850,6 +860,24 @@ calling agent's type. The gathering_context, evaluate, and review
 agents call this in their `run()` method. See
 [Configuration](configuration.md#external_mcp_servers) for the
 config schema.
+
+**Conditional prompt guidance:**
+
+When external performance data tools (e.g., `get_baseline_stats`,
+`find_similar_anomalies`, `get_distribution`) are detected in the
+agent's tool list, tailored guidance is injected into the system
+prompt. Each agent gets role-specific guidance:
+
+- **gathering_context**: grounding workflow — establish baselines
+  and characterize anomaly deviation
+- **evaluate**: convergence assessment — use z-scores, anomaly
+  search, and distribution shape to strengthen gate decisions
+- **review**: quantitative context — compare results against
+  historical baselines
+
+Deployments without an external performance data server see
+zero behavioral change — the guidance is only injected when
+the tools are present.
 
 ### SSH Executor
 

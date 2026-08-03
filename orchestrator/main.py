@@ -58,6 +58,9 @@ def _make_llm_factory(config: OrchestratorConfig):
             model=agent_cfg.get("model", ""),
         )
         provider.default_timeout = config.llm_timeout
+        effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
+        if effort:
+            provider.reasoning_effort = effort
         return provider
 
     return factory
@@ -239,6 +242,15 @@ def _advance_plan(
         if next_idx < len(steps):
             next_step = steps[next_idx]
             next_status = PLAN_AGENT_STATUS.get(next_step["agent_type"])
+            # Insert preparing_platform before provision
+            # so the platform agent can run system
+            # provisioning (flash, kickstart) before
+            # harness installation.
+            if (
+                next_status == "awaiting_provision"
+                and completed_status == "awaiting_hardware"
+            ):
+                next_status = "preparing_platform"
             if next_status:
                 next_step["status"] = "in_progress"
 
@@ -308,6 +320,7 @@ async def run_agent_task(
     ticket_data: dict | None = None,
 ):
     agent = None
+    success = False
 
     try:
         agent = dispatcher.create_agent(status, ticket_data=ticket_data)
@@ -349,6 +362,9 @@ async def run_agent_task(
                             provider=llm_override.get("provider", ""),
                             model=llm_override.get("model", ""),
                         )
+                        override_effort = llm_override.get("reasoning_effort")
+                        if override_effort:
+                            override_llm.reasoning_effort = override_effort
                         agent.llm = override_llm
                         logger.info(
                             f"LLM override for {ticket_id}:"
@@ -373,9 +389,11 @@ async def run_agent_task(
         except Exception:
             pass  # proceed with default iterations
 
-        # Jumpstarter: resolve image URLs before provisioning.
-        # This is a deterministic HTTP lookup — no LLM needed.
-        if status == "awaiting_provision":
+        # Jumpstarter: resolve image URLs before platform
+        # setup. This is a deterministic HTTP lookup — no
+        # LLM needed. Runs for both preparing_platform
+        # (new path) and awaiting_provision (legacy/direct).
+        if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 
             await _resolve_jumpstarter_images(
@@ -391,6 +409,7 @@ async def run_agent_task(
                     agent.run(ticket_id),
                     timeout=agent_task_timeout,
                 )
+                success = True
             except asyncio.TimeoutError:
                 logger.error(
                     f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
@@ -413,6 +432,7 @@ async def run_agent_task(
                 )
         else:
             await agent.run(ticket_id)
+            success = True
 
         if config:
             try:
@@ -460,12 +480,32 @@ async def run_agent_task(
                 "agent_stopped",
                 {"mode": "hard"},
             )
-    except Exception:
+    except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
+        err_msg = str(e).lower()
+        if (
+            "resource_exhausted" in err_msg
+            or "rate limit" in err_msg
+            or "429" in err_msg
+        ):
+            reason = "Agent encountered sustained API rate limits (RESOURCE_EXHAUSTED). Pausing ticket for guidance."
+        else:
+            reason = f"Agent failed with an unhandled exception: {e}"
+        try:
+            await _transition_to_guidance(
+                dispatcher.store_url,
+                ticket_id,
+                reason,
+                event_bus=dispatcher.events,
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to transition failed ticket {ticket_id} to guidance"
+            )
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        if status in PLAN_AGENT_STATUS.values():
+        if success and status in PLAN_AGENT_STATUS.values():
             try:
                 _advance_plan(
                     dispatcher.store_url,
@@ -825,6 +865,36 @@ async def _process_stop_requests(
                 if dispatcher.is_active(tid):
                     dispatcher.stop_agent(tid, mode)
                     logger.info(f"Processed stop request for {tid} (mode={mode})")
+                else:
+                    # Ticket has no active agent — transition it
+                    # to a non-dispatchable state so it doesn't
+                    # get picked up on the next poll cycle.
+                    if mode == "hard":
+                        resp = await client.post(
+                            f"{store_url}/api/v1/tickets/{tid}/force-close",
+                        )
+                        resp.raise_for_status()
+                        logger.info(f"Force-closed non-active ticket {tid}")
+                    else:
+                        resp = await client.post(
+                            f"{store_url}/api/v1/tickets/{tid}/transition",
+                            json={
+                                "status": "awaiting_customer_guidance",
+                                "comment": ("Graceful stop requested — ticket paused"),
+                            },
+                        )
+                        if resp.status_code == 409:
+                            resp = await client.post(
+                                f"{store_url}/api/v1/tickets/{tid}/force-close",
+                            )
+                            resp.raise_for_status()
+                            logger.info(
+                                f"Force-closed non-active ticket {tid}"
+                                " (transition not allowed)"
+                            )
+                        else:
+                            resp.raise_for_status()
+                            logger.info(f"Paused non-active ticket {tid}")
                 await client.patch(
                     f"{store_url}/api/v1/tickets/{tid}/fields",
                     json={"fields": {"stop_requested": None}},
@@ -868,6 +938,8 @@ def _maybe_start_introspection(
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = _make_llm_provider(config)
     llm.default_timeout = config.llm_timeout
+    if config.llm_reasoning_effort:
+        llm.reasoning_effort = config.llm_reasoning_effort
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()
@@ -1008,7 +1080,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 # the ticket has anomaly_context, redirect
                 # to gathering_context (investigation path).
                 # LLM decides intent; code enforces invariants.
-                # Skip if gathering_context already ran —
+                # Skip if gathering_context already ran ---
                 # prevents loop when planning_investigation
                 # stub transitions back to awaiting_hardware.
                 if status == "awaiting_hardware":
