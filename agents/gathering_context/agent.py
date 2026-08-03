@@ -24,6 +24,7 @@ from .prompts import (
     EXTERNAL_PERF_DATA_GUIDANCE,
     EXTERNAL_PERF_TOOL_NAMES,
     GATHERING_CONTEXT_SYSTEM_PROMPT,
+    WEBHOOK_GROUNDING_GUIDANCE,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,11 @@ class GatheringContextAgent(AgentBase):
         tool_names = {t.name for t in self.tools} if self.tools else set()
         if tool_names & EXTERNAL_PERF_TOOL_NAMES:
             prompt += EXTERNAL_PERF_DATA_GUIDANCE
+        # Webhook tickets need guidance on resolving directives
+        # from the alert data.
+        cf = ticket.get("custom_fields", {})
+        if cf.get("trigger_source") or cf.get("anomaly_context", {}).get("source"):
+            prompt += WEBHOOK_GROUNDING_GUIDANCE
         return prompt
 
     def _build_messages(
@@ -63,14 +69,23 @@ class GatheringContextAgent(AgentBase):
         )
 
         if anomaly:
-            content += (
-                f"**Anomaly Context:**\n"
-                f"- Subsystem: {anomaly.get('subsystem', 'unknown')}\n"
-                f"- Metric: {anomaly.get('metric', 'unknown')}\n"
-                f"- Direction: {anomaly.get('direction', 'degrading')}\n"
-                f"- Platform: {anomaly.get('platform', 'unspecified')}\n"
-                f"- Magnitude: {anomaly.get('magnitude', 'unspecified')}\n\n"
-            )
+            content += "**Anomaly Context:**\n"
+            # Present all anomaly fields — webhook tickets have
+            # different fields than manually submitted ones.
+            for key, val in anomaly.items():
+                if val is not None and val != "":
+                    content += f"- {key}: {val}\n"
+            content += "\n"
+            # Flag webhook-triggered tickets so the LLM knows
+            # it must resolve directives from the alert data.
+            if anomaly.get("source"):
+                content += (
+                    f"**This is a webhook-triggered ticket** "
+                    f"(source: {anomaly['source']}). "
+                    f"Directives (board_selector, image_version, "
+                    f"harness) may be missing and must be resolved "
+                    f"from the alert data.\n\n"
+                )
         else:
             content += (
                 "**No anomaly context found.** This ticket has no "
@@ -148,6 +163,23 @@ class GatheringContextAgent(AgentBase):
                 "notes": notes,
             },
         }
+
+        # Write resolved directives from webhook grounding
+        # so downstream agents know what hardware/image/harness
+        # to use.
+        directives = result.get("directives")
+        if directives and isinstance(directives, dict):
+            ticket = await self._get_ticket(ticket_id)
+            existing = ticket.get(
+                "custom_fields",
+                {},
+            ).get("directives", {})
+            # Merge — don't overwrite directives the user set
+            for k, v in directives.items():
+                if v and k not in existing:
+                    existing[k] = v
+            fields["directives"] = existing
+
         await self._update_fields(ticket_id, fields)
 
         if decision == "MATCH_FOUND" and matched_id:

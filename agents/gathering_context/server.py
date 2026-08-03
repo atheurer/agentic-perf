@@ -29,6 +29,7 @@ async def submit_gathering_context_result(
     match_confidence: float = 0.0,
     match_rationale: str = "",
     notes: str = "",
+    directives: dict | None = None,
 ) -> str:
     """Submit the dedup gate decision.
 
@@ -37,6 +38,9 @@ async def submit_gathering_context_result(
     match_confidence: 0.0-1.0 confidence in the match
     match_rationale: explanation of why this matches (or doesn't)
     notes: any additional context for the next agent
+    directives: optional dict of resolved directives for webhook
+        tickets (board_selector, image_version, harness). These
+        are written to the ticket for downstream agents.
     """
     return f"Decision recorded: {decision}"
 
@@ -74,6 +78,14 @@ def get_gathering_context_tools() -> list[ToolDefinition]:
                     "notes": {
                         "type": "string",
                         "description": ("Additional context for the next agent"),
+                    },
+                    "directives": {
+                        "type": "object",
+                        "description": (
+                            "Resolved directives for webhook tickets "
+                            "(board_selector, image_version, harness). "
+                            "Written to ticket for downstream agents."
+                        ),
                     },
                 },
                 "required": ["decision"],

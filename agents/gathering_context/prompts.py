@@ -9,6 +9,7 @@ from __future__ import annotations
 EXTERNAL_PERF_TOOL_NAMES = {
     "get_baseline_stats",
     "compare_run_to_baseline",
+    "get_run_info",
 }
 
 GATHERING_CONTEXT_SYSTEM_PROMPT = """\
@@ -105,4 +106,47 @@ has anomaly context with a platform identifier:
 - **Avoid `get_key_metrics`** for bulk data retrieval — raw responses
   are 800 KB-2 MB and cannot be reasoned about effectively.
 - Always pass `target` and `from_timestamp` filters to scope queries.
+"""
+
+
+WEBHOOK_GROUNDING_GUIDANCE = """
+
+## Webhook-Triggered Ticket Grounding
+
+This ticket was created by an external alert system (see
+`anomaly_context.source`). Unlike manually submitted tickets,
+webhook tickets may lack hardware directives (board_selector,
+image_version, harness). **You must populate these** from the
+alert data before submitting your result.
+
+### Workflow for webhook tickets
+
+1. **Resolve run metadata:** If `get_run_info` is available and
+   `anomaly_context.run_id` or `anomaly_context.dataset_id` is set,
+   call `get_run_info` to get the target/board type, OS version,
+   and dataset labels for the run that triggered the alert.
+
+2. **Map to directives:** From the run metadata, determine:
+   - `board_selector` — the Jumpstarter board-type label
+     (e.g., `board-type=renesas-rcar-s4`)
+   - `image_version` — the OS image (e.g., `AutoSD-10`)
+   - `harness` — the benchmark harness (e.g., `boot-time`)
+
+3. **Include directives in your result:** When you call
+   `submit_gathering_context_result`, include a `directives`
+   dict in your result with the resolved values. These will
+   be written to the ticket for downstream agents.
+
+4. **Fallback:** If `get_run_info` is not available or returns
+   no data, include what you can infer from the anomaly context
+   (e.g., `test_name` may indicate the harness) and note the
+   missing fields. The investigation will request guidance.
+
+### Field mapping reference
+
+| Run metadata field | Directive field | Example |
+|---|---|---|
+| `target` | `board_selector` | `board-type=renesas-rcar-s4` |
+| `os_version` or label | `image_version` | `AutoSD-10` |
+| `test_name` | `harness` | `boot-time` |
 """
