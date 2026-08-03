@@ -28,3 +28,4 @@ docs/.claude/
 # TUI build artifacts
 tui/aptui
 tui/dist/
+.pi/

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from orchestrator.config import _load_config_file
 from providers.events import EventBus
 
-from .api.router import api_router, health_router
+from .api.router import api_router, health_router, webhook_router
 from .auth import load_or_generate_token, make_auth_dependency
 from .ratelimit import (
     AuthFailureLimiter,
@@ -47,7 +47,7 @@ def mount_routers(
     auth: Any,
     rate_limit: Any = None,
 ) -> None:
-    """Mount API and health routers with dependencies.
+    """Mount API, health, and webhook routers with dependencies.
 
     Factored out so test helpers (which clear and re-mount routers)
     can use the same wiring as production. ``rate_limit`` may be
@@ -58,6 +58,7 @@ def mount_routers(
         deps.append(Depends(rate_limit))
     app.include_router(api_router, dependencies=deps)
     app.include_router(health_router)
+    app.include_router(webhook_router)
 
 
 def create_app() -> FastAPI:

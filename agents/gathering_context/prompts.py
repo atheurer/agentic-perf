@@ -9,6 +9,7 @@ from __future__ import annotations
 EXTERNAL_PERF_TOOL_NAMES = {
     "get_baseline_stats",
     "compare_run_to_baseline",
+    "get_run_info",
 }
 
 GATHERING_CONTEXT_SYSTEM_PROMPT = """\
@@ -105,4 +106,44 @@ has anomaly context with a platform identifier:
 - **Avoid `get_key_metrics`** for bulk data retrieval — raw responses
   are 800 KB-2 MB and cannot be reasoned about effectively.
 - Always pass `target` and `from_timestamp` filters to scope queries.
+"""
+
+
+WEBHOOK_GROUNDING_GUIDANCE = """
+
+## Webhook-Triggered Ticket Grounding
+
+This ticket was created by an external alert system (see
+`anomaly_context.source`). Unlike manually submitted tickets,
+webhook tickets may lack hardware directives (board_selector,
+image_version, harness). **You must populate these** from the
+alert data before submitting your result.
+
+### Workflow for webhook tickets
+
+1. **Resolve run metadata:** If `get_run_info` is available and
+   `anomaly_context.run_id` or `anomaly_context.dataset_id` is set,
+   call `get_run_info` with whichever ID you have. Pass it as
+   `run_id` or `dataset_id` (both accepted as string or int).
+   This returns the target/board type, OS identifier, and all
+   dataset labels for the run that triggered the alert.
+
+2. **Read the grounding skill:** Call `read_skill` with
+   harness `jumpstarter` and filename `webhook-grounding.md`
+   to learn how to map run metadata labels to directives.
+
+3. **Map to directives:** Following the skill guidance, resolve:
+   - `board_selector` (REQUIRED)
+   - `image_version` (REQUIRED)
+   - `harness`
+
+4. **Include directives in your result:** You MUST pass a
+   `directives` dict to `submit_gathering_context_result` with
+   the resolved values. Without these, downstream agents cannot
+   provision hardware or run benchmarks.
+
+5. **Fallback:** If `get_run_info` is not available or returns
+   no data, include what you can infer from the anomaly context
+   (e.g., `test_name` may indicate the harness) and note the
+   missing fields. The investigation will request guidance.
 """

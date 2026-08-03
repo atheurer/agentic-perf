@@ -13,6 +13,7 @@ from . import (
     transitions,
     transitions_info,
     users,
+    webhooks,
     whoami,
 )
 
@@ -33,3 +34,7 @@ api_router.include_router(whoami.router)
 
 health_router = APIRouter(prefix="/api/v1")
 health_router.include_router(health.router)
+
+# Webhook POST does its own auth; register outside the global dep.
+webhook_router = APIRouter(prefix="/api/v1")
+webhook_router.include_router(webhooks.router)
