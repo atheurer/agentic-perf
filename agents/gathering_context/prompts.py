@@ -123,14 +123,19 @@ alert data before submitting your result.
 
 1. **Resolve run metadata:** If `get_run_info` is available and
    `anomaly_context.run_id` or `anomaly_context.dataset_id` is set,
-   call `get_run_info` to get the target/board type, OS version,
-   and dataset labels for the run that triggered the alert.
+   call `get_run_info` with whichever ID you have. Pass it as
+   `run_id` or `dataset_id` (both accepted as string or int).
+   This returns the target/board type, OS identifier, and all
+   dataset labels for the run that triggered the alert.
 
 2. **Map to directives:** From the run metadata, determine:
-   - `board_selector` — the Jumpstarter board-type label
-     (e.g., `board-type=renesas-rcar-s4`)
-   - `image_version` — the OS image (e.g., `AutoSD-10`)
-   - `harness` — the benchmark harness (e.g., `boot-time`)
+   - `board_selector` — derive from the `target` field
+     (e.g., target `rcar_s4` → `board-type=renesas-rcar-s4`)
+   - `image_version` — from `os_id` or relevant labels
+     (e.g., `AutoSD-10`)
+   - `harness` — infer from `test_name`, `description`, or
+     the alert's `anomaly_context.test_name`
+     (e.g., `boot-time-verbose` → `boot-time`)
 
 3. **Include directives in your result:** When you call
    `submit_gathering_context_result`, include a `directives`
@@ -147,6 +152,6 @@ alert data before submitting your result.
 | Run metadata field | Directive field | Example |
 |---|---|---|
 | `target` | `board_selector` | `board-type=renesas-rcar-s4` |
-| `os_version` or label | `image_version` | `AutoSD-10` |
-| `test_name` | `harness` | `boot-time` |
+| `os_id` or labels | `image_version` | `AutoSD-10` |
+| `test_name` / `description` | `harness` | `boot-time` |
 """
