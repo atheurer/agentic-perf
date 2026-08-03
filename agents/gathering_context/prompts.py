@@ -172,8 +172,10 @@ alert data before submitting your result.
 Target-to-board-selector mapping:
 - `ride4_sa8775p_sx_r3` → `board-type=qc8775`
 - `rcar_s4` → `board-type=renesas-rcar-s4`
-- `ebbr` → `board-type=virtual`
 - `s32g_vnp_rdb3` → `board-type=nxp-s32g-vnp-rdb3`
+- `ebbr` → NOT a board type; it is a boot standard (EBBR)
+  used across multiple boards. Use other metadata (labels,
+  test description) to identify the actual board.
 
 Image version derivation:
 - Use `labels["RHIVOS Release"]` (e.g., `latest-RHIVOS-2-...` → `RHIVOS-2`)
