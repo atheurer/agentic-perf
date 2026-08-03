@@ -15,11 +15,40 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+import json
+
 from fastmcp import FastMCP
 
 from providers.llm.base import ToolDefinition
 
+SKILLS_DIR = Path(_project_root) / "skills"
+
 mcp = FastMCP("gathering-context")
+
+
+@mcp.tool()
+async def read_skill(harness: str, filename: str) -> str:
+    """Read a skill document for a harness or provider.
+
+    Skill docs contain domain-specific knowledge needed for
+    grounding decisions (e.g., how to map Horreum labels to
+    hardware directives).
+
+    Args:
+        harness: Skill category (e.g., 'jumpstarter', 'boot-time').
+        filename: Filename within the skill directory.
+    """
+    skill_path = SKILLS_DIR / harness / filename
+    if not skill_path.is_file():
+        return json.dumps(
+            {"found": False, "message": f"Skill not found: {harness}/{filename}"},
+        )
+    resolved = skill_path.resolve()
+    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
+        return json.dumps({"found": False, "message": "Invalid path"})
+    return json.dumps(
+        {"found": True, "filename": filename, "content": skill_path.read_text()},
+    )
 
 
 @mcp.tool()

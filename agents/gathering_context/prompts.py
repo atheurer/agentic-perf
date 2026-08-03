@@ -128,67 +128,22 @@ alert data before submitting your result.
    This returns the target/board type, OS identifier, and all
    dataset labels for the run that triggered the alert.
 
-2. **Map to directives:** From the run metadata, determine:
-   - `board_selector` — derive from the `target` field
-     (e.g., target `rcar_s4` → `board-type=renesas-rcar-s4`)
-   - `image_version` — from `os_id` or relevant labels
-     (e.g., `AutoSD-10`)
-   - `harness` — infer from `test_name`, `description`, or
-     the alert's `anomaly_context.test_name`
-     (e.g., `boot-time-verbose` → `boot-time`)
+2. **Read the grounding skill:** Call `read_skill` with
+   harness `jumpstarter` and filename `webhook-grounding.md`
+   to learn how to map run metadata labels to directives.
 
-3. **Include directives in your result:** You MUST pass a
+3. **Map to directives:** Following the skill guidance, resolve:
+   - `board_selector` (REQUIRED)
+   - `image_version` (REQUIRED)
+   - `harness`
+
+4. **Include directives in your result:** You MUST pass a
    `directives` dict to `submit_gathering_context_result` with
    the resolved values. Without these, downstream agents cannot
-   provision hardware or run benchmarks. Required fields:
-   - `board_selector` (REQUIRED) — e.g., `board-type=renesas-rcar-s4`
-   - `image_version` (REQUIRED) — e.g., `RHIVOS-2` or `AutoSD-10`
-   - `harness` — e.g., `boot-time`
+   provision hardware or run benchmarks.
 
-   Example:
-   ```json
-   {
-     "directives": {
-       "board_selector": "board-type=qc8775",
-       "image_version": "RHIVOS-2",
-       "harness": "boot-time"
-     }
-   }
-   ```
-
-4. **Fallback:** If `get_run_info` is not available or returns
+5. **Fallback:** If `get_run_info` is not available or returns
    no data, include what you can infer from the anomaly context
    (e.g., `test_name` may indicate the harness) and note the
    missing fields. The investigation will request guidance.
-
-### Horreum label reference
-
-The `get_run_info` response includes a `labels` dict with all
-Horreum dataset labels. Use these labels directly to populate
-directives — do NOT maintain hardcoded mappings.
-
-| Label | Purpose | Example |
-|---|---|---|
-| `RHIVOS Target` | Image target for provisioning. Pass through as-is. | `ride4_sa8775p_sx_r3`, `ebbr` |
-| `RHIVOS OS ID` | OS type (rhivos vs autosd) | `rhivos`, `autosd` |
-| `RHIVOS Mode` | Image build type | `bootc`, `ostree`, `raw` |
-| `RHIVOS Release` | Version/release identifier | `latest-RHIVOS-2-202607240103` |
-| `RHIVOS Build` | Build number | `16609661.875426a8` |
-| `RHIVOS image name` | Build variant (optional) | `ps`, `qe` |
-
-### Directive resolution from labels
-
-- **`harness`**: Infer from `anomaly_context.test_name` or the
-  Horreum test name (e.g., `boot-time-verbose` → `boot-time`).
-- **`board_selector`**: Use the Jumpstarter board-type label
-  that corresponds to the `RHIVOS Target`. The `get_run_info`
-  `target` field may help, but the board selector label is
-  a Jumpstarter concept — check available boards if unsure.
-- **`image_version`**: Derive from `RHIVOS Release` or
-  `RHIVOS OS ID`. Examples:
-  - `latest-RHIVOS-2-...` → `RHIVOS-2`
-  - `autosd` OS ID → `AutoSD-10` (check release label)
-
-Pass all resolved values through the `directives` dict in
-your `submit_gathering_context_result` call.
 """
