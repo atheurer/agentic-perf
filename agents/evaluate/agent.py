@@ -160,6 +160,7 @@ class EvaluateAgent(AgentBase):
         # Latest benchmark results
         run_id = cf.get("run_id", "")
         bench_status = cf.get("benchmark_status", "")
+        output_dirs = cf.get("output_dirs", [])
         output_dir = cf.get("output_dir", "")
         if run_id:
             content += (
@@ -167,19 +168,28 @@ class EvaluateAgent(AgentBase):
                 f"- Run ID: {run_id}\n"
                 f"- Status: {bench_status}\n"
             )
-            if output_dir:
+            if output_dirs:
+                content += "- Artifact Directories (all runs):\n"
+                for d in output_dirs:
+                    content += f"  - `{d}`\n"
+                content += (
+                    "  **Start by calling list_benchmark_artifacts"
+                    " with each path, then read per-sample data"
+                    " for statistical analysis before deciding.**\n"
+                )
+            elif output_dir:
                 content += (
                     f"- Output Dir: {output_dir}\n"
-                    f"  (use this path with list_benchmark_artifacts "
-                    f"and read_benchmark_artifact)\n"
+                    f"  **Start by calling list_benchmark_artifacts"
+                    f" with this path, then read per-sample data"
+                    f" for statistical analysis before deciding.**\n"
                 )
             content += "\n"
 
         content += (
             "Evaluate the convergence gates and submit your "
-            "decision. If infra tools are available, you may "
-            "query the host for detailed benchmark results "
-            "before deciding.\n"
+            "decision. Read the benchmark artifacts for "
+            "per-sample statistical analysis before deciding.\n"
         )
 
         return [{"role": "user", "content": content}]

@@ -2100,8 +2100,8 @@ async def execute_boot_time_test(
             response["output_summary"] = "\n".join(summary_lines[-30:])
 
     # Save output_dir to ticket so the evaluate agent
-    # can find artifacts. The LLM's submit_benchmark_result
-    # doesn't include output_dir, so we write it directly.
+    # can find artifacts. Accumulate across loop-back
+    # runs so all artifacts remain accessible.
     if _ticket and response.get("output_dir"):
         try:
             import os
@@ -2114,11 +2114,27 @@ async def execute_boot_time_test(
             ticket_id = _ticket.get("id", "")
             if ticket_id:
                 async with httpx.AsyncClient(timeout=10.0, headers=headers) as _client:
+                    # Fetch current list to append
+                    r = await _client.get(
+                        f"{store_url}/api/v1/tickets/{ticket_id}",
+                    )
+                    existing = r.json().get("custom_fields", {}).get("output_dirs", [])
+                    new_dir = response["output_dir"]
+                    if new_dir not in existing:
+                        existing.append(new_dir)
                     await _client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={"fields": {"output_dir": response["output_dir"]}},
+                        json={
+                            "fields": {
+                                "output_dir": new_dir,
+                                "output_dirs": existing,
+                            }
+                        },
                     )
-                logger.info(f"[boot-time] Saved output_dir to ticket {ticket_id}")
+                logger.info(
+                    f"[boot-time] Saved output_dir to ticket"
+                    f" {ticket_id} ({len(existing)} total)"
+                )
         except Exception:
             logger.warning("Failed to save output_dir", exc_info=True)
 

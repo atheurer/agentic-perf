@@ -402,13 +402,22 @@ class BenchmarkAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        fields = {
+        fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
-            "output_dir": result.get("output_dir", ""),
         }
+        # Accumulate output_dirs across loop-back runs
+        # so the evaluate agent can access all artifacts.
+        if result.get("output_dir"):
+            ticket = await self._get_ticket(ticket_id)
+            existing = ticket.get("custom_fields", {}).get("output_dirs", [])
+            if result["output_dir"] not in existing:
+                existing.append(result["output_dir"])
+            fields["output_dirs"] = existing
+            # Keep output_dir as latest for backward compat
+            fields["output_dir"] = result["output_dir"]
         await self._update_fields(ticket_id, fields)
 
         status = fields["benchmark_status"]
