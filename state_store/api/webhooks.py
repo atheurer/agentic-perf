@@ -226,6 +226,20 @@ async def receive_webhook(
             dedup_key_value,
             existing_id,
         )
+        # Record the dedup on the existing ticket so it's
+        # visible in the dashboard timeline.
+        event_bus = getattr(request.app.state, "event_bus", None)
+        if event_bus:
+            event_bus.emit(
+                existing_id,
+                "webhook",
+                "duplicate_suppressed",
+                {
+                    "source": source,
+                    "dedup_key": dedup_key_value,
+                    "submitted_by": username,
+                },
+            )
         return {
             "status": "duplicate",
             "ticket_id": existing_id,
