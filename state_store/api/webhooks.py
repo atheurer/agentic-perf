@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from state_store.audit import set_actor
 from state_store.identity import UserStore, hash_token
 from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
 from state_store.webhooks.registry import get_translator, list_sources
@@ -192,6 +193,8 @@ async def receive_webhook(
     """Receive and process a webhook from *source*."""
     # Custom auth (bypasses the global auth dependency)
     username = _authenticate_webhook(request, source)
+    ip = request.client.host if request.client else "unknown"
+    set_actor("webhook", username, ip)
 
     # Look up translator
     try:

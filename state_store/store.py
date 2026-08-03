@@ -8,6 +8,7 @@ from pathlib import Path
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
 
+from .audit import AuditLog
 from .models import (
     VALID_TRANSITIONS,
     AddCommentRequest,
@@ -30,13 +31,22 @@ class TicketNotFound(Exception):
 
 
 class TicketStore:
-    def __init__(self, persist_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        persist_dir: str | Path | None = None,
+        audit_log: AuditLog | None = None,
+    ) -> None:
         self._tickets: dict[str, Ticket] = {}
         self._lock = threading.Lock()
         self._global_seq = 0
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
         self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._audit = audit_log
         self._load_from_disk()
+
+    def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
+        if self._audit is not None:
+            self._audit.log(mutation, ticket_id, data)
 
     def create_ticket(
         self,
@@ -59,6 +69,11 @@ class TicketStore:
             )
             self._tickets[ticket.id] = ticket
             self._persist_ticket(ticket)
+            self._audit_log(
+                "create_ticket",
+                ticket.id,
+                {"summary": ticket.summary[:200]},
+            )
             return ticket.model_copy()
 
     def get_ticket(self, ticket_id: str) -> Ticket:
@@ -123,6 +138,7 @@ class TicketStore:
             else:
                 ticket.previous_status = None
 
+            old_status = current.value
             ticket.status = new_status
             ticket.updated_at = datetime.now(timezone.utc)
             self._global_seq += 1
@@ -138,6 +154,15 @@ class TicketStore:
                 )
 
             self._persist_ticket(ticket)
+            self._audit_log(
+                "transition_ticket",
+                ticket_id,
+                {
+                    "old_status": old_status,
+                    "new_status": new_status.value,
+                    "comment": request.comment,
+                },
+            )
             return ticket.model_copy()
 
     def update_fields(self, ticket_id: str, fields: dict) -> Ticket:
@@ -148,6 +173,11 @@ class TicketStore:
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
+            self._audit_log(
+                "update_fields",
+                ticket_id,
+                {"field_names": sorted(fields.keys())},
+            )
             return ticket.model_copy()
 
     def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
@@ -155,9 +185,15 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+            old_owners = list(ticket.owners)
             ticket.owners = list(owners)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
+            self._audit_log(
+                "set_owners",
+                ticket_id,
+                {"old_owners": old_owners, "new_owners": list(owners)},
+            )
             return ticket.model_copy()
 
     def add_comment(self, ticket_id: str, request: AddCommentRequest) -> Comment:
@@ -173,6 +209,11 @@ class TicketStore:
             ticket.comments.append(comment)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
+            self._audit_log(
+                "add_comment",
+                ticket_id,
+                {"author": request.author, "comment_id": comment.id},
+            )
             return comment.model_copy()
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
@@ -201,6 +242,15 @@ class TicketStore:
             if existing:
                 expires = datetime.fromisoformat(existing["expires"])
                 if expires > now and existing["owner"] != owner:
+                    self._audit_log(
+                        "claim_ticket",
+                        ticket_id,
+                        {
+                            "owner": owner,
+                            "result": "rejected",
+                            "held_by": existing["owner"],
+                        },
+                    )
                     return None
 
             expires = now + timedelta(seconds=duration_seconds)
@@ -212,6 +262,15 @@ class TicketStore:
             ticket.custom_fields["claim"] = claim
             ticket.updated_at = now
             self._persist_ticket(ticket)
+            self._audit_log(
+                "claim_ticket",
+                ticket_id,
+                {
+                    "owner": owner,
+                    "duration_seconds": duration_seconds,
+                    "result": "claimed",
+                },
+            )
             return claim
 
     def release_claim(self, ticket_id: str, owner: str) -> bool:
@@ -223,11 +282,21 @@ class TicketStore:
 
             existing = ticket.custom_fields.get("claim")
             if not existing or existing["owner"] != owner:
+                self._audit_log(
+                    "release_claim",
+                    ticket_id,
+                    {"owner": owner, "result": "not_owner"},
+                )
                 return False
 
             ticket.custom_fields.pop("claim", None)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
+            self._audit_log(
+                "release_claim",
+                ticket_id,
+                {"owner": owner, "result": "released"},
+            )
             return True
 
     def renew_claim(
@@ -241,6 +310,11 @@ class TicketStore:
 
             existing = ticket.custom_fields.get("claim")
             if not existing or existing["owner"] != owner:
+                self._audit_log(
+                    "renew_claim",
+                    ticket_id,
+                    {"owner": owner, "result": "not_owner"},
+                )
                 return None
 
             now = datetime.now(timezone.utc)
@@ -248,6 +322,15 @@ class TicketStore:
             existing["expires"] = expires.isoformat()
             ticket.updated_at = now
             self._persist_ticket(ticket)
+            self._audit_log(
+                "renew_claim",
+                ticket_id,
+                {
+                    "owner": owner,
+                    "duration_seconds": duration_seconds,
+                    "result": "renewed",
+                },
+            )
             return existing
 
     def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
@@ -264,8 +347,14 @@ class TicketStore:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
 
             if ticket.status == TicketStatus.CLOSED:
+                self._audit_log(
+                    "force_close",
+                    ticket_id,
+                    {"old_status": "closed", "result": "already_closed"},
+                )
                 return ticket.model_copy()
 
+            old_status = ticket.status.value
             ticket.previous_status = ticket.status
             ticket.status = TicketStatus.CLOSED
             ticket.updated_at = datetime.now(timezone.utc)
@@ -284,6 +373,11 @@ class TicketStore:
                 )
 
             self._persist_ticket(ticket)
+            self._audit_log(
+                "force_close",
+                ticket_id,
+                {"old_status": old_status, "comment": comment},
+            )
             return ticket.model_copy()
 
     def _persist_ticket(self, ticket: Ticket) -> None:
