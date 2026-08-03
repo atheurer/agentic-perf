@@ -1659,7 +1659,10 @@ async function renderList() {
 
 async function loadTickets() {
   try {
-    var qs = statusFilter ? '?status=' + statusFilter : '';
+    var params = [];
+    if (statusFilter) params.push('status=' + statusFilter);
+    params.push('fields=summary');
+    var qs = '?' + params.join('&');
     var results = await Promise.all([
       api('/tickets' + qs),
       api('/usage/summary').catch(function() { return null; }),

@@ -13,6 +13,22 @@ from ..store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
+# Fields stripped from list responses to reduce payload size.
+# previous_messages alone can be 50-100KB per ticket (full LLM
+# conversation history) and is only needed by agents resuming
+# work via the single-ticket GET endpoint.
+_HEAVY_FIELDS = {"previous_messages"}
+
+
+def _strip_heavy_fields(ticket: dict) -> dict:
+    cf = ticket.get("custom_fields")
+    if cf and any(k in cf for k in _HEAVY_FIELDS):
+        ticket = dict(ticket)
+        ticket["custom_fields"] = {
+            k: v for k, v in cf.items() if k not in _HEAVY_FIELDS
+        }
+    return ticket
+
 
 def _get_store(request: Request):
     return request.app.state.store
@@ -51,10 +67,23 @@ def create_ticket(body: CreateTicketRequest, request: Request):
     return ticket
 
 
+_SUMMARY_FIELDS = ("id", "summary", "status", "owners", "created_at", "updated_at")
+
+
 @router.get("")
-def list_tickets(request: Request, status: TicketStatus | None = Query(None)):
+def list_tickets(
+    request: Request,
+    status: TicketStatus | None = Query(None),
+    fields: str | None = Query(None),
+):
     store = _get_store(request)
-    return store.list_tickets(status=status)
+    tickets = store.list_tickets(status=status)
+    if fields == "summary":
+        return [
+            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS}
+            for t in tickets
+        ]
+    return [_strip_heavy_fields(t.model_dump(mode="json")) for t in tickets]
 
 
 @router.get("/{ticket_id}")
