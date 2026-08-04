@@ -18,6 +18,22 @@ class LLMTimeoutError(Exception):
         super().__init__(f"LLM API call to {provider} timed out after {timeout}s")
 
 
+class LLMRateLimitError(Exception):
+    """Raised when an LLM API call is rejected due to rate limiting."""
+
+    def __init__(
+        self,
+        provider: str = "unknown",
+        retry_after: float | None = None,
+    ) -> None:
+        self.provider = provider
+        self.retry_after = retry_after
+        msg = f"LLM API call to {provider} was rate-limited"
+        if retry_after:
+            msg += f" (retry after {retry_after}s)"
+        super().__init__(msg)
+
+
 @dataclass
 class ToolDefinition:
     name: str

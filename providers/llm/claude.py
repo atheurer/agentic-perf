@@ -8,6 +8,7 @@ import anthropic
 
 from .base import (
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolCall,
@@ -134,5 +135,17 @@ class ClaudeLLMProvider(LLMProvider):
             )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"claude/{self._model}") from None
+        except anthropic.RateLimitError as e:
+            retry_after: float | None = None
+            try:
+                retry_after = float(e.response.headers.get("retry-after", 0)) or None
+            except Exception:
+                pass
+            raise LLMRateLimitError(f"claude/{self._model}", retry_after) from None
+        except anthropic.APIStatusError as e:
+            # Vertex AI surfaces RESOURCE_EXHAUSTED as a non-429 APIStatusError.
+            if "resource_exhausted" in str(e).lower():
+                raise LLMRateLimitError(f"claude/{self._model}") from None
+            raise
 
         return self._parse_response(response)
