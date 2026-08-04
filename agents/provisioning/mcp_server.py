@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
+
+_SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
 
 logger = logging.getLogger(__name__)
 
@@ -760,6 +764,46 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                     "question": {"type": "string", "description": "Question to ask"},
                 },
                 "required": ["question"],
+            },
+        ),
+        ToolDefinition(
+            name="list_skill_docs",
+            description=(
+                "List available skill documents for a topic. "
+                "Use 'general' for host-tuning, connectivity, and network-perf guides. "
+                "Use a harness name (e.g. 'crucible') for harness-specific docs."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "harness": {
+                        "type": "string",
+                        "description": "Topic/harness name (e.g. 'general', 'crucible')",
+                    },
+                },
+                "required": ["harness"],
+            },
+        ),
+        ToolDefinition(
+            name="read_skill",
+            description=(
+                "Read a skill document. Always read 'general/host-tuning.md' "
+                "before applying any host tuning — it defines the required tool "
+                "ordering, BBR+fq dependency, and irqbalance strategy."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "harness": {
+                        "type": "string",
+                        "description": "Topic/harness name (e.g. 'general', 'crucible')",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Document filename (e.g. 'host-tuning.md')",
+                    },
+                },
+                "required": ["harness", "filename"],
             },
         ),
         ToolDefinition(
@@ -1626,6 +1670,22 @@ def create_provisioning_tool_handlers(
         results.update(skipped)
         return _summarize(results)
 
+    async def list_skill_docs(harness: str) -> dict:
+        skill_dir = _SKILLS_DIR / harness
+        if not skill_dir.is_dir():
+            return {"found": False, "message": f"No skill directory for '{harness}'"}
+        files = [f.name for f in sorted(skill_dir.iterdir()) if f.suffix == ".md"]
+        return {"found": True, "harness": harness, "files": files}
+
+    async def read_skill(harness: str, filename: str) -> dict:
+        skill_path = _SKILLS_DIR / harness / filename
+        if not skill_path.is_file():
+            return {"found": False, "message": f"Skill not found: {harness}/{filename}"}
+        resolved = skill_path.resolve()
+        if not str(resolved).startswith(str(_SKILLS_DIR.resolve())):
+            return {"found": False, "message": "Invalid path"}
+        return {"found": True, "filename": filename, "content": skill_path.read_text()}
+
     async def tune_nic(
         host: str,
         interface: str,
@@ -1961,6 +2021,8 @@ def create_provisioning_tool_handlers(
         return "Clarification requested. Ticket paused for human input."
 
     handlers = {
+        "list_skill_docs": list_skill_docs,
+        "read_skill": read_skill,
         "tune_nic": tune_nic,
         "tune_tcp": tune_tcp,
         "pin_irq": pin_irq,

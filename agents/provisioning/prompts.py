@@ -127,6 +127,11 @@ Important:
   uninstall_harness, verify_harness_install, check_existing_install, and
   update_install so the tool enforces this automatically.
 - Installation can take several minutes — be patient.
+- If the ticket requests host tuning (BBR, IRQ pinning, NIC settings), read
+  `general/host-tuning.md` via read_skill BEFORE calling any tuning tools.
+  It defines the required ordering (tune_nic → pin_irq) and irqbalance strategy.
+  After applying tuning, always call verify_host_tuning and include the result
+  in your submit_provisioning_result call.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly — do not ask the user
   if the config says "skip".
