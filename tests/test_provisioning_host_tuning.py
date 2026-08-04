@@ -6,8 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.conftest import MockSSHExecutor, MockSkillProvider, SSHResult
-
+from tests.conftest import MockSkillProvider, MockSSHExecutor, SSHResult
 
 PROC_INTERRUPTS_ONE_QUEUE = """\
   0:         19   IO-APIC    2-edge      timer
