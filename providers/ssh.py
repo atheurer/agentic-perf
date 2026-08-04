@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -127,11 +128,15 @@ class SSHExecutor:
         )
 
         if result.exit_code != 0:
+            caller = "".join(traceback.format_stack(limit=4)[:-1]).strip()
             logger.warning(
                 f"[ssh] {host} exit={result.exit_code}: {result.stderr[:200]}"
+                f"\n  caller: {caller}"
             )
 
         return result
+
+    _MAX_SSH_POLL_FAILURES = 10
 
     async def run_with_progress(
         self,
@@ -180,6 +185,7 @@ class SSHExecutor:
 
         last_reported = ""
         elapsed = 0
+        consecutive_ssh_failures = 0
 
         while True:
             await asyncio.sleep(poll_interval)
@@ -191,6 +197,32 @@ class SSHExecutor:
                 timeout=5,
                 key_path=key_path,
             )
+
+            # SSH connection failure (exit 255) or timeout (exit -1)
+            # is distinct from "test -f" returning 1 (file not found).
+            if done_check.exit_code in (-1, 255):
+                consecutive_ssh_failures += 1
+                if consecutive_ssh_failures >= self._MAX_SSH_POLL_FAILURES:
+                    logger.error(
+                        f"[ssh] {host}: {consecutive_ssh_failures} consecutive SSH"
+                        f" failures polling pid={pid}, giving up"
+                    )
+                    return SSHResult(
+                        stdout="",
+                        stderr=(
+                            f"Lost SSH connectivity to {host} after"
+                            f" {consecutive_ssh_failures} consecutive failures"
+                        ),
+                        exit_code=1,
+                    )
+                logger.warning(
+                    f"[ssh] {host}: SSH poll failure #{consecutive_ssh_failures}"
+                    f" for pid={pid}"
+                )
+                continue
+            else:
+                consecutive_ssh_failures = 0
+
             finished = done_check.exit_code == 0
 
             if progress_callback:

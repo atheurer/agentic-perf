@@ -13,11 +13,29 @@ from ..store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
-# Fields stripped from list responses to reduce payload size.
-# previous_messages alone can be 50-100KB per ticket (full LLM
-# conversation history) and is only needed by agents resuming
-# work via the single-ticket GET endpoint.
-_HEAVY_FIELDS = {"previous_messages"}
+# Custom fields stripped from list responses to reduce payload size.
+# These are only needed by agents resuming work via the single-ticket
+# GET endpoint, not by the browser list page or the orchestrator's
+# dispatch/stop-request polling.
+_HEAVY_FIELDS = {
+    "previous_messages",
+    "detailed_analysis",
+    "review_summary",
+    "execution_plan",
+    "run_file_used",
+    "validated_run_file",
+    "host_inventory",
+    "parsed_specs",
+    "chart_data",
+    "retrospective",
+    "scoped_context",
+    "hypothesis",
+    "recommendations",
+    "key_metrics",
+    "configuration_applied",
+    "follow_up_needed",
+    "verdict",
+}
 
 
 def _strip_heavy_fields(ticket: dict) -> dict:
@@ -74,14 +92,16 @@ _SUMMARY_FIELDS = ("id", "summary", "status", "owners", "created_at", "updated_a
 def list_tickets(
     request: Request,
     status: TicketStatus | None = Query(None),
+    exclude_status: TicketStatus | None = Query(None),
     fields: str | None = Query(None),
 ):
     store = _get_store(request)
     tickets = store.list_tickets(status=status)
+    if exclude_status is not None:
+        tickets = [t for t in tickets if t.status != exclude_status]
     if fields == "summary":
         return [
-            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS}
-            for t in tickets
+            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS} for t in tickets
         ]
     return [_strip_heavy_fields(t.model_dump(mode="json")) for t in tickets]
 
