@@ -56,6 +56,10 @@ def _check_preparing_platform(ticket: dict[str, Any]) -> tuple[bool, str]:
     cf = ticket.get("custom_fields", {})
     if not cf.get("resource_provider"):
         return False, "No resource provider set"
+    # user_provided resources carry no external reservation metadata;
+    # the platform agent uses assigned_hardware_ips instead.
+    if cf.get("resource_provider") == "user_provided":
+        return True, ""
     meta = cf.get("resource_provider_metadata", {})
     if not meta:
         return False, "No resource provider metadata"
