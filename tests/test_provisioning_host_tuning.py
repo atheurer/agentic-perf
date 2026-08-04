@@ -145,38 +145,66 @@ class TestTuneNic:
 
 class TestTuneTcp:
     @pytest.mark.asyncio
-    async def test_sets_bbr_and_fq(self):
-        ssh = MockSSHExecutor(
-            results={
-                "sysctl -n net.ipv4.tcp_congestion_control": SSHResult(stdout="cubic"),
-                "sysctl -n net.core.default_qdisc": SSHResult(stdout="fq_codel"),
-                "sysctl -w net.ipv4.tcp_congestion_control": SSHResult(stdout="ok"),
-                "sysctl -w net.core.default_qdisc": SSHResult(stdout="ok"),
-            }
-        )
-        # After write, verify reads return the new value
-        call_counts: dict[str, int] = {}
+    async def test_sets_bbr_and_fq_with_tc(self):
+        commands_run = []
 
         async def smart_run(host, command, timeout=300):
-            call_counts[command] = call_counts.get(command, 0) + 1
+            commands_run.append(command)
             if "sysctl -n net.ipv4.tcp_congestion_control" in command:
-                return SSHResult(
-                    stdout="cubic" if call_counts.get(command, 1) == 1 else "bbr"
-                )
+                return SSHResult(stdout="bbr")
             if "sysctl -n net.core.default_qdisc" in command:
-                return SSHResult(
-                    stdout="fq_codel" if call_counts.get(command, 1) == 1 else "fq"
-                )
+                return SSHResult(stdout="fq")
+            if "tc qdisc show" in command:
+                return SSHResult(stdout="qdisc fq 8001: root refcnt 2")
             return SSHResult(stdout="ok")
 
+        ssh = MockSSHExecutor()
         ssh.run = smart_run  # type: ignore[method-assign]
         handlers = make_handlers(ssh)
         result = await handlers["tune_tcp"](
-            host="10.0.0.1", congestion_control="bbr", qdisc="fq"
+            host="10.0.0.1",
+            interface="eno16695np0",
+            congestion_control="bbr",
+            qdisc="fq",
         )
         assert result["status"] == "ok"
         assert "net.ipv4.tcp_congestion_control" in result["sysctls"]
-        assert "net.core.default_qdisc" in result["sysctls"]
+        # tc qdisc replace must have been called on the interface
+        assert any("tc qdisc replace" in c and "eno16695np0" in c for c in commands_run)
+        assert result["tc_qdisc"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_qdisc_without_interface_skips_tc(self):
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](host="10.0.0.1", qdisc="fq")
+        assert not any("tc qdisc" in c for c in commands_run)
+        assert result["tc_qdisc"] == {}
+
+    @pytest.mark.asyncio
+    async def test_sets_buffer_sizes(self):
+        applied = []
+
+        async def tracking_run(host, command, timeout=300):
+            if "sysctl -w" in command:
+                applied.append(command)
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        await handlers["tune_tcp"](
+            host="10.0.0.1", rmem_max=134217728, wmem_max=134217728
+        )
+        assert any("rmem_max=134217728" in c for c in applied)
+        assert any("wmem_max=134217728" in c for c in applied)
 
     @pytest.mark.asyncio
     async def test_sysctl_write_failure_reported(self):
@@ -330,7 +358,7 @@ class TestVerifyHostTuning:
         ssh = MockSSHExecutor(
             results={
                 "net.ipv4.tcp_congestion_control": SSHResult(stdout="bbr"),
-                "net.core.default_qdisc": SSHResult(stdout="fq"),
+                "tc qdisc show": SSHResult(stdout="qdisc fq 8001: root refcnt 2"),
                 "ethtool -l": SSHResult(stdout=ETHTOOL_L_ONE_QUEUE),
                 "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE),
                 "smp_affinity_list": SSHResult(stdout="194"),
@@ -351,21 +379,28 @@ class TestVerifyHostTuning:
         )
         assert result["all_ok"] is True
         assert result["checks"]["net.ipv4.tcp_congestion_control"]["ok"] is True
-        assert result["checks"]["net.core.default_qdisc"]["ok"] is True
+        assert result["checks"]["qdisc"]["ok"] is True
         assert result["checks"]["channels"]["ok"] is True
 
     @pytest.mark.asyncio
     async def test_wrong_qdisc_detected(self):
-        ssh = MockSSHExecutor(
-            results={
-                "net.ipv4.tcp_congestion_control": SSHResult(stdout="bbr"),
-                "net.core.default_qdisc": SSHResult(stdout="fq_codel"),
-                "ethtool -l": SSHResult(stdout=ETHTOOL_L_ONE_QUEUE),
-                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE),
-                "smp_affinity_list": SSHResult(stdout="194"),
-                "is-active irqbalance": SSHResult(stdout="inactive"),
-            }
-        )
+        async def mock_run(host, command, timeout=300):
+            if "tc qdisc show" in command:
+                return SSHResult(stdout="qdisc fq_codel 0: root refcnt 2")
+            if "tcp_congestion_control" in command:
+                return SSHResult(stdout="bbr")
+            if "ethtool -l" in command:
+                return SSHResult(stdout=ETHTOOL_L_ONE_QUEUE)
+            if "/proc/interrupts" in command:
+                return SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE)
+            if "smp_affinity_list" in command:
+                return SSHResult(stdout="194")
+            if "is-active" in command:
+                return SSHResult(stdout="inactive")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = mock_run  # type: ignore[method-assign]
         handlers = make_handlers(ssh)
         result = await handlers["verify_host_tuning"](
             host="10.0.0.1",
@@ -373,8 +408,8 @@ class TestVerifyHostTuning:
             expected={"congestion_control": "bbr", "qdisc": "fq"},
         )
         assert result["all_ok"] is False
-        assert result["checks"]["net.core.default_qdisc"]["ok"] is False
-        assert result["checks"]["net.core.default_qdisc"]["actual"] == "fq_codel"
+        assert result["checks"]["qdisc"]["ok"] is False
+        assert result["checks"]["qdisc"]["actual"] == "fq_codel"
 
     @pytest.mark.asyncio
     async def test_irqbalance_drift_detected(self):

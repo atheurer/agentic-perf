@@ -19,18 +19,30 @@ Typical value for single-stream benchmarks: `channels=1` (one combined queue,
 one IRQ to pin).
 
 ### 2. TCP/Network Stack Tuning (`tune_tcp`)
-Kernel-wide sysctl settings. Not interface-specific — affects all connections
-on the host.
+TCP stack settings — sysctl values plus direct interface qdisc via `tc`.
 
 **BBR + fq are a matched pair.** BBR relies on the Fair Queue (`fq`) qdisc
 for per-flow pacing. Without `fq`, BBR cannot control its send rate properly
 and throughput suffers. `fq_codel` is a different algorithm focused on latency
 management and is NOT a substitute for `fq` with BBR.
 
-Always set both together:
+**Critical gotcha:** `sysctl -w net.core.default_qdisc=fq` only affects
+interfaces created AFTER the change. For a NIC that is already up (e.g.
+`eno16695np0`), you must also run `tc qdisc replace dev <interface> root fq`
+to change the qdisc on the live interface. Always pass `interface` to
+`tune_tcp` — it handles both the sysctl and the `tc` command.
+
+Always set both together, with the interface:
+```python
+tune_tcp(host, interface="eno16695np0", congestion_control="bbr", qdisc="fq")
 ```
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
+
+Optionally set socket buffer sizes — RHEL defaults (~208KB) may limit
+throughput on high-bandwidth paths. Only set these if the user explicitly
+requests a specific value; do not guess at a value without data:
+```python
+tune_tcp(host, interface="eno16695np0", congestion_control="bbr", qdisc="fq",
+         rmem_max=<user_specified>, wmem_max=<user_specified>)
 ```
 
 ### 3. IRQ Pinning (`pin_irq`)

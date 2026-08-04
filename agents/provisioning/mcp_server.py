@@ -838,22 +838,36 @@ def get_provisioning_tools() -> list[ToolDefinition]:
         ToolDefinition(
             name="tune_tcp",
             description=(
-                "Apply kernel-wide TCP/network stack sysctl settings on a host. "
-                "Not interface-specific — affects all connections. "
-                "BBR requires fq qdisc for per-flow pacing; always set both together. "
-                "Returns before/after value for each sysctl."
+                "Apply TCP/network stack settings on a host. "
+                "Sets congestion control and qdisc via sysctl AND applies the qdisc "
+                "directly to existing interfaces via 'tc qdisc replace' — the sysctl "
+                "alone only affects newly-created interfaces. "
+                "BBR requires fq (not fq_codel) for per-flow pacing; always set both. "
+                "Optionally sets socket buffer sizes (rmem_max, wmem_max)."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {
+                        "type": "string",
+                        "description": "NIC interface to apply qdisc to via tc (e.g. eno16695np0). Required when setting qdisc.",
+                    },
                     "congestion_control": {
                         "type": "string",
                         "description": "TCP congestion control algorithm (e.g. 'bbr', 'cubic')",
                     },
                     "qdisc": {
                         "type": "string",
-                        "description": "Default qdisc (e.g. 'fq' for BBR, 'fq_codel' for CUBIC)",
+                        "description": "Qdisc to set (e.g. 'fq' for BBR). Applied via both sysctl and tc qdisc replace.",
+                    },
+                    "rmem_max": {
+                        "type": "integer",
+                        "description": "Max socket receive buffer size in bytes (e.g. 134217728 for 128MB)",
+                    },
+                    "wmem_max": {
+                        "type": "integer",
+                        "description": "Max socket send buffer size in bytes (e.g. 134217728 for 128MB)",
                     },
                     "extra_sysctls": {
                         "type": "object",
@@ -1764,8 +1778,11 @@ def create_provisioning_tool_handlers(
 
     async def tune_tcp(
         host: str,
+        interface: str | None = None,
         congestion_control: str | None = None,
         qdisc: str | None = None,
+        rmem_max: int | None = None,
+        wmem_max: int | None = None,
         extra_sysctls: dict | None = None,
         user: str = "root",
         ssh_key_path: str = "",
@@ -1778,33 +1795,65 @@ def create_provisioning_tool_handlers(
         if congestion_control:
             sysctls["net.ipv4.tcp_congestion_control"] = congestion_control
         if qdisc:
+            # net.core.default_qdisc only affects newly-created interfaces;
+            # set it for future interfaces AND apply tc qdisc to existing ones.
             sysctls["net.core.default_qdisc"] = qdisc
+        if rmem_max is not None:
+            sysctls["net.core.rmem_max"] = str(rmem_max)
+            sysctls["net.core.rmem_default"] = str(rmem_max)
+        if wmem_max is not None:
+            sysctls["net.core.wmem_max"] = str(wmem_max)
+            sysctls["net.core.wmem_default"] = str(wmem_max)
         if extra_sysctls:
             sysctls.update({str(k): str(v) for k, v in extra_sysctls.items()})
 
         for key, value in sysctls.items():
-            # Read before
             rb = await _ssh.run(host, f"sysctl -n {key} 2>&1")
             before = rb.stdout.strip()
-            # Apply
             rw = await _ssh.run(host, f"sysctl -w {key}={value} 2>&1")
             if rw.exit_code != 0:
                 errors.append(f"{key}: {rw.stdout.strip()}")
                 results[key] = {"before": before, "requested": value, "ok": False}
                 continue
-            # Verify
             rv = await _ssh.run(host, f"sysctl -n {key} 2>&1")
             after = rv.stdout.strip()
-            results[key] = {
-                "before": before,
-                "after": after,
-                "ok": after == value,
-            }
+            results[key] = {"before": before, "after": after, "ok": after == value}
+
+        # Apply the qdisc directly to existing interfaces via tc.
+        # sysctl net.core.default_qdisc only affects newly-created interfaces;
+        # tc qdisc is required to change the qdisc on an interface already up.
+        tc_result: dict = {}
+        if qdisc and interface:
+            rt = await _ssh.run(
+                host,
+                f"tc qdisc replace dev {interface} root {qdisc} 2>&1",
+            )
+            if rt.exit_code == 0:
+                # Verify
+                rv2 = await _ssh.run(
+                    host,
+                    f"tc qdisc show dev {interface} 2>&1",
+                )
+                tc_result = {
+                    "interface": interface,
+                    "qdisc": qdisc,
+                    "ok": qdisc in rv2.stdout,
+                    "output": rv2.stdout.strip(),
+                }
+            else:
+                errors.append(f"tc qdisc replace {interface}: {rt.stdout.strip()}")
+                tc_result = {
+                    "interface": interface,
+                    "qdisc": qdisc,
+                    "ok": False,
+                    "error": rt.stdout.strip(),
+                }
 
         return {
             "host": host,
             "status": "error" if errors else "ok",
             "sysctls": results,
+            "tc_qdisc": tc_result,
             "errors": errors,
         }
 
@@ -1931,17 +1980,36 @@ def create_provisioning_tool_handlers(
         checks: dict[str, dict] = {}
         all_ok = True
 
-        # TCP sysctls
-        for key, cfg_key in [
-            ("net.ipv4.tcp_congestion_control", "congestion_control"),
-            ("net.core.default_qdisc", "qdisc"),
-        ]:
-            r = await _ssh.run(host, f"sysctl -n {key} 2>&1")
-            actual = r.stdout.strip()
-            expected_val = exp.get(cfg_key)
-            ok = (expected_val is None) or (actual == expected_val)
-            all_ok = all_ok and ok
-            checks[key] = {"actual": actual, "expected": expected_val, "ok": ok}
+        # TCP congestion control (sysctl)
+        r = await _ssh.run(host, "sysctl -n net.ipv4.tcp_congestion_control 2>&1")
+        actual_cc = r.stdout.strip()
+        expected_cc = exp.get("congestion_control")
+        cc_ok = (expected_cc is None) or (actual_cc == expected_cc)
+        all_ok = all_ok and cc_ok
+        checks["net.ipv4.tcp_congestion_control"] = {
+            "actual": actual_cc, "expected": expected_cc, "ok": cc_ok,
+        }
+
+        # Qdisc: check via tc on the interface (authoritative) not sysctl
+        # (sysctl net.core.default_qdisc only affects new interfaces)
+        expected_qdisc = exp.get("qdisc")
+        r_tc = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+        tc_output = r_tc.stdout.strip()
+        # tc output format: "qdisc fq 8001: root refcnt 2 ..."
+        actual_qdisc = None
+        for part in tc_output.split():
+            if part not in ("qdisc", "noqueue", "root", "refcnt"):
+                actual_qdisc = part
+                break
+        qdisc_ok = (expected_qdisc is None) or (actual_qdisc == expected_qdisc)
+        all_ok = all_ok and qdisc_ok
+        checks["qdisc"] = {
+            "interface": interface,
+            "actual": actual_qdisc,
+            "expected": expected_qdisc,
+            "ok": qdisc_ok,
+            "tc_output": tc_output,
+        }
 
         # NIC channel count
         r = await _ssh.run(host, f"ethtool -l {interface} 2>&1")
