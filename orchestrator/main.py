@@ -1139,6 +1139,29 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     logger.info(f"Skipping {tid} at {status}: is_active")
                     continue
 
+                # Deterministic enrichment for webhook tickets.
+                # Resolve directives from run metadata before
+                # any agent sees the ticket. Best-effort —
+                # agents handle gaps if enrichment fails.
+                if status == "triage_pending":
+                    cf = ticket.get("custom_fields", {})
+                    if cf.get("trigger_source"):
+                        try:
+                            from providers.webhook_enrichment import (
+                                enrich_webhook_ticket,
+                            )
+
+                            await enrich_webhook_ticket(
+                                config.state_store_url,
+                                tid,
+                                ticket,
+                            )
+                        except Exception:
+                            logger.warning(
+                                f"Webhook enrichment failed for {tid}",
+                                exc_info=True,
+                            )
+
                 if status == "awaiting_hardware" and ticket.get(
                     "custom_fields", {}
                 ).get("absent_suite"):

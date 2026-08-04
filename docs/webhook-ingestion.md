@@ -207,40 +207,49 @@ _TRANSLATORS: dict[str, str] = {
 
 3. Add tests in `tests/test_webhooks.py`.
 
-## Agent Grounding
+## Deterministic Enrichment
 
 Webhook tickets arrive without hardware directives (`board_selector`,
-`image_version`, `harness`). Unlike manually submitted tickets where
-the user provides these, the gathering_context agent must resolve
-them from the alert data.
+`image_version`, `harness`). The orchestrator resolves these
+automatically using deterministic code — no LLM reasoning needed.
 
 ### How it works
 
-1. The gathering_context agent detects webhook tickets via
-   `trigger_source` or `anomaly_context.source` on the ticket.
-2. If the `get_run_info` Domain MCP tool is available, the agent
-   calls it with the `run_id` or `dataset_id` from the anomaly
-   context to get the target/board type, OS version, and labels.
-3. The agent maps the metadata to directives:
-   - `target` → `board_selector` (e.g., `board-type=renesas-rcar-s4`)
-   - `os_id` or labels → `image_version` (e.g., `AutoSD-10`)
-   - `test_name` / description → `harness` (e.g., `boot-time`)
-4. The resolved directives are included in the
-   `submit_gathering_context_result` call and written to the ticket
-   for downstream agents (resource, platform, benchmark).
+1. Before triage dispatch, the orchestrator detects `trigger_source`
+   on the ticket and calls Domain MCP `get_run_info` with the
+   `run_id` or `dataset_id` from the anomaly context.
+2. The raw `run_metadata` (target, os_id, mode, build, labels) is
+   written to the ticket.
+3. `board_selector` is set from `run_metadata.target` — this matches
+   Jumpstarter exporter labels exactly (e.g.,
+   `target=ride4_sa8775p_sx_r3`). No mapping table needed.
+4. Image resolution reads `run_metadata` labels to derive:
+   - Image server (from `os_id`: rhivos → rhivos.auto-toolchain,
+     autosd → autosd.sig.centos.org)
+   - Image version (from `RHIVOS Release` label)
+   - Release path (full label value for RHIVOS, `nightly` for AutoSD)
+   - Image name (from `RHIVOS image name` label)
+   - Image type (from `RHIVOS Mode`: bootc → ostree, package → regular)
+
+All decisions are deterministic code in `providers/webhook_enrichment.py`
+and `providers/resource/jumpstarter_lifecycle.py`. Agents see the
+resolved directives and `run_metadata` on the ticket — they don't
+need to query for metadata themselves.
 
 ### Fallback
 
-If `get_run_info` is not available or returns no data, the agent
-infers what it can from the anomaly context (e.g., `test_name` may
-indicate the harness) and notes the missing fields. The
-investigation will request human guidance for unresolved directives.
+If `get_run_info` is unavailable or returns no data, the ticket
+proceeds without `run_metadata`. Agents handle the gaps — the
+triage agent infers what it can from the anomaly context, and
+missing directives trigger HITL guidance.
+
+Manual (non-webhook) tickets are unaffected — they use directives
+provided by the user and config defaults as before.
 
 ### Prerequisite
 
 The Domain MCP server must expose a `get_run_info` tool that returns
-metadata for a Horreum run or dataset by ID. Add `get_run_info` to
-the `enabled_tools` list for `gathering_context` in `config.json`.
+metadata for a Horreum run or dataset by ID.
 
 ## Dedup
 

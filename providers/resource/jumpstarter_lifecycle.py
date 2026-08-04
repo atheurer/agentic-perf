@@ -169,6 +169,79 @@ async def sweep_orphaned_leases(
         )
 
 
+# Image server base URLs by OS ID. The base URL includes
+# any path prefix needed for that server's layout.
+_IMAGE_SERVERS: dict[str, str] = {
+    "rhivos": "https://rhivos.auto-toolchain.redhat.com/in-vehicle-os",
+    "autosd": "https://autosd.sig.centos.org/",
+}
+
+
+def _derive_image_server(
+    labels: dict[str, Any],
+    os_id: str,
+) -> str:
+    """Derive image server URL from run metadata."""
+    if os_id and os_id in _IMAGE_SERVERS:
+        return _IMAGE_SERVERS[os_id]
+    label_os = labels.get("RHIVOS OS ID", "")
+    if label_os and label_os in _IMAGE_SERVERS:
+        return _IMAGE_SERVERS[label_os]
+    return ""
+
+
+def _derive_release(
+    labels: dict[str, Any],
+    os_id: str,
+) -> str:
+    """Derive the release path component from run metadata.
+
+    AutoSD uses 'nightly'. RHIVOS uses the full release label
+    as the path component (e.g., 'latest-RHIVOS-2-202607240103').
+    """
+    if os_id == "rhivos":
+        release = labels.get("RHIVOS Release", "")
+        if release:
+            return release
+    return "nightly"
+
+
+def _derive_image_version(labels: dict[str, Any]) -> str:
+    """Derive image_version from Horreum run labels.
+
+    Parses the RHIVOS Release label to extract the image
+    stream name (e.g., 'latest-RHIVOS-2-202607240103' → 'RHIVOS-2').
+    Falls back to OS Release for AutoSD.
+    """
+    release = labels.get("RHIVOS Release", "")
+    if release:
+        s = release
+        if s.startswith("latest-"):
+            s = s[7:]
+        # Strip trailing date stamp (8+ digits)
+        parts = s.rsplit("-", 1)
+        if len(parts) == 2 and re.match(r"^\d{8,}$", parts[1]):
+            s = parts[0]
+        # Normalize AutoSD release labels to image path
+        # format: 'autosd10' → 'AutoSD-10'
+        autosd_match = re.match(r"^autosd(\d+)$", s, re.IGNORECASE)
+        if autosd_match:
+            s = f"AutoSD-{autosd_match.group(1)}"
+        if s:
+            return s
+
+    # Fallback: try OS Release for AutoSD
+    os_release = labels.get("OS Release", "")
+    if "AutoSD" in os_release:
+        # Extract version number: "AutoSD 10" → "AutoSD-10"
+        parts = os_release.split()
+        for i, p in enumerate(parts):
+            if p.lower() == "autosd" and i + 1 < len(parts):
+                return f"AutoSD-{parts[i + 1]}"
+
+    return ""
+
+
 async def resolve_images(
     store_url: str,
     ticket_id: str,
@@ -208,20 +281,63 @@ async def resolve_images(
         # config, the provisioning agent must ask.
         img_cfg = image_config or {}
 
-        base_url = directives.get(
-            "image_server",
-            img_cfg.get(
-                "server",
-                "https://autosd.sig.centos.org/",
-            ),
-        )
+        run_meta = cf.get("run_metadata", {})
+        run_labels = run_meta.get("labels", {})
+
+        # Image server priority:
+        # 1. Explicit directive (user override)
+        # 2. Run metadata (knows which OS produced the alert)
+        # 3. Config default (jumpstarter_images.server)
+        # 4. Hardcoded AutoSD fallback
+        base_url = directives.get("image_server", "")
+        if not base_url:
+            base_url = _derive_image_server(
+                run_labels,
+                run_meta.get("os_id", ""),
+            )
+        if not base_url:
+            base_url = img_cfg.get("server", "")
+        if not base_url:
+            base_url = "https://autosd.sig.centos.org/"
+
         image_version = directives.get(
             "image_version",
             img_cfg.get("image_version", ""),
         )
-        release = directives.get("release", "nightly")
-        image_name = directives.get("image_name", "ps")
-        image_type = directives.get("image_type", "regular")
+
+        # Fall back to run_metadata from webhook enrichment.
+        # Derive image parameters from the run that triggered
+        # the alert — no config or mapping needed.
+        if not image_version:
+            image_version = _derive_image_version(run_labels)
+
+        os_id = run_meta.get("os_id", "")
+        if not os_id:
+            os_id = run_labels.get("RHIVOS OS ID", "")
+
+        # Release path: RHIVOS uses full release label,
+        # AutoSD uses 'nightly'.
+        release = directives.get("release", "")
+        if not release:
+            release = _derive_release(run_labels, os_id)
+
+        # Read image name and type from run metadata labels
+        # when available (webhook tickets). For manual tickets
+        # where run_metadata is absent, preserve the original
+        # defaults (ps/regular).
+        mode = run_labels.get("RHIVOS Mode", "")
+        if run_labels:
+            default_name = run_labels.get("RHIVOS image name", "")
+            if not default_name:
+                default_name = "ps" if mode in ("bootc", "ostree") else "qa"
+            default_type = "ostree" if mode in ("bootc", "ostree") else "regular"
+        else:
+            # Manual ticket — no run metadata, use original defaults
+            default_name = "ps"
+            default_type = "regular"
+
+        image_name = directives.get("image_name", default_name)
+        image_type = directives.get("image_type", default_type)
 
         if not image_version:
             logger.info(
@@ -297,6 +413,21 @@ async def resolve_images(
             resolve_image_urls,
         )
 
+        logger.info(
+            f"[jumpstarter-images] Resolving for {ticket_id}:"
+            f" server={base_url}"
+            f" version={image_version}"
+            f" release={release}"
+            f" target={board_target}"
+            f" name={image_name}"
+            f" type={image_type}"
+        )
+
+        # Internal image servers may use self-signed certs
+        # or internal CAs. Skip TLS verification for servers
+        # resolved from run metadata (not user-specified).
+        trust = not directives.get("image_server")
+
         result = await resolve_image_urls(
             base_url=base_url,
             image_version=image_version,
@@ -304,6 +435,7 @@ async def resolve_images(
             board_target=board_target,
             image_name=image_name,
             image_type=image_type,
+            trust_server=trust,
         )
 
         # If exact match failed, try fallbacks
@@ -318,6 +450,7 @@ async def resolve_images(
                         board_target=board_target,
                         image_name=v["image_name"],
                         image_type=v["image_type"],
+                        trust_server=trust,
                     )
                     if not result.get("error"):
                         break
@@ -373,7 +506,7 @@ async def resolve_images(
             )
 
     except Exception:
-        logger.debug(
-            "[jumpstarter-images] Resolution skipped",
+        logger.warning(
+            "[jumpstarter-images] Resolution failed with exception",
             exc_info=True,
         )
