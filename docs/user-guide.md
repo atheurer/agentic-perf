@@ -72,6 +72,11 @@ Status: triage_pending
 Summary: Compare memory bandwidth...
 ```
 
+You can also control hardware selection, image type, and other
+operational behavior via **directives** in the ticket's
+`custom_fields`. See [Ticket Directives Reference](ticket-directives.md)
+for the full list of available options.
+
 ### 2. Monitor Progress
 
 **Via CLI:**
