@@ -101,8 +101,7 @@ def list_tickets(
         tickets = [t for t in tickets if t.status != exclude_status]
     if fields == "summary":
         return [
-            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS}
-            for t in tickets
+            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS} for t in tickets
         ]
     return [_strip_heavy_fields(t.model_dump(mode="json")) for t in tickets]
 

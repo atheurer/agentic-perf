@@ -221,7 +221,9 @@ class AgentMCPClient:
         whenever the agent awaits asyncio.to_thread (LLM calls),
         burning 100% CPU on one core.
         """
-        ready: asyncio.Future[ClientSession] = asyncio.get_running_loop().create_future()
+        ready: asyncio.Future[ClientSession] = (
+            asyncio.get_running_loop().create_future()
+        )
         shutdown = asyncio.Event()
 
         async def _hold_connection() -> None:

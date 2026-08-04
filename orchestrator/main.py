@@ -607,9 +607,7 @@ async def _check_stale_tasks(
     import httpx
 
     now = time.time()
-    async with httpx.AsyncClient(
-        timeout=5.0, headers=_auth_headers()
-    ) as client:
+    async with httpx.AsyncClient(timeout=5.0, headers=_auth_headers()) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
             last_event_time = event_bus.last_event_time(tid)
             if last_event_time is None:
@@ -624,8 +622,7 @@ async def _check_stale_tasks(
                     ticket_status = ticket_data.get("status", "")
                     if ticket_status == "closed":
                         logger.info(
-                            f"Cleaning up active_tasks entry for"
-                            f" closed ticket {tid}"
+                            f"Cleaning up active_tasks entry for closed ticket {tid}"
                         )
                         dispatcher.mark_done(tid)
                         task.cancel()
@@ -643,8 +640,7 @@ async def _check_stale_tasks(
             if idle_seconds > stale_timeout:
                 if ticket_status == "awaiting_customer_guidance":
                     logger.debug(
-                        f"Skipping stale check for {tid}:"
-                        f" ticket is awaiting user input"
+                        f"Skipping stale check for {tid}: ticket is awaiting user input"
                     )
                     continue
 
@@ -891,25 +887,19 @@ async def _process_stop_requests(
                     if dispatcher.is_active(tid):
                         dispatcher.stop_agent(tid, "hard")
                         dispatcher.mark_done(tid)
-                        logger.info(
-                            f"Cancelled agent task for {tid}"
-                        )
+                        logger.info(f"Cancelled agent task for {tid}")
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/force-close",
                     )
                     if resp.status_code == 200:
                         logger.info(f"Force-closed ticket {tid}")
                     elif resp.status_code == 404:
-                        logger.warning(
-                            f"Ticket {tid} not found during force-close"
-                        )
+                        logger.warning(f"Ticket {tid} not found during force-close")
                     else:
                         resp.raise_for_status()
                 elif dispatcher.is_active(tid):
                     dispatcher.stop_agent(tid, "graceful")
-                    logger.info(
-                        f"Graceful stop requested for {tid}"
-                    )
+                    logger.info(f"Graceful stop requested for {tid}")
                 else:
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/transition",
