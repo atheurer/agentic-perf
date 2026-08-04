@@ -206,6 +206,7 @@ class TestProvisionJumpstarterSDK:
         result = ProvisionResult(board_name="test-board")
         diag = []
 
+        mock_socket = MagicMock()
         with (
             patch(
                 "providers.resource.jumpstarter_provision.asyncio.sleep",
@@ -220,6 +221,10 @@ class TestProvisionJumpstarterSDK:
                     ),
                 },
             ),
+            patch(
+                "socket.create_connection",
+                return_value=mock_socket,
+            ),
         ):
             r = await _run_provision_steps(
                 client,
@@ -231,6 +236,7 @@ class TestProvisionJumpstarterSDK:
 
         assert r.success
         assert r.ip == "10.0.0.1"
+        assert any("SSH port 22 reachable" in d for d in r.diagnostics)
         client.storage.flash.assert_called_once_with("https://image.xz")
         client.power.on.assert_called_once()
         assert client.ssh.run.call_count == 2  # inject + verify
@@ -368,6 +374,10 @@ class TestProvisionJumpstarterSDK:
                     ),
                 },
             ),
+            patch(
+                "socket.create_connection",
+                return_value=MagicMock(),
+            ),
         ):
             r = await _run_provision_steps(
                 client,
@@ -379,3 +389,47 @@ class TestProvisionJumpstarterSDK:
 
         assert not r.success
         assert any("SSH key injection failed" in d for d in r.diagnostics)
+
+
+class TestSSHValidation:
+    """Test post-flash SSH connectivity validation."""
+
+    @pytest.mark.asyncio
+    async def test_ssh_unreachable_fails_provision(self):
+        """Board with unreachable SSH should not be declared ready."""
+        from unittest.mock import MagicMock
+
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _run_provision_steps,
+        )
+
+        client = MagicMock()
+        client.storage.flash = MagicMock()
+        client.power.on = MagicMock()
+        client.tcp.address = MagicMock(return_value="10.99.99.99:22")
+
+        result = ProvisionResult(board_name="bad-board")
+        diag = []
+
+        with (
+            patch(
+                "providers.resource.jumpstarter_provision.asyncio.sleep",
+                return_value=None,
+            ),
+            patch(
+                "socket.create_connection",
+                side_effect=OSError("Connection timed out"),
+            ),
+        ):
+            r = await _run_provision_steps(
+                client,
+                "https://image.xz",
+                "",
+                result,
+                diag,
+            )
+
+        assert not r.success
+        assert r.ip == "10.99.99.99"
+        assert any("unreachable" in d for d in r.diagnostics)
