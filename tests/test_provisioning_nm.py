@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.conftest import MockSSHExecutor, MockSkillProvider, SSHResult
+from tests.conftest import MockSkillProvider, MockSSHExecutor, SSHResult
 
 
 def make_handlers(ssh: MockSSHExecutor):
