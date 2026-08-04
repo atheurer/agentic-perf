@@ -129,9 +129,16 @@ class ResourceAgent(AgentBase):
         fields = ticket.get("custom_fields", {})
         directives = fields.get("directives", {})
 
-        if directives.get("skip_teardown"):
+        skip_teardown = directives.get("skip_teardown")
+        if skip_teardown is None:
+            # Ticket did not express a preference; fall back to
+            # the operator's persistent config default.
+            from orchestrator.config import _load_config_file
+            skip_teardown = _load_config_file().get("skip_teardown", False)
+
+        if skip_teardown:
             logger.info(
-                f"[resource-agent] skip_teardown directive set,"
+                f"[resource-agent] skip_teardown set,"
                 f" skipping cleanup for {ticket_id}"
             )
             await self._add_comment(

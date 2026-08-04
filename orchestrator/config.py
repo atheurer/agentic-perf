@@ -159,6 +159,12 @@ class OrchestratorConfig:
             3600.0,
         )
 
+        # Per-user teardown default. When a ticket does not
+        # explicitly set directives.skip_teardown, this value
+        # is used. Protects run data on user-provided hardware
+        # where hosts are shared across experiments.
+        self.skip_teardown: bool = cfg.get("skip_teardown", False)
+
         # Introspection agent: continuous passive observer.
         # Enable globally via config or env var. Can also be
         # enabled per-ticket via custom_fields.introspection_enabled.

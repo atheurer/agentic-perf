@@ -419,8 +419,16 @@ async def _cleanup_harness_one(
         await _ssh.run(host, "rm -rf /root/.crucible", timeout=60)
         cleanup_details.append("config: /root/.crucible")
 
-        await _ssh.run(host, "rm -rf /var/lib/crucible", timeout=120)
-        cleanup_details.append("data: /var/lib/crucible")
+        # Preserve run results — only remove ancillary state
+        # (logs, CDM index, container images, etc.), not the
+        # run data that operators need for post-hoc analysis.
+        await _ssh.run(
+            host,
+            "find /var/lib/crucible -mindepth 1 -maxdepth 1"
+            " -not -name 'run' -exec rm -rf {} +",
+            timeout=120,
+        )
+        cleanup_details.append("data: /var/lib/crucible (run/ preserved)")
 
     logger.info(f"[provision] Removing {harness_name} install dir {path} on {host}")
     result = await _ssh.run(host, f"rm -rf {path}", timeout=120)
