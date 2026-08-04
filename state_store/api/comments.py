@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth import Principal, require_write_access
 from ..models import AddCommentRequest
 from ..store import TicketNotFound
+from .action_hints import after_comment
 
 router = APIRouter(prefix="/tickets", tags=["comments"])
 
@@ -32,7 +33,14 @@ def add_comment(ticket_id: str, body: AddCommentRequest, request: Request):
     if multi_user and principal.kind == "user":
         body = AddCommentRequest(author=principal.username, body=body.body)
 
-    return store.add_comment(ticket_id, body)
+    comment = store.add_comment(ticket_id, body)
+    result = comment.model_dump(mode="json")
+
+    ticket = store.get_ticket(ticket_id)
+    hint = after_comment(ticket, body.author)
+    result["action_required"] = hint
+
+    return result
 
 
 @router.get("/{ticket_id}/comments")
