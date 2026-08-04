@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +21,8 @@ logger = logging.getLogger(__name__)
 class _ServerConnection:
     name: str
     session: ClientSession
-    transport_cm: Any  # stdio_client, sse_client, or streamablehttp_client
-    session_cm: Any
+    _shutdown: asyncio.Event = field(default_factory=asyncio.Event)
+    _task: asyncio.Task[None] | None = None
 
 
 class AgentMCPClient:
@@ -212,61 +214,66 @@ class AgentMCPClient:
     ) -> None:
         """Shared connection logic for all transports.
 
-        Enters the transport context manager, creates a
-        ClientSession, initializes it, registers tools,
-        and stores the connection.
-
-        If any step fails (error, cancellation), cleans
-        up partially-entered context managers in the same
-        task to avoid anyio cancel scope mismatches
-        (modelcontextprotocol/python-sdk#577).
+        Runs the transport and session context managers in a
+        dedicated background task so their anyio cancel scopes
+        stay isolated from the agent's main task. Without this,
+        anyio's _deliver_cancellation retries via call_soon
+        whenever the agent awaits asyncio.to_thread (LLM calls),
+        burning 100% CPU on one core.
         """
-        session_cm = None
-        try:
-            streams = await transport_cm.__aenter__()
-            # SSE yields (read, write), StreamableHTTP
-            # yields (read, write, get_session_id).
-            read_stream = streams[0]
-            write_stream = streams[1]
-            session_cm = ClientSession(read_stream, write_stream)
-            session = await session_cm.__aenter__()
-            await session.initialize()
+        ready: asyncio.Future[ClientSession] = asyncio.get_running_loop().create_future()
+        shutdown = asyncio.Event()
 
-            result = await session.list_tools()
-            for t in result.tools:
-                if t.name in self._tool_routing:
-                    existing_server = self._tool_routing[t.name]
-                    raise ValueError(
-                        f"Tool {t.name!r} from server "
-                        f"{name!r} conflicts with server "
-                        f"{existing_server!r}"
-                    )
-                self._tool_routing[t.name] = name
-
-            self._servers[name] = _ServerConnection(
-                name=name,
-                session=session,
-                transport_cm=transport_cm,
-                session_cm=session_cm,
-            )
-            logger.info(
-                "MCP client connected to %s (%d tools)",
-                name,
-                len(result.tools),
-            )
-        except (Exception, BaseException):
-            # Clean up in the same task that entered
-            # the context managers.
-            if session_cm is not None:
-                try:
-                    await session_cm.__aexit__(None, None, None)
-                except (Exception, BaseException):
-                    pass
+        async def _hold_connection() -> None:
             try:
-                await transport_cm.__aexit__(None, None, None)
-            except (Exception, BaseException):
-                pass
+                async with transport_cm as streams:
+                    read_stream = streams[0]
+                    write_stream = streams[1]
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        ready.set_result(session)
+                        await shutdown.wait()
+            except (Exception, BaseException) as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+
+        task = asyncio.create_task(_hold_connection(), name=f"mcp:{name}")
+
+        try:
+            session = await ready
+        except (Exception, BaseException):
+            task.cancel()
+            with contextlib.suppress(Exception, BaseException):
+                await task
             raise
+
+        result = await session.list_tools()
+        for t in result.tools:
+            if t.name in self._tool_routing:
+                existing_server = self._tool_routing[t.name]
+                shutdown.set()
+                task.cancel()
+                with contextlib.suppress(Exception, BaseException):
+                    await task
+                raise ValueError(
+                    f"Tool {t.name!r} from server "
+                    f"{name!r} conflicts with server "
+                    f"{existing_server!r}"
+                )
+            self._tool_routing[t.name] = name
+
+        self._servers[name] = _ServerConnection(
+            name=name,
+            session=session,
+            _shutdown=shutdown,
+            _task=task,
+        )
+        logger.info(
+            "MCP client connected to %s (%d tools)",
+            name,
+            len(result.tools),
+        )
 
     async def list_tools(
         self,
@@ -329,25 +336,13 @@ class AgentMCPClient:
 
     async def disconnect(self) -> None:
         for conn in list(self._servers.values()):
-            # Close session and transport. Catches all
-            # exceptions including RuntimeError from
-            # anyio cancel scope mismatches (MCP SDK
-            # python-sdk#577). This occurs when the
-            # agent task is cancelled externally and
-            # cleanup runs from a different task context.
-            for cm_name, cm in [
-                ("session", conn.session_cm),
-                ("transport", conn.transport_cm),
-            ]:
+            conn._shutdown.set()
+            if conn._task is not None and not conn._task.done():
+                conn._task.cancel()
                 try:
-                    await cm.__aexit__(None, None, None)
-                except (Exception, BaseException) as exc:
-                    logger.debug(
-                        "Error closing %s for %s: %s",
-                        cm_name,
-                        conn.name,
-                        type(exc).__name__,
-                    )
+                    await conn._task
+                except (Exception, BaseException):
+                    pass
         self._servers.clear()
         self._tool_routing.clear()
         logger.info("MCP client disconnected all servers")

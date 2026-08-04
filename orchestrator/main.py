@@ -31,7 +31,7 @@ from providers.skills.zathras import ZathrasSkillProvider
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
 from .handoff import check_handoff
-from .poller import fetch_tickets_by_status
+from .poller import fetch_all_tickets
 
 logger = logging.getLogger(__name__)
 
@@ -460,17 +460,31 @@ async def run_agent_task(
             async with httpx.AsyncClient(
                 timeout=10.0, headers=_auth_headers()
             ) as client:
-                await client.patch(
-                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                    json={"fields": {"interrupted": True}},
+                # Check if ticket was already force-closed before
+                # trying to transition — avoids reopening a closed
+                # ticket.
+                r = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}",
                 )
-                await client.post(
-                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
-                    json={
-                        "status": "awaiting_customer_guidance",
-                        "comment": "Agent hard-stopped by user request",
-                    },
-                )
+                if r.status_code == 200:
+                    current = r.json().get("status", "")
+                    if current == "closed":
+                        logger.info(
+                            f"Ticket {ticket_id} already closed,"
+                            " skipping post-cancel transition"
+                        )
+                    else:
+                        await client.patch(
+                            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
+                            json={"fields": {"interrupted": True}},
+                        )
+                        await client.post(
+                            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
+                            json={
+                                "status": "awaiting_customer_guidance",
+                                "comment": "Agent hard-stopped by user request",
+                            },
+                        )
         except Exception:
             logger.exception(f"Failed to transition hard-stopped ticket {ticket_id}")
         if dispatcher.events:
@@ -584,80 +598,81 @@ async def _check_stale_tasks(
     Always skips tickets in awaiting_customer_guidance — the
     agent is waiting for user input which can take arbitrarily
     long.
+
+    Cleans up leaked active_tasks entries for closed tickets
+    (e.g. after force_close while an agent was running).
     """
     from datetime import datetime
 
     import httpx
 
     now = time.time()
-    for tid, task in dispatcher.active_tasks().items():
-        last_event_time = event_bus.last_event_time(tid)
-        if last_event_time is None:
-            continue
+    async with httpx.AsyncClient(
+        timeout=5.0, headers=_auth_headers()
+    ) as client:
+        for tid, task in list(dispatcher.active_tasks().items()):
+            last_event_time = event_bus.last_event_time(tid)
+            if last_event_time is None:
+                continue
 
-        # Check the ticket's updated_at as a secondary signal —
-        # tool_progress comments update this even though they
-        # don't go through the in-process EventBus.
-        last_activity = last_event_time
-        try:
-            async with httpx.AsyncClient(
-                timeout=5.0, headers=_auth_headers()
-            ) as client:
+            last_activity = last_event_time
+            ticket_status = None
+            try:
                 r = await client.get(f"{store_url}/api/v1/tickets/{tid}")
                 if r.status_code == 200:
-                    updated_at = r.json().get("updated_at", "")
+                    ticket_data = r.json()
+                    ticket_status = ticket_data.get("status", "")
+                    if ticket_status == "closed":
+                        logger.info(
+                            f"Cleaning up active_tasks entry for"
+                            f" closed ticket {tid}"
+                        )
+                        dispatcher.mark_done(tid)
+                        task.cancel()
+                        continue
+                    updated_at = ticket_data.get("updated_at", "")
                     if updated_at:
                         ticket_time = datetime.fromisoformat(updated_at)
                         ticket_ts = ticket_time.timestamp()
                         if ticket_ts > last_activity:
                             last_activity = ticket_ts
-        except Exception:
-            pass
-
-        idle_seconds = now - last_activity
-        if idle_seconds > stale_timeout:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=10.0,
-                    headers=_auth_headers(),
-                ) as client:
-                    r = await client.get(f"{store_url}/api/v1/tickets/{tid}")
-                    ticket = r.json()
-                    status = ticket.get("status", "")
-                    if status == "awaiting_customer_guidance":
-                        logger.debug(
-                            f"Skipping stale check for {tid}:"
-                            f" ticket is awaiting user input"
-                        )
-                        continue
             except Exception:
                 pass
 
-            logger.warning(
-                f"Stale task detected for {tid}:"
-                f" no events for {idle_seconds:.0f}s"
-                f" (threshold: {stale_timeout:.0f}s)"
-                f" — cancelling task"
-            )
-            event_bus.emit(
-                tid,
-                "orchestrator",
-                "agent_error",
-                {
-                    "reason": "stale_task_cancelled",
-                    "idle_seconds": round(idle_seconds),
-                    "threshold_seconds": round(stale_timeout),
-                },
-            )
-            await _transition_to_guidance(
-                store_url,
-                tid,
-                f"Agent task cancelled: no activity for"
-                f" {round(idle_seconds)}s (threshold:"
-                f" {round(stale_timeout)}s)",
-                event_bus=event_bus,
-            )
-            task.cancel()
+            idle_seconds = now - last_activity
+            if idle_seconds > stale_timeout:
+                if ticket_status == "awaiting_customer_guidance":
+                    logger.debug(
+                        f"Skipping stale check for {tid}:"
+                        f" ticket is awaiting user input"
+                    )
+                    continue
+
+                logger.warning(
+                    f"Stale task detected for {tid}:"
+                    f" no events for {idle_seconds:.0f}s"
+                    f" (threshold: {stale_timeout:.0f}s)"
+                    f" — cancelling task"
+                )
+                event_bus.emit(
+                    tid,
+                    "orchestrator",
+                    "agent_error",
+                    {
+                        "reason": "stale_task_cancelled",
+                        "idle_seconds": round(idle_seconds),
+                        "threshold_seconds": round(stale_timeout),
+                    },
+                )
+                await _transition_to_guidance(
+                    store_url,
+                    tid,
+                    f"Agent task cancelled: no activity for"
+                    f" {round(idle_seconds)}s (threshold:"
+                    f" {round(stale_timeout)}s)",
+                    event_bus=event_bus,
+                )
+                task.cancel()
 
 
 async def _block_absent_suite(
@@ -846,15 +861,20 @@ async def _block_handoff_failed(
 async def _process_stop_requests(
     dispatcher: Dispatcher,
     store_url: str,
+    dispatched_tickets: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
         import httpx
 
         async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
-            r = await client.get(f"{store_url}/api/v1/tickets")
-            if r.status_code != 200:
-                return
-            for ticket in r.json():
+            if dispatched_tickets is not None:
+                tickets = dispatched_tickets
+            else:
+                r = await client.get(f"{store_url}/api/v1/tickets")
+                if r.status_code != 200:
+                    return
+                tickets = r.json()
+            for ticket in tickets:
                 stop_req = ticket.get("custom_fields", {}).get(
                     "stop_requested",
                 )
@@ -862,39 +882,54 @@ async def _process_stop_requests(
                     continue
                 tid = ticket["id"]
                 mode = stop_req.get("mode", "graceful")
-                if dispatcher.is_active(tid):
-                    dispatcher.stop_agent(tid, mode)
-                    logger.info(f"Processed stop request for {tid} (mode={mode})")
+                if mode == "hard":
+                    # Hard stop: cancel the agent task (if any) AND
+                    # force-close the ticket. Both steps are needed
+                    # because force_close only changes ticket status
+                    # — it doesn't notify the dispatcher to kill the
+                    # running asyncio task.
+                    if dispatcher.is_active(tid):
+                        dispatcher.stop_agent(tid, "hard")
+                        dispatcher.mark_done(tid)
+                        logger.info(
+                            f"Cancelled agent task for {tid}"
+                        )
+                    resp = await client.post(
+                        f"{store_url}/api/v1/tickets/{tid}/force-close",
+                    )
+                    if resp.status_code == 200:
+                        logger.info(f"Force-closed ticket {tid}")
+                    elif resp.status_code == 404:
+                        logger.warning(
+                            f"Ticket {tid} not found during force-close"
+                        )
+                    else:
+                        resp.raise_for_status()
+                elif dispatcher.is_active(tid):
+                    dispatcher.stop_agent(tid, "graceful")
+                    logger.info(
+                        f"Graceful stop requested for {tid}"
+                    )
                 else:
-                    # Ticket has no active agent — transition it
-                    # to a non-dispatchable state so it doesn't
-                    # get picked up on the next poll cycle.
-                    if mode == "hard":
+                    resp = await client.post(
+                        f"{store_url}/api/v1/tickets/{tid}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": "Graceful stop requested — ticket paused",
+                        },
+                    )
+                    if resp.status_code in (400, 409):
                         resp = await client.post(
                             f"{store_url}/api/v1/tickets/{tid}/force-close",
                         )
                         resp.raise_for_status()
-                        logger.info(f"Force-closed non-active ticket {tid}")
-                    else:
-                        resp = await client.post(
-                            f"{store_url}/api/v1/tickets/{tid}/transition",
-                            json={
-                                "status": "awaiting_customer_guidance",
-                                "comment": ("Graceful stop requested — ticket paused"),
-                            },
+                        logger.info(
+                            f"Force-closed non-active ticket {tid}"
+                            " (transition not allowed)"
                         )
-                        if resp.status_code == 409:
-                            resp = await client.post(
-                                f"{store_url}/api/v1/tickets/{tid}/force-close",
-                            )
-                            resp.raise_for_status()
-                            logger.info(
-                                f"Force-closed non-active ticket {tid}"
-                                " (transition not allowed)"
-                            )
-                        else:
-                            resp.raise_for_status()
-                            logger.info(f"Paused non-active ticket {tid}")
+                    else:
+                        resp.raise_for_status()
+                        logger.info(f"Paused non-active ticket {tid}")
                 await client.patch(
                     f"{store_url}/api/v1/tickets/{tid}/fields",
                     json={"fields": {"stop_requested": None}},
@@ -1095,13 +1130,19 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 await asyncio.sleep(config.poll_interval)
                 continue
 
-        for status in STATUS_AGENT_MAP:
-            try:
-                tickets = await fetch_tickets_by_status(config.state_store_url, status)
-            except Exception:
-                logger.exception(f"Failed to fetch tickets for status={status}")
-                continue
+        try:
+            all_fetched = await fetch_all_tickets(config.state_store_url)
+        except Exception:
+            logger.exception("Failed to fetch tickets")
+            await asyncio.sleep(config.poll_interval)
+            continue
 
+        tickets_by_status: dict[str, list[dict[str, Any]]] = {}
+        for t in all_fetched:
+            tickets_by_status.setdefault(t.get("status", ""), []).append(t)
+
+        for status in STATUS_AGENT_MAP:
+            tickets = tickets_by_status.get(status, [])
             for ticket in tickets:
                 tid = ticket["id"]
                 if dispatcher.is_active(tid):
@@ -1199,7 +1240,11 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 )
                 dispatcher.set_task(tid, task)
 
-        await _process_stop_requests(dispatcher, config.state_store_url)
+        await _process_stop_requests(
+            dispatcher,
+            config.state_store_url,
+            dispatched_tickets=all_fetched,
+        )
 
         # Jumpstarter: release orphaned leases whose
         # tickets are closed or no longer active.
@@ -1289,10 +1334,16 @@ def main():
     # resulting BrokenPipeError internally.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+    import faulthandler
+
+    faulthandler.enable()
+    faulthandler.register(signal.SIGUSR1)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     _acquire_lock()
     _setup_api_token()
     config = OrchestratorConfig()

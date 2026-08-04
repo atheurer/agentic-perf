@@ -13,11 +13,11 @@ def _auth_headers() -> dict[str, str]:
     return {}
 
 
-async def fetch_tickets_by_status(store_url: str, status: str) -> list[dict[str, Any]]:
+async def fetch_all_tickets(store_url: str) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
         r = await client.get(
             f"{store_url}/api/v1/tickets",
-            params={"status": status},
+            params={"exclude_status": "closed"},
         )
         r.raise_for_status()
         return r.json()
