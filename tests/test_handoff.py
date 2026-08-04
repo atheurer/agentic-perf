@@ -251,6 +251,51 @@ class TestBenchmarkToReview:
         assert ok
 
 
+class TestPreparingPlatform:
+    """Validate preparing_platform handoff (resource → platform setup)."""
+
+    def test_user_provided_no_metadata(self):
+        """user_provided resources have no external metadata — must pass."""
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "user_provided",
+                "resource_provider_metadata": {},
+            }
+        }
+        ok, reason = check_handoff("preparing_platform", ticket)
+        assert ok, reason
+
+    def test_cloud_provider_with_metadata(self):
+        """Cloud providers must supply non-empty metadata."""
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_provider_metadata": {"instance_ids": ["i-abc123"]},
+            }
+        }
+        ok, reason = check_handoff("preparing_platform", ticket)
+        assert ok, reason
+
+    def test_cloud_provider_missing_metadata(self):
+        """Cloud provider with empty metadata must be rejected."""
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_provider_metadata": {},
+            }
+        }
+        ok, reason = check_handoff("preparing_platform", ticket)
+        assert not ok
+        assert "metadata" in reason.lower()
+
+    def test_no_resource_provider(self):
+        """Missing resource_provider must be rejected."""
+        ticket = {"custom_fields": {}}
+        ok, reason = check_handoff("preparing_platform", ticket)
+        assert not ok
+        assert "provider" in reason.lower()
+
+
 class TestNoCheckStatuses:
     """Statuses without handoff checks should always pass."""
 
