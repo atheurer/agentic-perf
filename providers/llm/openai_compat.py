@@ -17,6 +17,7 @@ from typing import Any
 
 from .base import (
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolCall,
@@ -82,6 +83,12 @@ class OpenAICompatLLMProvider(LLMProvider):
             )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"openai/{self._model}") from None
+        except Exception as e:
+            # openai.RateLimitError is only available if the package is installed;
+            # check by name to avoid a hard import dependency here.
+            if type(e).__name__ == "RateLimitError":
+                raise LLMRateLimitError(f"openai/{self._model}") from None
+            raise
         return self._parse_response(response)
 
     @staticmethod

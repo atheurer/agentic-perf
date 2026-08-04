@@ -14,6 +14,7 @@ import httpx
 from providers.events import EventBus
 from providers.llm.base import (
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolCall,
@@ -51,6 +52,12 @@ class AgentBase(ABC):
     # transient API or network issues without requiring
     # human intervention.
     LLM_TIMEOUT_RETRIES = 2
+
+    # Number of automatic retries on LLM rate limiting before
+    # escalating to awaiting_customer_guidance. Rate limits are
+    # transient so we retry more aggressively with exponential
+    # backoff (min 15s, doubling each attempt, capped at 5m).
+    LLM_RATE_LIMIT_RETRIES = 5
 
     def __init__(
         self,
@@ -344,9 +351,69 @@ class AgentBase(ABC):
                         ),
                     )
                     break
+                except LLMRateLimitError as e:
+                    if tok is not None:
+                        context.detach(tok)
+                        tok = None
+                    retries = getattr(self, "_llm_rate_limit_retries", 0)
+                    self._llm_rate_limit_retries = retries + 1
+                    if retries < self.LLM_RATE_LIMIT_RETRIES:
+                        wait = e.retry_after or min(15 * (2**retries), 300)
+                        logger.warning(
+                            f"[{self.agent_name}] Rate limited on"
+                            f" {ticket_id} (attempt"
+                            f" {retries + 1}/"
+                            f"{self.LLM_RATE_LIMIT_RETRIES}):"
+                            f" waiting {wait}s"
+                        )
+                        self._emit(
+                            ticket_id,
+                            "agent_error",
+                            {
+                                "reason": "rate_limited",
+                                "provider": e.provider,
+                                "wait_seconds": wait,
+                                "retry": retries + 1,
+                                "max_retries": self.LLM_RATE_LIMIT_RETRIES,
+                            },
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error(
+                        f"[{self.agent_name}] Rate limit retries"
+                        f" exhausted on {ticket_id} after"
+                        f" {self.LLM_RATE_LIMIT_RETRIES} attempts"
+                    )
+                    self._emit(
+                        ticket_id,
+                        "agent_error",
+                        {
+                            "reason": "rate_limited",
+                            "provider": e.provider,
+                            "retries_exhausted": True,
+                        },
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Agent {self.agent_name} hit sustained API rate"
+                        f" limits** ({e.provider}) after"
+                        f" {self.LLM_RATE_LIMIT_RETRIES} retries."
+                        f" You can resume by replying here.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=(
+                            f"{self.agent_name} rate-limited after"
+                            f" {self.LLM_RATE_LIMIT_RETRIES}"
+                            f" retries — pausing for guidance"
+                        ),
+                    )
+                    break
                 finally:
                     if tok is not None:
                         context.detach(tok)
+                self._llm_rate_limit_retries = 0
                 self._emit(
                     ticket_id,
                     "llm_response",

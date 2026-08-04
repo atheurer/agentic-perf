@@ -21,6 +21,7 @@ from providers.events import EventBus
 from providers.llm.base import (
     DEFAULT_LLM_TIMEOUT,
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolDefinition,
@@ -616,3 +617,232 @@ class TestRunAgentTaskTimeout:
         )
 
         agent.run.assert_called_once_with("FAST-001")
+
+
+class TestLLMRateLimitError:
+    """Test the LLMRateLimitError exception."""
+
+    def test_attributes(self):
+        err = LLMRateLimitError("claude/claude-opus-4-6", retry_after=30.0)
+        assert err.provider == "claude/claude-opus-4-6"
+        assert err.retry_after == 30.0
+        assert "rate-limited" in str(err)
+        assert "30.0s" in str(err)
+
+    def test_no_retry_after(self):
+        err = LLMRateLimitError("claude/claude-haiku-4-5")
+        assert err.retry_after is None
+        assert "rate-limited" in str(err)
+
+    def test_default_provider(self):
+        err = LLMRateLimitError()
+        assert err.provider == "unknown"
+
+
+class RateLimitTestLLMProvider(LLMProvider):
+    """LLM provider that always raises LLMRateLimitError."""
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int = 4096,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        raise LLMRateLimitError("test/model")
+
+
+class TestAgentRateLimitHandling:
+    """Test AgentBase handling of LLMRateLimitError."""
+
+    @pytest.mark.asyncio
+    async def test_agent_retries_then_transitions_on_rate_limit(self, tmp_path):
+        """Agent should retry LLM_RATE_LIMIT_RETRIES times then transition."""
+        from agents.base import AgentBase
+
+        class TestAgent(AgentBase):
+            LLM_RATE_LIMIT_RETRIES = 3
+
+            def _system_prompt(self, ticket):
+                return "test prompt"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        events = EventBus(log_dir=str(tmp_path))
+        agent = TestAgent(
+            agent_name="test-agent",
+            llm_provider=RateLimitTestLLMProvider(),
+            state_store_url="http://localhost:9999",
+            event_bus=events,
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "TEST-RL-001",
+                "summary": "test",
+                "description": "test",
+                "status": "awaiting_review",
+                "custom_fields": {},
+            }
+        )
+        agent._transition_ticket = AsyncMock()
+        agent._add_comment = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await agent.run("TEST-RL-001")
+
+        agent._transition_ticket.assert_called_once()
+        call_args = agent._transition_ticket.call_args
+        assert call_args[0][1] == "awaiting_customer_guidance"
+        assert "rate-limited" in call_args[1]["comment"]
+
+        agent._add_comment.assert_called_once()
+        comment = agent._add_comment.call_args[0][1]
+        assert "rate" in comment.lower()
+
+        ticket_events = events.get_events("TEST-RL-001", since=0, limit=100)
+        error_events = [e for e in ticket_events if e.get("event_type") == "agent_error"]
+        assert len(error_events) == 4  # 3 retries + 1 exhausted
+        for i in range(3):
+            assert error_events[i]["data"]["retry"] == i + 1
+        assert error_events[3]["data"]["retries_exhausted"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_recovers_after_transient_rate_limit(self, tmp_path):
+        """Agent should continue if a retry after rate limit succeeds."""
+        from agents.base import AgentBase
+
+        call_count = 0
+
+        class TransientRateLimitProvider(LLMProvider):
+            async def complete(
+                self, system_prompt, messages, tools=None, max_tokens=4096, timeout=None
+            ):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise LLMRateLimitError("test/model")
+                return LLMResponse(text="Done", tool_calls=[], stop_reason="end_turn")
+
+        class TestAgent(AgentBase):
+            LLM_RATE_LIMIT_RETRIES = 3
+
+            def _system_prompt(self, ticket):
+                return "test prompt"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        events = EventBus(log_dir=str(tmp_path))
+        agent = TestAgent(
+            agent_name="test-agent",
+            llm_provider=TransientRateLimitProvider(),
+            state_store_url="http://localhost:9999",
+            event_bus=events,
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "TEST-RL-002",
+                "summary": "test",
+                "description": "test",
+                "status": "awaiting_review",
+                "custom_fields": {},
+            }
+        )
+        agent._transition_ticket = AsyncMock()
+        agent._add_comment = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await agent.run("TEST-RL-002")
+
+        # Recovered — should NOT have transitioned to guidance
+        agent._transition_ticket.assert_not_called()
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_uses_retry_after_from_error(self, tmp_path):
+        """Agent should use retry_after from LLMRateLimitError when present."""
+        from agents.base import AgentBase
+
+        class RetryAfterProvider(LLMProvider):
+            async def complete(
+                self, system_prompt, messages, tools=None, max_tokens=4096, timeout=None
+            ):
+                raise LLMRateLimitError("test/model", retry_after=45.0)
+
+        class TestAgent(AgentBase):
+            LLM_RATE_LIMIT_RETRIES = 1
+
+            def _system_prompt(self, ticket):
+                return "test prompt"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        agent = TestAgent(
+            agent_name="test-agent",
+            llm_provider=RetryAfterProvider(),
+            state_store_url="http://localhost:9999",
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "TEST-RL-003",
+                "summary": "test",
+                "description": "test",
+                "status": "awaiting_review",
+                "custom_fields": {},
+            }
+        )
+        agent._transition_ticket = AsyncMock()
+        agent._add_comment = AsyncMock()
+
+        sleep_calls = []
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = lambda s: sleep_calls.append(s)
+            await agent.run("TEST-RL-003")
+
+        # First sleep should use retry_after=45.0
+        assert sleep_calls and sleep_calls[0] == 45.0
+
+
+class TestClaudeRateLimit:
+    """Test Claude provider raises LLMRateLimitError on 429."""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_error_raised(self):
+        import anthropic
+
+        from providers.llm.claude import ClaudeLLMProvider
+        from providers.llm.base import LLMRateLimitError
+
+        provider = ClaudeLLMProvider.__new__(ClaudeLLMProvider)
+        provider._model = "test-model"
+        provider.default_timeout = None
+
+        mock_client = MagicMock()
+        mock_client.messages.create = MagicMock(
+            side_effect=anthropic.RateLimitError(
+                message="rate limited",
+                response=MagicMock(headers={}),
+                body={},
+            )
+        )
+        provider._client = mock_client
+
+        with pytest.raises(LLMRateLimitError) as exc_info:
+            await provider.complete(
+                system_prompt="test",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+            )
+        assert "claude" in exc_info.value.provider
