@@ -47,7 +47,7 @@ class ProvisionResult:
 
 async def provision_jumpstarter(
     lease_name: str,
-    flash_url: str,
+    flash_url: str | dict[str, str],
     ssh_public_key: str,
     ssh_key_path: str = "",
     board_name: str = "",
@@ -62,7 +62,9 @@ async def provision_jumpstarter(
 
     Args:
         lease_name: Jumpstarter lease ID.
-        flash_url: URL of the OS image to flash.
+        flash_url: URL of the OS image to flash (single
+            string for EBBR), or dict of {partition: url}
+            for multi-partition boards (SA8775P).
         ssh_public_key: Public key to inject.
         ssh_key_path: Path to the private key.
         board_name: Exporter name for diagnostics.
@@ -105,7 +107,7 @@ async def provision_jumpstarter(
 
 def _provision_sync(
     lease_name: str,
-    flash_url: str,
+    flash_url: str | dict[str, str],
     ssh_public_key: str,
     board_name: str,
     client_config_path: str,
@@ -131,7 +133,7 @@ def _provision_sync(
 
 async def _provision_async(
     lease_name: str,
-    flash_url: str,
+    flash_url: str | dict[str, str],
     ssh_public_key: str,
     board_name: str,
     client_config_path: str,
@@ -191,7 +193,7 @@ async def _provision_async(
 
 async def _run_provision_steps(
     client: Any,
-    flash_url: str,
+    flash_url: str | dict[str, str],
     ssh_public_key: str,
     result: ProvisionResult,
     diag: list[str],
@@ -218,7 +220,15 @@ async def _run_provision_steps(
         diag.append(f"Pre-flash power cycle warning: {exc}")
         logger.warning("[platform] Pre-flash power cycle failed: %s", exc)
 
-    logger.info("[platform] Flashing %s", result.board_name)
+    if isinstance(flash_url, dict):
+        logger.info(
+            "[platform] Flashing %s (%d partitions: %s)",
+            result.board_name,
+            len(flash_url),
+            ", ".join(flash_url.keys()),
+        )
+    else:
+        logger.info("[platform] Flashing %s", result.board_name)
     t0 = time.monotonic()
     try:
         await to_thread.run_sync(lambda: client.storage.flash(flash_url))
