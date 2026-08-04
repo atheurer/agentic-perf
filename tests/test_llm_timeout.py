@@ -822,8 +822,8 @@ class TestClaudeRateLimit:
     async def test_rate_limit_error_raised(self):
         import anthropic
 
-        from providers.llm.claude import ClaudeLLMProvider
         from providers.llm.base import LLMRateLimitError
+        from providers.llm.claude import ClaudeLLMProvider
 
         provider = ClaudeLLMProvider.__new__(ClaudeLLMProvider)
         provider._model = "test-model"

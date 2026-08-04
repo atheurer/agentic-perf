@@ -4,10 +4,13 @@ import asyncio
 import logging
 import re
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
+
+_SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
 
 logger = logging.getLogger(__name__)
 
@@ -763,6 +766,175 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
+            name="list_skill_docs",
+            description=(
+                "List available skill documents for a topic. "
+                "Use 'general' for host-tuning, connectivity, and network-perf guides. "
+                "Use a harness name (e.g. 'crucible') for harness-specific docs."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "harness": {
+                        "type": "string",
+                        "description": "Topic/harness name (e.g. 'general', 'crucible')",
+                    },
+                },
+                "required": ["harness"],
+            },
+        ),
+        ToolDefinition(
+            name="read_skill",
+            description=(
+                "Read a skill document. Always read 'general/host-tuning.md' "
+                "before applying any host tuning — it defines the required tool "
+                "ordering, BBR+fq dependency, and irqbalance strategy."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "harness": {
+                        "type": "string",
+                        "description": "Topic/harness name (e.g. 'general', 'crucible')",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Document filename (e.g. 'host-tuning.md')",
+                    },
+                },
+                "required": ["harness", "filename"],
+            },
+        ),
+        ToolDefinition(
+            name="tune_nic",
+            description=(
+                "Apply ethtool NIC settings on a host for benchmark preparation. "
+                "Sets queue/channel count and optionally ring buffer sizes and offloads. "
+                "MUST be called before pin_irq — changing channel count alters which "
+                "IRQ numbers the NIC has. Returns before/after state for each setting."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {"type": "string", "description": "NIC interface name (e.g. eno16695np0)"},
+                    "channels": {
+                        "type": "integer",
+                        "description": "Combined queue/channel count (default: 1 for IRQ pinning)",
+                    },
+                    "ring_rx": {"type": "integer", "description": "RX ring buffer size (optional)"},
+                    "ring_tx": {"type": "integer", "description": "TX ring buffer size (optional)"},
+                    "offloads": {
+                        "type": "object",
+                        "description": "Offload flags to set, e.g. {\"gro\": \"on\", \"lro\": \"off\"} (optional)",
+                    },
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                },
+                "required": ["host", "interface"],
+            },
+        ),
+        ToolDefinition(
+            name="tune_tcp",
+            description=(
+                "Apply TCP/network stack settings on a host. "
+                "Sets congestion control and qdisc via sysctl AND applies the qdisc "
+                "directly to existing interfaces via 'tc qdisc replace' — the sysctl "
+                "alone only affects newly-created interfaces. "
+                "BBR requires fq (not fq_codel) for per-flow pacing; always set both. "
+                "Optionally sets socket buffer sizes (rmem_max, wmem_max)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {
+                        "type": "string",
+                        "description": "NIC interface to apply qdisc to via tc (e.g. eno16695np0). Required when setting qdisc.",
+                    },
+                    "congestion_control": {
+                        "type": "string",
+                        "description": "TCP congestion control algorithm (e.g. 'bbr', 'cubic')",
+                    },
+                    "qdisc": {
+                        "type": "string",
+                        "description": "Qdisc to set (e.g. 'fq' for BBR). Applied via both sysctl and tc qdisc replace.",
+                    },
+                    "rmem_max": {
+                        "type": "integer",
+                        "description": "Max socket receive buffer size in bytes (e.g. 134217728 for 128MB)",
+                    },
+                    "wmem_max": {
+                        "type": "integer",
+                        "description": "Max socket send buffer size in bytes (e.g. 134217728 for 128MB)",
+                    },
+                    "extra_sysctls": {
+                        "type": "object",
+                        "description": "Additional net.* sysctl key/value pairs to set (optional)",
+                    },
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                },
+                "required": ["host"],
+            },
+        ),
+        ToolDefinition(
+            name="pin_irq",
+            description=(
+                "Pin NIC IRQ(s) to a specific CPU and coordinate irqbalance so the "
+                "pin is not overridden during a run. Must be called after tune_nic. "
+                "irqbalance_mode controls how irqbalance is handled: "
+                "'ban_irq' (default) adds the IRQ to IRQBALANCE_BANNED_INTERRUPTS so "
+                "irqbalance keeps running for other IRQs but won't touch this one; "
+                "'ban_cpu' adds the CPU to IRQBALANCE_BANNED_CPUS; "
+                "'disable' masks and stops irqbalance entirely."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {"type": "string", "description": "NIC interface name"},
+                    "cpu": {"type": "integer", "description": "CPU core number to pin IRQ to"},
+                    "irqbalance_mode": {
+                        "type": "string",
+                        "enum": ["ban_irq", "ban_cpu", "disable"],
+                        "description": "How to prevent irqbalance from overriding the pin (default: ban_irq)",
+                    },
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                },
+                "required": ["host", "interface", "cpu"],
+            },
+        ),
+        ToolDefinition(
+            name="verify_host_tuning",
+            description=(
+                "Verify that host tuning settings match expected values. "
+                "Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and "
+                "irqbalance status. Returns pass/fail per parameter with actual values. "
+                "Call after tuning to confirm settings applied, and after benchmarks "
+                "to detect drift (e.g. irqbalance overriding a pin mid-run)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {"type": "string", "description": "NIC interface name"},
+                    "expected": {
+                        "type": "object",
+                        "description": (
+                            "Expected values to check. Supported keys: "
+                            "congestion_control, qdisc, channels, irq_cpu, irqbalance_mode. "
+                            "Omit keys you don't want checked."
+                        ),
+                    },
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                },
+                "required": ["host", "interface"],
+            },
+        ),
+        ToolDefinition(
             name="submit_provisioning_result",
             description="Submit the provisioning result when all hosts are prepared.",
             input_schema={
@@ -1511,6 +1683,396 @@ def create_provisioning_tool_handlers(
         results.update(skipped)
         return _summarize(results)
 
+    async def list_skill_docs(harness: str) -> dict:
+        skill_dir = _SKILLS_DIR / harness
+        if not skill_dir.is_dir():
+            return {"found": False, "message": f"No skill directory for '{harness}'"}
+        files = [f.name for f in sorted(skill_dir.iterdir()) if f.suffix == ".md"]
+        return {"found": True, "harness": harness, "files": files}
+
+    async def read_skill(harness: str, filename: str) -> dict:
+        skill_path = _SKILLS_DIR / harness / filename
+        if not skill_path.is_file():
+            return {"found": False, "message": f"Skill not found: {harness}/{filename}"}
+        resolved = skill_path.resolve()
+        if not str(resolved).startswith(str(_SKILLS_DIR.resolve())):
+            return {"found": False, "message": "Invalid path"}
+        return {"found": True, "filename": filename, "content": skill_path.read_text()}
+
+    async def tune_nic(
+        host: str,
+        interface: str,
+        channels: int = 1,
+        ring_rx: int | None = None,
+        ring_tx: int | None = None,
+        offloads: dict | None = None,
+        user: str = "root",
+        ssh_key_path: str = "",
+    ) -> dict:
+        _ssh = ssh
+        applied = []
+        errors = []
+
+        # Read current channel count
+        r = await _ssh.run(host, f"ethtool -l {interface} 2>&1")
+        before_channels: int | None = None
+        for line in r.stdout.splitlines():
+            if line.strip().startswith("Combined:") and "Current" not in "".join(
+                r.stdout.splitlines()[: r.stdout.splitlines().index(line)]
+            ):
+                try:
+                    before_channels = int(line.split()[-1])
+                except ValueError:
+                    pass
+                break
+
+        # Parse current hardware/software sections properly
+        sections = r.stdout.split("Current hardware settings:")
+        if len(sections) == 2:
+            for line in sections[1].splitlines():
+                if line.strip().startswith("Combined:"):
+                    try:
+                        before_channels = int(line.split()[-1])
+                    except ValueError:
+                        pass
+                    break
+
+        if channels != before_channels:
+            r2 = await _ssh.run(host, f"ethtool -L {interface} combined {channels} 2>&1")
+            if r2.exit_code == 0:
+                applied.append(f"channels: {before_channels} → {channels}")
+            else:
+                errors.append(f"ethtool -L failed: {r2.stdout.strip()}")
+        else:
+            applied.append(f"channels: already {channels}")
+
+        # Ring buffers
+        if ring_rx is not None or ring_tx is not None:
+            parts = []
+            if ring_rx is not None:
+                parts.append(f"rx {ring_rx}")
+            if ring_tx is not None:
+                parts.append(f"tx {ring_tx}")
+            r3 = await _ssh.run(host, f"ethtool -G {interface} {' '.join(parts)} 2>&1")
+            if r3.exit_code == 0:
+                applied.append(f"ring buffers: {' '.join(parts)}")
+            else:
+                errors.append(f"ethtool -G failed: {r3.stdout.strip()}")
+
+        # Offloads
+        for flag, value in (offloads or {}).items():
+            r4 = await _ssh.run(host, f"ethtool -K {interface} {flag} {value} 2>&1")
+            if r4.exit_code == 0:
+                applied.append(f"offload {flag}={value}")
+            else:
+                errors.append(f"ethtool -K {flag}={value} failed: {r4.stdout.strip()}")
+
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error" if errors else "ok",
+            "applied": applied,
+            "errors": errors,
+        }
+
+    async def tune_tcp(
+        host: str,
+        interface: str | None = None,
+        congestion_control: str | None = None,
+        qdisc: str | None = None,
+        rmem_max: int | None = None,
+        wmem_max: int | None = None,
+        extra_sysctls: dict | None = None,
+        user: str = "root",
+        ssh_key_path: str = "",
+    ) -> dict:
+        _ssh = ssh
+        results = {}
+        errors = []
+
+        sysctls: dict[str, str] = {}
+        if congestion_control:
+            sysctls["net.ipv4.tcp_congestion_control"] = congestion_control
+        if qdisc:
+            # net.core.default_qdisc only affects newly-created interfaces;
+            # set it for future interfaces AND apply tc qdisc to existing ones.
+            sysctls["net.core.default_qdisc"] = qdisc
+        if rmem_max is not None:
+            sysctls["net.core.rmem_max"] = str(rmem_max)
+            sysctls["net.core.rmem_default"] = str(rmem_max)
+        if wmem_max is not None:
+            sysctls["net.core.wmem_max"] = str(wmem_max)
+            sysctls["net.core.wmem_default"] = str(wmem_max)
+        if extra_sysctls:
+            sysctls.update({str(k): str(v) for k, v in extra_sysctls.items()})
+
+        for key, value in sysctls.items():
+            rb = await _ssh.run(host, f"sysctl -n {key} 2>&1")
+            before = rb.stdout.strip()
+            rw = await _ssh.run(host, f"sysctl -w {key}={value} 2>&1")
+            if rw.exit_code != 0:
+                errors.append(f"{key}: {rw.stdout.strip()}")
+                results[key] = {"before": before, "requested": value, "ok": False}
+                continue
+            rv = await _ssh.run(host, f"sysctl -n {key} 2>&1")
+            after = rv.stdout.strip()
+            results[key] = {"before": before, "after": after, "ok": after == value}
+
+        # Apply the qdisc directly to existing interfaces via tc.
+        # sysctl net.core.default_qdisc only affects newly-created interfaces;
+        # tc qdisc is required to change the qdisc on an interface already up.
+        tc_result: dict = {}
+        if qdisc and interface:
+            rt = await _ssh.run(
+                host,
+                f"tc qdisc replace dev {interface} root {qdisc} 2>&1",
+            )
+            if rt.exit_code == 0:
+                # Verify
+                rv2 = await _ssh.run(
+                    host,
+                    f"tc qdisc show dev {interface} 2>&1",
+                )
+                tc_result = {
+                    "interface": interface,
+                    "qdisc": qdisc,
+                    "ok": qdisc in rv2.stdout,
+                    "output": rv2.stdout.strip(),
+                }
+            else:
+                errors.append(f"tc qdisc replace {interface}: {rt.stdout.strip()}")
+                tc_result = {
+                    "interface": interface,
+                    "qdisc": qdisc,
+                    "ok": False,
+                    "error": rt.stdout.strip(),
+                }
+
+        return {
+            "host": host,
+            "status": "error" if errors else "ok",
+            "sysctls": results,
+            "tc_qdisc": tc_result,
+            "errors": errors,
+        }
+
+    async def pin_irq(
+        host: str,
+        interface: str,
+        cpu: int,
+        irqbalance_mode: str = "ban_irq",
+        user: str = "root",
+        ssh_key_path: str = "",
+    ) -> dict:
+        _ssh = ssh
+        errors = []
+        applied = []
+
+        # Discover IRQ number(s) for the interface
+        r = await _ssh.run(host, "cat /proc/interrupts 2>&1")
+        irq_numbers = []
+        for line in r.stdout.splitlines():
+            if interface in line:
+                try:
+                    irq_numbers.append(int(line.split(":")[0].strip()))
+                except ValueError:
+                    pass
+
+        if not irq_numbers:
+            return {
+                "host": host,
+                "interface": interface,
+                "status": "error",
+                "errors": [f"No IRQ found for {interface} in /proc/interrupts"],
+            }
+
+        cpu_mask = hex(1 << cpu)
+
+        for irq in irq_numbers:
+            r2 = await _ssh.run(
+                host,
+                f"echo {cpu_mask} > /proc/irq/{irq}/smp_affinity 2>&1",
+            )
+            if r2.exit_code == 0:
+                applied.append(f"IRQ {irq} → CPU {cpu} (mask {cpu_mask})")
+            else:
+                errors.append(f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}")
+
+        # irqbalance coordination
+        ib_result = {"mode": irqbalance_mode}
+        if irqbalance_mode == "disable":
+            r3 = await _ssh.run(host, "systemctl mask irqbalance && systemctl stop irqbalance 2>&1")
+            ib_result["status"] = "masked" if r3.exit_code == 0 else "error"
+            if r3.exit_code != 0:
+                errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
+
+        elif irqbalance_mode == "ban_irq":
+            banned = " ".join(str(i) for i in irq_numbers)
+            # Read existing banned interrupts
+            rb = await _ssh.run(
+                host,
+                "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
+            )
+            existing = ""
+            for line in rb.stdout.splitlines():
+                if "IRQBALANCE_BANNED_INTERRUPTS" in line:
+                    existing = line.split("=", 1)[-1].strip().strip('"')
+            new_val = f"{existing} {banned}".strip()
+            r4 = await _ssh.run(
+                host,
+                f"sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+                f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
+                f"systemctl restart irqbalance 2>&1",
+            )
+            ib_result["banned_interrupts"] = new_val
+            ib_result["status"] = "restarted" if r4.exit_code == 0 else "error"
+            if r4.exit_code != 0:
+                errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
+
+        elif irqbalance_mode == "ban_cpu":
+            cpu_mask_ib = hex(1 << cpu)
+            rb = await _ssh.run(
+                host,
+                "grep -s IRQBALANCE_BANNED_CPUS /etc/sysconfig/irqbalance || echo ''",
+            )
+            existing = ""
+            for line in rb.stdout.splitlines():
+                if "IRQBALANCE_BANNED_CPUS" in line:
+                    existing = line.split("=", 1)[-1].strip().strip('"')
+            # Merge masks
+            try:
+                merged = hex(int(existing, 16) | (1 << cpu)) if existing else cpu_mask_ib
+            except ValueError:
+                merged = cpu_mask_ib
+            r5 = await _ssh.run(
+                host,
+                f"sed -i '/IRQBALANCE_BANNED_CPUS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+                f"echo 'IRQBALANCE_BANNED_CPUS=\"{merged}\"' >> /etc/sysconfig/irqbalance; "
+                f"systemctl restart irqbalance 2>&1",
+            )
+            ib_result["banned_cpus_mask"] = merged
+            ib_result["status"] = "restarted" if r5.exit_code == 0 else "error"
+            if r5.exit_code != 0:
+                errors.append(f"irqbalance ban_cpu failed: {r5.stdout.strip()}")
+
+        return {
+            "host": host,
+            "interface": interface,
+            "irq_numbers": irq_numbers,
+            "cpu": cpu,
+            "cpu_mask": cpu_mask,
+            "irqbalance": ib_result,
+            "status": "error" if errors else "ok",
+            "applied": applied,
+            "errors": errors,
+        }
+
+    async def verify_host_tuning(
+        host: str,
+        interface: str,
+        expected: dict | None = None,
+        user: str = "root",
+        ssh_key_path: str = "",
+    ) -> dict:
+        _ssh = ssh
+        exp = expected or {}
+        checks: dict[str, dict] = {}
+        all_ok = True
+
+        # TCP congestion control (sysctl)
+        r = await _ssh.run(host, "sysctl -n net.ipv4.tcp_congestion_control 2>&1")
+        actual_cc = r.stdout.strip()
+        expected_cc = exp.get("congestion_control")
+        cc_ok = (expected_cc is None) or (actual_cc == expected_cc)
+        all_ok = all_ok and cc_ok
+        checks["net.ipv4.tcp_congestion_control"] = {
+            "actual": actual_cc, "expected": expected_cc, "ok": cc_ok,
+        }
+
+        # Qdisc: check via tc on the interface (authoritative) not sysctl
+        # (sysctl net.core.default_qdisc only affects new interfaces)
+        expected_qdisc = exp.get("qdisc")
+        r_tc = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+        tc_output = r_tc.stdout.strip()
+        # tc output format: "qdisc fq 8001: root refcnt 2 ..."
+        actual_qdisc = None
+        for part in tc_output.split():
+            if part not in ("qdisc", "noqueue", "root", "refcnt"):
+                actual_qdisc = part
+                break
+        qdisc_ok = (expected_qdisc is None) or (actual_qdisc == expected_qdisc)
+        all_ok = all_ok and qdisc_ok
+        checks["qdisc"] = {
+            "interface": interface,
+            "actual": actual_qdisc,
+            "expected": expected_qdisc,
+            "ok": qdisc_ok,
+            "tc_output": tc_output,
+        }
+
+        # NIC channel count
+        r = await _ssh.run(host, f"ethtool -l {interface} 2>&1")
+        actual_channels: int | None = None
+        sections = r.stdout.split("Current hardware settings:")
+        if len(sections) == 2:
+            for line in sections[1].splitlines():
+                if line.strip().startswith("Combined:"):
+                    try:
+                        actual_channels = int(line.split()[-1])
+                    except ValueError:
+                        pass
+                    break
+        expected_channels = exp.get("channels")
+        ch_ok = (expected_channels is None) or (actual_channels == expected_channels)
+        all_ok = all_ok and ch_ok
+        checks["channels"] = {
+            "actual": actual_channels,
+            "expected": expected_channels,
+            "ok": ch_ok,
+        }
+
+        # IRQ affinity
+        ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
+        irq_numbers = []
+        for line in ri.stdout.splitlines():
+            if interface in line:
+                try:
+                    irq_numbers.append(int(line.split(":")[0].strip()))
+                except ValueError:
+                    pass
+
+        irq_check: dict = {"irq_numbers": irq_numbers}
+        expected_cpu = exp.get("irq_cpu")
+        if irq_numbers:
+            irq = irq_numbers[0]
+            ra = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
+            actual_affinity = ra.stdout.strip()
+            irq_check["cpu_affinity"] = actual_affinity
+            if expected_cpu is not None:
+                irq_ok = str(expected_cpu) in actual_affinity.split(",")
+                irq_check["expected_cpu"] = expected_cpu
+                irq_check["ok"] = irq_ok
+                all_ok = all_ok and irq_ok
+        checks["irq"] = irq_check
+
+        # irqbalance status
+        rib = await _ssh.run(host, "systemctl is-active irqbalance 2>&1")
+        ib_active = rib.stdout.strip() == "active"
+        expected_ib_mode = exp.get("irqbalance_mode")
+        ib_check: dict = {"active": ib_active}
+        if expected_ib_mode == "disable":
+            ib_ok = not ib_active
+            ib_check["ok"] = ib_ok
+            all_ok = all_ok and ib_ok
+        checks["irqbalance"] = ib_check
+
+        return {
+            "host": host,
+            "interface": interface,
+            "all_ok": all_ok,
+            "checks": checks,
+        }
+
     async def get_private_config(harness_name: str, key: str) -> Any:
         result = await skill_provider.get_private_config(harness_name, key)
         if result is None:
@@ -1526,6 +2088,12 @@ def create_provisioning_tool_handlers(
         return "Clarification requested. Ticket paused for human input."
 
     handlers = {
+        "list_skill_docs": list_skill_docs,
+        "read_skill": read_skill,
+        "tune_nic": tune_nic,
+        "tune_tcp": tune_tcp,
+        "pin_irq": pin_irq,
+        "verify_host_tuning": verify_host_tuning,
         "check_platform_contract": check_platform_contract,
         "check_host_prerequisites": check_host_prerequisites,
         "install_packages": install_packages,
