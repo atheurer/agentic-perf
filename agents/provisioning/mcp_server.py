@@ -1003,6 +1003,96 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "required": ["provisioning_complete", "hosts_provisioned"],
             },
         ),
+        ToolDefinition(
+            name="nm_set_mtu",
+            description=(
+                "Set the MTU on a network interface persistently via NetworkManager. "
+                "Using 'ip link set mtu' is NOT persistent — NM overrides it on "
+                "connection events. This tool modifies the NM connection profile and "
+                "brings it up. Read skills/general/network-manager.md before calling. "
+                "MTU 9000 requires end-to-end switch support — do not set it unless "
+                "the user explicitly requests jumbo frames."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {"type": "string", "description": "Interface name (e.g. eno16695np0)"},
+                    "mtu": {"type": "integer", "description": "MTU value (e.g. 1500 or 9000)"},
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                },
+                "required": ["host", "interface", "mtu"],
+            },
+        ),
+        ToolDefinition(
+            name="nm_set_ip",
+            description=(
+                "Configure a static IP address on an interface via NetworkManager. "
+                "Used when a ticket requests a private test network. "
+                "Modifies the NM connection profile and brings it up."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "interface": {"type": "string", "description": "Interface name"},
+                    "ip_cidr": {"type": "string", "description": "IP address with prefix (e.g. 172.16.0.1/24)"},
+                    "gateway": {"type": "string", "description": "Gateway IP (optional)"},
+                    "dns": {"type": "string", "description": "DNS server IP (optional)"},
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                },
+                "required": ["host", "interface", "ip_cidr"],
+            },
+        ),
+        ToolDefinition(
+            name="nm_set_dhcp",
+            description="Switch an interface to DHCP via NetworkManager.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string"},
+                    "interface": {"type": "string"},
+                    "user": {"type": "string"},
+                },
+                "required": ["host", "interface"],
+            },
+        ),
+        ToolDefinition(
+            name="nm_show_connection",
+            description=(
+                "Show the current NetworkManager connection profile for an interface. "
+                "Returns IP method, addresses, MTU, and connection name. "
+                "Use this to audit actual interface configuration before a benchmark."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string"},
+                    "interface": {"type": "string"},
+                    "user": {"type": "string"},
+                },
+                "required": ["host", "interface"],
+            },
+        ),
+        ToolDefinition(
+            name="nm_verify_interface",
+            description=(
+                "Verify that a network interface matches expected configuration. "
+                "Checks live state (ip link) not just the NM profile. "
+                "Returns pass/fail per parameter: mtu, ip_address, state."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string"},
+                    "interface": {"type": "string"},
+                    "expected_mtu": {"type": "integer", "description": "Expected MTU (optional)"},
+                    "expected_ip": {"type": "string", "description": "Expected IP address without prefix (optional)"},
+                    "user": {"type": "string"},
+                },
+                "required": ["host", "interface"],
+            },
+        ),
     ]
 
 
@@ -2139,6 +2229,166 @@ def create_provisioning_tool_handlers(
         await request_clarification_fn(question)
         return "Clarification requested. Ticket paused for human input."
 
+    # -----------------------------------------------------------------------
+    # NetworkManager tools
+    # -----------------------------------------------------------------------
+
+    async def _nm_find_connection(host: str, interface: str) -> str:
+        """Return the NM connection name that owns the interface, or the interface name."""
+        r = await ssh.run(
+            host,
+            f"nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ':{interface}$' | cut -d: -f1",
+        )
+        name = r.stdout.strip()
+        return name if name else interface
+
+    async def nm_set_mtu(
+        host: str,
+        interface: str,
+        mtu: int,
+        user: str = "root",
+    ) -> dict:
+        conn = await _nm_find_connection(host, interface)
+        r_before = await ssh.run(host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'")
+        before_mtu = r_before.stdout.strip()
+
+        r = await ssh.run(
+            host,
+            f"nmcli connection modify '{conn}' 802-3-ethernet.mtu {mtu} 2>&1"
+            f" && nmcli connection up '{conn}' 2>&1",
+        )
+        if r.exit_code != 0:
+            return {
+                "host": host, "interface": interface,
+                "status": "error", "error": r.stdout.strip(),
+            }
+
+        r_after = await ssh.run(host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'")
+        after_mtu = r_after.stdout.strip()
+        actual = int(after_mtu.split()[-1]) if after_mtu else None
+        return {
+            "host": host, "interface": interface, "connection": conn,
+            "before": before_mtu, "after": after_mtu,
+            "status": "ok" if actual == mtu else "error",
+            "ok": actual == mtu,
+        }
+
+    async def nm_set_ip(
+        host: str,
+        interface: str,
+        ip_cidr: str,
+        gateway: str | None = None,
+        dns: str | None = None,
+        user: str = "root",
+    ) -> dict:
+        conn = await _nm_find_connection(host, interface)
+        cmds = [
+            f"nmcli connection modify '{conn}' ipv4.method manual ipv4.addresses '{ip_cidr}'",
+        ]
+        if gateway:
+            cmds.append(f"nmcli connection modify '{conn}' ipv4.gateway '{gateway}'")
+        if dns:
+            cmds.append(f"nmcli connection modify '{conn}' ipv4.dns '{dns}'")
+        cmds.append(f"nmcli connection up '{conn}'")
+
+        errors = []
+        for cmd in cmds:
+            r = await ssh.run(host, cmd + " 2>&1")
+            if r.exit_code != 0:
+                errors.append(r.stdout.strip())
+
+        r_verify = await ssh.run(host, f"ip addr show {interface} 2>/dev/null | grep 'inet '")
+        return {
+            "host": host, "interface": interface, "connection": conn,
+            "ip_cidr": ip_cidr, "gateway": gateway,
+            "live_addresses": r_verify.stdout.strip(),
+            "status": "error" if errors else "ok",
+            "errors": errors,
+        }
+
+    async def nm_set_dhcp(
+        host: str,
+        interface: str,
+        user: str = "root",
+    ) -> dict:
+        conn = await _nm_find_connection(host, interface)
+        r = await ssh.run(
+            host,
+            f"nmcli connection modify '{conn}' ipv4.method auto ipv4.addresses '' ipv4.gateway '' 2>&1"
+            f" && nmcli connection up '{conn}' 2>&1",
+        )
+        return {
+            "host": host, "interface": interface, "connection": conn,
+            "status": "ok" if r.exit_code == 0 else "error",
+            "output": r.stdout.strip(),
+        }
+
+    async def nm_show_connection(
+        host: str,
+        interface: str,
+        user: str = "root",
+    ) -> dict:
+        conn = await _nm_find_connection(host, interface)
+        r = await ssh.run(
+            host,
+            f"nmcli connection show '{conn}' 2>/dev/null"
+            f" | grep -E 'ipv4\\.method|ipv4\\.addresses|802-3-ethernet\\.mtu|GENERAL\\.STATE'",
+        )
+        live = await ssh.run(
+            host,
+            f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*';"
+            f" ip addr show {interface} 2>/dev/null | grep 'inet '",
+        )
+        return {
+            "host": host, "interface": interface, "connection": conn,
+            "profile": r.stdout.strip(),
+            "live": live.stdout.strip(),
+        }
+
+    async def nm_verify_interface(
+        host: str,
+        interface: str,
+        expected_mtu: int | None = None,
+        expected_ip: str | None = None,
+        user: str = "root",
+    ) -> dict:
+        checks: dict[str, dict] = {}
+        all_ok = True
+
+        r_link = await ssh.run(host, f"ip link show {interface} 2>/dev/null")
+        link_output = r_link.stdout
+
+        # MTU check
+        actual_mtu: int | None = None
+        for token in link_output.split():
+            if token.isdigit() and "mtu" in link_output[max(0, link_output.find(token) - 5):link_output.find(token)]:
+                actual_mtu = int(token)
+                break
+        import re as _re
+        m = _re.search(r'mtu (\d+)', link_output)
+        if m:
+            actual_mtu = int(m.group(1))
+        mtu_ok = (expected_mtu is None) or (actual_mtu == expected_mtu)
+        all_ok = all_ok and mtu_ok
+        checks["mtu"] = {"actual": actual_mtu, "expected": expected_mtu, "ok": mtu_ok}
+
+        # IP check
+        r_addr = await ssh.run(host, f"ip addr show {interface} 2>/dev/null | grep 'inet '")
+        actual_ips = [line.strip().split()[1].split("/")[0] for line in r_addr.stdout.splitlines() if "inet " in line]
+        ip_ok = (expected_ip is None) or (expected_ip in actual_ips)
+        all_ok = all_ok and ip_ok
+        checks["ip"] = {"actual": actual_ips, "expected": expected_ip, "ok": ip_ok}
+
+        # State check
+        state_ok = "UP" in link_output and "state UP" in link_output
+        checks["state"] = {"up": state_ok, "ok": state_ok}
+        all_ok = all_ok and state_ok
+
+        return {
+            "host": host, "interface": interface,
+            "all_ok": all_ok, "checks": checks,
+        }
+
     handlers = {
         "list_skill_docs": list_skill_docs,
         "read_skill": read_skill,
@@ -2146,6 +2396,11 @@ def create_provisioning_tool_handlers(
         "tune_tcp": tune_tcp,
         "pin_irq": pin_irq,
         "verify_host_tuning": verify_host_tuning,
+        "nm_set_mtu": nm_set_mtu,
+        "nm_set_ip": nm_set_ip,
+        "nm_set_dhcp": nm_set_dhcp,
+        "nm_show_connection": nm_show_connection,
+        "nm_verify_interface": nm_verify_interface,
         "check_platform_contract": check_platform_contract,
         "check_host_prerequisites": check_host_prerequisites,
         "install_packages": install_packages,

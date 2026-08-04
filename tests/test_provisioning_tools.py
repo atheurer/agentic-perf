@@ -676,6 +676,12 @@ async def test_all_tools_use_hosts_or_targets():
             "tune_tcp",
             "pin_irq",
             "verify_host_tuning",
+            # Per-host NM tools — parameters vary per host so no hosts array
+            "nm_set_mtu",
+            "nm_set_ip",
+            "nm_set_dhcp",
+            "nm_show_connection",
+            "nm_verify_interface",
         )
     ]
     for t in host_facing:
