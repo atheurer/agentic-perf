@@ -47,6 +47,43 @@ The tool returns averaged timing metrics across all samples:
 | `avg_userspace_s` | seconds | Userspace startup time |
 | `sample_count` | count | Number of samples successfully collected |
 
+## Reboot Behavior
+
+The harness supports multiple reboot methods depending on the
+environment:
+
+### Jumpstarter boards (with `--jumpstarter-serial`)
+
+Reboot cycles use explicit Jumpstarter power control:
+`j power off` → configurable delay → `j power on`. This is
+more reliable than `j power cycle` or SSH-initiated reboots
+on embedded boards.
+
+The `--power-off-delay` parameter controls the wait between
+power off and power on (default: 2 seconds). Boards that need
+more settling time can increase this.
+
+Serial output is captured during each boot cycle for detailed
+timing analysis. The `capture-boot` helper handles serial
+capture independently from power control (`--no-power` mode).
+
+### SSH reboot with Jumpstarter fallback
+
+When Jumpstarter is available but serial capture is not
+enabled, the harness attempts SSH reboot first. If the SSH
+reboot hangs (board doesn't go down within 120 seconds), the
+harness falls back to Jumpstarter power cycling automatically.
+
+Samples that required power cycle fallback are tracked:
+- `power_cycle_fallbacks` count in `collection_status.json`
+- Exit code 2 when any fallbacks occurred
+- Affected samples listed in the run summary
+
+### Standard SSH reboot (no Jumpstarter)
+
+Uses `reboot` command via SSH. Requires the SUT to have a
+stable IP across reboots.
+
 ## Provisioning Scope
 
 The boot-time harness has NO provisioning step. The
@@ -102,13 +139,27 @@ For RHIVOS / Automotive Linux targets:
 NetworkManager|end0|eth0|systemd-modules-load|udev|dbus-broker.service|remote-fs.target|SELinux
 ```
 
+For bootc/ostree targets, also include:
+
+```
+ostree-prepare-root|ostree-remount|initrd-switch-root
+```
+
+These services are bootc-specific:
+- `ostree-prepare-root.service` — composefs erofs mount + sealing
+- `ostree-remount.service` — OSTree bind mounts in real root
+- `initrd-switch-root.service` — root pivot
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | All samples collected successfully |
-| 2 | Partial success — some samples collected before a failure |
-| 1 | Total failure — no samples collected |
+| 2 | Partial success — samples collected but with issues (lease expiry, power cycle fallbacks) |
+| 1 | Total failure — no usable samples collected |
 
 Exit code 2 (partial) still produces usable results. The response
-includes `samples_requested` and `samples_collected` for context.
+includes `samples_requested`, `samples_collected`, and
+`power_cycle_fallbacks` for context. Power cycle fallback samples
+may have slightly different timing characteristics than clean
+SSH reboots — note this in the analysis if the count is high.
