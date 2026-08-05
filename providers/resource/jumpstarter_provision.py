@@ -304,6 +304,34 @@ async def _run_provision_steps(
 
     result.ip = ip
 
+    # Validate SSH connectivity before declaring the
+    # platform ready. Catches: wrong/stale IP, network
+    # not up, SSH not running, initramfs failures that
+    # leave a login prompt but no network stack.
+    import socket as _socket
+
+    ssh_reachable = False
+    for attempt in range(6):
+        try:
+            s = _socket.create_connection((ip, 22), timeout=10)
+            s.close()
+            ssh_reachable = True
+            diag.append(f"SSH port 22 reachable on {ip} (attempt {attempt + 1})")
+            break
+        except (OSError, ConnectionRefusedError):
+            if attempt < 5:
+                await asyncio.sleep(10)
+
+    if not ssh_reachable:
+        diag.append(
+            f"SSH port 22 unreachable on {ip} after 6"
+            f" attempts (60s). The board may have booted"
+            f" with no network, wrong IP, or a corrupt"
+            f" image. Check serial output for boot errors."
+        )
+        result.diagnostics = diag
+        return result
+
     # ── Step 5: Inject SSH key ───────────────────────
     if ssh_public_key:
         try:
