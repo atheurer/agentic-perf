@@ -106,14 +106,21 @@ async def _provision_jumpstarter(
             }
         )
 
-    # Get the flash URL from flash_targets (structured)
+    # Get the flash URL(s) from flash_targets (structured)
     # or fall back to parsing flash_command (string).
     flash_targets = flash_info.get("flash_targets", [])
     if flash_targets:
-        # Use the first target's URL — for single-
-        # partition boards (EBBR) this is the image.
-        # Multi-partition boards pass the full command.
-        flash_url = flash_targets[0].get("url", "")
+        if len(flash_targets) == 1:
+            # Single-partition boards (EBBR) — one image URL.
+            flash_url = flash_targets[0].get("url", "")
+        else:
+            # Multi-partition boards (SA8775P) — pass a dict
+            # of {partition: url} to provision_jumpstarter.
+            flash_url = {
+                t["partition"]: t["url"]
+                for t in flash_targets
+                if t.get("partition") and t.get("url")
+            }
     else:
         flash_command = flash_info.get("flash_command", "")
         if not flash_command:
