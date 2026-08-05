@@ -63,9 +63,7 @@ class TestCommentHint:
             json={"status": "awaiting_customer_guidance"},
         )
 
-    def test_user_comment_on_paused_ticket_returns_hint(
-        self, client, ticket_id
-    ):
+    def test_user_comment_on_paused_ticket_returns_hint(self, client, ticket_id):
         self._pause_ticket(client, ticket_id)
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/comments",
@@ -77,11 +75,11 @@ class TestCommentHint:
         assert hint["method"] == "POST"
         assert "/transition" in hint["path"]
         assert hint["body"]["status"] == "triage_pending"
-        assert "resume" in hint["reason"].lower() or "transition" in hint["reason"].lower()
+        assert (
+            "resume" in hint["reason"].lower() or "transition" in hint["reason"].lower()
+        )
 
-    def test_agent_comment_on_paused_ticket_no_hint(
-        self, client, ticket_id
-    ):
+    def test_agent_comment_on_paused_ticket_no_hint(self, client, ticket_id):
         self._pause_ticket(client, ticket_id)
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/comments",
