@@ -98,7 +98,7 @@ async def enrich_webhook_ticket(
         existing_directives = cf.get("directives", {})
         if not existing_directives.get("board_selector"):
             merged = dict(existing_directives)
-            merged["board_selector"] = f"target={target}"
+            merged["board_selector"] = f"board-type={target}"
             fields["directives"] = merged
 
     async with httpx.AsyncClient(
