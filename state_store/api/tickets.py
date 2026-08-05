@@ -10,6 +10,7 @@ from ..models import (
     UpdateFieldsRequest,
 )
 from ..store import TicketNotFound
+from .action_hints import after_create
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -82,7 +83,9 @@ def create_ticket(body: CreateTicketRequest, request: Request):
         created_by=created_by,
         owners=owners,
     )
-    return ticket
+    result = ticket.model_dump(mode="json")
+    result["action_required"] = after_create(ticket)
+    return result
 
 
 _SUMMARY_FIELDS = ("id", "summary", "status", "owners", "created_at", "updated_at")
