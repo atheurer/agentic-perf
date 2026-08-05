@@ -817,19 +817,34 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
-                    "interface": {"type": "string", "description": "NIC interface name (e.g. eno16695np0)"},
+                    "interface": {
+                        "type": "string",
+                        "description": "NIC interface name (e.g. eno16695np0)",
+                    },
                     "channels": {
                         "type": "integer",
                         "description": "Combined queue/channel count (default: 1 for IRQ pinning)",
                     },
-                    "ring_rx": {"type": "integer", "description": "RX ring buffer size (optional)"},
-                    "ring_tx": {"type": "integer", "description": "TX ring buffer size (optional)"},
+                    "ring_rx": {
+                        "type": "integer",
+                        "description": "RX ring buffer size (optional)",
+                    },
+                    "ring_tx": {
+                        "type": "integer",
+                        "description": "TX ring buffer size (optional)",
+                    },
                     "offloads": {
                         "type": "object",
-                        "description": "Offload flags to set, e.g. {\"gro\": \"on\", \"lro\": \"off\"} (optional)",
+                        "description": 'Offload flags to set, e.g. {"gro": "on", "lro": "off"} (optional)',
                     },
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
-                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                    "ssh_key_path": {
+                        "type": "string",
+                        "description": "Path to SSH private key",
+                    },
                 },
                 "required": ["host", "interface"],
             },
@@ -872,8 +887,14 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "type": "object",
                         "description": "Additional net.* sysctl key/value pairs to set (optional)",
                     },
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
-                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                    "ssh_key_path": {
+                        "type": "string",
+                        "description": "Path to SSH private key",
+                    },
                 },
                 "required": ["host"],
             },
@@ -893,15 +914,27 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
-                    "interface": {"type": "string", "description": "NIC interface name"},
-                    "cpu": {"type": "integer", "description": "CPU core number to pin IRQ to"},
+                    "interface": {
+                        "type": "string",
+                        "description": "NIC interface name",
+                    },
+                    "cpu": {
+                        "type": "integer",
+                        "description": "CPU core number to pin IRQ to",
+                    },
                     "irqbalance_mode": {
                         "type": "string",
                         "enum": ["ban_irq", "ban_cpu", "disable"],
                         "description": "How to prevent irqbalance from overriding the pin (default: ban_irq)",
                     },
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
-                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                    "ssh_key_path": {
+                        "type": "string",
+                        "description": "Path to SSH private key",
+                    },
                 },
                 "required": ["host", "interface", "cpu"],
             },
@@ -919,7 +952,10 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
-                    "interface": {"type": "string", "description": "NIC interface name"},
+                    "interface": {
+                        "type": "string",
+                        "description": "NIC interface name",
+                    },
                     "expected": {
                         "type": "object",
                         "description": (
@@ -928,8 +964,14 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                             "Omit keys you don't want checked."
                         ),
                     },
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
-                    "ssh_key_path": {"type": "string", "description": "Path to SSH private key"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
+                    "ssh_key_path": {
+                        "type": "string",
+                        "description": "Path to SSH private key",
+                    },
                 },
                 "required": ["host", "interface"],
             },
@@ -1738,7 +1780,9 @@ def create_provisioning_tool_handlers(
                     break
 
         if channels != before_channels:
-            r2 = await _ssh.run(host, f"ethtool -L {interface} combined {channels} 2>&1")
+            r2 = await _ssh.run(
+                host, f"ethtool -L {interface} combined {channels} 2>&1"
+            )
             if r2.exit_code == 0:
                 applied.append(f"channels: {before_channels} → {channels}")
             else:
@@ -1896,12 +1940,16 @@ def create_provisioning_tool_handlers(
             if r2.exit_code == 0:
                 applied.append(f"IRQ {irq} → CPU {cpu} (mask {cpu_mask})")
             else:
-                errors.append(f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}")
+                errors.append(
+                    f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}"
+                )
 
         # irqbalance coordination
         ib_result = {"mode": irqbalance_mode}
         if irqbalance_mode == "disable":
-            r3 = await _ssh.run(host, "systemctl mask irqbalance && systemctl stop irqbalance 2>&1")
+            r3 = await _ssh.run(
+                host, "systemctl mask irqbalance && systemctl stop irqbalance 2>&1"
+            )
             ib_result["status"] = "masked" if r3.exit_code == 0 else "error"
             if r3.exit_code != 0:
                 errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
@@ -1941,7 +1989,9 @@ def create_provisioning_tool_handlers(
                     existing = line.split("=", 1)[-1].strip().strip('"')
             # Merge masks
             try:
-                merged = hex(int(existing, 16) | (1 << cpu)) if existing else cpu_mask_ib
+                merged = (
+                    hex(int(existing, 16) | (1 << cpu)) if existing else cpu_mask_ib
+                )
             except ValueError:
                 merged = cpu_mask_ib
             r5 = await _ssh.run(
@@ -1986,7 +2036,9 @@ def create_provisioning_tool_handlers(
         cc_ok = (expected_cc is None) or (actual_cc == expected_cc)
         all_ok = all_ok and cc_ok
         checks["net.ipv4.tcp_congestion_control"] = {
-            "actual": actual_cc, "expected": expected_cc, "ok": cc_ok,
+            "actual": actual_cc,
+            "expected": expected_cc,
+            "ok": cc_ok,
         }
 
         # Qdisc: check via tc on the interface (authoritative) not sysctl

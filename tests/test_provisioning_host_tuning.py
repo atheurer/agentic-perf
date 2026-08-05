@@ -215,9 +215,7 @@ class TestTuneTcp:
             }
         )
         handlers = make_handlers(ssh)
-        result = await handlers["tune_tcp"](
-            host="10.0.0.1", congestion_control="bbr"
-        )
+        result = await handlers["tune_tcp"](host="10.0.0.1", congestion_control="bbr")
         assert result["status"] == "error"
         assert result["errors"]
 
