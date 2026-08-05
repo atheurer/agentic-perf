@@ -157,8 +157,12 @@ async def _provision_async(
     config = ClientConfigV1Alpha1.from_file(client_config_path)
 
     async with BlockingPortal() as portal:
+        # When lease_name is set, the resource agent already
+        # created the lease. Don't pass selector — it causes
+        # a mismatch if the key order differs and the SDK
+        # creates a new lease instead of reusing the existing.
         async with config.lease_async(
-            selector=selector or None,
+            selector=None if lease_name else (selector or None),
             exporter_name=None,
             lease_name=lease_name,
             duration=timedelta(hours=2),
