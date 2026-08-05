@@ -1017,9 +1017,18 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
-                    "interface": {"type": "string", "description": "Interface name (e.g. eno16695np0)"},
-                    "mtu": {"type": "integer", "description": "MTU value (e.g. 1500 or 9000)"},
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "interface": {
+                        "type": "string",
+                        "description": "Interface name (e.g. eno16695np0)",
+                    },
+                    "mtu": {
+                        "type": "integer",
+                        "description": "MTU value (e.g. 1500 or 9000)",
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
                 },
                 "required": ["host", "interface", "mtu"],
             },
@@ -1036,10 +1045,22 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
                     "interface": {"type": "string", "description": "Interface name"},
-                    "ip_cidr": {"type": "string", "description": "IP address with prefix (e.g. 172.16.0.1/24)"},
-                    "gateway": {"type": "string", "description": "Gateway IP (optional)"},
-                    "dns": {"type": "string", "description": "DNS server IP (optional)"},
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "ip_cidr": {
+                        "type": "string",
+                        "description": "IP address with prefix (e.g. 172.16.0.1/24)",
+                    },
+                    "gateway": {
+                        "type": "string",
+                        "description": "Gateway IP (optional)",
+                    },
+                    "dns": {
+                        "type": "string",
+                        "description": "DNS server IP (optional)",
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
                 },
                 "required": ["host", "interface", "ip_cidr"],
             },
@@ -1086,8 +1107,14 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "properties": {
                     "host": {"type": "string"},
                     "interface": {"type": "string"},
-                    "expected_mtu": {"type": "integer", "description": "Expected MTU (optional)"},
-                    "expected_ip": {"type": "string", "description": "Expected IP address without prefix (optional)"},
+                    "expected_mtu": {
+                        "type": "integer",
+                        "description": "Expected MTU (optional)",
+                    },
+                    "expected_ip": {
+                        "type": "string",
+                        "description": "Expected IP address without prefix (optional)",
+                    },
                     "user": {"type": "string"},
                 },
                 "required": ["host", "interface"],
@@ -2249,7 +2276,9 @@ def create_provisioning_tool_handlers(
         user: str = "root",
     ) -> dict:
         conn = await _nm_find_connection(host, interface)
-        r_before = await ssh.run(host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'")
+        r_before = await ssh.run(
+            host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'"
+        )
         before_mtu = r_before.stdout.strip()
 
         r = await ssh.run(
@@ -2259,16 +2288,23 @@ def create_provisioning_tool_handlers(
         )
         if r.exit_code != 0:
             return {
-                "host": host, "interface": interface,
-                "status": "error", "error": r.stdout.strip(),
+                "host": host,
+                "interface": interface,
+                "status": "error",
+                "error": r.stdout.strip(),
             }
 
-        r_after = await ssh.run(host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'")
+        r_after = await ssh.run(
+            host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'"
+        )
         after_mtu = r_after.stdout.strip()
         actual = int(after_mtu.split()[-1]) if after_mtu else None
         return {
-            "host": host, "interface": interface, "connection": conn,
-            "before": before_mtu, "after": after_mtu,
+            "host": host,
+            "interface": interface,
+            "connection": conn,
+            "before": before_mtu,
+            "after": after_mtu,
             "status": "ok" if actual == mtu else "error",
             "ok": actual == mtu,
         }
@@ -2297,10 +2333,15 @@ def create_provisioning_tool_handlers(
             if r.exit_code != 0:
                 errors.append(r.stdout.strip())
 
-        r_verify = await ssh.run(host, f"ip addr show {interface} 2>/dev/null | grep 'inet '")
+        r_verify = await ssh.run(
+            host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
+        )
         return {
-            "host": host, "interface": interface, "connection": conn,
-            "ip_cidr": ip_cidr, "gateway": gateway,
+            "host": host,
+            "interface": interface,
+            "connection": conn,
+            "ip_cidr": ip_cidr,
+            "gateway": gateway,
             "live_addresses": r_verify.stdout.strip(),
             "status": "error" if errors else "ok",
             "errors": errors,
@@ -2318,7 +2359,9 @@ def create_provisioning_tool_handlers(
             f" && nmcli connection up '{conn}' 2>&1",
         )
         return {
-            "host": host, "interface": interface, "connection": conn,
+            "host": host,
+            "interface": interface,
+            "connection": conn,
             "status": "ok" if r.exit_code == 0 else "error",
             "output": r.stdout.strip(),
         }
@@ -2340,7 +2383,9 @@ def create_provisioning_tool_handlers(
             f" ip addr show {interface} 2>/dev/null | grep 'inet '",
         )
         return {
-            "host": host, "interface": interface, "connection": conn,
+            "host": host,
+            "interface": interface,
+            "connection": conn,
             "profile": r.stdout.strip(),
             "live": live.stdout.strip(),
         }
@@ -2361,11 +2406,18 @@ def create_provisioning_tool_handlers(
         # MTU check
         actual_mtu: int | None = None
         for token in link_output.split():
-            if token.isdigit() and "mtu" in link_output[max(0, link_output.find(token) - 5):link_output.find(token)]:
+            if (
+                token.isdigit()
+                and "mtu"
+                in link_output[
+                    max(0, link_output.find(token) - 5) : link_output.find(token)
+                ]
+            ):
                 actual_mtu = int(token)
                 break
         import re as _re
-        m = _re.search(r'mtu (\d+)', link_output)
+
+        m = _re.search(r"mtu (\d+)", link_output)
         if m:
             actual_mtu = int(m.group(1))
         mtu_ok = (expected_mtu is None) or (actual_mtu == expected_mtu)
@@ -2373,8 +2425,14 @@ def create_provisioning_tool_handlers(
         checks["mtu"] = {"actual": actual_mtu, "expected": expected_mtu, "ok": mtu_ok}
 
         # IP check
-        r_addr = await ssh.run(host, f"ip addr show {interface} 2>/dev/null | grep 'inet '")
-        actual_ips = [line.strip().split()[1].split("/")[0] for line in r_addr.stdout.splitlines() if "inet " in line]
+        r_addr = await ssh.run(
+            host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
+        )
+        actual_ips = [
+            line.strip().split()[1].split("/")[0]
+            for line in r_addr.stdout.splitlines()
+            if "inet " in line
+        ]
         ip_ok = (expected_ip is None) or (expected_ip in actual_ips)
         all_ok = all_ok and ip_ok
         checks["ip"] = {"actual": actual_ips, "expected": expected_ip, "ok": ip_ok}
@@ -2385,8 +2443,10 @@ def create_provisioning_tool_handlers(
         all_ok = all_ok and state_ok
 
         return {
-            "host": host, "interface": interface,
-            "all_ok": all_ok, "checks": checks,
+            "host": host,
+            "interface": interface,
+            "all_ok": all_ok,
+            "checks": checks,
         }
 
     handlers = {

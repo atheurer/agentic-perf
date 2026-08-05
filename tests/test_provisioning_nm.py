@@ -58,8 +58,12 @@ class TestNmSetMtu:
     async def test_returns_error_on_nmcli_failure(self):
         ssh = MockSSHExecutor(
             results={
-                "nmcli connection show --active": SSHResult(stdout="eno16695np0:eno16695np0"),
-                "nmcli connection modify": SSHResult(stdout="Error: unknown connection", exit_code=1),
+                "nmcli connection show --active": SSHResult(
+                    stdout="eno16695np0:eno16695np0"
+                ),
+                "nmcli connection modify": SSHResult(
+                    stdout="Error: unknown connection", exit_code=1
+                ),
             }
         )
         handlers = make_handlers(ssh)
@@ -82,7 +86,9 @@ class TestNmSetIp:
         async def tracking_run(host, command, timeout=300):
             commands.append(command)
             if "ip addr show" in command:
-                return SSHResult(stdout="    inet 172.16.0.1/24 brd 172.16.0.255 scope global eno16695np0")
+                return SSHResult(
+                    stdout="    inet 172.16.0.1/24 brd 172.16.0.255 scope global eno16695np0"
+                )
             if "nmcli connection show --active" in command:
                 return SSHResult(stdout="eno16695np0:eno16695np0")
             return SSHResult(stdout="", exit_code=0)
