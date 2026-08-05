@@ -134,12 +134,12 @@ class ResourceAgent(AgentBase):
             # Ticket did not express a preference; fall back to
             # the operator's persistent config default.
             from orchestrator.config import _load_config_file
+
             skip_teardown = _load_config_file().get("skip_teardown", False)
 
         if skip_teardown:
             logger.info(
-                f"[resource-agent] skip_teardown set,"
-                f" skipping cleanup for {ticket_id}"
+                f"[resource-agent] skip_teardown set, skipping cleanup for {ticket_id}"
             )
             await self._add_comment(
                 ticket_id,

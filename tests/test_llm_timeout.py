@@ -705,7 +705,9 @@ class TestAgentRateLimitHandling:
         assert "rate" in comment.lower()
 
         ticket_events = events.get_events("TEST-RL-001", since=0, limit=100)
-        error_events = [e for e in ticket_events if e.get("event_type") == "agent_error"]
+        error_events = [
+            e for e in ticket_events if e.get("event_type") == "agent_error"
+        ]
         assert len(error_events) == 4  # 3 retries + 1 exhausted
         for i in range(3):
             assert error_events[i]["data"]["retry"] == i + 1
