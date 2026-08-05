@@ -165,6 +165,18 @@ class OrchestratorConfig:
         # where hosts are shared across experiments.
         self.skip_teardown: bool = cfg.get("skip_teardown", False)
 
+        # Maximum number of concurrent agent tasks. Prevents
+        # resource exhaustion when the state store contains a
+        # large backlog of pending tickets. Excess tickets are
+        # skipped and picked up on subsequent poll cycles.
+        _max_agents_raw = _env_or_cfg(
+            "MAX_CONCURRENT_AGENTS",
+            cfg,
+            "max_concurrent_agents",
+            8,
+        )
+        self.max_concurrent_agents: int = max(1, int(_max_agents_raw))
+
         # Introspection agent: continuous passive observer.
         # Enable globally via config or env var. Can also be
         # enabled per-ticket via custom_fields.introspection_enabled.

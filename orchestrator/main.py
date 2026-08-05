@@ -1083,7 +1083,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
     logger.info(
         f"Orchestrator started (store={config.state_store_url}, "
-        f"poll={config.poll_interval}s, llm={config.llm_provider})"
+        f"poll={config.poll_interval}s, llm={config.llm_provider}, "
+        f"max_agents={config.max_concurrent_agents})"
     )
 
     # System-wide budget check (per orchestrator session)
@@ -1095,6 +1096,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
             session_cost_usd=config.budget_session_cost_usd,
         )
         logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
+
+    status_names = list(STATUS_AGENT_MAP)
+    status_offset = 0
+    was_at_capacity = False
 
     while True:
         # Check system-wide budget before dispatching
@@ -1131,9 +1136,27 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         for t in all_fetched:
             tickets_by_status.setdefault(t.get("status", ""), []).append(t)
 
-        for status in STATUS_AGENT_MAP:
+        at_capacity = False
+        rotated = status_names[status_offset:] + status_names[:status_offset]
+        status_offset = (status_offset + 1) % len(status_names)
+
+        for status in rotated:
+            if at_capacity:
+                break
+
             tickets = tickets_by_status.get(status, [])
             for ticket in tickets:
+                active_count = len(dispatcher.active_tasks())
+                if active_count >= config.max_concurrent_agents:
+                    if not was_at_capacity:
+                        logger.info(
+                            f"At capacity ({active_count}/"
+                            f"{config.max_concurrent_agents})"
+                            f" — deferring remaining tickets"
+                        )
+                    at_capacity = True
+                    break
+
                 tid = ticket["id"]
                 if dispatcher.is_active(tid):
                     logger.info(f"Skipping {tid} at {status}: is_active")
@@ -1275,6 +1298,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 config.stale_task_timeout,
                 store_url=config.state_store_url,
             )
+
+        if was_at_capacity and not at_capacity:
+            logger.info("Below capacity — resuming normal dispatch")
+        was_at_capacity = at_capacity
 
         await asyncio.sleep(config.poll_interval)
 
