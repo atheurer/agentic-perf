@@ -29,6 +29,45 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+async def _resolve_latest_monthly(
+    monthly_url: str,
+    trust_server: bool = False,
+) -> str:
+    """Resolve 'monthly' to the latest dated subdirectory.
+
+    Monthly builds are stored in dated directories like
+    monthly/autosd10-202608010205/. This lists the directory
+    and returns the path to the latest build.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            verify=not trust_server,
+        ) as client:
+            r = await client.get(monthly_url + "/")
+            if r.status_code != 200:
+                return ""
+            # Parse directory listing for dated subdirs
+            import re
+
+            dirs = re.findall(
+                r'href="([^"]+\d{10,}/?)"',
+                r.text,
+            )
+            if not dirs:
+                return ""
+            latest = sorted(dirs)[-1].rstrip("/")
+            resolved = f"monthly/{latest}"
+            logger.info(f"[images] Resolved monthly to {resolved}")
+            return resolved
+    except Exception:
+        logger.warning(
+            "[images] Failed to resolve monthly release",
+            exc_info=True,
+        )
+        return ""
+
+
 async def resolve_image_urls(
     base_url: str = "https://autosd.sig.centos.org/",
     image_version: str = "AutoSD-10",
@@ -36,6 +75,7 @@ async def resolve_image_urls(
     board_target: str = "",
     image_name: str = "ps",
     image_type: str = "regular",
+    trust_server: bool = False,
 ) -> dict[str, Any]:
     """Resolve image URLs from the build server manifest.
 
@@ -58,10 +98,44 @@ async def resolve_image_urls(
           combos for this board (for fallback selection)
     """
     base_url = base_url.rstrip("/")
+
+    # Monthly releases use dated subdirectories (e.g.,
+    # monthly/autosd10-202608010205/). Resolve 'monthly'
+    # to the latest available build.
+    if release == "monthly":
+        release = (
+            await _resolve_latest_monthly(
+                f"{base_url}/{image_version}/monthly",
+                trust_server,
+            )
+            or release
+        )
+
     manifest_url = f"{base_url}/{image_version}/{release}/info/test_images_info.json"
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        verify=not trust_server,
+    ) as client:
         r = await client.get(manifest_url)
+
+        # Fallback: if the specific release 404s, try the
+        # latest symlink (e.g., latest-RHIVOS-2). Release
+        # labels in Horreum may not match exact server paths.
+        if r.status_code == 404 and release != "nightly":
+            fallback_release = f"latest-{image_version}"
+            fallback_url = (
+                f"{base_url}/{image_version}/{fallback_release}"
+                f"/info/test_images_info.json"
+            )
+            logger.info(
+                f"[images] Release {release} not found, trying {fallback_release}"
+            )
+            r = await client.get(fallback_url)
+            if r.status_code == 200:
+                manifest_url = fallback_url
+
         if r.status_code != 200:
             return {
                 "error": (

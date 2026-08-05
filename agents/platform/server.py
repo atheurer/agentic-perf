@@ -148,6 +148,7 @@ async def _provision_jumpstarter(
             ssh_public_key = pub_path.read_text().strip()
     board_name = metadata.get("exporter_name", "")
     lease_id = metadata.get("lease_id", "")
+    selector = metadata.get("selector", "")
 
     from providers.resource.jumpstarter_provision import (
         provision_jumpstarter,
@@ -159,6 +160,7 @@ async def _provision_jumpstarter(
         ssh_public_key=ssh_public_key,
         ssh_key_path=ssh_key_path,
         board_name=board_name,
+        selector=selector,
     )
 
     return json.dumps(

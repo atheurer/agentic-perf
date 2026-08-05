@@ -52,6 +52,7 @@ async def provision_jumpstarter(
     ssh_key_path: str = "",
     board_name: str = "",
     client_config_path: str = "",
+    selector: str = "",
 ) -> ProvisionResult:
     """Run the deterministic flash + boot + verify sequence.
 
@@ -89,6 +90,7 @@ async def provision_jumpstarter(
             ssh_public_key,
             board_name,
             client_config_path,
+            selector,
         )
         return prov_result
     except Exception as exc:
@@ -107,6 +109,7 @@ def _provision_sync(
     ssh_public_key: str,
     board_name: str,
     client_config_path: str,
+    selector: str = "",
 ) -> ProvisionResult:
     """Synchronous provisioning — runs in executor thread.
 
@@ -122,6 +125,7 @@ def _provision_sync(
         ssh_public_key,
         board_name,
         client_config_path,
+        selector,
     )
 
 
@@ -131,6 +135,7 @@ async def _provision_async(
     ssh_public_key: str,
     board_name: str,
     client_config_path: str,
+    selector: str = "",
 ) -> ProvisionResult:
     """Async provisioning using the Jumpstarter SDK."""
     from anyio.from_thread import BlockingPortal
@@ -152,8 +157,12 @@ async def _provision_async(
     config = ClientConfigV1Alpha1.from_file(client_config_path)
 
     async with BlockingPortal() as portal:
+        # When lease_name is set, the resource agent already
+        # created the lease. Don't pass selector — it causes
+        # a mismatch if the key order differs and the SDK
+        # creates a new lease instead of reusing the existing.
         async with config.lease_async(
-            selector=None,
+            selector=None if lease_name else (selector or None),
             exporter_name=None,
             lease_name=lease_name,
             duration=timedelta(hours=2),
@@ -188,9 +197,27 @@ async def _run_provision_steps(
     diag: list[str],
 ) -> ProvisionResult:
     """Execute the deterministic provision steps."""
+    # ── Step 1: Flash ────────────────────────────────
+    # Ensure the board is in a known power state before
+    # flashing.  After a lease expiry mid-benchmark the
+    # board may be mid-boot or hung — flashing without a
+    # clean power cycle fails with "Failed to get U-Boot
+    # prompt."
+    import asyncio as _asyncio
+
     from anyio import to_thread
 
-    # ── Step 1: Flash ────────────────────────────────
+    logger.info("[platform] Power cycling %s before flash", result.board_name)
+    try:
+        await to_thread.run_sync(lambda: client.power.off())
+        await _asyncio.sleep(5)
+        await to_thread.run_sync(lambda: client.power.on())
+        await _asyncio.sleep(10)
+        diag.append("Pre-flash power cycle OK")
+    except Exception as exc:
+        diag.append(f"Pre-flash power cycle warning: {exc}")
+        logger.warning("[platform] Pre-flash power cycle failed: %s", exc)
+
     logger.info("[platform] Flashing %s", result.board_name)
     t0 = time.monotonic()
     try:

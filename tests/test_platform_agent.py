@@ -232,7 +232,8 @@ class TestProvisionJumpstarterSDK:
         assert r.success
         assert r.ip == "10.0.0.1"
         client.storage.flash.assert_called_once_with("https://image.xz")
-        client.power.on.assert_called_once()
+        # Called twice: pre-flash power cycle + Step 2 power on
+        assert client.power.on.call_count == 2
         assert client.ssh.run.call_count == 2  # inject + verify
 
     @pytest.mark.asyncio
