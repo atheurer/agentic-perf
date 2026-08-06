@@ -111,12 +111,16 @@ async def test_store_transition_emits_exactly_one_event(
     )
 
     events = event_bus.get_events(tid)
-    transition_events = [e for e in events if e.get("event_type") == "transition"]
+    transition_events = [e for e in events if e.get("event_type") == "status_change"]
     assert len(transition_events) == 2
     evt = transition_events[1]
     assert evt["data"]["to"] == "awaiting_hardware"
     assert evt["data"]["from"] == "triage_pending"
     assert evt["data"]["comment"] == "triage done"
+
+    # status_trail on the ticket is the authoritative breadcrumb source
+    ticket = store.get_ticket(tid)
+    assert ticket.status_trail == ["new", "triage_pending", "awaiting_hardware"]
 
 
 async def test_no_event_without_event_bus() -> None:
@@ -164,7 +168,7 @@ async def test_store_no_double_emit_on_consecutive_transitions(
     )
 
     events = event_bus.get_events(tid)
-    transition_events = [e for e in events if e.get("event_type") == "transition"]
+    transition_events = [e for e in events if e.get("event_type") == "status_change"]
     assert len(transition_events) == 3
     assert transition_events[0]["data"]["to"] == "triage_pending"
     assert transition_events[1]["data"]["to"] == "awaiting_hardware"

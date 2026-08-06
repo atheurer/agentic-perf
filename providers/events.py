@@ -22,6 +22,7 @@ EVENT_TYPES = {
     "tool_result",
     "tool_skipped",
     "transition",
+    "status_change",
     "comment",
     "tool_progress",
     "llm_usage",

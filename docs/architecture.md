@@ -919,8 +919,26 @@ error is recorded.
 | `tool_called` | Before tool execution | tool name, input |
 | `tool_result` | After tool execution | tool name, is_error, content |
 | `tool_skipped` | Tool call not executed | tool name, reason |
-| `transition` | Ticket status change | new status, comment |
+| `status_change` | Ticket status change (from store) | from, to, triggered_by, comment |
+| `transition` | Ticket status change (from agent) | to, comment |
 | `comment` | Comment added to ticket | body |
+
+### Transition Events and Breadcrumbs
+
+Two event types record state transitions, serving different purposes:
+
+- **`status_change`** — emitted by the state store when state actually
+  changes. One event per transition, regardless of who initiated it.
+  Serves as an audit trail in the JSONL event log.
+- **`transition`** — emitted by agents and the orchestrator with
+  contextual information (agent name, reasoning). Shown in the
+  live feed for activity tracking.
+
+The dashboard breadcrumb trail is **not** built from events. Instead,
+each ticket carries a `status_trail` list that the store appends to
+on every transition. The dashboard reads this directly from the
+ticket object — instant, correct, and unaffected by event ordering
+or dual-EventBus duplication.
 
 ### Storage
 
