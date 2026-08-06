@@ -1880,7 +1880,7 @@ async def execute_boot_time_test(
         metadata = fields.get("resource_provider_metadata", {})
         lease_id = metadata.get("lease_id", "")
         directives = fields.get("directives", {})
-        serial_enabled = directives.get("jumpstarter_serial", True)
+        serial_enabled = directives.get("jumpstarter_serial", False)
         if (
             lease_id
             and fields.get("resource_provider") == "jumpstarter"
@@ -1910,6 +1910,12 @@ async def execute_boot_time_test(
     import os as _os
 
     run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
+    # Timeout: samples × ~90s per sample + 15min overhead.
+    # Prevents orphaned jmp shell subprocesses from keeping
+    # the pipe open indefinitely (observed: 4hr hang when
+    # capture-boot timed out but jmp shell child lingered).
+    benchmark_timeout = (samples * 90) + 900
+
     proc = await _asyncio.create_subprocess_exec(
         *cmd,
         stdout=_asyncio.subprocess.PIPE,
@@ -1917,7 +1923,18 @@ async def execute_boot_time_test(
         cwd=str(output_dir),
         env=run_env,
     )
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    try:
+        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
+            proc.communicate(),
+            timeout=benchmark_timeout,
+        )
+    except _asyncio.TimeoutError:
+        logger.warning(
+            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
+        )
+        proc.kill()
+        stdout_bytes, stderr_bytes = await proc.communicate()
+
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
     stderr_str = stderr_bytes.decode(errors="replace")
