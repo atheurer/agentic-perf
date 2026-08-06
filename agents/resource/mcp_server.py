@@ -4,6 +4,7 @@ import logging
 import re
 from typing import Any
 
+from paths import get_default_ssh_key
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
 
@@ -287,7 +288,7 @@ def create_resource_tool_handlers(
             "controller": None,
             "targets": [],
             "ssh_user": "root",
-            "ssh_key_path": "~/.ssh/id_rsa",
+            "ssh_key_path": get_default_ssh_key(),
         }
 
         lines = text.split("\n")
@@ -327,9 +328,11 @@ def create_resource_tool_handlers(
         return result
 
     async def validate_host(
-        host: str, user: str = "root", ssh_key_path: str = "~/.ssh/id_rsa"
+        host: str,
+        user: str = "root",
+        ssh_key_path: str | None = None,
     ) -> dict:
-        effective_key = ssh_key_path if ssh_key_path != "~/.ssh/id_rsa" else None
+        effective_key = get_default_ssh_key() if ssh_key_path is None else ssh_key_path
         result = await ssh.run(
             host,
             "echo SSH_OK",

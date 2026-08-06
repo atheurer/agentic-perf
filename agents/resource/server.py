@@ -25,6 +25,7 @@ if _project_root not in sys.path:
 from fastmcp import FastMCP
 
 from agents.server_utils import build_secrets_provider, build_ssh_from_ticket
+from paths import get_default_ssh_key
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +78,11 @@ FQDN_RE = re.compile(
 @mcp.tool()
 async def parse_host_config(text: str) -> str:
     """Extract structured host configuration from free-form text. Parses IP addresses, hostnames, roles (controller/target/client/server), SSH user, and SSH key path."""
-    default_key = "~/.ssh/id_ed25519"
-    config_path = Path.home() / ".agentic-perf" / "config.json"
-    if config_path.exists():
-        with open(config_path) as _f:
-            _cfg = json.load(_f)
-        default_key = _cfg.get("ssh_key_path", _cfg.get("ssh_key", default_key))
-
     result: dict[str, Any] = {
         "controller": None,
         "targets": [],
         "ssh_user": "root",
-        "ssh_key_path": default_key,
+        "ssh_key_path": get_default_ssh_key(),
     }
 
     lines = text.split("\n")

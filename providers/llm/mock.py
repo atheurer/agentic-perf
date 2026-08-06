@@ -23,7 +23,7 @@ MOCK_RESOURCE_RESULT = {
         "targets": ["10.0.5.3", "10.0.5.4"],
     },
     "ssh_user": "root",
-    "ssh_key_path": "~/.ssh/id_rsa",
+    "ssh_key_path": "~/.ssh/id_ed25519",
     "lease_expiration": "2026-06-09T00:00:00Z",
     "validation_results": {
         "10.0.5.2": {"reachable": True, "message": "Host validated (simulated)"},

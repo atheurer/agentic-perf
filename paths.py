@@ -47,3 +47,28 @@ def get_instance_name() -> str:
         except (json.JSONDecodeError, OSError):
             pass
     return socket.gethostname().split(".")[0]
+
+
+def get_default_ssh_key() -> str:
+    """Return the default SSH key path for this deployment.
+
+    Resolution order:
+    1. SSH_KEY env var
+    2. ssh_key_path in ~/.agentic-perf/config.json
+    3. ssh_key in ~/.agentic-perf/config.json
+    4. ~/.ssh/id_ed25519
+    """
+    env_val = os.environ.get("SSH_KEY")
+    if env_val:
+        return env_val
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+            if isinstance(cfg, dict):
+                for key in ("ssh_key_path", "ssh_key"):
+                    val = cfg.get(key)
+                    if val and isinstance(val, str):
+                        return val
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "~/.ssh/id_ed25519"
