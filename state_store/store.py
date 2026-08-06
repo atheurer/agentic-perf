@@ -35,6 +35,7 @@ class TicketStore:
         self,
         persist_dir: str | Path | None = None,
         audit_log: AuditLog | None = None,
+        event_bus: object | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
         self._lock = threading.Lock()
@@ -42,6 +43,7 @@ class TicketStore:
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._audit = audit_log
+        self._event_bus = event_bus
         self._load_from_disk()
 
     def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
@@ -163,6 +165,22 @@ class TicketStore:
                     "comment": request.comment,
                 },
             )
+
+            # Emit transition event so the dashboard
+            # breadcrumb trail is always complete,
+            # regardless of who initiated the transition.
+            if self._event_bus:
+                self._event_bus.emit(
+                    ticket_id,
+                    "system",
+                    "transition",
+                    {
+                        "from": old_status,
+                        "to": new_status.value,
+                        "comment": request.comment or "",
+                    },
+                )
+
             return ticket.model_copy()
 
     def update_fields(self, ticket_id: str, fields: dict) -> Ticket:

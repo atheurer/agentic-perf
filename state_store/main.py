@@ -184,8 +184,11 @@ def create_app() -> FastAPI:
 
     audit_log = AuditLog()
     app.state.audit_log = audit_log
-    app.state.store = TicketStore(audit_log=audit_log)
     app.state.event_bus = EventBus()
+    app.state.store = TicketStore(
+        audit_log=audit_log,
+        event_bus=app.state.event_bus,
+    )
     mount_routers(app, auth, rate_limit_dep)
 
     if STATIC_DIR.is_dir():
