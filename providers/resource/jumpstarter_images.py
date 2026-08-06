@@ -135,6 +135,7 @@ async def resolve_image_urls(
             r = await client.get(fallback_url)
             if r.status_code == 200:
                 manifest_url = fallback_url
+                release = fallback_release
 
         if r.status_code != 200:
             return {
