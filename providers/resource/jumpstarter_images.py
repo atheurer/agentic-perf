@@ -120,9 +120,46 @@ async def resolve_image_urls(
     ) as client:
         r = await client.get(manifest_url)
 
-        # Fallback: if the specific release 404s, try the
-        # latest symlink (e.g., latest-RHIVOS-2). Release
-        # labels in Horreum may not match exact server paths.
+        # Fallback chain when the specific release 404s:
+        # 1. Match by datestamp (e.g., latest-RHIVOS-2-202607240103
+        #    → latest-RHIVOS-2.1-202607240103). The on-host release
+        #    string may omit the minor version.
+        # 2. Use the latest symlink (e.g., latest-RHIVOS-2).
+        if r.status_code == 404 and release != "nightly":
+            # Extract datestamp and search for a matching release
+            import re as _re
+
+            date_match = _re.search(r"(\d{10,})", release)
+            if date_match:
+                datestamp = date_match.group(1)
+                listing_url = f"{base_url}/{image_version}/"
+                try:
+                    listing_r = await client.get(listing_url)
+                    if listing_r.status_code == 200:
+                        dir_matches = _re.findall(
+                            r'href="([^"]*' + datestamp + r'[^"]*/)"',
+                            listing_r.text,
+                        )
+                        if dir_matches:
+                            matched_dir = dir_matches[0].rstrip("/")
+                            # Strip leading path if present
+                            if "/" in matched_dir:
+                                matched_dir = matched_dir.split("/")[-1]
+                            datestamp_url = (
+                                f"{base_url}/{image_version}/{matched_dir}"
+                                f"/info/test_images_info.json"
+                            )
+                            logger.info(
+                                f"[images] Release {release} not found,"
+                                f" trying datestamp match: {matched_dir}"
+                            )
+                            r = await client.get(datestamp_url)
+                            if r.status_code == 200:
+                                manifest_url = datestamp_url
+                                release = matched_dir
+                except Exception:
+                    pass
+
         if r.status_code == 404 and release != "nightly":
             fallback_release = f"latest-{image_version}"
             fallback_url = (
