@@ -806,6 +806,52 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
+            name="disable_firewall",
+            description=(
+                "Flush all iptables/ip6tables rules and set default policies to ACCEPT "
+                "on a host. Use this on dedicated benchmark hosts before running "
+                "connectivity checks or benchmarks — fresh lab hosts often block "
+                "benchmark ports (30002/30003 for uperf, etc.) by default. "
+                "Do NOT call this on shared or production hosts."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                },
+                "required": ["host"],
+            },
+        ),
+        ToolDefinition(
+            name="open_firewall_port",
+            description=(
+                "Open specific TCP/UDP ports in iptables on a host without flushing "
+                "all rules. Use this when the host firewall should stay active but "
+                "benchmark ports need to be explicitly allowed. "
+                "For dedicated benchmark hosts with no firewall requirements, "
+                "disable_firewall is simpler."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP"},
+                    "ports": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "TCP port numbers to open (e.g. [30002, 30003] for uperf)",
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["tcp", "udp", "both"],
+                        "description": "Protocol to open (default: tcp)",
+                    },
+                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                },
+                "required": ["host", "ports"],
+            },
+        ),
+        ToolDefinition(
             name="tune_nic",
             description=(
                 "Apply ethtool NIC settings on a host for benchmark preparation. "
@@ -1858,6 +1904,70 @@ def create_provisioning_tool_handlers(
             return {"found": False, "message": "Invalid path"}
         return {"found": True, "filename": filename, "content": skill_path.read_text()}
 
+    async def disable_firewall(
+        host: str,
+        user: str = "root",
+    ) -> dict:
+        results = []
+        errors = []
+        for cmd, label in [
+            ("iptables -F",                    "iptables flush rules"),
+            ("iptables -X",                    "iptables delete chains"),
+            ("iptables -P INPUT ACCEPT",       "iptables INPUT accept"),
+            ("iptables -P FORWARD ACCEPT",     "iptables FORWARD accept"),
+            ("iptables -P OUTPUT ACCEPT",      "iptables OUTPUT accept"),
+            ("ip6tables -F 2>/dev/null",       "ip6tables flush rules"),
+            ("ip6tables -X 2>/dev/null",       "ip6tables delete chains"),
+            ("ip6tables -P INPUT ACCEPT 2>/dev/null",   "ip6tables INPUT accept"),
+            ("ip6tables -P FORWARD ACCEPT 2>/dev/null", "ip6tables FORWARD accept"),
+            ("ip6tables -P OUTPUT ACCEPT 2>/dev/null",  "ip6tables OUTPUT accept"),
+            ("systemctl stop firewalld 2>/dev/null; systemctl mask firewalld 2>/dev/null; true",
+             "firewalld stop+mask"),
+        ]:
+            r = await ssh.run(host, cmd + " 2>&1")
+            if r.exit_code == 0:
+                results.append(label)
+            else:
+                errors.append(f"{label}: {r.stdout.strip()}")
+
+        # Verify connectivity port is open
+        r_verify = await ssh.run(host, "iptables -L INPUT -n | head -5")
+        return {
+            "host": host,
+            "status": "error" if errors else "ok",
+            "applied": results,
+            "errors": errors,
+            "iptables_input": r_verify.stdout.strip(),
+        }
+
+    async def open_firewall_port(
+        host: str,
+        ports: list[int],
+        protocol: str = "tcp",
+        user: str = "root",
+    ) -> dict:
+        protos = ["tcp", "udp"] if protocol == "both" else [protocol]
+        applied = []
+        errors = []
+        for port in ports:
+            for proto in protos:
+                cmd = (
+                    f"iptables -C INPUT -p {proto} --dport {port} -j ACCEPT 2>/dev/null"
+                    f" || iptables -I INPUT -p {proto} --dport {port} -j ACCEPT"
+                )
+                r = await ssh.run(host, cmd + " 2>&1")
+                if r.exit_code == 0:
+                    applied.append(f"{proto}/{port}")
+                else:
+                    errors.append(f"{proto}/{port}: {r.stdout.strip()}")
+
+        return {
+            "host": host,
+            "status": "error" if errors else "ok",
+            "opened": applied,
+            "errors": errors,
+        }
+
     async def tune_nic(
         host: str,
         interface: str,
@@ -2452,6 +2562,8 @@ def create_provisioning_tool_handlers(
     handlers = {
         "list_skill_docs": list_skill_docs,
         "read_skill": read_skill,
+        "disable_firewall": disable_firewall,
+        "open_firewall_port": open_firewall_port,
         "tune_nic": tune_nic,
         "tune_tcp": tune_tcp,
         "pin_irq": pin_irq,

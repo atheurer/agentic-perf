@@ -682,6 +682,8 @@ async def test_all_tools_use_hosts_or_targets():
             "nm_set_dhcp",
             "nm_show_connection",
             "nm_verify_interface",
+            "disable_firewall",
+            "open_firewall_port",
         )
     ]
     for t in host_facing:
