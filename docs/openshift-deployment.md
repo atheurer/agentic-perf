@@ -253,6 +253,9 @@ spec:
               mkdir -p /opt/app-root/src/.config/jumpstarter/clients
               cp /ext-secrets/jumpstarter/perf-ci.yaml /opt/app-root/src/.config/jumpstarter/clients/perf-ci.yaml
               cp /ext-secrets/jumpstarter/config.yaml /opt/app-root/src/.config/jumpstarter/config.yaml
+
+              # Ensure secrets are readable by group 0 (OpenShift arbitrary UIDs)
+              chmod -R g+rX /data/agentic-perf/secrets
           volumeMounts:
             - name: data
               mountPath: /data/agentic-perf
