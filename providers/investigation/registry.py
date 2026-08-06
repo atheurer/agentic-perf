@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 from typing import Any
 
 from paths import CONFIG_PATH as _CONFIG_PATH
@@ -84,6 +85,28 @@ def _create_single_provider(
 
     # Pass all config except "backend" to the constructor
     kwargs = {k: v for k, v in config.items() if k != "backend"}
+
+    # Resolve token from secret file if "secret" is set
+    # and "token" is not already provided.
+    secret_path = kwargs.pop("secret", "")
+    if secret_path and not kwargs.get("token"):
+        from pathlib import Path
+
+        secrets_dir = (
+            Path(
+                os.environ.get(
+                    "AGENTIC_PERF_HOME",
+                    str(Path.home() / ".agentic-perf"),
+                )
+            )
+            / "secrets"
+        )
+        token_file = secrets_dir / secret_path
+        if token_file.exists():
+            kwargs["token"] = token_file.read_text().strip()
+            logger.info(f"[investigation] Loaded token from {token_file}")
+        else:
+            logger.warning(f"[investigation] Secret file not found: {token_file}")
 
     module_path, cls_name = entry["class"].rsplit(".", 1)
     module = importlib.import_module(module_path)
