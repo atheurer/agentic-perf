@@ -1517,6 +1517,38 @@ async def execute_benchmark(
             f"[benchmark] Stopped stale crucible-valkey container on {controller}"
         )
 
+    # Restart OpenSearch before every run to ensure the CDM server (and its
+    # node_modules) is freshly started alongside it. crucible's start_opensearch
+    # only calls start_cdm_server when OpenSearch is not already running; if a
+    # previous run left OpenSearch up, the CDM server may be absent, causing
+    # add-run.sh to fail with "node_modules not found" at indexing time.
+    # Stopping first guarantees a clean start_opensearch → start_cdm_server sequence.
+    logger.info(
+        f"[benchmark] Cycling OpenSearch on {controller} to ensure CDM server is fresh"
+    )
+    await _ssh.run(controller, "crucible stop opensearch 2>/dev/null || true", timeout=60)
+    # Wait up to 30s for the container to be fully gone
+    for _ in range(6):
+        gone = await _ssh.run(
+            controller,
+            "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-opensearch"
+            " && echo RUNNING || echo GONE",
+        )
+        if "GONE" in (gone.stdout or ""):
+            break
+        import asyncio as _asyncio
+        await _asyncio.sleep(5)
+    start_result = await _ssh.run(
+        controller, "crucible start opensearch 2>&1", timeout=180
+    )
+    if "Successfully started OpenSearch" not in (start_result.stdout or ""):
+        logger.warning(
+            f"[benchmark] OpenSearch may not have started cleanly: "
+            f"{(start_result.stdout or '')[-200:]}"
+        )
+    else:
+        logger.info(f"[benchmark] OpenSearch and CDM server started on {controller}")
+
     cmd = f"{run_command or 'crucible run'} {remote_path}"
     logger.info(f"[benchmark] Executing: {cmd}")
     result = await _ssh.run_with_progress(
