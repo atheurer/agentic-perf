@@ -170,16 +170,19 @@ class TicketStore:
             # breadcrumb trail is always complete,
             # regardless of who initiated the transition.
             if self._event_bus:
-                self._event_bus.emit(
-                    ticket_id,
-                    "system",
-                    "transition",
-                    {
-                        "from": old_status,
-                        "to": new_status.value,
-                        "comment": request.comment or "",
-                    },
-                )
+                try:
+                    self._event_bus.emit(
+                        ticket_id,
+                        "system",
+                        "transition",
+                        {
+                            "from": old_status,
+                            "to": new_status.value,
+                            "comment": request.comment or "",
+                        },
+                    )
+                except Exception as e:
+                    logger.exception(f"[store] Failed to emit transition event: {e}")
 
             return ticket.model_copy()
 

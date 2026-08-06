@@ -1095,10 +1095,10 @@ class TestLLMIntegration:
         assert summary["verdict"] == "clean"
         assert summary["stats"]["total_events"] == 2
 
-    async def test_usage_recording(self) -> None:
+    async def test_usage_recording(self, tmp_path) -> None:
         from providers.events import EventBus
 
-        bus = EventBus()
+        bus = EventBus(log_dir=tmp_path)
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
             event_bus=bus,
@@ -1118,11 +1118,11 @@ class TestLLMIntegration:
         agent_usage = bus.get_agent_usage("PERF-1")
         assert "introspection-agent" in agent_usage
 
-    async def test_usage_recording_object_usage(self) -> None:
+    async def test_usage_recording_object_usage(self, tmp_path) -> None:
         """_record_usage handles usage as an object with attributes."""
         from providers.events import EventBus
 
-        bus = EventBus()
+        bus = EventBus(log_dir=tmp_path)
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
             event_bus=bus,
