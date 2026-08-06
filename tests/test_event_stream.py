@@ -1,7 +1,7 @@
 """Tests for SSE event stream endpoint.
 
 Covers: event polling, multi-ticket mode, type filtering,
-since cursor, zero emit() calls from state store, and
+since cursor, zero emit() calls from stream module, and
 streaming via a real uvicorn server.
 """
 

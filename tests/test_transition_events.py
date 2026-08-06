@@ -1,10 +1,9 @@
 """Tests for transition event emission.
 
-Verifies that transition events are emitted by the agent's
-EventBus (orchestrator-side), not by the state store.  This
-ensures all events share a single sequence counter, preventing
-seq collisions that drop events or cause the UI to miss
-transitions.
+Verifies that transition events are emitted exactly once per
+status change.  Since 81fce78, the state store emits transition
+events directly in ``transition_ticket`` — callers (agents,
+orchestrator) no longer emit their own copies.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ import pytest
 from agents.base import AgentBase
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
+from state_store.store import TicketStore
 
 
 class _StubAgent(AgentBase):
@@ -65,11 +66,11 @@ def agent(event_bus: EventBus) -> _StubAgent:
     )
 
 
-async def test_transition_emits_event(
+async def test_agent_transition_does_not_emit(
     agent: _StubAgent,
     event_bus: EventBus,
 ) -> None:
-    """_transition_ticket emits a transition event through the EventBus."""
+    """Agent _transition_ticket no longer emits — the store handles it."""
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
     mock_response.json.return_value = {"status": "awaiting_hardware"}
@@ -84,38 +85,38 @@ async def test_transition_emits_event(
         )
 
     events = event_bus.get_events("TICKET-1")
-    assert len(events) == 1
-    evt = events[0]
-    assert evt["event_type"] == "transition"
-    assert evt["data"]["to"] == "awaiting_hardware"
-    assert evt["data"]["comment"] == "triage complete"
-    assert evt["data"]["ticket_id"] == "TICKET-1"
+    assert len(events) == 0
 
 
-async def test_transition_events_share_seq_with_agent_events(
-    agent: _StubAgent,
+async def test_store_transition_emits_exactly_one_event(
     event_bus: EventBus,
 ) -> None:
-    """Transition events use the same seq counter as agent events."""
-    # Emit an agent event first
-    event_bus.emit("TICKET-1", "triage-agent", "agent_started", {})
+    """One store transition → exactly one transition event in the log."""
+    store = TicketStore(event_bus=event_bus)
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="Test ticket", description="test"),
+    )
+    tid = ticket.id
 
-    mock_response = MagicMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json.return_value = {"status": "awaiting_hardware"}
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.TRIAGE_PENDING),
+    )
+    store.transition_ticket(
+        tid,
+        TransitionRequest(
+            status=TicketStatus.AWAITING_HARDWARE,
+            comment="triage done",
+        ),
+    )
 
-    with patch.object(
-        agent._client, "post", new_callable=AsyncMock, return_value=mock_response
-    ):
-        await agent._transition_ticket("TICKET-1", "awaiting_hardware")
-
-    events = event_bus.get_events("TICKET-1")
-    assert len(events) == 2
-    # Seq numbers should be monotonically increasing from the same counter
-    assert events[0]["seq"] == 1
-    assert events[1]["seq"] == 2
-    assert events[0]["event_type"] == "agent_started"
-    assert events[1]["event_type"] == "transition"
+    events = event_bus.get_events(tid)
+    transition_events = [e for e in events if e.get("event_type") == "transition"]
+    assert len(transition_events) == 2
+    evt = transition_events[1]
+    assert evt["data"]["to"] == "awaiting_hardware"
+    assert evt["data"]["from"] == "triage_pending"
+    assert evt["data"]["comment"] == "triage done"
 
 
 async def test_no_event_without_event_bus() -> None:
@@ -137,3 +138,34 @@ async def test_no_event_without_event_bus() -> None:
         result = await agent._transition_ticket("TICKET-1", "awaiting_hardware")
 
     assert result["status"] == "awaiting_hardware"
+
+
+async def test_store_no_double_emit_on_consecutive_transitions(
+    event_bus: EventBus,
+) -> None:
+    """Three consecutive transitions produce exactly three transition events."""
+    store = TicketStore(event_bus=event_bus)
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="Test ticket", description="test"),
+    )
+    tid = ticket.id
+
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.TRIAGE_PENDING),
+    )
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.AWAITING_HARDWARE),
+    )
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.AWAITING_PROVISION),
+    )
+
+    events = event_bus.get_events(tid)
+    transition_events = [e for e in events if e.get("event_type") == "transition"]
+    assert len(transition_events) == 3
+    assert transition_events[0]["data"]["to"] == "triage_pending"
+    assert transition_events[1]["data"]["to"] == "awaiting_hardware"
+    assert transition_events[2]["data"]["to"] == "awaiting_provision"

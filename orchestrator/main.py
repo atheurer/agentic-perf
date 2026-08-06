@@ -290,17 +290,6 @@ def _advance_plan(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={"status": next_status, "comment": comment},
                 )
-                if event_bus:
-                    event_bus.emit(
-                        ticket_id,
-                        "orchestrator",
-                        "transition",
-                        {
-                            "to": next_status,
-                            "comment": comment,
-                            "ticket_id": ticket_id,
-                        },
-                    )
                 return
 
         client.patch(
@@ -566,17 +555,6 @@ async def _transition_to_guidance(
             f"Failed to transition {ticket_id} to awaiting_customer_guidance"
         )
         return
-    if event_bus:
-        event_bus.emit(
-            ticket_id,
-            "orchestrator",
-            "transition",
-            {
-                "to": "awaiting_customer_guidance",
-                "comment": comment,
-                "ticket_id": ticket_id,
-            },
-        )
 
 
 async def _check_stale_tasks(
@@ -705,17 +683,6 @@ async def _block_absent_suite(
                 "comment": "Absent benchmark suite — no harness can run this",
             },
         )
-        if event_bus:
-            event_bus.emit(
-                ticket_id,
-                "orchestrator",
-                "transition",
-                {
-                    "to": "awaiting_customer_guidance",
-                    "comment": "Absent benchmark suite — no harness can run this",
-                    "ticket_id": ticket_id,
-                },
-            )
 
 
 # Jumpstarter lifecycle functions extracted to
@@ -810,17 +777,6 @@ async def _block_handoff_failed(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={"status": retry_status, "comment": rewind_comment},
             )
-            if event_bus:
-                event_bus.emit(
-                    ticket_id,
-                    "orchestrator",
-                    "transition",
-                    {
-                        "to": retry_status,
-                        "comment": rewind_comment,
-                        "ticket_id": ticket_id,
-                    },
-                )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -841,17 +797,6 @@ async def _block_handoff_failed(
                 "comment": block_comment,
             },
         )
-        if event_bus:
-            event_bus.emit(
-                ticket_id,
-                "orchestrator",
-                "transition",
-                {
-                    "to": "awaiting_customer_guidance",
-                    "comment": block_comment,
-                    "ticket_id": ticket_id,
-                },
-            )
 
 
 async def _process_stop_requests(
