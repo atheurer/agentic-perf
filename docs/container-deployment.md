@@ -80,7 +80,12 @@ Mount a volume at `/data/agentic-perf` for:
 
 ## OpenShift deployment
 
-### Via web UI
+For a comprehensive OpenShift deployment guide covering secrets
+management, init containers, troubleshooting, and lessons learned
+from production deployment, see
+[OpenShift Deployment Guide](openshift-deployment.md).
+
+### Quick start via web UI
 
 1. **Create project:** e.g., `agentic-perf`
 2. **Add to project → Import from Git:**
