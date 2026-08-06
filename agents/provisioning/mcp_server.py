@@ -882,7 +882,10 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                 "type": "object",
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP"},
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
                 },
                 "required": ["host"],
             },
@@ -910,7 +913,10 @@ def get_provisioning_tools() -> list[ToolDefinition]:
                         "enum": ["tcp", "udp", "both"],
                         "description": "Protocol to open (default: tcp)",
                     },
-                    "user": {"type": "string", "description": "SSH user (default: root)"},
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user (default: root)",
+                    },
                 },
                 "required": ["host", "ports"],
             },
@@ -1975,16 +1981,34 @@ def create_provisioning_tool_handlers(
             filename = doc.get("filename", "")
             skill_path = _SKILLS_DIR / harness / filename
             if not skill_path.is_file():
-                results.append({"harness": harness, "filename": filename, "found": False,
-                                "message": f"Skill not found: {harness}/{filename}"})
+                results.append(
+                    {
+                        "harness": harness,
+                        "filename": filename,
+                        "found": False,
+                        "message": f"Skill not found: {harness}/{filename}",
+                    }
+                )
                 continue
             resolved = skill_path.resolve()
             if not str(resolved).startswith(str(_SKILLS_DIR.resolve())):
-                results.append({"harness": harness, "filename": filename,
-                                "found": False, "message": "Invalid path"})
+                results.append(
+                    {
+                        "harness": harness,
+                        "filename": filename,
+                        "found": False,
+                        "message": "Invalid path",
+                    }
+                )
                 continue
-            results.append({"harness": harness, "filename": filename, "found": True,
-                            "content": skill_path.read_text()})
+            results.append(
+                {
+                    "harness": harness,
+                    "filename": filename,
+                    "found": True,
+                    "content": skill_path.read_text(),
+                }
+            )
         return results
 
     async def tune_hosts(targets: list[dict]) -> dict:
@@ -1993,7 +2017,6 @@ def create_provisioning_tool_handlers(
         hosts = []
         for t in targets:
             host = t.get("host", "")
-            interface = t.get("interface", "")
             hosts.append(host)
 
             async def _tune_one(t=t) -> dict:
@@ -2067,7 +2090,9 @@ def create_provisioning_tool_handlers(
                 if t.get("irq_cpu") is not None:
                     expected["irq_cpu"] = t["irq_cpu"]
                 if expected:
-                    r = await verify_host_tuning(host=h, interface=iface, expected=expected)
+                    r = await verify_host_tuning(
+                        host=h, interface=iface, expected=expected
+                    )
                     steps.append({"verify": r})
                     if not r.get("all_ok"):
                         errors.append(f"Verification failed: {r.get('checks', {})}")
@@ -2091,7 +2116,7 @@ def create_provisioning_tool_handlers(
         success = sum(1 for r in results.values() if r.get("status") == "ok")
         return {
             "results": results,
-            "summary": f"{len(results)} host(s): {success} ok, {len(results)-success} failed",
+            "summary": f"{len(results)} host(s): {success} ok, {len(results) - success} failed",
         }
 
     async def disable_firewall(
@@ -2101,18 +2126,20 @@ def create_provisioning_tool_handlers(
         results = []
         errors = []
         for cmd, label in [
-            ("iptables -F",                    "iptables flush rules"),
-            ("iptables -X",                    "iptables delete chains"),
-            ("iptables -P INPUT ACCEPT",       "iptables INPUT accept"),
-            ("iptables -P FORWARD ACCEPT",     "iptables FORWARD accept"),
-            ("iptables -P OUTPUT ACCEPT",      "iptables OUTPUT accept"),
-            ("ip6tables -F 2>/dev/null",       "ip6tables flush rules"),
-            ("ip6tables -X 2>/dev/null",       "ip6tables delete chains"),
-            ("ip6tables -P INPUT ACCEPT 2>/dev/null",   "ip6tables INPUT accept"),
+            ("iptables -F", "iptables flush rules"),
+            ("iptables -X", "iptables delete chains"),
+            ("iptables -P INPUT ACCEPT", "iptables INPUT accept"),
+            ("iptables -P FORWARD ACCEPT", "iptables FORWARD accept"),
+            ("iptables -P OUTPUT ACCEPT", "iptables OUTPUT accept"),
+            ("ip6tables -F 2>/dev/null", "ip6tables flush rules"),
+            ("ip6tables -X 2>/dev/null", "ip6tables delete chains"),
+            ("ip6tables -P INPUT ACCEPT 2>/dev/null", "ip6tables INPUT accept"),
             ("ip6tables -P FORWARD ACCEPT 2>/dev/null", "ip6tables FORWARD accept"),
-            ("ip6tables -P OUTPUT ACCEPT 2>/dev/null",  "ip6tables OUTPUT accept"),
-            ("systemctl stop firewalld 2>/dev/null; systemctl mask firewalld 2>/dev/null; true",
-             "firewalld stop+mask"),
+            ("ip6tables -P OUTPUT ACCEPT 2>/dev/null", "ip6tables OUTPUT accept"),
+            (
+                "systemctl stop firewalld 2>/dev/null; systemctl mask firewalld 2>/dev/null; true",
+                "firewalld stop+mask",
+            ),
         ]:
             r = await ssh.run(host, cmd + " 2>&1")
             if r.exit_code == 0:
