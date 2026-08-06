@@ -683,6 +683,8 @@ async def test_all_tools_use_hosts_or_targets():
             "nm_show_connection",
             "nm_verify_interface",
             "disable_firewall",
+            "read_skills",
+            "tune_hosts",
             "open_firewall_port",
         )
     ]

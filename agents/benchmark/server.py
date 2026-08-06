@@ -231,6 +231,29 @@ async def read_skill(harness: str, filename: str) -> str:
 
 
 @mcp.tool()
+async def read_skills(docs: list[dict]) -> str:
+    """Read multiple skill documents in one call. Each entry must have 'harness' and 'filename'. Use this instead of calling read_skill repeatedly — it saves iterations when you need several docs (e.g. host-tuning + uperf-run-file + run-file-pitfalls in one call)."""
+    await _ensure_init()
+    results = []
+    for doc in docs:
+        harness = doc.get("harness", "")
+        filename = doc.get("filename", "")
+        skill_path = SKILLS_DIR / harness / filename
+        if not skill_path.is_file():
+            results.append({"harness": harness, "filename": filename, "found": False,
+                            "message": f"Skill not found: {harness}/{filename}"})
+            continue
+        resolved = skill_path.resolve()
+        if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
+            results.append({"harness": harness, "filename": filename, "found": False,
+                            "message": "Invalid path"})
+            continue
+        results.append({"harness": harness, "filename": filename, "found": True,
+                        "content": skill_path.read_text()})
+    return json.dumps(results)
+
+
+@mcp.tool()
 async def list_harness_docs(harness: str) -> str:
     """List documentation files available for a benchmark harness. Returns file paths and sizes. Use this to discover what reference material is available before constructing a run file."""
     await _ensure_init()

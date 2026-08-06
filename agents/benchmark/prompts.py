@@ -130,9 +130,14 @@ to construct a correct run file — getting the format right is critical.
        endpoints, schema errors), call `request_clarification` to escalate.
      - If you cannot determine the cause, call `request_clarification` with the
        relevant log excerpt so the user can investigate.
-   - If status is "failed" with a non-zero exit code, you may also call
-     `get_run_logs(controller, run_id, max_kb=100)` for more context before
-     deciding to retry or escalate.
+   - If `execute_benchmark` returns a non-zero `exit_code`, call
+     `submit_benchmark_result` immediately with status "failed" and the error
+     message from the response. Do NOT call `get_run_logs`, do NOT attempt to
+     read files from the run directory, do NOT query OpenSearch. There are no
+     results to extract from a failed run and doing so wastes iterations.
+     The only exception: if the exit_code is non-zero but `run_id` is present
+     and the message indicates only the indexing step failed (not the benchmark
+     itself), call `request_clarification` to let the user decide.
    - **Never submit status "completed" unless the result_summary is present.**
 
    **IMPORTANT: Your job ends here.** Do NOT analyze results, query metrics,
