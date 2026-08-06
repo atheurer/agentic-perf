@@ -2478,7 +2478,7 @@ var STATUS_AGENT_NAME = {
 };
 
 function appendTransitionTrail(status) {
-  if (trailStates.length && trailStates[trailStates.length - 1] === status) return;
+  if (trailStates.indexOf(status) !== -1) return;
   trailStates.push(status);
   rebuildTrail();
 }
