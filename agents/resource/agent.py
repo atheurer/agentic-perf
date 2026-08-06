@@ -11,6 +11,7 @@ from agents.infra.server import cleanup_passwordless_ssh
 from agents.mcp_client import AgentMCPClient
 from agents.provisioning.mcp_server import cleanup_harness
 from agents.server_utils import _resolve_vault_secret_name, resolve_ssh_key
+from paths import get_default_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 from providers.resource.registry import ResourceProviderRegistry
@@ -568,14 +569,14 @@ class ResourceAgent(AgentBase):
             result = {
                 "assigned_hardware_ips": {},
                 "ssh_user": "root",
-                "ssh_key_path": "~/.ssh/id_rsa",
+                "ssh_key_path": get_default_ssh_key(),
                 "notes": "Could not produce structured output",
             }
 
         fields: dict[str, Any] = {
             "assigned_hardware_ips": result.get("assigned_hardware_ips", {}),
             "ssh_user": result.get("ssh_user", "root"),
-            "ssh_key_path": result.get("ssh_key_path", "~/.ssh/id_rsa"),
+            "ssh_key_path": result.get("ssh_key_path") or get_default_ssh_key(),
             "lease_expiration": result.get("lease_expiration"),
             "resource_provider": result.get("resource_provider", "user_provided"),
         }

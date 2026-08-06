@@ -1567,3 +1567,166 @@ class TestRegistryWithPSAPCC:
             "aws": "cloud",
             "psap-cc": "gpu_cluster",
         }
+
+
+# ---------------------------------------------------------------------------
+# SSH key default resolution (issue #382)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDefaultSshKey:
+    """Tests for paths.get_default_ssh_key()."""
+
+    def test_fallback_to_ed25519(self, monkeypatch, tmp_path):
+        import paths
+
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        monkeypatch.setattr(paths, "CONFIG_PATH", tmp_path / "missing.json")
+        assert paths.get_default_ssh_key() == "~/.ssh/id_ed25519"
+
+    def test_env_var_overrides_all(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"ssh_key_path": "/config/key"}))
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.setenv("SSH_KEY", "/env/key")
+        assert paths.get_default_ssh_key() == "/env/key"
+
+    def test_config_ssh_key_path(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"ssh_key_path": "/config/key.pem"}))
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "/config/key.pem"
+
+    def test_config_ssh_key_fallback(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"ssh_key": "/alt/key"}))
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "/alt/key"
+
+    def test_config_ssh_key_path_takes_priority(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "ssh_key_path": "/primary",
+                    "ssh_key": "/secondary",
+                }
+            )
+        )
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "/primary"
+
+    def test_corrupt_config_falls_through(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text("NOT JSON")
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "~/.ssh/id_ed25519"
+
+    def test_non_dict_config_falls_through(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text("[]")
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "~/.ssh/id_ed25519"
+
+    def test_non_string_value_falls_through(self, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"ssh_key_path": 123}))
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        assert paths.get_default_ssh_key() == "~/.ssh/id_ed25519"
+
+
+class TestParseHostConfigDefault:
+    """parse_host_config uses get_default_ssh_key(), not a hardcoded value."""
+
+    @pytest.mark.asyncio
+    async def test_default_from_config(self, no_secrets, monkeypatch, tmp_path):
+        import paths
+
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"ssh_key_path": "/custom/key.pem"}))
+        monkeypatch.setattr(paths, "CONFIG_PATH", config)
+        monkeypatch.delenv("SSH_KEY", raising=False)
+
+        from agents.resource.mcp_server import create_resource_tool_handlers
+
+        handlers, *_ = create_resource_tool_handlers(
+            secrets_provider=no_secrets,
+        )
+        result = await handlers["parse_host_config"](text="controller: 10.1.2.3")
+        assert result["ssh_key_path"] == "/custom/key.pem"
+
+    @pytest.mark.asyncio
+    async def test_inline_key_overrides_default(
+        self, no_secrets, monkeypatch, tmp_path
+    ):
+        import paths
+
+        monkeypatch.delenv("SSH_KEY", raising=False)
+        monkeypatch.setattr(paths, "CONFIG_PATH", tmp_path / "none.json")
+
+        from agents.resource.mcp_server import create_resource_tool_handlers
+
+        handlers, *_ = create_resource_tool_handlers(
+            secrets_provider=no_secrets,
+        )
+        result = await handlers["parse_host_config"](
+            text="controller: 10.1.2.3\nssh_key: /inline/key"
+        )
+        assert result["ssh_key_path"] == "/inline/key"
+
+
+class TestValidateHostKeyPassthrough:
+    """validate_host must pass an explicitly-provided key through to ssh.run.
+
+    Regression test for the sentinel bug: previously, passing the same
+    value as the hardcoded default caused the key to be silently discarded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_key_passed_through(self, no_secrets, monkeypatch):
+        from providers.ssh import SSHExecutor
+
+        ssh_mock = AsyncMock(spec=SSHExecutor)
+        ssh_mock.run = AsyncMock(
+            return_value=MagicMock(
+                exit_code=0,
+                stdout="SSH_OK\nhostname.example.com\nRHEL 9",
+                stderr="",
+            )
+        )
+        monkeypatch.setattr(
+            "agents.resource.mcp_server.SSHExecutor",
+            lambda **kw: ssh_mock,
+        )
+
+        from agents.resource.mcp_server import create_resource_tool_handlers
+
+        handlers, *_ = create_resource_tool_handlers(
+            secrets_provider=no_secrets,
+        )
+        await handlers["validate_host"](
+            host="10.0.0.1",
+            ssh_key_path="~/.ssh/id_rsa",
+        )
+        call_kwargs = ssh_mock.run.call_args
+        assert call_kwargs.kwargs.get("key_path") == "~/.ssh/id_rsa"
