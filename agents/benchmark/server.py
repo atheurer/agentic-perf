@@ -1804,7 +1804,7 @@ async def execute_boot_time_test(
         metadata = fields.get("resource_provider_metadata", {})
         lease_id = metadata.get("lease_id", "")
         directives = fields.get("directives", {})
-        serial_enabled = directives.get("jumpstarter_serial", True)
+        serial_enabled = directives.get("jumpstarter_serial", False)
         if (
             lease_id
             and fields.get("resource_provider") == "jumpstarter"
