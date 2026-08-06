@@ -127,6 +127,10 @@ Important:
   uninstall_harness, verify_harness_install, check_existing_install, and
   update_install so the tool enforces this automatically.
 - Installation can take several minutes — be patient.
+- On freshly provisioned or QUADS-allocated hosts, call disable_firewall on
+  ALL endpoint hosts (client and server) before connectivity checks or
+  benchmarks. Fresh lab hosts block benchmark ports (uperf uses 30002/30003)
+  by default. Do NOT call on shared or production hosts.
 - If the ticket requests host tuning (BBR, IRQ pinning, NIC settings), read
   `general/host-tuning.md` via read_skill BEFORE calling any tuning tools.
   It defines the required ordering (tune_nic → pin_irq) and irqbalance strategy.

@@ -13,6 +13,32 @@ For example:
 - Using `cpu` with mpstat will fail; using `num` with
   procstat will fail
 
+## mpstat::Busy-CPU — aggregation bug (use "sum")
+
+**Known bug (perftool-incubator/tool-sysstat#65):** `mpstat::Busy-CPU`
+is stored with `default-aggregation: avg`, but the underlying data is
+one sample per CPU type (usr, sys, soft, irq, …). These types are
+mutually exclusive time slices that together sum to total CPU busy time.
+Averaging them instead of summing them produces a value ~4× too low
+(e.g., 25% instead of 99% for a saturated core).
+
+**Workaround — always pass `"aggregation": "sum"`** when querying
+`mpstat::Busy-CPU` without `type` in the breakout:
+
+```json
+{
+  "source": "mpstat",
+  "type": "Busy-CPU",
+  "breakout": ["hostname", "num=195"],
+  "aggregation": "sum",
+  "resolution": 180
+}
+```
+
+Alternatively, include `"type"` in the breakout to get per-mode values
+and sum them manually. Do NOT rely on the default aggregation for this
+metric.
+
 **For every new source:type combination you query**, first
 query WITHOUT breakouts to discover what's available via
 `remainingBreakouts`. That list ONLY applies to that
