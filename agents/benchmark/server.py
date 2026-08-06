@@ -1793,15 +1793,11 @@ async def execute_boot_time_test(
         cmd.append("--clean-journal=true")
 
     # Auto-enable Jumpstarter serial capture when a
-    # Jumpstarter lease is active. Serial data is written
-    # to files — it does NOT flow into LLM context.
-    #
-    # When the Jumpstarter MCP connection is active, the
-    # socket is at /tmp/jumpstarter-*/socket. Pass it as
-    # JUMPSTARTER_HOST so boot-timings-test.sh uses the
-    # existing connection instead of creating a new one
-    # via `jmp shell --lease` (which would conflict with
-    # the active MCP connection).
+    # Jumpstarter lease is active. Always use the lease
+    # name so the harness creates its own scoped connection.
+    # Do NOT search for existing sockets in /tmp/ — with
+    # concurrent tickets, a socket from another ticket's
+    # platform agent could be found and then go stale.
     jumpstarter_env: dict[str, str] = {}
     if _ticket:
         fields = _ticket.get("custom_fields", {})
@@ -1815,41 +1811,10 @@ async def execute_boot_time_test(
             and serial_enabled
         ):
             cmd.append("--jumpstarter-serial")
-            # Find an active Jumpstarter socket. The
-            # provisioning agent's MCP subprocess may
-            # have exited, leaving a dead socket file.
-            # Verify connectivity before using it.
-            import socket as _sock
-
-            jmp_sockets = sorted(
-                Path("/tmp").glob("jumpstarter-*/socket"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
+            cmd.append(f"--jumpstarter-lease-name={lease_id}")
+            logger.info(
+                f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
             )
-            live_socket = None
-            for sp in jmp_sockets:
-                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-                try:
-                    s.connect(str(sp))
-                    s.close()
-                    live_socket = sp
-                    break
-                except (OSError, ConnectionRefusedError):
-                    s.close()
-                    continue
-
-            if live_socket:
-                jumpstarter_env["JUMPSTARTER_HOST"] = str(live_socket)
-                logger.info(f"[boot-time] Using live Jumpstarter socket: {live_socket}")
-            else:
-                # No live socket — fall back to jmp shell
-                # which creates a new connection from the
-                # lease.
-                cmd.append(f"--jumpstarter-lease-name={lease_id}")
-                logger.info(
-                    "[boot-time] No live Jumpstarter socket "
-                    "found, using --jumpstarter-lease-name"
-                )
 
     # Separator for boot-time-analysis-tools arguments
     cmd.append("--")
