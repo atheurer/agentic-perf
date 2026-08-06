@@ -112,18 +112,14 @@ def _create_single_provider(
                 )
                 token_file = None
         except Exception as e:
-            logger.warning(
-                f"[investigation] Invalid secret path {secret_path}: {e}"
-            )
+            logger.warning(f"[investigation] Invalid secret path {secret_path}: {e}")
             token_file = None
 
         if token_file and token_file.exists():
             kwargs["token"] = token_file.read_text().strip()
             logger.info(f"[investigation] Loaded token from {token_file}")
         elif token_file:
-            logger.warning(
-                f"[investigation] Secret file not found: {token_file}"
-            )
+            logger.warning(f"[investigation] Secret file not found: {token_file}")
 
     module_path, cls_name = entry["class"].rsplit(".", 1)
     module = importlib.import_module(module_path)
