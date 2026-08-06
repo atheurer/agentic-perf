@@ -240,16 +240,34 @@ async def read_skills(docs: list[dict]) -> str:
         filename = doc.get("filename", "")
         skill_path = SKILLS_DIR / harness / filename
         if not skill_path.is_file():
-            results.append({"harness": harness, "filename": filename, "found": False,
-                            "message": f"Skill not found: {harness}/{filename}"})
+            results.append(
+                {
+                    "harness": harness,
+                    "filename": filename,
+                    "found": False,
+                    "message": f"Skill not found: {harness}/{filename}",
+                }
+            )
             continue
         resolved = skill_path.resolve()
         if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
-            results.append({"harness": harness, "filename": filename, "found": False,
-                            "message": "Invalid path"})
+            results.append(
+                {
+                    "harness": harness,
+                    "filename": filename,
+                    "found": False,
+                    "message": "Invalid path",
+                }
+            )
             continue
-        results.append({"harness": harness, "filename": filename, "found": True,
-                        "content": skill_path.read_text()})
+        results.append(
+            {
+                "harness": harness,
+                "filename": filename,
+                "found": True,
+                "content": skill_path.read_text(),
+            }
+        )
     return json.dumps(results)
 
 
@@ -1549,7 +1567,9 @@ async def execute_benchmark(
     logger.info(
         f"[benchmark] Cycling OpenSearch on {controller} to ensure CDM server is fresh"
     )
-    await _ssh.run(controller, "crucible stop opensearch 2>/dev/null || true", timeout=60)
+    await _ssh.run(
+        controller, "crucible stop opensearch 2>/dev/null || true", timeout=60
+    )
     # Wait up to 30s for the container to be fully gone
     for _ in range(6):
         gone = await _ssh.run(
@@ -1560,6 +1580,7 @@ async def execute_benchmark(
         if "GONE" in (gone.stdout or ""):
             break
         import asyncio as _asyncio
+
         await _asyncio.sleep(5)
     start_result = await _ssh.run(
         controller, "crucible start opensearch 2>&1", timeout=180
