@@ -806,6 +806,70 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
+            name="read_skills",
+            description=(
+                "Read multiple skill documents in one call. Use this instead of calling "
+                "read_skill repeatedly — saves iterations when you need several docs at once "
+                "(e.g. general/host-tuning.md + general/network-manager.md in one call)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "docs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "harness": {"type": "string"},
+                                "filename": {"type": "string"},
+                            },
+                            "required": ["harness", "filename"],
+                        },
+                        "description": "List of {harness, filename} pairs to read",
+                    },
+                },
+                "required": ["docs"],
+            },
+        ),
+        ToolDefinition(
+            name="tune_hosts",
+            description=(
+                "Apply tuning to multiple hosts in one call. Runs tune_nic → tune_tcp → "
+                "pin_irq → disable_firewall (if requested) → verify_host_tuning for each "
+                "host concurrently. Use this instead of calling individual tuning tools "
+                "one host at a time — saves multiple iterations. "
+                "Always read general/host-tuning.md before calling this."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "description": "Per-host tuning specifications",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "host": {"type": "string"},
+                                "interface": {"type": "string"},
+                                "channels": {"type": "integer"},
+                                "congestion_control": {"type": "string"},
+                                "qdisc": {"type": "string"},
+                                "irq_cpu": {"type": "integer"},
+                                "irqbalance_mode": {
+                                    "type": "string",
+                                    "enum": ["ban_irq", "ban_cpu", "disable"],
+                                },
+                                "mtu": {"type": "integer"},
+                                "disable_firewall": {"type": "boolean"},
+                            },
+                            "required": ["host", "interface"],
+                        },
+                    },
+                },
+                "required": ["targets"],
+            },
+        ),
+        ToolDefinition(
             name="disable_firewall",
             description=(
                 "Flush all iptables/ip6tables rules and set default policies to ACCEPT "
@@ -1904,6 +1968,132 @@ def create_provisioning_tool_handlers(
             return {"found": False, "message": "Invalid path"}
         return {"found": True, "filename": filename, "content": skill_path.read_text()}
 
+    async def read_skills(docs: list[dict]) -> list:
+        results = []
+        for doc in docs:
+            harness = doc.get("harness", "")
+            filename = doc.get("filename", "")
+            skill_path = _SKILLS_DIR / harness / filename
+            if not skill_path.is_file():
+                results.append({"harness": harness, "filename": filename, "found": False,
+                                "message": f"Skill not found: {harness}/{filename}"})
+                continue
+            resolved = skill_path.resolve()
+            if not str(resolved).startswith(str(_SKILLS_DIR.resolve())):
+                results.append({"harness": harness, "filename": filename,
+                                "found": False, "message": "Invalid path"})
+                continue
+            results.append({"harness": harness, "filename": filename, "found": True,
+                            "content": skill_path.read_text()})
+        return results
+
+    async def tune_hosts(targets: list[dict]) -> dict:
+        results = {}
+        coros = []
+        hosts = []
+        for t in targets:
+            host = t.get("host", "")
+            interface = t.get("interface", "")
+            hosts.append(host)
+
+            async def _tune_one(t=t) -> dict:
+                h = t.get("host", "")
+                iface = t.get("interface", "")
+                steps = []
+                errors = []
+
+                # Step 1: tune_nic (must come first)
+                if t.get("channels") is not None:
+                    r = await tune_nic(
+                        host=h,
+                        interface=iface,
+                        channels=t.get("channels", 1),
+                        ring_rx=t.get("ring_rx"),
+                        ring_tx=t.get("ring_tx"),
+                        offloads=t.get("offloads"),
+                    )
+                    steps.append({"tune_nic": r})
+                    if r.get("status") == "error":
+                        errors.extend(r.get("errors", []))
+
+                # Step 2: tune_tcp
+                if t.get("congestion_control") or t.get("qdisc"):
+                    r = await tune_tcp(
+                        host=h,
+                        interface=iface,
+                        congestion_control=t.get("congestion_control"),
+                        qdisc=t.get("qdisc"),
+                        rmem_max=t.get("rmem_max"),
+                        wmem_max=t.get("wmem_max"),
+                    )
+                    steps.append({"tune_tcp": r})
+                    if r.get("status") == "error":
+                        errors.extend(r.get("errors", []))
+
+                # Step 3: pin_irq (after tune_nic — channel count determines IRQ numbers)
+                if t.get("irq_cpu") is not None:
+                    r = await pin_irq(
+                        host=h,
+                        interface=iface,
+                        cpu=t["irq_cpu"],
+                        irqbalance_mode=t.get("irqbalance_mode", "ban_irq"),
+                    )
+                    steps.append({"pin_irq": r})
+                    if r.get("status") == "error":
+                        errors.extend(r.get("errors", []))
+
+                # Step 4: MTU via NetworkManager
+                if t.get("mtu") is not None:
+                    r = await nm_set_mtu(host=h, interface=iface, mtu=t["mtu"])
+                    steps.append({"nm_set_mtu": r})
+                    if r.get("status") == "error":
+                        errors.append(r.get("error", "nm_set_mtu failed"))
+
+                # Step 5: disable firewall
+                if t.get("disable_firewall"):
+                    r = await disable_firewall(host=h)
+                    steps.append({"disable_firewall": r})
+                    if r.get("status") == "error":
+                        errors.extend(r.get("errors", []))
+
+                # Step 6: verify
+                expected = {}
+                if t.get("congestion_control"):
+                    expected["congestion_control"] = t["congestion_control"]
+                if t.get("qdisc"):
+                    expected["qdisc"] = t["qdisc"]
+                if t.get("channels") is not None:
+                    expected["channels"] = t["channels"]
+                if t.get("irq_cpu") is not None:
+                    expected["irq_cpu"] = t["irq_cpu"]
+                if expected:
+                    r = await verify_host_tuning(host=h, interface=iface, expected=expected)
+                    steps.append({"verify": r})
+                    if not r.get("all_ok"):
+                        errors.append(f"Verification failed: {r.get('checks', {})}")
+
+                return {
+                    "host": h,
+                    "status": "error" if errors else "ok",
+                    "steps": steps,
+                    "errors": errors,
+                }
+
+            coros.append(_tune_one())
+
+        raw = await asyncio.gather(*coros, return_exceptions=True)
+        for host, result in zip(hosts, raw):
+            if isinstance(result, Exception):
+                results[host] = {"status": "error", "errors": [str(result)]}
+            else:
+                results[host] = result
+
+        success = sum(1 for r in results.values() if r.get("status") == "ok")
+        return {
+            "results": results,
+            "summary": f"{len(results)} host(s): {success} ok, {len(results)-success} failed",
+        }
+
     async def disable_firewall(
         host: str,
         user: str = "root",
@@ -2562,6 +2752,8 @@ def create_provisioning_tool_handlers(
     handlers = {
         "list_skill_docs": list_skill_docs,
         "read_skill": read_skill,
+        "read_skills": read_skills,
+        "tune_hosts": tune_hosts,
         "disable_firewall": disable_firewall,
         "open_firewall_port": open_firewall_port,
         "tune_nic": tune_nic,
