@@ -137,7 +137,9 @@ async def resolve_image_urls(
                     listing_r = await client.get(listing_url)
                     if listing_r.status_code == 200:
                         dir_matches = _re.findall(
-                            r'href="([^"]*' + datestamp + r'[^"]*/)"',
+                            r'href=["\']?([^"\'\s]*'
+                            + datestamp
+                            + r'[^"\'\s]*/?)["\']?',
                             listing_r.text,
                         )
                         if dir_matches:
