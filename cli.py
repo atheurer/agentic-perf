@@ -349,14 +349,12 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
 
     if cmd == "/abort":
         r = client.post(
-            f"/api/v1/tickets/{ticket_id}/comments",
-            json={"author": "user", "body": message},
+            f"/api/v1/tickets/{ticket_id}/abort",
+            json={"reason": "User /abort command"},
         )
-        r.raise_for_status()
-        r = client.post(
-            f"/api/v1/tickets/{ticket_id}/transition",
-            json={"status": "awaiting_teardown", "comment": "User /abort command"},
-        )
+        if r.status_code == 409:
+            print(f"Cannot abort: {r.json().get('detail', '')}")
+            return True
         r.raise_for_status()
         print("Ticket aborted — moving to teardown.")
         return True
@@ -517,11 +515,8 @@ def cmd_reply(args):
 
     if args.abort:
         r = client.post(
-            f"/api/v1/tickets/{args.ticket_id}/transition",
-            json={
-                "status": "awaiting_teardown",
-                "comment": "User requested abort, skipping to cleanup",
-            },
+            f"/api/v1/tickets/{args.ticket_id}/abort",
+            json={"reason": "User requested abort via reply --abort"},
         )
         r.raise_for_status()
         print("Reply added and ticket aborted — moving to teardown.")
@@ -668,36 +663,18 @@ def cmd_deny(args):
 def cmd_abort(args):
     client, url = get_client(args)
 
-    r = client.get(f"/api/v1/tickets/{args.ticket_id}")
-    r.raise_for_status()
-    t = r.json()
-
-    if t["status"] != "awaiting_customer_guidance":
-        print(f"Ticket is not waiting for input (status: {t['status']})")
-        print(
-            "Abort is only available when the ticket is in awaiting_customer_guidance."
-        )
-        return
-
     reason = args.reason or "User requested abort"
     r = client.post(
-        f"/api/v1/tickets/{args.ticket_id}/comments",
-        json={
-            "author": "user",
-            "body": f"**Abort requested:** {reason}",
-        },
+        f"/api/v1/tickets/{args.ticket_id}/abort",
+        json={"reason": reason},
     )
-    if _check_403(r):
+    if r.status_code == 404:
+        print(f"Ticket {args.ticket_id} not found.")
         return
-    r.raise_for_status()
-
-    r = client.post(
-        f"/api/v1/tickets/{args.ticket_id}/transition",
-        json={
-            "status": "awaiting_teardown",
-            "comment": "User requested abort, skipping to cleanup",
-        },
-    )
+    if r.status_code == 409:
+        detail = r.json().get("detail", "Cannot abort")
+        print(detail)
+        return
     if _check_403(r):
         return
     r.raise_for_status()

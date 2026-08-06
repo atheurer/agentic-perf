@@ -33,6 +33,16 @@ class HITLTimeoutError(Exception):
     """
 
 
+class HITLDriftError(Exception):
+    """Raised when the ticket moves away during HITL wait.
+
+    The agent unwinds cleanly — no further transition needed.
+    The orchestrator's exception handler must NOT transition the
+    ticket to awaiting_customer_guidance; it is already where it
+    should be (e.g., awaiting_teardown after an abort).
+    """
+
+
 class AgentBase(ABC):
     # Default inner-loop iteration budget. Agents can override
     # via constructor. Set to 0 for unlimited iterations —
@@ -725,6 +735,8 @@ class AgentBase(ABC):
                         f"{self.agent_name} hit max iterations — pausing for guidance"
                     ),
                 )
+        except HITLDriftError:
+            raise
         except HITLTimeoutError as e:
             # Clean stop after two consecutive HITL timeouts.  The ticket is
             # already in awaiting_customer_guidance — just log and exit without
@@ -1177,6 +1189,13 @@ class AgentBase(ABC):
 
     _HITL_POLL_INTERVAL = 5.0
     _HITL_TIMEOUT = 1800.0
+    _HITL_NO_RESUME_STATUSES = frozenset(
+        {
+            "awaiting_teardown",
+            "retrospective_pending",
+            "closed",
+        }
+    )
 
     async def _request_human_input(self, ticket_id: str, question: str) -> str:
         """Pause for human input and return the user's reply.
@@ -1208,9 +1227,29 @@ class AgentBase(ABC):
             ticket = await self._get_ticket(ticket_id)
             if ticket.get("status") != "awaiting_customer_guidance":
                 resumed_status = ticket.get("status", "")
+                cf = ticket.get("custom_fields", {})
+                if resumed_status in self._HITL_NO_RESUME_STATUSES or cf.get(
+                    "abort_requested"
+                ):
+                    self._emit(
+                        ticket_id,
+                        "agent_aborted",
+                        {
+                            "reason": "ticket_drifted",
+                            "new_status": resumed_status,
+                            "abort_requested": bool(
+                                cf.get("abort_requested"),
+                            ),
+                        },
+                    )
+                    raise HITLDriftError(
+                        f"Ticket {ticket_id} moved to "
+                        f"{resumed_status} while agent "
+                        f"{self.agent_name} was waiting"
+                    )
                 self._emit(
                     ticket_id,
-                    "transition",
+                    "hitl_resumed",
                     {
                         "to": resumed_status,
                         "comment": "Resumed after user reply",
@@ -1264,6 +1303,27 @@ class AgentBase(ABC):
                 elapsed += self._HITL_POLL_INTERVAL
                 ticket = await self._get_ticket(ticket_id)
                 if ticket.get("status") != "awaiting_customer_guidance":
+                    resumed_status = ticket.get("status", "")
+                    cf = ticket.get("custom_fields", {})
+                    if resumed_status in self._HITL_NO_RESUME_STATUSES or cf.get(
+                        "abort_requested"
+                    ):
+                        self._emit(
+                            ticket_id,
+                            "agent_aborted",
+                            {
+                                "reason": "ticket_drifted",
+                                "new_status": resumed_status,
+                                "abort_requested": bool(
+                                    cf.get("abort_requested"),
+                                ),
+                            },
+                        )
+                        raise HITLDriftError(
+                            f"Ticket {ticket_id} moved to "
+                            f"{resumed_status} while agent "
+                            f"{self.agent_name} was waiting"
+                        )
                     new_comments = ticket.get("comments", [])[comment_count:]
                     user_replies = [
                         c["body"]

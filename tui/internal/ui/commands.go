@@ -200,13 +200,9 @@ func (m *Model) cmdSubmit(args []string) tea.Cmd {
 
 func (m *Model) cmdAbort(id string) tea.Cmd {
 	return func() tea.Msg {
-		_, err := m.client.AddComment(id, "user", "Aborting ticket via TUI")
+		_, err := m.client.AbortTicket(id, "User abort via TUI")
 		if err != nil {
-			return errMsg{err}
-		}
-		_, err = m.client.TransitionTicket(id, "awaiting_teardown", "User abort via TUI")
-		if err != nil {
-			return errMsg{fmt.Errorf("abort transition failed: %w", err)}
+			return errMsg{fmt.Errorf("abort failed: %w", err)}
 		}
 		return sysMsg(fmt.Sprintf("%s → awaiting_teardown (aborted)", id))
 	}

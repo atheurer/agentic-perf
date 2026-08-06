@@ -1,11 +1,12 @@
-"""Tests for graceful and hard stop functionality.
+"""Tests for graceful stop, hard stop, and abort functionality.
 
-Covers: stop API endpoints, agent stop flag, dispatcher stop_agent.
+Covers: stop API endpoints, abort endpoint, agent stop flag,
+abort drift guard, dispatcher stop_agent.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -508,3 +509,273 @@ class TestProcessStopRequests:
 
         result = store.get_ticket(ticket.id)
         assert result.status.value == "awaiting_customer_guidance"
+
+
+# ── Abort Endpoint Tests ─────────────────────────────────
+
+
+@pytest.fixture
+def guidance_ticket(store):
+    """A ticket parked in awaiting_customer_guidance."""
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="test", description="test"),
+    )
+    for status in [
+        "triage_pending",
+        "awaiting_hardware",
+    ]:
+        store.transition_ticket(
+            ticket.id,
+            TransitionRequest(status=status),
+        )
+    store.transition_ticket(
+        ticket.id,
+        TransitionRequest(status="awaiting_customer_guidance"),
+    )
+    return store.get_ticket(ticket.id)
+
+
+class TestAbortEndpoint:
+    def test_abort_sets_marker(self, client, guidance_ticket):
+        r = client.post(f"/api/v1/tickets/{guidance_ticket.id}/abort")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "awaiting_teardown"
+        marker = data["custom_fields"]["abort_requested"]
+        assert "requested_at" in marker
+
+    def test_abort_retires_plan_step(self, client, store, guidance_ticket):
+        plan = {
+            "current_step": 1,
+            "steps": [
+                {
+                    "id": 0,
+                    "agent_type": "benchmark",
+                    "status": "completed",
+                    "params": {},
+                },
+                {
+                    "id": 1,
+                    "agent_type": "review",
+                    "status": "in_progress",
+                    "params": {},
+                },
+            ],
+        }
+        store.update_fields(
+            guidance_ticket.id,
+            {"execution_plan": plan},
+        )
+        r = client.post(f"/api/v1/tickets/{guidance_ticket.id}/abort")
+        assert r.status_code == 200
+        updated_plan = r.json()["custom_fields"]["execution_plan"]
+        assert updated_plan["steps"][1]["status"] == "aborted"
+
+    def test_abort_non_guidance_returns_409(self, client, active_ticket):
+        r = client.post(f"/api/v1/tickets/{active_ticket.id}/abort")
+        assert r.status_code == 409
+
+    def test_abort_with_reason(self, client, store, guidance_ticket):
+        r = client.post(
+            f"/api/v1/tickets/{guidance_ticket.id}/abort",
+            json={"reason": "Aborting via TUI"},
+        )
+        assert r.status_code == 200
+        ticket = store.get_ticket(guidance_ticket.id)
+        comments = [c.body for c in ticket.comments]
+        assert any("Aborting via TUI" in c for c in comments)
+
+    def test_abort_nonexistent_returns_404(self, client):
+        r = client.post("/api/v1/tickets/PERF-nonexist/abort")
+        assert r.status_code == 404
+
+
+# ── Store-level Abort Marker Tests ───────────────────────
+
+
+class TestStoreAbortMarker:
+    def test_guidance_to_teardown_sets_marker(self, store):
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="test", description="test"),
+        )
+        for status in ["triage_pending", "awaiting_hardware"]:
+            store.transition_ticket(
+                ticket.id,
+                TransitionRequest(status=status),
+            )
+        store.transition_ticket(
+            ticket.id,
+            TransitionRequest(status="awaiting_customer_guidance"),
+        )
+        result = store.transition_ticket(
+            ticket.id,
+            TransitionRequest(status="awaiting_teardown"),
+        )
+        assert "abort_requested" in result.custom_fields
+        assert "requested_at" in result.custom_fields["abort_requested"]
+
+    def test_normal_teardown_does_not_set_marker(self, store):
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="test", description="test"),
+        )
+        for status in [
+            "triage_pending",
+            "awaiting_hardware",
+            "awaiting_provision",
+            "executing_benchmark",
+            "awaiting_review",
+            "awaiting_teardown",
+        ]:
+            store.transition_ticket(
+                ticket.id,
+                TransitionRequest(status=status),
+            )
+        result = store.get_ticket(ticket.id)
+        assert "abort_requested" not in result.custom_fields
+
+
+# ── HITL Drift Guard Tests ───────────────────────────────
+
+
+class TestHITLDriftGuard:
+    @pytest.mark.asyncio
+    async def test_drift_guard_raises_on_abort(self):
+        from agents.base import AgentBase, HITLDriftError
+
+        agent = MagicMock(spec=AgentBase)
+        agent.agent_name = "review-agent"
+        agent._events = None
+        agent._client = AsyncMock()
+        agent.store_url = "http://localhost:8090"
+        agent._emit = MagicMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._HITL_POLL_INTERVAL = 0.01
+        agent._HITL_TIMEOUT = 0.1
+        agent._HITL_NO_RESUME_STATUSES = AgentBase._HITL_NO_RESUME_STATUSES
+
+        call_count = 0
+
+        async def fake_get_ticket(ticket_id):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return {
+                    "id": ticket_id,
+                    "status": "awaiting_customer_guidance",
+                    "comments": [],
+                    "custom_fields": {},
+                }
+            return {
+                "id": ticket_id,
+                "status": "awaiting_teardown",
+                "comments": [],
+                "custom_fields": {
+                    "abort_requested": {
+                        "requested_at": "2026-08-06T00:00:00Z",
+                    },
+                },
+            }
+
+        agent._get_ticket = AsyncMock(side_effect=fake_get_ticket)
+
+        with pytest.raises(HITLDriftError, match="awaiting_teardown"):
+            await AgentBase._request_human_input(
+                agent,
+                "PERF-TEST",
+                "Need input",
+            )
+
+        agent._emit.assert_any_call(
+            "PERF-TEST",
+            "agent_aborted",
+            {
+                "reason": "ticket_drifted",
+                "new_status": "awaiting_teardown",
+                "abort_requested": True,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_drift_guard_on_closed_ticket(self):
+        from agents.base import AgentBase, HITLDriftError
+
+        agent = MagicMock(spec=AgentBase)
+        agent.agent_name = "review-agent"
+        agent._events = None
+        agent._client = AsyncMock()
+        agent.store_url = "http://localhost:8090"
+        agent._emit = MagicMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._HITL_POLL_INTERVAL = 0.01
+        agent._HITL_TIMEOUT = 0.1
+        agent._HITL_NO_RESUME_STATUSES = AgentBase._HITL_NO_RESUME_STATUSES
+
+        async def fake_get_ticket(ticket_id):
+            return {
+                "id": ticket_id,
+                "status": "closed",
+                "comments": [],
+                "custom_fields": {},
+            }
+
+        agent._get_ticket = AsyncMock(side_effect=fake_get_ticket)
+
+        with pytest.raises(HITLDriftError, match="closed"):
+            await AgentBase._request_human_input(
+                agent,
+                "PERF-TEST",
+                "Need input",
+            )
+
+
+# ── _advance_plan Abort Guard Test ───────────────────────
+
+
+class TestAdvancePlanAbortGuard:
+    def test_advance_plan_noop_when_aborted(self):
+        from orchestrator.main import _advance_plan
+
+        plan = {
+            "current_step": 0,
+            "steps": [
+                {
+                    "id": 0,
+                    "agent_type": "benchmark",
+                    "status": "in_progress",
+                    "params": {},
+                },
+                {
+                    "id": 1,
+                    "agent_type": "review",
+                    "status": "pending",
+                    "params": {},
+                },
+            ],
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "status": "awaiting_teardown",
+            "custom_fields": {
+                "execution_plan": plan,
+                "abort_requested": {
+                    "requested_at": "2026-08-06T00:00:00Z",
+                },
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+
+        with patch("httpx.Client", return_value=mock_client):
+            _advance_plan(
+                "http://localhost:8090",
+                "PERF-TEST",
+                "executing_benchmark",
+            )
+
+        mock_client.patch.assert_not_called()
+        mock_client.post.assert_not_called()
