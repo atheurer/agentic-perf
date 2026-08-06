@@ -241,7 +241,6 @@ async def get_run_summary(
         )
 
 
-@mcp.tool()
 async def cdm_api_request(
     controller: str,
     path: str,
@@ -249,7 +248,7 @@ async def cdm_api_request(
     body: dict | None = None,
     port: int = 3000,
 ) -> str:
-    """Make an HTTP request to the CDM query server on the controller. Only applicable when the harness is crucible and the review config indicates cdm_api as the results method."""
+    """Internal helper — use cdm_api_requests (plural) to make CDM queries."""
     await _ensure_init()
 
     if method == "GET":
@@ -287,6 +286,41 @@ async def cdm_api_request(
                 "error": "Response is not valid JSON",
             }
         )
+
+
+@mcp.tool()
+async def cdm_api_requests(
+    controller: str,
+    requests: list[dict],
+    port: int = 3000,
+) -> str:
+    """Make multiple CDM API requests concurrently in one call. Each entry needs 'label', 'method', and 'path'; optionally 'body' for POST. Use this instead of calling cdm_api_request repeatedly to save iterations — e.g. fetch uperf Gbps, mpstat CPU, and tcp-window cwnd for all samples in one call."""
+    import asyncio as _asyncio
+    await _ensure_init()
+
+    async def _one(req: dict) -> tuple[str, dict]:
+        label = req.get("label", req.get("path", "?"))
+        raw = await cdm_api_request(
+            controller=controller,
+            path=req.get("path", ""),
+            method=req.get("method", "POST"),
+            body=req.get("body"),
+            port=port,
+        )
+        try:
+            return label, json.loads(raw)
+        except Exception:
+            return label, {"raw": raw}
+
+    results = await _asyncio.gather(*[_one(r) for r in requests], return_exceptions=True)
+    out = {}
+    for item in results:
+        if isinstance(item, Exception):
+            out["error"] = {"status": "error", "error": str(item)}
+        else:
+            label, data = item
+            out[label] = data
+    return json.dumps(out)
 
 
 @mcp.tool()
