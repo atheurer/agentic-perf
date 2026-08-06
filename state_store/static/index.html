@@ -1743,7 +1743,9 @@ async function renderDetail(ticketId) {
     const ticket = await api('/tickets/' + ticketId);
     lastSeq = 0;
     renderedEvents = [];
-    trailStates = [];
+    // Seed the trail with the ticket creation states
+    // which don't have transition events.
+    trailStates = ['new', 'triage_pending'];
 
     var ownershipHtml = '';
     if (_isMultiUser) {
@@ -1839,7 +1841,21 @@ async function renderDetail(ticketId) {
     bindActionButtons(ticketId);
     initPanelDivider();
 
-    await pollEvents(ticketId);
+    // Initial load: fetch ALL events at once for complete
+    // breadcrumbs and history. Only poll for NEW events after.
+    try {
+      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=10000');
+      var initEvents = initData.events || [];
+      if (initEvents.length > 0) {
+        lastSeq = initData.latest_seq;
+        renderNewEvents(initEvents);
+      }
+    } catch (e) {
+      console.warn('Initial event load failed:', e);
+    }
+    // Ensure current status is in trail even if
+    // its transition event is missing.
+    appendTransitionTrail(ticket.status);
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
   } catch (err) {
     app.innerHTML =
