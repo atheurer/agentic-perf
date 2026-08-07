@@ -61,8 +61,8 @@ Your tasks:
 
 4. Do NOT set up SSH keys between the controller and endpoints. That is the
    benchmark agent's responsibility (it runs as a pre-run step). Do NOT use
-   setup_passwordless_ssh, write_remote_file, or execute_command to distribute
-   SSH keys — any of these can destroy existing keys or duplicate work.
+   setup_passwordless_ssh or write_remote_file to distribute SSH keys —
+   these can destroy existing keys or duplicate work.
 
 5. Check the ticket for the "fresh_host" field. If fresh_host is true, the host was
    freshly provisioned (e.g., via QUADS) and has no harness installed. Skip

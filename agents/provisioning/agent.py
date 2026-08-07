@@ -82,7 +82,6 @@ class ProvisioningAgent(AgentBase):
             "check_host_prerequisites",
             "check_platform_contract",
             "configure_host",
-            "execute_command",
         }
     )
 
