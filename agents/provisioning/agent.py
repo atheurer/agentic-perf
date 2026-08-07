@@ -81,7 +81,6 @@ class ProvisioningAgent(AgentBase):
             "ensure_prerequisites",
             "check_host_prerequisites",
             "check_platform_contract",
-            "configure_host",
         }
     )
 

@@ -1249,24 +1249,6 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 
 
 @mcp.tool()
-async def configure_host(targets: list[dict], user: str = "root") -> str:
-    """Apply OS-level configuration for optimal benchmark performance on multiple hosts. Each target is {"host": "...", "config": {...}}. Supports CPU isolation, hugepages, IRQ affinity, tuned profiles."""
-    await _ensure_init()
-    results: dict[str, dict] = {}
-    for t in targets:
-        host = t["host"]
-        config = t.get("config", {})
-        results[host] = {
-            "host": host,
-            "config_applied": config,
-            "status": "success",
-            "reboot_required": False,
-            "message": f"Configuration applied on {host} (simulated)",
-        }
-    return json.dumps(_summarize(results))
-
-
-@mcp.tool()
 async def ensure_harness_installed(
     hosts: list[str],
     harness_name: str,

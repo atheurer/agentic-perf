@@ -607,44 +607,6 @@ def get_provisioning_tools() -> list[ToolDefinition]:
             },
         ),
         ToolDefinition(
-            name="configure_host",
-            description=(
-                "Apply OS-level configuration for optimal benchmark performance "
-                "on multiple hosts. Each target specifies a host and its config. "
-                "Supports CPU isolation, hugepages, IRQ affinity, tuned profiles."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "targets": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "host": {"type": "string"},
-                                "config": {
-                                    "type": "object",
-                                    "properties": {
-                                        "cpu_isolation": {"type": "string"},
-                                        "hugepages": {"type": "integer"},
-                                        "irq_affinity": {"type": "string"},
-                                        "tuned_profile": {"type": "string"},
-                                    },
-                                },
-                            },
-                            "required": ["host", "config"],
-                        },
-                        "description": "List of {host, config} targets",
-                    },
-                    "user": {
-                        "type": "string",
-                        "description": "SSH user (default: root)",
-                    },
-                },
-                "required": ["targets"],
-            },
-        ),
-        ToolDefinition(
             name="ensure_prerequisites",
             description=(
                 "Check and install missing prerequisites on all hosts in one "
@@ -1917,20 +1879,6 @@ def create_provisioning_tool_handlers(
         results.update(skipped)
         return _summarize(results)
 
-    async def configure_host(targets: list[dict], user: str = "root") -> dict:
-        results: dict[str, dict] = {}
-        for t in targets:
-            host = t["host"]
-            config = t.get("config", {})
-            results[host] = {
-                "host": host,
-                "config_applied": config,
-                "status": "success",
-                "reboot_required": False,
-                "message": f"Configuration applied on {host} (simulated)",
-            }
-        return _summarize(results)
-
     async def ensure_harness_installed(
         hosts: list[str],
         harness_name: str,
@@ -2801,7 +2749,6 @@ def create_provisioning_tool_handlers(
         "install_harness": install_harness,
         "install_k3s": install_k3s,
         "verify_harness_install": verify_harness_install,
-        "configure_host": configure_host,
         "ensure_harness_installed": ensure_harness_installed,
         "get_private_config": get_private_config,
         "request_clarification": request_clarification,
