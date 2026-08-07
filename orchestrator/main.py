@@ -62,8 +62,6 @@ def _make_llm_factory(config: OrchestratorConfig):
         effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
         if effort:
             provider.reasoning_effort = effort
-        max_tokens = agent_cfg.get("max_tokens")
-        provider.max_tokens = int(max_tokens) if max_tokens else config.llm_max_tokens
         return provider
 
     return factory
@@ -384,9 +382,6 @@ async def run_agent_task(
                         override_effort = llm_override.get("reasoning_effort")
                         if override_effort:
                             override_llm.reasoning_effort = override_effort
-                        override_max_tokens = llm_override.get("max_tokens")
-                        if override_max_tokens:
-                            override_llm.max_tokens = int(override_max_tokens)
                         agent.llm = override_llm
                         logger.info(
                             f"LLM override for {ticket_id}:"
@@ -948,7 +943,6 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     llm.default_timeout = config.llm_timeout
     if config.llm_reasoning_effort:
         llm.reasoning_effort = config.llm_reasoning_effort
-    llm.max_tokens = config.llm_max_tokens
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()

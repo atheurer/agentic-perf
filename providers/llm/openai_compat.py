@@ -55,14 +55,14 @@ class OpenAICompatLLMProvider(LLMProvider):
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
-        max_tokens: int | None = None,
+        max_tokens: int = 4096,
         timeout: float | None = None,
     ) -> LLMResponse:
         oai_messages = self._convert_messages(system_prompt, messages)
 
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": self._resolve_max_tokens(max_tokens),
+            "max_tokens": max_tokens,
             "messages": oai_messages,
         }
         if tools:
