@@ -59,8 +59,30 @@ to construct a correct run file — getting the format right is critical.
 5. **Validate network path (network benchmarks only)** — For network benchmarks
    (uperf, trafficgen, iperf, k8s-netperf, etc.), you MUST verify that the
    benchmark traffic port is reachable between the test hosts BEFORE constructing
-   the run-file. Use `test_port_connectivity` with the test IPs (not management
-   IPs) and the benchmark's listener port (e.g., 30002 for uperf).
+   the run-file.
+
+   **First, resolve the endpoint access addresses** — the addresses the
+   controller uses for SSH/orchestration (`assigned_hardware_ips` /
+   `ssh_hardware_ips`, per 6e below). Do this before discovering any test
+   interfaces, so you have a clear, separate answer for "how does the
+   controller reach this host" before you ever look at "what IP is the
+   test traffic interface using."
+
+   **Test interfaces are NOT necessarily the access interfaces.** They can
+   be the same IP — but only if the endpoint access info you were given
+   happens to be assigned to the same NIC as the test interface. Never
+   assume this. When you discover a test-interface IP (e.g. by reading
+   `ip addr` on the host, per 6f below), that IP is for benchmark traffic
+   and `test_port_connectivity` only — it must never be substituted for
+   the run-file endpoint `host` field, which must always stay the
+   access address resolved in the paragraph above. Mixing these up
+   produces a run-file the controller cannot orchestrate: it will try to
+   SSH the benchmark traffic IP instead of the actual access address and
+   fail if they live on different networks (e.g. cross-datacenter).
+
+   Once you have both addresses resolved, use `test_port_connectivity`
+   with the test-interface IPs (not the access/management IPs) and the
+   benchmark's listener port (e.g., 30002 for uperf).
 
    This tool starts a real listener on the server and connects from the client —
    it is NOT a passive port scan. If it returns `all_reachable: false`, there is
@@ -108,7 +130,10 @@ to construct a correct run file — getting the format right is critical.
       benchmark's skill doc for guidance on network discovery and how to use
       the discovered interfaces in the run-file parameters. Do not assume the
       management IPs are correct for benchmark traffic when the user specified
-      different interfaces.
+      different interfaces. **This discovery is for benchmark-traffic
+      parameters only** (e.g. `ifname`, `mv-params`) — it never changes what
+      goes in the endpoint `host` field. That field stays the access address
+      from 6e regardless of which interface the benchmark traffic uses.
 
 7. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
