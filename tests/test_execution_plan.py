@@ -186,6 +186,118 @@ def test_advance_plan_completes_step_and_advances():
         assert transition_call.kwargs["json"]["status"] == "executing_benchmark"
 
 
+def _provision_plan():
+    return {
+        "current_step": 0,
+        "run_ids": [],
+        "steps": [
+            {
+                "id": 0,
+                "agent_type": "provision",
+                "status": "in_progress",
+                "params": {},
+                "results": {},
+            },
+            {
+                "id": 1,
+                "agent_type": "benchmark",
+                "status": "pending",
+                "params": {},
+                "results": {},
+            },
+        ],
+    }
+
+
+def test_advance_plan_blocks_when_host_tuning_missing():
+    """Requested IRQ pinning with no configuration_applied blocks advance."""
+    from orchestrator.main import _advance_plan
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "status": "awaiting_provision",
+        "custom_fields": {
+            "parsed_specs": {"irq_pinning_cpu": 2},
+            "configuration_applied": {},
+            "execution_plan": _provision_plan(),
+        },
+    }
+
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
+
+        # Should redirect to guidance, not patch the plan forward.
+        client.patch.assert_not_called()
+        transition_call = client.post.call_args
+        assert transition_call.kwargs["json"]["status"] == (
+            "awaiting_customer_guidance"
+        )
+        assert "irq_pinning_cpu" in transition_call.kwargs["json"]["comment"]
+
+
+def test_advance_plan_allows_when_host_tuning_applied():
+    """Requested IRQ pinning WITH configuration_applied advances normally."""
+    from orchestrator.main import _advance_plan
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "status": "awaiting_provision",
+        "custom_fields": {
+            "parsed_specs": {"irq_pinning_cpu": 2},
+            "configuration_applied": {"irq_pinning": "cpu2 verified"},
+            "execution_plan": _provision_plan(),
+        },
+    }
+
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
+
+        patch_call = client.patch.call_args
+        updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
+        assert updated_plan["steps"][0]["status"] == "completed"
+        assert updated_plan["current_step"] == 1
+
+
+def test_advance_plan_allows_when_no_tuning_requested():
+    """No tuning-relevant parsed_specs fields — advances without any check."""
+    from orchestrator.main import _advance_plan
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "status": "awaiting_provision",
+        "custom_fields": {
+            "parsed_specs": {"benchmark_tool": "fio"},
+            "configuration_applied": {},
+            "execution_plan": _provision_plan(),
+        },
+    }
+
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
+
+        patch_call = client.patch.call_args
+        updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
+        assert updated_plan["steps"][0]["status"] == "completed"
+
+
 def test_advance_plan_final_step_no_transition():
     """After the last step, _advance_plan saves results but no transition."""
     from orchestrator.main import _advance_plan

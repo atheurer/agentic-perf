@@ -24,10 +24,10 @@ verify_harness_install, check_existing_install, update_install) also accept
 `controller_host` — always set this to the controller's IP so the harness is
 only installed/checked/verified on the controller (the default behavior).
 
-Tools with per-host parameters use `targets: list[dict]`:
-  configure_host — each target is {"host": "...", "config": {...}}
-
 All batched tools return results keyed by host, with a summary line.
+
+Network tuning tools (tune_nic, tune_tcp, pin_irq, verify_host_tuning) take a
+single host per call, not a batch — call them once per host that needs tuning.
 
 ## Combined Tools
 
@@ -121,6 +121,41 @@ Your tasks:
 
 10. If any step fails, report the error details.
 
+11. **Host-level network tuning is your responsibility — never defer it.**
+    Check the ticket's `parsed_specs` and description for ANY of these:
+    IRQ pinning/affinity (e.g. `irq_pinning_cpu`), NIC queue count
+    (e.g. `combined_queues`), congestion control (e.g. `congestion_control`,
+    "BBR", "cubic"), qdisc (e.g. `qdisc`, "fq_codel"), or other NIC/kernel
+    tuning. If ANY of these are present, tuning is required — this is not a
+    judgment call, and it is not something to defer to a later phase or a
+    different agent. The benchmark agent has no tools for this (no
+    `pin_irq`, `tune_nic`, or `smp_affinity` access) — if you don't apply
+    it here, it never happens, silently. Before proceeding:
+    a. Call `read_skill` for `general/host-tuning.md` — it defines the
+       required ordering (tune_nic → pin_irq) and irqbalance strategy.
+    b. Apply the tuning with `tune_nic` (queue count, ring buffers,
+       offloads), `tune_tcp` (congestion control, qdisc), and `pin_irq`
+       (IRQ affinity + irqbalance) as needed — one call per host per tool.
+       **Do NOT use `execute_command` to hand-roll this with raw shell
+       (ethtool/tc/sysctl/echo-to-smp_affinity) even if you know the
+       commands.** These tools aren't just wrappers around the same
+       shell commands — they encode details that are easy to get wrong
+       by hand: `pin_irq` writes an exact single-CPU hex bitmask to
+       `smp_affinity` AND bans the IRQ from irqbalance in the same call;
+       a hand-written `echo "1 2" > smp_affinity_list` sets a *range*
+       covering CPU 1 AND 2, not a pin to CPU 2 alone, and skips the
+       irqbalance step entirely — both wrong in ways that won't be
+       obvious until someone reads `/proc/interrupts` after the fact.
+    c. Call `verify_host_tuning` and include its result in your
+       `submit_provisioning_result` call. If verification shows the tuning
+       did NOT take effect (e.g. IRQ landed on a different CPU than
+       requested), do NOT report `provisioning_complete=true` — call
+       `request_clarification` instead.
+    This is different from SSH key setup (see below) — that genuinely is
+    the benchmark agent's job because it runs per-execution. Network
+    tuning is host state that must be correct before any benchmark runs,
+    which is why it belongs here, not there.
+
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.
   Always set controller_host on install_harness, ensure_harness_installed,
@@ -131,11 +166,6 @@ Important:
   ALL endpoint hosts (client and server) before connectivity checks or
   benchmarks. Fresh lab hosts block benchmark ports (uperf uses 30002/30003)
   by default. Do NOT call on shared or production hosts.
-- If the ticket requests host tuning (BBR, IRQ pinning, NIC settings), read
-  `general/host-tuning.md` via read_skill BEFORE calling any tuning tools.
-  It defines the required ordering (tune_nic → pin_irq) and irqbalance strategy.
-  After applying tuning, always call verify_host_tuning and include the result
-  in your submit_provisioning_result call.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly — do not ask the user
   if the config says "skip".
