@@ -32,10 +32,14 @@ from agents.server_utils import (
     build_skill_provider,
     build_ssh_from_ticket,
 )
+from providers.llm.base import ToolDefinition
+from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("provisioning-agent")
+
+_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
 _ssh = None
@@ -160,7 +164,8 @@ def _os_matches(detected: str, supported: list[str]) -> bool:
     return False
 
 
-async def _validate_platform_contract_one(
+async def validate_platform_contract(
+    ssh: SSHExecutor,
     host: str,
     private_config: dict,
 ) -> dict:
@@ -182,7 +187,7 @@ async def _validate_platform_contract_one(
     # OS detection
     supported_os = contract.get("supported_os", [])
     if supported_os:
-        os_result = await _ssh.run(host, "cat /etc/os-release")
+        os_result = await ssh.run(host, "cat /etc/os-release")
         if os_result.exit_code != 0:
             result["status"] = "failed"
             result["message"] = f"Could not detect OS on {host}: {os_result.stderr}"
@@ -199,7 +204,7 @@ async def _validate_platform_contract_one(
     # Repo validation
     required_repos = contract.get("required_repos", [])
     if required_repos:
-        repo_result = await _ssh.run(
+        repo_result = await ssh.run(
             host, "dnf repolist --enabled 2>/dev/null || yum repolist 2>/dev/null"
         )
         repo_output = repo_result.stdout.lower() if repo_result.exit_code == 0 else ""
@@ -214,7 +219,7 @@ async def _validate_platform_contract_one(
     required_packages = contract.get("required_packages", [])
     if required_packages:
         for pkg in required_packages:
-            pkg_result = await _ssh.run(
+            pkg_result = await ssh.run(
                 host, f"which {pkg} 2>/dev/null || rpm -q {pkg} 2>/dev/null"
             )
             if pkg_result.exit_code != 0:
@@ -333,9 +338,11 @@ async def _ensure_prerequisites_one(
     }
 
 
-async def _discover_crucible_token_files(host: str, install_path: str) -> list[str]:
+async def _discover_crucible_token_files(
+    ssh: SSHExecutor, host: str, install_path: str
+) -> list[str]:
     """Read registries.json on the host and extract all referenced token file paths."""
-    result = await _ssh.run(
+    result = await ssh.run(
         host, f"cat {install_path}/config/registries.json 2>/dev/null"
     )
     if result.exit_code != 0 or not result.stdout.strip():
@@ -369,29 +376,36 @@ async def _discover_crucible_token_files(host: str, install_path: str) -> list[s
     return paths
 
 
-async def _cleanup_harness_one(
+async def cleanup_harness(
+    ssh: SSHExecutor,
     host: str,
     harness_name: str,
     install_path: str | None = None,
     pre_uninstall_commands: list[str] | None = None,
 ) -> dict:
-    """Remove a harness installation from a host."""
+    """Remove a harness installation from a host.
+
+    Takes an explicit ssh executor (rather than using the module-global
+    _ssh) so it's directly importable and callable by other agents —
+    e.g. the resource agent calls this during teardown, outside the
+    provisioning MCP server process where _ssh is never initialized.
+    """
     path = install_path or f"/opt/{harness_name}"
     cleanup_details = []
 
     for cmd in pre_uninstall_commands or []:
         logger.info(f"[provision] Pre-uninstall on {host}: {cmd}")
-        await _ssh.run(host, cmd, timeout=120)
+        await ssh.run(host, cmd, timeout=120)
 
     if harness_name == "crucible":
-        token_files = await _discover_crucible_token_files(host, path)
+        token_files = await _discover_crucible_token_files(ssh, host, path)
         if token_files:
             logger.info(
                 f"[provision] Found {len(token_files)} token files in "
                 f"registries.json on {host}"
             )
 
-        await _ssh.run(
+        await ssh.run(
             host,
             "podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^crucible-'"
             " | xargs -r podman stop 2>/dev/null"
@@ -404,7 +418,7 @@ async def _cleanup_harness_one(
         logger.info(f"[provision] Stopped crucible containers on {host}")
 
         for token_path in token_files:
-            await _ssh.run(host, f"rm -f {token_path}")
+            await ssh.run(host, f"rm -f {token_path}")
             cleanup_details.append(f"token: {token_path}")
         logger.info(f"[provision] Removed {len(token_files)} token files on {host}")
 
@@ -413,16 +427,16 @@ async def _cleanup_harness_one(
             "/etc/sysconfig/crucible",
             "/etc/profile.d/crucible_completions.sh",
         ]:
-            await _ssh.run(host, f"rm -f {artifact}")
+            await ssh.run(host, f"rm -f {artifact}")
         cleanup_details.append("system: symlinks, sysconfig, profile.d")
 
-        await _ssh.run(host, "rm -rf /root/.crucible", timeout=60)
+        await ssh.run(host, "rm -rf /root/.crucible", timeout=60)
         cleanup_details.append("config: /root/.crucible")
 
         # Preserve run results — only remove ancillary state
         # (logs, CDM index, container images, etc.), not the
         # run data that operators need for post-hoc analysis.
-        await _ssh.run(
+        await ssh.run(
             host,
             "find /var/lib/crucible -mindepth 1 -maxdepth 1"
             " -not -name 'run' -exec rm -rf {} +",
@@ -431,7 +445,7 @@ async def _cleanup_harness_one(
         cleanup_details.append("data: /var/lib/crucible (run/ preserved)")
 
     logger.info(f"[provision] Removing {harness_name} install dir {path} on {host}")
-    result = await _ssh.run(host, f"rm -rf {path}", timeout=120)
+    result = await ssh.run(host, f"rm -rf {path}", timeout=120)
     if result.exit_code != 0:
         return {
             "host": host,
@@ -441,7 +455,7 @@ async def _cleanup_harness_one(
             "message": f"Failed to remove {path}: {result.stderr}",
         }
 
-    await _ssh.run(host, f"rm -rf {path}-moved-on-*", timeout=60)
+    await ssh.run(host, f"rm -rf {path}-moved-on-*", timeout=60)
 
     return {
         "host": host,
@@ -581,7 +595,7 @@ async def _install_harness_one(
                 ),
             }
 
-    platform_result = await _validate_platform_contract_one(host, private_config)
+    platform_result = await validate_platform_contract(_ssh, host, private_config)
     if platform_result["status"] == "failed":
         return {
             "host": host,
@@ -1045,7 +1059,7 @@ async def check_platform_contract(
     await _ensure_init()
     private_config = await _skill_provider.get_all_private_config(harness_name)
     results = await _gather_for_hosts(
-        hosts, _validate_platform_contract_one, private_config
+        hosts, lambda h, *a: validate_platform_contract(_ssh, h, *a), private_config
     )
     return json.dumps(_summarize(results))
 
@@ -1231,7 +1245,7 @@ async def uninstall_harness(
     )
     results = await _gather_for_hosts(
         filtered,
-        _cleanup_harness_one,
+        lambda h, *a: cleanup_harness(_ssh, h, *a),
         harness_name,
         provisioning.get("install_target_path"),
         provisioning.get("pre_uninstall_commands"),
@@ -1249,21 +1263,837 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 
 
 @mcp.tool()
-async def configure_host(targets: list[dict], user: str = "root") -> str:
-    """Apply OS-level configuration for optimal benchmark performance on multiple hosts. Each target is {"host": "...", "config": {...}}. Supports CPU isolation, hugepages, IRQ affinity, tuned profiles."""
+async def list_skill_docs(harness: str) -> str:
+    """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    skill_dir = _SKILLS_DIR / harness
+    if not skill_dir.is_dir():
+        return json.dumps(
+            {"found": False, "message": f"No skill directory for '{harness}'"}
+        )
+    files = [f.name for f in sorted(skill_dir.iterdir()) if f.suffix == ".md"]
+    return json.dumps({"found": True, "harness": harness, "files": files})
+
+
+def _read_skill_one(harness: str, filename: str) -> dict:
+    skill_path = _SKILLS_DIR / harness / filename
+    if not skill_path.is_file():
+        return {"found": False, "message": f"Skill not found: {harness}/{filename}"}
+    resolved = skill_path.resolve()
+    if not str(resolved).startswith(str(_SKILLS_DIR.resolve())):
+        return {"found": False, "message": "Invalid path"}
+    return {"found": True, "filename": filename, "content": skill_path.read_text()}
+
+
+@mcp.tool()
+async def read_skill(harness: str, filename: str) -> str:
+    """Read a skill document. Always read 'general/host-tuning.md' before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
+    return json.dumps(_read_skill_one(harness, filename))
+
+
+@mcp.tool()
+async def read_skills(docs: list[dict]) -> str:
+    """Read multiple skill documents in one call. Use this instead of calling read_skill repeatedly — saves iterations when you need several docs at once (e.g. general/host-tuning.md + general/network-manager.md in one call)."""
+    results = []
+    for doc in docs:
+        harness = doc.get("harness", "")
+        filename = doc.get("filename", "")
+        result = _read_skill_one(harness, filename)
+        result["harness"] = harness
+        result["filename"] = filename
+        results.append(result)
+    return json.dumps(results)
+
+
+@mcp.tool()
+async def disable_firewall(host: str, user: str = "root") -> str:
+    """Flush all iptables/ip6tables rules and set default policies to ACCEPT on a host. Use this on dedicated benchmark hosts before running connectivity checks or benchmarks — fresh lab hosts often block benchmark ports (30002/30003 for uperf, etc.) by default. Do NOT call this on shared or production hosts."""
     await _ensure_init()
-    results: dict[str, dict] = {}
-    for t in targets:
-        host = t["host"]
-        config = t.get("config", {})
-        results[host] = {
+    results = []
+    errors = []
+    for cmd, label in [
+        ("iptables -F", "iptables flush rules"),
+        ("iptables -X", "iptables delete chains"),
+        ("iptables -P INPUT ACCEPT", "iptables INPUT accept"),
+        ("iptables -P FORWARD ACCEPT", "iptables FORWARD accept"),
+        ("iptables -P OUTPUT ACCEPT", "iptables OUTPUT accept"),
+        ("ip6tables -F 2>/dev/null", "ip6tables flush rules"),
+        ("ip6tables -X 2>/dev/null", "ip6tables delete chains"),
+        ("ip6tables -P INPUT ACCEPT 2>/dev/null", "ip6tables INPUT accept"),
+        ("ip6tables -P FORWARD ACCEPT 2>/dev/null", "ip6tables FORWARD accept"),
+        ("ip6tables -P OUTPUT ACCEPT 2>/dev/null", "ip6tables OUTPUT accept"),
+        (
+            "systemctl stop firewalld 2>/dev/null; systemctl mask firewalld 2>/dev/null; true",
+            "firewalld stop+mask",
+        ),
+    ]:
+        r = await _ssh.run(host, cmd + " 2>&1")
+        if r.exit_code == 0:
+            results.append(label)
+        else:
+            errors.append(f"{label}: {r.stdout.strip()}")
+
+    r_verify = await _ssh.run(host, "iptables -L INPUT -n | head -5")
+    return json.dumps(
+        {
             "host": host,
-            "config_applied": config,
-            "status": "success",
-            "reboot_required": False,
-            "message": f"Configuration applied on {host} (simulated)",
+            "status": "error" if errors else "ok",
+            "applied": results,
+            "errors": errors,
+            "iptables_input": r_verify.stdout.strip(),
         }
-    return json.dumps(_summarize(results))
+    )
+
+
+@mcp.tool()
+async def open_firewall_port(
+    host: str,
+    ports: list[int],
+    protocol: str = "tcp",
+    user: str = "root",
+) -> str:
+    """Open specific TCP/UDP ports in iptables on a host without flushing all rules. Use this when the host firewall should stay active but benchmark ports need to be explicitly allowed. For dedicated benchmark hosts with no firewall requirements, disable_firewall is simpler."""
+    await _ensure_init()
+    protos = ["tcp", "udp"] if protocol == "both" else [protocol]
+    applied = []
+    errors = []
+    for port in ports:
+        for proto in protos:
+            cmd = (
+                f"iptables -C INPUT -p {proto} --dport {port} -j ACCEPT 2>/dev/null"
+                f" || iptables -I INPUT -p {proto} --dport {port} -j ACCEPT"
+            )
+            r = await _ssh.run(host, cmd + " 2>&1")
+            if r.exit_code == 0:
+                applied.append(f"{proto}/{port}")
+            else:
+                errors.append(f"{proto}/{port}: {r.stdout.strip()}")
+
+    return json.dumps(
+        {
+            "host": host,
+            "status": "error" if errors else "ok",
+            "opened": applied,
+            "errors": errors,
+        }
+    )
+
+
+async def _tune_nic_one(
+    host: str,
+    interface: str,
+    channels: int = 1,
+    ring_rx: int | None = None,
+    ring_tx: int | None = None,
+    offloads: dict | None = None,
+) -> dict:
+    applied = []
+    errors = []
+
+    # Read current channel count
+    r = await _ssh.run(host, f"ethtool -l {interface} 2>&1")
+    before_channels: int | None = None
+    sections = r.stdout.split("Current hardware settings:")
+    if len(sections) == 2:
+        for line in sections[1].splitlines():
+            if line.strip().startswith("Combined:"):
+                try:
+                    before_channels = int(line.split()[-1])
+                except ValueError:
+                    pass
+                break
+
+    if channels != before_channels:
+        r2 = await _ssh.run(host, f"ethtool -L {interface} combined {channels} 2>&1")
+        if r2.exit_code == 0:
+            applied.append(f"channels: {before_channels} → {channels}")
+        else:
+            errors.append(f"ethtool -L failed: {r2.stdout.strip()}")
+    else:
+        applied.append(f"channels: already {channels}")
+
+    # Ring buffers
+    if ring_rx is not None or ring_tx is not None:
+        parts = []
+        if ring_rx is not None:
+            parts.append(f"rx {ring_rx}")
+        if ring_tx is not None:
+            parts.append(f"tx {ring_tx}")
+        r3 = await _ssh.run(host, f"ethtool -G {interface} {' '.join(parts)} 2>&1")
+        if r3.exit_code == 0:
+            applied.append(f"ring buffers: {' '.join(parts)}")
+        else:
+            errors.append(f"ethtool -G failed: {r3.stdout.strip()}")
+
+    # Offloads
+    for flag, value in (offloads or {}).items():
+        r4 = await _ssh.run(host, f"ethtool -K {interface} {flag} {value} 2>&1")
+        if r4.exit_code == 0:
+            applied.append(f"offload {flag}={value}")
+        else:
+            errors.append(f"ethtool -K {flag}={value} failed: {r4.stdout.strip()}")
+
+    return {
+        "host": host,
+        "interface": interface,
+        "status": "error" if errors else "ok",
+        "applied": applied,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def tune_nic(
+    host: str,
+    interface: str,
+    channels: int = 1,
+    ring_rx: int | None = None,
+    ring_tx: int | None = None,
+    offloads: dict | None = None,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Apply ethtool NIC settings on a host for benchmark preparation. Sets queue/channel count and optionally ring buffer sizes and offloads. MUST be called before pin_irq — changing channel count alters which IRQ numbers the NIC has. Returns before/after state for each setting."""
+    await _ensure_init()
+    return json.dumps(
+        await _tune_nic_one(host, interface, channels, ring_rx, ring_tx, offloads)
+    )
+
+
+async def _tune_tcp_one(
+    host: str,
+    interface: str | None = None,
+    congestion_control: str | None = None,
+    qdisc: str | None = None,
+    rmem_max: int | None = None,
+    wmem_max: int | None = None,
+    extra_sysctls: dict | None = None,
+) -> dict:
+    results = {}
+    errors = []
+
+    sysctls: dict[str, str] = {}
+    if congestion_control:
+        sysctls["net.ipv4.tcp_congestion_control"] = congestion_control
+    if qdisc:
+        # net.core.default_qdisc only affects newly-created interfaces;
+        # set it for future interfaces AND apply tc qdisc to existing ones.
+        sysctls["net.core.default_qdisc"] = qdisc
+    if rmem_max is not None:
+        sysctls["net.core.rmem_max"] = str(rmem_max)
+        sysctls["net.core.rmem_default"] = str(rmem_max)
+    if wmem_max is not None:
+        sysctls["net.core.wmem_max"] = str(wmem_max)
+        sysctls["net.core.wmem_default"] = str(wmem_max)
+    if extra_sysctls:
+        sysctls.update({str(k): str(v) for k, v in extra_sysctls.items()})
+
+    for key, value in sysctls.items():
+        rb = await _ssh.run(host, f"sysctl -n {key} 2>&1")
+        before = rb.stdout.strip()
+        rw = await _ssh.run(host, f"sysctl -w {key}={value} 2>&1")
+        if rw.exit_code != 0:
+            errors.append(f"{key}: {rw.stdout.strip()}")
+            results[key] = {"before": before, "requested": value, "ok": False}
+            continue
+        rv = await _ssh.run(host, f"sysctl -n {key} 2>&1")
+        after = rv.stdout.strip()
+        results[key] = {"before": before, "after": after, "ok": after == value}
+
+    # Apply the qdisc directly to existing interfaces via tc.
+    # sysctl net.core.default_qdisc only affects newly-created interfaces;
+    # tc qdisc is required to change the qdisc on an interface already up.
+    tc_result: dict = {}
+    if qdisc and interface:
+        rt = await _ssh.run(host, f"tc qdisc replace dev {interface} root {qdisc} 2>&1")
+        if rt.exit_code == 0:
+            rv2 = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+            tc_result = {
+                "interface": interface,
+                "qdisc": qdisc,
+                "ok": qdisc in rv2.stdout,
+                "output": rv2.stdout.strip(),
+            }
+        else:
+            errors.append(f"tc qdisc replace {interface}: {rt.stdout.strip()}")
+            tc_result = {
+                "interface": interface,
+                "qdisc": qdisc,
+                "ok": False,
+                "error": rt.stdout.strip(),
+            }
+
+    return {
+        "host": host,
+        "status": "error" if errors else "ok",
+        "sysctls": results,
+        "tc_qdisc": tc_result,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def tune_tcp(
+    host: str,
+    interface: str | None = None,
+    congestion_control: str | None = None,
+    qdisc: str | None = None,
+    rmem_max: int | None = None,
+    wmem_max: int | None = None,
+    extra_sysctls: dict | None = None,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Apply TCP/network stack settings on a host. Sets congestion control and qdisc via sysctl AND applies the qdisc directly to existing interfaces via 'tc qdisc replace' — the sysctl alone only affects newly-created interfaces. BBR requires fq (not fq_codel) for per-flow pacing; always set both. Optionally sets socket buffer sizes (rmem_max, wmem_max)."""
+    await _ensure_init()
+    return json.dumps(
+        await _tune_tcp_one(
+            host,
+            interface,
+            congestion_control,
+            qdisc,
+            rmem_max,
+            wmem_max,
+            extra_sysctls,
+        )
+    )
+
+
+async def _pin_irq_one(
+    host: str,
+    interface: str,
+    cpu: int,
+    irqbalance_mode: str = "ban_irq",
+) -> dict:
+    errors = []
+    applied = []
+
+    # Discover IRQ number(s) for the interface
+    r = await _ssh.run(host, "cat /proc/interrupts 2>&1")
+    irq_numbers = []
+    for line in r.stdout.splitlines():
+        if interface in line:
+            try:
+                irq_numbers.append(int(line.split(":")[0].strip()))
+            except ValueError:
+                pass
+
+    if not irq_numbers:
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "errors": [f"No IRQ found for {interface} in /proc/interrupts"],
+        }
+
+    cpu_mask = hex(1 << cpu)
+
+    for irq in irq_numbers:
+        r2 = await _ssh.run(
+            host, f"echo {cpu_mask} > /proc/irq/{irq}/smp_affinity 2>&1"
+        )
+        if r2.exit_code == 0:
+            applied.append(f"IRQ {irq} → CPU {cpu} (mask {cpu_mask})")
+        else:
+            errors.append(
+                f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}"
+            )
+
+    ib_result = {"mode": irqbalance_mode}
+    if irqbalance_mode == "disable":
+        r3 = await _ssh.run(
+            host, "systemctl mask irqbalance && systemctl stop irqbalance 2>&1"
+        )
+        ib_result["status"] = "masked" if r3.exit_code == 0 else "error"
+        if r3.exit_code != 0:
+            errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
+
+    elif irqbalance_mode == "ban_irq":
+        banned = " ".join(str(i) for i in irq_numbers)
+        rb = await _ssh.run(
+            host,
+            "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
+        )
+        existing = ""
+        for line in rb.stdout.splitlines():
+            if "IRQBALANCE_BANNED_INTERRUPTS" in line:
+                existing = line.split("=", 1)[-1].strip().strip('"')
+        new_val = f"{existing} {banned}".strip()
+        r4 = await _ssh.run(
+            host,
+            f"sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
+            f"systemctl restart irqbalance 2>&1",
+        )
+        ib_result["banned_interrupts"] = new_val
+        ib_result["status"] = "restarted" if r4.exit_code == 0 else "error"
+        if r4.exit_code != 0:
+            errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
+
+    elif irqbalance_mode == "ban_cpu":
+        cpu_mask_ib = hex(1 << cpu)
+        rb = await _ssh.run(
+            host, "grep -s IRQBALANCE_BANNED_CPUS /etc/sysconfig/irqbalance || echo ''"
+        )
+        existing = ""
+        for line in rb.stdout.splitlines():
+            if "IRQBALANCE_BANNED_CPUS" in line:
+                existing = line.split("=", 1)[-1].strip().strip('"')
+        try:
+            merged = hex(int(existing, 16) | (1 << cpu)) if existing else cpu_mask_ib
+        except ValueError:
+            merged = cpu_mask_ib
+        r5 = await _ssh.run(
+            host,
+            f"sed -i '/IRQBALANCE_BANNED_CPUS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+            f"echo 'IRQBALANCE_BANNED_CPUS=\"{merged}\"' >> /etc/sysconfig/irqbalance; "
+            f"systemctl restart irqbalance 2>&1",
+        )
+        ib_result["banned_cpus_mask"] = merged
+        ib_result["status"] = "restarted" if r5.exit_code == 0 else "error"
+        if r5.exit_code != 0:
+            errors.append(f"irqbalance ban_cpu failed: {r5.stdout.strip()}")
+
+    return {
+        "host": host,
+        "interface": interface,
+        "irq_numbers": irq_numbers,
+        "cpu": cpu,
+        "cpu_mask": cpu_mask,
+        "irqbalance": ib_result,
+        "status": "error" if errors else "ok",
+        "applied": applied,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def pin_irq(
+    host: str,
+    interface: str,
+    cpu: int,
+    irqbalance_mode: str = "ban_irq",
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Pin NIC IRQ(s) to a specific CPU and coordinate irqbalance so the pin is not overridden during a run. Must be called after tune_nic. irqbalance_mode controls how irqbalance is handled: 'ban_irq' (default) adds the IRQ to IRQBALANCE_BANNED_INTERRUPTS so irqbalance keeps running for other IRQs but won't touch this one; 'ban_cpu' adds the CPU to IRQBALANCE_BANNED_CPUS; 'disable' masks and stops irqbalance entirely."""
+    await _ensure_init()
+    return json.dumps(await _pin_irq_one(host, interface, cpu, irqbalance_mode))
+
+
+async def _verify_host_tuning_one(
+    host: str,
+    interface: str,
+    expected: dict | None = None,
+) -> dict:
+    exp = expected or {}
+    checks: dict[str, dict] = {}
+    all_ok = True
+
+    # TCP congestion control (sysctl)
+    r = await _ssh.run(host, "sysctl -n net.ipv4.tcp_congestion_control 2>&1")
+    actual_cc = r.stdout.strip()
+    expected_cc = exp.get("congestion_control")
+    cc_ok = (expected_cc is None) or (actual_cc == expected_cc)
+    all_ok = all_ok and cc_ok
+    checks["net.ipv4.tcp_congestion_control"] = {
+        "actual": actual_cc,
+        "expected": expected_cc,
+        "ok": cc_ok,
+    }
+
+    # Qdisc: check via tc on the interface (authoritative) not sysctl
+    # (sysctl net.core.default_qdisc only affects new interfaces)
+    expected_qdisc = exp.get("qdisc")
+    r_tc = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+    tc_output = r_tc.stdout.strip()
+    actual_qdisc = None
+    for part in tc_output.split():
+        if part not in ("qdisc", "noqueue", "root", "refcnt"):
+            actual_qdisc = part
+            break
+    qdisc_ok = (expected_qdisc is None) or (actual_qdisc == expected_qdisc)
+    all_ok = all_ok and qdisc_ok
+    checks["qdisc"] = {
+        "interface": interface,
+        "actual": actual_qdisc,
+        "expected": expected_qdisc,
+        "ok": qdisc_ok,
+        "tc_output": tc_output,
+    }
+
+    # NIC channel count
+    r = await _ssh.run(host, f"ethtool -l {interface} 2>&1")
+    actual_channels: int | None = None
+    sections = r.stdout.split("Current hardware settings:")
+    if len(sections) == 2:
+        for line in sections[1].splitlines():
+            if line.strip().startswith("Combined:"):
+                try:
+                    actual_channels = int(line.split()[-1])
+                except ValueError:
+                    pass
+                break
+    expected_channels = exp.get("channels")
+    ch_ok = (expected_channels is None) or (actual_channels == expected_channels)
+    all_ok = all_ok and ch_ok
+    checks["channels"] = {
+        "actual": actual_channels,
+        "expected": expected_channels,
+        "ok": ch_ok,
+    }
+
+    # IRQ affinity
+    ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
+    irq_numbers = []
+    for line in ri.stdout.splitlines():
+        if interface in line:
+            try:
+                irq_numbers.append(int(line.split(":")[0].strip()))
+            except ValueError:
+                pass
+
+    irq_check: dict = {"irq_numbers": irq_numbers}
+    expected_cpu = exp.get("irq_cpu")
+    if irq_numbers:
+        irq = irq_numbers[0]
+        ra = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
+        actual_affinity = ra.stdout.strip()
+        irq_check["cpu_affinity"] = actual_affinity
+        if expected_cpu is not None:
+            irq_ok = str(expected_cpu) in actual_affinity.split(",")
+            irq_check["expected_cpu"] = expected_cpu
+            irq_check["ok"] = irq_ok
+            all_ok = all_ok and irq_ok
+    checks["irq"] = irq_check
+
+    # irqbalance status
+    rib = await _ssh.run(host, "systemctl is-active irqbalance 2>&1")
+    ib_active = rib.stdout.strip() == "active"
+    expected_ib_mode = exp.get("irqbalance_mode")
+    ib_check: dict = {"active": ib_active}
+    if expected_ib_mode == "disable":
+        ib_ok = not ib_active
+        ib_check["ok"] = ib_ok
+        all_ok = all_ok and ib_ok
+    checks["irqbalance"] = ib_check
+
+    return {
+        "host": host,
+        "interface": interface,
+        "all_ok": all_ok,
+        "checks": checks,
+    }
+
+
+@mcp.tool()
+async def verify_host_tuning(
+    host: str,
+    interface: str,
+    expected: dict | None = None,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Verify that host tuning settings match expected values. Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run)."""
+    await _ensure_init()
+    return json.dumps(await _verify_host_tuning_one(host, interface, expected))
+
+
+@mcp.tool()
+async def tune_hosts(targets: list[dict]) -> str:
+    """Apply tuning to multiple hosts in one call. Runs tune_nic → tune_tcp → pin_irq → disable_firewall (if requested) → verify_host_tuning for each host concurrently. Use this instead of calling individual tuning tools one host at a time — saves multiple iterations. Always read general/host-tuning.md before calling this."""
+    await _ensure_init()
+
+    async def _tune_one(t: dict) -> dict:
+        h = t.get("host", "")
+        iface = t.get("interface", "")
+        steps = []
+        errors = []
+
+        if t.get("channels") is not None:
+            r = await _tune_nic_one(
+                host=h,
+                interface=iface,
+                channels=t.get("channels", 1),
+                ring_rx=t.get("ring_rx"),
+                ring_tx=t.get("ring_tx"),
+                offloads=t.get("offloads"),
+            )
+            steps.append({"tune_nic": r})
+            if r.get("status") == "error":
+                errors.extend(r.get("errors", []))
+
+        if t.get("congestion_control") or t.get("qdisc"):
+            r = await _tune_tcp_one(
+                host=h,
+                interface=iface,
+                congestion_control=t.get("congestion_control"),
+                qdisc=t.get("qdisc"),
+                rmem_max=t.get("rmem_max"),
+                wmem_max=t.get("wmem_max"),
+            )
+            steps.append({"tune_tcp": r})
+            if r.get("status") == "error":
+                errors.extend(r.get("errors", []))
+
+        if t.get("irq_cpu") is not None:
+            r = await _pin_irq_one(
+                host=h,
+                interface=iface,
+                cpu=t["irq_cpu"],
+                irqbalance_mode=t.get("irqbalance_mode", "ban_irq"),
+            )
+            steps.append({"pin_irq": r})
+            if r.get("status") == "error":
+                errors.extend(r.get("errors", []))
+
+        if t.get("mtu") is not None:
+            r = await _nm_set_mtu_one(host=h, interface=iface, mtu=t["mtu"])
+            steps.append({"nm_set_mtu": r})
+            if r.get("status") == "error":
+                errors.append(r.get("error", "nm_set_mtu failed"))
+
+        if t.get("disable_firewall"):
+            r_json = await disable_firewall(host=h)
+            r = json.loads(r_json)
+            steps.append({"disable_firewall": r})
+            if r.get("status") == "error":
+                errors.extend(r.get("errors", []))
+
+        expected = {}
+        if t.get("congestion_control"):
+            expected["congestion_control"] = t["congestion_control"]
+        if t.get("qdisc"):
+            expected["qdisc"] = t["qdisc"]
+        if t.get("channels") is not None:
+            expected["channels"] = t["channels"]
+        if t.get("irq_cpu") is not None:
+            expected["irq_cpu"] = t["irq_cpu"]
+        if expected:
+            r = await _verify_host_tuning_one(
+                host=h, interface=iface, expected=expected
+            )
+            steps.append({"verify": r})
+            if not r.get("all_ok"):
+                errors.append(f"Verification failed: {r.get('checks', {})}")
+
+        return {
+            "host": h,
+            "status": "error" if errors else "ok",
+            "steps": steps,
+            "errors": errors,
+        }
+
+    hosts = [t.get("host", "") for t in targets]
+    raw = await asyncio.gather(*[_tune_one(t) for t in targets], return_exceptions=True)
+    results: dict[str, dict] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"status": "error", "errors": [str(result)]}
+        else:
+            results[host] = result
+
+    success = sum(1 for r in results.values() if r.get("status") == "ok")
+    return json.dumps(
+        {
+            "results": results,
+            "summary": (
+                f"{len(results)} host(s): {success} ok, {len(results) - success} failed"
+            ),
+        }
+    )
+
+
+async def _nm_find_connection(host: str, interface: str) -> str:
+    """Return the NM connection name that owns the interface, or the interface name."""
+    r = await _ssh.run(
+        host,
+        f"nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null"
+        f" | grep ':{interface}$' | cut -d: -f1",
+    )
+    name = r.stdout.strip()
+    return name if name else interface
+
+
+async def _nm_set_mtu_one(host: str, interface: str, mtu: int) -> dict:
+    conn = await _nm_find_connection(host, interface)
+    r_before = await _ssh.run(
+        host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'"
+    )
+    before_mtu = r_before.stdout.strip()
+
+    r = await _ssh.run(
+        host,
+        f"nmcli connection modify '{conn}' 802-3-ethernet.mtu {mtu} 2>&1"
+        f" && nmcli connection up '{conn}' 2>&1",
+    )
+    if r.exit_code != 0:
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "error": r.stdout.strip(),
+        }
+
+    r_after = await _ssh.run(
+        host, f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*'"
+    )
+    after_mtu = r_after.stdout.strip()
+    actual = int(after_mtu.split()[-1]) if after_mtu else None
+    return {
+        "host": host,
+        "interface": interface,
+        "connection": conn,
+        "before": before_mtu,
+        "after": after_mtu,
+        "status": "ok" if actual == mtu else "error",
+        "ok": actual == mtu,
+    }
+
+
+@mcp.tool()
+async def nm_set_mtu(host: str, interface: str, mtu: int, user: str = "root") -> str:
+    """Set the MTU on a network interface persistently via NetworkManager. Using 'ip link set mtu' is NOT persistent — NM overrides it on connection events. This tool modifies the NM connection profile and brings it up. Read skills/general/network-manager.md before calling. MTU 9000 requires end-to-end switch support — do not set it unless the user explicitly requests jumbo frames."""
+    await _ensure_init()
+    return json.dumps(await _nm_set_mtu_one(host, interface, mtu))
+
+
+@mcp.tool()
+async def nm_set_ip(
+    host: str,
+    interface: str,
+    ip_cidr: str,
+    gateway: str | None = None,
+    dns: str | None = None,
+    user: str = "root",
+) -> str:
+    """Configure a static IP address on an interface via NetworkManager. Used when a ticket requests a private test network. Modifies the NM connection profile and brings it up."""
+    await _ensure_init()
+    conn = await _nm_find_connection(host, interface)
+    cmds = [
+        f"nmcli connection modify '{conn}' ipv4.method manual ipv4.addresses '{ip_cidr}'",
+    ]
+    if gateway:
+        cmds.append(f"nmcli connection modify '{conn}' ipv4.gateway '{gateway}'")
+    if dns:
+        cmds.append(f"nmcli connection modify '{conn}' ipv4.dns '{dns}'")
+    cmds.append(f"nmcli connection up '{conn}'")
+
+    errors = []
+    for cmd in cmds:
+        r = await _ssh.run(host, cmd + " 2>&1")
+        if r.exit_code != 0:
+            errors.append(r.stdout.strip())
+
+    r_verify = await _ssh.run(
+        host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
+    )
+    return json.dumps(
+        {
+            "host": host,
+            "interface": interface,
+            "connection": conn,
+            "ip_cidr": ip_cidr,
+            "gateway": gateway,
+            "live_addresses": r_verify.stdout.strip(),
+            "status": "error" if errors else "ok",
+            "errors": errors,
+        }
+    )
+
+
+@mcp.tool()
+async def nm_set_dhcp(host: str, interface: str, user: str = "root") -> str:
+    """Switch an interface to DHCP via NetworkManager."""
+    await _ensure_init()
+    conn = await _nm_find_connection(host, interface)
+    r = await _ssh.run(
+        host,
+        f"nmcli connection modify '{conn}' ipv4.method auto ipv4.addresses '' ipv4.gateway '' 2>&1"
+        f" && nmcli connection up '{conn}' 2>&1",
+    )
+    return json.dumps(
+        {
+            "host": host,
+            "interface": interface,
+            "connection": conn,
+            "status": "ok" if r.exit_code == 0 else "error",
+            "output": r.stdout.strip(),
+        }
+    )
+
+
+@mcp.tool()
+async def nm_show_connection(host: str, interface: str, user: str = "root") -> str:
+    """Show the current NetworkManager connection profile for an interface. Returns IP method, addresses, MTU, and connection name. Use this to audit actual interface configuration before a benchmark."""
+    await _ensure_init()
+    conn = await _nm_find_connection(host, interface)
+    r = await _ssh.run(
+        host,
+        f"nmcli connection show '{conn}' 2>/dev/null"
+        f" | grep -E 'ipv4\\.method|ipv4\\.addresses|802-3-ethernet\\.mtu|GENERAL\\.STATE'",
+    )
+    live = await _ssh.run(
+        host,
+        f"ip link show {interface} 2>/dev/null | grep -o 'mtu [0-9]*';"
+        f" ip addr show {interface} 2>/dev/null | grep 'inet '",
+    )
+    return json.dumps(
+        {
+            "host": host,
+            "interface": interface,
+            "connection": conn,
+            "profile": r.stdout.strip(),
+            "live": live.stdout.strip(),
+        }
+    )
+
+
+@mcp.tool()
+async def nm_verify_interface(
+    host: str,
+    interface: str,
+    expected_mtu: int | None = None,
+    expected_ip: str | None = None,
+    user: str = "root",
+) -> str:
+    """Verify that a network interface matches expected configuration. Checks live state (ip link) not just the NM profile. Returns pass/fail per parameter: mtu, ip_address, state."""
+    await _ensure_init()
+    checks: dict[str, dict] = {}
+    all_ok = True
+
+    r_link = await _ssh.run(host, f"ip link show {interface} 2>/dev/null")
+    link_output = r_link.stdout
+
+    m = re.search(r"mtu (\d+)", link_output)
+    actual_mtu = int(m.group(1)) if m else None
+    mtu_ok = (expected_mtu is None) or (actual_mtu == expected_mtu)
+    all_ok = all_ok and mtu_ok
+    checks["mtu"] = {"actual": actual_mtu, "expected": expected_mtu, "ok": mtu_ok}
+
+    r_addr = await _ssh.run(
+        host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
+    )
+    actual_ips = [
+        line.strip().split()[1].split("/")[0]
+        for line in r_addr.stdout.splitlines()
+        if "inet " in line
+    ]
+    ip_ok = (expected_ip is None) or (expected_ip in actual_ips)
+    all_ok = all_ok and ip_ok
+    checks["ip"] = {"actual": actual_ips, "expected": expected_ip, "ok": ip_ok}
+
+    state_ok = "UP" in link_output and "state UP" in link_output
+    checks["state"] = {"up": state_ok, "ok": state_ok}
+    all_ok = all_ok and state_ok
+
+    return json.dumps(
+        {
+            "host": host,
+            "interface": interface,
+            "all_ok": all_ok,
+            "checks": checks,
+        }
+    )
 
 
 @mcp.tool()
@@ -1311,6 +2141,24 @@ async def get_private_config(harness_name: str, key: str) -> str:
             }
         )
     return json.dumps({"key": key, "value": result})
+
+
+async def get_registered_tools() -> list[ToolDefinition]:
+    """Introspect this server's registered @mcp.tool() functions.
+
+    Returns ToolDefinition objects (name, description, input_schema) for
+    every tool this server exposes over MCP. Useful for tests and tooling
+    that need to inspect schemas without spawning the actual subprocess.
+    """
+    tools = await mcp.list_tools()
+    return [
+        ToolDefinition(
+            name=t.name,
+            description=t.description or "",
+            input_schema=t.parameters,
+        )
+        for t in tools
+    ]
 
 
 if __name__ == "__main__":

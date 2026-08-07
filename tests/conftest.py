@@ -179,3 +179,39 @@ class MockSSHExecutor:
             }
         )
         return self._default
+
+
+def make_provisioning_handlers(
+    ssh: MockSSHExecutor,
+    skill_provider: SkillProvider | None = None,
+    secrets_provider: SecretsProvider | None = None,
+):
+    """Return a dict-like accessor for agents.provisioning.server's @mcp.tool()
+    functions, wired to the given mocks and bypassing _ensure_init().
+
+    FastMCP's @mcp.tool() decorator returns the function unchanged and
+    directly callable, so this just patches the module's lazily-initialized
+    globals and JSON-decodes each tool's string return value into a dict,
+    matching the calling convention the old mcp_server.py closure-based
+    handlers used (``await handlers["tool_name"](**kwargs)`` -> dict).
+    """
+    import json
+
+    import agents.provisioning.server as srv
+
+    srv._ssh = ssh
+    srv._skill_provider = skill_provider or MockSkillProvider()
+    srv._secrets_provider = secrets_provider
+    srv._initialized = True
+
+    class _Handlers:
+        def __getitem__(self, name: str):
+            fn = getattr(srv, name)
+
+            async def _wrapper(**kwargs):
+                result = await fn(**kwargs)
+                return json.loads(result) if isinstance(result, str) else result
+
+            return _wrapper
+
+    return _Handlers()

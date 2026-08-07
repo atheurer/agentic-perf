@@ -2,25 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
-from tests.conftest import MockSkillProvider, MockSSHExecutor, SSHResult
+from tests.conftest import MockSSHExecutor, SSHResult, make_provisioning_handlers
 
 
 def make_handlers(ssh: MockSSHExecutor):
-    from agents.provisioning.mcp_server import create_provisioning_tool_handlers
-
-    async def noop(q):
-        pass
-
-    with patch("agents.provisioning.mcp_server.SSHExecutor", return_value=ssh):
-        handlers, _ = create_provisioning_tool_handlers(
-            skill_provider=MockSkillProvider(),
-            request_clarification_fn=noop,
-        )
-    return handlers
+    return make_provisioning_handlers(ssh)
 
 
 # ---------------------------------------------------------------------------
