@@ -226,7 +226,10 @@ def get_review_tools(
                         },
                     },
                     "ssh_key_path": {"type": "string"},
-                    "port": {"type": "integer", "description": "CDM server port (default: 3000)"},
+                    "port": {
+                        "type": "integer",
+                        "description": "CDM server port (default: 3000)",
+                    },
                 },
                 "required": ["controller", "requests"],
             },
@@ -679,7 +682,9 @@ def create_review_tool_handlers(
             )
             return label, result
 
-        results = await _asyncio.gather(*[_one(r) for r in requests], return_exceptions=True)
+        results = await _asyncio.gather(
+            *[_one(r) for r in requests], return_exceptions=True
+        )
         out = {}
         for item in results:
             if isinstance(item, Exception):
