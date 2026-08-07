@@ -92,7 +92,12 @@ class TicketStore:
                 tickets = [t for t in tickets if t.status == status]
             return [t.model_copy() for t in tickets]
 
-    def transition_ticket(self, ticket_id: str, request: TransitionRequest) -> Ticket:
+    def transition_ticket(
+        self,
+        ticket_id: str,
+        request: TransitionRequest,
+        triggered_by: str = "system",
+    ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
@@ -161,6 +166,7 @@ class TicketStore:
 
             old_status = current.value
             ticket.status = new_status
+            ticket.status_trail.append(new_status.value)
             ticket.updated_at = datetime.now(timezone.utc)
             self._global_seq += 1
             ticket.transition_seq = self._global_seq
@@ -186,14 +192,20 @@ class TicketStore:
             )
 
             # Emit transition event so the dashboard
-            # breadcrumb trail is always complete,
-            # regardless of who initiated the transition.
+            # Emit status_change for the dashboard breadcrumb
+            # trail. This is the authoritative record of state
+            # transitions — one event per transition, emitted
+            # at the point where state actually changes.
+            # Agents separately emit "transition" events with
+            # additional context (agent name, reasoning) for
+            # the live feed. The UI uses status_change for
+            # breadcrumbs and transition for the feed.
             if self._event_bus:
                 try:
                     self._event_bus.emit(
                         ticket_id,
-                        "system",
-                        "transition",
+                        triggered_by,
+                        "status_change",
                         {
                             "from": old_status,
                             "to": new_status.value,
@@ -201,7 +213,7 @@ class TicketStore:
                         },
                     )
                 except Exception as e:
-                    logger.exception(f"[store] Failed to emit transition event: {e}")
+                    logger.exception(f"[store] Failed to emit status_change event: {e}")
 
             return ticket.model_copy()
 
@@ -397,6 +409,7 @@ class TicketStore:
             old_status = ticket.status.value
             ticket.previous_status = ticket.status
             ticket.status = TicketStatus.CLOSED
+            ticket.status_trail.append(TicketStatus.CLOSED.value)
             ticket.updated_at = datetime.now(timezone.utc)
             self._global_seq += 1
             ticket.transition_seq = self._global_seq

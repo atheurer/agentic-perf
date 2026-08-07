@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TicketStatus(str, Enum):
@@ -139,9 +139,23 @@ class Ticket(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     previous_status: TicketStatus | None = None
+    status_trail: list[str] = Field(default_factory=lambda: ["new"])
     transition_seq: int = 0
     created_by: str = ""
     owners: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _backfill_status_trail(self) -> "Ticket":
+        """Ensure status_trail reflects current status for existing tickets.
+
+        Tickets persisted before status_trail was added will load
+        with the default ["new"]. If the ticket's actual status
+        differs, append it so the dashboard shows at least the
+        current state.
+        """
+        if self.status_trail == ["new"] and self.status != TicketStatus.NEW:
+            self.status_trail.append(self.status.value)
+        return self
 
 
 class CreateTicketRequest(BaseModel):
