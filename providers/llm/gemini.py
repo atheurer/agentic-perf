@@ -120,7 +120,7 @@ class GeminiLLMProvider(LLMProvider):
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> LLMResponse:
         from google.genai import types
@@ -129,7 +129,7 @@ class GeminiLLMProvider(LLMProvider):
 
         config_kwargs: dict[str, Any] = {
             "system_instruction": system_prompt,
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": self._resolve_max_tokens(max_tokens),
         }
         if tools:
             config_kwargs["tools"] = [self._convert_tools(tools)]

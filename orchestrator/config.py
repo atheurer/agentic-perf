@@ -24,6 +24,12 @@ class OrchestratorConfig:
         # a cheap model since it makes periodic narrative calls
         # across the full ticket lifecycle.
         "introspection": {"model": "claude-haiku-4-5"},
+        # Review does heavy analysis (multi-metric interpretation,
+        # markdown tables, structured key_metrics) and typically
+        # runs with reasoning_effort set, where thinking tokens
+        # share the max_tokens budget with visible output. Give
+        # it much more headroom than the global default.
+        "review": {"max_tokens": "32000"},
     }
 
     def __init__(
@@ -139,6 +145,19 @@ class OrchestratorConfig:
             120.0,
         )
 
+        # Max output tokens for a single LLM completion. Applies
+        # to agents without a more specific override (see
+        # _BUILTIN_AGENT_MODELS and agent_models.<type>.max_tokens
+        # in config.json).
+        self.llm_max_tokens: int = int(
+            _env_or_cfg(
+                "LLM_MAX_TOKENS",
+                llm_cfg,
+                "max_tokens",
+                8000,
+            )
+        )
+
         # Maximum wall-clock time (seconds) for an entire
         # agent task. 0 disables. Catches agents stuck in
         # tool loops or waiting on unresponsive services.
@@ -190,23 +209,28 @@ class OrchestratorConfig:
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 
-        Resolution order:
-        1. agent_models.<type>         — explicit per-agent config
-        2. agent_models.default        — explicit catch-all config
-        3. _BUILTIN_AGENT_MODELS.<type> — built-in defaults for
-           reasoning-heavy agents (e.g. Sonnet for triage)
-        4. top-level llm config        — global default
+        Layers, later ones filling in keys the earlier ones didn't set:
+        1. top-level llm config        — global default (provider, model)
+        2. _BUILTIN_AGENT_MODELS.<type> — built-in defaults for
+           reasoning-heavy agents (e.g. Sonnet for triage, a higher
+           max_tokens for review)
+        3. agent_models.default        — explicit catch-all config
+        4. agent_models.<type>         — explicit per-agent config
+
+        Explicit config keys always win over built-in defaults, but an
+        explicit override for one key (e.g. review's model) doesn't
+        erase a built-in default for another key (e.g. review's
+        max_tokens) the way a wholesale dict replacement would.
         """
-        if agent_type in self._agent_models:
-            return dict(self._agent_models[agent_type])
-        if "default" in self._agent_models:
-            return dict(self._agent_models["default"])
+        base = {"provider": self.llm_provider, "model": self.llm_model}
         builtin = self._BUILTIN_AGENT_MODELS.get(agent_type)
         if builtin:
-            base = {"provider": self.llm_provider, "model": self.llm_model}
             base.update(builtin)
-            return base
-        return {"provider": self.llm_provider, "model": self.llm_model}
+        if "default" in self._agent_models:
+            base.update(self._agent_models["default"])
+        if agent_type in self._agent_models:
+            base.update(self._agent_models[agent_type])
+        return base
 
 
 def _env_or_cfg(
