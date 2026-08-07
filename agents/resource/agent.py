@@ -9,7 +9,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.infra.server import cleanup_passwordless_ssh
 from agents.mcp_client import AgentMCPClient
-from agents.provisioning.mcp_server import cleanup_harness
+from agents.provisioning.server import cleanup_harness
 from agents.server_utils import _resolve_vault_secret_name, resolve_ssh_key
 from paths import get_default_ssh_key
 from providers.events import EventBus

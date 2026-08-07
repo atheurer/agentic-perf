@@ -8,18 +8,54 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
-from .mcp_server import get_provisioning_tools
 from .prompts import PROVISIONING_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_MCP_TOOL_NAMES = frozenset(
-    t.name
-    for t in get_provisioning_tools()
-    if t.name not in ("request_clarification", "submit_provisioning_result")
-)
+# The only two tools NOT served by the provisioning MCP server (server.py) —
+# everything else the agent can call comes from that live connection.
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="request_clarification",
+        description="Ask the user for clarification. Pauses the ticket for human input.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to ask"},
+            },
+            "required": ["question"],
+        },
+    ),
+    ToolDefinition(
+        name="submit_provisioning_result",
+        description="Submit the provisioning result when all hosts are prepared.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "provisioning_complete": {"type": "boolean"},
+                "hosts_provisioned": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "harness_version": {"type": "string"},
+                "harness_name": {"type": "string"},
+                "configuration_applied": {"type": "object"},
+                "k3s_installed": {
+                    "type": "boolean",
+                    "description": "Whether K3s was installed",
+                },
+                "k3s_version": {
+                    "type": "string",
+                    "description": "K3s version string (if installed)",
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["provisioning_complete", "hosts_provisioned"],
+        },
+    ),
+]
 
 
 class ProvisioningAgent(AgentBase):
@@ -35,9 +71,7 @@ class ProvisioningAgent(AgentBase):
         self._secrets_provider = secrets_provider
         self._ticket_id: str | None = None
 
-        local_tools = [
-            t for t in get_provisioning_tools() if t.name not in _MCP_TOOL_NAMES
-        ]
+        local_tools = list(_LOCAL_TOOLS)
 
         async def _request_clarification(question: str) -> str:
             return await self._do_request_clarification(question)

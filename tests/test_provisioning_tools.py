@@ -4,10 +4,9 @@ from unittest.mock import patch
 
 import pytest
 
-from agents.provisioning.mcp_server import (
+from agents.provisioning.server import (
     _parse_os_release,
     _summarize,
-    create_provisioning_tool_handlers,
     validate_platform_contract,
 )
 from tests.conftest import (
@@ -15,6 +14,7 @@ from tests.conftest import (
     MockSkillProvider,
     MockSSHExecutor,
     SSHResult,
+    make_provisioning_handlers,
 )
 
 ZATHRAS_PRIVATE_CONFIG = {
@@ -127,15 +127,9 @@ def mock_secrets_missing() -> MockSecretsProvider:
 
 @pytest.fixture
 def handlers(mock_provider, mock_ssh, mock_secrets):
-    async def noop_clarification(q):
-        pass
-
-    h = create_provisioning_tool_handlers(
-        skill_provider=mock_provider,
-        secrets_provider=mock_secrets,
-        request_clarification_fn=noop_clarification,
+    return make_provisioning_handlers(
+        mock_ssh, skill_provider=mock_provider, secrets_provider=mock_secrets
     )
-    return h, mock_ssh
 
 
 @pytest.mark.asyncio
@@ -150,14 +144,6 @@ async def test_get_private_config_constraints(mock_provider):
 async def test_get_private_config_not_found(mock_provider):
     result = await mock_provider.get_private_config("unknown", "constraints")
     assert result is None
-
-
-@pytest.mark.asyncio
-async def test_verify_harness_reads_verify_command(handlers):
-    h, mock_ssh = handlers
-    with patch("agents.provisioning.mcp_server.SSHExecutor", return_value=mock_ssh):
-        # We can't easily patch the ssh inside the closure, so test the config lookup
-        pass
 
 
 @pytest.mark.asyncio
@@ -210,15 +196,6 @@ async def test_update_install_reads_from_config(mock_provider):
 @pytest.mark.asyncio
 async def test_contract_validation_passes(mock_provider, mock_secrets):
     """Contract validation succeeds when all required secrets are present."""
-
-    async def noop(q):
-        pass
-
-    handlers, ssh = create_provisioning_tool_handlers(
-        skill_provider=mock_provider,
-        secrets_provider=mock_secrets,
-        request_clarification_fn=noop,
-    )
     config = await mock_provider.get_all_private_config("crucible")
     contract = config["install_contract"]
     assert len(contract["secret_files"]) == 2
@@ -233,15 +210,6 @@ async def test_contract_validation_fails_missing_secret(
     mock_provider, mock_secrets_missing
 ):
     """Contract validation fails when required secrets are missing."""
-
-    async def noop(q):
-        pass
-
-    handlers, ssh = create_provisioning_tool_handlers(
-        skill_provider=mock_provider,
-        secrets_provider=mock_secrets_missing,
-        request_clarification_fn=noop,
-    )
     config = await mock_provider.get_all_private_config("crucible")
     for entry in config["install_contract"]["secret_files"]:
         secret_path = config["secrets"][entry["secret_key"]]
@@ -430,38 +398,6 @@ def test_summarize_boolean_fields():
 # --- Batched tool handler tests ---
 
 
-@pytest.fixture
-def batched_handlers(mock_provider, mock_secrets):
-    """Create handlers and return (handlers_dict, MockSSHExecutor)."""
-    ssh = MockSSHExecutor(
-        results={
-            "os-release": SSHResult(stdout=RHEL9_OS_RELEASE),
-            "repolist": SSHResult(
-                stdout="repo id              repo name\nepel               Extra Packages"
-            ),
-            "which podman": SSHResult(stdout="/usr/bin/podman\npodman version 4.9"),
-            "which git": SSHResult(stdout="/usr/bin/git\ngit version 2.43"),
-            "which jq": SSHResult(stdout="/usr/bin/jq\njq-1.7"),
-            "which curl": SSHResult(stdout="/usr/bin/curl\ncurl 8.5"),
-            "dnf install": SSHResult(stdout="Complete!"),
-        }
-    )
-
-    async def noop_clarification(q):
-        pass
-
-    h, _ = create_provisioning_tool_handlers(
-        skill_provider=mock_provider,
-        secrets_provider=mock_secrets,
-        request_clarification_fn=noop_clarification,
-    )
-    # Patch the ssh inside the closure handlers
-    # The handlers close over ssh from SSHExecutor(user="root") — we need
-    # to intercept at the module level. Instead, test the batching via
-    # the module-level helpers directly.
-    return h, ssh
-
-
 @pytest.mark.asyncio
 async def test_batched_check_platform_contract(mock_provider):
     """check_platform_contract with multiple hosts returns per-host results."""
@@ -481,7 +417,7 @@ async def test_batched_check_platform_contract(mock_provider):
             "required_packages": ["git"],
         }
     }
-    from agents.provisioning.mcp_server import _gather_for_hosts
+    from agents.provisioning.server import _gather_for_hosts
 
     async def _check_one(host: str) -> dict:
         return await validate_platform_contract(ssh, host, config)
@@ -537,7 +473,7 @@ async def test_batched_check_host_prerequisites():
             "which curl": SSHResult(stdout="/usr/bin/curl\ncurl 8.5"),
         }
     )
-    from agents.provisioning.mcp_server import _gather_for_hosts
+    from agents.provisioning.server import _gather_for_hosts
 
     async def _check_one(host: str) -> dict:
         prereqs = {}
@@ -611,7 +547,7 @@ async def test_batched_install_packages():
 @pytest.mark.asyncio
 async def test_gather_for_hosts_handles_exceptions():
     """_gather_for_hosts converts exceptions to error results."""
-    from agents.provisioning.mcp_server import _gather_for_hosts
+    from agents.provisioning.server import _gather_for_hosts
 
     async def _fail_on_h2(host: str) -> dict:
         if host == "h2":
@@ -628,7 +564,7 @@ async def test_gather_for_hosts_handles_exceptions():
 @pytest.mark.asyncio
 async def test_single_host_list_works():
     """Passing a single-element list produces the same result as the old API."""
-    from agents.provisioning.mcp_server import _gather_for_hosts
+    from agents.provisioning.server import _gather_for_hosts
 
     async def _simple(host: str) -> dict:
         return {"host": host, "status": "success"}
@@ -641,9 +577,9 @@ async def test_single_host_list_works():
 @pytest.mark.asyncio
 async def test_ensure_harness_installed_tool_in_definitions():
     """ensure_harness_installed tool exists in the tool definitions."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     names = [t.name for t in tools]
     assert "ensure_harness_installed" in names
 
@@ -655,9 +591,9 @@ async def test_ensure_harness_installed_tool_in_definitions():
 @pytest.mark.asyncio
 async def test_all_tools_use_hosts_or_targets():
     """All host-facing tools use 'hosts' (array) or 'targets' (array), not 'host' (string)."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     host_facing = [
         t
         for t in tools
@@ -704,9 +640,9 @@ async def test_all_tools_use_hosts_or_targets():
 @pytest.mark.asyncio
 async def test_ensure_prerequisites_tool_in_definitions():
     """ensure_prerequisites tool exists in the tool definitions."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     names = [t.name for t in tools]
     assert "ensure_prerequisites" in names
 
@@ -838,7 +774,7 @@ async def test_ensure_prerequisites_reports_failures():
 
 def test_filter_controller_only_skips_non_controller():
     """When controller_only_install is true, non-controller hosts are skipped."""
-    from agents.provisioning.mcp_server import _filter_controller_only
+    from agents.provisioning.server import _filter_controller_only
 
     hosts = ["ctrl", "target1", "target2"]
     provisioning = {"controller_only_install": True}
@@ -852,7 +788,7 @@ def test_filter_controller_only_skips_non_controller():
 
 def test_filter_controller_only_false_installs_all():
     """When controller_only_install is false, all hosts pass through."""
-    from agents.provisioning.mcp_server import _filter_controller_only
+    from agents.provisioning.server import _filter_controller_only
 
     hosts = ["ctrl", "target1", "target2"]
     provisioning = {"controller_only_install": False}
@@ -863,7 +799,7 @@ def test_filter_controller_only_false_installs_all():
 
 def test_filter_controller_only_no_controller_host_passes_all():
     """When controller_host is empty, all hosts pass through regardless of flag."""
-    from agents.provisioning.mcp_server import _filter_controller_only
+    from agents.provisioning.server import _filter_controller_only
 
     hosts = ["h1", "h2", "h3"]
     provisioning = {"controller_only_install": True}
@@ -874,7 +810,7 @@ def test_filter_controller_only_no_controller_host_passes_all():
 
 def test_filter_controller_only_default_is_true():
     """When controller_only_install is absent, it defaults to True."""
-    from agents.provisioning.mcp_server import _filter_controller_only
+    from agents.provisioning.server import _filter_controller_only
 
     hosts = ["ctrl", "target1"]
     provisioning = {}
@@ -899,9 +835,9 @@ def test_filter_controller_only_server_module():
 @pytest.mark.asyncio
 async def test_install_harness_tool_has_controller_host():
     """install_harness tool schema includes controller_host property."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     tool = next(t for t in tools if t.name == "install_harness")
     assert "controller_host" in tool.input_schema["properties"]
 
@@ -909,9 +845,9 @@ async def test_install_harness_tool_has_controller_host():
 @pytest.mark.asyncio
 async def test_ensure_harness_installed_tool_has_controller_host():
     """ensure_harness_installed tool schema includes controller_host property."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     tool = next(t for t in tools if t.name == "ensure_harness_installed")
     assert "controller_host" in tool.input_schema["properties"]
 
@@ -919,9 +855,9 @@ async def test_ensure_harness_installed_tool_has_controller_host():
 @pytest.mark.asyncio
 async def test_all_install_tools_have_controller_host():
     """All install-related tools have controller_host in their schema."""
-    from agents.provisioning.mcp_server import get_provisioning_tools
+    from agents.provisioning.server import get_registered_tools
 
-    tools = get_provisioning_tools()
+    tools = await get_registered_tools()
     install_tools = [
         "install_harness",
         "ensure_harness_installed",

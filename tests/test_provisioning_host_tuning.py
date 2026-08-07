@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
-from tests.conftest import MockSkillProvider, MockSSHExecutor, SSHResult
+from tests.conftest import MockSSHExecutor, SSHResult, make_provisioning_handlers
 
 PROC_INTERRUPTS_ONE_QUEUE = """\
   0:         19   IO-APIC    2-edge      timer
@@ -37,17 +35,7 @@ Combined:    4
 
 
 def make_handlers(ssh: MockSSHExecutor):
-    from agents.provisioning.mcp_server import create_provisioning_tool_handlers
-
-    async def noop_clarification(q):
-        pass
-
-    with patch("agents.provisioning.mcp_server.SSHExecutor", return_value=ssh):
-        handlers, _ = create_provisioning_tool_handlers(
-            skill_provider=MockSkillProvider(),
-            request_clarification_fn=noop_clarification,
-        )
-    return handlers
+    return make_provisioning_handlers(ssh)
 
 
 # ---------------------------------------------------------------------------
