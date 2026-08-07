@@ -683,7 +683,7 @@ def create_review_tool_handlers(
         out = {}
         for item in results:
             if isinstance(item, Exception):
-                out[f"error"] = {"status": "error", "error": str(item)}
+                out["error"] = {"status": "error", "error": str(item)}
             else:
                 label, data = item
                 out[label] = data
