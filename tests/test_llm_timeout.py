@@ -142,7 +142,7 @@ class TestClaudeTimeout:
 
         # Mock the client to hang
         mock_client = MagicMock()
-        mock_client.messages.create = MagicMock(
+        mock_client.messages.stream = MagicMock(
             side_effect=lambda **kwargs: time.sleep(10)
         )
         provider._client = mock_client
@@ -169,8 +169,13 @@ class TestClaudeTimeout:
         mock_response = MagicMock()
         mock_response.content = []
         mock_response.stop_reason = "end_turn"
+        mock_stream_cm = MagicMock()
+        mock_stream_cm.__enter__ = MagicMock(return_value=mock_stream_cm)
+        mock_stream_cm.__exit__ = MagicMock(return_value=False)
+        mock_stream_cm.until_done = MagicMock()
+        mock_stream_cm.get_final_message = MagicMock(return_value=mock_response)
         mock_client = MagicMock()
-        mock_client.messages.create = MagicMock(return_value=mock_response)
+        mock_client.messages.stream = MagicMock(return_value=mock_stream_cm)
         provider._client = mock_client
 
         # Should not raise — timeout=0 means no wrapping
@@ -832,7 +837,7 @@ class TestClaudeRateLimit:
         provider.default_timeout = None
 
         mock_client = MagicMock()
-        mock_client.messages.create = MagicMock(
+        mock_client.messages.stream = MagicMock(
             side_effect=anthropic.RateLimitError(
                 message="rate limited",
                 response=MagicMock(headers={}),
