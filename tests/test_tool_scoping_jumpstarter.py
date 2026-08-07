@@ -76,6 +76,28 @@ class TestProvisioningToolScoping:
         agent._apply_tool_scoping(ticket)
         assert len(agent.tools) == 10
 
+    def test_always_deny_removes_execute_command_regardless_of_harness(self):
+        """execute_command is denied for every harness, not just self-installing.
+
+        Regression test for the bug where _apply_tool_scoping ran before
+        mcp_tools were merged into self.tools, so _PROVISIONING_DENY_TOOLS
+        never filtered anything for any harness — and execute_command
+        needs denying for normal harnesses too (see #483), which
+        _apply_tool_scoping's harness-gated logic doesn't cover anyway.
+        """
+        agent = self._make_agent()
+        agent.tools = agent.tools + [
+            ToolDefinition(name="execute_command", description="", input_schema={})
+        ]
+        # Simulate a normal (non-self-installing) harness — _apply_tool_scoping
+        # would leave execute_command alone, but _apply_always_deny must not.
+        ticket = {"custom_fields": {"directives": {"harness": "crucible"}}}
+        agent._apply_tool_scoping(ticket)
+        agent._apply_always_deny()
+        names = {t.name for t in agent.tools}
+        assert "execute_command" not in names
+        assert "install_harness" in names
+
 
 class TestBenchmarkToolScoping:
     """Test _HARNESS_TOOLS on the benchmark agent."""
