@@ -126,7 +126,7 @@ class MockLLMProvider(LLMProvider):
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> LLMResponse:
         if self._responses:
