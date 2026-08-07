@@ -1123,7 +1123,8 @@ class AgentBase(ABC):
 
         Returns True only when:
         1. A plan exists with more steps after the current one, AND
-        2. The current step's agent_type matches this agent (i.e., this
+        2. The current step is "in_progress" (matching _advance_plan), AND
+        3. The current step's agent_type matches this agent (i.e., this
            agent is executing a plan-managed step, not a pre-plan step
            in the normal pipeline).
 
@@ -1140,6 +1141,8 @@ class AgentBase(ABC):
         if current_idx >= len(steps) or current_idx + 1 >= len(steps):
             return False
         step = steps[current_idx]
+        if step.get("status") != "in_progress":
+            return False
         expected_status = self._PLAN_AGENT_STATUS.get(
             step.get("agent_type", ""),
         )

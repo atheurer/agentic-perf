@@ -336,25 +336,6 @@ class ReviewAgent(AgentBase):
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
-        if not self._user_approved_submit:
-            logger.info(
-                f"[review-agent] Completion called without user approval "
-                f"on {ticket_id} — escalating to HITL"
-            )
-            question = (
-                "The review agent attempted to submit results without "
-                "presenting findings for your review first. The agent's "
-                "analysis so far:\n\n"
-                f"{response.text[:2000] if response.text else 'No analysis text.'}"
-                "\n\nPlease provide guidance on what to investigate, "
-                "or reply 'done' to accept and submit."
-            )
-            reply = await self._request_human_input(ticket_id, question)
-            if _is_approved(reply):
-                self._user_approved_submit = True
-            else:
-                return
-
         result = self._get_submit_result(response)
         if not result:
             result = self._parse_json_response(response.text)
@@ -372,6 +353,7 @@ class ReviewAgent(AgentBase):
             "key_metrics": result.get("key_metrics", {}),
             "recommendations": result.get("recommendations", []),
             "follow_up_needed": result.get("follow_up_needed", False),
+            "review_submitted": True,
         }
         if result.get("chart_data"):
             fields["chart_data"] = result["chart_data"]

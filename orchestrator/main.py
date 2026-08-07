@@ -212,18 +212,33 @@ def _advance_plan(
         current = plan.get("current_step", 0)
 
         if current >= len(steps):
+            logger.debug(
+                f"[advance-plan] {ticket_id}: step index {current} past end of plan"
+            )
             return
 
         step = steps[current]
         if step.get("status") != "in_progress":
+            logger.debug(
+                f"[advance-plan] {ticket_id}: step {current} "
+                f"status is {step.get('status')!r}, not in_progress"
+            )
             return
 
         expected_status = PLAN_AGENT_STATUS.get(step.get("agent_type", ""))
         if expected_status != completed_status:
+            logger.debug(
+                f"[advance-plan] {ticket_id}: completed "
+                f"{completed_status} but step expects "
+                f"{expected_status}"
+            )
             return
 
         ticket_status = ticket.get("status", "")
         if ticket_status == "awaiting_customer_guidance":
+            logger.debug(
+                f"[advance-plan] {ticket_id}: ticket is at guidance, deferring"
+            )
             return
         if cf.get("abort_requested"):
             return
@@ -259,7 +274,12 @@ def _advance_plan(
 
                 client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                    json={"fields": {"execution_plan": plan}},
+                    json={
+                        "fields": {
+                            "execution_plan": plan,
+                            "review_submitted": None,
+                        },
+                    },
                 )
 
                 _apply_step_overrides(
@@ -297,7 +317,12 @@ def _advance_plan(
 
         client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": {"execution_plan": plan}},
+            json={
+                "fields": {
+                    "execution_plan": plan,
+                    "review_submitted": None,
+                },
+            },
         )
     finally:
         client.close()
@@ -1113,6 +1138,11 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 tid = ticket["id"]
                 if dispatcher.is_active(tid):
                     logger.info(f"Skipping {tid} at {status}: is_active")
+                    continue
+
+                cf = ticket.get("custom_fields", {})
+                if status == "awaiting_review" and cf.get("review_submitted"):
+                    logger.info(f"Skipping {tid}: review already submitted")
                     continue
 
                 # Deterministic enrichment for webhook tickets.
