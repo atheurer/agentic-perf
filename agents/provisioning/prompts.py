@@ -24,10 +24,10 @@ verify_harness_install, check_existing_install, update_install) also accept
 `controller_host` — always set this to the controller's IP so the harness is
 only installed/checked/verified on the controller (the default behavior).
 
-Tools with per-host parameters use `targets: list[dict]`:
-  configure_host — each target is {"host": "...", "config": {...}}
-
 All batched tools return results keyed by host, with a summary line.
+
+Network tuning tools (tune_nic, tune_tcp, pin_irq, verify_host_tuning) take a
+single host per call, not a batch — call them once per host that needs tuning.
 
 ## Combined Tools
 
@@ -133,7 +133,9 @@ Your tasks:
     it here, it never happens, silently. Before proceeding:
     a. Call `read_skill` for `general/host-tuning.md` — it defines the
        required ordering (tune_nic → pin_irq) and irqbalance strategy.
-    b. Apply the tuning with `tune_nic` / `pin_irq` as needed.
+    b. Apply the tuning with `tune_nic` (queue count, ring buffers,
+       offloads), `tune_tcp` (congestion control, qdisc), and `pin_irq`
+       (IRQ affinity + irqbalance) as needed — one call per host per tool.
     c. Call `verify_host_tuning` and include its result in your
        `submit_provisioning_result` call. If verification shows the tuning
        did NOT take effect (e.g. IRQ landed on a different CPU than
