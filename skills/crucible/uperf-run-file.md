@@ -36,6 +36,25 @@ Layers 1 and 2 may use different IPs than layer 3,
 especially in cloud environments where hosts have multiple
 interfaces or IP addresses.
 
+**Also verify layer 2 before calling `execute_benchmark`** —
+don't just trust whatever value ended up in each endpoint's
+`host` field. SSH access from the controller to each endpoint
+should already be in place from `setup_passwordless_ssh`, so
+this is a real connectivity check, not a port probe. Use
+`execute_command` on the controller for each endpoint host in
+your run-file:
+
+```
+ssh -o ConnectTimeout=5 -o BatchMode=yes \
+  -o StrictHostKeyChecking=accept-new <endpoint-host> hostname
+```
+
+If this fails for a host that `setup_passwordless_ssh` already
+reported as reachable, you likely put the wrong value in that
+endpoint's `host` field (e.g. a layer-3 test-interface IP
+instead of the layer-2 access address) — see "Discovering test
+interfaces" below.
+
 ### uperf port formula
 
 Crucible's uperf benchmark uses these TCP ports per
