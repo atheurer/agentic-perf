@@ -193,36 +193,45 @@ def get_review_tools(
             },
         ),
         ToolDefinition(
-            name="cdm_api_request",
+            name="cdm_api_requests",
             description=(
-                "Make an HTTP request to the CDM query server on the controller. "
-                "Only applicable when the harness is crucible and the review "
-                "config indicates cdm_api as the results method."
+                "Make multiple CDM API requests in one call. "
+                "Use this instead of calling cdm_api_request repeatedly — "
+                "each request in the batch runs concurrently, saving iterations "
+                "when querying several metrics or periods at once "
+                "(e.g. uperf Gbps + mpstat CPU + tcp-window cwnd for one period)."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "controller": {"type": "string", "description": "Controller host"},
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST"],
-                        "description": "HTTP method",
+                    "requests": {
+                        "type": "array",
+                        "description": "List of requests to make concurrently",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Label to identify this response in results",
+                                },
+                                "method": {
+                                    "type": "string",
+                                    "enum": ["GET", "POST"],
+                                },
+                                "path": {"type": "string"},
+                                "body": {"type": "object"},
+                            },
+                            "required": ["label", "method", "path"],
+                        },
                     },
-                    "path": {
-                        "type": "string",
-                        "description": "API path (e.g., /api/v1/run/<id>/iterations)",
-                    },
-                    "body": {
-                        "type": "object",
-                        "description": "Request body for POST requests",
-                    },
-                    "ssh_key_path": {"type": "string", "description": "SSH key path"},
+                    "ssh_key_path": {"type": "string"},
                     "port": {
                         "type": "integer",
                         "description": "CDM server port (default: 3000)",
                     },
                 },
-                "required": ["controller", "method", "path"],
+                "required": ["controller", "requests"],
             },
         ),
         ToolDefinition(
@@ -653,6 +662,38 @@ def create_review_tool_handlers(
                 "error": "Response is not valid JSON",
             }
 
+    async def cdm_api_requests(
+        controller: str,
+        requests: list[dict],
+        ssh_key_path: str | None = None,
+        port: int = 3000,
+    ) -> dict:
+        import asyncio as _asyncio
+
+        async def _one(req: dict) -> tuple[str, dict]:
+            label = req.get("label", req.get("path", "?"))
+            result = await cdm_api_request(
+                controller=controller,
+                method=req.get("method", "POST"),
+                path=req.get("path", ""),
+                body=req.get("body"),
+                ssh_key_path=ssh_key_path,
+                port=port,
+            )
+            return label, result
+
+        results = await _asyncio.gather(
+            *[_one(r) for r in requests], return_exceptions=True
+        )
+        out = {}
+        for item in results:
+            if isinstance(item, Exception):
+                out["error"] = {"status": "error", "error": str(item)}
+            else:
+                label, data = item
+                out[label] = data
+        return out
+
     async def compare_results(
         run_id: str,
         baseline_id: str,
@@ -688,7 +729,7 @@ def create_review_tool_handlers(
         "read_skill": read_skill,
         "get_run_summary": get_run_summary,
         "read_run_results": read_run_results,
-        "cdm_api_request": cdm_api_request,
+        "cdm_api_requests": cdm_api_requests,
         "compare_results": compare_results,
         "request_clarification": request_clarification,
     }

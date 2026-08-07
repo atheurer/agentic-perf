@@ -1,5 +1,46 @@
 # CDM Query Guide — Breakouts and Per-Pair Analysis
 
+## Batch queries — save iterations with cdm_api_requests
+
+**Use `cdm_api_requests` for all CDM queries** — it is the only CDM query
+tool available. Pass a list of requests; they run concurrently and all
+results return in one call, saving iterations.
+
+```json
+{
+  "controller": "controller.example.com",
+  "requests": [
+    {
+      "label": "uperf_gbps_s1",
+      "method": "POST",
+      "path": "/api/v1/metric-data",
+      "body": {"run": "<run_id>", "period": "<period_s1>",
+               "source": "uperf", "type": "Gbps", "resolution": 180}
+    },
+    {
+      "label": "cpu195_s1",
+      "method": "POST",
+      "path": "/api/v1/metric-data",
+      "body": {"run": "<run_id>", "period": "<period_s1>",
+               "source": "mpstat", "type": "Busy-CPU",
+               "breakout": ["hostname", "num=195", "type"],
+               "resolution": 180, "aggregation": "sum"}
+    },
+    {
+      "label": "cwnd_s1",
+      "method": "POST",
+      "path": "/api/v1/metric-data",
+      "body": {"run": "<run_id>", "period": "<period_s1>",
+               "source": "tcp-window", "type": "snd-cwnd",
+               "breakout": ["hostname", "dport=30003"],
+               "resolution": 180}
+    }
+  ]
+}
+```
+
+Results are keyed by the `label` field you provide.
+
 ## Discovering available breakouts
 
 **CRITICAL: breakouts are per source:type combination.**
