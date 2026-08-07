@@ -68,6 +68,15 @@ This shows all UP interfaces with their IPs. Look for:
 - Interfaces with only link-local IPv6 (fe80::) — these
   are UP but have no IPv4 address configured
 
+**Don't assume the IP you find here is for the endpoint `host`
+field (layer 2, above) — you likely already have what you need
+for that.** This discovery is for identifying the test NIC and
+confirming layer 3 connectivity (`test_port_connectivity`,
+`ifname`). It's technically possible for the test IP to also be
+the access IP, but don't default to that: check what's already
+in `assigned_hardware_ips` for the endpoint `host` field before
+reaching for whatever you just discovered here.
+
 You can also identify NIC types:
 ```
 ethtool -i <interface> | grep driver
