@@ -10,17 +10,25 @@ in the run data. Benchmark parameters (message size, thread count,
 protocol, duration, etc.) are already stored in the run-file and
 searchable in OpenSearch — do NOT duplicate them as tags.
 
+**Tag value format: use underscores only — no hyphens/dashes,
+spaces, or commas.** Crucible's tag parser treats hyphens and
+commas as field separators, not just commas. A hyphenated value
+like `"IRQ-isolated network performance"` or
+`"100G-throughput-CUBIC-fq_codel"` fails with
+`"ERROR: format for tag is not valid"` just like a comma-separated
+one does. Underscores are the only safe word separator.
+
 Good tags:
 ```json
 "tags": {
-  "study": "throughput-scaling-june2026",
-  "hypothesis": "linear scaling to 8 threads",
-  "environment": "aws-us-east-2",
-  "jira": "PERF-12345"
+  "study": "throughput_scaling_june2026",
+  "hypothesis": "linear_scaling_to_8_threads",
+  "environment": "aws_us_east_2",
+  "jira": "PERF_12345"
 }
 ```
 
-Bad tags (redundant with run-file params):
+Bad tags (redundant with run-file params, AND hyphens will fail parsing):
 ```json
 "tags": {
   "benchmark": "uperf",
@@ -32,10 +40,8 @@ Bad tags (redundant with run-file params):
 }
 ```
 
-Also: tag values must NOT contain commas. Crucible's tag parser
-splits on commas, so `"thread-counts": "1,8,32"` causes a parse
-error ("format for tag is not valid: 8"). Use dashes or other
-separators if you must encode multiple values in one tag.
+If you need to encode multiple values in one tag, join them with
+underscores (e.g. `"1_8_32"`), never commas or dashes.
 
 Keep tags minimal — 2-4 entries that help identify the study or
 context, not a summary of the run-file.
