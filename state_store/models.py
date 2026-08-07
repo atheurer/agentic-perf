@@ -174,6 +174,13 @@ class StopRequest(BaseModel):
     mode: StopMode = StopMode.GRACEFUL
 
 
+class AbortRequest(BaseModel):
+    reason: str = Field(
+        default="User requested abort",
+        max_length=500,
+    )
+
+
 class ClaimRequest(BaseModel):
     owner: str
     duration_seconds: int = 300

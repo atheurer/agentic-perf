@@ -104,6 +104,25 @@ class TicketStore:
             if current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                 if new_status == TicketStatus.AWAITING_TEARDOWN:
                     allowed = [TicketStatus.AWAITING_TEARDOWN]
+                    # Atomically mark the abort and retire the
+                    # execution plan so _advance_plan and resumed
+                    # agents see the marker immediately.
+                    ticket.custom_fields["abort_requested"] = {
+                        "requested_at": datetime.now(
+                            timezone.utc,
+                        ).isoformat(),
+                    }
+                    plan = ticket.custom_fields.get("execution_plan")
+                    if isinstance(plan, dict):
+                        steps = plan.get("steps", [])
+                        idx = plan.get("current_step", 0)
+                        if (
+                            isinstance(steps, list)
+                            and isinstance(idx, int)
+                            and 0 <= idx < len(steps)
+                            and isinstance(steps[idx], dict)
+                        ):
+                            steps[idx]["status"] = "aborted"
                 elif ticket.previous_status is None:
                     raise InvalidTransition(
                         "Cannot resume from AWAITING_CUSTOMER_GUIDANCE: no previous status"

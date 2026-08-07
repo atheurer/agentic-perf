@@ -185,6 +185,22 @@ func (c *Client) UpdateFields(id string, fields map[string]interface{}) (*Ticket
 	return &t, nil
 }
 
+func (c *Client) AbortTicket(id, reason string) (*Ticket, error) {
+	var body interface{}
+	if reason != "" {
+		body = map[string]interface{}{"reason": reason}
+	}
+	data, err := c.doRequest("POST", "/api/v1/tickets/"+id+"/abort", body)
+	if err != nil {
+		return nil, err
+	}
+	var t Ticket
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 func (c *Client) AddComment(id, author, text string) (*Comment, error) {
 	body := map[string]interface{}{"author": author, "body": text}
 	data, err := c.doRequest("POST", "/api/v1/tickets/"+id+"/comments", body)

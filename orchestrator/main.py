@@ -10,6 +10,7 @@ import sys
 import time
 from typing import Any
 
+from agents.base import HITLDriftError
 from paths import LOCK_FILE
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
@@ -223,6 +224,8 @@ def _advance_plan(
 
         ticket_status = ticket.get("status", "")
         if ticket_status == "awaiting_customer_guidance":
+            return
+        if cf.get("abort_requested"):
             return
 
         step["status"] = "completed"
@@ -483,6 +486,11 @@ async def run_agent_task(
                 "agent_stopped",
                 {"mode": "hard"},
             )
+    except HITLDriftError:
+        logger.info(
+            f"Agent cleanly unwound after ticket drift on "
+            f"{ticket_id} (status={status}) — no transition needed"
+        )
     except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
         err_msg = str(e).lower()

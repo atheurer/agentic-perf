@@ -8,6 +8,7 @@ from ..auth import Principal, require_admin, require_write_access
 from ..models import (
     NON_DISPATCHABLE_STATUSES,
     TERMINAL_STATUSES,
+    AbortRequest,
     AddCommentRequest,
     StopRequest,
     TicketStatus,
@@ -59,7 +60,11 @@ def stop_ticket(ticket_id: str, body: StopRequest, request: Request):
 
 
 @router.post("/tickets/{ticket_id}/abort")
-def abort_ticket(ticket_id: str, request: Request):
+def abort_ticket(
+    ticket_id: str,
+    request: Request,
+    body: AbortRequest | None = None,
+):
     store = request.app.state.store
     try:
         ticket = store.get_ticket(ticket_id)
@@ -77,11 +82,12 @@ def abort_ticket(ticket_id: str, request: Request):
             ),
         )
 
+    reason = body.reason if body else "User requested abort"
     store.add_comment(
         ticket_id,
         AddCommentRequest(
             author="user",
-            body="**Abort requested:** User requested abort from web UI",
+            body=f"**Abort requested:** {reason}",
         ),
     )
     updated = store.transition_ticket(
