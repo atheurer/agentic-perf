@@ -121,6 +121,29 @@ Your tasks:
 
 10. If any step fails, report the error details.
 
+11. **Host-level network tuning is your responsibility — never defer it.**
+    Check the ticket's `parsed_specs` and description for ANY of these:
+    IRQ pinning/affinity (e.g. `irq_pinning_cpu`), NIC queue count
+    (e.g. `combined_queues`), congestion control (e.g. `congestion_control`,
+    "BBR", "cubic"), qdisc (e.g. `qdisc`, "fq_codel"), or other NIC/kernel
+    tuning. If ANY of these are present, tuning is required — this is not a
+    judgment call, and it is not something to defer to a later phase or a
+    different agent. The benchmark agent has no tools for this (no
+    `pin_irq`, `tune_nic`, or `smp_affinity` access) — if you don't apply
+    it here, it never happens, silently. Before proceeding:
+    a. Call `read_skill` for `general/host-tuning.md` — it defines the
+       required ordering (tune_nic → pin_irq) and irqbalance strategy.
+    b. Apply the tuning with `tune_nic` / `pin_irq` as needed.
+    c. Call `verify_host_tuning` and include its result in your
+       `submit_provisioning_result` call. If verification shows the tuning
+       did NOT take effect (e.g. IRQ landed on a different CPU than
+       requested), do NOT report `provisioning_complete=true` — call
+       `request_clarification` instead.
+    This is different from SSH key setup (see below) — that genuinely is
+    the benchmark agent's job because it runs per-execution. Network
+    tuning is host state that must be correct before any benchmark runs,
+    which is why it belongs here, not there.
+
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.
   Always set controller_host on install_harness, ensure_harness_installed,
@@ -131,11 +154,6 @@ Important:
   ALL endpoint hosts (client and server) before connectivity checks or
   benchmarks. Fresh lab hosts block benchmark ports (uperf uses 30002/30003)
   by default. Do NOT call on shared or production hosts.
-- If the ticket requests host tuning (BBR, IRQ pinning, NIC settings), read
-  `general/host-tuning.md` via read_skill BEFORE calling any tuning tools.
-  It defines the required ordering (tune_nic → pin_irq) and irqbalance strategy.
-  After applying tuning, always call verify_host_tuning and include the result
-  in your submit_provisioning_result call.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly — do not ask the user
   if the config says "skip".

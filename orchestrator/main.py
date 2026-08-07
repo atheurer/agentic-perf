@@ -113,6 +113,7 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             "hosts_provisioned": cf.get("hosts_provisioned", []),
             "harness_name": cf.get("harness_name", ""),
             "harness_version": cf.get("harness_version", ""),
+            "configuration_applied": cf.get("configuration_applied", {}),
         }
     elif agent_type == "teardown":
         return {"teardown_complete": True}
@@ -122,6 +123,30 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             "review_summary": cf.get("review_summary", ""),
         }
     return {}
+
+
+# parsed_specs keys that imply host-level NIC/kernel tuning is required.
+# If any of these are present, the provisioning agent must have applied
+# and verified the tuning (see agents/provisioning/prompts.py) — the
+# benchmark agent has no tools to do this itself.
+_HOST_TUNING_SPEC_KEYS = (
+    "irq_pinning_cpu",
+    "combined_queues",
+    "congestion_control",
+    "qdisc",
+)
+
+
+def _missing_host_tuning(cf: dict) -> str:
+    """Return a comma-separated list of requested tuning fields if the
+    ticket's parsed_specs requires host tuning but configuration_applied
+    is empty. Empty string if tuning wasn't requested or was recorded.
+    """
+    parsed_specs = cf.get("parsed_specs") or {}
+    requested = [k for k in _HOST_TUNING_SPEC_KEYS if k in parsed_specs]
+    if requested and not cf.get("configuration_applied"):
+        return ", ".join(requested)
+    return ""
 
 
 def _apply_step_overrides(
@@ -244,6 +269,32 @@ def _advance_plan(
             return
         if cf.get("abort_requested"):
             return
+
+        if step.get("agent_type") == "provision":
+            missing = _missing_host_tuning(cf)
+            if missing:
+                logger.warning(
+                    f"[advance-plan] {ticket_id}: parsed_specs requests host "
+                    f"tuning ({missing}) but configuration_applied is empty "
+                    f"— blocking advance to benchmark"
+                )
+                client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": (
+                            "Provisioning reported complete, but the ticket "
+                            f"requests host tuning ({missing}) and no "
+                            "configuration_applied was recorded. The "
+                            "provisioning agent may have deferred this work "
+                            "incorrectly — the benchmark agent has no tools "
+                            "to apply NIC/IRQ tuning. Reply to have "
+                            "provisioning re-run tuning, or override if this "
+                            "was intentional."
+                        ),
+                    },
+                )
+                return
 
         step["status"] = "completed"
         step["results"] = _capture_step_results(
