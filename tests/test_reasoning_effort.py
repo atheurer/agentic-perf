@@ -51,8 +51,13 @@ class TestClaudeReasoningEffort:
         mock_response.content = []
         mock_response.stop_reason = "end_turn"
         mock_response.usage = None
+        mock_stream_cm = MagicMock()
+        mock_stream_cm.__enter__ = MagicMock(return_value=mock_stream_cm)
+        mock_stream_cm.__exit__ = MagicMock(return_value=False)
+        mock_stream_cm.until_done = MagicMock()
+        mock_stream_cm.get_final_message = MagicMock(return_value=mock_response)
         mock_client = MagicMock()
-        mock_client.messages.create = MagicMock(return_value=mock_response)
+        mock_client.messages.stream = MagicMock(return_value=mock_stream_cm)
         provider._client = mock_client
         return provider, mock_client
 
@@ -64,7 +69,7 @@ class TestClaudeReasoningEffort:
             messages=[{"role": "user", "content": "hi"}],
             timeout=0,
         )
-        kwargs = client.messages.create.call_args[1]
+        kwargs = client.messages.stream.call_args[1]
         assert kwargs["thinking"] == {"type": "adaptive"}
         assert kwargs["output_config"] == {"effort": "high"}
 
@@ -76,7 +81,7 @@ class TestClaudeReasoningEffort:
             messages=[{"role": "user", "content": "hi"}],
             timeout=0,
         )
-        kwargs = client.messages.create.call_args[1]
+        kwargs = client.messages.stream.call_args[1]
         assert "thinking" not in kwargs
         assert "output_config" not in kwargs
 
@@ -88,7 +93,7 @@ class TestClaudeReasoningEffort:
             messages=[{"role": "user", "content": "hi"}],
             timeout=0,
         )
-        kwargs = client.messages.create.call_args[1]
+        kwargs = client.messages.stream.call_args[1]
         assert kwargs["output_config"] == {"effort": "max"}
 
 

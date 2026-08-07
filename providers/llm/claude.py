@@ -102,6 +102,20 @@ class ClaudeLLMProvider(LLMProvider):
             usage=usage,
         )
 
+    def _stream_to_message(self, kwargs: dict[str, Any]) -> Any:
+        """Run a completion via the streaming API and return the final message.
+
+        Anthropic requires streaming for requests that may take longer than
+        10 minutes to complete — a higher max_tokens combined with adaptive
+        thinking (reasoning_effort) can cross that threshold, and a plain
+        messages.create() call raises an APIError in that case. Streaming
+        avoids the error; the caller only needs the final assembled message,
+        not the incremental chunks, so this drains the stream synchronously.
+        """
+        with self._client.messages.stream(**kwargs) as stream:
+            stream.until_done()
+            return stream.get_final_message()
+
     async def complete(
         self,
         system_prompt: str,
@@ -126,11 +140,11 @@ class ClaudeLLMProvider(LLMProvider):
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:
             # Explicit 0 disables timeout.
-            response = await asyncio.to_thread(self._client.messages.create, **kwargs)
+            response = await asyncio.to_thread(self._stream_to_message, kwargs)
             return self._parse_response(response)
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(self._client.messages.create, **kwargs),
+                asyncio.to_thread(self._stream_to_message, kwargs),
                 timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
