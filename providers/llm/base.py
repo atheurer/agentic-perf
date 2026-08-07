@@ -8,6 +8,14 @@ from typing import Any
 # Can be overridden per-provider or per-call.
 DEFAULT_LLM_TIMEOUT: float = 120.0
 
+# Default max output tokens for a single LLM completion.
+# Can be overridden per-provider or per-call. Agents that do
+# extended thinking (reasoning_effort set) share this budget
+# between thinking tokens and visible output, so agents doing
+# heavy analysis (e.g. review) are given a much higher value
+# via _BUILTIN_AGENT_MODELS in orchestrator/config.py.
+DEFAULT_LLM_MAX_TOKENS: int = 8000
+
 
 class LLMTimeoutError(Exception):
     """Raised when an LLM API call exceeds its timeout."""
@@ -76,6 +84,14 @@ class LLMProvider(ABC):
     # accept additional values (e.g. Claude's "xhigh"/"max").
     reasoning_effort: str | None = None
 
+    # Per-instance default max output tokens. Set by the
+    # orchestrator from config; individual complete() calls can
+    # override. None means use DEFAULT_LLM_MAX_TOKENS. When
+    # reasoning_effort is set, thinking tokens and visible output
+    # share this budget, so agents doing heavy analysis need a
+    # much higher value than agents that just call tools.
+    max_tokens: int | None = None
+
     def _resolve_timeout(self, timeout: float | None) -> float:
         """Resolve effective timeout from call, instance, and global defaults.
 
@@ -88,12 +104,24 @@ class LLMProvider(ABC):
             return self.default_timeout
         return DEFAULT_LLM_TIMEOUT
 
+    def _resolve_max_tokens(self, max_tokens: int | None) -> int:
+        """Resolve effective max_tokens from call, instance, and global defaults.
+
+        Precedence: explicit call parameter → instance max_tokens
+        → module DEFAULT_LLM_MAX_TOKENS.
+        """
+        if max_tokens is not None:
+            return max_tokens
+        if self.max_tokens is not None:
+            return self.max_tokens
+        return DEFAULT_LLM_MAX_TOKENS
+
     @abstractmethod
     async def complete(
         self,
         system_prompt: str,
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> LLMResponse: ...
