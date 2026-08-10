@@ -129,6 +129,10 @@ class TriageAgent(AgentBase):
         if scoped_context and isinstance(scoped_context, dict):
             fields["scoped_context"] = scoped_context
 
+        reference_tickets = result.get("reference_tickets")
+        if reference_tickets and isinstance(reference_tickets, list):
+            fields["reference_tickets"] = reference_tickets
+
         # Every ticket gets a full-lifecycle execution plan covering
         # resource allocation through teardown. The LLM should
         # produce this, but if it doesn't, we build a default.

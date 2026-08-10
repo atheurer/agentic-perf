@@ -143,13 +143,18 @@ findings, including the required_hosts list built from the benchmark roles.
 
 ## Execution Plans
 
-EVERY ticket gets an execution_plan that covers the full lifecycle — from resource
-allocation through teardown. The plan ALWAYS starts with resource + provision and
-ALWAYS ends with teardown. The orchestrator advances through the plan step by step.
+EVERY ticket gets an execution_plan that covers the full lifecycle.
+The orchestrator advances through the plan step by step.
 
 ### Step types
 
 The execution_plan is a list of steps. Each step has an agent_type and params:
+
+- **analyze**: Analyze existing data (historical metrics, prior ticket results,
+  investigation records) WITHOUT provisioning hardware. Use this as the FIRST
+  step when the ticket is investigating an anomaly, comparing prior results, or
+  answering a question that existing data might resolve.
+  params: {label (optional — e.g. "historical-review", "cross-ticket-comparison")}
 
 - **resource**: Acquire infrastructure.
   params: {required_hosts: [...] (optional — defaults to ticket-level required_hosts)}
@@ -177,6 +182,48 @@ on structured data (required_hosts, directives) instead of stale ticket-level te
   Mid-plan teardowns (between iterations) should ALWAYS preserve the controller
   so the harness installation and benchmark results from earlier iterations remain
   accessible. Only the final teardown at the end of the plan should release everything.
+
+### Choosing the right plan
+
+Use these guidelines to decide whether to include an analyze step:
+
+- **"Measure X" / "Run boot-time test"** → benchmark-first plan (no analyze).
+  The user wants fresh measurements.
+- **"Investigate why X regressed" / "Why is kernel boot time higher?"** →
+  analyze-first plan. Query existing data before provisioning hardware.
+- **"Compare results from PERF-X and PERF-Y"** → data-only plan (analyze + review,
+  no hardware). Set reference_tickets in custom_fields.
+- **Webhook-triggered anomaly** (ticket has anomaly_context) → the gathering_context
+  agent handles dedup, then routes to analyze automatically. Triage should still
+  generate a hybrid plan with analyze first.
+- **No external data tools available** → benchmark-first plan. Cannot analyze
+  without data sources.
+
+### Data-only investigation (no hardware)
+
+[
+    {"agent_type": "analyze", "params": {"label": "cross-ticket-comparison"}},
+    {"agent_type": "review", "params": {}}
+]
+
+Use when the question can be answered from existing data: prior ticket results,
+historical metrics, investigation records. No teardown needed since no hardware
+was provisioned.
+
+### Analyze-first with benchmark fallback
+
+[
+    {"agent_type": "analyze", "params": {"label": "historical-review"}},
+    {"agent_type": "resource", "params": {}},
+    {"agent_type": "provision", "params": {}},
+    {"agent_type": "benchmark", "params": {}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "teardown", "params": {}}
+]
+
+The analyze agent will skip to review if analysis is conclusive, or continue
+to the resource step if new measurements are needed. The remaining steps
+execute only if the analyze agent declares inconclusive.
 
 ### Single benchmark request
 

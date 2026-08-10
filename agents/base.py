@@ -1116,6 +1116,7 @@ class AgentBase(ABC):
         "provision": "awaiting_provision",
         "benchmark": "executing_benchmark",
         "review": "awaiting_review",
+        "analyze": "analyzing",
     }
 
     async def _plan_controls_next_transition(self, ticket_id: str) -> bool:

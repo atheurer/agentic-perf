@@ -75,6 +75,7 @@ PLAN_AGENT_STATUS = {
     "provision": "awaiting_provision",
     "benchmark": "executing_benchmark",
     "review": "awaiting_review",
+    "analyze": "analyzing",
 }
 
 
@@ -308,6 +309,19 @@ def _advance_plan(
         plan["run_ids"] = run_ids
 
         next_idx = current + 1
+
+        # Conclusive analysis: skip hardware/benchmark steps
+        # and jump directly to review.
+        if step.get("agent_type") == "analyze" and cf.get("analysis_result", {}).get(
+            "conclusive"
+        ):
+            for skip_idx in range(next_idx, len(steps)):
+                skip_step = steps[skip_idx]
+                if skip_step["agent_type"] == "review":
+                    next_idx = skip_idx
+                    break
+                skip_step["status"] = "skipped"
+
         plan["current_step"] = next_idx
 
         if next_idx < len(steps):

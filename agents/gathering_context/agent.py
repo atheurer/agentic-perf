@@ -171,13 +171,13 @@ class GatheringContextAgent(AgentBase):
             summary = (
                 "**No Dedup Match**\n\n"
                 "No open Investigation Records match this anomaly. "
-                "Proceeding to investigation planning."
+                "Proceeding to data analysis."
             )
             if notes:
                 summary += f"\n\n**Notes:** {notes}"
             await self._add_comment(ticket_id, summary)
             await self._transition_ticket(
                 ticket_id,
-                "planning_investigation",
-                comment="No dedup match, proceeding to investigation",
+                "analyzing",
+                comment="No dedup match, analyzing existing data",
             )

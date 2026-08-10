@@ -20,6 +20,9 @@ class TicketStatus(str, Enum):
     RETROSPECTIVE_PENDING = "retrospective_pending"
     CLOSED = "closed"
 
+    # Data analysis before hardware provisioning
+    ANALYZING = "analyzing"
+
     # Recursive investigation loop statuses (RHIVOS 03A)
     GATHERING_CONTEXT = "gathering_context"
     PLANNING_INVESTIGATION = "planning_investigation"
@@ -36,6 +39,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.NEW: [TicketStatus.TRIAGE_PENDING],
     TicketStatus.TRIAGE_PENDING: [
         TicketStatus.AWAITING_HARDWARE,
+        TicketStatus.ANALYZING,  # data analysis path
         TicketStatus.GATHERING_CONTEXT,  # investigation path
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
@@ -86,10 +90,21 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.CLOSED,
     ],
     TicketStatus.CLOSED: [],
+    # --- Data analysis path ---
+    # Analyzing: query external data sources and prior ticket
+    # results to investigate without provisioning hardware.
+    # Skip forward to review if conclusive, or continue to
+    # the hardware pipeline if new measurements are needed.
+    TicketStatus.ANALYZING: [
+        TicketStatus.AWAITING_REVIEW,  # analysis conclusive
+        TicketStatus.AWAITING_HARDWARE,  # need benchmark data
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+    ],
     # --- Recursive investigation loop ---
     # Gathering context: check Investigation Records for dedup,
     # collect change-context from source control.
     TicketStatus.GATHERING_CONTEXT: [
+        TicketStatus.ANALYZING,  # analyze existing data first
         TicketStatus.PLANNING_INVESTIGATION,
         TicketStatus.RETROSPECTIVE_PENDING,  # dedup match, skip to retro
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,

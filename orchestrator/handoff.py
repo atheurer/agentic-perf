@@ -156,8 +156,17 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _check_awaiting_review(ticket: dict[str, Any]) -> tuple[bool, str]:
-    """Validate benchmark execution before review."""
+    """Validate that review has something to review.
+
+    Accepts either benchmark results (run_id + benchmark_status)
+    or analysis results (analysis_result from the analyze agent).
+    Data-only investigations skip benchmarks entirely.
+    """
     cf = ticket.get("custom_fields", {})
+
+    # Analysis-only path: analysis_result is sufficient for review
+    if cf.get("analysis_result"):
+        return True, ""
 
     benchmark_status = cf.get("benchmark_status")
     run_id = cf.get("run_id")
