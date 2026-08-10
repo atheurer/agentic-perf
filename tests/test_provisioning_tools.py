@@ -611,6 +611,7 @@ async def test_all_tools_use_hosts_or_targets():
             "tune_nic",
             "tune_tcp",
             "pin_irq",
+            "reset_irq_pinning",
             "verify_host_tuning",
             # Per-host NM tools — parameters vary per host so no hosts array
             "nm_set_mtu",
