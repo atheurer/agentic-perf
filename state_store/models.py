@@ -70,6 +70,8 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.AWAITING_REVIEW: [
         TicketStatus.AWAITING_TEARDOWN,
+        TicketStatus.SYNTHESIZING_RESULTS,  # record findings
+        TicketStatus.ANALYZING,  # loop back to data analysis
         TicketStatus.TRIAGE_PENDING,  # ad-hoc rerun loop
         TicketStatus.EXECUTING_BENCHMARK,  # plan-driven re-benchmark
         TicketStatus.AWAITING_HARDWARE,  # plan-driven infrastructure cycle
@@ -122,6 +124,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     # (tainted hardware). Supports #92 multi-turn by allowing
     # the evaluate agent to sequence additional benchmark runs.
     TicketStatus.EVALUATING_CONVERGENCE: [
+        TicketStatus.ANALYZING,  # loop back to data analysis
         TicketStatus.PLANNING_INVESTIGATION,  # refine params
         TicketStatus.PREPARING_PLATFORM,  # re-provision hardware
         TicketStatus.AWAITING_PROVISION,  # re-install harness only

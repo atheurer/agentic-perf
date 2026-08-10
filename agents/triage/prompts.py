@@ -156,6 +156,11 @@ The execution_plan is a list of steps. Each step has an agent_type and params:
   answering a question that existing data might resolve.
   params: {label (optional — e.g. "historical-review", "cross-ticket-comparison")}
 
+- **synthesis**: Create an investigation record from the findings. Include this
+  after review when the ticket has anomaly_context (alert-triggered) so the
+  root cause is recorded for future dedup.
+  params: {}
+
 - **resource**: Acquire infrastructure.
   params: {required_hosts: [...] (optional — defaults to ticket-level required_hosts)}
 
@@ -209,6 +214,15 @@ Use these guidelines to decide whether to include an analyze step:
 Use when the question can be answered from existing data: prior ticket results,
 historical metrics, investigation records. No teardown needed since no hardware
 was provisioned.
+
+If the ticket has anomaly_context (alert-triggered), add a synthesis step to
+record findings:
+
+[
+    {"agent_type": "analyze", "params": {"label": "alert-investigation"}},
+    {"agent_type": "review", "params": {}},
+    {"agent_type": "synthesis", "params": {}}
+]
 
 ### Analyze-first with benchmark fallback
 

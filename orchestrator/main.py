@@ -76,6 +76,7 @@ PLAN_AGENT_STATUS = {
     "benchmark": "executing_benchmark",
     "review": "awaiting_review",
     "analyze": "analyzing",
+    "synthesis": "synthesizing_results",
 }
 
 
@@ -354,6 +355,17 @@ def _advance_plan(
             if next_status:
                 next_step["status"] = "in_progress"
 
+                # Apply step overrides BEFORE saving the plan
+                # so that mutations (e.g. analysis-informed
+                # benchmark params) are persisted.
+                _apply_step_overrides(
+                    store_url,
+                    client,
+                    ticket_id,
+                    next_step,
+                    cf,
+                )
+
                 client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
@@ -362,14 +374,6 @@ def _advance_plan(
                             "review_submitted": None,
                         },
                     },
-                )
-
-                _apply_step_overrides(
-                    store_url,
-                    client,
-                    ticket_id,
-                    next_step,
-                    cf,
                 )
 
                 label = next_step.get("params", {}).get(

@@ -160,6 +160,7 @@ ad-hoc test execution (original linear pipeline) and recursive investigation
 | `executing_benchmark` | BenchmarkAgent | — |
 | `awaiting_review` | ReviewAgent | — |
 | `awaiting_teardown` | ResourceAgent | teardown |
+| `analyzing` | AnalyzeAgent | Data-first investigation |
 | `gathering_context` | GatheringContextAgent | Investigation Record dedup |
 | `planning_investigation` | *(stub)* | — |
 | `evaluating_convergence` | EvaluateAgent | Convergence assessment |
@@ -169,6 +170,35 @@ Terminal statuses (`closed`, `awaiting_customer_guidance`) do not dispatch
 agents. `awaiting_customer_guidance` resumes to the previous status when the
 user replies. The `planning_investigation` agent is a stub that auto-advances;
 all other investigation loop agents are fully implemented.
+
+### Analysis Agent (Data-First Investigation)
+
+The analysis agent investigates performance questions by querying
+existing data — historical metrics via Domain MCP, prior ticket
+results, and investigation records — without provisioning hardware.
+
+Triage routes to the analysis agent when the request is an
+investigation ("investigate why X regressed") rather than a
+measurement ("measure boot time"). Webhook-triggered alerts route
+through `gathering_context` (dedup) then to `analyzing`.
+
+The agent reads domain-specific investigation methodology from
+skill files (e.g. `skills/boot-time/investigation-methodology.md`),
+queries available data sources, and declares the analysis either:
+
+- **Conclusive** — root cause identified from existing data. The
+  execution plan skips hardware provisioning and advances to review.
+- **Inconclusive** — available data is insufficient. The plan
+  continues to the standard benchmark pipeline. The agent's
+  `suggested_params` are gap-filled into the benchmark step.
+
+Three investigation paths:
+
+- **Data-only:** `[analyze, review]` — no hardware provisioned
+- **Hybrid:** `[analyze, resource, provision, benchmark, review, teardown]`
+  — analyze first, benchmark if inconclusive
+- **Benchmark-first:** `[resource, provision, benchmark, review, teardown]`
+  — standard pipeline, no analyze step
 
 ### Introspection Agent (Out-of-Band)
 
@@ -460,8 +490,15 @@ documentation, schemas, and example run-files through its tools. The LLM
 builds the run-file directly (no template patching), validated against the
 harness schema. Handles both remotehosts and Kubernetes endpoint types.
 
-**Review Agent** — Retrieves results from the benchmark harness, analyzes
-metrics, and produces a verdict (hypothesis confirmed/refuted/inconclusive)
+**Analysis Agent** — Investigates performance questions by querying existing
+data (Domain MCP, prior tickets, investigation records) without provisioning
+hardware. Reads investigation methodology skills per harness. Declares
+findings conclusive (skip to review) or inconclusive (continue to benchmark).
+Cross-ticket tools (`get_ticket_results`, `search_tickets`) enable
+comparative analysis across prior investigations.
+
+**Review Agent** — Retrieves results from the benchmark harness or analysis
+findings, and produces a verdict (hypothesis confirmed/refuted/inconclusive)
 with key metrics and recommendations. Harness-agnostic: discovers how to
 retrieve results through skill providers. Defaults to auto-submit — set
 `review_mode: interactive` in directives for iterative HITL investigation.

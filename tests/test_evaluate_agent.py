@@ -815,6 +815,18 @@ class TestBenchmarkRouting:
 # --- Dispatcher integration ---
 
 
+try:
+    from orchestrator.dispatcher import Dispatcher  # noqa: F401
+
+    _HAS_DISPATCHER = True
+except ImportError:
+    _HAS_DISPATCHER = False
+
+
+@pytest.mark.skipif(
+    not _HAS_DISPATCHER,
+    reason="orchestrator imports unavailable",
+)
 class TestDispatcherIntegration:
     def test_dispatcher_creates_evaluate_agent(self):
         from agents.evaluate.agent import EvaluateAgent
