@@ -285,6 +285,30 @@ class TestPinIrq:
         assert "0x" not in affinity_writes[0]
 
     @pytest.mark.asyncio
+    async def test_ban_irq_dedupes_existing_entries(self):
+        """Re-running pin_irq against the same device (retry, or a prior run
+        that failed partway through the smp_affinity writes but still ran
+        the irqbalance ban step) must not keep appending duplicate IRQ
+        numbers to IRQBALANCE_BANNED_INTERRUPTS."""
+
+        async def tracking_run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n408\n")
+            if "IRQBALANCE_BANNED_INTERRUPTS" in command and "grep" in command:
+                return SSHResult(stdout='IRQBALANCE_BANNED_INTERRUPTS="407 408 999"')
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2]
+        )
+        assert result["status"] == "ok"
+        banned = result["irqbalance"]["banned_interrupts"]
+        assert banned == "407 408 999"
+
+    @pytest.mark.asyncio
     async def test_msi_irqs_discovery_ignores_proc_interrupts_naming(self):
         """Primary regression test for #496/#499: msi_irqs discovery must
         succeed even when /proc/interrupts uses PCI-address naming (mlx5)

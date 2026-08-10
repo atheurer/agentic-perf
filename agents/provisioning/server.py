@@ -1753,7 +1753,6 @@ async def _pin_irq_one(
             errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
 
     elif irqbalance_mode == "ban_irq":
-        banned = " ".join(str(i) for i in irq_numbers)
         rb = await _ssh.run(
             host,
             "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
@@ -1762,7 +1761,12 @@ async def _pin_irq_one(
         for line in rb.stdout.splitlines():
             if "IRQBALANCE_BANNED_INTERRUPTS" in line:
                 existing = line.split("=", 1)[-1].strip().strip('"')
-        new_val = f"{existing} {banned}".strip()
+        # Dedupe against whatever's already banned — re-running pin_irq
+        # against the same device (e.g. a retry, or a prior run that failed
+        # partway through) must not keep appending the same IRQ numbers.
+        existing_irqs = {int(tok) for tok in existing.split() if tok.isdigit()}
+        merged_irqs = sorted(existing_irqs | set(irq_numbers))
+        new_val = " ".join(str(i) for i in merged_irqs)
         r4 = await _ssh.run(
             host,
             f"sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
