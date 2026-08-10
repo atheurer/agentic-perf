@@ -1723,10 +1723,18 @@ async def _pin_irq_one(
     assignments: list[dict] = []
     for i, irq in enumerate(irq_numbers):
         cpu = cpu_list[i % len(cpu_list)]
-        mask = hex(1 << cpu)
-        r2 = await _ssh.run(host, f"echo {mask} > /proc/irq/{irq}/smp_affinity 2>&1")
+        # /proc/irq/N/smp_affinity rejects a "0x"-prefixed mask on systems
+        # with enough CPUs to need the comma-grouped 32-bit-word format
+        # (e.g. 128 CPUs) — confirmed live: `echo 0x4 > smp_affinity` fails
+        # with exit 1, `echo 4 > smp_affinity` succeeds and the kernel
+        # zero-pads/groups it automatically. hex()'s "0x" prefix is for
+        # display only; strip it before writing.
+        mask_hex = format(1 << cpu, "x")
+        r2 = await _ssh.run(
+            host, f"echo {mask_hex} > /proc/irq/{irq}/smp_affinity 2>&1"
+        )
         if r2.exit_code == 0:
-            applied.append(f"IRQ {irq} → CPU {cpu} (mask {mask})")
+            applied.append(f"IRQ {irq} → CPU {cpu} (mask 0x{mask_hex})")
             assignments.append({"irq": irq, "cpu": cpu})
         else:
             errors.append(

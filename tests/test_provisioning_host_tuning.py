@@ -259,6 +259,32 @@ class TestPinIrq:
         assert result["irqbalance"]["mode"] == "ban_irq"
 
     @pytest.mark.asyncio
+    async def test_smp_affinity_write_has_no_0x_prefix(self):
+        """Regression test: /proc/irq/N/smp_affinity rejects a "0x"-prefixed
+        mask on systems with enough CPUs to need the comma-grouped 32-bit-word
+        format (confirmed live on a 128-CPU host — `echo 0x4 > smp_affinity`
+        fails, `echo 4 > smp_affinity` succeeds)."""
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "msi_irqs" in command:
+                return SSHResult(stdout="408\n")
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2]
+        )
+        assert result["status"] == "ok"
+        affinity_writes = [c for c in commands_run if "smp_affinity" in c]
+        assert len(affinity_writes) == 1
+        assert "echo 4 >" in affinity_writes[0]
+        assert "0x" not in affinity_writes[0]
+
+    @pytest.mark.asyncio
     async def test_msi_irqs_discovery_ignores_proc_interrupts_naming(self):
         """Primary regression test for #496/#499: msi_irqs discovery must
         succeed even when /proc/interrupts uses PCI-address naming (mlx5)
