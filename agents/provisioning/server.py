@@ -1558,45 +1558,182 @@ async def tune_tcp(
     )
 
 
-async def _pin_irq_one(
+def _device_path(interface: str, pci: str) -> str:
+    if interface:
+        return f"/sys/class/net/{interface}/device"
+    if pci:
+        return f"/sys/bus/pci/devices/{pci}"
+    return ""
+
+
+def _parse_cpu_range(text: str) -> list[int]:
+    """Parse a Linux cpulist range string (e.g. "0-3,8,32-35") into ints."""
+    cpus: list[int] = []
+    for part in text.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.extend(range(int(lo), int(hi) + 1))
+        else:
+            cpus.append(int(part))
+    return cpus
+
+
+async def _discover_irqs(
+    host: str,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+) -> tuple[list[int], str]:
+    """Resolve IRQ numbers for a device. Returns (irq_numbers, resolved_pci).
+
+    Primary method: list /sys/.../device/msi_irqs/, which has one entry per
+    IRQ for any MSI/MSI-X device regardless of how the driver names its
+    /proc/interrupts lines. This is required for drivers like mlx5, which
+    name interrupts by PCI address (e.g. "mlx5_comp1@pci:0000:21:00.0") with
+    no interface name present at all — a substring match against the
+    interface name never finds them.
+
+    Falls back to a /proc/interrupts substring match (interface name and/or
+    PCI address) only if msi_irqs is unavailable (legacy INTx devices).
+    """
+    if irqs:
+        return sorted(int(i) for i in irqs), pci
+
+    device_path = _device_path(interface, pci)
+    resolved_pci = pci
+
+    if device_path and not resolved_pci:
+        rp = await _ssh.run(host, f"basename $(readlink -f {device_path}) 2>&1")
+        candidate = rp.stdout.strip()
+        if candidate and "/" not in candidate:
+            resolved_pci = candidate
+
+    irq_numbers: list[int] = []
+    if device_path:
+        rm = await _ssh.run(host, f"ls {device_path}/msi_irqs/ 2>&1")
+        irq_numbers = sorted(int(tok) for tok in rm.stdout.split() if tok.isdigit())
+
+    if not irq_numbers and (interface or resolved_pci):
+        ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
+        seen = set()
+        for line in ri.stdout.splitlines():
+            if (interface and interface in line) or (
+                resolved_pci and resolved_pci in line
+            ):
+                try:
+                    seen.add(int(line.split(":")[0].strip()))
+                except ValueError:
+                    pass
+        irq_numbers = sorted(seen)
+
+    return irq_numbers, resolved_pci
+
+
+async def _resolve_target_cpus(
     host: str,
     interface: str,
-    cpu: int,
+    pci: str,
+    cpus: list[int] | None,
+    numa_node: int | None,
+) -> tuple[list[int], str, list[str]]:
+    """Resolve the CPU list to round-robin IRQs across.
+
+    Precedence: explicit `cpus` > explicit `numa_node` > auto-detected local
+    NUMA node of the device. Returns (cpu_list, target_mode, errors).
+    """
+    if cpus:
+        return list(cpus), "cpu_list", []
+
+    if numa_node is not None:
+        node = numa_node
+        mode = f"numa_node:{node}"
+    else:
+        device_path = _device_path(interface, pci)
+        if not device_path:
+            return [], "", ["Cannot auto-detect NUMA node without interface or pci"]
+        rn = await _ssh.run(host, f"cat {device_path}/numa_node 2>&1")
+        try:
+            node = int(rn.stdout.strip())
+        except ValueError:
+            node = -1
+        if node < 0:
+            # -1 means "no NUMA affinity" (e.g. single-node or virtualized
+            # systems) — node 0 always exists in that case.
+            node = 0
+        mode = f"numa_node:{node} (auto-detected local node)"
+
+    rc = await _ssh.run(host, f"cat /sys/devices/system/node/node{node}/cpulist 2>&1")
+    try:
+        cpu_list = _parse_cpu_range(rc.stdout)
+    except ValueError:
+        cpu_list = []
+    if not cpu_list:
+        return [], mode, [f"No CPUs found for NUMA node {node}"]
+    return cpu_list, mode, []
+
+
+async def _pin_irq_one(
+    host: str,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+    cpus: list[int] | None = None,
+    numa_node: int | None = None,
     irqbalance_mode: str = "ban_irq",
 ) -> dict:
-    errors = []
-    applied = []
+    errors: list[str] = []
+    applied: list[str] = []
 
-    # Discover IRQ number(s) for the interface
-    r = await _ssh.run(host, "cat /proc/interrupts 2>&1")
-    irq_numbers = []
-    for line in r.stdout.splitlines():
-        if interface in line:
-            try:
-                irq_numbers.append(int(line.split(":")[0].strip()))
-            except ValueError:
-                pass
+    if not interface and not pci and not irqs:
+        return {
+            "host": host,
+            "status": "error",
+            "errors": ["Must provide interface, pci, or irqs to identify the device"],
+        }
 
+    irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
     if not irq_numbers:
+        ident = interface or pci or "device"
         return {
             "host": host,
             "interface": interface,
+            "pci": resolved_pci,
             "status": "error",
-            "errors": [f"No IRQ found for {interface} in /proc/interrupts"],
+            "errors": [
+                f"No IRQs found for {ident} (checked msi_irqs and /proc/interrupts)"
+            ],
         }
 
-    cpu_mask = hex(1 << cpu)
+    cpu_list, target_mode, cpu_errors = await _resolve_target_cpus(
+        host, interface, pci, cpus, numa_node
+    )
+    if cpu_errors:
+        return {
+            "host": host,
+            "interface": interface,
+            "pci": resolved_pci,
+            "irq_numbers": irq_numbers,
+            "status": "error",
+            "errors": cpu_errors,
+        }
 
-    for irq in irq_numbers:
-        r2 = await _ssh.run(
-            host, f"echo {cpu_mask} > /proc/irq/{irq}/smp_affinity 2>&1"
-        )
+    assignments: list[dict] = []
+    for i, irq in enumerate(irq_numbers):
+        cpu = cpu_list[i % len(cpu_list)]
+        mask = hex(1 << cpu)
+        r2 = await _ssh.run(host, f"echo {mask} > /proc/irq/{irq}/smp_affinity 2>&1")
         if r2.exit_code == 0:
-            applied.append(f"IRQ {irq} → CPU {cpu} (mask {cpu_mask})")
+            applied.append(f"IRQ {irq} → CPU {cpu} (mask {mask})")
+            assignments.append({"irq": irq, "cpu": cpu})
         else:
             errors.append(
                 f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}"
             )
+
+    used_cpus = sorted({a["cpu"] for a in assignments})
 
     ib_result = {"mode": irqbalance_mode}
     if irqbalance_mode == "disable":
@@ -1630,7 +1767,9 @@ async def _pin_irq_one(
             errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
 
     elif irqbalance_mode == "ban_cpu":
-        cpu_mask_ib = hex(1 << cpu)
+        # Bans the union of all CPUs actually used for this device's IRQs
+        # (round-robin pinning can spread IRQs across several CPUs, not
+        # just one).
         rb = await _ssh.run(
             host, "grep -s IRQBALANCE_BANNED_CPUS /etc/sysconfig/irqbalance || echo ''"
         )
@@ -1639,9 +1778,12 @@ async def _pin_irq_one(
             if "IRQBALANCE_BANNED_CPUS" in line:
                 existing = line.split("=", 1)[-1].strip().strip('"')
         try:
-            merged = hex(int(existing, 16) | (1 << cpu)) if existing else cpu_mask_ib
+            merged_mask = int(existing, 16) if existing else 0
         except ValueError:
-            merged = cpu_mask_ib
+            merged_mask = 0
+        for c in used_cpus:
+            merged_mask |= 1 << c
+        merged = hex(merged_mask)
         r5 = await _ssh.run(
             host,
             f"sed -i '/IRQBALANCE_BANNED_CPUS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
@@ -1656,9 +1798,11 @@ async def _pin_irq_one(
     return {
         "host": host,
         "interface": interface,
+        "pci": resolved_pci,
         "irq_numbers": irq_numbers,
-        "cpu": cpu,
-        "cpu_mask": cpu_mask,
+        "cpus": cpu_list,
+        "target_mode": target_mode,
+        "assignments": assignments,
         "irqbalance": ib_result,
         "status": "error" if errors else "ok",
         "applied": applied,
@@ -1669,15 +1813,177 @@ async def _pin_irq_one(
 @mcp.tool()
 async def pin_irq(
     host: str,
-    interface: str,
-    cpu: int,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+    cpus: list[int] | None = None,
+    numa_node: int | None = None,
     irqbalance_mode: str = "ban_irq",
     user: str = "root",
     ssh_key_path: str = "",
 ) -> str:
-    """Pin NIC IRQ(s) to a specific CPU and coordinate irqbalance so the pin is not overridden during a run. Must be called after tune_nic. irqbalance_mode controls how irqbalance is handled: 'ban_irq' (default) adds the IRQ to IRQBALANCE_BANNED_INTERRUPTS so irqbalance keeps running for other IRQs but won't touch this one; 'ban_cpu' adds the CPU to IRQBALANCE_BANNED_CPUS; 'disable' masks and stops irqbalance entirely."""
+    """Pin NIC IRQ(s) round-robin across CPUs and coordinate irqbalance so the pin is not overridden during a run. Must be called after tune_nic.
+
+    Device selection (provide one): `interface` (e.g. ens1f0np0), `pci` (bus
+    address, e.g. 0000:21:00.0), or explicit `irqs` (skips IRQ discovery
+    entirely). IRQ discovery uses /sys/.../device/msi_irqs/, which works
+    across NIC drivers that don't put the interface name in
+    /proc/interrupts (e.g. mlx5/ConnectX).
+
+    CPU targeting (checked in this order):
+    - `cpus`: explicit CPU list — IRQs are round-robin assigned across it.
+    - `numa_node`: round-robin across that NUMA node's CPUs (no local-node
+      auto-detection — use this to intentionally pin to a non-local node).
+    - neither: auto-detects the device's own local NUMA node and
+      round-robins across its CPUs.
+
+    irqbalance_mode: 'ban_irq' (default) adds the pinned IRQs to
+    IRQBALANCE_BANNED_INTERRUPTS so irqbalance keeps running for other IRQs
+    but won't touch these; 'ban_cpu' adds all CPUs used by this pin to
+    IRQBALANCE_BANNED_CPUS; 'disable' masks and stops irqbalance entirely.
+    Use reset_irq_pinning to undo a previous pin."""
     await _ensure_init()
-    return json.dumps(await _pin_irq_one(host, interface, cpu, irqbalance_mode))
+    return json.dumps(
+        await _pin_irq_one(host, interface, pci, irqs, cpus, numa_node, irqbalance_mode)
+    )
+
+
+async def _reset_irq_pinning_one(
+    host: str,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+    cpus: list[int] | None = None,
+) -> dict:
+    errors: list[str] = []
+    applied: list[str] = []
+
+    if not interface and not pci and not irqs:
+        return {
+            "host": host,
+            "status": "error",
+            "errors": ["Must provide interface, pci, or irqs to identify the device"],
+        }
+
+    irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    if not irq_numbers:
+        ident = interface or pci or "device"
+        return {
+            "host": host,
+            "interface": interface,
+            "pci": resolved_pci,
+            "status": "error",
+            "errors": [
+                f"No IRQs found for {ident} (checked msi_irqs and /proc/interrupts)"
+            ],
+        }
+
+    rd = await _ssh.run(host, "cat /proc/irq/default_smp_affinity 2>&1")
+    default_mask = rd.stdout.strip() or "ffffffff"
+    for irq in irq_numbers:
+        r2 = await _ssh.run(
+            host, f"echo {default_mask} > /proc/irq/{irq}/smp_affinity 2>&1"
+        )
+        if r2.exit_code == 0:
+            applied.append(f"IRQ {irq} affinity restored to default ({default_mask})")
+        else:
+            errors.append(
+                f"restore smp_affinity failed for IRQ {irq}: {r2.stdout.strip()}"
+            )
+
+    rb = await _ssh.run(
+        host,
+        "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
+    )
+    existing = ""
+    for line in rb.stdout.splitlines():
+        if "IRQBALANCE_BANNED_INTERRUPTS" in line:
+            existing = line.split("=", 1)[-1].strip().strip('"')
+    remaining = [
+        tok for tok in existing.split() if tok.isdigit() and int(tok) not in irq_numbers
+    ]
+    new_val = " ".join(remaining)
+    r3 = await _ssh.run(
+        host,
+        "sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+        + (
+            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
+            if new_val
+            else ""
+        )
+        + "true",
+    )
+    if r3.exit_code != 0:
+        errors.append(
+            f"clearing IRQBALANCE_BANNED_INTERRUPTS failed: {r3.stdout.strip()}"
+        )
+    else:
+        applied.append(f"IRQBALANCE_BANNED_INTERRUPTS cleared for IRQs {irq_numbers}")
+
+    if cpus:
+        rbc = await _ssh.run(
+            host, "grep -s IRQBALANCE_BANNED_CPUS /etc/sysconfig/irqbalance || echo ''"
+        )
+        existing_cpus_mask = ""
+        for line in rbc.stdout.splitlines():
+            if "IRQBALANCE_BANNED_CPUS" in line:
+                existing_cpus_mask = line.split("=", 1)[-1].strip().strip('"')
+        try:
+            mask_val = int(existing_cpus_mask, 16) if existing_cpus_mask else 0
+        except ValueError:
+            mask_val = 0
+        for c in cpus:
+            mask_val &= ~(1 << c)
+        new_cpu_mask = hex(mask_val)
+        r4 = await _ssh.run(
+            host,
+            "sed -i '/IRQBALANCE_BANNED_CPUS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
+            + (
+                f"echo 'IRQBALANCE_BANNED_CPUS=\"{new_cpu_mask}\"' >> /etc/sysconfig/irqbalance; "
+                if mask_val
+                else ""
+            )
+            + "true",
+        )
+        if r4.exit_code != 0:
+            errors.append(
+                f"clearing IRQBALANCE_BANNED_CPUS failed: {r4.stdout.strip()}"
+            )
+        else:
+            applied.append(f"IRQBALANCE_BANNED_CPUS cleared for CPUs {cpus}")
+
+    r5 = await _ssh.run(
+        host, "systemctl unmask irqbalance 2>&1 && systemctl restart irqbalance 2>&1"
+    )
+    if r5.exit_code == 0:
+        applied.append("irqbalance unmasked and restarted")
+    else:
+        errors.append(f"irqbalance restart failed: {r5.stdout.strip()}")
+
+    return {
+        "host": host,
+        "interface": interface,
+        "pci": resolved_pci,
+        "irq_numbers": irq_numbers,
+        "status": "error" if errors else "ok",
+        "applied": applied,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def reset_irq_pinning(
+    host: str,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+    cpus: list[int] | None = None,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Undo a previous pin_irq call: restores default smp_affinity for the device's IRQs, removes them from IRQBALANCE_BANNED_INTERRUPTS, and unmasks+restarts irqbalance. Pass `cpus` (the CPU list previously used) to also clear IRQBALANCE_BANNED_CPUS entries for a prior ban_cpu pin. Safe to call unconditionally regardless of which irqbalance_mode was previously used — use this before re-tuning a host that may carry a stale pin from a previous ticket."""
+    await _ensure_init()
+    return json.dumps(await _reset_irq_pinning_one(host, interface, pci, irqs, cpus))
 
 
 async def _verify_host_tuning_one(
@@ -1742,26 +2048,32 @@ async def _verify_host_tuning_one(
         "ok": ch_ok,
     }
 
-    # IRQ affinity
-    ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
-    irq_numbers = []
-    for line in ri.stdout.splitlines():
-        if interface in line:
-            try:
-                irq_numbers.append(int(line.split(":")[0].strip()))
-            except ValueError:
-                pass
+    # IRQ affinity — verify every assigned IRQ, not just one. `msi_irqs`
+    # discovery (via _discover_irqs) works for drivers that don't put the
+    # interface name in /proc/interrupts (e.g. mlx5).
+    irq_numbers, _resolved_pci = await _discover_irqs(host, interface=interface)
 
     irq_check: dict = {"irq_numbers": irq_numbers}
-    expected_cpu = exp.get("irq_cpu")
+    expected_assignments = exp.get("irq_assignments")
     if irq_numbers:
-        irq = irq_numbers[0]
-        ra = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
-        actual_affinity = ra.stdout.strip()
-        irq_check["cpu_affinity"] = actual_affinity
-        if expected_cpu is not None:
-            irq_ok = str(expected_cpu) in actual_affinity.split(",")
-            irq_check["expected_cpu"] = expected_cpu
+        affinities: dict[int, str] = {}
+        for irq in irq_numbers:
+            ra = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
+            affinities[irq] = ra.stdout.strip()
+        irq_check["cpu_affinity"] = affinities
+        if expected_assignments:
+            mismatches = []
+            for a in expected_assignments:
+                irq = a.get("irq")
+                exp_cpu = a.get("cpu")
+                actual = affinities.get(irq, "")
+                if str(exp_cpu) not in actual.split(","):
+                    mismatches.append(
+                        {"irq": irq, "expected_cpu": exp_cpu, "actual": actual}
+                    )
+            irq_check["expected_assignments"] = expected_assignments
+            irq_check["mismatches"] = mismatches
+            irq_ok = not mismatches
             irq_check["ok"] = irq_ok
             all_ok = all_ok and irq_ok
     checks["irq"] = irq_check
@@ -1793,7 +2105,12 @@ async def verify_host_tuning(
     user: str = "root",
     ssh_key_path: str = "",
 ) -> str:
-    """Verify that host tuning settings match expected values. Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run)."""
+    """Verify that host tuning settings match expected values. Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run).
+
+    For IRQ verification, pass `expected["irq_assignments"]` as the exact
+    `assignments` list returned by pin_irq (e.g. [{"irq": 407, "cpu": 2},
+    ...]) — every IRQ in the list is checked against its assigned CPU, not
+    just the first one."""
     await _ensure_init()
     return json.dumps(await _verify_host_tuning_one(host, interface, expected))
 
@@ -1835,16 +2152,24 @@ async def tune_hosts(targets: list[dict]) -> str:
             if r.get("status") == "error":
                 errors.extend(r.get("errors", []))
 
-        if t.get("irq_cpu") is not None:
-            r = await _pin_irq_one(
+        pin_irq_result = None
+        wants_pin = (
+            t.get("pin_irq")
+            or t.get("irq_cpus") is not None
+            or t.get("irq_numa_node") is not None
+        )
+        if wants_pin:
+            pin_irq_result = await _pin_irq_one(
                 host=h,
                 interface=iface,
-                cpu=t["irq_cpu"],
+                pci=t.get("irq_pci", ""),
+                cpus=t.get("irq_cpus"),
+                numa_node=t.get("irq_numa_node"),
                 irqbalance_mode=t.get("irqbalance_mode", "ban_irq"),
             )
-            steps.append({"pin_irq": r})
-            if r.get("status") == "error":
-                errors.extend(r.get("errors", []))
+            steps.append({"pin_irq": pin_irq_result})
+            if pin_irq_result.get("status") == "error":
+                errors.extend(pin_irq_result.get("errors", []))
 
         if t.get("mtu") is not None:
             r = await _nm_set_mtu_one(host=h, interface=iface, mtu=t["mtu"])
@@ -1866,8 +2191,8 @@ async def tune_hosts(targets: list[dict]) -> str:
             expected["qdisc"] = t["qdisc"]
         if t.get("channels") is not None:
             expected["channels"] = t["channels"]
-        if t.get("irq_cpu") is not None:
-            expected["irq_cpu"] = t["irq_cpu"]
+        if pin_irq_result and pin_irq_result.get("assignments"):
+            expected["irq_assignments"] = pin_irq_result["assignments"]
         if expected:
             r = await _verify_host_tuning_one(
                 host=h, interface=iface, expected=expected

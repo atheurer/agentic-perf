@@ -46,10 +46,39 @@ tune_tcp(host, interface="eno16695np0", congestion_control="bbr", qdisc="fq",
 ```
 
 ### 3. IRQ Pinning (`pin_irq`)
-Pins NIC interrupt(s) to a specific CPU core and prevents irqbalance from
-overriding the pin during a run.
+Pins NIC interrupt(s) round-robin across one or more CPUs and prevents
+irqbalance from overriding the pin during a run.
 
 **Must be called after `tune_nic`** — channel count determines which IRQs exist.
+
+**Device selection** (provide one): `interface` (e.g. `ens1f0np0`), `pci`
+(bus address, e.g. `0000:21:00.0`), or explicit `irqs` (skips discovery
+entirely). IRQ discovery lists `/sys/.../device/msi_irqs/`, which works
+across NIC drivers that don't put the interface name in `/proc/interrupts`
+(e.g. mlx5/ConnectX name interrupts by PCI address instead, like
+`mlx5_comp1@pci:0000:21:00.0` — a plain interface-name match finds nothing
+on those NICs).
+
+**CPU targeting** — pick the mode that fits (checked in this order):
+- `cpus=[194, 195]` — explicit list; IRQs are round-robin assigned across it.
+- `numa_node=1` — round-robin across that NUMA node's CPUs. Use this to
+  intentionally pin to a specific (including non-local) node — no local-node
+  auto-detection happens when you specify a node yourself.
+- neither — auto-detects the device's own local NUMA node and round-robins
+  across its CPUs. Use this when you just want "the right node" without
+  looking up NUMA topology yourself.
+
+For a single-queue NIC (the common case for single-stream benchmarks), any
+of these modes reduces to pinning that one IRQ to one CPU — pass a
+single-element `cpus` list for that.
+
+**Undoing a pin:** use `reset_irq_pinning` (same device-selection params) to
+restore default `smp_affinity`, clear the IRQ from
+`IRQBALANCE_BANNED_INTERRUPTS`, and unmask+restart irqbalance. Hosts are
+often reused across ticket iterations without teardown — if a previous
+ticket pinned IRQs differently (different NUMA node, different CPU count),
+call `reset_irq_pinning` before re-tuning rather than layering a new pin on
+top of stale bans.
 
 ## IRQ Pinning and irqbalance
 
@@ -62,7 +91,7 @@ Three modes, choose based on the situation:
 | Mode | What it does | When to use |
 |------|-------------|-------------|
 | `ban_irq` (default) | Adds the NIC IRQ(s) to `IRQBALANCE_BANNED_INTERRUPTS`; irqbalance restarts and keeps balancing everything else | Preferred — surgical, least disruptive |
-| `ban_cpu` | Adds the target CPU to `IRQBALANCE_BANNED_CPUS`; irqbalance won't place any interrupt on that CPU | Use when you also want the application CPU free from all irqbalance activity |
+| `ban_cpu` | Adds every CPU used by this pin to `IRQBALANCE_BANNED_CPUS`; irqbalance won't place any interrupt on those CPUs | Use when you also want the application CPU(s) free from all irqbalance activity |
 | `disable` | Masks and stops irqbalance entirely | Use only when you control all IRQ affinity on the host and don't want any automatic balancing |
 
 ## Application CPU and IRQ CPU Relationship
@@ -88,14 +117,14 @@ Example (AMD R7725, ConnectX-7 NIC on NUMA node 1):
 1. tune_nic(host, interface, channels=1)       # Set channel count first
 2. tune_tcp(host, congestion_control="bbr",    # TCP stack (order vs nic doesn't matter,
             qdisc="fq")                        # but must be before benchmark starts)
-3. pin_irq(host, interface, cpu=194,           # Pin IRQ after channel count is set
-           irqbalance_mode="ban_irq")
+3. result = pin_irq(host, interface, cpus=[194],  # Pin IRQ after channel count is set
+                     irqbalance_mode="ban_irq")
 4. verify_host_tuning(host, interface,         # Confirm everything applied
    expected={
        "congestion_control": "bbr",
        "qdisc": "fq",
        "channels": 1,
-       "irq_cpu": 194,
+       "irq_assignments": result["assignments"],  # e.g. [{"irq": 42, "cpu": 194}]
    })
 ```
 

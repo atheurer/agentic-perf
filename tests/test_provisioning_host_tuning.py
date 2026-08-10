@@ -17,6 +17,13 @@ PROC_INTERRUPTS_TWO_QUEUES = """\
  43:      12346   PCI-MSI    0-edge      eno16695np0-TxRx-1
 """
 
+# mlx5-style /proc/interrupts: interrupts are named by PCI address, not
+# interface name — a plain interface-name substring match finds nothing.
+PROC_INTERRUPTS_MLX5 = """\
+407:      12345   PCI-MSI-edge      mlx5_comp0@pci:0000:21:00.0
+408:      12346   PCI-MSI-edge      mlx5_comp1@pci:0000:21:00.0
+"""
+
 ETHTOOL_L_ONE_QUEUE = """\
 Channel parameters for eno16695np0:
 Pre-set maximums:
@@ -236,7 +243,7 @@ class TestPinIrq:
     async def test_happy_path_ban_irq(self):
         ssh = MockSSHExecutor(
             results={
-                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE),
+                "msi_irqs": SSHResult(stdout="42\n"),
                 "smp_affinity": SSHResult(stdout="", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
@@ -244,32 +251,104 @@ class TestPinIrq:
         )
         handlers = make_handlers(ssh)
         result = await handlers["pin_irq"](
-            host="10.0.0.1", interface="eno16695np0", cpu=194
+            host="10.0.0.1", interface="eno16695np0", cpus=[194]
         )
         assert result["status"] == "ok"
         assert result["irq_numbers"] == [42]
-        assert result["cpu"] == 194
+        assert result["assignments"] == [{"irq": 42, "cpu": 194}]
         assert result["irqbalance"]["mode"] == "ban_irq"
 
     @pytest.mark.asyncio
-    async def test_irq_not_found_returns_error(self):
+    async def test_msi_irqs_discovery_ignores_proc_interrupts_naming(self):
+        """Primary regression test for #496/#499: msi_irqs discovery must
+        succeed even when /proc/interrupts uses PCI-address naming (mlx5)
+        with no interface name present at all."""
         ssh = MockSSHExecutor(
             results={
+                "msi_irqs": SSHResult(stdout="407\n408\n"),
+                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
+                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2]
+        )
+        assert result["status"] == "ok"
+        assert result["irq_numbers"] == [407, 408]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_proc_interrupts_by_pci_when_msi_irqs_missing(self):
+        ssh = MockSSHExecutor(
+            results={
+                "msi_irqs": SSHResult(
+                    stdout="ls: cannot access: No such file or directory",
+                    exit_code=2,
+                ),
+                "basename": SSHResult(stdout="0000:21:00.0"),
+                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
+                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2]
+        )
+        assert result["status"] == "ok"
+        assert result["irq_numbers"] == [407, 408]
+        assert result["pci"] == "0000:21:00.0"
+
+    @pytest.mark.asyncio
+    async def test_explicit_irqs_skips_discovery(self):
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](host="10.0.0.1", irqs=[407], cpus=[2])
+        assert result["status"] == "ok"
+        assert result["irq_numbers"] == [407]
+        assert not any("msi_irqs" in c or "/proc/interrupts" in c for c in commands_run)
+
+    @pytest.mark.asyncio
+    async def test_requires_device_identifier(self):
+        ssh = MockSSHExecutor()
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](host="10.0.0.1", cpus=[2])
+        assert result["status"] == "error"
+        assert "interface, pci, or irqs" in result["errors"][0]
+
+    @pytest.mark.asyncio
+    async def test_no_irqs_found_returns_error(self):
+        ssh = MockSSHExecutor(
+            results={
+                "msi_irqs": SSHResult(
+                    stdout="ls: cannot access: No such file or directory",
+                    exit_code=2,
+                ),
                 "/proc/interrupts": SSHResult(stdout="  0:  19  timer\n"),
             }
         )
         handlers = make_handlers(ssh)
         result = await handlers["pin_irq"](
-            host="10.0.0.1", interface="eno16695np0", cpu=194
+            host="10.0.0.1", interface="eno16695np0", cpus=[194]
         )
         assert result["status"] == "error"
-        assert "No IRQ found" in result["errors"][0]
+        assert "No IRQs found" in result["errors"][0]
 
     @pytest.mark.asyncio
-    async def test_multiple_irqs_pinned(self):
+    async def test_explicit_cpu_list_round_robins(self):
         ssh = MockSSHExecutor(
             results={
-                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_TWO_QUEUES),
+                "msi_irqs": SSHResult(stdout="407\n408\n409\n"),
                 "smp_affinity": SSHResult(stdout="", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
@@ -277,11 +356,59 @@ class TestPinIrq:
         )
         handlers = make_handlers(ssh)
         result = await handlers["pin_irq"](
-            host="10.0.0.1", interface="eno16695np0", cpu=194
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2, 3]
         )
         assert result["status"] == "ok"
-        assert sorted(result["irq_numbers"]) == [42, 43]
-        assert len(result["applied"]) == 2
+        assert result["assignments"] == [
+            {"irq": 407, "cpu": 2},
+            {"irq": 408, "cpu": 3},
+            {"irq": 409, "cpu": 2},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_auto_detects_local_numa_node(self):
+        ssh = MockSSHExecutor(
+            results={
+                "msi_irqs": SSHResult(stdout="407\n"),
+                "numa_node": SSHResult(stdout="1"),
+                "cpulist": SSHResult(stdout="192-199"),
+                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](host="10.0.0.1", interface="ens1f0np0")
+        assert result["status"] == "ok"
+        assert result["target_mode"].startswith("numa_node:1")
+        assert result["assignments"] == [{"irq": 407, "cpu": 192}]
+
+    @pytest.mark.asyncio
+    async def test_explicit_numa_node_skips_local_detection(self):
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n408\n")
+            if "cpulist" in command:
+                return SSHResult(stdout="64-71")
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", numa_node=2
+        )
+        assert result["status"] == "ok"
+        # Explicit numa_node must skip the local-node auto-detection read.
+        assert not any("cat" in c and "/device/numa_node" in c for c in commands_run)
+        assert result["target_mode"] == "numa_node:2"
+        assert result["assignments"] == [
+            {"irq": 407, "cpu": 64},
+            {"irq": 408, "cpu": 65},
+        ]
 
     @pytest.mark.asyncio
     async def test_disable_mode_masks_irqbalance(self):
@@ -289,8 +416,8 @@ class TestPinIrq:
 
         async def tracking_run(host, command, timeout=300):
             commands_run.append(command)
-            if "/proc/interrupts" in command:
-                return SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE)
+            if "msi_irqs" in command:
+                return SSHResult(stdout="42\n")
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -299,7 +426,7 @@ class TestPinIrq:
         result = await handlers["pin_irq"](
             host="10.0.0.1",
             interface="eno16695np0",
-            cpu=194,
+            cpus=[194],
             irqbalance_mode="disable",
         )
         assert result["status"] == "ok"
@@ -307,13 +434,13 @@ class TestPinIrq:
         assert any("mask irqbalance" in c for c in commands_run)
 
     @pytest.mark.asyncio
-    async def test_ban_cpu_mode(self):
+    async def test_ban_cpu_bans_union_of_used_cpus(self):
         commands_run = []
 
         async def tracking_run(host, command, timeout=300):
             commands_run.append(command)
-            if "/proc/interrupts" in command:
-                return SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE)
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n408\n")
             if "IRQBALANCE_BANNED_CPUS" in command:
                 return SSHResult(stdout="")
             return SSHResult(stdout="", exit_code=0)
@@ -323,13 +450,91 @@ class TestPinIrq:
         handlers = make_handlers(ssh)
         result = await handlers["pin_irq"](
             host="10.0.0.1",
-            interface="eno16695np0",
-            cpu=194,
+            interface="ens1f0np0",
+            cpus=[2, 3],
             irqbalance_mode="ban_cpu",
         )
         assert result["status"] == "ok"
         assert result["irqbalance"]["mode"] == "ban_cpu"
-        assert any("IRQBALANCE_BANNED_CPUS" in c for c in commands_run)
+        mask = int(result["irqbalance"]["banned_cpus_mask"], 16)
+        assert mask == (1 << 2) | (1 << 3)
+
+
+# ---------------------------------------------------------------------------
+# reset_irq_pinning
+# ---------------------------------------------------------------------------
+
+
+class TestResetIrqPinning:
+    @pytest.mark.asyncio
+    async def test_reset_restores_default_affinity_and_clears_matching_ban(self):
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n408\n")
+            if "default_smp_affinity" in command:
+                return SSHResult(stdout="ffffffff")
+            if "IRQBALANCE_BANNED_INTERRUPTS" in command:
+                return SSHResult(stdout='IRQBALANCE_BANNED_INTERRUPTS="407 408 999"')
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["reset_irq_pinning"](
+            host="10.0.0.1", interface="ens1f0np0"
+        )
+        assert result["status"] == "ok"
+        assert any("restored to default" in a for a in result["applied"])
+        assert any("unmasked and restarted" in a for a in result["applied"])
+        # Only this device's IRQs (407, 408) are stripped — the unrelated
+        # IRQ 999 banned by something else must survive.
+        assert any('IRQBALANCE_BANNED_INTERRUPTS="999"' in c for c in commands_run)
+        assert not any('IRQBALANCE_BANNED_INTERRUPTS="407' in c for c in commands_run)
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_banned_cpus_when_given(self):
+        async def tracking_run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n")
+            if "IRQBALANCE_BANNED_CPUS" in command:
+                return SSHResult(stdout='IRQBALANCE_BANNED_CPUS="0xc"')
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["reset_irq_pinning"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[2, 3]
+        )
+        assert result["status"] == "ok"
+        assert any("IRQBALANCE_BANNED_CPUS cleared" in a for a in result["applied"])
+
+    @pytest.mark.asyncio
+    async def test_reset_requires_device_identifier(self):
+        ssh = MockSSHExecutor()
+        handlers = make_handlers(ssh)
+        result = await handlers["reset_irq_pinning"](host="10.0.0.1")
+        assert result["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_reset_no_irqs_found_returns_error(self):
+        ssh = MockSSHExecutor(
+            results={
+                "msi_irqs": SSHResult(
+                    stdout="ls: cannot access: No such file or directory",
+                    exit_code=2,
+                ),
+                "/proc/interrupts": SSHResult(stdout="  0:  19  timer\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["reset_irq_pinning"](
+            host="10.0.0.1", interface="eno16695np0"
+        )
+        assert result["status"] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +563,7 @@ class TestVerifyHostTuning:
                 "congestion_control": "bbr",
                 "qdisc": "fq",
                 "channels": 1,
-                "irq_cpu": 194,
+                "irq_assignments": [{"irq": 42, "cpu": 194}],
                 "irqbalance_mode": "disable",
             },
         )
@@ -366,6 +571,33 @@ class TestVerifyHostTuning:
         assert result["checks"]["net.ipv4.tcp_congestion_control"]["ok"] is True
         assert result["checks"]["qdisc"]["ok"] is True
         assert result["checks"]["channels"]["ok"] is True
+        assert result["checks"]["irq"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_irq_mismatch_detected(self):
+        ssh = MockSSHExecutor(
+            results={
+                "net.ipv4.tcp_congestion_control": SSHResult(stdout="bbr"),
+                "tc qdisc show": SSHResult(stdout="qdisc fq 8001: root refcnt 2"),
+                "ethtool -l": SSHResult(stdout=ETHTOOL_L_ONE_QUEUE),
+                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_TWO_QUEUES),
+                "smp_affinity_list": SSHResult(stdout="3"),
+                "is-active irqbalance": SSHResult(stdout="inactive"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["verify_host_tuning"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            expected={
+                "irq_assignments": [
+                    {"irq": 42, "cpu": 194},
+                    {"irq": 43, "cpu": 195},
+                ]
+            },
+        )
+        assert result["all_ok"] is False
+        assert len(result["checks"]["irq"]["mismatches"]) == 2
 
     @pytest.mark.asyncio
     async def test_wrong_qdisc_detected(self):
