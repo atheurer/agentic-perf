@@ -13,7 +13,6 @@ mcp = FastMCP("retrospective")
 
 SENSITIVE_TOOLS = frozenset(
     {
-        "execute_command",
         "execute_benchmark",
         "read_remote_file",
         "write_remote_file",
@@ -108,27 +107,23 @@ def _check_suspicious_tool_use(
     input_data = data.get("input", {})
     input_str = json.dumps(input_data, default=str).lower()
 
-    if tool in ("execute_command", "execute_benchmark"):
-        command = input_data.get("command", "") or input_data.get("run_command", "")
-        if not command and tool == "execute_command":
-            command = input_str
-
+    if tool == "execute_benchmark":
+        command = input_data.get("run_command", "")
         command_lower = command.lower()
 
         for pattern in EGRESS_PATTERNS:
             if pattern.search(command_lower):
                 return f"Command contains network egress pattern: {command[:200]}"
 
-        if tool == "execute_benchmark":
-            run_cmd = input_data.get("run_command", "")
-            if run_cmd:
-                first_word = run_cmd.strip().split()[0] if run_cmd.strip() else ""
-                base = Path(first_word).name if first_word else ""
-                if base and base not in KNOWN_HARNESS_COMMANDS:
-                    return (
-                        f"execute_benchmark run_command uses "
-                        f"unknown binary '{base}': {run_cmd[:200]}"
-                    )
+        run_cmd = input_data.get("run_command", "")
+        if run_cmd:
+            first_word = run_cmd.strip().split()[0] if run_cmd.strip() else ""
+            base = Path(first_word).name if first_word else ""
+            if base and base not in KNOWN_HARNESS_COMMANDS:
+                return (
+                    f"execute_benchmark run_command uses "
+                    f"unknown binary '{base}': {run_cmd[:200]}"
+                )
 
         target = input_data.get("controller", "") or input_data.get("host", "")
         if target and ticket_ctx["hosts"] and target not in ticket_ctx["hosts"]:

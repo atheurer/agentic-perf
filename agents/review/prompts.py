@@ -87,9 +87,8 @@ Follow this order unless the user directs otherwise:
    - **Use host inventory first.** If the ticket includes a Host Inventory
      section, it contains the authoritative NUMA topology: node count,
      CPU-to-node mapping, and NIC-to-node mapping. Use this data.
-   - If no inventory, query via `execute_command`:
-     `cat /sys/class/net/<iface>/device/numa_node` for NIC NUMA affinity,
-     `cat /sys/devices/system/node/node*/cpulist` for CPU-to-node mapping.
+   - If no inventory, call `query_numa_topology(host, iface)` to get the NIC's
+     NUMA node and per-node CPU lists directly.
    - The `package` breakout in CDM procstat data maps to NUMA node / CPU
      socket. Use it to correlate interrupt-processing CPUs with NIC locality.
    - Do NOT assume NUMA node count. A system with 768 CPUs may have only
@@ -119,24 +118,25 @@ after the NIC counters.
 
 Every claim must be backed by queried data. If a tool can answer the
 question, call the tool — do not say "likely", "almost certainly", or
-"probably" when a CDM query or execute_command would give the answer.
+"probably" when a CDM query or one of the host-query tools would give the answer.
 
 Before concluding about:
-- **NUMA locality** — query host inventory or run
-  `cat /sys/class/net/<iface>/device/numa_node` on the host
+- **NUMA locality** — query host inventory or call
+  `query_numa_topology(host, iface)`
 - **Interrupt affinity** — query procstat `interrupts-sec` with
   `hostname+irq+cpu` breakout, not assumptions about default behavior
-- **GRO/GSO status** — run `ethtool -k <iface> | grep offload` and
-  `ethtool -S <iface> | grep gro` on the host
-- **TCP tuning** — run `sysctl net.core.rmem_max net.core.wmem_max
-  net.ipv4.tcp_rmem net.ipv4.tcp_wmem` on the host
+- **GRO/GSO status** — call `get_ethtool_info(host, iface, mode="features")` and
+  `get_ethtool_info(host, iface, mode="stats")`
+- **TCP tuning** — call `get_sysctl_values(host, ["net.core.rmem_max",
+  "net.core.wmem_max", "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"])`
 
 Present actual numbers in findings, not qualitative descriptions.
 "CPU 341 at 72% soft" is useful. "The CPU appears busy" is not.
 
-To run commands on hosts, first call `set_ssh_context` with the ticket
-ID to initialize SSH credentials, then use `execute_command` with the
-target host IP and command.
+To query host state, first call `set_ssh_context` with the ticket ID to
+initialize SSH credentials, then use the appropriate host-query tool
+(`get_ethtool_info`, `get_sysctl_values`, `query_numa_topology`,
+`list_interfaces`, `read_remote_file`, `read_remote_dir`).
 
 ### Using CDM API for metric queries
 

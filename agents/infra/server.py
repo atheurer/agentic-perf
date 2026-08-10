@@ -11,14 +11,13 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import tempfile
-import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -29,12 +28,6 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.infra.command_policy import (
-    CommandPolicy,
-    check_command,
-    extract_binary,
-    load_policy,
-)
 from agents.server_utils import (
     _resolve_vault_secret_name,
     resolve_ssh_key,
@@ -52,15 +45,9 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _ssh: SSHExecutor | None = None
 _ssh_key_stack: AsyncExitStack | None = None
-_agent_name: str | None = None
-_policy: CommandPolicy | None = None
 _secrets_provider = None
 _state_store_url: str | None = None
 _ticket_id: str | None = None
-
-_APPROVAL_POLL_INTERVAL = 3
-_APPROVAL_TIMEOUT = 300
-_background_pids: dict[str, dict[str, Any]] = {}
 
 
 def _store_headers() -> dict[str, str]:
@@ -68,44 +55,6 @@ def _store_headers() -> dict[str, str]:
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
-
-
-def _emit_approval_event(
-    decision: str,
-    binary: str,
-    host: str,
-    command: str,
-) -> None:
-    """Write an approval audit event to the ticket's JSONL log."""
-    import json as _json
-    from datetime import datetime, timezone
-
-    from paths import LOG_DIR
-
-    if not _ticket_id:
-        return
-
-    agent = _agent_name or "unknown"
-    event = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "ticket_id": _ticket_id,
-        "agent": agent,
-        "event_type": "command_approval",
-        "data": {
-            "decision": decision,
-            "binary": binary,
-            "host": host,
-            "command": command[:500],
-        },
-    }
-    try:
-        path = LOG_DIR / f"{_ticket_id}.jsonl"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(_json.dumps(event, default=str) + "\n")
-    except OSError:
-        logger.warning(
-            "Failed to write approval audit event for %s", _ticket_id, exc_info=True
-        )
 
 
 def _get_ssh() -> SSHExecutor:
@@ -132,13 +81,13 @@ def _format_result(result: SSHResult) -> str:
 
 
 @mcp.tool()
-async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
+async def set_ssh_context(ticket_id: str) -> str:
     """Set SSH credentials by reading them from a ticket's custom_fields.
 
     Must be called before any SSH operations. Resolves ssh_key_path and
     ssh_user from the ticket so credentials never appear in tool inputs.
     """
-    global _ssh, _ssh_key_stack, _agent_name, _policy, _state_store_url, _ticket_id
+    global _ssh, _ssh_key_stack, _state_store_url, _ticket_id
 
     _ticket_id = ticket_id
 
@@ -171,19 +120,11 @@ async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
 
     _ssh = SSHExecutor(user=ssh_user, key_path=resolved_key, strict_host_key=strict)
 
-    if agent_name:
-        _agent_name = agent_name
-        _policy = load_policy(agent_name)
-    else:
-        _agent_name = None
-        _policy = None
-
     return json.dumps(
         {
             "status": "ok",
             "ssh_user": ssh_user,
             "has_key": ssh_key is not None,
-            "agent_policy": agent_name or "none",
         }
     )
 
@@ -265,6 +206,168 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
+async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
+    """Copy a remote directory to a local temp directory.
+
+    Returns the local path for the agent to read files from directly.
+    Use for multi-file data like crucible tool-data directories.
+    """
+    ssh = _get_ssh()
+    local_dir = tempfile.mkdtemp(prefix="remote-dir-")
+    result = await ssh.copy_from(host, remote_path, local_dir)
+    if result.exit_code != 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": result.stderr or result.stdout,
+            }
+        )
+    return json.dumps({"success": True, "local_path": local_dir})
+
+
+@mcp.tool()
+async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str:
+    """Get ethtool information for a network interface.
+
+    mode='features' returns offload feature flags (ethtool -k),
+    mode='stats' returns NIC statistics (ethtool -S).
+    """
+    ssh = _get_ssh()
+    quoted = shlex.quote(iface)
+    if mode == "features":
+        result = await ssh.run(host, f"ethtool -k {quoted}", timeout=30)
+    elif mode == "stats":
+        result = await ssh.run(host, f"ethtool -S {quoted}", timeout=30)
+    else:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Unknown mode {mode!r}. Use 'features' or 'stats'.",
+            }
+        )
+    return _format_result(result)
+
+
+@mcp.tool()
+async def get_sysctl_values(host: str, params: list[str]) -> str:
+    """Read sysctl parameter values from a remote host.
+
+    Pass a list of sysctl key names
+    (e.g. ['net.core.rmem_max', 'net.ipv4.tcp_wmem']).
+    """
+    ssh = _get_ssh()
+    _PARAM_RE = re.compile(r"^[a-zA-Z0-9._/-]+$")
+    for p in params:
+        if not _PARAM_RE.match(p):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Invalid sysctl key {p!r}: must match [a-zA-Z0-9._/-]+",
+                }
+            )
+    cmd = "sysctl " + " ".join(shlex.quote(p) for p in params)
+    result = await ssh.run(host, cmd, timeout=30)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def query_numa_topology(host: str, iface: str) -> str:
+    """Query NUMA topology for a host.
+
+    Returns which NUMA node a NIC belongs to, and the CPU list for each
+    NUMA node.
+    """
+    ssh = _get_ssh()
+    quoted = shlex.quote(iface)
+
+    node_result = await ssh.run(
+        host,
+        f"cat /sys/class/net/{quoted}/device/numa_node",
+        timeout=15,
+    )
+    if node_result.exit_code != 0:
+        return json.dumps(
+            {
+                "error": (
+                    f"Failed to read NIC NUMA node: "
+                    f"{node_result.stderr or node_result.stdout}"
+                ),
+            }
+        )
+
+    cpulist_result = await ssh.run(
+        host,
+        'for f in /sys/devices/system/node/node*/cpulist; do echo "$f: $(cat $f)"; done',
+        timeout=15,
+    )
+    if cpulist_result.exit_code != 0:
+        return json.dumps(
+            {
+                "error": (
+                    f"Failed to read per-node CPU lists: "
+                    f"{cpulist_result.stderr or cpulist_result.stdout}"
+                ),
+            }
+        )
+
+    return json.dumps(
+        {
+            "nic_numa_node": node_result.stdout.strip(),
+            "node_cpu_lists": cpulist_result.stdout.strip(),
+            "iface": iface,
+        }
+    )
+
+
+@mcp.tool()
+async def verify_ssh_path(host: str, target_host: str) -> str:
+    """Verify SSH reachability from one host to another.
+
+    For example, use this to validate that crucible's controller can reach
+    its endpoints before starting a benchmark.
+    """
+    ssh = _get_ssh()
+    cmd = (
+        f"ssh -o ConnectTimeout=5 -o BatchMode=yes "
+        f"-o StrictHostKeyChecking=accept-new "
+        f"{shlex.quote(target_host)} hostname"
+    )
+    result = await ssh.run(host, cmd, timeout=20)
+    reachable = result.exit_code == 0
+    out: dict[str, Any] = {
+        "reachable": reachable,
+        "from": host,
+        "to": target_host,
+    }
+    if reachable:
+        out["hostname"] = result.stdout.strip()
+    return json.dumps(out)
+
+
+@mcp.tool()
+async def list_interfaces(host: str) -> str:
+    """List network interfaces that are UP with their assigned IP addresses."""
+    ssh = _get_ssh()
+    result = await ssh.run(host, "ip -br addr show", timeout=15)
+    if result.exit_code != 0:
+        return _format_result(result)
+
+    interfaces = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        iface = parts[0]
+        state = parts[1]
+        if state != "UP":
+            continue
+        addresses = parts[2:] if len(parts) > 2 else []
+        interfaces.append({"iface": iface, "state": state, "addresses": addresses})
+
+    return json.dumps(interfaces)
+
+
+@mcp.tool()
 async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     """Deploy a secret file to a remote host.
 
@@ -334,8 +437,6 @@ async def transfer_file(
             args.extend(["-i", ssh.key_path])
         args.extend([f"{ssh.user}@{host}:{remote_path}", local_path])
 
-        import asyncio
-
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -359,328 +460,6 @@ async def transfer_file(
             "local_path": local_path,
             "remote_path": remote_path,
             "error": result.stderr if result.exit_code != 0 else None,
-        }
-    )
-
-
-async def _get_ticket_approvals() -> list[dict]:
-    """Read the per-ticket command_approvals list from custom_fields.
-
-    Returns a list of approval records: [{"binary": ..., "host": ...}, ...]
-    Also supports the legacy format (bare string list) for backwards compat.
-    """
-    if not _state_store_url or not _ticket_id:
-        return []
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0, headers=_store_headers()) as client:
-            r = await client.get(f"{_state_store_url}/api/v1/tickets/{_ticket_id}")
-            r.raise_for_status()
-            fields = r.json().get("custom_fields", {})
-            raw = fields.get("command_approvals", [])
-            result = []
-            for entry in raw:
-                if isinstance(entry, str):
-                    result.append({"binary": entry, "host": "*"})
-                elif isinstance(entry, dict):
-                    result.append(entry)
-            return result
-    except httpx.HTTPStatusError:
-        logger.warning(
-            "State store returned error fetching approvals for %s",
-            _ticket_id,
-            exc_info=True,
-        )
-        return []
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
-        logger.error(
-            "State store unreachable fetching approvals for %s: %s",
-            _ticket_id,
-            exc,
-        )
-        return []
-    except Exception:
-        logger.exception("Unexpected error fetching approvals for %s", _ticket_id)
-        return []
-
-
-def _approval_matches(
-    approvals: list[dict],
-    binary: str,
-    host: str,
-) -> bool:
-    """Check if a binary+host pair is covered by an existing approval."""
-    for entry in approvals:
-        if entry.get("binary") != binary:
-            continue
-        approved_host = entry.get("host", "*")
-        if approved_host == "*" or approved_host == host:
-            return True
-    return False
-
-
-async def _request_approval(command: str, binary: str, host: str) -> str:
-    """Request user approval for a command not in the allowlist.
-
-    Writes a pending_approval request to the ticket's custom_fields,
-    then polls until the user responds or the timeout expires.
-
-    Returns: "approved_once", "approved_ticket", or "denied".
-    """
-    import asyncio
-    import uuid
-
-    import httpx
-
-    if not _state_store_url or not _ticket_id:
-        return "denied"
-
-    approval_id = f"appr-{uuid.uuid4().hex[:8]}"
-    pending = {
-        "id": approval_id,
-        "agent": _agent_name or "unknown",
-        "command": command[:500],
-        "binary": binary,
-        "host": host,
-        "requested_at": (
-            __import__("datetime")
-            .datetime.now(__import__("datetime").timezone.utc)
-            .isoformat()
-        ),
-        "status": "pending",
-    }
-
-    logger.info(
-        "Requesting approval for %s: %s on %s",
-        _agent_name,
-        command[:120],
-        host,
-    )
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.patch(
-            f"{_state_store_url}/api/v1/tickets/{_ticket_id}/fields",
-            json={"fields": {"pending_approval": pending}},
-        )
-
-        elapsed = 0
-        while elapsed < _APPROVAL_TIMEOUT:
-            await asyncio.sleep(_APPROVAL_POLL_INTERVAL)
-            elapsed += _APPROVAL_POLL_INTERVAL
-
-            try:
-                r = await client.get(f"{_state_store_url}/api/v1/tickets/{_ticket_id}")
-                r.raise_for_status()
-                fields = r.json().get("custom_fields", {})
-                pa = fields.get("pending_approval", {})
-                if pa.get("id") != approval_id:
-                    return "denied"
-                status = pa.get("status", "pending")
-                if status != "pending":
-                    logger.info(
-                        "Approval response for %s: %s",
-                        command[:80],
-                        status,
-                    )
-                    return status
-            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException):
-                logger.warning(
-                    "Error polling for approval of %s", command[:80], exc_info=True
-                )
-
-    logger.warning("Approval timeout for: %s", command[:120])
-    return "denied"
-
-
-@mcp.tool()
-async def execute_command(
-    host: str,
-    command: str,
-    timeout: int = 300,
-    background: bool = False,
-) -> str:
-    """Execute a command on a remote host via SSH.
-
-    Subject to per-agent command policy: the command's binary must be in
-    the agent's allowlist, and the command must not match any blocked pattern.
-    If the binary is not in the allowlist but is otherwise safe, the user
-    will be prompted for approval.
-
-    Set background=True to run the command in the background. The response
-    will include a bg_id and pid. You MUST call stop_background_command(bg_id)
-    when you no longer need the background process — for example, after
-    using nc to test port connectivity, stop the listener before the
-    benchmark needs that port. Do NOT append '&' to the command string;
-    use this parameter instead.
-
-    Call set_ssh_context() with agent_name to load the policy.
-    """
-    ssh = _get_ssh()
-
-    # LLMs sometimes emit HTML entities in tool arguments (&amp; for &,
-    # &quot; for ", etc.). Decode before policy check so the policy sees
-    # and validates exactly what will be executed.
-    command = html.unescape(command)
-
-    if _policy is not None:
-        allowed, reason = check_command(command, _policy)
-        if not allowed:
-            if "not in allowlist" in reason:
-                binary = extract_binary(command)
-                ticket_approvals = await _get_ticket_approvals()
-                if _approval_matches(ticket_approvals, binary, host):
-                    logger.info(
-                        "Binary %r pre-approved for host %s, executing",
-                        binary,
-                        host,
-                    )
-                    _emit_approval_event("pre_approved", binary, host, command)
-                else:
-                    decision = await _request_approval(command, binary, host)
-                    _emit_approval_event(decision, binary, host, command)
-                    if decision not in (
-                        "approved_once",
-                        "approved_ticket",
-                    ):
-                        logger.warning(
-                            "Command denied by user for %s: %s",
-                            _agent_name,
-                            command[:120],
-                        )
-                        return json.dumps(
-                            {
-                                "exit_code": -1,
-                                "stdout": "",
-                                "stderr": (
-                                    f"Command denied by user: "
-                                    f"binary {binary!r} not approved"
-                                ),
-                                "blocked": True,
-                            }
-                        )
-            else:
-                logger.warning(
-                    "Command blocked for %s: %s — %s",
-                    _agent_name,
-                    command[:120],
-                    reason,
-                )
-                return json.dumps(
-                    {
-                        "exit_code": -1,
-                        "stdout": "",
-                        "stderr": (f"Command blocked by policy: {reason}"),
-                        "blocked": True,
-                    }
-                )
-
-        if timeout > _policy.max_timeout:
-            timeout = _policy.max_timeout
-
-    if background:
-        bg_id = f"bg-{uuid.uuid4().hex[:8]}"
-        mkd = await ssh.run(host, "mktemp -d /tmp/bg-XXXXXXXX", timeout=10)
-        if mkd.exit_code != 0 or not mkd.stdout.strip():
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "exit_code": mkd.exit_code,
-                    "stdout": mkd.stdout or "",
-                    "stderr": mkd.stderr or "Failed to create temp directory",
-                }
-            )
-        bg_dir = mkd.stdout.strip()
-        out_file = f"{bg_dir}/out"
-        bg_cmd = f"nohup {command} > {out_file} 2>&1 & echo {_PID_SENTINEL}$!"
-        result = await ssh.run(host, bg_cmd, timeout=30)
-        pid = parse_pid_sentinel(result.stdout or "")
-        if result.exit_code == 0 and pid is not None:
-            _background_pids[bg_id] = {
-                "host": host,
-                "pid": pid,
-                "command": command,
-                "dir": bg_dir,
-                "out_file": out_file,
-            }
-            return json.dumps(
-                {
-                    "status": "backgrounded",
-                    "bg_id": bg_id,
-                    "pid": pid,
-                    "host": host,
-                }
-            )
-        return json.dumps(
-            {
-                "status": "failed",
-                "exit_code": result.exit_code,
-                "stdout": result.stdout or "",
-                "stderr": result.stderr or "",
-            }
-        )
-
-    result = await ssh.run(host, command, timeout=timeout)
-
-    return _format_result(result)
-
-
-@mcp.tool()
-async def stop_background_command(bg_id: str) -> str:
-    """Stop a background command started by execute_command.
-
-    Pass the bg_id returned by execute_command when background=True.
-    Always call this when you no longer need the background process
-    — for example, after a connectivity test, stop the nc listener
-    before the benchmark needs that port.
-    """
-    ssh = _get_ssh()
-    entry = _background_pids.pop(bg_id, None)
-    if entry is None:
-        return json.dumps({"status": "error", "message": f"Unknown bg_id: {bg_id}"})
-
-    host = entry["host"]
-    pid = entry["pid"]
-
-    await ssh.run(host, f"kill {pid} 2>/dev/null", timeout=5)
-    check = await ssh.run(host, f"kill -0 {pid} 2>/dev/null", timeout=5)
-    if check.exit_code == 0:
-        await ssh.run(host, f"kill -9 {pid} 2>/dev/null", timeout=5)
-
-    bg_dir = entry.get("dir")
-    if bg_dir:
-        await ssh.run(host, f"rm -rf {bg_dir}", timeout=5)
-
-    return json.dumps({"status": "stopped", "bg_id": bg_id, "pid": pid})
-
-
-@mcp.tool()
-async def check_background_command(bg_id: str) -> str:
-    """Check whether a background command is still running.
-
-    Returns the running status and recent output (last 20 lines).
-    """
-    ssh = _get_ssh()
-    entry = _background_pids.get(bg_id)
-    if entry is None:
-        return json.dumps({"status": "error", "message": f"Unknown bg_id: {bg_id}"})
-
-    host = entry["host"]
-    pid = entry["pid"]
-
-    check = await ssh.run(host, f"kill -0 {pid} 2>/dev/null", timeout=5)
-    running = check.exit_code == 0
-
-    out_file = entry.get("out_file", f"/tmp/{bg_id}.out")
-    tail = await ssh.run(host, f"tail -20 {out_file} 2>/dev/null", timeout=5)
-    output = tail.stdout.strip() if tail.stdout else ""
-
-    return json.dumps(
-        {
-            "bg_id": bg_id,
-            "running": running,
-            "pid": pid,
-            "output": output,
         }
     )
 

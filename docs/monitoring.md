@@ -82,7 +82,7 @@ log review.
 | Retry loops | medium/high | Same tool called with identical input 3+ times. Tracked per-tool — interleaved calls to other tools do not break loop detection. |
 | Wasted iterations | medium/high | 25%+ of an agent's LLM calls produced only failed tool results |
 | Max iterations | high | Agent exhausted its iteration budget |
-| Tool bypass | medium/high | Agent uses a generic tool (e.g., `execute_command`) for tasks a specialized tool handles (e.g., `execute_benchmark`). Includes detection of manual schema exploration (`--schema`, `--help` via SSH) and manual container orchestration (`podman run` via SSH). |
+| Tool bypass | medium/high | Agent uses a generic tool (e.g., `read_remote_file`) for tasks a specialized tool handles (e.g., `execute_benchmark`). Includes detection of manual schema exploration and manual container orchestration via SSH. |
 | Missing precondition | high | A required lookup returned a negative result (e.g., `get_runfile_schema` returned `found: false`) and the agent proceeded with the dependent action (`execute_benchmark`) instead of escalating. Precondition pairs are configurable. |
 | Stale progress | medium | No new events for a configurable threshold (default 5 minutes) while the ticket is in an active status. Distinct from the orchestrator's stale-task watchdog — reported as an observation, not a cancellation. |
 
@@ -130,7 +130,7 @@ is flagged). Override via private skills.
 Detects when agents use generic tools instead of purpose-built ones.
 Contains two sections:
 - `tool_mappings` — generic-to-specialized tool relationships per
-  agent (e.g., benchmark agent using `execute_command` instead of
+  agent (e.g., benchmark agent using a host-query tool instead of
   `execute_benchmark`)
 - `command_patterns` — regex patterns matched against tool input
   to detect specific bypass behaviors (e.g., manual schema
@@ -151,15 +151,15 @@ Contains two sections:
         "tool_mappings": [
             {
                 "agent": "provisioning",
-                "generic_tool": "execute_command",
+                "generic_tool": "read_remote_file",
                 "specialized_tool": "jmp_run",
-                "description": "running commands directly instead of via Jumpstarter"
+                "description": "reading files directly instead of via Jumpstarter"
             }
         ],
         "command_patterns": [
             {
                 "agent": "benchmark",
-                "tool": "execute_command",
+                "tool": "read_remote_file",
                 "pattern": "our-internal-tool --manual-mode",
                 "description": "manual invocation of internal tool",
                 "severity": "medium"

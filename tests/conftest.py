@@ -167,6 +167,19 @@ class MockSSHExecutor:
                 return result
         return self._default
 
+    async def copy_from(
+        self, host: str, remote_path: str, local_path: str, timeout: int = 120
+    ) -> SSHResult:
+        self.calls.append(
+            {
+                "method": "copy_from",
+                "host": host,
+                "remote_path": remote_path,
+                "local_path": local_path,
+            }
+        )
+        return self._default
+
     async def copy_to(
         self, host: str, local_path: str, remote_path: str, timeout: int = 60
     ) -> SSHResult:

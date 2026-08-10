@@ -100,16 +100,6 @@ class ProvisioningAgent(AgentBase):
     # when adding new self-contained harnesses.
     _SELF_INSTALLING: frozenset[str] = frozenset({"boot-time", "arcaflow-plugins"})
 
-    # Denied for every harness, no exceptions (see #483): analysis of
-    # 444 ticket logs showed the agent bypassing structured tools
-    # (tune_nic, tune_tcp, pin_irq, disable_firewall, nm_set_mtu) in
-    # favor of raw execute_command, causing tuning that doesn't
-    # persist, skipped verification, and wasted iteration budget on
-    # ad-hoc command discovery. Every legitimate provisioning
-    # operation has a structured tool — this is not harness-specific
-    # scoping like _PROVISIONING_DENY_TOOLS below.
-    _ALWAYS_DENY_TOOLS: frozenset[str] = frozenset({"execute_command"})
-
     _PROVISIONING_DENY_TOOLS: frozenset[str] = frozenset(
         {
             "deploy_secret",
@@ -182,10 +172,6 @@ class ProvisioningAgent(AgentBase):
                 t for t in self.tools if t.name not in self._PROVISIONING_DENY_TOOLS
             ]
 
-    def _apply_always_deny(self) -> None:
-        """Remove tools denied for every harness, no exceptions (see #483)."""
-        self.tools = [t for t in self.tools if t.name not in self._ALWAYS_DENY_TOOLS]
-
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
 
@@ -237,8 +223,6 @@ class ProvisioningAgent(AgentBase):
         # scoping as before.
         if not is_jumpstarter:
             self._apply_tool_scoping(ticket)
-
-        self._apply_always_deny()
 
         try:
             await super().run(ticket_id)

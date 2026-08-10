@@ -1,8 +1,8 @@
 # Tool bypass detection patterns for the introspection agent.
 #
-# Detects when agents use general-purpose tools (like execute_command)
-# for tasks that purpose-built tools handle better. This is not about
-# tool failures — it's about tool misuse that wastes LLM iterations.
+# Detects when agents use general-purpose tools for tasks that
+# purpose-built tools handle better. This is not about tool failures
+# — it's about tool misuse that wastes LLM iterations.
 #
 # Private overrides: place additional patterns in
 #   ~/.agentic-perf/private-skills/introspection.json
@@ -20,9 +20,9 @@
 
 tool_mappings:
   - agent: "benchmark"
-    generic_tool: "execute_command"
+    generic_tool: "read_remote_file"
     specialized_tool: "execute_benchmark"
-    description: "manually orchestrating benchmark execution instead of using execute_benchmark"
+    description: "manually reading result files instead of using execute_benchmark"
 
 # --- Command content patterns ---
 #
@@ -34,13 +34,13 @@ tool_mappings:
 
 command_patterns:
   - agent: "benchmark"
-    tool: "execute_command"
-    pattern: "podman run.*--schema|podman run.*--help|podman run.*--json-schema"
+    tool: "read_remote_file"
+    pattern: "podman.*schema|podman.*--help|podman.*json-schema"
     description: "manual schema exploration via SSH — use get_runfile_schema instead"
     severity: "medium"
 
   - agent: "benchmark"
-    tool: "execute_command"
-    pattern: "podman run(?!.*--schema|.*--help|.*--json-schema)"
+    tool: "read_remote_file"
+    pattern: "/var/lib/crucible/run/.*/tool-data"
     description: "manual container orchestration via SSH — use execute_benchmark instead"
     severity: "high"

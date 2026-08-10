@@ -271,6 +271,56 @@ class SSHExecutor:
             exit_code=exit_code,
         )
 
+    async def copy_from(
+        self,
+        host: str,
+        remote_path: str,
+        local_path: str,
+        timeout: int = 120,
+        key_path: str | None = None,
+    ) -> SSHResult:
+        args = [
+            "scp",
+            "-r",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"StrictHostKeyChecking={self.strict_host_key}",
+        ]
+        if self.strict_host_key == "no":
+            args.extend(["-o", "UserKnownHostsFile=/dev/null"])
+        effective_key = key_path or self.key_path
+        if effective_key:
+            args.extend(["-i", effective_key])
+        args.extend([f"{self.user}@{host}:{remote_path}", local_path])
+
+        logger.info(f"[scp] {self.user}@{host}:{remote_path} -> {local_path}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return SSHResult(
+                stdout="", stderr=f"SCP timed out after {timeout}s", exit_code=-1
+            )
+
+        return SSHResult(
+            stdout=stdout_bytes.decode("utf-8", errors="replace"),
+            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            exit_code=proc.returncode or 0,
+        )
+
     async def copy_to(
         self,
         host: str,

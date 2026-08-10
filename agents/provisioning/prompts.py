@@ -136,16 +136,6 @@ Your tasks:
     b. Apply the tuning with `tune_nic` (queue count, ring buffers,
        offloads), `tune_tcp` (congestion control, qdisc), and `pin_irq`
        (IRQ affinity + irqbalance) as needed — one call per host per tool.
-       **Do NOT use `execute_command` to hand-roll this with raw shell
-       (ethtool/tc/sysctl/echo-to-smp_affinity) even if you know the
-       commands.** These tools aren't just wrappers around the same
-       shell commands — they encode details that are easy to get wrong
-       by hand: `pin_irq` writes an exact single-CPU hex bitmask to
-       `smp_affinity` AND bans the IRQ from irqbalance in the same call;
-       a hand-written `echo "1 2" > smp_affinity_list` sets a *range*
-       covering CPU 1 AND 2, not a pin to CPU 2 alone, and skips the
-       irqbalance step entirely — both wrong in ways that won't be
-       obvious until someone reads `/proc/interrupts` after the fact.
     c. Call `verify_host_tuning` and include its result in your
        `submit_provisioning_result` call. If verification shows the tuning
        did NOT take effect (e.g. IRQ landed on a different CPU than

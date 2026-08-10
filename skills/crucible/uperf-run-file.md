@@ -40,14 +40,9 @@ interfaces or IP addresses.
 don't just trust whatever value ended up in each endpoint's
 `host` field. SSH access from the controller to each endpoint
 should already be in place from `setup_passwordless_ssh`, so
-this is a real connectivity check, not a port probe. Use
-`execute_command` on the controller for each endpoint host in
-your run-file:
-
-```
-ssh -o ConnectTimeout=5 -o BatchMode=yes \
-  -o StrictHostKeyChecking=accept-new <endpoint-host> hostname
-```
+this is a real connectivity check, not a port probe. Call
+`verify_ssh_path(controller_host, endpoint_host)` for each
+endpoint host in your run-file.
 
 If this fails for a host that `setup_passwordless_ssh` already
 reported as reachable, you likely put the wrong value in that
@@ -73,14 +68,9 @@ For multiple pairs, pair 2 uses 30004/30005, pair 3 uses
 ### Discovering test interfaces
 
 When the user specifies non-management NICs, you need to
-discover what's available on the hosts. Use `execute_command`
-to run these on the client and server hosts:
-
-```
-ip -br addr show | grep UP
-```
-
-This shows all UP interfaces with their IPs. Look for:
+discover what's available on the hosts. Call
+`list_interfaces(host)` on each of the client and server hosts
+to get all UP interfaces with their IP addresses. Look for:
 - Interfaces with IPs on a shared private subnet (e.g.,
   10.10.x.x on both hosts) — these are likely the test
   network

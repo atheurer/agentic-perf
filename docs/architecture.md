@@ -492,10 +492,10 @@ The introspection agent:
   only failed tool results)
 - Detects retry loops (per-tool, survives interleaved diagnostics)
   and max iteration exhaustion
-- Detects tool bypass patterns: agents using generic tools (e.g.,
-  `execute_command`) instead of purpose-built tools (e.g.,
-  `execute_benchmark`), manual schema exploration via SSH, and
-  manual container orchestration via SSH
+- Detects tool bypass patterns: agents using generic tools instead of
+  purpose-built tools (e.g., using `execute_benchmark` for known
+  harnesses), manual schema exploration via SSH, and manual container
+  orchestration via SSH
 - Stops automatically when the ticket reaches a terminal status
 - Never transitions ticket state or modifies agent behavior (Phase 1)
 
