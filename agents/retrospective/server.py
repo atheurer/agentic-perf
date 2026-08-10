@@ -105,7 +105,6 @@ def _check_suspicious_tool_use(
         return None
 
     input_data = data.get("input", {})
-    input_str = json.dumps(input_data, default=str).lower()
 
     if tool == "execute_benchmark":
         command = input_data.get("run_command", "")

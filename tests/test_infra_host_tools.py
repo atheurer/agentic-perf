@@ -34,9 +34,7 @@ class TestGetEthtoolInfo:
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "rx-checksumming" in data["stdout"]
-        assert any(
-            "ethtool -k" in c["command"] for c in patch_ssh.calls
-        )
+        assert any("ethtool -k" in c["command"] for c in patch_ssh.calls)
 
     @pytest.mark.asyncio
     async def test_stats_mode(self, patch_ssh):
@@ -83,7 +81,9 @@ class TestGetSysctlValues:
     @pytest.mark.asyncio
     async def test_invalid_key_rejected(self, patch_ssh):
         # Semicolon in key name should fail the regex guard.
-        result = await srv.get_sysctl_values("10.0.0.1", ["net.core.rmem_max; rm -rf /"])
+        result = await srv.get_sysctl_values(
+            "10.0.0.1", ["net.core.rmem_max; rm -rf /"]
+        )
         data = json.loads(result)
         assert data["success"] is False
         assert "Invalid sysctl key" in data["error"]
@@ -213,14 +213,14 @@ class TestReadRemoteDir:
     async def test_success(self, patch_ssh, monkeypatch):
         # copy_from is on the SSHExecutor, not the module — patch it via
         # the mock already installed on srv._ssh.
-        import asyncio
-
         async def _fake_copy_from(host, remote_path, local_path, timeout=120):
             return SSHResult(exit_code=0, stdout="", stderr="")
 
         monkeypatch.setattr(srv._ssh, "copy_from", _fake_copy_from)
 
-        result = await srv.read_remote_dir("10.0.0.1", "/var/lib/crucible/run/abc/tool-data")
+        result = await srv.read_remote_dir(
+            "10.0.0.1", "/var/lib/crucible/run/abc/tool-data"
+        )
         data = json.loads(result)
         assert data["success"] is True
         assert "local_path" in data
