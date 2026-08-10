@@ -77,9 +77,13 @@ To view the contents of any file returned in listing mode, call `read_run_result
 
 ---
 
-## 3. Deep Fallback: Manual Parsing Recipes
+## 3. Deep Fallback: Local Parsing Recipes
 
-In rare situations where you need to run complex multi-file calculations or statistical aggregations directly on the host, use `execute_command` with the following optimized Python snippets.
+In rare situations where you need to run complex multi-file calculations or
+statistical aggregations on tool-data directories, use
+`read_remote_dir(host, remote_path)` to copy the directory locally, then read
+individual files with the local Read tool. The following Python snippets show
+how to process the files once you have them locally.
 
 ### Recipe 1: Extracting Turbostat Data
 ```python

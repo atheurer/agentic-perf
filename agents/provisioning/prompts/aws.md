@@ -5,8 +5,10 @@ you MUST establish root SSH access before doing anything else. Crucible and
 most benchmark harnesses require root. There are TWO requirements:
 
 **Part A: Enable root login on every host (controller + all targets).**
-Use execute_command on EACH host directly (do NOT SSH hop through the
-controller — execute_command connects to each host independently):
+Use `write_remote_file` to write a setup script, then run it on EACH host
+directly (do NOT SSH hop through the controller — each host is reachable
+independently). Alternatively, use structured provisioning tools where
+available. The following shell commands show what needs to happen:
 ```
 sudo sed -i 's/.*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sudo mkdir -p /root/.ssh

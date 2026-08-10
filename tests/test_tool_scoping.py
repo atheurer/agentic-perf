@@ -32,7 +32,6 @@ class TestHarnessToolScoping:
                 "execute_boot_time_test",
                 "submit_benchmark_result",
                 "request_clarification",
-                "execute_command",
                 "execute_benchmark",
                 "get_execution_config",
                 "get_benchmark_params",
@@ -59,7 +58,6 @@ class TestHarnessToolScoping:
         all_names = [
             "read_skill",
             "execute_benchmark",
-            "execute_command",
             "get_execution_config",
         ]
         agent.tools = self._make_tools(all_names)
@@ -77,7 +75,6 @@ class TestHarnessToolScoping:
         all_names = [
             "read_skill",
             "execute_benchmark",
-            "execute_command",
         ]
         agent.tools = self._make_tools(all_names)
         ticket = {"custom_fields": {}}
@@ -87,7 +84,7 @@ class TestHarnessToolScoping:
 
     def test_empty_directives_keeps_all_tools(self):
         agent = self._make_agent()
-        all_names = ["read_skill", "execute_command"]
+        all_names = ["read_skill", "execute_benchmark"]
         agent.tools = self._make_tools(all_names)
         ticket = {
             "custom_fields": {"directives": {}},

@@ -54,7 +54,7 @@ to construct a correct run file — getting the format right is critical.
    - target_ssh_hosts: the endpoint SSH-reachable IPs (from ssh_hardware_ips.targets)
    This generates a key on the controller and injects it on each endpoint via
    their SSH-reachable IPs, then verifies the controller can reach each endpoint
-   on the private IPs. Do NOT use execute_command to set up SSH keys manually.
+   on the private IPs.
 
 5. **Validate network path (network benchmarks only)** — For network benchmarks
    (uperf, trafficgen, iperf, k8s-netperf, etc.), you MUST verify that the

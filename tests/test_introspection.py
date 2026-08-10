@@ -1493,7 +1493,7 @@ class TestToolBypassDetection:
         return load_tool_bypass_patterns()
 
     def test_generic_tool_bypass_detected(self) -> None:
-        """Flags when benchmark-agent uses execute_command many
+        """Flags when benchmark-agent uses read_remote_file many
         times without calling execute_benchmark."""
         events = [
             _make_event(
@@ -1501,8 +1501,8 @@ class TestToolBypassDetection:
                 "tool_called",
                 agent="benchmark-agent",
                 data={
-                    "tool": "execute_command",
-                    "input": {"command": f"cmd-{i}"},
+                    "tool": "read_remote_file",
+                    "input": {"host": "10.0.0.1", "remote_path": f"/tmp/out-{i}"},
                 },
             )
             for i in range(1, 6)
@@ -1527,8 +1527,8 @@ class TestToolBypassDetection:
                 "tool_called",
                 agent="benchmark-agent",
                 data={
-                    "tool": "execute_command",
-                    "input": {"command": f"cmd-{i}"},
+                    "tool": "read_remote_file",
+                    "input": {"host": "10.0.0.1", "remote_path": f"/tmp/out-{i}"},
                 },
             )
             for i in range(1, 6)
@@ -1564,8 +1564,8 @@ class TestToolBypassDetection:
                 "tool_called",
                 agent="benchmark-agent",
                 data={
-                    "tool": "execute_command",
-                    "input": {"command": f"cmd-{i}"},
+                    "tool": "read_remote_file",
+                    "input": {"host": "10.0.0.1", "remote_path": f"/tmp/out-{i}"},
                 },
             )
             for i in range(1, 3)  # Only 2, below default 3
@@ -1584,18 +1584,18 @@ class TestToolBypassDetection:
         assert len(generic_bypass) == 0
 
     def test_schema_exploration_detected(self) -> None:
-        """Flags podman run --schema via execute_command."""
+        """Flags manual schema exploration via read_remote_file."""
         events = [
             _make_event(
                 1,
                 "tool_called",
                 agent="benchmark-agent",
                 data={
-                    "tool": "execute_command",
+                    "tool": "read_remote_file",
                     "input": {
-                        "command": (
-                            "podman run --rm quay.io/plugin:latest --schema 2>/dev/null"
-                        ),
+                        "host": "10.0.0.1",
+                        "remote_path": "/tmp/podman-schema-output",
+                        "command_hint": "podman run --rm quay.io/plugin:latest --schema",
                     },
                 },
             ),
@@ -1615,17 +1615,18 @@ class TestToolBypassDetection:
         assert schema_bypass[0]["severity"] == "medium"
 
     def test_container_orchestration_detected(self) -> None:
-        """Flags podman run (non-schema) via execute_command."""
+        """Flags manual tool-data access via read_remote_file."""
         events = [
             _make_event(
                 1,
                 "tool_called",
                 agent="benchmark-agent",
                 data={
-                    "tool": "execute_command",
+                    "tool": "read_remote_file",
                     "input": {
-                        "command": (
-                            "podman run -d --network=host quay.io/plugin:latest"
+                        "host": "10.0.0.1",
+                        "remote_path": (
+                            "/var/lib/crucible/run/abc123/tool-data/profiler/turbostat"
                         ),
                     },
                 },
@@ -1654,8 +1655,8 @@ class TestToolBypassDetection:
                 "tool_called",
                 agent="provisioning-agent",
                 data={
-                    "tool": "execute_command",
-                    "input": {"command": f"cmd-{i}"},
+                    "tool": "read_remote_file",
+                    "input": {"host": "10.0.0.1", "remote_path": f"/tmp/out-{i}"},
                 },
             )
             for i in range(1, 6)

@@ -131,7 +131,7 @@ Follow a ticket's progress in real-time:
 [resource-agent] ✓ Resources allocated
 
 [benchmark-agent] Preparing benchmark...
-[benchmark-agent] → execute_command("10.1.37.12", "ethtool eno16695np0")
+[benchmark-agent] → get_ethtool_info("10.1.37.12", "eno16695np0")
 [benchmark-agent] → execute_benchmark(controller, run_file, "crucible")
 [benchmark-agent] ⏳ Running... (sample 2/6, elapsed 3m42s)
 ```
@@ -160,7 +160,7 @@ When an agent needs input, the TUI surfaces it as a prompt:
   throughput variation — are all 6 samples consistent?
 
 [review-agent] Investigating...
-[review-agent] → execute_command("10.1.37.14", "ethtool -S eno16695np0 | grep gro")
+[review-agent] → get_ethtool_info("10.1.37.14", "eno16695np0", mode="stats")
 ```
 
 The TUI should:

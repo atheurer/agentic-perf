@@ -248,10 +248,11 @@ should understand what is enforced today and what is not.
 
 **What is enforced:**
 
-- **Command policy** (`agents/infra/command_policy.py`) — per-agent
-  binary allowlists, blocked patterns, and shell-bypass detection
-  (chaining, subshells, interpreter payloads). This catches
-  accidental LLM hallucinations and trivial evasion attempts.
+- **Purpose-built host-query tools** — instead of a generic SSH
+  command executor, the infra server exposes targeted read-only tools
+  (`get_ethtool_info`, `get_sysctl_values`, `query_numa_topology`,
+  `list_interfaces`, `verify_ssh_path`, `read_remote_dir`). Each tool
+  has a fixed, validated code path — no free-form shell injection.
 - **Bearer token auth** (`state_store/auth.py`) — every API request
   requires a token generated on first run and shared via env var.
 - **Dispatch claims** — ticket-level leases prevent duplicate agent

@@ -25,7 +25,7 @@ def mock_infra_server(tmp_path: Path) -> Path:
         _context = {"ready": False, "user": None}
 
         @mcp.tool()
-        async def set_ssh_context(ticket_id: str, agent_name: str = "") -> str:
+        async def set_ssh_context(ticket_id: str) -> str:
             \"\"\"Set SSH context from ticket.\"\"\"
             _context["ready"] = True
             _context["user"] = "root"
@@ -33,7 +33,6 @@ def mock_infra_server(tmp_path: Path) -> Path:
                 "status": "ok",
                 "ssh_user": "root",
                 "has_key": True,
-                "agent_policy": agent_name or "none",
             })
 
         @mcp.tool()
@@ -46,33 +45,6 @@ def mock_infra_server(tmp_path: Path) -> Path:
                 "host": host,
                 "system_info": "mockhost\\nNAME=MockOS\\n4\\n16",
             })
-
-        @mcp.tool()
-        async def execute_command(host: str, command: str, timeout: int = 300, background: bool = False) -> str:
-            \"\"\"Execute a command.\"\"\"
-            if not _context["ready"]:
-                return json.dumps({"error": "SSH context not set"})
-            if background or command.rstrip().endswith("&"):
-                return json.dumps({
-                    "status": "backgrounded",
-                    "bg_id": "bg-mock1234",
-                    "pid": 12345,
-                    "host": host,
-                })
-            return json.dumps({
-                "exit_code": 0,
-                "stdout": f"mock output for: {command}",
-            })
-
-        @mcp.tool()
-        async def stop_background_command(bg_id: str) -> str:
-            \"\"\"Stop a background command.\"\"\"
-            return json.dumps({"status": "stopped", "bg_id": bg_id, "pid": 12345})
-
-        @mcp.tool()
-        async def check_background_command(bg_id: str) -> str:
-            \"\"\"Check a background command.\"\"\"
-            return json.dumps({"bg_id": bg_id, "running": True, "pid": 12345, "output": "mock"})
 
         @mcp.tool()
         async def write_remote_file(host: str, remote_path: str, content: str) -> str:
@@ -90,6 +62,36 @@ def mock_infra_server(tmp_path: Path) -> Path:
                 "exit_code": 0,
                 "stdout": f"mock content of {remote_path}",
             })
+
+        @mcp.tool()
+        async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
+            \"\"\"Copy a remote directory to a local temp directory.\"\"\"
+            return json.dumps({"success": True, "local_path": "/tmp/remote-dir-mock"})
+
+        @mcp.tool()
+        async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str:
+            \"\"\"Get ethtool info for a NIC.\"\"\"
+            return json.dumps({"exit_code": 0, "stdout": f"mock ethtool {mode} for {iface}"})
+
+        @mcp.tool()
+        async def get_sysctl_values(host: str, params: list) -> str:
+            \"\"\"Read sysctl parameter values.\"\"\"
+            return json.dumps({"exit_code": 0, "stdout": "net.core.rmem_max = 4194304"})
+
+        @mcp.tool()
+        async def query_numa_topology(host: str, iface: str) -> str:
+            \"\"\"Query NUMA topology for a host.\"\"\"
+            return json.dumps({"nic_numa_node": "0", "node_cpu_lists": "mock", "iface": iface})
+
+        @mcp.tool()
+        async def verify_ssh_path(host: str, target_host: str) -> str:
+            \"\"\"Verify SSH reachability from one host to another.\"\"\"
+            return json.dumps({"reachable": True, "from": host, "to": target_host, "hostname": "mock-host"})
+
+        @mcp.tool()
+        async def list_interfaces(host: str) -> str:
+            \"\"\"List UP network interfaces.\"\"\"
+            return json.dumps([{"iface": "eth0", "state": "UP", "addresses": ["10.0.0.1/24"]}])
 
         @mcp.tool()
         async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
@@ -171,11 +173,14 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "set_ssh_context",
             "check_host",
             "check_hosts",
-            "execute_command",
-            "stop_background_command",
-            "check_background_command",
             "write_remote_file",
             "read_remote_file",
+            "read_remote_dir",
+            "get_ethtool_info",
+            "get_sysctl_values",
+            "query_numa_topology",
+            "verify_ssh_path",
+            "list_interfaces",
             "deploy_secret",
             "transfer_file",
             "test_port_connectivity",
@@ -193,7 +198,7 @@ async def test_infra_set_context_then_check_host(mock_infra_server: Path):
     try:
         result = await client.call_tool(
             "set_ssh_context",
-            {"ticket_id": "PERF-TEST", "agent_name": "provisioning-agent"},
+            {"ticket_id": "PERF-TEST"},
         )
         ctx = json.loads(result)
         assert ctx["status"] == "ok"
@@ -203,23 +208,6 @@ async def test_infra_set_context_then_check_host(mock_infra_server: Path):
         host_info = json.loads(result)
         assert host_info["reachable"] is True
         assert host_info["host"] == "10.0.0.1"
-    finally:
-        await client.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_infra_execute_command(mock_infra_server: Path):
-    client = AgentMCPClient()
-    await client.connect(str(mock_infra_server), name="infra")
-    try:
-        await client.call_tool("set_ssh_context", {"ticket_id": "PERF-TEST"})
-        result = await client.call_tool(
-            "execute_command",
-            {"host": "10.0.0.1", "command": "hostname -f"},
-        )
-        data = json.loads(result)
-        assert data["exit_code"] == 0
-        assert "hostname" in data["stdout"]
     finally:
         await client.disconnect()
 
@@ -283,8 +271,8 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "list_benchmarks" in names
         assert "resolve_benchmark" in names
         assert "set_ssh_context" in names
-        assert "execute_command" in names
-        assert len(names) == 13
+        assert "get_ethtool_info" in names
+        assert len(names) == 16
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -335,7 +323,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 13
+    assert len(client._tool_routing) == 16
 
     await client.disconnect()
     assert len(client._servers) == 0

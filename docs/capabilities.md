@@ -219,21 +219,20 @@ Agents **cannot modify** custom fields directly. Instead, they write results bac
 
 ## Guardrails and Safety
 
-### Command Policy
-The **command policy** (`agents/infra/command_policy.py`) restricts SSH commands globally and per-agent:
+### Host-Query Tool Guardrails
+The infra MCP server exposes purpose-built read-only tools instead of a generic
+SSH command executor. Each tool has a fixed, validated code path:
 
-**Global Denied Patterns:**
-- `rm -rf /` (recursively delete root)
-- `mkfs` (format filesystem)
-- `dd if=/dev/zero of=/dev/` (overwrite block device)
-- `chmod 777 /` (open filesystem permissions)
-- `shutdown`, `reboot` (stop system)
-- `poweroff`, `halt` (stop system)
+- `get_ethtool_info` — NIC offload features or stats (ethtool)
+- `get_sysctl_values` — kernel parameters (validated key format)
+- `query_numa_topology` — NIC NUMA node and per-node CPU lists
+- `list_interfaces` — UP interfaces with IP addresses
+- `verify_ssh_path` — SSH reachability between hosts
+- `read_remote_dir` — copy a remote directory locally for inspection
 
-**Per-Agent Allowlists** (in `agents/infra/policies/*.json`):
-- **Provisioning**: Can run `yum`, `apt`, `git`, `harness-cli` but not `root` shell
-- **Benchmark**: Restricted to harness CLI and read commands
-- **Teardown**: Only `harness-uninstall` and resource cleanup commands
+This replaces the previous `execute_command` tool and its per-agent
+allowlist policy (`agents/infra/command_policy.py`). Every host
+interaction now has an explicit, narrow scope — no free-form shell.
 
 ### Budget Enforcement
 - Per-ticket LLM token limit
