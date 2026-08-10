@@ -185,6 +185,21 @@ def _apply_step_overrides(
             existing.update(step_params["directives"])
             override_fields["directives"] = existing
 
+    # When a benchmark step follows an inconclusive analysis,
+    # merge the analysis agent's suggested params into the step.
+    if agent_type == "benchmark":
+        analysis = cf.get("analysis_result", {})
+        if not analysis.get("conclusive") and analysis.get("benchmark_needed"):
+            suggested = analysis["benchmark_needed"].get("suggested_params", {})
+            if suggested:
+                existing_params = dict(step_params)
+                # Suggested params fill gaps but don't override
+                # explicit plan params set by triage.
+                for k, v in suggested.items():
+                    if k not in existing_params:
+                        existing_params[k] = v
+                next_step["params"] = existing_params
+
     # Apply per-step scoped_context if provided, or clear the
     # agent's section so it falls back to structured data
     # (required_hosts) instead of stale ticket-level text.

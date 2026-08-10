@@ -188,6 +188,17 @@ class AnalyzeAgent(AgentBase):
             )
             parts.append("")
 
+        harness = directives.get("harness", "")
+        if harness:
+            parts.append(
+                f"**Harness:** {harness} — start by reading "
+                f"the investigation methodology skill: "
+                f"`list_skill_docs('{harness}')` then "
+                f"`read_skill('{harness}', "
+                f"'investigation-methodology.md')`"
+            )
+            parts.append("")
+
         parts.append(
             "Analyze the available data using the tools provided. "
             "Query external data sources, prior tickets, and "

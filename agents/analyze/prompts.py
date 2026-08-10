@@ -36,6 +36,20 @@ After analysis, you must decide:
   explain what's missing and what benchmark would help.
   The ticket advances to hardware provisioning.
 
+## Investigation Methodology
+
+Before starting your analysis, read the investigation methodology
+skill file for the relevant harness:
+
+1. Call `list_skill_docs` with the harness category (e.g., 'boot-time')
+2. Look for an `investigation-methodology.md` file
+3. Call `read_skill` to load it
+4. Follow the methodology's step-by-step investigation approach
+
+The methodology skill teaches you domain-specific knowledge:
+which metrics to check, what patterns are known, how to interpret
+phase breakdowns, and when to declare conclusive vs inconclusive.
+
 ## Rules
 
 - **Never provision hardware or run benchmarks.** You analyze

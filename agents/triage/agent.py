@@ -76,6 +76,21 @@ class TriageAgent(AgentBase):
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return TRIAGE_SYSTEM_PROMPT
 
+    def _has_external_data_tools(self) -> bool:
+        """Check if external MCP data tools are configured."""
+        from orchestrator.config import _load_config_file
+
+        try:
+            config = _load_config_file()
+        except Exception:
+            return False
+        servers = config.get("external_mcp_servers", [])
+        for srv in servers:
+            agents = srv.get("agents", {})
+            if "analyze" in agents or "gathering_context" in agents:
+                return True
+        return False
+
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         content = (
             f"## Performance Test Request\n\n"
@@ -83,6 +98,40 @@ class TriageAgent(AgentBase):
             f"**Summary:** {ticket['summary']}\n\n"
             f"**Description:**\n{ticket['description']}\n"
         )
+
+        # Tell triage whether external data tools are available
+        has_data_tools = self._has_external_data_tools()
+        cf = ticket.get("custom_fields", {})
+        has_anomaly = bool(cf.get("anomaly_context"))
+        ref_tickets = cf.get("reference_tickets", [])
+
+        content += "\n## Data Analysis Capability\n\n"
+        if has_data_tools:
+            content += (
+                "External data tools ARE available. You CAN "
+                "include an `analyze` step in the execution plan "
+                "when the investigation would benefit from "
+                "analyzing existing data before provisioning "
+                "hardware.\n"
+            )
+        else:
+            content += (
+                "External data tools are NOT available. Do NOT "
+                "include an `analyze` step — use the standard "
+                "benchmark-first plan.\n"
+            )
+        if has_anomaly:
+            content += (
+                "\nThis ticket has anomaly_context (alert-triggered). "
+                "It will route through gathering_context for dedup "
+                "before reaching the execution plan.\n"
+            )
+        if ref_tickets:
+            content += (
+                f"\nReference tickets provided: {ref_tickets}. "
+                "Include an analyze step for cross-ticket "
+                "comparison.\n"
+            )
 
         if ticket.get("comments"):
             content += "\n## Previous Comments\n"

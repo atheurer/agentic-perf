@@ -20,6 +20,8 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("analyze-agent")
 
+SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
+
 _STORE_URL = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
 _AUTH_TOKEN = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
 
@@ -29,6 +31,57 @@ def _headers() -> dict[str, str]:
     if _AUTH_TOKEN:
         h["Authorization"] = f"Bearer {_AUTH_TOKEN}"
     return h
+
+
+@mcp.tool()
+async def read_skill(category: str, filename: str) -> str:
+    """Read an investigation methodology skill document.
+
+    Skill docs contain domain-specific knowledge for
+    investigating anomalies (e.g., boot-time phase analysis,
+    known patterns, measurement model).
+
+    Args:
+        category: Skill category (e.g., 'boot-time', 'jumpstarter').
+        filename: Filename within the skill directory.
+    """
+    skill_path = SKILLS_DIR / category / filename
+    if not skill_path.is_file():
+        return json.dumps(
+            {
+                "found": False,
+                "message": f"Skill not found: {category}/{filename}",
+            },
+        )
+    resolved = skill_path.resolve()
+    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
+        return json.dumps({"found": False, "message": "Invalid path"})
+    return json.dumps(
+        {
+            "found": True,
+            "filename": filename,
+            "content": skill_path.read_text(),
+        },
+    )
+
+
+@mcp.tool()
+async def list_skill_docs(category: str) -> str:
+    """List available skill documents for a category.
+
+    Args:
+        category: Skill category (e.g., 'boot-time', 'jumpstarter').
+    """
+    skill_dir = SKILLS_DIR / category
+    if not skill_dir.is_dir():
+        return json.dumps(
+            {
+                "found": False,
+                "message": f"No skills for category: {category}",
+            },
+        )
+    files = [f.name for f in sorted(skill_dir.iterdir()) if f.suffix == ".md"]
+    return json.dumps({"category": category, "files": files})
 
 
 @mcp.tool()
