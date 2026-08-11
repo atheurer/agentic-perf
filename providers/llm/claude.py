@@ -17,6 +17,8 @@ from .base import (
 
 
 class ClaudeLLMProvider(LLMProvider):
+    _backend: str = "direct"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -131,6 +133,15 @@ class ClaudeLLMProvider(LLMProvider):
             "messages": messages,
             "cache_control": {"type": "ephemeral"},
         }
+        if self._backend == "vertex":
+            kwargs.pop("cache_control", None)
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ]
         if tools:
             kwargs["tools"] = [self._tool_def_to_dict(t) for t in tools]
         if self.reasoning_effort is not None:
