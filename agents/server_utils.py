@@ -260,6 +260,60 @@ def build_repo_cache():
     return cache
 
 
+async def assert_ticket_active(
+    ticket_id: str | None = None,
+    state_store_url: str | None = None,
+    expected_status: str | None = None,
+) -> dict[str, Any]:
+    """Check that the ticket is still in an active, expected status.
+
+    Returns the full ticket dict on success. Returns a rejection dict
+    (with ``"status": "rejected"``) if the ticket has been aborted or
+    drifted — the caller should return this to the LLM as a tool result
+    instead of proceeding with the side-effecting operation.
+    """
+    import httpx
+
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
+    state_store_url = state_store_url or os.environ.get(
+        "STATE_STORE_URL", "http://localhost:8090"
+    )
+
+    if not ticket_id:
+        return {}
+
+    headers = {}
+    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+        r = await client.get(
+            f"{state_store_url}/api/v1/tickets/{ticket_id}",
+        )
+        r.raise_for_status()
+        ticket = r.json()
+
+    cf = ticket.get("custom_fields", {})
+    status = ticket.get("status", "")
+
+    if cf.get("abort_requested"):
+        return {
+            "status": "rejected",
+            "reason": "Ticket has been aborted",
+            "ticket_status": status,
+        }
+
+    if expected_status and status != expected_status:
+        return {
+            "status": "rejected",
+            "reason": (f"Ticket status is {status}, expected {expected_status}"),
+            "ticket_status": status,
+        }
+
+    return ticket
+
+
 async def build_ssh_from_ticket(
     ticket_id: str | None = None,
     state_store_url: str | None = None,

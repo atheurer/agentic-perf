@@ -595,6 +595,14 @@ async def execute_benchmark(
     """Execute the benchmark on the controller host. For crucible, sends a JSON run-file via SCP and runs 'crucible run'. For zathras, constructs a burden command. This may take several minutes."""
     await _ensure_init()
 
+    from agents.server_utils import assert_ticket_active
+
+    active_check = await assert_ticket_active(
+        expected_status="executing_benchmark",
+    )
+    if active_check.get("status") == "rejected":
+        return json.dumps(active_check)
+
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
 

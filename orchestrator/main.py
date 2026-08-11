@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from agents.base import HITLDriftError
+from agents.base import AgentAbortedError, HITLDriftError
 from paths import LOCK_FILE
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
@@ -600,7 +600,7 @@ async def run_agent_task(
                 "agent_stopped",
                 {"mode": "hard"},
             )
-    except HITLDriftError:
+    except (HITLDriftError, AgentAbortedError):
         logger.info(
             f"Agent cleanly unwound after ticket drift on "
             f"{ticket_id} (status={status}) — no transition needed"
