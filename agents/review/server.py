@@ -138,9 +138,7 @@ async def read_run_results(
         f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
         timeout=15,
     )
-    run_dir = (
-        find_result.stdout.strip() if find_result.exit_code == 0 else ""
-    )
+    run_dir = find_result.stdout.strip() if find_result.exit_code == 0 else ""
     if not run_dir:
         return json.dumps(
             {
@@ -177,9 +175,7 @@ async def read_run_results(
                 }
             )
 
-        size_cmd = "stat --printf='%s %n\\n' " + " ".join(
-            f"'{p}'" for p in raw_paths
-        )
+        size_cmd = "stat --printf='%s %n\\n' " + " ".join(f"'{p}'" for p in raw_paths)
         size_result = await _ssh.run(controller, size_cmd, timeout=20)
         files = []
         if size_result.exit_code == 0 and size_result.stdout.strip():
@@ -239,18 +235,16 @@ async def read_run_results(
                 "run_id": run_id,
                 "file_path": file_path,
                 "message": f"Failed to read {file_path}",
-                "stderr": (
-                    read_result.stderr[:500]
-                    if read_result.stderr
-                    else ""
-                ),
+                "stderr": (read_result.stderr[:500] if read_result.stderr else ""),
             }
         )
 
     content = read_result.stdout or ""
     file_size_cmd = f"stat --printf='%s' '{file_path}'"
     file_size_result = await _ssh.run(
-        controller, file_size_cmd, timeout=10,
+        controller,
+        file_size_cmd,
+        timeout=10,
     )
     try:
         file_size = int(file_size_result.stdout.strip())
