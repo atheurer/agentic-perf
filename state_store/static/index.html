@@ -1744,6 +1744,7 @@ async function renderDetail(ticketId) {
     const ticket = await api('/tickets/' + ticketId);
     lastSeq = 0;
     renderedEvents = [];
+    _lastResultHash = '';
     // Seed the trail from the ticket's authoritative
     // status_trail — the store appends on every transition.
     trailStates = (ticket.status_trail && ticket.status_trail.length > 0)
@@ -2043,10 +2044,18 @@ function renderCustomFields(ticket) {
 
 // ── Event Polling & Rendering ──
 
+var _lastResultHash = '';
+
 async function refreshResultSection(ticketId) {
   if (!ticketId) return;
   try {
     var ticket = await api('/tickets/' + ticketId);
+    // Skip rebuild if ticket data hasn't changed.
+    // innerHTML comparison fails because browsers normalize HTML.
+    var dataHash = JSON.stringify(ticket.custom_fields || {});
+    if (dataHash === _lastResultHash) return;
+    _lastResultHash = dataHash;
+
     var el = document.getElementById('result-section');
     if (el) {
       el.innerHTML = renderCustomFields(ticket);
