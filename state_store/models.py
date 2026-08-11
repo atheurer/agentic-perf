@@ -70,6 +70,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.AWAITING_REVIEW: [
         TicketStatus.AWAITING_TEARDOWN,
+        TicketStatus.SYNTHESIZING_RESULTS,  # record findings
         TicketStatus.ANALYZING,  # loop back to data analysis
         TicketStatus.TRIAGE_PENDING,  # ad-hoc rerun loop
         TicketStatus.EXECUTING_BENCHMARK,  # plan-driven re-benchmark
