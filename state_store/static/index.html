@@ -2058,11 +2058,23 @@ async function refreshResultSection(ticketId) {
 
     var el = document.getElementById('result-section');
     if (el) {
+      var cfDetails = el.querySelector('details');
+      var cfWasOpen = cfDetails ? cfDetails.open : false;
       el.innerHTML = renderCustomFields(ticket);
+      if (cfWasOpen) {
+        var newCfDetails = el.querySelector('details');
+        if (newCfDetails) newCfDetails.open = true;
+      }
     }
     var hypo = document.getElementById('hypothesis-section');
     if (hypo) {
+      var hypoDetails = hypo.querySelector('details');
+      var hypoWasOpen = hypoDetails ? hypoDetails.open : false;
       hypo.innerHTML = renderHypothesisCard(ticket);
+      if (hypoWasOpen) {
+        var newHypoDetails = hypo.querySelector('details');
+        if (newHypoDetails) newHypoDetails.open = true;
+      }
     }
     // Also refresh introspection on transitions
     var cf = ticket.custom_fields || {};
