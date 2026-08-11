@@ -41,19 +41,36 @@ read_harness_doc to learn about result formats and interpretation.
 
 ## Step 3: Retrieve Results
 
-Start by calling get_run_summary to get the result-summary.json. This gives you the
-run summary AND a `metrics` array listing every source+type indexed in CDM. Use this
-metrics list as the gate for all subsequent queries (see CDM metric availability below).
+**First: check for local artifacts.** If `output_dir` or `output_dirs` is set
+in the ticket's custom_fields, the results are stored locally on the
+orchestrator host. Use `list_benchmark_artifacts` with the output_dir to
+discover available files, then `read_benchmark_artifact` to read them.
+This is the preferred method — it requires no SSH and no network access.
 
-Use read_run_results (listing mode, no file_path) to discover available raw files.
-Use read_run_results (reading mode, with file_path) to read specific files — it
-auto-decompresses .xz files and defaults to 4000 bytes. Request more if needed.
+**Second: if no local artifacts exist,** start by calling `get_run_summary`
+to get the result-summary.json. This gives you the run summary AND a
+`metrics` array listing every source+type indexed in CDM. Use this metrics
+list as the gate for all subsequent queries (see CDM metric availability
+below).
 
-**DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results directory on the controller (e.g., `/var/lib/crucible/run/uperf...`) **exactly once** at the beginning of the review phase. Once located, cache it in your memory and reuse it for all subsequent tools and actions. Running expensive `find` or directory search commands repeatedly is highly inefficient and strictly prohibited.
+Use `read_run_results` (listing mode, no file_path) to discover available
+raw files. Use `read_run_results` (reading mode, with file_path) to read
+specific files — it auto-decompresses .xz files and defaults to 4000 bytes.
+Request more if needed.
 
-For harnesses that provide a structured API (indicated in the review config), you may
-also have access to tools like get_run_summary or cdm_api_request. The review config
-will tell you when these are applicable.
+**Always read the harness skill file** (via `read_skill`) before deciding
+how to retrieve results. The skill file will tell you where results are
+stored for that harness.
+
+**DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results
+directory **exactly once** at the beginning of the review phase. Once located,
+cache it in your memory and reuse it for all subsequent tools and actions.
+Running expensive `find` or directory search commands repeatedly is highly
+inefficient and strictly prohibited.
+
+For harnesses that provide a structured API (indicated in the review config),
+you may also have access to tools like get_run_summary or cdm_api_request.
+The review config will tell you when these are applicable.
 
 ## Step 4: Analysis
 

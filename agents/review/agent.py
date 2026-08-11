@@ -247,6 +247,31 @@ class ReviewAgent(AgentBase):
         if cf.get("benchmark_suite"):
             content += f"**Benchmark Suite:** {cf['benchmark_suite']}\n"
 
+        # Pre-scan local artifacts so the LLM doesn't need
+        # to discover them via SSH trial-and-error.
+        output_dir = cf.get("output_dir", "")
+        if output_dir:
+            from pathlib import Path
+
+            odir = Path(output_dir)
+            if odir.is_dir():
+                files = [
+                    str(f.relative_to(odir))
+                    for f in sorted(odir.rglob("*"))
+                    if f.is_file()
+                ]
+                content += (
+                    f"\n## Local Artifacts\n"
+                    f"Results are stored locally at `{output_dir}`.\n"
+                    f"Use `read_benchmark_artifact` with this "
+                    f"output_dir to read files. Do NOT use SSH.\n"
+                    f"\nAvailable files ({len(files)}):\n"
+                )
+                for fn in files[:30]:
+                    content += f"- `{fn}`\n"
+                if len(files) > 30:
+                    content += f"- ... and {len(files) - 30} more\n"
+
         harness = cf.get("harness_name") or cf.get("directives", {}).get(
             "harness", "crucible"
         )
