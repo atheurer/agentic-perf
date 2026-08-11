@@ -2058,23 +2058,36 @@ async function refreshResultSection(ticketId) {
 
     var el = document.getElementById('result-section');
     if (el) {
-      var cfDetails = el.querySelector('details');
-      var cfWasOpen = cfDetails ? cfDetails.open : false;
+      // Preserve open/closed state of <details> across rebuild
+      var openDetails = {};
+      el.querySelectorAll('details').forEach(function(d) {
+        if (d.id) openDetails[d.id] = d.open;
+        else {
+          var s = d.querySelector('summary');
+          if (s) openDetails[s.textContent.trim()] = d.open;
+        }
+      });
       el.innerHTML = renderCustomFields(ticket);
-      if (cfWasOpen) {
-        var newCfDetails = el.querySelector('details');
-        if (newCfDetails) newCfDetails.open = true;
-      }
+      el.querySelectorAll('details').forEach(function(d) {
+        var key = d.id || (d.querySelector('summary') || {}).textContent;
+        if (key && openDetails[key.trim()] !== undefined) d.open = openDetails[key.trim()];
+      });
     }
     var hypo = document.getElementById('hypothesis-section');
     if (hypo) {
-      var hypoDetails = hypo.querySelector('details');
-      var hypoWasOpen = hypoDetails ? hypoDetails.open : false;
+      var hypoOpen = {};
+      hypo.querySelectorAll('details').forEach(function(d) {
+        if (d.id) hypoOpen[d.id] = d.open;
+        else {
+          var s = d.querySelector('summary');
+          if (s) hypoOpen[s.textContent.trim()] = d.open;
+        }
+      });
       hypo.innerHTML = renderHypothesisCard(ticket);
-      if (hypoWasOpen) {
-        var newHypoDetails = hypo.querySelector('details');
-        if (newHypoDetails) newHypoDetails.open = true;
-      }
+      hypo.querySelectorAll('details').forEach(function(d) {
+        var key = d.id || (d.querySelector('summary') || {}).textContent;
+        if (key && hypoOpen[key.trim()] !== undefined) d.open = hypoOpen[key.trim()];
+      });
     }
     // Also refresh introspection on transitions
     var cf = ticket.custom_fields || {};
