@@ -171,6 +171,27 @@ class SynthesisAgent(AgentBase):
             "convergence_gate",
             result.get("convergence_outcome", ""),
         )
+
+        # Analysis-only tickets have no evaluation_result.
+        # Derive outcome from analysis_result and review verdict.
+        if not outcome:
+            analysis = cf.get("analysis_result", {})
+            verdict = cf.get("verdict", "")
+            if analysis.get("conclusive") and analysis.get("root_cause"):
+                outcome = "ISOLATION"
+                if not root_cause:
+                    root_cause = analysis["root_cause"]
+                if not confidence:
+                    confidence = 0.9
+            elif verdict == "hypothesis_confirmed":
+                outcome = "ISOLATION"
+            elif verdict == "hypothesis_refuted":
+                outcome = "EXPECTED_BEHAVIOR"
+                if not confidence:
+                    confidence = 0.8
+            elif verdict == "inconclusive":
+                outcome = "ENTROPY_STALL"
+
         metrics = self._collect_operational_metrics(ticket_id, cf)
 
         # Create the Investigation Record via MCP
