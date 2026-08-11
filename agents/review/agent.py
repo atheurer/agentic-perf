@@ -133,6 +133,7 @@ class ReviewAgent(AgentBase):
 
         review_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
+        eval_server = str(Path(__file__).parent.parent / "evaluate" / "server.py")
 
         mcp = AgentMCPClient()
         await mcp.connect(
@@ -141,6 +142,7 @@ class ReviewAgent(AgentBase):
             env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
         )
         await mcp.connect(infra_server, name="infra")
+        await mcp.connect(eval_server, name="evaluate-tools")
 
         # Connect any configured external MCP servers
         # (e.g., historical baselines for comparison).
@@ -251,15 +253,16 @@ class ReviewAgent(AgentBase):
         # to discover them via SSH trial-and-error.
         output_dir = cf.get("output_dir", "")
         if output_dir:
-            from pathlib import Path
-
             odir = Path(output_dir)
             if odir.is_dir():
-                files = [
-                    str(f.relative_to(odir))
-                    for f in sorted(odir.rglob("*"))
-                    if f.is_file()
-                ]
+                try:
+                    files = [
+                        str(f.relative_to(odir))
+                        for f in sorted(odir.rglob("*"))
+                        if f.is_file()
+                    ]
+                except OSError:
+                    files = []
                 content += (
                     f"\n## Local Artifacts\n"
                     f"Results are stored locally at `{output_dir}`.\n"

@@ -166,10 +166,14 @@ Before concluding about:
 Present actual numbers in findings, not qualitative descriptions.
 "CPU 341 at 72% soft" is useful. "The CPU appears busy" is not.
 
-To query host state, first call `set_ssh_context` with the ticket ID to
-initialize SSH credentials, then use the appropriate host-query tool
+To query host state when results are on a remote controller,
+first call `set_ssh_context` with the ticket ID to initialize SSH
+credentials, then use the appropriate host-query tool
 (`get_ethtool_info`, `get_sysctl_values`, `query_numa_topology`,
 `list_interfaces`, `read_remote_file`, `read_remote_dir`).
+Do NOT use SSH tools if local artifacts are available — if you
+already have a Local Artifacts section in your context, all data
+is accessible via `read_benchmark_artifact` without SSH.
 
 ### Using CDM API for metric queries
 
