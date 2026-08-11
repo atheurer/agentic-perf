@@ -84,37 +84,6 @@ def get_review_tools(
             },
         ),
         ToolDefinition(
-            name="retrieve_results",
-            description=(
-                "Retrieve benchmark result files from the controller host via SSH. "
-                "Finds result files in the specified directory and returns their "
-                "contents. Use the results directory from the review config or "
-                "run file."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "controller": {
-                        "type": "string",
-                        "description": "Controller hostname or IP",
-                    },
-                    "results_dir": {
-                        "type": "string",
-                        "description": "Directory path to search for results on the controller",
-                    },
-                    "file_pattern": {
-                        "type": "string",
-                        "description": "Glob pattern for result files (default: find common result files)",
-                    },
-                    "ssh_key_path": {
-                        "type": "string",
-                        "description": "SSH key path",
-                    },
-                },
-                "required": ["controller", "results_dir"],
-            },
-        ),
-        ToolDefinition(
             name="read_skill",
             description=(
                 "Read a skill document containing lessons learned from prior "
@@ -182,11 +151,7 @@ def get_review_tools(
                     },
                     "max_bytes": {
                         "type": "integer",
-                        "description": "Maximum bytes to read from the file (default: 20000, max: 50000).",
-                    },
-                    "ssh_key_path": {
-                        "type": "string",
-                        "description": "SSH key path",
+                        "description": "Maximum bytes to read from the file (default: 4000, max: 50000). Start small to preview, request more if needed.",
                     },
                 },
                 "required": ["run_id", "controller"],
@@ -366,7 +331,7 @@ def create_review_tool_handlers(
                 "harness": harness_name,
                 "message": (
                     f"No 'review' section found in {harness_name} private-skills config. "
-                    f"Try using retrieve_results with the results directory from the "
+                    f"Try using read_run_results with the results directory from the "
                     f"run file or execution config."
                 ),
                 "results_dir_pattern": execution.get("results_dir_pattern", ""),
@@ -376,82 +341,6 @@ def create_review_tool_handlers(
             "status": "ok",
             "harness": harness_name,
             "review_config": review,
-        }
-
-    async def retrieve_results(
-        controller: str,
-        results_dir: str,
-        file_pattern: str | None = None,
-        ssh_key_path: str | None = None,
-    ) -> dict:
-        if not file_pattern:
-            find_cmd = (
-                f"find {results_dir} -maxdepth 3 "
-                f"\\( -name '*.csv' -o -name '*.json' -o -name 'result*' "
-                f"-o -name 'summary*' -o -name '*.out' \\) "
-                f"-type f 2>/dev/null | head -50"
-            )
-        else:
-            find_cmd = (
-                f"find {results_dir} -maxdepth 3 -name '{file_pattern}' "
-                f"-type f 2>/dev/null | head -50"
-            )
-
-        find_result = await ssh.run(
-            controller,
-            find_cmd,
-            timeout=15,
-            key_path=ssh_key_path,
-        )
-        if find_result.exit_code != 0 or not find_result.stdout.strip():
-            ls_result = await ssh.run(
-                controller,
-                f"ls -laR {results_dir} 2>/dev/null | head -100",
-                timeout=15,
-                key_path=ssh_key_path,
-            )
-            return {
-                "status": "no_files_found",
-                "results_dir": results_dir,
-                "pattern": file_pattern or "(default)",
-                "directory_listing": ls_result.stdout[:3000]
-                if ls_result.stdout
-                else "",
-                "message": (
-                    "No matching result files found. The directory listing is "
-                    "included — use it to identify the correct file paths and "
-                    "call retrieve_results again with a more specific pattern."
-                ),
-            }
-
-        files = find_result.stdout.strip().split("\n")
-        contents = {}
-        total_size = 0
-        max_total = 50000
-
-        for fpath in files:
-            if total_size >= max_total:
-                contents[fpath] = "(skipped — total output limit reached)"
-                continue
-            result = await ssh.run(
-                controller,
-                f"head -c 10000 '{fpath}'",
-                timeout=15,
-                key_path=ssh_key_path,
-            )
-            if result.exit_code == 0 and result.stdout:
-                contents[fpath] = result.stdout
-                total_size += len(result.stdout)
-            else:
-                contents[fpath] = (
-                    f"(read error: {result.stderr[:200] if result.stderr else 'empty'})"
-                )
-
-        return {
-            "status": "ok",
-            "results_dir": results_dir,
-            "files_found": len(files),
-            "contents": contents,
         }
 
     async def read_skill(harness: str, filename: str) -> dict:
@@ -725,7 +614,6 @@ def create_review_tool_handlers(
 
     handlers = {
         "get_review_config": get_review_config,
-        "retrieve_results": retrieve_results,
         "read_skill": read_skill,
         "get_run_summary": get_run_summary,
         "read_run_results": read_run_results,

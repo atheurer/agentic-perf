@@ -114,79 +114,159 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 
 
 @mcp.tool()
-async def retrieve_results(
+async def read_run_results(
     controller: str,
-    results_dir: str,
-    file_pattern: str = "",
-    harness: str = "",
+    run_id: str,
+    file_path: str = "",
+    max_bytes: int = 4000,
 ) -> str:
-    """Retrieve benchmark result files from the controller host via SSH. Finds result files in the specified directory and returns their contents. Use the results directory from the review config or run file."""
+    """Read benchmark run result files from the controller.
+
+    Two modes:
+    - Listing mode (no file_path): returns file paths and sizes for
+      all result/tool files in the run directory. Use this first to
+      see what is available, then request specific files.
+    - Reading mode (with file_path): returns the contents of one file.
+      Automatically decompresses .xz files. Use max_bytes to control
+      how much data is returned (default 4000 for a preview; call
+      again with a larger value if you need more).
+    """
     await _ensure_init()
 
-    if not file_pattern:
-        find_cmd = (
-            f"find {results_dir} -maxdepth 3 "
-            f"\\( -name '*.csv' -o -name '*.json' -o -name 'result*' "
-            f"-o -name 'summary*' -o -name '*.out' \\) "
-            f"-type f 2>/dev/null | head -50"
-        )
-    else:
-        find_cmd = (
-            f"find {results_dir} -maxdepth 3 -name '{file_pattern}' "
-            f"-type f 2>/dev/null | head -50"
-        )
-
-    find_result = await _ssh.run(controller, find_cmd, timeout=15)
-    if find_result.exit_code != 0 or not find_result.stdout.strip():
-        ls_result = await _ssh.run(
-            controller,
-            f"ls -laR {results_dir} 2>/dev/null | head -100",
-            timeout=15,
-        )
+    find_result = await _ssh.run(
+        controller,
+        f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
+        timeout=15,
+    )
+    run_dir = (
+        find_result.stdout.strip() if find_result.exit_code == 0 else ""
+    )
+    if not run_dir:
         return json.dumps(
             {
-                "status": "no_files_found",
-                "results_dir": results_dir,
-                "pattern": file_pattern or "(default)",
-                "directory_listing": ls_result.stdout[:3000]
-                if ls_result.stdout
-                else "",
+                "run_id": run_id,
+                "status": "not_found",
+                "message": f"No run directory found matching {run_id}",
+            }
+        )
+
+    if not file_path:
+        find_cmd = (
+            f"find {run_dir} -type f "
+            f"\\( -name '*.xz' -o -name '*.csv' -o -name '*.json' "
+            f"-o -name '*.txt' -o -name 'result*' \\) "
+            f"! -path '*/roadblock/*' ! -path '*/msgs/*' "
+            f"! -path '*/workshop/*' "
+            f"2>/dev/null"
+            f" | head -100"
+        )
+        find_files = await _ssh.run(controller, find_cmd, timeout=20)
+        raw_paths = (
+            find_files.stdout.strip().split("\n")
+            if find_files.exit_code == 0 and find_files.stdout.strip()
+            else []
+        )
+
+        if not raw_paths:
+            return json.dumps(
+                {
+                    "status": "no_files_found",
+                    "run_id": run_id,
+                    "run_dir": run_dir,
+                    "message": "No result files found in run directory.",
+                }
+            )
+
+        size_cmd = "stat --printf='%s %n\\n' " + " ".join(
+            f"'{p}'" for p in raw_paths
+        )
+        size_result = await _ssh.run(controller, size_cmd, timeout=20)
+        files = []
+        if size_result.exit_code == 0 and size_result.stdout.strip():
+            for line in size_result.stdout.strip().split("\n"):
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    try:
+                        files.append(
+                            {
+                                "path": parts[1],
+                                "size_bytes": int(parts[0]),
+                            },
+                        )
+                    except ValueError:
+                        files.append({"path": parts[1], "size_bytes": -1})
+        else:
+            files = [{"path": p, "size_bytes": -1} for p in raw_paths]
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "run_id": run_id,
+                "run_dir": run_dir,
+                "files": files,
                 "message": (
-                    "No matching result files found. The directory listing is "
-                    "included — use it to identify the correct file paths and "
-                    "call retrieve_results again with a more specific pattern."
+                    "Use read_run_results with a specific file_path to "
+                    "read contents. Files ending in .xz are automatically "
+                    "decompressed. Start with max_bytes=4000 (default) to "
+                    "preview, then request more if needed."
                 ),
             }
         )
 
-    files = find_result.stdout.strip().split("\n")
-    contents = {}
-    total_size = 0
-    max_total = 50000
-
-    for fpath in files:
-        if total_size >= max_total:
-            contents[fpath] = "(skipped — total output limit reached)"
-            continue
-        result = await _ssh.run(
-            controller,
-            f"head -c 10000 '{fpath}'",
-            timeout=15,
+    if not file_path.startswith("/var/lib/crucible/run"):
+        return json.dumps(
+            {
+                "status": "error",
+                "message": (
+                    "Access denied. Only paths under "
+                    "/var/lib/crucible/run are permitted."
+                ),
+            }
         )
-        if result.exit_code == 0 and result.stdout:
-            contents[fpath] = result.stdout
-            total_size += len(result.stdout)
-        else:
-            contents[fpath] = (
-                f"(read error: {result.stderr[:200] if result.stderr else 'empty'})"
-            )
+
+    limit_bytes = min(max(max_bytes, 100), 50000)
+    is_xz = file_path.endswith(".xz")
+    if is_xz:
+        cmd = f"xzcat '{file_path}' 2>/dev/null | head -c {limit_bytes}"
+    else:
+        cmd = f"head -c {limit_bytes} '{file_path}'"
+
+    read_result = await _ssh.run(controller, cmd, timeout=30)
+    if read_result.exit_code != 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "run_id": run_id,
+                "file_path": file_path,
+                "message": f"Failed to read {file_path}",
+                "stderr": (
+                    read_result.stderr[:500]
+                    if read_result.stderr
+                    else ""
+                ),
+            }
+        )
+
+    content = read_result.stdout or ""
+    file_size_cmd = f"stat --printf='%s' '{file_path}'"
+    file_size_result = await _ssh.run(
+        controller, file_size_cmd, timeout=10,
+    )
+    try:
+        file_size = int(file_size_result.stdout.strip())
+    except (ValueError, AttributeError):
+        file_size = -1
 
     return json.dumps(
         {
             "status": "ok",
-            "results_dir": results_dir,
-            "files_found": len(files),
-            "contents": contents,
+            "run_id": run_id,
+            "file_path": file_path,
+            "is_compressed": is_xz,
+            "bytes_read": len(content),
+            "file_size": file_size,
+            "truncated": len(content) >= limit_bytes,
+            "content": content,
         }
     )
 
@@ -408,7 +488,7 @@ async def get_review_config(harness_name: str) -> str:
                 "harness": harness_name,
                 "message": (
                     f"No 'review' section found in {harness_name} private-skills config. "
-                    f"Try using retrieve_results with the results directory from the "
+                    f"Try using read_run_results with the results directory from the "
                     f"run file or execution config."
                 ),
                 "results_dir_pattern": execution.get("results_dir_pattern", ""),

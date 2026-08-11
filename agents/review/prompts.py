@@ -41,8 +41,13 @@ read_harness_doc to learn about result formats and interpretation.
 
 ## Step 3: Retrieve Results
 
-Use retrieve_results to fetch benchmark output from the controller. Pass the harness
-name, run ID, and any results directory information from the ticket or review config.
+Start by calling get_run_summary to get the result-summary.json. This gives you the
+run summary AND a `metrics` array listing every source+type indexed in CDM. Use this
+metrics list as the gate for all subsequent queries (see CDM metric availability below).
+
+Use read_run_results (listing mode, no file_path) to discover available raw files.
+Use read_run_results (reading mode, with file_path) to read specific files — it
+auto-decompresses .xz files and defaults to 4000 bytes. Request more if needed.
 
 **DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results directory on the controller (e.g., `/var/lib/crucible/run/uperf...`) **exactly once** at the beginning of the review phase. Once located, cache it in your memory and reuse it for all subsequent tools and actions. Running expensive `find` or directory search commands repeatedly is highly inefficient and strictly prohibited.
 
@@ -161,6 +166,20 @@ metrics collected during the benchmark. Use `cdm_api_request` to query:
 
 When the result set is large, use breakout filters to narrow to the
 specific host, CPU, or interface you need.
+
+### CDM metric availability — check before querying
+
+The `metrics` array returned by `get_run_summary` is the DEFINITIVE list of
+what is queryable via CDM. Each entry has a `source` and `types` array.
+Before making any CDM query:
+
+1. Check if the source appears in the metrics array
+2. If YES → query via cdm_api_requests
+3. If NO → the data was not indexed into CDM. Use read_run_results to list
+   and read the raw tool output files instead.
+
+Do NOT query CDM for sources absent from the metrics list — they will return
+HTTP 500 errors and waste iterations.
 
 ## Step 5: Submit Review
 
