@@ -415,6 +415,36 @@ class EvaluateAgent(AgentBase):
         }
         await self._update_fields(ticket_id, eval_fields)
 
+        # Guard: loop_analyze requires a prior analysis phase.
+        # Code blocks the transition and escalates to human
+        # guidance if the ticket never went through analysis.
+        if decision == "loop_analyze":
+            ticket = await self._get_ticket(ticket_id)
+            if not ticket.get("custom_fields", {}).get(
+                "analysis_result",
+            ):
+                logger.warning(
+                    f"[evaluate] {ticket_id}: loop_analyze "
+                    f"requested but no prior analysis_result"
+                )
+                await self._add_comment(
+                    ticket_id,
+                    "**Blocked:** The evaluate agent requested "
+                    "loop_analyze but this ticket has no prior "
+                    "analysis phase. Data analysis tools may "
+                    "not be configured. Reply to set up an "
+                    "analysis path or choose a different "
+                    "approach.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        "loop_analyze blocked: no prior analysis phase on this ticket"
+                    ),
+                )
+                return
+
         if decision in ("converged", "stalled"):
             summary = (
                 f"**Convergence: {decision.upper()}**\n\n"
@@ -495,6 +525,45 @@ class EvaluateAgent(AgentBase):
                 "planning_investigation",
                 comment=(
                     f"Loop back: refining parameters (hypothesis: {hypothesis[:60]})"
+                ),
+            )
+
+        elif decision == "loop_analyze":
+            summary = (
+                f"**Loop Back: Analyze More Data**\n\n"
+                f"- **Hypothesis:** {hypothesis}\n"
+                f"- **Rationale:** {params_rationale or notes}\n"
+                f"- **Info Gain:** {info_gain}\n"
+            )
+            await self._add_comment(ticket_id, summary)
+
+            # Append an analyze step to the plan
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            plan = cf.get("execution_plan", {})
+            steps = plan.get("steps", [])
+            new_step = {
+                "id": len(steps),
+                "agent_type": "analyze",
+                "status": "pending",
+                "params": {
+                    "label": "follow-up-analysis",
+                    "hypothesis": hypothesis,
+                },
+                "results": {},
+            }
+            steps.append(new_step)
+            plan["steps"] = steps
+            await self._update_fields(
+                ticket_id,
+                {"execution_plan": plan},
+            )
+
+            await self._transition_ticket(
+                ticket_id,
+                "analyzing",
+                comment=(
+                    f"Loop back: analyzing more data (hypothesis: {hypothesis[:60]})"
                 ),
             )
 

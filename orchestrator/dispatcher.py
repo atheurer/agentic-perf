@@ -39,6 +39,8 @@ STATUS_AGENT_MAP = {
     "awaiting_review": "review",
     "awaiting_teardown": "resource_teardown",
     "retrospective_pending": "retrospective",
+    # Data analysis path
+    "analyzing": "analyze",
     # Recursive investigation loop
     "gathering_context": "gathering_context",
     "planning_investigation": "planning_investigation",
@@ -411,6 +413,16 @@ class Dispatcher:
             )
         elif agent_type == "retrospective":
             return RetrospectiveAgent(
+                llm_provider=llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+
+        # Analysis agent (data-first investigation)
+        if agent_type == "analyze":
+            from agents.analyze.agent import AnalyzeAgent
+
+            return AnalyzeAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,

@@ -12,6 +12,18 @@ from pathlib import Path
 
 import pytest
 
+try:
+    from fastmcp import FastMCP  # noqa: F401
+
+    _HAS_FASTMCP_SERVER = True
+except ImportError:
+    _HAS_FASTMCP_SERVER = False
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_FASTMCP_SERVER,
+    reason="fastmcp server support not installed",
+)
+
 from agents.mcp_client import AgentMCPClient
 
 

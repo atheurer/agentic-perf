@@ -187,10 +187,16 @@ def get_evaluate_tools() -> list[ToolDefinition]:
                         "enum": [
                             "loop_plan",
                             "loop_provision",
+                            "loop_analyze",
                             "converged",
                             "stalled",
                         ],
-                        "description": ("The convergence decision"),
+                        "description": (
+                            "The convergence decision. Use "
+                            "loop_analyze to go back and query "
+                            "more existing data instead of "
+                            "running another benchmark."
+                        ),
                     },
                     "convergence_gate": {
                         "type": "string",

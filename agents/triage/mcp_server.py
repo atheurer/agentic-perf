@@ -283,6 +283,16 @@ def get_triage_tools() -> list[ToolDefinition]:
                         },
                         "additionalProperties": True,
                     },
+                    "reference_tickets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Ticket IDs referenced for comparison or "
+                            "context (e.g. ['PERF-ABC123', 'PERF-DEF456']). "
+                            "Set when the user asks to compare or reference "
+                            "prior investigation results."
+                        ),
+                    },
                     "notes": {
                         "type": "string",
                         "description": "Additional notes about the triage",

@@ -75,6 +75,8 @@ PLAN_AGENT_STATUS = {
     "provision": "awaiting_provision",
     "benchmark": "executing_benchmark",
     "review": "awaiting_review",
+    "analyze": "analyzing",
+    "synthesis": "synthesizing_results",
 }
 
 
@@ -183,6 +185,21 @@ def _apply_step_overrides(
             existing = dict(cf.get("directives", {}))
             existing.update(step_params["directives"])
             override_fields["directives"] = existing
+
+    # When a benchmark step follows an inconclusive analysis,
+    # merge the analysis agent's suggested params into the step.
+    if agent_type == "benchmark":
+        analysis = cf.get("analysis_result", {})
+        if not analysis.get("conclusive") and analysis.get("benchmark_needed"):
+            suggested = analysis["benchmark_needed"].get("suggested_params", {})
+            if suggested:
+                existing_params = dict(step_params)
+                # Suggested params fill gaps but don't override
+                # explicit plan params set by triage.
+                for k, v in suggested.items():
+                    if k not in existing_params:
+                        existing_params[k] = v
+                next_step["params"] = existing_params
 
     # Apply per-step scoped_context if provided, or clear the
     # agent's section so it falls back to structured data
@@ -308,6 +325,19 @@ def _advance_plan(
         plan["run_ids"] = run_ids
 
         next_idx = current + 1
+
+        # Conclusive analysis: skip hardware/benchmark steps
+        # and jump directly to review.
+        if step.get("agent_type") == "analyze" and cf.get("analysis_result", {}).get(
+            "conclusive"
+        ):
+            for skip_idx in range(next_idx, len(steps)):
+                skip_step = steps[skip_idx]
+                if skip_step["agent_type"] == "review":
+                    next_idx = skip_idx
+                    break
+                skip_step["status"] = "skipped"
+
         plan["current_step"] = next_idx
 
         if next_idx < len(steps):
@@ -325,6 +355,17 @@ def _advance_plan(
             if next_status:
                 next_step["status"] = "in_progress"
 
+                # Apply step overrides BEFORE saving the plan
+                # so that mutations (e.g. analysis-informed
+                # benchmark params) are persisted.
+                _apply_step_overrides(
+                    store_url,
+                    client,
+                    ticket_id,
+                    next_step,
+                    cf,
+                )
+
                 client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
@@ -333,14 +374,6 @@ def _advance_plan(
                             "review_submitted": None,
                         },
                     },
-                )
-
-                _apply_step_overrides(
-                    store_url,
-                    client,
-                    ticket_id,
-                    next_step,
-                    cf,
                 )
 
                 label = next_step.get("params", {}).get(

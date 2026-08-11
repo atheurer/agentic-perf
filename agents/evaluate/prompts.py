@@ -63,6 +63,14 @@ After analysis, call submit_evaluation_result with your decision:
 - **loop_provision** — Hardware state may be tainted (e.g., kernel state
   contamination, leftover processes). Re-provisioning is needed before
   the next experiment.
+- **loop_analyze** — The benchmark results suggest that querying existing
+  data (historical metrics, prior ticket results, investigation records)
+  could answer the remaining questions without another benchmark run.
+  Only use this if the ticket has `analysis_result` in its custom_fields
+  (meaning it previously went through the analysis agent) or if the
+  ticket description indicates external data sources are available.
+  Do NOT use loop_analyze if the ticket went straight from triage to
+  benchmarking without an analysis phase.
 - **converged** — A convergence gate has fired. Report which gate, the
   root cause summary (if Isolation), and your confidence.
 - **stalled** — Entropy stall detected. Report what is known and why

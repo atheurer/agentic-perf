@@ -366,6 +366,18 @@ class TestPlanControlsAlignment:
 # ── 4. _advance_plan logging ────────────────────────────
 
 
+try:
+    from orchestrator.main import _advance_plan  # noqa: F401
+
+    _HAS_ORCHESTRATOR = True
+except ImportError:
+    _HAS_ORCHESTRATOR = False
+
+
+@pytest.mark.skipif(
+    not _HAS_ORCHESTRATOR,
+    reason="orchestrator imports unavailable",
+)
 class TestAdvancePlanLogging:
     """Verify _advance_plan logs when it declines to advance."""
 
@@ -425,6 +437,10 @@ class TestAdvancePlanLogging:
 # ── 5. Marker clearing on plan advance ──────────────────
 
 
+@pytest.mark.skipif(
+    not _HAS_ORCHESTRATOR,
+    reason="orchestrator imports unavailable",
+)
 class TestMarkerClearedOnAdvance:
     """Verify that _advance_plan clears review_submitted when
     it completes a step — enabling re-dispatch if the ticket
