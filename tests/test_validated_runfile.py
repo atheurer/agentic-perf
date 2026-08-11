@@ -9,12 +9,9 @@ from unittest.mock import patch
 import pytest
 
 from agents.benchmark.agent import BenchmarkAgent
-from agents.benchmark.mcp_server import (
-    _compute_params_fingerprint,
-    create_benchmark_tool_handlers,
-)
+from agents.benchmark.server import _compute_params_fingerprint
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSkillProvider
+from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
 
 # ── Fixtures ──────────────────────────────────────────────
 
@@ -52,13 +49,8 @@ def _make_provider(
 
 
 def _make_handlers(provider: MockSkillProvider):
-    async def noop_clarification(q):
-        pass
-
-    h, ssh = create_benchmark_tool_handlers(
-        skill_provider=provider,
-        request_clarification_fn=noop_clarification,
-    )
+    ssh = MockSSHExecutor()
+    h = make_benchmark_handlers(ssh=ssh, skill_provider=provider)
     return h, ssh
 
 

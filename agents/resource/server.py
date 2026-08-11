@@ -60,7 +60,7 @@ async def _ensure_init():
 
 
 # ---------------------------------------------------------------------------
-# Regex helpers (from mcp_server.py)
+# Regex helpers
 # ---------------------------------------------------------------------------
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -367,6 +367,21 @@ async def get_accumulated_metadata() -> str:
         if key in _last_reservation:
             result[key] = _last_reservation[key]
     return json.dumps(result)
+
+
+async def get_registered_tools():
+    """Introspect this server's registered @mcp.tool() functions."""
+    from providers.llm.base import ToolDefinition
+
+    tools = await mcp.list_tools()
+    return [
+        ToolDefinition(
+            name=t.name,
+            description=t.description or "",
+            input_schema=t.parameters,
+        )
+        for t in tools
+    ]
 
 
 if __name__ == "__main__":

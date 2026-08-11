@@ -5,12 +5,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from agents.benchmark.mcp_server import (
-    _validate_run_command,
-    create_benchmark_tool_handlers,
-)
+from agents.benchmark.server import _validate_run_command
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSkillProvider
+from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
 
 
 @pytest.fixture
@@ -50,14 +47,10 @@ def mock_provider() -> MockSkillProvider:
 
 @pytest.fixture
 def handlers(mock_provider):
-    async def noop_clarification(q):
-        pass
-
-    h, ssh = create_benchmark_tool_handlers(
+    return make_benchmark_handlers(
+        ssh=MockSSHExecutor(),
         skill_provider=mock_provider,
-        request_clarification_fn=noop_clarification,
     )
-    return h
 
 
 @pytest.mark.asyncio
@@ -165,17 +158,7 @@ def _make_crucible_handlers(mock_ssh):
         ),
     )
 
-    async def noop_clarification(q):
-        pass
-
-    h, real_ssh = create_benchmark_tool_handlers(
-        skill_provider=provider,
-        request_clarification_fn=noop_clarification,
-    )
-    real_ssh.run = mock_ssh.run
-    real_ssh.run_with_progress = mock_ssh.run_with_progress
-    real_ssh.copy_to = mock_ssh.copy_to
-    return h
+    return make_benchmark_handlers(ssh=mock_ssh, skill_provider=provider)
 
 
 @pytest.mark.asyncio

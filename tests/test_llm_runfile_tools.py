@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from agents.benchmark.mcp_server import create_benchmark_tool_handlers
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSkillProvider
+from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
 
 MOCK_SCHEMA = {
     "type": "object",
@@ -104,26 +103,18 @@ def provider_without_schema() -> MockSkillProvider:
 
 @pytest.fixture
 def handlers_with_schema(provider_with_schema):
-    async def noop_clarification(q):
-        pass
-
-    h, ssh = create_benchmark_tool_handlers(
+    return make_benchmark_handlers(
+        ssh=MockSSHExecutor(),
         skill_provider=provider_with_schema,
-        request_clarification_fn=noop_clarification,
     )
-    return h
 
 
 @pytest.fixture
 def handlers_without_schema(provider_without_schema):
-    async def noop_clarification(q):
-        pass
-
-    h, ssh = create_benchmark_tool_handlers(
+    return make_benchmark_handlers(
+        ssh=MockSSHExecutor(),
         skill_provider=provider_without_schema,
-        request_clarification_fn=noop_clarification,
     )
-    return h
 
 
 @pytest.mark.asyncio
@@ -182,7 +173,8 @@ async def test_present_runfile_for_approval():
     provider = MockSkillProvider(
         runfile_template=RunfileTemplate(benchmark="uperf", template={}),
     )
-    h, _ = create_benchmark_tool_handlers(
+    h = make_benchmark_handlers(
+        ssh=MockSSHExecutor(),
         skill_provider=provider,
         request_clarification_fn=capture_clarification,
     )
