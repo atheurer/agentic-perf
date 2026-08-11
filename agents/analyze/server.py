@@ -125,7 +125,11 @@ async def search_tickets(
 ) -> str:
     """Search for prior tickets by harness, board type, or status.
     Returns matching ticket IDs with summaries and key results.
-    Use this to find relevant prior investigations for comparison."""
+    Use this to find relevant prior investigations for comparison.
+
+    Note: fetches all tickets then filters in Python. Acceptable
+    for current scale; will need server-side filtering if the
+    ticket store grows large."""
     import httpx
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -175,12 +179,16 @@ async def submit_analysis_result(
     evidence: str = "",
     root_cause: str = "",
     benchmark_needed_reason: str = "",
-    benchmark_needed_samples: int = 0,
+    benchmark_needed_params: str = "",
 ) -> str:
     """Submit analysis findings. Set conclusive=true if the data
     answers the question (ticket advances to review). Set
     conclusive=false if new benchmark data is needed (ticket
-    advances to hardware provisioning)."""
+    advances to hardware provisioning).
+
+    benchmark_needed_params is a JSON string of suggested
+    benchmark parameters (e.g. '{"samples": 50, "duration": 60}').
+    """
     result: dict = {
         "conclusive": conclusive,
         "finding": finding,
@@ -192,10 +200,13 @@ async def submit_analysis_result(
         result["benchmark_needed"] = {
             "reason": benchmark_needed_reason,
         }
-        if benchmark_needed_samples > 0:
-            result["benchmark_needed"]["suggested_params"] = {
-                "samples": benchmark_needed_samples,
-            }
+        if benchmark_needed_params:
+            try:
+                result["benchmark_needed"]["suggested_params"] = json.loads(
+                    benchmark_needed_params
+                )
+            except (json.JSONDecodeError, TypeError):
+                pass
     return json.dumps(result)
 
 

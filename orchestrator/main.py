@@ -76,7 +76,6 @@ PLAN_AGENT_STATUS = {
     "benchmark": "executing_benchmark",
     "review": "awaiting_review",
     "analyze": "analyzing",
-    "synthesis": "synthesizing_results",
 }
 
 
