@@ -16,6 +16,13 @@ This document guides the Review Agent on how to locate, retrieve, and interpret 
 
 ---
 
+### Check CDM availability FIRST
+
+Before querying CDM for any metric source, check the `metrics` array from
+`get_run_summary`. This array lists every source and type that was successfully
+post-processed and indexed. If a source (e.g., turbostat) is NOT in this list,
+skip CDM entirely for that source and use `read_run_results` for raw file access.
+
 ## 1. Primary Path: CDM API Queries
 
 Always try to retrieve your performance data using `cdm_api_request` to query the controller's port 3000 REST API.
@@ -69,7 +76,7 @@ To view the contents of any file returned in listing mode, call `read_run_result
   "run_id": "<run-uuid>",
   "controller": "<controller-ip>",
   "file_path": "/var/lib/crucible/run/.../turbostat-stdout.txt.xz",
-  "max_bytes": 20000
+  "max_bytes": 4000
 }
 ```
 * **Automatic Decompression:** If the file ends with `.xz`, the tool automatically decompresses it on the fly and returns the plain-text contents.
