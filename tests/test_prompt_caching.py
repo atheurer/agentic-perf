@@ -118,6 +118,19 @@ class TestVertexBackendCaching:
         kwargs = client.messages.stream.call_args[1]
         assert kwargs["system"][0]["text"] == prompt
 
+    @pytest.mark.asyncio
+    async def test_empty_system_prompt_skips_block(self):
+        """Vertex with empty system_prompt should not wrap it in a block."""
+        provider, client, _ = _make_provider("vertex")
+        await provider.complete(
+            system_prompt="",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=0,
+        )
+        kwargs = client.messages.stream.call_args[1]
+        assert "cache_control" not in kwargs
+        assert kwargs["system"] == ""
+
 
 class TestCacheTokenParsing:
     @pytest.mark.asyncio
