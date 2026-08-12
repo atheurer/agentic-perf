@@ -83,10 +83,15 @@ Each entry has:
 If switchroot varies between fast and slow boots:
 
 1. Find the Switchroot phase boundaries from systemd-dbus entries
-2. Filter saplot entries within that phase
-3. Compare service start times and durations — look for a
-   service that takes ~1.5s longer in slow boots
-4. Common suspects: network services (DHCP timeout), storage
+2. Filter ALL entries within that phase (saplot for service
+   timing, journalctl for kernel/system messages, systemd-dbus
+   for sub-phase boundaries)
+3. Compare service durations (saplot `time` field) between
+   fast and slow samples — look for a service that takes
+   significantly longer in slow boots
+4. Check journalctl entries for errors, timeouts, retries,
+   or warnings that appear only in slow samples
+5. Common suspects: network services (DHCP timeout), storage
    mounts (slow device detection), container startup, SELinux
    relabeling
 
