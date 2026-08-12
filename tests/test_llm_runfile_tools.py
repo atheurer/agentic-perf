@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
+from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
 
 MOCK_SCHEMA = {
     "type": "object",

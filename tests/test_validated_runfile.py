@@ -11,7 +11,7 @@ import pytest
 from agents.benchmark.agent import BenchmarkAgent
 from agents.benchmark.server import _compute_params_fingerprint
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
+from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
 
 # ── Fixtures ──────────────────────────────────────────────
 

@@ -7,7 +7,7 @@ import pytest
 
 from agents.benchmark.server import _validate_run_command
 from providers.skills.base import RunfileTemplate
-from tests.conftest import MockSSHExecutor, MockSkillProvider, make_benchmark_handlers
+from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
 
 
 @pytest.fixture
