@@ -131,10 +131,8 @@ class ClaudeLLMProvider(LLMProvider):
             "max_tokens": self._resolve_max_tokens(max_tokens),
             "system": system_prompt,
             "messages": messages,
-            "cache_control": {"type": "ephemeral"},
         }
         if self._backend == "vertex":
-            kwargs.pop("cache_control", None)
             if system_prompt:
                 kwargs["system"] = [
                     {
@@ -143,6 +141,8 @@ class ClaudeLLMProvider(LLMProvider):
                         "cache_control": {"type": "ephemeral"},
                     },
                 ]
+        else:
+            kwargs["cache_control"] = {"type": "ephemeral"}
         if tools:
             kwargs["tools"] = [self._tool_def_to_dict(t) for t in tools]
         if self.reasoning_effort is not None:

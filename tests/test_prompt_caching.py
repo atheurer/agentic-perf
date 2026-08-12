@@ -11,11 +11,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from providers.llm.claude import ClaudeLLMProvider
+
 
 def _make_provider(backend: str = "direct"):
     """Create a ClaudeLLMProvider with mocked client, bypassing __init__."""
-    from providers.llm.claude import ClaudeLLMProvider
-
     provider = ClaudeLLMProvider.__new__(ClaudeLLMProvider)
     provider._model = "claude-sonnet-4-6"
     provider._backend = backend
@@ -33,8 +33,8 @@ def _make_provider(backend: str = "direct"):
     mock_response.usage.cache_creation_input_tokens = 20
 
     mock_stream_cm = MagicMock()
-    mock_stream_cm.__enter__ = MagicMock(return_value=mock_stream_cm)
-    mock_stream_cm.__exit__ = MagicMock(return_value=False)
+    mock_stream_cm.__enter__.return_value = mock_stream_cm
+    mock_stream_cm.__exit__.return_value = False
     mock_stream_cm.until_done = MagicMock()
     mock_stream_cm.get_final_message = MagicMock(
         return_value=mock_response,
@@ -136,13 +136,7 @@ class TestCacheTokenParsing:
     @pytest.mark.asyncio
     async def test_parse_response_surfaces_cache_tokens(self):
         """_parse_response should include both cache token fields."""
-        provider, _, _ = _make_provider("direct")
-        await provider.complete(
-            system_prompt="test",
-            messages=[{"role": "user", "content": "hi"}],
-            timeout=0,
-        )
-        provider2, client2, mock_resp = _make_provider("direct")
-        response = provider2._parse_response(mock_resp)
+        provider, _, mock_resp = _make_provider("direct")
+        response = provider._parse_response(mock_resp)
         assert response.usage["cache_read_input_tokens"] == 80
         assert response.usage["cache_creation_input_tokens"] == 20
