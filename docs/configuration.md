@@ -242,7 +242,6 @@ These apply when no `agent_iterations` configuration is present:
 | Agent type | Default iterations | Rationale |
 |---|---|---|
 | `review` | 50 | Heavy analysis with multi-metric interpretation |
-| `provisioning` | 30 | Flash + boot + key injection on hardware |
 | `platform` | 10 | Deterministic SDK-driven provisioning |
 | `evaluating_convergence` | 0 (unlimited) | Convergence gates handle termination |
 | `analyze` | 0 (unlimited) | Investigation depth varies by ticket |

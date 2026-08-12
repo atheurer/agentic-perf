@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from paths import CONFIG_PATH, get_instance_name
+
+logger = logging.getLogger(__name__)
 
 
 def _load_config_file() -> dict:
@@ -18,7 +21,6 @@ def _load_config_file() -> dict:
 class OrchestratorConfig:
     _BUILTIN_AGENT_ITERATIONS: dict[str, int] = {
         "review": 50,
-        "provisioning": 30,
         "platform": 10,
         "evaluating_convergence": 0,
         "analyze": 0,
@@ -130,6 +132,18 @@ class OrchestratorConfig:
         )
         self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
         self._agent_iterations: dict[str, int] = cfg.get("agent_iterations", {})
+
+        # Bridge legacy jumpstarter_images.provisioning_max_iterations
+        if "provisioning" not in self._agent_iterations:
+            legacy_val = cfg.get("jumpstarter_images", {}).get(
+                "provisioning_max_iterations",
+            )
+            if legacy_val is not None:
+                self._agent_iterations["provisioning"] = int(legacy_val)
+                logger.warning(
+                    "jumpstarter_images.provisioning_max_iterations is"
+                    " deprecated; use agent_iterations.provisioning instead"
+                )
 
         self.global_max_iterations: int = int(
             _env_or_cfg(

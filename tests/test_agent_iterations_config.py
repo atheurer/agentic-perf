@@ -32,7 +32,7 @@ class TestConfigResolution:
         assert config.get_agent_max_iterations("platform") == 10
         assert config.get_agent_max_iterations("evaluating_convergence") == 0
         assert config.get_agent_max_iterations("analyze") == 0
-        assert config.get_agent_max_iterations("provisioning") == 30
+        assert config.get_agent_max_iterations("provisioning") is None
 
     def test_config_per_agent_overrides_builtin(self):
         """Explicit agent_iterations.<type> beats the builtin default."""
@@ -97,6 +97,30 @@ class TestConfigResolution:
         monkeypatch.setenv("GLOBAL_MAX_ITERATIONS", "200")
         config = self._make_config({"global_max_iterations": 50})
         assert config.global_max_iterations == 200
+
+    def test_legacy_jumpstarter_provisioning_max_iterations(self):
+        """Legacy jumpstarter_images.provisioning_max_iterations is bridged."""
+        config = self._make_config(
+            {
+                "jumpstarter_images": {"provisioning_max_iterations": 60},
+            }
+        )
+        assert config.get_agent_max_iterations("provisioning") == 60
+
+    def test_agent_iterations_beats_legacy_jumpstarter(self):
+        """Explicit agent_iterations.provisioning takes precedence over legacy key."""
+        config = self._make_config(
+            {
+                "agent_iterations": {"provisioning": 45},
+                "jumpstarter_images": {"provisioning_max_iterations": 60},
+            }
+        )
+        assert config.get_agent_max_iterations("provisioning") == 45
+
+    def test_non_jumpstarter_provisioning_keeps_default(self):
+        """Without legacy or config, provisioning uses constructor default (None)."""
+        config = self._make_config({})
+        assert config.get_agent_max_iterations("provisioning") is None
 
 
 class TestDispatcherIterationsFactory:
