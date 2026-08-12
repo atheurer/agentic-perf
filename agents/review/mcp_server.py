@@ -331,8 +331,10 @@ def create_review_tool_handlers(
                 "harness": harness_name,
                 "message": (
                     f"No 'review' section found in {harness_name} private-skills config. "
-                    f"Try using read_run_results with the results directory from the "
-                    f"run file or execution config."
+                    f"Check output_dir/output_dirs on the ticket for local artifacts "
+                    f"(use list_benchmark_artifacts + read_benchmark_artifact). "
+                    f"If no local artifacts, try read_run_results with the results "
+                    f"directory from the run file or execution config."
                 ),
                 "results_dir_pattern": execution.get("results_dir_pattern", ""),
                 "execution_keys": list(execution.keys()),
