@@ -43,6 +43,15 @@ class HITLDriftError(Exception):
     """
 
 
+class AgentAbortedError(Exception):
+    """Raised when the agent detects the ticket has been aborted or drifted.
+
+    Unlike HITLDriftError (raised inside HITL wait loops), this fires from
+    the top-of-iteration drift check — catching status changes that happen
+    between LLM calls rather than during them.
+    """
+
+
 class AgentBase(ABC):
     # Default inner-loop iteration budget. Agents can override
     # via constructor. Set to 0 for unlimited iterations —
@@ -147,6 +156,9 @@ class AgentBase(ABC):
     async def run(self, ticket_id: str) -> None:
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
+        self._dispatched_status = ticket.get("status", "")
+        self._aborted = False
+        self._last_interject_ticket: dict[str, Any] | None = None
         system_prompt = self._system_prompt(ticket)
         cf = ticket.get("custom_fields", {})
         if cf.get("remember_previous") and cf.get("previous_messages"):
@@ -223,6 +235,7 @@ class AgentBase(ABC):
                 interject_msg = await self._check_interject(
                     ticket_id,
                 )
+                self._check_drift()
                 if interject_msg:
                     messages.append(
                         {
@@ -665,8 +678,23 @@ class AgentBase(ABC):
                             )
                         calls_to_run = non_clarify
 
+                try:
+                    pre_tool_ticket = await self._get_ticket(
+                        ticket_id,
+                    )
+                    self._last_interject_ticket = pre_tool_ticket
+                    self._check_drift()
+                except AgentAbortedError:
+                    raise
+                except Exception:
+                    pass
+
                 tool_results_content = []
                 for tc in calls_to_run:
+                    if self._aborted:
+                        raise AgentAbortedError(
+                            "Skipping remaining tool calls — agent aborted"
+                        )
                     self._emit(
                         ticket_id,
                         "tool_called",
@@ -735,7 +763,7 @@ class AgentBase(ABC):
                         f"{self.agent_name} hit max iterations — pausing for guidance"
                     ),
                 )
-        except HITLDriftError:
+        except (HITLDriftError, AgentAbortedError):
             raise
         except HITLTimeoutError as e:
             # Clean stop after two consecutive HITL timeouts.  The ticket is
@@ -900,6 +928,8 @@ class AgentBase(ABC):
                 else:
                     content = json.dumps(result, default=str)
                 return ToolResult(tool_use_id=tool_call.id, content=content)
+            except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
+                raise
             except Exception as e:
                 logger.exception(f"[{self.agent_name}] Tool {tool_call.name} failed")
                 return ToolResult(
@@ -912,6 +942,8 @@ class AgentBase(ABC):
             try:
                 content = await self._mcp.call_tool(tool_call.name, tool_call.input)
                 return ToolResult(tool_use_id=tool_call.id, content=content)
+            except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
+                raise
             except Exception as e:
                 logger.exception(
                     f"[{self.agent_name}] MCP tool {tool_call.name} failed"
@@ -1151,6 +1183,36 @@ class AgentBase(ABC):
         ticket_status = ticket.get("status", "")
         return expected_status == ticket_status
 
+    def _check_drift(self) -> None:
+        """Raise AgentAbortedError if ticket status drifted from dispatch.
+
+        Uses the ticket cached by _check_interject — no extra HTTP call.
+        Exempts awaiting_customer_guidance (budget-grace transitions there).
+        """
+        if self._aborted:
+            raise AgentAbortedError("Agent already aborted")
+        ticket = self._last_interject_ticket
+        if ticket is None:
+            return
+        current_status = ticket.get("status", "")
+        if current_status == self._dispatched_status:
+            return
+        if current_status == "awaiting_customer_guidance":
+            return
+        self._aborted = True
+        self._emit(
+            ticket.get("id", ""),
+            "agent_aborted",
+            {
+                "reason": "status_drift",
+                "dispatched_status": self._dispatched_status,
+                "current_status": current_status,
+            },
+        )
+        raise AgentAbortedError(
+            f"Ticket drifted from {self._dispatched_status} to {current_status}"
+        )
+
     async def _check_interject(self, ticket_id: str) -> str | None:
         """Check for and consume a pending user interjection.
 
@@ -1162,6 +1224,7 @@ class AgentBase(ABC):
             ticket = await self._get_ticket(ticket_id)
         except Exception:
             return None
+        self._last_interject_ticket = ticket
         cf = ticket.get("custom_fields", {})
         interject = cf.get("pending_interject")
         if not interject:

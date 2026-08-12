@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from agents.base import AgentBase
+from agents.base import AgentAbortedError, AgentBase, HITLDriftError, HITLTimeoutError
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
@@ -135,6 +135,8 @@ class RetrospectiveAgent(AgentBase):
 
         try:
             await super().run(ticket_id)
+        except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
+            raise
         except Exception:
             logger.exception(
                 f"[retrospective-agent] Failed on {ticket_id}, closing ticket anyway"
