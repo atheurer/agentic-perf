@@ -209,6 +209,19 @@ enabled, the harness attempts SSH reboot first. If the SSH
 reboot hangs (board doesn't go down within 120 seconds), the
 harness falls back to Jumpstarter power cycling automatically.
 
+### Passive serial capture
+
+Set `serial_capture: true` in directives to capture serial
+output in the background during SSH-based reboots. This runs
+`j serial pipe` alongside the benchmark without changing the
+reboot method. The serial log is saved as `serial-capture.log`
+in the output directory.
+
+Use this when you need firmware/watchdog/kernel messages that
+aren't available via SSH or journal — for example, to
+investigate reboot hangs where the board becomes unresponsive.
+If the serial capture fails, the benchmark continues normally.
+
 Samples that required power cycle fallback are tracked:
 - `power_cycle_fallbacks` count in `collection_status.json`
 - Exit code 2 when any fallbacks occurred
