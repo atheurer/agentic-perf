@@ -460,6 +460,9 @@ class TestUniversalPlan:
             patch_calls[0][1].get("json", {}),
         )
         plan = body["fields"]["execution_plan"]
-        assert len(plan["steps"]) == 3
-        assert plan["steps"][0]["params"]["label"] == "1-thread"
-        assert plan["steps"][2]["agent_type"] == "review"
+        # The guardrail prepends a "resource" step when the LLM
+        # omits it, so the plan grows from 3 to 4 steps.
+        assert len(plan["steps"]) == 4
+        assert plan["steps"][0]["agent_type"] == "resource"
+        assert plan["steps"][1]["params"]["label"] == "1-thread"
+        assert plan["steps"][3]["agent_type"] == "review"

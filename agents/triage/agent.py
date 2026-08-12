@@ -475,6 +475,25 @@ class TriageAgent(AgentBase):
                         "results": {},
                     }
                 )
+            # The resource agent validates SSH, inventories hosts, and
+            # populates assigned_hardware_ips.  If the LLM omitted it
+            # (e.g. user-provided hosts), prepend one so the pipeline
+            # doesn't skip host validation.  "analyze" is the only
+            # valid non-resource first step (data-only investigation).
+            if steps[0]["agent_type"] not in ("resource", "analyze"):
+                steps.insert(
+                    0,
+                    {
+                        "id": 0,
+                        "agent_type": "resource",
+                        "status": "in_progress",
+                        "params": {},
+                        "results": {},
+                    },
+                )
+                for i, s in enumerate(steps):
+                    s["id"] = i
+                    s["status"] = "in_progress" if i == 0 else "pending"
         else:
             # Default full-lifecycle plan
             steps = [
@@ -590,9 +609,17 @@ class TriageAgent(AgentBase):
                 ),
             )
         else:
-            # Transition to the first plan step's target status
+            # Only "resource" and "analyze" have valid transitions
+            # from triage_pending.  Any other step type (e.g. the LLM
+            # skipping "resource" and putting "provision" first) must
+            # funnel through awaiting_hardware so the resource agent
+            # still validates hosts and populates assigned_hardware_ips.
+            _TRIAGE_EXIT_STATUSES = {
+                "resource": "awaiting_hardware",
+                "analyze": "analyzing",
+            }
             first_step_type = steps[0]["agent_type"]
-            first_status = self._PLAN_AGENT_STATUS.get(
+            first_status = _TRIAGE_EXIT_STATUSES.get(
                 first_step_type,
                 "awaiting_hardware",
             )
