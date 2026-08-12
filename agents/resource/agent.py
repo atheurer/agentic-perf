@@ -38,8 +38,7 @@ _LOCAL_TOOLS = [
     ToolDefinition(
         name="submit_resource_result",
         description=(
-            "Submit the resource allocation result when host "
-            "validation is complete."
+            "Submit the resource allocation result when host validation is complete."
         ),
         input_schema={
             "type": "object",
@@ -66,8 +65,7 @@ _LOCAL_TOOLS = [
                 "resource_reservation_id": {
                     "type": ["string", "null"],
                     "description": (
-                        "Reservation ID for teardown "
-                        "(from reserve_resources result)"
+                        "Reservation ID for teardown (from reserve_resources result)"
                     ),
                 },
                 "resource_provider_metadata": {
@@ -90,9 +88,7 @@ _LOCAL_TOOLS = [
                 "notes": {"type": "string"},
                 "quads_assignment_id": {
                     "type": ["integer", "null"],
-                    "description": (
-                        "Deprecated: use resource_reservation_id instead"
-                    ),
+                    "description": ("Deprecated: use resource_reservation_id instead"),
                 },
                 "quads_cloud_name": {
                     "type": ["string", "null"],

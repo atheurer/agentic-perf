@@ -59,8 +59,7 @@ _LOCAL_TOOLS = [
     ToolDefinition(
         name="submit_benchmark_result",
         description=(
-            "Submit the benchmark execution result when the run "
-            "completes or fails."
+            "Submit the benchmark execution result when the run completes or fails."
         ),
         input_schema={
             "type": "object",

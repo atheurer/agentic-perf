@@ -78,8 +78,7 @@ _LOCAL_TOOLS = [
                             "nic_speed": {
                                 "type": ["integer", "string"],
                                 "description": (
-                                    "Required NIC speed in Gbps "
-                                    "(e.g. 25, '100Gbps')"
+                                    "Required NIC speed in Gbps (e.g. 25, '100Gbps')"
                                 ),
                             },
                             "min_cores": {

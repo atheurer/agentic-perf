@@ -291,9 +291,7 @@ def make_benchmark_handlers(
 
             async def _wrapper(**kwargs):
                 result = await fn(**kwargs)
-                return (
-                    _json.loads(result) if isinstance(result, str) else result
-                )
+                return _json.loads(result) if isinstance(result, str) else result
 
             return _wrapper
 
@@ -336,9 +334,7 @@ def make_resource_handlers(
 
             async def _wrapper(**kwargs):
                 result = await fn(**kwargs)
-                return (
-                    _json.loads(result) if isinstance(result, str) else result
-                )
+                return _json.loads(result) if isinstance(result, str) else result
 
             return _wrapper
 
