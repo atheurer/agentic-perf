@@ -9,21 +9,74 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
-from .mcp_server import get_benchmark_tools
 from .prompts import BENCHMARK_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_TOOL_NAMES = frozenset(
-    {"request_clarification", "present_runfile_for_approval", "submit_benchmark_result"}
-)
-
-_MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_benchmark_tools() if t.name not in _LOCAL_TOOL_NAMES
-) | {"list_harness_docs", "read_harness_doc"}
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="request_clarification",
+        description="Ask the user for clarification. Pauses the ticket for human input.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Question to ask",
+                },
+            },
+            "required": ["question"],
+        },
+    ),
+    ToolDefinition(
+        name="present_runfile_for_approval",
+        description=(
+            "Present the constructed run-file to the user for review and approval. "
+            "The user can approve, request changes, or reject. Returns a status string."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_file": {
+                    "type": "object",
+                    "description": "The complete run-file to present",
+                },
+                "benchmark": {
+                    "type": "string",
+                    "description": "Benchmark name for context",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief summary of what this run-file will do",
+                },
+            },
+            "required": ["run_file"],
+        },
+    ),
+    ToolDefinition(
+        name="submit_benchmark_result",
+        description=(
+            "Submit the benchmark execution result when the run completes or fails."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "benchmark_status": {
+                    "type": "string",
+                    "enum": ["completed", "failed"],
+                },
+                "run_file_used": {"type": "object"},
+                "benchmark_duration": {"type": ["integer", "null"]},
+                "notes": {"type": "string"},
+            },
+            "required": ["run_id", "benchmark_status"],
+        },
+    ),
+]
 
 
 class BenchmarkAgent(AgentBase):
@@ -41,9 +94,7 @@ class BenchmarkAgent(AgentBase):
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
 
-        local_tools = [
-            t for t in get_benchmark_tools() if t.name not in _MCP_TOOL_NAMES
-        ]
+        local_tools = list(_LOCAL_TOOLS)
 
         async def _request_clarification(question: str) -> str:
             return await self._do_request_clarification(question)

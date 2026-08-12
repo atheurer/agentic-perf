@@ -193,6 +193,17 @@ class MockSSHExecutor:
         )
         return self._default
 
+    async def run_with_progress(
+        self, host: str, command: str, progress_callback=None
+    ) -> SSHResult:
+        self.calls.append(
+            {"method": "run_with_progress", "host": host, "command": command}
+        )
+        for pattern, result in self._results.items():
+            if pattern in command:
+                return result
+        return self._default
+
 
 def make_provisioning_handlers(
     ssh: MockSSHExecutor,
@@ -224,6 +235,106 @@ def make_provisioning_handlers(
             async def _wrapper(**kwargs):
                 result = await fn(**kwargs)
                 return json.loads(result) if isinstance(result, str) else result
+
+            return _wrapper
+
+    return _Handlers()
+
+
+def make_benchmark_handlers(
+    ssh: MockSSHExecutor,
+    skill_provider: SkillProvider | None = None,
+    repo_cache=None,
+    request_clarification_fn=None,
+):
+    """Return a dict-like accessor for agents.benchmark.server's @mcp.tool()
+    functions, wired to the given mocks and bypassing _ensure_init().
+
+    Also provides ``present_runfile_for_approval`` (a local-only tool
+    defined in agent.py) when *request_clarification_fn* is given, so
+    tests that exercised it via the old create_benchmark_tool_handlers
+    closure still work.
+    """
+    import json as _json
+
+    import agents.benchmark.server as srv
+
+    srv._ssh = ssh
+    srv._skill_provider = skill_provider or MockSkillProvider()
+    srv._repo_cache = repo_cache
+    srv._initialized = True
+
+    class _Handlers:
+        def __getitem__(self, name: str):
+            if name == "present_runfile_for_approval" and request_clarification_fn:
+
+                async def _present(
+                    run_file: dict,
+                    benchmark: str | None = None,
+                    summary: str | None = None,
+                ) -> str:
+                    bench_label = f" for {benchmark}" if benchmark else ""
+                    summary_line = f"\n\n{summary}" if summary else ""
+                    question = (
+                        f"Please review this run-file{bench_label}"
+                        f"{summary_line}\n\n"
+                        f"```json\n{_json.dumps(run_file, indent=2)}\n```"
+                        "\n\nDo you approve this configuration? "
+                        "(approve / request changes / reject)"
+                    )
+                    await request_clarification_fn(question)
+                    return "Execution paused for user approval."
+
+                return _present
+
+            fn = getattr(srv, name)
+
+            async def _wrapper(**kwargs):
+                result = await fn(**kwargs)
+                return _json.loads(result) if isinstance(result, str) else result
+
+            return _wrapper
+
+        def __contains__(self, name: str) -> bool:
+            if name == "present_runfile_for_approval":
+                return request_clarification_fn is not None
+            return hasattr(srv, name)
+
+    return _Handlers()
+
+
+def make_resource_handlers(
+    ssh: MockSSHExecutor | None = None,
+    registry=None,
+    secrets_provider: SecretsProvider | None = None,
+    instance_name: str | None = None,
+):
+    """Return a dict-like accessor for agents.resource.server's @mcp.tool()
+    functions, wired to the given mocks and bypassing _ensure_init().
+    """
+    import json as _json
+
+    import agents.resource.server as srv
+
+    if registry is None and secrets_provider is not None:
+        from providers.resource.registry import ResourceProviderRegistry
+
+        registry = ResourceProviderRegistry(
+            secrets_provider,
+            instance_name=instance_name,
+        )
+
+    srv._ssh = ssh or MockSSHExecutor()
+    srv._registry = registry
+    srv._initialized = True
+
+    class _Handlers:
+        def __getitem__(self, name: str):
+            fn = getattr(srv, name)
+
+            async def _wrapper(**kwargs):
+                result = await fn(**kwargs)
+                return _json.loads(result) if isinstance(result, str) else result
 
             return _wrapper
 

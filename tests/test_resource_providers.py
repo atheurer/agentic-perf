@@ -921,11 +921,11 @@ class TestAWSResourceProvider:
 class TestResourceToolHandlers:
     @pytest.mark.asyncio
     async def test_list_resource_providers_via_handler(self, both_secrets):
-        from agents.resource.mcp_server import create_resource_tool_handlers
         from providers.resource.registry import ResourceProviderRegistry
+        from tests.conftest import make_resource_handlers
 
         reg = ResourceProviderRegistry(both_secrets)
-        handlers, *_ = create_resource_tool_handlers(registry=reg)
+        handlers = make_resource_handlers(registry=reg)
 
         result = await handlers["list_resource_providers"]()
         names = [p["name"] for p in result["configured_providers"]]
@@ -934,9 +934,9 @@ class TestResourceToolHandlers:
 
     @pytest.mark.asyncio
     async def test_parse_host_config(self, no_secrets):
-        from agents.resource.mcp_server import create_resource_tool_handlers
+        from tests.conftest import make_resource_handlers
 
-        handlers, *_ = create_resource_tool_handlers(secrets_provider=no_secrets)
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
         result = await handlers["parse_host_config"](
             text="controller: 10.1.2.3\ntarget: 10.1.2.4\nuser: testuser"
         )
@@ -946,16 +946,16 @@ class TestResourceToolHandlers:
 
     @pytest.mark.asyncio
     async def test_handler_creates_registry_from_secrets(self, no_secrets):
-        from agents.resource.mcp_server import create_resource_tool_handlers
+        from tests.conftest import make_resource_handlers
 
-        handlers, *_ = create_resource_tool_handlers(secrets_provider=no_secrets)
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
         result = await handlers["list_resource_providers"]()
         assert result["count"] == 0
 
     @pytest.mark.asyncio
     async def test_check_available_with_required_hosts(self, no_secrets):
-        from agents.resource.mcp_server import create_resource_tool_handlers
         from providers.resource.aws import AWSResourceProvider
+        from tests.conftest import make_resource_handlers
 
         provider = AWSResourceProvider(
             region="us-east-1",
@@ -976,7 +976,7 @@ class TestResourceToolHandlers:
         )
         mock_reg = MagicMock()
         mock_reg.get_provider = AsyncMock(return_value=provider)
-        handlers, *_ = create_resource_tool_handlers(registry=mock_reg)
+        handlers = make_resource_handlers(registry=mock_reg)
 
         required_hosts = [
             {"roles": ["controller"], "min_memory_gb": 16},
@@ -999,8 +999,8 @@ class TestResourceToolHandlers:
     @pytest.mark.asyncio
     async def test_check_available_without_required_hosts(self, no_secrets):
         """Flat requirements still work when required_hosts is not provided."""
-        from agents.resource.mcp_server import create_resource_tool_handlers
         from providers.resource.aws import AWSResourceProvider
+        from tests.conftest import make_resource_handlers
 
         provider = AWSResourceProvider(
             region="us-east-1",
@@ -1021,7 +1021,7 @@ class TestResourceToolHandlers:
         )
         mock_reg = MagicMock()
         mock_reg.get_provider = AsyncMock(return_value=provider)
-        handlers, *_ = create_resource_tool_handlers(registry=mock_reg)
+        handlers = make_resource_handlers(registry=mock_reg)
 
         result = await handlers["check_available_resources"](
             provider="aws", requirements={"nic_speed": 25}
@@ -1667,11 +1667,9 @@ class TestParseHostConfigDefault:
         monkeypatch.setattr(paths, "CONFIG_PATH", config)
         monkeypatch.delenv("SSH_KEY", raising=False)
 
-        from agents.resource.mcp_server import create_resource_tool_handlers
+        from tests.conftest import make_resource_handlers
 
-        handlers, *_ = create_resource_tool_handlers(
-            secrets_provider=no_secrets,
-        )
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
         result = await handlers["parse_host_config"](text="controller: 10.1.2.3")
         assert result["ssh_key_path"] == "/custom/key.pem"
 
@@ -1684,11 +1682,9 @@ class TestParseHostConfigDefault:
         monkeypatch.delenv("SSH_KEY", raising=False)
         monkeypatch.setattr(paths, "CONFIG_PATH", tmp_path / "none.json")
 
-        from agents.resource.mcp_server import create_resource_tool_handlers
+        from tests.conftest import make_resource_handlers
 
-        handlers, *_ = create_resource_tool_handlers(
-            secrets_provider=no_secrets,
-        )
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
         result = await handlers["parse_host_config"](
             text="controller: 10.1.2.3\nssh_key: /inline/key"
         )
@@ -1705,7 +1701,9 @@ class TestValidateHostKeyPassthrough:
     @pytest.mark.asyncio
     async def test_explicit_key_passed_through(self, no_secrets, monkeypatch):
         from providers.ssh import SSHExecutor
+        from tests.conftest import make_resource_handlers
 
+        constructed_with = {}
         ssh_mock = AsyncMock(spec=SSHExecutor)
         ssh_mock.run = AsyncMock(
             return_value=MagicMock(
@@ -1714,19 +1712,19 @@ class TestValidateHostKeyPassthrough:
                 stderr="",
             )
         )
+
+        def _capture_ssh(**kw):
+            constructed_with.update(kw)
+            return ssh_mock
+
         monkeypatch.setattr(
-            "agents.resource.mcp_server.SSHExecutor",
-            lambda **kw: ssh_mock,
+            "providers.ssh.SSHExecutor",
+            _capture_ssh,
         )
 
-        from agents.resource.mcp_server import create_resource_tool_handlers
-
-        handlers, *_ = create_resource_tool_handlers(
-            secrets_provider=no_secrets,
-        )
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
         await handlers["validate_host"](
             host="10.0.0.1",
             ssh_key_path="~/.ssh/id_rsa",
         )
-        call_kwargs = ssh_mock.run.call_args
-        assert call_kwargs.kwargs.get("key_path") == "~/.ssh/id_rsa"
+        assert constructed_with.get("key_path") == "~/.ssh/id_rsa"

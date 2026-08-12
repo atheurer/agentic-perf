@@ -8,10 +8,9 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
-from .mcp_server import get_review_tools
 from .prompts import (
     EXTERNAL_PERF_DATA_GUIDANCE,
     EXTERNAL_PERF_TOOL_NAMES,
@@ -20,11 +19,98 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_TOOL_NAMES = frozenset({"request_clarification", "submit_review_result"})
-
-_MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_review_tools() if t.name not in _LOCAL_TOOL_NAMES
-) | {"list_harness_docs", "read_harness_doc"}
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="request_clarification",
+        description="Ask the user for clarification. Pauses the ticket for human input.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to ask"},
+            },
+            "required": ["question"],
+        },
+    ),
+    ToolDefinition(
+        name="submit_review_result",
+        description="Submit the performance review analysis when complete.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "review_summary": {
+                    "type": "string",
+                    "description": "1-2 sentence summary",
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": [
+                        "hypothesis_confirmed",
+                        "hypothesis_refuted",
+                        "inconclusive",
+                    ],
+                },
+                "detailed_analysis": {
+                    "type": "string",
+                    "description": "Multi-paragraph markdown analysis",
+                },
+                "key_metrics": {
+                    "type": "object",
+                    "description": "Key metric values and assessments",
+                },
+                "recommendations": {"type": "array", "items": {"type": "string"}},
+                "follow_up_needed": {"type": "boolean"},
+                "chart_data": {
+                    "type": "object",
+                    "description": (
+                        "Optional chart for the web dashboard. Visualize the "
+                        "single most informative finding from your analysis."
+                    ),
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Chart title, e.g. 'Throughput by Thread Count'",
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["bar", "line", "doughnut"],
+                        },
+                        "labels": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "X-axis labels or segment names",
+                        },
+                        "datasets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Dataset label, e.g. 'Gbps' or 'IOPS'",
+                                    },
+                                    "values": {
+                                        "type": "array",
+                                        "items": {"type": "number"},
+                                    },
+                                },
+                                "required": ["label", "values"],
+                            },
+                        },
+                    },
+                    "required": ["title", "type", "labels", "datasets"],
+                },
+                "results_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional URL to a harness-specific results viewer "
+                        "for deeper analysis"
+                    ),
+                },
+            },
+            "required": ["review_summary", "verdict", "detailed_analysis"],
+        },
+    ),
+]
 
 
 def _is_approved(reply: str) -> bool:
@@ -52,11 +138,7 @@ class ReviewAgent(AgentBase):
         self._ticket_id: str | None = None
         self._user_approved_submit: bool = True
 
-        local_tools = [
-            t
-            for t in get_review_tools(repo_cache=repo_cache)
-            if t.name not in _MCP_TOOL_NAMES
-        ]
+        local_tools = list(_LOCAL_TOOLS)
 
         async def _request_clarification(question: str) -> str:
             reply = await self._do_request_clarification(question)

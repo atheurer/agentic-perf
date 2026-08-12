@@ -7,16 +7,96 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
-from .mcp_server import get_retrospective_tools
 from .prompts import RETROSPECTIVE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_retrospective_tools() if t.name != "submit_retrospective"
-)
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="submit_retrospective",
+        description=(
+            "Submit the retrospective analysis. Call this after "
+            "classifying all signals from the transcript."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "description": "List of classified findings",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": [
+                                    "tool_defect",
+                                    "skill_gap",
+                                    "schema_mismatch",
+                                    "prompt_gap",
+                                    "convergence_failure",
+                                    "deviation",
+                                    "misuse",
+                                ],
+                            },
+                            "severity": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                            },
+                            "agent": {
+                                "type": "string",
+                                "description": "Which agent was affected",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": (
+                                    "Human-readable description of the finding"
+                                ),
+                            },
+                            "recommended_action": {
+                                "type": "string",
+                                "enum": [
+                                    "code_fix",
+                                    "skill_doc",
+                                    "schema_update",
+                                    "prompt_update",
+                                    "investigation",
+                                ],
+                            },
+                        },
+                        "required": [
+                            "category",
+                            "severity",
+                            "agent",
+                            "description",
+                            "recommended_action",
+                        ],
+                    },
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One-paragraph summary of the retrospective",
+                },
+                "stats": {
+                    "type": "object",
+                    "description": "Aggregate statistics",
+                    "properties": {
+                        "total_events": {"type": "integer"},
+                        "total_tool_errors": {"type": "integer"},
+                        "total_retries": {"type": "integer"},
+                        "hitl_count": {"type": "integer"},
+                        "estimated_wasted_iterations": {
+                            "type": "integer",
+                        },
+                    },
+                },
+            },
+            "required": ["findings", "summary", "stats"],
+        },
+    ),
+]
 
 
 class RetrospectiveAgent(AgentBase):
@@ -26,9 +106,7 @@ class RetrospectiveAgent(AgentBase):
         state_store_url: str,
         event_bus: EventBus | None = None,
     ) -> None:
-        local_tools = [
-            t for t in get_retrospective_tools() if t.name not in _MCP_TOOL_NAMES
-        ]
+        local_tools = list(_LOCAL_TOOLS)
 
         super().__init__(
             agent_name="retrospective-agent",

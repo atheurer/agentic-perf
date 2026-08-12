@@ -16,7 +16,7 @@ install tooling, execute benchmarks, and deliver structured analysis.
 | `agents/base.py` | `AgentBase` — LLM loop, tool dispatch, state store client |
 | `agents/{name}/agent.py` | Agent implementation (extends AgentBase) |
 | `agents/{name}/prompts.py` | System prompt for the agent |
-| `agents/{name}/mcp_server.py` | MCP tools scoped to this agent |
+| `agents/{name}/server.py` | FastMCP tool server (runtime MCP subprocess) |
 | `agents/introspection/agent.py` | Continuous passive observer (not AgentBase) |
 | `agents/mcp_client.py` | MCP client for multi-server tool routing |
 | `orchestrator/dispatcher.py` | Status → agent mapping, dispatch logic |

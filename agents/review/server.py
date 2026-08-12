@@ -500,5 +500,20 @@ async def get_review_config(harness_name: str) -> str:
     )
 
 
+async def get_registered_tools():
+    """Introspect this server's registered @mcp.tool() functions."""
+    from providers.llm.base import ToolDefinition
+
+    tools = await mcp.list_tools()
+    return [
+        ToolDefinition(
+            name=t.name,
+            description=t.description or "",
+            input_schema=t.parameters,
+        )
+        for t in tools
+    ]
+
+
 if __name__ == "__main__":
     mcp.run()

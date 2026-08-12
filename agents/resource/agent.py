@@ -13,20 +13,94 @@ from agents.provisioning.server import cleanup_harness
 from agents.server_utils import _resolve_vault_secret_name, resolve_ssh_key
 from paths import get_default_ssh_key
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.resource.registry import ResourceProviderRegistry
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
-from .mcp_server import get_resource_tools
 from .prompts import RESOURCE_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_INTERNAL_TOOLS = frozenset({"submit_resource_result", "get_accumulated_metadata"})
-_MCP_TOOL_NAMES = frozenset(
-    t.name for t in get_resource_tools() if t.name not in _INTERNAL_TOOLS
-)
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="get_accumulated_metadata",
+        description=(
+            "Return accumulated provider metadata from prior "
+            "reserve_resources calls. Includes public_ips, private_ips, "
+            "and ip_mapping needed for splitting SSH vs benchmark IPs."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    ToolDefinition(
+        name="submit_resource_result",
+        description=(
+            "Submit the resource allocation result when host validation is complete."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "assigned_hardware_ips": {
+                    "type": "object",
+                    "description": "Controller and target host IPs/hostnames",
+                    "properties": {
+                        "controller": {"type": "string"},
+                        "targets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                "ssh_user": {"type": "string"},
+                "ssh_key_path": {"type": "string"},
+                "resource_provider": {
+                    "type": "string",
+                    "description": (
+                        "Provider used: 'quads', 'aws', 'user_provided', etc."
+                    ),
+                },
+                "resource_reservation_id": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Reservation ID for teardown (from reserve_resources result)"
+                    ),
+                },
+                "resource_provider_metadata": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "Provider-specific metadata for teardown. "
+                        "QUADS: {assignment_id, cloud_name}. "
+                        "AWS: {instance_ids, region, instance_type}."
+                    ),
+                },
+                "lease_expiration": {"type": ["string", "null"]},
+                "fresh_host": {
+                    "type": "boolean",
+                    "description": (
+                        "True if hosts were freshly provisioned and need "
+                        "a full harness install. Set true for QUADS and "
+                        "cloud providers."
+                    ),
+                },
+                "notes": {"type": "string"},
+                "quads_assignment_id": {
+                    "type": ["integer", "null"],
+                    "description": ("Deprecated: use resource_reservation_id instead"),
+                },
+                "quads_cloud_name": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Deprecated: use resource_provider_metadata instead"
+                    ),
+                },
+            },
+            "required": ["assigned_hardware_ips", "ssh_user"],
+        },
+    ),
+]
 
 
 def _match_to_provider_ip(
@@ -73,11 +147,7 @@ class ResourceAgent(AgentBase):
 
         # Only keep local tools (submit_resource_result) -- MCP tools
         # are added dynamically in run() for create mode.
-        local_tools = (
-            [t for t in get_resource_tools() if t.name not in _MCP_TOOL_NAMES]
-            if mode == "create"
-            else []
-        )
+        local_tools = list(_LOCAL_TOOLS) if mode == "create" else []
 
         super().__init__(
             agent_name="resource-agent",
