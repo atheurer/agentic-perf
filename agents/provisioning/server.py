@@ -13,10 +13,12 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import sys
+import textwrap
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -1745,30 +1747,47 @@ async def _pin_irq_one(
             errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
 
     elif irqbalance_mode == "ban_irq":
-        rb = await _ssh.run(
-            host,
-            "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
-        )
-        existing = ""
-        for line in rb.stdout.splitlines():
-            if "IRQBALANCE_BANNED_INTERRUPTS" in line:
-                existing = line.split("=", 1)[-1].strip().strip('"')
-        # Dedupe against whatever's already banned — re-running pin_irq
-        # against the same device (e.g. a retry, or a prior run that failed
-        # partway through) must not keep appending the same IRQ numbers.
-        existing_irqs = {int(tok) for tok in existing.split() if tok.isdigit()}
-        merged_irqs = sorted(existing_irqs | set(irq_numbers))
-        new_val = " ".join(str(i) for i in merged_irqs)
+        # Use the irqbalance socket API to ban IRQs at runtime without
+        # restarting the daemon. irqbalance 1.9.x no longer reads
+        # IRQBALANCE_BANNED_INTERRUPTS from the environment; the socket
+        # command "settings ban irqs ..." is the only reliable mechanism.
+        # Runtime bans are cleared automatically when irqbalance restarts,
+        # so reset_irq_pinning just needs to restart the daemon — no config
+        # file cleanup required for bans set this way.
+        irq_set_literal = "{" + ", ".join(str(i) for i in irq_numbers) + "}"
+        script = textwrap.dedent(f"""\
+            import socket, struct, os, re, subprocess
+            pid = subprocess.run(
+                ["pgrep", "irqbalance"], capture_output=True, text=True
+            ).stdout.strip()
+            if not pid:
+                raise SystemExit("irqbalance not running")
+            sock = "/run/irqbalance/irqbalance" + pid + ".sock"
+            new_irqs = {irq_set_literal}
+            def rpc(msg):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(sock)
+                creds = struct.pack("iii", os.getpid(), os.getuid(), os.getgid())
+                s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, creds)])
+                data = s.recv(65536).decode()
+                s.close()
+                return data
+            existing = {{int(m) for m in re.findall(r"IRQ (\\d+)", rpc(b"setup"))}}
+            merged = sorted(existing | new_irqs)
+            rpc(("settings ban irqs " + " ".join(str(i) for i in merged)).encode())
+            print(" ".join(str(i) for i in merged))
+        """)
+        encoded = base64.b64encode(script.encode()).decode()
         r4 = await _ssh.run(
             host,
-            f"sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
-            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
-            f"systemctl restart irqbalance 2>&1",
+            f"python3 -c 'import base64; exec(base64.b64decode(\"{encoded}\").decode())'",
         )
-        ib_result["banned_interrupts"] = new_val
-        ib_result["status"] = "restarted" if r4.exit_code == 0 else "error"
         if r4.exit_code != 0:
             errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
+            ib_result["status"] = "error"
+        else:
+            ib_result["banned_interrupts"] = r4.stdout.strip()
+            ib_result["status"] = "banned"
 
     assignments: list[dict] = []
     for i, irq in enumerate(irq_numbers):
@@ -1928,34 +1947,18 @@ async def _reset_irq_pinning_one(
                 f"restore smp_affinity failed for IRQ {irq}: {r2.stdout.strip()}"
             )
 
-    rb = await _ssh.run(
-        host,
-        "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
-    )
-    existing = ""
-    for line in rb.stdout.splitlines():
-        if "IRQBALANCE_BANNED_INTERRUPTS" in line:
-            existing = line.split("=", 1)[-1].strip().strip('"')
-    remaining = [
-        tok for tok in existing.split() if tok.isdigit() and int(tok) not in irq_numbers
-    ]
-    new_val = " ".join(remaining)
+    # Socket-based bans (set by the current ban_irq implementation) are runtime-
+    # only and cleared automatically when irqbalance restarts below. Just scrub
+    # any stale config-file entries left by older runs of this code.
     r3 = await _ssh.run(
         host,
-        "sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
-        + (
-            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
-            if new_val
-            else ""
-        )
-        + "true",
+        "sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d;/IRQBALANCE_ARGS=/d' "
+        "/etc/sysconfig/irqbalance 2>/dev/null; true",
     )
     if r3.exit_code != 0:
-        errors.append(
-            f"clearing IRQBALANCE_BANNED_INTERRUPTS failed: {r3.stdout.strip()}"
-        )
+        errors.append(f"clearing irqbalance config entries failed: {r3.stdout.strip()}")
     else:
-        applied.append(f"IRQBALANCE_BANNED_INTERRUPTS cleared for IRQs {irq_numbers}")
+        applied.append("irqbalance stale ban config cleared")
 
     if cpus:
         rbc = await _ssh.run(

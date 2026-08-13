@@ -241,12 +241,14 @@ class TestTuneTcp:
 class TestPinIrq:
     @pytest.mark.asyncio
     async def test_happy_path_ban_irq(self):
+        # The ban_irq command is a base64-encoded Python script that talks to
+        # the irqbalance socket API. The mock returns what the script prints:
+        # the space-separated list of now-banned IRQ numbers.
         ssh = MockSSHExecutor(
             results={
                 "msi_irqs": SSHResult(stdout="42\n"),
                 "smp_affinity_list": SSHResult(stdout="194", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
-                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
+                "base64": SSHResult(stdout="42"),
             }
         )
         handlers = make_handlers(ssh)
@@ -257,6 +259,7 @@ class TestPinIrq:
         assert result["irq_numbers"] == [42]
         assert result["assignments"] == [{"irq": 42, "cpu": 194}]
         assert result["irqbalance"]["mode"] == "ban_irq"
+        assert result["irqbalance"]["status"] == "banned"
 
     @pytest.mark.asyncio
     async def test_uses_smp_affinity_list_not_hex_mask(self):
@@ -291,15 +294,18 @@ class TestPinIrq:
     @pytest.mark.asyncio
     async def test_ban_irq_dedupes_existing_entries(self):
         """Re-running pin_irq against the same device (retry, or a prior run
-        that failed partway through the smp_affinity writes but still ran
-        the irqbalance ban step) must not keep appending duplicate IRQ
-        numbers to IRQBALANCE_BANNED_INTERRUPTS."""
+        that failed partway through the smp_affinity writes but still ran the
+        irqbalance ban step) must not lose IRQs banned by other devices.
+        The ban script queries the socket for existing banned IRQs, merges,
+        and sends the combined list. The mock simulates the script's output
+        for a host that already had IRQ 999 banned by another device."""
 
         async def tracking_run(host, command, timeout=300):
             if "msi_irqs" in command:
                 return SSHResult(stdout="407\n408\n")
-            if "IRQBALANCE_BANNED_INTERRUPTS" in command and "grep" in command:
-                return SSHResult(stdout='IRQBALANCE_BANNED_INTERRUPTS="407 408 999"')
+            if "base64" in command:
+                # Script merges {407,408} with existing {999} → prints all three
+                return SSHResult(stdout="407 408 999")
             if "smp_affinity_list" in command and "cat" in command:
                 return SSHResult(stdout="2")
             return SSHResult(stdout="", exit_code=0)
@@ -324,7 +330,7 @@ class TestPinIrq:
                 "msi_irqs": SSHResult(stdout="407\n408\n"),
                 "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
                 "smp_affinity_list": SSHResult(stdout="2", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "base64": SSHResult(stdout="407 408"),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
         )
@@ -346,7 +352,7 @@ class TestPinIrq:
                 "msi_irqs": SSHResult(stdout="\n".join(str(i) for i in range(1306, 1370))),
                 "ls /proc/irq/": SSHResult(stdout="0\n1\n1306\n1307\n1308\n"),
                 "smp_affinity_list": SSHResult(stdout="192", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "base64": SSHResult(stdout="1306 1307 1308"),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
         )
@@ -370,7 +376,7 @@ class TestPinIrq:
                 "basename": SSHResult(stdout="0000:21:00.0"),
                 "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
                 "smp_affinity_list": SSHResult(stdout="2", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "base64": SSHResult(stdout="407 408"),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
         )
@@ -461,7 +467,7 @@ class TestPinIrq:
                 "numa_node": SSHResult(stdout="1"),
                 "cpulist": SSHResult(stdout="192-199"),
                 "smp_affinity_list": SSHResult(stdout="192", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "base64": SSHResult(stdout="407 408"),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
         )
@@ -596,8 +602,6 @@ class TestResetIrqPinning:
                 return SSHResult(stdout="407\n408\n")
             if "default_smp_affinity" in command:
                 return SSHResult(stdout="ffffffff")
-            if "IRQBALANCE_BANNED_INTERRUPTS" in command:
-                return SSHResult(stdout='IRQBALANCE_BANNED_INTERRUPTS="407 408 999"')
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -609,10 +613,8 @@ class TestResetIrqPinning:
         assert result["status"] == "ok"
         assert any("restored to default" in a for a in result["applied"])
         assert any("unmasked and restarted" in a for a in result["applied"])
-        # Only this device's IRQs (407, 408) are stripped — the unrelated
-        # IRQ 999 banned by something else must survive.
-        assert any('IRQBALANCE_BANNED_INTERRUPTS="999"' in c for c in commands_run)
-        assert not any('IRQBALANCE_BANNED_INTERRUPTS="407' in c for c in commands_run)
+        # Stale config-file ban entries from older runs must be scrubbed.
+        assert any("IRQBALANCE_BANNED_INTERRUPTS" in c and "sed" in c for c in commands_run)
 
     @pytest.mark.asyncio
     async def test_reset_clears_banned_cpus_when_given(self):
