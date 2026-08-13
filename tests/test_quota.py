@@ -600,6 +600,7 @@ class TestDispatcherQuotaBlocking:
         d._handoff_blocked = set()
         d._quota_blocked = {"T-001"}
         d._quota_warned = {"T-001"}
+        d._redactor = None
         d._instance_name = "test"
         d.events = None
         d.release_claim = MagicMock()
