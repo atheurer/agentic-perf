@@ -73,6 +73,13 @@ def cmd_submit(args):
     ticket = r.json()
     tid = ticket["id"]
 
+    if getattr(args, "stop_after", None):
+        r = client.patch(
+            f"/api/v1/tickets/{tid}/fields",
+            json={"fields": {"stop_after_step": args.stop_after}},
+        )
+        r.raise_for_status()
+
     r = client.post(
         f"/api/v1/tickets/{tid}/transition", json={"status": "triage_pending"}
     )
@@ -85,6 +92,8 @@ def cmd_submit(args):
         print(f"Created by: {ticket['created_by']}")
     if ticket.get("owners"):
         print(f"Owners: {', '.join(ticket['owners'])}")
+    if getattr(args, "stop_after", None):
+        print(f"Stop after: {args.stop_after}")
 
 
 def cmd_list(args):
@@ -1256,6 +1265,16 @@ def main():
     p_submit.add_argument(
         "--owners",
         help="Comma-separated list of owners (multi-user mode)",
+    )
+    p_submit.add_argument(
+        "--stop-after",
+        choices=["triage", "resource", "provision", "benchmark", "review"],
+        metavar="STEP",
+        help=(
+            "Halt after this step completes "
+            "(triage, resource, provision, benchmark, review). "
+            "For debugging."
+        ),
     )
 
     p_list = sub.add_parser("list", help="List tickets")
