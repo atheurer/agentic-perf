@@ -244,7 +244,7 @@ class TestPinIrq:
         ssh = MockSSHExecutor(
             results={
                 "msi_irqs": SSHResult(stdout="42\n"),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "smp_affinity_list": SSHResult(stdout="194", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
@@ -259,17 +259,20 @@ class TestPinIrq:
         assert result["irqbalance"]["mode"] == "ban_irq"
 
     @pytest.mark.asyncio
-    async def test_smp_affinity_write_has_no_0x_prefix(self):
-        """Regression test: /proc/irq/N/smp_affinity rejects a "0x"-prefixed
-        mask on systems with enough CPUs to need the comma-grouped 32-bit-word
-        format (confirmed live on a 128-CPU host — `echo 0x4 > smp_affinity`
-        fails, `echo 4 > smp_affinity` succeeds)."""
+    async def test_uses_smp_affinity_list_not_hex_mask(self):
+        """Regression test: pin_irq must use smp_affinity_list (plain CPU
+        number) rather than smp_affinity (hex bitmask). On systems with large
+        CPU counts (e.g. 768 CPUs), the raw large hex number for high-numbered
+        CPUs is silently rejected by the kernel — confirmed live on a 768-CPU
+        host with CPU 192 (1<<192 hex string fails, smp_affinity_list succeeds)."""
         commands_run = []
 
         async def tracking_run(host, command, timeout=300):
             commands_run.append(command)
             if "msi_irqs" in command:
                 return SSHResult(stdout="408\n")
+            if "smp_affinity_list" in command and "cat" in command:
+                return SSHResult(stdout="2")
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -279,9 +282,10 @@ class TestPinIrq:
             host="10.0.0.1", interface="ens1f0np0", cpus=[2]
         )
         assert result["status"] == "ok"
-        affinity_writes = [c for c in commands_run if "smp_affinity" in c]
+        affinity_writes = [c for c in commands_run if "smp_affinity_list" in c and "echo" in c]
         assert len(affinity_writes) == 1
-        assert "echo 4 >" in affinity_writes[0]
+        assert "echo 2 >" in affinity_writes[0]
+        assert "smp_affinity_list" in affinity_writes[0]
         assert "0x" not in affinity_writes[0]
 
     @pytest.mark.asyncio
@@ -296,6 +300,8 @@ class TestPinIrq:
                 return SSHResult(stdout="407\n408\n")
             if "IRQBALANCE_BANNED_INTERRUPTS" in command and "grep" in command:
                 return SSHResult(stdout='IRQBALANCE_BANNED_INTERRUPTS="407 408 999"')
+            if "smp_affinity_list" in command and "cat" in command:
+                return SSHResult(stdout="2")
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -317,7 +323,7 @@ class TestPinIrq:
             results={
                 "msi_irqs": SSHResult(stdout="407\n408\n"),
                 "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "smp_affinity_list": SSHResult(stdout="2", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
@@ -339,7 +345,7 @@ class TestPinIrq:
             results={
                 "msi_irqs": SSHResult(stdout="\n".join(str(i) for i in range(1306, 1370))),
                 "ls /proc/irq/": SSHResult(stdout="0\n1\n1306\n1307\n1308\n"),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "smp_affinity_list": SSHResult(stdout="192", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
@@ -363,7 +369,7 @@ class TestPinIrq:
                 ),
                 "basename": SSHResult(stdout="0000:21:00.0"),
                 "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_MLX5),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "smp_affinity_list": SSHResult(stdout="2", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
@@ -382,6 +388,8 @@ class TestPinIrq:
 
         async def tracking_run(host, command, timeout=300):
             commands_run.append(command)
+            if "smp_affinity_list" in command and "cat" in command:
+                return SSHResult(stdout="2")
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -420,14 +428,20 @@ class TestPinIrq:
 
     @pytest.mark.asyncio
     async def test_explicit_cpu_list_round_robins(self):
-        ssh = MockSSHExecutor(
-            results={
-                "msi_irqs": SSHResult(stdout="407\n408\n409\n"),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
-                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
-                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
-            }
-        )
+        # Readback must return the CPU that was written for each IRQ.
+        irq_to_cpu = {407: 2, 408: 3, 409: 2}
+
+        async def tracking_run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n408\n409\n")
+            if "smp_affinity_list" in command and "cat" in command:
+                for irq, cpu in irq_to_cpu.items():
+                    if f"/proc/irq/{irq}/" in command:
+                        return SSHResult(stdout=str(cpu))
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
         handlers = make_handlers(ssh)
         result = await handlers["pin_irq"](
             host="10.0.0.1", interface="ens1f0np0", cpus=[2, 3]
@@ -446,7 +460,7 @@ class TestPinIrq:
                 "msi_irqs": SSHResult(stdout="407\n"),
                 "numa_node": SSHResult(stdout="1"),
                 "cpulist": SSHResult(stdout="192-199"),
-                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "smp_affinity_list": SSHResult(stdout="192", exit_code=0),
                 "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
                 "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
             }
@@ -467,6 +481,9 @@ class TestPinIrq:
                 return SSHResult(stdout="407\n408\n")
             if "cpulist" in command:
                 return SSHResult(stdout="64-71")
+            if "smp_affinity_list" in command and "cat" in command:
+                cpu = "64" if "/407/" in command else "65"
+                return SSHResult(stdout=cpu)
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -492,6 +509,8 @@ class TestPinIrq:
             commands_run.append(command)
             if "msi_irqs" in command:
                 return SSHResult(stdout="42\n")
+            if "smp_affinity_list" in command and "cat" in command:
+                return SSHResult(stdout="194")
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -517,6 +536,9 @@ class TestPinIrq:
                 return SSHResult(stdout="407\n408\n")
             if "IRQBALANCE_BANNED_CPUS" in command:
                 return SSHResult(stdout="")
+            if "smp_affinity_list" in command and "cat" in command:
+                cpu = "2" if "/407/" in command else "3"
+                return SSHResult(stdout=cpu)
             return SSHResult(stdout="", exit_code=0)
 
         ssh = MockSSHExecutor()
@@ -532,6 +554,30 @@ class TestPinIrq:
         assert result["irqbalance"]["mode"] == "ban_cpu"
         mask = int(result["irqbalance"]["banned_cpus_mask"], 16)
         assert mask == (1 << 2) | (1 << 3)
+
+    @pytest.mark.asyncio
+    async def test_verify_catches_silent_affinity_ignore(self):
+        """Regression test: some drivers silently ignore smp_affinity_list writes
+        (write returns exit=0 but affinity doesn't change). Readback verify must
+        catch this and report an error rather than silently claiming success."""
+
+        async def tracking_run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="407\n")
+            if "smp_affinity_list" in command and "cat" in command:
+                # Readback shows a different CPU than what was requested
+                return SSHResult(stdout="0")
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="ens1f0np0", cpus=[192]
+        )
+        assert result["status"] == "error"
+        assert result["assignments"] == []
+        assert any("verify failed" in e for e in result["errors"])
 
 
 # ---------------------------------------------------------------------------

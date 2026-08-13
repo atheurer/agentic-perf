@@ -1731,23 +1731,33 @@ async def _pin_irq_one(
     assignments: list[dict] = []
     for i, irq in enumerate(irq_numbers):
         cpu = cpu_list[i % len(cpu_list)]
-        # /proc/irq/N/smp_affinity rejects a "0x"-prefixed mask on systems
-        # with enough CPUs to need the comma-grouped 32-bit-word format
-        # (e.g. 128 CPUs) — confirmed live: `echo 0x4 > smp_affinity` fails
-        # with exit 1, `echo 4 > smp_affinity` succeeds and the kernel
-        # zero-pads/groups it automatically. hex()'s "0x" prefix is for
-        # display only; strip it before writing.
-        mask_hex = format(1 << cpu, "x")
+        # Use smp_affinity_list (plain CPU number) rather than smp_affinity
+        # (hex bitmask). The bitmask format requires comma-grouped 32-bit words
+        # on systems with >32 CPUs (e.g. CPU 192 needs a 24-group mask), and a
+        # raw large hex number is silently rejected. smp_affinity_list accepts
+        # a plain integer regardless of CPU count — confirmed live on 768-CPU host.
         r2 = await _ssh.run(
-            host, f"echo {mask_hex} > /proc/irq/{irq}/smp_affinity 2>&1"
+            host, f"echo {cpu} > /proc/irq/{irq}/smp_affinity_list 2>&1"
         )
-        if r2.exit_code == 0:
-            applied.append(f"IRQ {irq} → CPU {cpu} (mask 0x{mask_hex})")
-            assignments.append({"irq": irq, "cpu": cpu})
-        else:
+        if r2.exit_code != 0:
             errors.append(
-                f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}"
+                f"smp_affinity_list write failed for IRQ {irq}: {r2.stdout.strip()}"
             )
+            continue
+        # Verify the write actually landed — read back and confirm the CPU
+        # appears (managed IRQs on some drivers silently ignore the write).
+        rv = await _ssh.run(
+            host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1"
+        )
+        actual = rv.stdout.strip()
+        if str(cpu) not in actual.split(","):
+            errors.append(
+                f"smp_affinity_list verify failed for IRQ {irq}: "
+                f"wrote {cpu}, got '{actual}'"
+            )
+        else:
+            applied.append(f"IRQ {irq} → CPU {cpu}")
+            assignments.append({"irq": irq, "cpu": cpu})
 
     used_cpus = sorted({a["cpu"] for a in assignments})
 
