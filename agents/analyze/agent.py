@@ -188,6 +188,35 @@ class AnalyzeAgent(AgentBase):
             )
             parts.append("")
 
+        # Extract run IDs mentioned in the description
+        # or anomaly context for direct querying
+        import re
+
+        cited_run_ids: list[str] = []
+        description = ticket.get("description", "")
+        # Match patterns like "Run 234571" or "run_id: 283494"
+        for match in re.findall(
+            r"(?:Run|run_id|run)[:\s]+?(\d{5,})",
+            description,
+        ):
+            if match not in cited_run_ids:
+                cited_run_ids.append(match)
+        # Also check anomaly_context.run_id
+        if anomaly and anomaly.get("run_id"):
+            rid = str(anomaly["run_id"])
+            if rid not in cited_run_ids:
+                cited_run_ids.append(rid)
+
+        if cited_run_ids:
+            parts.append(f"**Cited Run IDs:** {', '.join(cited_run_ids)}")
+            parts.append(
+                "Use `get_run_info` to query each run ID "
+                "for metadata (target, OS, build, timing). "
+                "These are specific data points referenced "
+                "in the investigation."
+            )
+            parts.append("")
+
         harness = directives.get("harness", "")
         if harness:
             parts.append(

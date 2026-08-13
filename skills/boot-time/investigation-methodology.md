@@ -18,6 +18,14 @@ If this investigation was triggered by a Horreum alert:
   a statistically significant shift — do NOT re-confirm with
   new measurements. Investigate the cause.
 
+If the ticket description or anomaly context references specific
+Horreum run IDs, query them directly:
+
+- Call `get_run_info` with each run ID to retrieve the run's
+  metadata (target, OS, build, timestamps)
+- This gives you concrete data points to anchor the analysis
+  rather than relying on aggregate statistics alone
+
 ## Step 2: Query Historical Data
 
 Use Domain MCP tools to understand the anomaly:
