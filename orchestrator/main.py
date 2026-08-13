@@ -326,14 +326,26 @@ def _advance_plan(
 
         next_idx = current + 1
 
-        # Conclusive analysis: skip hardware/benchmark steps
-        # and jump directly to review.
-        if step.get("agent_type") == "analyze" and cf.get("analysis_result", {}).get(
-            "conclusive"
-        ):
+        # Conclusive analysis: skip hardware/benchmark steps.
+        # Triggers after analyze completes (skip to review) and
+        # after synthesis completes (skip remaining hardware
+        # steps to teardown, since the analysis path is done).
+        analysis_conclusive = cf.get("analysis_result", {}).get(
+            "conclusive",
+        )
+        if step.get("agent_type") == "analyze" and analysis_conclusive:
             for skip_idx in range(next_idx, len(steps)):
                 skip_step = steps[skip_idx]
                 if skip_step["agent_type"] == "review":
+                    next_idx = skip_idx
+                    break
+                skip_step["status"] = "skipped"
+        elif step.get("agent_type") == "synthesis" and analysis_conclusive:
+            # After synthesis on a conclusive analysis, skip
+            # any remaining hardware steps to teardown.
+            for skip_idx in range(next_idx, len(steps)):
+                skip_step = steps[skip_idx]
+                if skip_step["agent_type"] == "teardown":
                     next_idx = skip_idx
                     break
                 skip_step["status"] = "skipped"
