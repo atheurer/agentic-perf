@@ -395,17 +395,23 @@ class QuadsClient:
             "-c",
             (
                 "import pexpect, sys\n"
-                f"child = pexpect.spawn('/bin/bash', ['-c', {ssh_cmd!r}], timeout=30)\n"
+                "password = sys.stdin.readline().rstrip('\\n')\n"
+                f"child = pexpect.spawn('/bin/bash', ['-c', {ssh_cmd!r}],"
+                " timeout=30)\n"
                 "child.expect('[Pp]assword')\n"
-                f"child.sendline({self.default_root_password!r})\n"
+                "child.sendline(password)\n"
                 "child.expect(pexpect.EOF)\n"
                 "out = child.before.decode()\n"
-                "print('ok' if 'KEY_COPIED' in out else f'unexpected: {out}')\n"
+                "print('ok' if 'KEY_COPIED' in out else"
+                " f'unexpected: {out}')\n"
             ),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate(
+            input=self.default_root_password.encode() + b"\n",
+        )
         output = stdout.decode().strip()
         if "ok" in output:
             return "ok"
