@@ -194,8 +194,13 @@ class SynthesisAgent(AgentBase):
 
         metrics = self._collect_operational_metrics(ticket_id, cf)
 
-        # Create the Investigation Record via MCP
+        # Create the Investigation Record via MCP.
+        # Use dedup_key (set by enrichment) for metric/platform
+        # so future alerts with the same dedup_key match this
+        # record deterministically. Fall back to anomaly_context
+        # fields if dedup_key is not set.
         anomaly = cf.get("anomaly_context", {})
+        dedup_key = cf.get("dedup_key", {})
         rc = metrics.get("resource_consumption", {})
         record_created = False
         if self._mcp and anomaly:
@@ -204,9 +209,15 @@ class SynthesisAgent(AgentBase):
                     "create_investigation_record",
                     {
                         "subsystem": anomaly.get("subsystem", ""),
-                        "metric": anomaly.get("metric", ""),
+                        "metric": dedup_key.get(
+                            "metric",
+                            anomaly.get("metric", ""),
+                        ),
                         "direction": anomaly.get("direction", "degrading"),
-                        "platform": anomaly.get("platform", ""),
+                        "platform": dedup_key.get(
+                            "platform",
+                            anomaly.get("platform", ""),
+                        ),
                         "magnitude": anomaly.get("magnitude", ""),
                         "root_cause_summary": root_cause,
                         "confidence": confidence,
