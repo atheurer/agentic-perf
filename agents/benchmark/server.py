@@ -1910,13 +1910,76 @@ async def execute_boot_time_test(
 
     logger.info(f"[boot-time] Executing: {' '.join(cmd[:6])}... ({samples} samples)")
 
+    # ── Passive serial capture ───────────────────────────
+    # Run `jmp shell --lease <id> -- j serial pipe` in the
+    # background to capture serial output during SSH-based
+    # reboots. Non-blocking — if serial fails, the benchmark
+    # continues. Captures firmware/watchdog/kernel messages
+    # that aren't available via SSH or journal.
+    import os as _os
+
+    serial_proc = None
+    serial_log_fh = None
+    serial_log_path = output_dir / "serial-capture.log"
+    if _ticket:
+        _fields = _ticket.get("custom_fields", {})
+        _metadata = _fields.get(
+            "resource_provider_metadata",
+            {},
+        )
+        _lease_id = _metadata.get("lease_id", "")
+        _directives = _fields.get("directives", {})
+        _passive_serial = _directives.get(
+            "serial_capture",
+            False,
+        )
+        # Don't run passive serial alongside active serial
+        _serial_active = _directives.get(
+            "jumpstarter_serial",
+            False,
+        )
+        if (
+            _lease_id
+            and _fields.get("resource_provider") == "jumpstarter"
+            and _passive_serial
+            and not _serial_active
+        ):
+            try:
+                serial_log_fh = open(
+                    serial_log_path,
+                    "w",
+                    encoding="utf-8",
+                )
+                serial_proc = await _asyncio.create_subprocess_exec(
+                    "jmp",
+                    "shell",
+                    f"--lease={_lease_id}",
+                    "--",
+                    "j",
+                    "serial",
+                    "pipe",
+                    stdout=serial_log_fh,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                )
+                logger.info(
+                    f"[boot-time] Passive serial capture "
+                    f"started (lease={_lease_id}, "
+                    f"pid={serial_proc.pid})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[boot-time] Failed to start passive serial capture: {e}"
+                )
+                serial_proc = None
+                if serial_log_fh:
+                    serial_log_fh.close()
+                    serial_log_fh = None
+
     # ── Execute ───────────────────────────────────────────
     # Run from output_dir so boot-timings-test.sh creates
     # its results folder (and SCPs files) here, not relative
     # to the scripts repo.
     # Merge Jumpstarter env vars with current environment
-    import os as _os
-
     run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
     # Timeout: samples × ~90s per sample + 15min overhead.
     # Prevents orphaned jmp shell subprocesses from keeping
@@ -1946,6 +2009,36 @@ async def execute_boot_time_test(
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
     stderr_str = stderr_bytes.decode(errors="replace")
+
+    # ── Stop passive serial capture ─────────────────────────
+    if serial_proc is not None:
+        try:
+            serial_proc.terminate()
+            try:
+                await _asyncio.wait_for(
+                    serial_proc.wait(),
+                    timeout=10,
+                )
+            except _asyncio.TimeoutError:
+                serial_proc.kill()
+                await serial_proc.wait()
+            logger.info("[boot-time] Passive serial capture stopped")
+        except Exception as e:
+            logger.warning(f"[boot-time] Error stopping serial capture: {e}")
+    if serial_log_fh is not None:
+        try:
+            serial_log_fh.close()
+        except Exception:
+            pass
+    if serial_log_path.exists():
+        size = serial_log_path.stat().st_size
+        if size > 0:
+            logger.info(
+                f"[boot-time] Serial capture log: {serial_log_path} ({size} bytes)"
+            )
+        else:
+            # Remove empty log file
+            serial_log_path.unlink(missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
