@@ -160,6 +160,37 @@ class GatheringContextAgent(AgentBase):
             f"platform={dedup_platform})"
         )
 
+        # Record that the anomaly persists in this build
+        run_meta = cf.get("run_metadata", {})
+        anomaly = cf.get("anomaly_context", {})
+        build_id = run_meta.get(
+            "build",
+            str(anomaly.get("run_id", "unknown")),
+        )
+        from providers.investigation.models import (
+            BuildHistoryEntry,
+        )
+
+        try:
+            entry = BuildHistoryEntry(
+                build_id=str(build_id),
+                action="SKIP_MATCHED",
+                comment=(f"Deterministic dedup from ticket {ticket_id}"),
+            )
+            await provider.append_build_history(
+                matched_id,
+                entry,
+            )
+            logger.info(
+                f"[gathering-context] Appended build "
+                f"history to {matched_id}: {build_id}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[gathering-context] Failed to append "
+                f"build history to {matched_id}: {e}"
+            )
+
         await self._update_fields(
             ticket_id,
             {
