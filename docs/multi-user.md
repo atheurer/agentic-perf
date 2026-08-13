@@ -66,7 +66,10 @@ agentic-perf group add-member gpu-team alice
 agentic-perf group add-member gpu-team bob
 ```
 
-Groups currently affect only secrets resolution (see below).
+Groups affect secrets resolution (see below) and LLM budget
+quotas.  When per-group quotas are configured, all of a user's
+groups must be within their limits for dispatch to proceed (AND
+semantics).
 
 ### Ticket Ownership
 

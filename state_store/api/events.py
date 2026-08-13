@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import time
+from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from providers.cost import estimate_cost
 
 from ..store import TicketNotFound
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["events"])
 usage_router = APIRouter(prefix="/usage", tags=["usage"])
@@ -306,3 +310,63 @@ def get_usage_summary(request: Request):
     _summary_cache = result
     _summary_cache_ts = now
     return result
+
+
+@usage_router.get("/by-user")
+def get_usage_by_user(
+    request: Request,
+    window_hours: int = Query(
+        24,
+        description="Rolling window in hours (default 24)",
+        ge=1,
+        le=168,
+    ),
+):
+    """Get LLM usage aggregated by user from the quota ledger.
+
+    Admin-only.  Uses the quota ledger (not per-ticket JSONL)
+    for accurate cross-ticket, cross-archive aggregation.
+    """
+    from state_store.auth import require_admin
+
+    principal = request.state.principal
+    require_admin(principal)
+
+    try:
+        from providers.quota import UsageLedger
+    except ImportError:
+        return {"by_user": {}, "window_hours": window_hours}
+
+    ledger = UsageLedger()
+    window = timedelta(hours=window_hours)
+
+    entries = ledger.read_window(window)
+    ledger.close()
+
+    by_user: dict[str, dict] = {}
+    for e in entries:
+        if not e.charged_to:
+            continue
+        if e.charged_to not in by_user:
+            by_user[e.charged_to] = {
+                "total_tokens": 0,
+                "total_cost_usd": 0.0,
+                "llm_calls": 0,
+                "groups": set(),
+            }
+        u = by_user[e.charged_to]
+        u["total_tokens"] += e.input_tokens + e.output_tokens
+        u["total_cost_usd"] += e.cost_usd
+        u["llm_calls"] += 1
+        u["groups"].update(e.groups)
+
+    result = {}
+    for username, data in by_user.items():
+        result[username] = {
+            "total_tokens": data["total_tokens"],
+            "total_cost_usd": round(data["total_cost_usd"], 6),
+            "llm_calls": data["llm_calls"],
+            "groups": sorted(data["groups"]),
+        }
+
+    return {"by_user": result, "window_hours": window_hours}

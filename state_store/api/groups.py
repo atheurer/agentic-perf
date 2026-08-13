@@ -14,6 +14,7 @@ from state_store.identity import (
     DuplicateGroup,
     GroupNotFound,
     UserNotFound,
+    UserQuota,
     UserStore,
 )
 
@@ -98,3 +99,29 @@ def remove_member(name: str, username: str, request: Request):
     except UserNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"status": "removed"}
+
+
+@router.put("/{name}/quota")
+def set_group_quota(name: str, body: UserQuota, request: Request):
+    """Set a group's LLM budget quota (admin-only)."""
+    principal = _get_principal(request)
+    require_admin(principal)
+    store = _get_store(request)
+    try:
+        group = store.set_group_quota(name, body)
+    except GroupNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return group.model_dump(mode="json")
+
+
+@router.delete("/{name}/quota")
+def clear_group_quota(name: str, request: Request):
+    """Clear a group's LLM budget quota (admin-only)."""
+    principal = _get_principal(request)
+    require_admin(principal)
+    store = _get_store(request)
+    try:
+        group = store.set_group_quota(name, None)
+    except GroupNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return group.model_dump(mode="json")

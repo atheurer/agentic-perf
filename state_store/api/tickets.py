@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..auth import Principal, require_write_access
@@ -11,6 +13,8 @@ from ..models import (
 )
 from ..store import TicketNotFound
 from .action_hints import after_create
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -61,6 +65,52 @@ def _is_multi_user(request: Request) -> bool:
     return getattr(request.app.state, "multi_user", False)
 
 
+def _check_creation_quota(
+    request: Request,
+    created_by: str,
+) -> str | None:
+    """Advisory quota check at ticket creation.
+
+    Returns a warning string if the user is over quota,
+    None otherwise.  Never blocks creation in phase 1
+    (warn-only).
+    """
+    if not created_by or not _is_multi_user(request):
+        return None
+    try:
+        from providers.quota import (
+            UsageLedger,
+            check_user_quota,
+            quota_from_config,
+        )
+
+        user_store = getattr(request.app.state, "user_store", None)
+        if user_store is None:
+            return None
+        config = getattr(request.app.state, "config_raw", {})
+        user = user_store.get_user(created_by)
+        user_quota = user.llm_quota
+        if user_quota is None:
+            user_quota = quota_from_config(config)
+        if user_quota is None:
+            return None
+
+        ledger = UsageLedger()
+        result = check_user_quota(
+            created_by,
+            user_quota,
+            None,
+            ledger,
+            is_service_account=user.service_account,
+        )
+        ledger.close()
+        if result.exceeded:
+            return "; ".join(result.reasons)
+    except Exception:
+        logger.debug("Quota check at creation failed", exc_info=True)
+    return None
+
+
 @router.post("")
 def create_ticket(body: CreateTicketRequest, request: Request):
     store = _get_store(request)
@@ -78,6 +128,9 @@ def create_ticket(body: CreateTicketRequest, request: Request):
     elif body.owners:
         owners = list(body.owners)
 
+    # Advisory quota check at creation time.
+    quota_warning = _check_creation_quota(request, created_by)
+
     ticket = store.create_ticket(
         body,
         created_by=created_by,
@@ -85,6 +138,8 @@ def create_ticket(body: CreateTicketRequest, request: Request):
     )
     result = ticket.model_dump(mode="json")
     result["action_required"] = after_create(ticket)
+    if quota_warning:
+        result["quota_warning"] = quota_warning
     return result
 
 

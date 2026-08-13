@@ -1028,6 +1028,66 @@ def _maybe_start_introspection(
         logger.info(f"Introspection started for {ticket_id}")
 
 
+async def _add_comment(
+    store_url: str,
+    ticket_id: str,
+    body: str,
+) -> None:
+    """Post a comment on a ticket (fire-and-forget)."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers=_auth_headers(),
+        ) as client:
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={"author": "orchestrator", "body": body},
+            )
+    except Exception:
+        logger.exception("Failed to add comment on %s", ticket_id)
+
+
+def _check_dispatch_quota(
+    ticket: dict[str, Any],
+    user_store: Any,
+    usage_ledger: Any,
+    config: OrchestratorConfig,
+) -> Any:
+    """Check per-user/group quota for a ticket at dispatch time.
+
+    Returns a QuotaStatus or None if quota checking does not
+    apply (no created_by, service account exempt, legacy mode).
+    """
+    created_by = ticket.get("created_by", "")
+    if not created_by:
+        return None
+
+    try:
+        from providers.quota import (
+            check_user_quota,
+            resolve_quota_inputs,
+        )
+
+        user_quota, group_quotas, is_svc = resolve_quota_inputs(
+            created_by,
+            user_store,
+            config.raw,
+        )
+
+        return check_user_quota(
+            created_by,
+            user_quota,
+            group_quotas,
+            usage_ledger,
+            is_service_account=is_svc,
+        )
+    except Exception:
+        logger.exception("Quota check failed for %s", created_by)
+        return None
+
+
 async def poll_loop(config: OrchestratorConfig) -> None:
     llm = _make_llm_provider(config)
     llm.default_timeout = config.llm_timeout
@@ -1110,7 +1170,14 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     from providers.redaction import Redactor
 
     redactor = Redactor()
-    events = EventBus(redactor=redactor)
+
+    usage_ledger = None
+    if config.raw.get("auth", {}).get("multi_user", False):
+        from providers.quota import UsageLedger
+
+        usage_ledger = UsageLedger()
+
+    events = EventBus(redactor=redactor, usage_ledger=usage_ledger)
 
     # Initialize OpenTelemetry LLM instrumentation.
     # Spans from the Anthropic/OpenAI SDKs are captured
@@ -1328,10 +1395,70 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                         )
                     continue
 
+                # Per-user/group quota check (multi-user only).
+                # Skip over-quota tickets without blocking or
+                # transitioning — they auto-resume when the
+                # rolling window advances.
+                if multi_user and usage_ledger is not None and user_store is not None:
+                    quota_status = _check_dispatch_quota(
+                        ticket,
+                        user_store,
+                        usage_ledger,
+                        config,
+                    )
+                    if quota_status is not None and quota_status.exceeded:
+                        if quota_status.warn_only:
+                            if not dispatcher.is_quota_warned(tid):
+                                reason_text = "; ".join(quota_status.reasons)
+                                logger.info(f"Quota warning for {tid}: {reason_text}")
+                                await _add_comment(
+                                    config.state_store_url,
+                                    tid,
+                                    f"**Quota warning:** {reason_text}\n\n"
+                                    f"Dispatch continues (warn-only mode).",
+                                )
+                                dispatcher.mark_quota_warned(tid)
+                        else:
+                            if not dispatcher.is_quota_blocked(tid):
+                                reason_text = "; ".join(quota_status.reasons)
+                                logger.warning(
+                                    f"Quota exceeded for {tid}: {reason_text}"
+                                )
+                                await _add_comment(
+                                    config.state_store_url,
+                                    tid,
+                                    f"**Quota exceeded:** {reason_text}\n\n"
+                                    f"Ticket paused until the rolling "
+                                    f"window resets.",
+                                )
+                                dispatcher.mark_quota_blocked(tid)
+                            continue
+                    else:
+                        dispatcher.clear_quota_blocked(tid)
+
                 if not dispatcher.try_claim(tid, status):
                     logger.info(f"Skipping {tid} at {status}: claim held")
                     continue
                 dispatcher.start_renewal(tid)
+
+                # Register ticket owner for ledger attribution
+                # before any agent runs.
+                if multi_user and events is not None:
+                    created_by = ticket.get("created_by", "")
+                    if created_by and user_store is not None:
+                        try:
+                            u = user_store.get_user(created_by)
+                            events.register_ticket_owner(
+                                tid,
+                                created_by,
+                                u.groups,
+                            )
+                        except Exception:
+                            events.register_ticket_owner(
+                                tid,
+                                created_by,
+                                [],
+                            )
 
                 # Start introspection BEFORE the pipeline agent
                 # so no events are missed in a startup race.

@@ -125,6 +125,7 @@ class EventBus:
         self,
         log_dir: str | Path | None = None,
         redactor: Any | None = None,
+        usage_ledger: Any | None = None,
     ) -> None:
         self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self._log_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +136,8 @@ class EventBus:
         self._file_handles: dict[str, Any] = {}
         self._cumulative: dict[str, CumulativeUsage] = {}
         self._last_event_time: dict[str, float] = {}
+        self._usage_ledger = usage_ledger
+        self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
@@ -252,6 +255,24 @@ class EventBus:
         """
         return self._last_event_time.get(ticket_id)
 
+    def register_ticket_owner(
+        self,
+        ticket_id: str,
+        charged_to: str,
+        groups: list[str],
+    ) -> None:
+        """Register who to charge for a ticket's LLM usage.
+
+        Called by the orchestrator at dispatch time so that
+        ``record_llm_usage`` can write ledger entries with
+        correct attribution.
+        """
+        self._ticket_owners[ticket_id] = (charged_to, list(groups))
+
+    def unregister_ticket_owner(self, ticket_id: str) -> None:
+        """Remove ownership attribution for a terminal ticket."""
+        self._ticket_owners.pop(ticket_id, None)
+
     def record_llm_usage(
         self,
         ticket_id: str,
@@ -296,6 +317,15 @@ class EventBus:
                     cache_read_input_tokens,
                     cache_creation_input_tokens,
                 )
+
+        self._write_ledger_entry(
+            ticket_id,
+            input_tokens,
+            output_tokens,
+            model,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        )
 
     def get_cumulative_usage(self, ticket_id: str) -> dict[str, Any]:
         """Get accumulated LLM usage for a ticket."""
@@ -400,7 +430,51 @@ class EventBus:
         except Exception:
             logger.exception(f"Failed to write event to file for {ticket_id}")
 
+    def _write_ledger_entry(
+        self,
+        ticket_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        model: str,
+        cache_read_input_tokens: int,
+        cache_creation_input_tokens: int,
+    ) -> None:
+        """Append a usage record to the quota ledger."""
+        if self._usage_ledger is None:
+            return
+        charged_to, groups = self._ticket_owners.get(ticket_id, ("", []))
+        if not charged_to:
+            return
+        try:
+            from providers.cost import estimate_cost
+            from providers.quota import LedgerEntry
+
+            cost = estimate_cost(
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+            )
+            entry = LedgerEntry(
+                ts=datetime.now(timezone.utc).isoformat(),
+                ticket_id=ticket_id,
+                charged_to=charged_to,
+                groups=groups,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cost_usd=cost,
+            )
+            self._usage_ledger.append(entry)
+        except Exception:
+            logger.exception("Failed to write ledger entry for %s", ticket_id)
+
     def close(self) -> None:
+        if self._usage_ledger is not None:
+            self._usage_ledger.close()
         for fh in self._file_handles.values():
             try:
                 fh.close()
