@@ -19,7 +19,7 @@ If this investigation was triggered by a Horreum alert:
   new measurements. Investigate the cause.
 
 If the ticket description or anomaly context references specific
-Horreum run IDs, query them directly:
+run IDs from an external data source, query them directly:
 
 - Call `get_run_info` with each run ID to retrieve the run's
   metadata (target, OS, build, timestamps)
