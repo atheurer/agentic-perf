@@ -140,11 +140,66 @@ class AnalyzeAgent(AgentBase):
             ]
         self.tools = mcp_tools
 
+        # Pre-fetch run info for cited run IDs so the LLM
+        # has the data without needing to call get_run_info.
+        ticket = await self._get_ticket(ticket_id)
+        self._prefetched_run_info = await self._prefetch_cited_runs(
+            ticket,
+        )
+
         try:
             await super().run(ticket_id)
         finally:
             await mcp.disconnect()
             self._mcp = None
+            self._prefetched_run_info = {}
+
+    async def _prefetch_cited_runs(
+        self,
+        ticket: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Pre-fetch run info for cited run IDs.
+
+        Extracts run IDs from the ticket description and
+        anomaly context, queries each via get_run_info,
+        and returns a dict of run_id → metadata.
+        """
+        import re
+
+        cf = ticket.get("custom_fields", {})
+        description = ticket.get("description", "")
+        anomaly = cf.get("anomaly_context", {})
+
+        cited_ids: list[str] = []
+        for match in re.findall(
+            r"(?:Run|run_id|run)[:\s]+?(\d{5,})",
+            description,
+        ):
+            if match not in cited_ids:
+                cited_ids.append(match)
+        if anomaly.get("run_id"):
+            rid = str(anomaly["run_id"])
+            if rid not in cited_ids:
+                cited_ids.append(rid)
+
+        if not cited_ids or not self._mcp:
+            return {}
+
+        results: dict[str, Any] = {}
+        for run_id in cited_ids:
+            try:
+                resp = await self._mcp.call_tool(
+                    "get_run_info",
+                    {"run_id": int(run_id)},
+                )
+                if resp:
+                    data = json.loads(resp)
+                    if not data.get("error"):
+                        results[run_id] = data
+                        logger.info(f"[analyze] Pre-fetched run {run_id}")
+            except Exception as e:
+                logger.debug(f"[analyze] Failed to pre-fetch run {run_id}: {e}")
+        return results
 
     def _build_context(
         self,
@@ -207,7 +262,16 @@ class AnalyzeAgent(AgentBase):
             if rid not in cited_run_ids:
                 cited_run_ids.append(rid)
 
-        if cited_run_ids:
+        # Include pre-fetched run data if available
+        prefetched = getattr(self, "_prefetched_run_info", {})
+        if prefetched:
+            parts.append("## Pre-Fetched Run Data")
+            parts.append("")
+            for rid, info in prefetched.items():
+                parts.append(f"**Run {rid}:**")
+                parts.append(f"```json\n{json.dumps(info, indent=2, default=str)}\n```")
+                parts.append("")
+        elif cited_run_ids:
             parts.append(f"**Cited Run IDs:** {', '.join(cited_run_ids)}")
             parts.append(
                 "Use `get_run_info` to query each run ID "
