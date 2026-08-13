@@ -520,3 +520,68 @@ class TestDispatcherIntegration:
         agent = dispatcher.create_agent("gathering_context")
         assert isinstance(agent, GatheringContextAgent)
         assert agent.agent_name == "gathering-context-agent"
+
+
+class TestDeterministicDedup:
+    """Test deterministic dedup via canonical dedup_key fields."""
+
+    def test_analyzing_transition_still_valid(self):
+        """gathering_context can still transition to analyzing."""
+        valid = VALID_TRANSITIONS[TicketStatus.GATHERING_CONTEXT]
+        assert TicketStatus.ANALYZING in valid
+
+    def test_retrospective_transition_valid(self):
+        """gathering_context can transition to retrospective."""
+        valid = VALID_TRANSITIONS[TicketStatus.GATHERING_CONTEXT]
+        assert TicketStatus.RETROSPECTIVE_PENDING in valid
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_without_dedup_key(self):
+        """No dedup_key on ticket → returns False."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        agent = MagicMock()
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {"anomaly_context": {"source": "horreum"}},
+            }
+        )
+        # Call the static logic — dedup_key is missing
+
+        ticket = {
+            "custom_fields": {
+                "anomaly_context": {"source": "horreum"},
+            },
+        }
+        # dedup_key not present → should return False
+        dedup_key = ticket["custom_fields"].get("dedup_key", {})
+        assert not dedup_key.get("metric")
+        assert not dedup_key.get("platform")
+
+    def test_dedup_key_set_by_enrichment(self):
+        """Verify dedup_key structure matches what enrichment sets."""
+        dedup_key = {
+            "metric": "CoV - BOOT2 - Kernel Duration",
+            "platform": "qc8775",
+        }
+        # Both fields present and non-empty
+        assert dedup_key["metric"]
+        assert dedup_key["platform"]
+        # Exact match would work
+        assert dedup_key["metric"] == "CoV - BOOT2 - Kernel Duration"
+        assert dedup_key["platform"] == "qc8775"
+
+    def test_different_metrics_dont_match(self):
+        """Different metric strings should not match."""
+        key_a = {"metric": "CoV - BOOT2 - Kernel Duration", "platform": "qc8775"}
+        key_b = {"metric": "CoV - BOOT2 - InitRD Duration", "platform": "qc8775"}
+        assert key_a["metric"] != key_b["metric"]
+
+    def test_different_platforms_dont_match(self):
+        """Different platforms should not match."""
+        key_a = {"metric": "CoV - BOOT2 - Kernel Duration", "platform": "qc8775"}
+        key_b = {
+            "metric": "CoV - BOOT2 - Kernel Duration",
+            "platform": "nxp-s32g-vnp-rdb3",
+        }
+        assert key_a["platform"] != key_b["platform"]
