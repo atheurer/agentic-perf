@@ -1728,39 +1728,13 @@ async def _pin_irq_one(
             "errors": cpu_errors,
         }
 
-    assignments: list[dict] = []
-    for i, irq in enumerate(irq_numbers):
-        cpu = cpu_list[i % len(cpu_list)]
-        # Use smp_affinity_list (plain CPU number) rather than smp_affinity
-        # (hex bitmask). The bitmask format requires comma-grouped 32-bit words
-        # on systems with >32 CPUs (e.g. CPU 192 needs a 24-group mask), and a
-        # raw large hex number is silently rejected. smp_affinity_list accepts
-        # a plain integer regardless of CPU count — confirmed live on 768-CPU host.
-        r2 = await _ssh.run(
-            host, f"echo {cpu} > /proc/irq/{irq}/smp_affinity_list 2>&1"
-        )
-        if r2.exit_code != 0:
-            errors.append(
-                f"smp_affinity_list write failed for IRQ {irq}: {r2.stdout.strip()}"
-            )
-            continue
-        # Verify the write actually landed — read back and confirm the CPU
-        # appears (managed IRQs on some drivers silently ignore the write).
-        rv = await _ssh.run(
-            host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1"
-        )
-        actual = rv.stdout.strip()
-        if str(cpu) not in actual.split(","):
-            errors.append(
-                f"smp_affinity_list verify failed for IRQ {irq}: "
-                f"wrote {cpu}, got '{actual}'"
-            )
-        else:
-            applied.append(f"IRQ {irq} → CPU {cpu}")
-            assignments.append({"irq": irq, "cpu": cpu})
-
-    used_cpus = sorted({a["cpu"] for a in assignments})
-
+    # Apply irqbalance ban/disable BEFORE writing affinities. On a busy host
+    # irqbalance fires every 10 seconds; writing 64 IRQs one-by-one takes
+    # ~25 seconds of sequential SSH ops, so irqbalance races against the writes
+    # and overrides early assignments before the ban lands. Stopping/banning
+    # first ensures the writes are never overridden during the loop.
+    # ban_cpu is the exception — it needs used_cpus from assignments, so it
+    # runs after the write loop (below).
     ib_result = {"mode": irqbalance_mode}
     if irqbalance_mode == "disable":
         r3 = await _ssh.run(
@@ -1796,7 +1770,40 @@ async def _pin_irq_one(
         if r4.exit_code != 0:
             errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
 
-    elif irqbalance_mode == "ban_cpu":
+    assignments: list[dict] = []
+    for i, irq in enumerate(irq_numbers):
+        cpu = cpu_list[i % len(cpu_list)]
+        # Use smp_affinity_list (plain CPU number) rather than smp_affinity
+        # (hex bitmask). The bitmask format requires comma-grouped 32-bit words
+        # on systems with >32 CPUs (e.g. CPU 192 needs a 24-group mask), and a
+        # raw large hex number is silently rejected. smp_affinity_list accepts
+        # a plain integer regardless of CPU count — confirmed live on 768-CPU host.
+        r2 = await _ssh.run(
+            host, f"echo {cpu} > /proc/irq/{irq}/smp_affinity_list 2>&1"
+        )
+        if r2.exit_code != 0:
+            errors.append(
+                f"smp_affinity_list write failed for IRQ {irq}: {r2.stdout.strip()}"
+            )
+            continue
+        # Verify the write actually landed — read back and confirm the CPU
+        # appears (managed IRQs on some drivers silently ignore the write).
+        rv = await _ssh.run(
+            host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1"
+        )
+        actual = rv.stdout.strip()
+        if str(cpu) not in actual.split(","):
+            errors.append(
+                f"smp_affinity_list verify failed for IRQ {irq}: "
+                f"wrote {cpu}, got '{actual}'"
+            )
+        else:
+            applied.append(f"IRQ {irq} → CPU {cpu}")
+            assignments.append({"irq": irq, "cpu": cpu})
+
+    used_cpus = sorted({a["cpu"] for a in assignments})
+
+    if irqbalance_mode == "ban_cpu":
         # Bans the union of all CPUs actually used for this device's IRQs
         # (round-robin pinning can spread IRQs across several CPUs, not
         # just one).
