@@ -109,11 +109,24 @@ class TestValueRedaction:
         result = redactor.redact_string(TICKET, text)
         assert urlenc not in result
 
-    def test_unregistered_ticket_unchanged(self, redactor: Redactor) -> None:
+    def test_unregistered_ticket_values_unchanged(self, redactor: Redactor) -> None:
+        """Value redaction is ticket-scoped; patterns still fire globally."""
         redactor.register(TICKET, SECRET_PATH, SECRET)
         text = f"password {SECRET}"
         result = redactor.redact_string("OTHER-TICKET", text)
         assert result == text
+
+    def test_patterns_fire_for_unregistered_ticket(self, redactor: Redactor) -> None:
+        text = "Bearer eyJtoken123.abc.def"
+        result = redactor.redact_string("NO-SUCH-TICKET", text)
+        assert "eyJtoken123" not in result
+
+    def test_regex_metacharacters_in_value(self, redactor: Redactor) -> None:
+        meta_val = "sec.ret+val*ue??"
+        redactor.register(TICKET, "path", meta_val)
+        text = f"value is {meta_val}"
+        result = redactor.redact_string(TICKET, text)
+        assert meta_val not in result
 
 
 # ── 3. Redaction — patterns ──────────────────────────────────
@@ -165,6 +178,19 @@ class TestPatternRedaction:
         result = redactor.redact_string(TICKET, text)
         assert "my-root-password" not in result
 
+    def test_bearer_prefix_preserved(self, redactor: Redactor) -> None:
+        """Pattern replacement keeps structural prefix for debuggability."""
+        text = "header Bearer eyJsecrettoken"
+        result = redactor.redact_string(TICKET, text)
+        assert "Bearer " in result
+        assert "eyJsecrettoken" not in result
+
+    def test_env_key_prefix_preserved(self, redactor: Redactor) -> None:
+        text = "podman run -e KUBEADMIN_PASSWORD=abc123xyz"
+        result = redactor.redact_string(TICKET, text)
+        assert "-e KUBEADMIN_PASSWORD=" in result
+        assert "abc123xyz" not in result
+
     def test_all_default_patterns_have_names(self) -> None:
         for name, pattern in DEFAULT_PATTERNS:
             assert name, "Pattern name must be non-empty"
@@ -215,6 +241,15 @@ class TestRecursiveRedaction:
         assert result["ratio"] == 3.14
         assert SECRET not in result["secret_field"]
 
+    def test_secret_in_dict_key(self, redactor: Redactor) -> None:
+        """Secrets appearing as dict keys are redacted too."""
+        redactor.register(TICKET, SECRET_PATH, SECRET)
+        data = {SECRET: "some value", "safe_key": "safe_value"}
+        result = redactor.redact(TICKET, data)
+        serialized = json.dumps(result)
+        assert SECRET not in serialized
+        assert "safe_key" in serialized
+
     def test_content_blocks(self, redactor: Redactor) -> None:
         """LLM responses use content-block lists with text fields."""
         redactor.register(TICKET, SECRET_PATH, SECRET)
@@ -244,11 +279,12 @@ class TestFailClosed:
         with patch.object(
             redactor,
             "_redact_recursive",
-            side_effect=RuntimeError("boom"),
+            side_effect=RuntimeError(f"contains {SECRET}"),
         ):
             result = redactor.redact(TICKET, data)
         assert "redaction_error" in result
-        assert "boom" in result["redaction_error"]
+        assert result["redaction_error"] == "RuntimeError"
+        assert SECRET not in result["redaction_error"]
         assert result["original_keys"] == ["key", "other"]
         assert SECRET not in json.dumps(result)
 
@@ -261,6 +297,18 @@ class TestFailClosed:
             result = redactor.redact(TICKET, "not a dict")
         assert "redaction_error" in result
         assert result["original_keys"] == []
+
+    def test_redact_string_fail_closed(self, redactor: Redactor) -> None:
+        """Direct redact_string() callers get fail-closed too."""
+        redactor.register(TICKET, SECRET_PATH, SECRET)
+        with patch.object(
+            redactor,
+            "_redact_string_inner",
+            side_effect=RuntimeError("regex blow up"),
+        ):
+            result = redactor.redact_string(TICKET, f"secret: {SECRET}")
+        assert result == "[REDACTED:redaction_error]"
+        assert SECRET not in result
 
 
 # ── 6. Deregister ────────────────────────────────────────────
@@ -317,6 +365,17 @@ class TestJSONDecomposition:
         result = redactor.redact_string(TICKET, text)
         assert "short" in result
 
+    def test_json_decomposed_values_have_base64_variants(
+        self, redactor: Redactor
+    ) -> None:
+        inner_secret = "vault-secret-value-12345"
+        blob = json.dumps({"password": inner_secret})
+        redactor.register(TICKET, "vault/creds", blob)
+        b64_inner = base64.b64encode(inner_secret.encode()).decode()
+        text = f"encoded: {b64_inner}"
+        result = redactor.redact_string(TICKET, text)
+        assert b64_inner not in result
+
     def test_non_json_value_not_decomposed(self, redactor: Redactor) -> None:
         redactor.register(TICKET, "path", "not-json-at-all")
         assert TICKET in redactor._registries
@@ -327,7 +386,7 @@ class TestJSONDecomposition:
 
 
 class TestPerformance:
-    def test_100kb_payload_under_5ms(self, redactor: Redactor) -> None:
+    def test_100kb_payload_under_50ms(self, redactor: Redactor) -> None:
         for i in range(20):
             val = f"secret-value-{i:04d}-{'x' * 20}"
             redactor.register(TICKET, f"path/{i}", val)
@@ -368,7 +427,8 @@ class TestPerformance:
 
 
 class TestDepthNodeCaps:
-    def test_deeply_nested_no_crash(self, redactor: Redactor) -> None:
+    def test_deeply_nested_secrets_not_leaked(self, redactor: Redactor) -> None:
+        """Secrets past depth cap are replaced with cap markers, not leaked."""
         redactor.register(TICKET, SECRET_PATH, SECRET)
         data: dict = {"leaf": SECRET}
         for _ in range(_MAX_DEPTH + 10):
@@ -377,9 +437,11 @@ class TestDepthNodeCaps:
         result = redactor.redact(TICKET, data)
         assert isinstance(result, dict)
         serialized = json.dumps(result)
-        assert "nested" in serialized
+        assert SECRET not in serialized
+        assert "depth_limit_exceeded" in serialized
 
-    def test_wide_structure_no_hang(self, redactor: Redactor) -> None:
+    def test_wide_structure_secrets_not_leaked(self, redactor: Redactor) -> None:
+        """Secrets past node cap are replaced with cap markers, not leaked."""
         redactor.register(TICKET, SECRET_PATH, SECRET)
         data = {
             "items": [SECRET] * (_MAX_NODES + 100),
@@ -391,8 +453,5 @@ class TestDepthNodeCaps:
 
         assert elapsed < 5.0, f"Wide-structure redaction took {elapsed:.1f}s"
         assert isinstance(result, dict)
-        items = result["items"]
-        redacted_count = sum(1 for item in items if "[REDACTED:" in item)
-        unchanged_count = sum(1 for item in items if item == SECRET)
-        assert redacted_count > 0
-        assert redacted_count + unchanged_count == len(items)
+        serialized = json.dumps(result)
+        assert SECRET not in serialized
