@@ -88,7 +88,123 @@ class GatheringContextAgent(AgentBase):
 
         return [{"role": "user", "content": content}]
 
+    async def _deterministic_dedup(
+        self,
+        ticket_id: str,
+        ticket: dict[str, Any],
+    ) -> bool:
+        """Check for dedup match using canonical dedup fields.
+
+        The ticket's ``dedup_key`` (set at ingestion by webhook
+        enrichment, ticket creation, or any upstream process)
+        contains normalized ``metric`` and ``platform`` values.
+        These are compared against open investigation records
+        using exact matching.
+
+        This is source-agnostic — any ticket creator that sets
+        ``dedup_key.metric`` and ``dedup_key.platform`` gets
+        deterministic dedup. Source-specific field extraction
+        belongs in the webhook translator or enrichment layer,
+        not here.
+
+        Returns True if a match was found and the ticket was
+        transitioned.
+        """
+        cf = ticket.get("custom_fields", {})
+        dedup_key = cf.get("dedup_key", {})
+
+        dedup_metric = dedup_key.get("metric", "")
+        dedup_platform = dedup_key.get("platform", "")
+
+        if not dedup_metric or not dedup_platform:
+            return False
+
+        from providers.investigation.registry import (
+            create_record_provider,
+        )
+
+        try:
+            provider = create_record_provider()
+        except Exception:
+            logger.debug(
+                "[gathering-context] Investigation records "
+                "provider not available for deterministic "
+                "dedup"
+            )
+            return False
+
+        try:
+            records = await provider.query(
+                state="open",
+                metric=dedup_metric,
+                platform=dedup_platform,
+                limit=10,
+            )
+        except Exception:
+            logger.warning(
+                "[gathering-context] Failed to query "
+                "investigation records for deterministic "
+                "dedup — falling back to LLM"
+            )
+            return False
+
+        if not records:
+            return False
+
+        matched = records[0]
+        matched_id = matched.investigation_id
+        logger.info(
+            f"[gathering-context] Deterministic dedup "
+            f"match: {matched_id} "
+            f"(metric={dedup_metric}, "
+            f"platform={dedup_platform})"
+        )
+
+        await self._update_fields(
+            ticket_id,
+            {
+                "dedup_result": {
+                    "decision": "MATCH_FOUND",
+                    "matched_investigation_id": matched_id,
+                    "match_confidence": 1.0,
+                    "match_rationale": (
+                        "Deterministic match on "
+                        f"metric='{dedup_metric}' "
+                        f"platform='{dedup_platform}'"
+                    ),
+                    "match_method": "deterministic",
+                },
+            },
+        )
+
+        summary = (
+            "**Dedup Match Found** "
+            "(deterministic)\n\n"
+            f"- **Matched Record:** {matched_id}\n"
+            f"- **Metric:** {dedup_metric}\n"
+            f"- **Platform:** {dedup_platform}\n\n"
+            "Skipping investigation — this anomaly "
+            "matches an open Investigation Record."
+        )
+        await self._add_comment(ticket_id, summary)
+        await self._transition_ticket(
+            ticket_id,
+            "retrospective_pending",
+            comment=(
+                f"Deterministic dedup match: {matched_id}. Skipping investigation."
+            ),
+        )
+        return True
+
     async def run(self, ticket_id: str) -> None:
+        # Try deterministic dedup first — no LLM needed
+        ticket = await self._get_ticket(ticket_id)
+        if await self._deterministic_dedup(
+            ticket_id,
+            ticket,
+        ):
+            return
+
         gc_server = str(Path(__file__).with_name("server.py"))
         ir_server = str(Path(__file__).parent.parent / "investigation" / "server.py")
 

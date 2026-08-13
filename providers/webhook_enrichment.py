@@ -92,8 +92,21 @@ async def enrich_webhook_ticket(
 
     fields: dict[str, Any] = {"run_metadata": run_info}
 
-    # Set board_selector from target if not already in directives
+    # Set canonical dedup_key for deterministic dedup matching.
+    # The gathering_context agent compares these fields against
+    # open investigation records using exact matching.
+    # Source-specific extraction happens here; the dedup logic
+    # itself is source-agnostic.
+    anomaly = cf.get("anomaly_context", {})
     target = run_info.get("target", "")
+    variable_name = anomaly.get("variable_name", "")
+    if target and variable_name:
+        fields["dedup_key"] = {
+            "metric": variable_name,
+            "platform": target,
+        }
+
+    # Set board_selector from target if not already in directives
     if target:
         existing_directives = cf.get("directives", {})
         if not existing_directives.get("board_selector"):
