@@ -734,23 +734,73 @@ async def execute_benchmark(
                 if pw_result.exit_code == 0 and pw_result.stdout.strip():
                     env_vars["KUBEADMIN_PASSWORD"] = pw_result.stdout.strip()
 
-        env_flags = " ".join(f'-e {k}="{v}"' for k, v in env_vars.items())
+        for k, v in env_vars.items():
+            if "\n" in k or "\r" in k or "\n" in v or "\r" in v:
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "harness": "benchmark-runner",
+                        "message": (
+                            f"env var {k!r} contains newline/CR — "
+                            "rejected to prevent env-file injection"
+                        ),
+                    }
+                )
+
+        env_tmpdir_result = await _ssh.run(
+            controller,
+            "mktemp -d /tmp/.benchmark-env-XXXXXXXX",
+            timeout=10,
+        )
+        if env_tmpdir_result.exit_code != 0 or not env_tmpdir_result.stdout.strip():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "harness": "benchmark-runner",
+                    "message": "Failed to create secure env temp dir on controller",
+                }
+            )
+        env_dir = env_tmpdir_result.stdout.strip()
+        env_file_path = f"{env_dir}/env"
+
+        env_file_content = "\n".join(f"{k}={v}" for k, v in env_vars.items())
+        write_result = await _ssh.run(
+            controller,
+            f"cat > {env_file_path} && chmod 600 {env_file_path}",
+            stdin_data=env_file_content.encode(),
+        )
+        if write_result.exit_code != 0:
+            await _ssh.run(controller, f"rm -rf {env_dir}")
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "harness": "benchmark-runner",
+                    "message": "Failed to write env file on controller",
+                }
+            )
 
         await _ssh.run(controller, f"mkdir -p {artifacts_dir}")
 
         cmd = (
-            f"podman run --rm {env_flags} "
+            f"podman run --rm --env-file {env_file_path} "
             f"-v {kubeconfig_path}:/root/.kube/config "
             f"-v {artifacts_dir}:{artifacts_dir} "
             f"--privileged "
             f"{container_image} 2>&1"
         )
-        logger.info(f"[benchmark] Executing benchmark-runner: {cmd}")
-        result = await _ssh.run_with_progress(
-            controller,
-            cmd,
-            progress_callback=_benchmark_progress,
+        logger.info(
+            "[benchmark] Executing benchmark-runner: %s (env-file: %d vars)",
+            container_image,
+            len(env_vars),
         )
+        try:
+            result = await _ssh.run_with_progress(
+                controller,
+                cmd,
+                progress_callback=_benchmark_progress,
+            )
+        finally:
+            await _ssh.run(controller, f"rm -rf {env_dir}")
 
         artifacts_cmd = f"ls {artifacts_dir}/ 2>/dev/null | tail -1"
         artifacts_result = await _ssh.run(controller, artifacts_cmd)
@@ -1836,6 +1886,9 @@ async def execute_boot_time_test(
         logger.info(f"[boot-time] Installing boot-time-analysis-tools on {sut_host}")
         import asyncio as _asyncio
 
+        # Security: password on argv is visible in /proc/pid/cmdline.
+        # The external scripts require --password= on the command line;
+        # upstream fix: accept --password-file or SSHPASS env var.
         install_proc = await _asyncio.create_subprocess_exec(
             str(install_script),
             sut_host,
@@ -1865,6 +1918,7 @@ async def execute_boot_time_test(
     run_uuid = uuid.uuid4().hex[:8]
     output_dir = Path(tempfile.mkdtemp(prefix=f"boot-time-{run_uuid}-"))
 
+    # Security: password on argv — see comment at install_proc above.
     cmd = [
         str(test_script),
         sut_host,
@@ -1908,7 +1962,12 @@ async def execute_boot_time_test(
     if description:
         cmd.extend(["--description", description])
 
-    logger.info(f"[boot-time] Executing: {' '.join(cmd[:6])}... ({samples} samples)")
+    safe_cmd = [a for a in cmd[:6] if not a.startswith("--password=")]
+    logger.info(
+        "[boot-time] Executing: %s ... (%d samples)",
+        " ".join(safe_cmd),
+        samples,
+    )
 
     # ── Passive serial capture ───────────────────────────
     # Run `jmp shell --lease <id> -- j serial pipe` in the

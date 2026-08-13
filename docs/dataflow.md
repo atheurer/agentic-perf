@@ -103,15 +103,16 @@ This document describes how data moves through agentic-perf and highlights where
 - **SSH private keys**: Never stored in logs or tickets
   - Injected at runtime as environment variables
   - Stored in `~/.agentic-perf/secrets/` (user responsibility)
-  - Agent code never prints or logs keys
-- **API tokens**: QUADS, AWS, PSAP credentials never logged
+  - Agent code should not print or log keys
+- **API tokens**: QUADS, AWS, PSAP credentials should not be logged
   - Stored in `~/.agentic-perf/secrets/`
   - Injected at runtime
 - **Customer data**: If benchmark processes real customer data
   - Users must sanitize before submission
   - Results should not include PII
 - **Passwords**: Should never be submitted in tickets
-  - If user includes passwords, agent should flag for redaction
+  - ⚠️ Some external scripts require passwords on the command line
+    (visible in `/proc/pid/cmdline`); see #456 for hardening status
 
 ---
 
@@ -190,8 +191,8 @@ agentic-perf submit "Test NIC performance" \
 ### 4. Provisioning Agent Installs Harness (SSH)
 - **Secret injection**: SSH key injected as env var
 - **Command execution**: Run `yum install`, `git clone`, harness setup
-- **Logging**: Event log records each SSH command (redacted for security)
-- **Sensitive data**: SSH key not in logs; command output sanitized
+- **Logging**: Event log records each SSH command (⚠️ not yet redacted — #456)
+- **Sensitive data**: SSH key not in logs; command output not yet sanitized (#456)
 
 ### 5. Benchmark Agent Executes Test (Harness CLI)
 - **Input**: Run configuration (JSON)
@@ -262,12 +263,13 @@ agentic-perf submit "Test NIC performance" \
 
 ### For Developers
 1. **Never log secrets**
-   - Use `redacted` placeholder in logs
-   - Secrets should only be in environment variables
+   - ⚠️ Automated redaction is planned (#456) but not yet enforced in code
+   - Prefer environment variables or stdin over command-line arguments
+   - Avoid interpolating secret values into shell command strings
    
 2. **Filter event logs**
-   - Before including tool output in logs, sanitize
-   - Redact SSH key paths, API tokens, etc.
+   - ⚠️ Automated log filtering is planned (#456) but not yet implemented
+   - Use `scripts/scrub-event-logs.py` to retroactively scrub known patterns
    
 3. **Validate all input**
    - User-provided hostnames could hide injection attacks

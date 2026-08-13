@@ -92,6 +92,7 @@ class SSHExecutor:
         timeout: int = 300,
         key_path: str | None = None,
         allocate_pty: bool = False,
+        stdin_data: bytes | None = None,
     ) -> SSHResult:
         args = self._ssh_args(host, key_path=key_path, allocate_pty=allocate_pty) + [
             command
@@ -100,12 +101,13 @@ class SSHExecutor:
 
         proc = await asyncio.create_subprocess_exec(
             *args,
+            stdin=(asyncio.subprocess.PIPE if stdin_data is not None else None),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
         try:
-            coro = proc.communicate()
+            coro = proc.communicate(input=stdin_data)
             if timeout > 0:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     coro, timeout=timeout

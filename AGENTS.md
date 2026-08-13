@@ -278,3 +278,10 @@ should understand what is enforced today and what is not.
   themselves run as root over SSH with no additional confinement.
 - **Audit logging** (JSONL event files) is best-effort — a disk-full
   condition will log a warning but not block execution.
+- **Process-argument exposure** — some code paths pass secrets as
+  command-line arguments visible in `/proc/pid/cmdline`:
+  - Boot-time-analysis external scripts require `--password=` on
+    argv (upstream limitation; see #456).
+  - Use `scripts/scrub-event-logs.py` to retroactively scrub
+    known sensitive patterns from JSONL event logs.
+  - Automated log redaction is planned (#456) but not yet wired in.
