@@ -195,7 +195,27 @@ class AnalyzeAgent(AgentBase):
                 if resp:
                     data = json.loads(resp)
                     if not data.get("error"):
-                        results[run_id] = data
+                        # Extract only metadata — the full
+                        # payload can be hundreds of MB for
+                        # boot-time-verbose runs with
+                        # thousands of per-sample log entries.
+                        summary = {
+                            k: data[k]
+                            for k in (
+                                "target",
+                                "os_id",
+                                "build",
+                                "start_time",
+                                "stop_time",
+                                "run_id",
+                                "dataset_id",
+                                "description",
+                                "mode",
+                                "error",
+                            )
+                            if k in data
+                        }
+                        results[run_id] = summary
                         logger.info(f"[analyze] Pre-fetched run {run_id}")
             except Exception as e:
                 logger.debug(f"[analyze] Failed to pre-fetch run {run_id}: {e}")
