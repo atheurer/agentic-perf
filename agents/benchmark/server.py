@@ -734,13 +734,50 @@ async def execute_benchmark(
                 if pw_result.exit_code == 0 and pw_result.stdout.strip():
                     env_vars["KUBEADMIN_PASSWORD"] = pw_result.stdout.strip()
 
-        env_file_path = f"/tmp/.benchmark-env-{run_uuid}"
-        env_file_content = "\n".join(f"{k}={v}" for k, v in env_vars.items())
-        await _ssh.run(
+        for k, v in env_vars.items():
+            if "\n" in k or "\r" in k or "\n" in v or "\r" in v:
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "harness": "benchmark-runner",
+                        "message": (
+                            f"env var {k!r} contains newline/CR — "
+                            "rejected to prevent env-file injection"
+                        ),
+                    }
+                )
+
+        env_tmpdir_result = await _ssh.run(
             controller,
-            f"umask 077 && cat > {env_file_path}",
+            "mktemp -d /tmp/.benchmark-env-XXXXXXXX",
+            timeout=10,
+        )
+        if env_tmpdir_result.exit_code != 0 or not env_tmpdir_result.stdout.strip():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "harness": "benchmark-runner",
+                    "message": "Failed to create secure env temp dir on controller",
+                }
+            )
+        env_dir = env_tmpdir_result.stdout.strip()
+        env_file_path = f"{env_dir}/env"
+
+        env_file_content = "\n".join(f"{k}={v}" for k, v in env_vars.items())
+        write_result = await _ssh.run(
+            controller,
+            f"cat > {env_file_path} && chmod 600 {env_file_path}",
             stdin_data=env_file_content.encode(),
         )
+        if write_result.exit_code != 0:
+            await _ssh.run(controller, f"rm -rf {env_dir}")
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "harness": "benchmark-runner",
+                    "message": "Failed to write env file on controller",
+                }
+            )
 
         await _ssh.run(controller, f"mkdir -p {artifacts_dir}")
 
@@ -756,12 +793,14 @@ async def execute_benchmark(
             container_image,
             len(env_vars),
         )
-        result = await _ssh.run_with_progress(
-            controller,
-            cmd,
-            progress_callback=_benchmark_progress,
-        )
-        await _ssh.run(controller, f"rm -f {env_file_path}")
+        try:
+            result = await _ssh.run_with_progress(
+                controller,
+                cmd,
+                progress_callback=_benchmark_progress,
+            )
+        finally:
+            await _ssh.run(controller, f"rm -rf {env_dir}")
 
         artifacts_cmd = f"ls {artifacts_dir}/ 2>/dev/null | tail -1"
         artifacts_result = await _ssh.run(controller, artifacts_cmd)

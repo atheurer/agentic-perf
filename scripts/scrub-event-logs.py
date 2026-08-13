@@ -16,6 +16,11 @@ Usage:
 
     # Apply changes (atomic rename per file):
     python3 scripts/scrub-event-logs.py --apply
+
+WARNING: Stop the orchestrator before running with --apply.
+EventBus keeps log files open for appending; os.replace() during
+a live run will silently discard events written between read and
+rename, and subsequent appends go to the now-unlinked inode.
 """
 
 from __future__ import annotations

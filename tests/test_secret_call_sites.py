@@ -105,6 +105,12 @@ class TestV2EnvFile:
         ) -> SSHResult:
             ssh_commands.append(command)
             ssh_stdin_data.append(stdin_data)
+            if "mktemp" in command:
+                return SSHResult(
+                    stdout="/tmp/.benchmark-env-test1234\n",
+                    stderr="",
+                    exit_code=0,
+                )
             return SSHResult(stdout="", stderr="", exit_code=0)
 
         async def mock_run_with_progress(
@@ -158,6 +164,9 @@ class TestV2EnvFile:
         assert podman_cmd, "Expected a podman run command"
         assert "--env-file" in podman_cmd[0], "Expected --env-file in podman command"
         assert "-e " not in podman_cmd[0], "Expected no -e flags in podman command"
+
+        cleanup_cmd = [c for c in ssh_commands if "rm -rf" in c]
+        assert cleanup_cmd, "Expected env dir cleanup via rm -rf"
 
 
 # ── V3: boot-time password not in log ──────────────────────────
