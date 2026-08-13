@@ -121,9 +121,14 @@ class CumulativeUsage:
 
 
 class EventBus:
-    def __init__(self, log_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        log_dir: str | Path | None = None,
+        redactor: Any | None = None,
+    ) -> None:
         self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._redactor = redactor
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -229,6 +234,8 @@ class EventBus:
         data: dict[str, Any] | None = None,
     ) -> Event:
         with self._lock:
+            if data and self._redactor:
+                data = self._redactor.redact(ticket_id, data)
             seq = self._next_seq(ticket_id)
             event = Event(seq, ticket_id, agent, event_type, data)
             self._events.setdefault(ticket_id, []).append(event)

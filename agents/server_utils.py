@@ -425,16 +425,36 @@ async def tool_progress(
     _emit_tool_progress_event(ticket_id, author, message)
 
 
+_progress_redactor = None
+
+
+def _get_progress_redactor():
+    """Lazy-init a pattern-only Redactor for the bypass path."""
+    global _progress_redactor
+    if _progress_redactor is None:
+        from providers.redaction import Redactor
+
+        _progress_redactor = Redactor()
+    return _progress_redactor
+
+
 def _emit_tool_progress_event(
     ticket_id: str,
     author: str,
     message: str,
 ) -> None:
-    """Append a tool_progress event directly to the JSONL event log."""
+    """Append a tool_progress event directly to the JSONL event log.
+
+    Applies pattern-only redaction (no value registry — the MCP
+    subprocess has no access to the orchestrator's secret registry).
+    """
     import json as _json
     from datetime import datetime, timezone
 
     from paths import LOG_DIR
+
+    redactor = _get_progress_redactor()
+    message = redactor.redact_string(ticket_id, message)
 
     log_dir = LOG_DIR
     path = log_dir / f"{ticket_id}.jsonl"

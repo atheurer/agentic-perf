@@ -182,9 +182,12 @@ def create_app() -> FastAPI:
     )
     app.state.auth_dependency = auth
 
-    audit_log = AuditLog()
+    from providers.redaction import Redactor
+
+    audit_redactor = Redactor()
+    audit_log = AuditLog(redactor=audit_redactor)
     app.state.audit_log = audit_log
-    app.state.event_bus = EventBus()
+    app.state.event_bus = EventBus(redactor=audit_redactor)
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,

@@ -66,6 +66,7 @@ class Dispatcher:
         user_store: UserStore | None = None,
         secrets_root: Path | None = None,
         vault_config: dict | None = None,
+        redactor: Any | None = None,
     ) -> None:
         self.store_url = state_store_url
         self.llm = llm_provider
@@ -79,6 +80,7 @@ class Dispatcher:
         self._user_store = user_store
         self._secrets_root = secrets_root
         self._vault_config = vault_config
+        self._redactor = redactor
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
@@ -218,6 +220,8 @@ class Dispatcher:
         self.stop_renewal(ticket_id)
         self.release_claim(ticket_id)
         self.clear_handoff_blocked(ticket_id)
+        if self._redactor:
+            self._redactor.deregister_ticket(ticket_id)
         # Note: introspection is NOT stopped here. It runs
         # across the full ticket lifecycle and self-stops on
         # terminal status. Stopping it on every agent handoff
@@ -310,36 +314,54 @@ class Dispatcher:
         If multi-user is configured and the ticket has a ``created_by``
         user, builds a per-user cascade (user → groups → shared).
         Otherwise returns the shared deployment secrets.
+
+        When a redactor is configured, the resolved provider is wrapped
+        in a RecordingSecretsProvider so that secret values are
+        automatically registered for redaction on access.
         """
+        provider: SecretsProvider | None
+
         if self._user_store is None or self._secrets_root is None:
-            return self.secrets
+            provider = self.secrets
+        elif ticket_data is None:
+            provider = self.secrets
+        else:
+            created_by = ticket_data.get("created_by", "")
+            if not created_by:
+                provider = self.secrets
+            else:
+                from state_store.identity import UserNotFound
 
-        if ticket_data is None:
-            return self.secrets
+                try:
+                    user = self._user_store.get_user(created_by)
+                except UserNotFound:
+                    logger.warning(
+                        "Ticket creator '%s' not found; using shared secrets",
+                        created_by,
+                    )
+                    provider = self.secrets
+                else:
+                    from providers.secrets.cascade import build_cascade_for_user
 
-        created_by = ticket_data.get("created_by", "")
-        if not created_by:
-            return self.secrets
+                    provider = build_cascade_for_user(
+                        username=user.username,
+                        groups=user.groups,
+                        secrets_root=self._secrets_root,
+                        vault_config=self._vault_config,
+                    )
 
-        from state_store.identity import UserNotFound
+        if provider is not None and self._redactor is not None:
+            ticket_id = (ticket_data or {}).get("id", "")
+            if ticket_id:
+                from providers.secrets.recording import RecordingSecretsProvider
 
-        try:
-            user = self._user_store.get_user(created_by)
-        except UserNotFound:
-            logger.warning(
-                "Ticket creator '%s' not found; using shared secrets",
-                created_by,
-            )
-            return self.secrets
+                return RecordingSecretsProvider(
+                    provider,
+                    self._redactor,
+                    ticket_id,
+                )
 
-        from providers.secrets.cascade import build_cascade_for_user
-
-        return build_cascade_for_user(
-            username=user.username,
-            groups=user.groups,
-            secrets_root=self._secrets_root,
-            vault_config=self._vault_config,
-        )
+        return provider
 
     def create_agent(
         self,
