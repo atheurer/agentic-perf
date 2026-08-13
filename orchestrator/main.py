@@ -1107,7 +1107,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     else:
         secrets = local_secrets
 
-    events = EventBus()
+    from providers.redaction import Redactor
+
+    redactor = Redactor()
+    events = EventBus(redactor=redactor)
 
     # Initialize OpenTelemetry LLM instrumentation.
     # Spans from the Anthropic/OpenAI SDKs are captured
@@ -1149,6 +1152,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         user_store=user_store,
         secrets_root=secrets_root,
         vault_config=vault_config,
+        redactor=redactor,
     )
 
     logger.info(

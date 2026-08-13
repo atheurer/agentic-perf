@@ -28,8 +28,13 @@ def get_actor() -> dict[str, str]:
 
 
 class AuditLog:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        redactor: Any | None = None,
+    ) -> None:
         self._path = path or AUDIT_LOG
+        self._redactor = redactor
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._fh: IO[str] | None = None
@@ -66,6 +71,8 @@ class AuditLog:
         data: dict[str, Any],
     ) -> None:
         with self._lock:
+            if self._redactor:
+                data = self._redactor.redact(ticket_id, data)
             self._seq += 1
             entry = {
                 "seq": self._seq,
