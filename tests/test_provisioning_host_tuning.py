@@ -330,6 +330,30 @@ class TestPinIrq:
         assert result["irq_numbers"] == [407, 408]
 
     @pytest.mark.asyncio
+    async def test_msi_irqs_filters_inactive_vectors(self):
+        """Regression test: msi_irqs/ lists all allocated MSI-X vectors but
+        many NICs (ConnectX, etc.) allocate far more than the driver uses.
+        Inactive vectors have no /proc/irq/N/ entry; smp_affinity writes fail.
+        Only vectors present in /proc/irq/ should be pinned."""
+        ssh = MockSSHExecutor(
+            results={
+                "msi_irqs": SSHResult(stdout="\n".join(str(i) for i in range(1306, 1370))),
+                "ls /proc/irq/": SSHResult(stdout="0\n1\n1306\n1307\n1308\n"),
+                "smp_affinity": SSHResult(stdout="", exit_code=0),
+                "IRQBALANCE_BANNED_INTERRUPTS": SSHResult(stdout=""),
+                "systemctl restart irqbalance": SSHResult(stdout="", exit_code=0),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", interface="eno16695np0", cpus=[192]
+        )
+        assert result["status"] == "ok"
+        assert result["irq_numbers"] == [1306, 1307, 1308]
+        assert len(result["assignments"]) == 3
+        assert not result["errors"]
+
+    @pytest.mark.asyncio
     async def test_falls_back_to_proc_interrupts_by_pci_when_msi_irqs_missing(self):
         ssh = MockSSHExecutor(
             results={

@@ -1614,7 +1614,15 @@ async def _discover_irqs(
     irq_numbers: list[int] = []
     if device_path:
         rm = await _ssh.run(host, f"ls {device_path}/msi_irqs/ 2>&1")
-        irq_numbers = sorted(int(tok) for tok in rm.stdout.split() if tok.isdigit())
+        candidates = sorted(int(tok) for tok in rm.stdout.split() if tok.isdigit())
+        if candidates:
+            # msi_irqs/ lists ALL allocated MSI-X vectors, including inactive
+            # ones the driver has not bound to a queue. Inactive vectors have
+            # no /proc/irq/N/ entry and smp_affinity writes fail against them.
+            # Filter to only vectors the kernel has created irq dirs for.
+            ra = await _ssh.run(host, "ls /proc/irq/ 2>/dev/null")
+            active = {int(tok) for tok in ra.stdout.split() if tok.isdigit()}
+            irq_numbers = sorted(n for n in candidates if n in active) if active else candidates
 
     if not irq_numbers and (interface or resolved_pci):
         ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
