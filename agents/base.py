@@ -60,6 +60,12 @@ class AgentBase(ABC):
     # arbitrary count.
     DEFAULT_MAX_ITERATIONS = 20
 
+    # Global ticket-wide iteration ceiling. Configurable
+    # via config.json global_max_iterations or env var
+    # GLOBAL_MAX_ITERATIONS. The orchestrator sets this
+    # on each agent; standalone usage keeps this default.
+    DEFAULT_GLOBAL_MAX_ITERATIONS = 100
+
     # Minimum seconds between tool calls. Prevents agents
     # from overwhelming hosts with rapid-fire SSH commands
     # or API calls. Configurable via config.json:
@@ -196,7 +202,9 @@ class AgentBase(ABC):
                 remaining_agent = max(
                     0, self.max_iterations - previous_agent_iterations
                 )
-                global_max = cf.get("global_max_iterations_override", 100)
+                global_max = cf.get(
+                    "global_max_iterations_override", self.DEFAULT_GLOBAL_MAX_ITERATIONS
+                )
                 remaining_global = max(0, global_max - previous_global_iterations)
                 messages.append(
                     {
@@ -252,7 +260,9 @@ class AgentBase(ABC):
                 )
 
                 # Check global ticket max iterations
-                global_max = cf.get("global_max_iterations_override", 100)
+                global_max = cf.get(
+                    "global_max_iterations_override", self.DEFAULT_GLOBAL_MAX_ITERATIONS
+                )
                 global_iterations = previous_global_iterations + (
                     iteration - previous_agent_iterations
                 )

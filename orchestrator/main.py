@@ -444,6 +444,9 @@ async def run_agent_task(
 
         dispatcher.set_agent(ticket_id, agent)
 
+        if config and hasattr(agent, "DEFAULT_GLOBAL_MAX_ITERATIONS"):
+            agent.DEFAULT_GLOBAL_MAX_ITERATIONS = config.global_max_iterations
+
         # Investigation tickets get unlimited iterations for
         # all agents — convergence gates and budget guardrails
         # handle termination, not arbitrary iteration caps.
@@ -488,20 +491,6 @@ async def run_agent_task(
                             f"LLM override for {ticket_id}:"
                             f" provider={llm_override.get('provider', '')}"
                             f" model={llm_override.get('model', '')}"
-                        )
-                    # Jumpstarter provisioning: flash + boot +
-                    # key injection should complete in ~15 tool
-                    # calls with structured context. Default
-                    # cap of 30 catches runaway loops.
-                    elif (
-                        status == "awaiting_provision"
-                        and cf.get("resource_provider") == "jumpstarter"
-                    ):
-                        from orchestrator.config import _load_config_file
-
-                        _jmp_cfg = _load_config_file().get("jumpstarter_images", {})
-                        agent.max_iterations = _jmp_cfg.get(
-                            "provisioning_max_iterations", 30
                         )
 
         except Exception:
@@ -1155,6 +1144,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         events,
         repo_cache=repo_cache,
         llm_factory=llm_factory,
+        iterations_factory=config.get_agent_max_iterations,
         instance_name=config.instance_name,
         user_store=user_store,
         secrets_root=secrets_root,

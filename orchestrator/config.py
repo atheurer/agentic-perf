@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from paths import CONFIG_PATH, get_instance_name
+
+logger = logging.getLogger(__name__)
 
 
 def _load_config_file() -> dict:
@@ -16,6 +19,13 @@ def _load_config_file() -> dict:
 
 
 class OrchestratorConfig:
+    _BUILTIN_AGENT_ITERATIONS: dict[str, int] = {
+        "review": 50,
+        "platform": 10,
+        "evaluating_convergence": 0,
+        "analyze": 0,
+    }
+
     _BUILTIN_AGENT_MODELS: dict[str, dict[str, str]] = {
         "triage": {"model": "claude-sonnet-4-6"},
         "evaluating_convergence": {"model": "claude-sonnet-4-6"},
@@ -121,6 +131,28 @@ class OrchestratorConfig:
             "ssh_key_vault_secret"
         )
         self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
+        self._agent_iterations: dict[str, int] = cfg.get("agent_iterations", {})
+
+        # Bridge legacy jumpstarter_images.provisioning_max_iterations
+        if "provisioning" not in self._agent_iterations:
+            legacy_val = cfg.get("jumpstarter_images", {}).get(
+                "provisioning_max_iterations",
+            )
+            if legacy_val is not None:
+                self._agent_iterations["provisioning"] = int(legacy_val)
+                logger.warning(
+                    "jumpstarter_images.provisioning_max_iterations is"
+                    " deprecated; use agent_iterations.provisioning instead"
+                )
+
+        self.global_max_iterations: int = int(
+            _env_or_cfg(
+                "GLOBAL_MAX_ITERATIONS",
+                cfg,
+                "global_max_iterations",
+                100,
+            )
+        )
         self._openai_api_key = os.environ.get("OPENAI_API_KEY")
         self._openai_base_url = os.environ.get("OPENAI_BASE_URL") or llm_cfg.get(
             "base_url"
@@ -231,6 +263,28 @@ class OrchestratorConfig:
         if agent_type in self._agent_models:
             base.update(self._agent_models[agent_type])
         return base
+
+    def get_agent_max_iterations(self, agent_type: str) -> int | None:
+        """Get max_iterations for an agent type.
+
+        Layers (first match wins):
+        1. agent_iterations.<agent_type>  — explicit per-agent config
+        2. agent_iterations.default       — explicit catch-all
+        3. _BUILTIN_AGENT_ITERATIONS      — built-in defaults
+        4. None                           — agent constructor default
+
+        Uses ``is not None`` checks so 0 (unlimited) is a valid value.
+        """
+        val = self._agent_iterations.get(agent_type)
+        if val is not None:
+            return int(val)
+        default_val = self._agent_iterations.get("default")
+        if default_val is not None:
+            return int(default_val)
+        builtin = self._BUILTIN_AGENT_ITERATIONS.get(agent_type)
+        if builtin is not None:
+            return builtin
+        return None
 
 
 def _env_or_cfg(

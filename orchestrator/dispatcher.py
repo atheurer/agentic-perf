@@ -61,6 +61,7 @@ class Dispatcher:
         event_bus: EventBus | None = None,
         repo_cache: RepoCache | None = None,
         llm_factory: Any | None = None,
+        iterations_factory: Any | None = None,
         instance_name: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         user_store: UserStore | None = None,
@@ -74,6 +75,7 @@ class Dispatcher:
         self.events = event_bus
         self.repo_cache = repo_cache
         self._llm_factory = llm_factory
+        self._iterations_factory = iterations_factory
         self._instance_name = instance_name or "unknown"
         self.lease_seconds = lease_seconds
         self._user_store = user_store
@@ -352,16 +354,17 @@ class Dispatcher:
 
         llm = self._get_llm(agent_type)
         ticket_secrets = self._get_secrets_for_ticket(ticket_data)
+        agent: Any = None
 
         if agent_type == "triage":
-            return TriageAgent(
+            agent = TriageAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
                 event_bus=self.events,
             )
         elif agent_type == "resource_create":
-            return ResourceAgent(
+            agent = ResourceAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="create",
@@ -372,13 +375,13 @@ class Dispatcher:
         elif agent_type == "platform":
             from agents.platform import PlatformAgent
 
-            return PlatformAgent(
+            agent = PlatformAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
         elif agent_type == "provisioning":
-            return ProvisioningAgent(
+            agent = ProvisioningAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
@@ -386,7 +389,7 @@ class Dispatcher:
                 event_bus=self.events,
             )
         elif agent_type == "benchmark":
-            return BenchmarkAgent(
+            agent = BenchmarkAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
@@ -395,7 +398,7 @@ class Dispatcher:
                 repo_cache=self.repo_cache,
             )
         elif agent_type == "review":
-            return ReviewAgent(
+            agent = ReviewAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 skill_provider=self.skills,
@@ -403,7 +406,7 @@ class Dispatcher:
                 repo_cache=self.repo_cache,
             )
         elif agent_type == "resource_teardown":
-            return ResourceAgent(
+            agent = ResourceAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 mode="teardown",
@@ -412,56 +415,55 @@ class Dispatcher:
                 instance_name=self._instance_name,
             )
         elif agent_type == "retrospective":
-            return RetrospectiveAgent(
+            agent = RetrospectiveAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
-
-        # Analysis agent (data-first investigation)
-        if agent_type == "analyze":
+        elif agent_type == "analyze":
             from agents.analyze.agent import AnalyzeAgent
 
-            return AnalyzeAgent(
+            agent = AnalyzeAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
-
-        # Gathering context agent (dedup gate)
-        if agent_type == "gathering_context":
-            return GatheringContextAgent(
+        elif agent_type == "gathering_context":
+            agent = GatheringContextAgent(
                 llm_provider=self.llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
-
-        # Evaluating convergence agent
-        if agent_type == "evaluating_convergence":
-            return EvaluateAgent(
+        elif agent_type == "evaluating_convergence":
+            agent = EvaluateAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
-
-        # Synthesizing results agent
-        if agent_type == "synthesizing_results":
-            return SynthesisAgent(
+        elif agent_type == "synthesizing_results":
+            agent = SynthesisAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
+        else:
+            stub_targets = {
+                "planning_investigation": "awaiting_hardware",
+            }
+            if agent_type in stub_targets:
+                agent = StubAgent(
+                    agent_name=f"{agent_type}-agent",
+                    target_status=stub_targets[agent_type],
+                    state_store_url=self.store_url,
+                )
 
-        # Remaining investigation loop agents (stubs until
-        # full implementations land in later issues)
-        stub_targets = {
-            "planning_investigation": "awaiting_hardware",
-        }
-        if agent_type in stub_targets:
-            return StubAgent(
-                agent_name=f"{agent_type}-agent",
-                target_status=stub_targets[agent_type],
-                state_store_url=self.store_url,
+        if agent is not None and hasattr(agent, "max_iterations"):
+            resolved = (
+                self._iterations_factory(agent_type)
+                if self._iterations_factory
+                else None
             )
+            if resolved is not None:
+                agent.max_iterations = resolved
 
-        return None
+        return agent

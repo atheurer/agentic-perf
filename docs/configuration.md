@@ -207,6 +207,80 @@ This override is cleared after the agent completes.
 
 ---
 
+### `agent_iterations` — Per-Agent Iteration Limits
+
+Override the maximum LLM iterations for specific agent types. This
+lets you tune iteration budgets without changing code — for example,
+raising the review agent's budget for complex analyses or lowering
+provisioning's budget for quick tasks.
+
+```json
+{
+    "agent_iterations": {
+        "review": 75,
+        "benchmark": 40,
+        "provisioning": 30
+    }
+}
+```
+
+**Resolution order** (first match wins):
+1. `agent_iterations.<agent_type>` — explicit per-agent config
+2. `agent_iterations.default` — explicit catch-all
+3. Built-in agent defaults (see table below)
+4. Agent constructor default (20)
+
+A value of **0 means unlimited** — termination is then driven by
+convergence gates, cost guardrails, or HITL intervention rather
+than an arbitrary count. Use `is not None` semantics internally
+so 0 is treated as a valid value, not as missing.
+
+#### Built-in Agent Defaults
+
+These apply when no `agent_iterations` configuration is present:
+
+| Agent type | Default iterations | Rationale |
+|---|---|---|
+| `review` | 50 | Heavy analysis with multi-metric interpretation |
+| `platform` | 10 | Deterministic SDK-driven provisioning |
+| `evaluating_convergence` | 0 (unlimited) | Convergence gates handle termination |
+| `analyze` | 0 (unlimited) | Investigation depth varies by ticket |
+| *(all others)* | 20 | Base default from `AgentBase` |
+
+#### `global_max_iterations` — Ticket-Wide Ceiling
+
+A hard ceiling on total LLM iterations across all agents for a
+single ticket. Prevents runaway tickets from consuming unbounded
+resources.
+
+| Field | Type | Default | Env override |
+|---|---|---|---|
+| `global_max_iterations` | int | `100` | `GLOBAL_MAX_ITERATIONS` |
+
+Individual tickets can override this via
+`custom_fields.global_max_iterations_override`.
+
+#### Per-Ticket Runtime Override
+
+Individual tickets can override the per-agent limit at runtime via
+`custom_fields.max_iterations_override`. This takes precedence over
+both config and built-in defaults:
+
+```bash
+curl -X PATCH .../api/v1/tickets/PERF-123 \
+  -d '{"custom_fields": {"max_iterations_override": 200}}'
+```
+
+The override is cleared after the agent completes.
+
+#### Migration Note
+
+The `jumpstarter_images.provisioning_max_iterations` config key is
+superseded by `agent_iterations.provisioning`. The built-in default
+for provisioning (30) matches the previous jumpstarter default.
+
+---
+
 ### `state_store` — State Store Connection
 
 | Field | Type | Default | Env override | Description |
@@ -333,8 +407,7 @@ provisioning.
 ```json
 {
     "jumpstarter_images": {
-        "server": "https://autosd.sig.centos.org/",
-        "provisioning_max_iterations": 30
+        "server": "https://autosd.sig.centos.org/"
     }
 }
 ```
@@ -343,7 +416,10 @@ provisioning.
 |---|---|---|---|
 | `server` | string | `"https://autosd.sig.centos.org/"` | Base URL of the OS image build server |
 | `image_version` | string | — | Default OS image version (e.g., `AutoSD-10`). If not set, must be specified per-ticket via `directives.image_version`. |
-| `provisioning_max_iterations` | int | `30` | Maximum LLM iterations for the provisioning agent on Jumpstarter tickets. |
+
+> **Note:** `provisioning_max_iterations` was previously supported
+> here. Use `agent_iterations.provisioning` instead (see
+> [agent_iterations](#agent_iterations--per-agent-iteration-limits)).
 
 Jumpstarter also requires:
 - **Secrets:** `~/.agentic-perf/secrets/jumpstarter/config.json` with `{"client_name": "<name>"}` matching the jmp CLI client config.
