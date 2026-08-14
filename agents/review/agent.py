@@ -362,11 +362,17 @@ class ReviewAgent(AgentBase):
                 for fn in top_level:
                     content += f"- `{fn}`\n"
                 if nested:
-                    content += f"\nPer-sample files ({len(nested)} files):\n"
+                    content += f"\nPer-sample files ({len(nested)} total):\n"
                     for fn in nested[:10]:
                         content += f"- `{fn}`\n"
                     if len(nested) > 10:
-                        content += f"- ... and {len(nested) - 10} more\n"
+                        content += (
+                            f"- ... and "
+                            f"{len(nested) - 10} more "
+                            f"— use "
+                            f"`list_benchmark_artifacts` "
+                            f"to see all files\n"
+                        )
 
         harness = cf.get("harness_name") or cf.get("directives", {}).get(
             "harness", "crucible"
