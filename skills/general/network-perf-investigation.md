@@ -14,16 +14,46 @@ which host is the bottleneck?
 
 ## Step 2: Find the bottleneck CPU
 
-Use procstat or mpstat with `hostname+cpu` breakouts to get
-per-CPU utilization. Look for:
+Use mpstat with `hostname,num` breakout to get per-CPU utilization.
+**The mpstat CPU number breakout dimension is called `num`, NOT `cpu`.**
+Using `cpu` with mpstat returns no breakout data — the query silently
+aggregates and the per-CPU information is lost.
 
+**Two-step pattern — always start with ranking, then drill into type:**
+
+Step 1 — rank active CPUs (do this first):
+```
+crucible get metric --period <ID> --source mpstat --type Busy-CPU \
+  --breakout hostname,num
+```
+
+Step 2 — for the hot CPUs only, add `type` to see work breakdown:
+```
+crucible get metric --period <ID> --source mpstat --type Busy-CPU \
+  --breakout hostname,num,type --filter 'num=<hot_cpu>'
+```
+
+Adding `type` upfront splits each CPU into 4+ rows and makes it hard
+to spot the busiest cores. Always rank first.
+
+**Work types to look for (Step 2):**
+- **usr** — user-space application (uperf, benchmark process)
 - **sys (kernel) time** — TCP stack processing, socket operations
 - **soft (softirq) time** — NIC NAPI polling, packet processing
 - **irq (hardirq) time** — NIC interrupt handler
 
+**Note:** procstat uses `cpu` as its breakout dimension — that is
+correct for procstat. Only mpstat uses `num`.
+
 For single-stream TCP, expect one CPU dominated by sys (the
 application's kernel receive/send path) and one CPU dominated
 by soft (the NIC's RX/TX softirq processing).
+
+**Available mpstat topology breakouts:** `package`, `die`, `core`,
+`thread`, `num`. A `node` (NUMA node) breakout does not yet exist in
+CDM — map CPU numbers to NUMA nodes via host inventory or sysfs
+(`/sys/devices/system/node/nodeN/cpulist`). Tracked in
+perftool-incubator/tool-sysstat#68.
 
 ## Step 3: Time-resolved CPU analysis
 
@@ -59,19 +89,38 @@ NUMA locality conclusions.
 
 ## Step 4: IRQ destination and NUMA locality
 
-Use procstat `interrupts-sec` with `hostname+irq+cpu` breakouts
-to find which CPUs process NIC interrupts. Additionally use the
-`package` breakout (which maps to NUMA node) to verify locality.
+Use procstat `interrupts-sec` with `hostname,irq,cpu` breakouts
+to find which CPUs process NIC interrupts. Note: for **procstat**,
+the CPU breakout dimension is `cpu`; for **mpstat**, it is `num`.
+Additionally use the `package` breakout (which maps to socket/NUMA
+node) to verify locality.
 
 **Key checks:**
 - Is the NIC on the same NUMA node as the IRQ-processing CPUs?
   Check: `cat /sys/class/net/<iface>/device/numa_node`
 - Is the application process on the same NUMA node as the NIC?
-  For single-thread tests, the process CPU is the one with all
-  the sys time — no need to hunt for the PID.
+  Find the CPU with high `usr` time (mpstat `hostname,num` breakout)
+  and verify it falls in the NIC's NUMA node CPU range.
 - Cross-NUMA traffic (NIC on one node, application on another)
   adds significant latency on AMD EPYC (Infinity Fabric) and
   Intel Xeon (UPI) platforms.
+
+**NUMA locality assessment — always check these three things:**
+
+1. NIC NUMA node: `cat /sys/class/net/<iface>/device/numa_node`
+2. IRQ-processing CPUs: procstat `interrupts-sec` with
+   `hostname,irq,cpu` breakout — confirm CPUs match the NIC's node
+3. Application CPUs: mpstat `Busy-CPU` with `hostname,num` breakout —
+   CPU(s) with high `usr` time are where the benchmark runs; confirm
+   they are in the NIC's NUMA node range
+
+**Tool overhead caveat:** Tools like bpftrace (used by the `bpf`
+subtool) run unpinned and may land on NUMA-0 CPUs even when the
+benchmark is correctly pinned to another NUMA node. At high packet
+rates (>100G), bpftrace aggregation threads can saturate a single
+core. If a NUMA-0 CPU is at 100% but pidstat shows it is `bpftrace`
+(not the benchmark binary), tool overhead is the cause — not a
+cross-NUMA placement bug. Tracked in perftool-incubator/tool-bpf#6.
 
 **irqbalance migration:**
 - If IRQ destinations differ between samples, irqbalance is
