@@ -87,6 +87,8 @@ class Dispatcher:
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._handoff_blocked: set[tuple[str, str]] = set()
+        self._quota_blocked: set[str] = set()
+        self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
 
@@ -192,6 +194,22 @@ class Dispatcher:
             (t, s) for t, s in self._handoff_blocked if t != ticket_id
         }
 
+    def is_quota_blocked(self, ticket_id: str) -> bool:
+        return ticket_id in self._quota_blocked
+
+    def mark_quota_blocked(self, ticket_id: str) -> None:
+        self._quota_blocked.add(ticket_id)
+
+    def clear_quota_blocked(self, ticket_id: str) -> None:
+        self._quota_blocked.discard(ticket_id)
+        self._quota_warned.discard(ticket_id)
+
+    def is_quota_warned(self, ticket_id: str) -> bool:
+        return ticket_id in self._quota_warned
+
+    def mark_quota_warned(self, ticket_id: str) -> None:
+        self._quota_warned.add(ticket_id)
+
     def stop_agent(self, ticket_id: str, mode: str = "graceful") -> bool:
         self.stop_introspection(ticket_id)
         if mode == "graceful":
@@ -224,6 +242,9 @@ class Dispatcher:
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
+        self.clear_quota_blocked(ticket_id)
+        if self.events is not None:
+            self.events.unregister_ticket_owner(ticket_id)
         # Note: introspection is NOT stopped here. It runs
         # across the full ticket lifecycle and self-stops on
         # terminal status. Stopping it on every agent handoff

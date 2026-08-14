@@ -29,6 +29,20 @@ _USERNAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 DEFAULT_USERS_PATH = AGENTIC_PERF_HOME / "users.json"
 
 
+try:
+    from providers.quota import UserQuota
+except ImportError:
+
+    class UserQuota(BaseModel):  # type: ignore[no-redef]
+        """Fallback when providers.quota is not importable."""
+
+        max_cost_usd_24h: float = 0.0
+        max_cost_usd_7d: float = 0.0
+        max_tokens_24h: int = 0
+        max_tokens_7d: int = 0
+        enforce: bool = False
+
+
 class User(BaseModel):
     username: str
     token_hash: str
@@ -43,6 +57,7 @@ class User(BaseModel):
     service_account: bool = False
     allowed_sources: list[str] = Field(default_factory=list)  # IP/CIDR
     max_requests_per_hour: int | None = None
+    llm_quota: UserQuota | None = None
 
 
 class Group(BaseModel):
@@ -51,6 +66,7 @@ class Group(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )
+    llm_quota: UserQuota | None = None
 
 
 def validate_username(username: str) -> str:
@@ -238,9 +254,39 @@ class UserStore:
                         exc_info=True,
                     )
 
+    def set_user_quota(
+        self,
+        username: str,
+        quota: UserQuota | None,
+    ) -> User:
+        """Set or clear a user's LLM quota."""
+        normalized = username.lower()
+        with self._lock:
+            user = self._users.get(normalized)
+            if user is None:
+                raise UserNotFound(f"User '{username}' not found")
+            user.llm_quota = quota
+            self._save()
+            return user.model_copy()
+
     # ------------------------------------------------------------------
     # Group operations
     # ------------------------------------------------------------------
+
+    def set_group_quota(
+        self,
+        group_name: str,
+        quota: UserQuota | None,
+    ) -> Group:
+        """Set or clear a group's LLM quota."""
+        normalized = group_name.lower()
+        with self._lock:
+            group = self._groups.get(normalized)
+            if group is None:
+                raise GroupNotFound(f"Group '{group_name}' not found")
+            group.llm_quota = quota
+            self._save()
+            return group.model_copy()
 
     def create_group(self, name: str, description: str = "") -> Group:
         normalized = name.lower()

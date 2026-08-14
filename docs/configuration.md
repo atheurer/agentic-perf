@@ -299,6 +299,79 @@ for provisioning (30) matches the previous jumpstarter default.
 Per-ticket budgets are set via `custom_fields.llm_budget` on
 individual tickets — see [Architecture](architecture.md) for details.
 
+#### Per-User / Per-Group Quotas (multi-user mode)
+
+In multi-user mode, per-user and per-group quotas prevent one
+user's workload from consuming the entire deployment budget.
+
+```json
+{
+    "llm_budget": {
+        "session_cost_usd": 50.00,
+        "default_user_quota": {
+            "max_cost_usd_24h": 10.00,
+            "max_cost_usd_7d": 50.00,
+            "max_tokens_24h": 0,
+            "max_tokens_7d": 0,
+            "enforce": false
+        },
+        "default_group_quota": {
+            "max_cost_usd_24h": 50.00,
+            "enforce": false
+        }
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `default_user_quota` | object | none | Default quota applied to users without an explicit per-user quota. |
+| `default_group_quota` | object | none | Default quota applied to groups without an explicit per-group quota. |
+
+**Quota fields** (all optional, zero = no limit):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `max_cost_usd_24h` | float | `0` | Max LLM cost in a rolling 24-hour window. |
+| `max_cost_usd_7d` | float | `0` | Max LLM cost in a rolling 7-day window. |
+| `max_tokens_24h` | int | `0` | Max total tokens in a rolling 24-hour window. |
+| `max_tokens_7d` | int | `0` | Max total tokens in a rolling 7-day window. |
+| `enforce` | bool | `false` | When false, violations are logged and commented but never block dispatch (warn-only mode). Set true for hard enforcement. |
+
+Per-user quotas can also be set via the API:
+
+```bash
+curl -X PUT .../api/v1/users/alice/quota \
+  -d '{"max_cost_usd_24h": 10.0, "enforce": false}'
+```
+
+**Enforcement points:**
+
+1. **Pre-dispatch** — over-quota tickets are skipped (not blocked).
+   Other users' tickets continue processing.
+2. **In-loop** — secondary check bounds overshoot between dispatch
+   cycles.
+3. **Creation-time advisory** — warns at ticket creation if the
+   user is already over quota.
+
+**Semantics:** user AND group quotas must both pass. Multi-group
+uses AND semantics (all groups must be within limits). Service
+accounts are exempt by default but an explicitly-set quota is
+honored.
+
+**Usage ledger:** quota accounting uses a separate daily JSONL
+ledger (`~/.agentic-perf/logs/usage-ledger-YYYY-MM-DD.jsonl`),
+not the per-ticket event logs. This survives ticket archival and
+avoids the event scan truncation limit.
+
+**Known limitation:** dispatch-time checks cannot stop running
+agents. Overshoot is bounded by `max_concurrent_agents ×
+per-ticket budget`. Introspection spend charges the ticket
+creator.
+
+**Legacy mode:** quotas are a no-op when `multi_user` is false
+(`created_by` is always empty).
+
 ---
 
 ### `introspection` — Introspection Agent

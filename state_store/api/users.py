@@ -17,6 +17,7 @@ from state_store.auth import (
 from state_store.identity import (
     DuplicateUser,
     UserNotFound,
+    UserQuota,
     UserStore,
 )
 
@@ -127,6 +128,32 @@ def revoke_admin(username: str, request: Request):
     store = _get_store(request)
     try:
         user = store.remove_admin(username)
+    except UserNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return UserStore.to_safe_dict(user)
+
+
+@router.put("/{username}/quota")
+def set_user_quota(username: str, body: UserQuota, request: Request):
+    """Set a user's LLM budget quota (admin-only)."""
+    principal = _get_principal(request)
+    require_admin(principal)
+    store = _get_store(request)
+    try:
+        user = store.set_user_quota(username, body)
+    except UserNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return UserStore.to_safe_dict(user)
+
+
+@router.delete("/{username}/quota")
+def clear_user_quota(username: str, request: Request):
+    """Clear a user's LLM budget quota (admin-only)."""
+    principal = _get_principal(request)
+    require_admin(principal)
+    store = _get_store(request)
+    try:
+        user = store.set_user_quota(username, None)
     except UserNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return UserStore.to_safe_dict(user)

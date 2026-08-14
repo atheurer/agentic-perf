@@ -992,12 +992,14 @@ class AgentBase(ABC):
         )
 
     async def _check_budget(self, ticket_id: str) -> str:
-        """Check per-ticket LLM budget.
+        """Check per-ticket LLM budget and per-user quota.
 
         Returns 'ok', 'warn', or 'pause'. On 'pause', the agent
         transitions the ticket to awaiting_customer_guidance so
         the user can decide to increase the budget or abort.
         """
+        result = "ok"
+
         try:
             from orchestrator.config import _load_config_file
             from providers.budget import (
@@ -1011,58 +1013,127 @@ class AgentBase(ABC):
             cf = ticket.get("custom_fields", {})
             config = _load_config_file()
             budget = budget_from_custom_fields(cf, config)
-            if budget is None:
-                return "ok"
+            if budget is not None:
+                assert self._events is not None
+                usage = self._events.get_cumulative_usage(ticket_id)
+                cost = estimate_cumulative_cost(usage)
+                status = check_ticket_budget(budget, usage, cost)
 
-            assert self._events is not None
-            usage = self._events.get_cumulative_usage(ticket_id)
-            cost = estimate_cumulative_cost(usage)
-            status = check_ticket_budget(budget, usage, cost)
+                if status.action == BudgetAction.PAUSE:
+                    self._emit(
+                        ticket_id,
+                        "agent_error",
+                        {
+                            "reason": "budget_exceeded",
+                            "detail": status.reason,
+                        },
+                    )
+                    logger.warning(
+                        f"[{self.agent_name}] Budget exceeded on"
+                        f" {ticket_id}: {status.reason}"
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Budget exceeded:** {status.reason}\n\n"
+                        f"Ticket paused. Increase the budget in "
+                        f"custom_fields.llm_budget or approve "
+                        f"continued spending.",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=f"Budget exceeded: {status.reason}",
+                    )
+                    return "pause"
 
-            if status.action == BudgetAction.PAUSE:
-                self._emit(
-                    ticket_id,
-                    "agent_error",
-                    {
-                        "reason": "budget_exceeded",
-                        "detail": status.reason,
-                    },
-                )
-                logger.warning(
-                    f"[{self.agent_name}] Budget exceeded on"
-                    f" {ticket_id}: {status.reason}"
-                )
-                await self._add_comment(
-                    ticket_id,
-                    f"**Budget exceeded:** {status.reason}\n\n"
-                    f"Ticket paused. Increase the budget in "
-                    f"custom_fields.llm_budget or approve "
-                    f"continued spending.",
-                )
-                await self._transition_ticket(
-                    ticket_id,
-                    "awaiting_customer_guidance",
-                    comment=f"Budget exceeded: {status.reason}",
-                )
-                return "pause"
-
-            if status.action == BudgetAction.WARN:
-                logger.info(
-                    f"[{self.agent_name}] Budget warning on"
-                    f" {ticket_id}: {status.reason}"
-                )
-                await self._add_comment(
-                    ticket_id,
-                    f"**Budget warning:** {status.reason}",
-                )
-                return "warn"
+                if status.action == BudgetAction.WARN:
+                    logger.info(
+                        f"[{self.agent_name}] Budget warning on"
+                        f" {ticket_id}: {status.reason}"
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Budget warning:** {status.reason}",
+                    )
+                    result = "warn"
 
         except ImportError:
             pass
         except Exception:
             logger.exception(f"[{self.agent_name}] Budget check failed")
 
-        return "ok"
+        # Per-user quota check (secondary in-loop enforcement
+        # to bound overshoot between dispatch cycles).  Runs
+        # independently of per-ticket budget so it is never
+        # bypassed by a missing ticket-level budget config.
+        try:
+            if self._events is not None:
+                ledger = getattr(self._events, "_usage_ledger", None)
+                if ledger is not None:
+                    ticket = await self._get_ticket(ticket_id)
+                    created_by = ticket.get("created_by", "")
+                    if created_by:
+                        from orchestrator.config import _load_config_file
+                        from providers.quota import (
+                            check_user_quota,
+                            resolve_quota_inputs,
+                        )
+
+                        config = _load_config_file()
+                        user_store = getattr(
+                            self,
+                            "_user_store",
+                            None,
+                        )
+                        if user_store is None:
+                            user_store = getattr(
+                                self._events,
+                                "_user_store",
+                                None,
+                            )
+
+                        if user_store is not None:
+                            uq, gqs, is_svc = resolve_quota_inputs(
+                                created_by,
+                                user_store,
+                                config,
+                            )
+                            quota_result = check_user_quota(
+                                created_by,
+                                uq,
+                                gqs,
+                                ledger,
+                                is_service_account=is_svc,
+                            )
+                        else:
+                            from providers.quota import quota_from_config
+
+                            default_quota = quota_from_config(config)
+                            quota_result = check_user_quota(
+                                created_by,
+                                default_quota,
+                                None,
+                                ledger,
+                            )
+
+                        if quota_result.exceeded and not quota_result.warn_only:
+                            reason_text = "; ".join(quota_result.reasons)
+                            logger.warning(
+                                f"[{self.agent_name}] User quota exceeded "
+                                f"for {created_by}: {reason_text}"
+                            )
+                            await self._add_comment(
+                                ticket_id,
+                                f"**User quota exceeded:** {reason_text}\n\n"
+                                f"Agent pausing for quota reset.",
+                            )
+                            return "pause"
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(f"[{self.agent_name}] User quota check failed")
+
+        return result
 
     async def _get_investigation_ledger(
         self,
