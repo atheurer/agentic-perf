@@ -345,17 +345,28 @@ class ReviewAgent(AgentBase):
                     ]
                 except OSError:
                     files = []
+                # Show top-level files first (metadata,
+                # merged results, serial capture), then
+                # a sample of per-sample files.
+                top_level = [f for f in files if "/" not in f]
+                nested = [f for f in files if "/" in f]
                 content += (
                     f"\n## Local Artifacts\n"
-                    f"Results are stored locally at `{output_dir}`.\n"
-                    f"Use `read_benchmark_artifact` with this "
-                    f"output_dir to read files. Do NOT use SSH.\n"
-                    f"\nAvailable files ({len(files)}):\n"
+                    f"Results are stored locally at "
+                    f"`{output_dir}`.\n"
+                    f"Use `read_benchmark_artifact` with "
+                    f"this output_dir to read files. "
+                    f"Do NOT use SSH.\n"
+                    f"\nTop-level files:\n"
                 )
-                for fn in files[:30]:
+                for fn in top_level:
                     content += f"- `{fn}`\n"
-                if len(files) > 30:
-                    content += f"- ... and {len(files) - 30} more\n"
+                if nested:
+                    content += f"\nPer-sample files ({len(nested)} files):\n"
+                    for fn in nested[:10]:
+                        content += f"- `{fn}`\n"
+                    if len(nested) > 10:
+                        content += f"- ... and {len(nested) - 10} more\n"
 
         harness = cf.get("harness_name") or cf.get("directives", {}).get(
             "harness", "crucible"
