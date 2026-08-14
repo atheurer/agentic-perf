@@ -435,13 +435,29 @@ class TriageAgent(AgentBase):
         # Preserve user-provided directives that triage
         # didn't set. The user may have specified
         # image_version or other operational parameters
-        # in the ticket's custom_fields.directives.
+        # in the ticket's custom_fields.
+        # User directives take precedence over triage's
+        # — triage fills gaps, doesn't override.
+        # Also check top-level custom_fields for directives
+        # that the user set outside the directives dict
+        # (e.g., image_version, system_config).
         ticket = await self._get_ticket(ticket_id)
-        user_directives = ticket.get("custom_fields", {}).get("directives", {})
+        cf = ticket.get("custom_fields", {})
+        user_directives = cf.get("directives", {})
         if user_directives:
-            merged = dict(user_directives)
-            merged.update(directives)
+            merged = dict(directives)
+            merged.update(user_directives)
             directives = merged
+        # Promote top-level custom_fields that belong
+        # in directives but weren't placed there by
+        # the ticket creator.
+        _PROMOTABLE = (
+            "image_version",
+            "serial_capture",
+        )
+        for key in _PROMOTABLE:
+            if key in cf and key not in directives:
+                directives[key] = cf[key]
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
