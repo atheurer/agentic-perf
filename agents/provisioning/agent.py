@@ -118,6 +118,166 @@ class ProvisioningAgent(AgentBase):
         }
     )
 
+    async def _apply_system_config(
+        self,
+        ticket_id: str,
+        hosts: list[str],
+        config_ops: list[dict[str, Any]],
+        cf: dict[str, Any],
+    ) -> None:
+        """Apply structured system configuration operations.
+
+        Runs deterministic operations on provisioned hosts
+        before the benchmark starts. No LLM involved — code
+        executes each operation directly via SSH.
+
+        Supported actions:
+            write_file: Write content to a file on the host
+            run_command: Execute a shell command on the host
+        """
+        import asyncio as _asyncio
+
+        ssh_user = cf.get("ssh_user", "root")
+        ssh_password = cf.get("ssh_password", "password")
+
+        async def _ssh_run(
+            host: str,
+            cmd: str,
+            timeout: int = 30,
+        ) -> tuple[int, str, str]:
+            """Run a command via sshpass for password auth."""
+            proc = await _asyncio.create_subprocess_exec(
+                "sshpass",
+                "-p",
+                ssh_password,
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                f"{ssh_user}@{host}",
+                cmd,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await _asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
+            return (
+                proc.returncode or 0,
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+            )
+
+        # Use first host (controller) for config
+        host = hosts[0] if hosts else None
+        if not host:
+            logger.warning(f"[provisioning] {ticket_id}: no hosts for system_config")
+            return
+
+        # Strip jumpstarter: prefix if present
+        if host.startswith("jumpstarter:"):
+            # Resolve via ticket's assigned IPs
+            assigned = cf.get(
+                "assigned_hardware_ips",
+                {},
+            )
+            host = assigned.get("controller", host)
+            if host.startswith("jumpstarter:"):
+                logger.warning(
+                    f"[provisioning] {ticket_id}: cannot "
+                    f"resolve jumpstarter host for "
+                    f"system_config"
+                )
+                return
+
+        applied: list[str] = []
+        errors: list[str] = []
+
+        for i, op in enumerate(config_ops):
+            action = op.get("action", "")
+            try:
+                if action == "write_file":
+                    path = op.get("path", "")
+                    content = op.get("content", "")
+                    if not path:
+                        errors.append(f"Op {i}: write_file missing path")
+                        continue
+                    # Create parent directory
+                    mkdir_cmd = f"mkdir -p $(dirname '{path}')"
+                    await _ssh_run(
+                        host,
+                        mkdir_cmd,
+                        timeout=10,
+                    )
+                    # Write file via heredoc
+                    write_cmd = (
+                        f"cat > '{path}' << 'SYSCONFIG_EOF'\n{content}\nSYSCONFIG_EOF"
+                    )
+                    rc, out, err = await _ssh_run(
+                        host,
+                        write_cmd,
+                        timeout=10,
+                    )
+                    if rc == 0:
+                        applied.append(f"write_file: {path}")
+                        logger.info(f"[provisioning] {ticket_id}: wrote {path}")
+                    else:
+                        errors.append(f"Op {i}: write_file {path} failed: {err}")
+
+                elif action == "run_command":
+                    command = op.get("command", "")
+                    if not command:
+                        errors.append(f"Op {i}: run_command missing command")
+                        continue
+                    timeout = op.get("timeout", 30)
+                    rc, out, err = await _ssh_run(
+                        host,
+                        command,
+                        timeout=timeout,
+                    )
+                    if rc == 0:
+                        applied.append(f"run_command: {command}")
+                        logger.info(f"[provisioning] {ticket_id}: ran: {command}")
+                    else:
+                        errors.append(
+                            f"Op {i}: run_command '{command}' failed (exit {rc}): {err}"
+                        )
+
+                else:
+                    errors.append(f"Op {i}: unknown action '{action}'")
+
+            except Exception as e:
+                errors.append(f"Op {i}: {action} error: {e}")
+
+        # Report results
+        summary_parts = []
+        if applied:
+            summary_parts.append(
+                "**System Configuration Applied:**\n"
+                + "\n".join(f"- {a}" for a in applied)
+            )
+        if errors:
+            summary_parts.append(
+                "**System Configuration Errors:**\n"
+                + "\n".join(f"- {e}" for e in errors)
+            )
+        if summary_parts:
+            await self._add_comment(
+                ticket_id,
+                "\n\n".join(summary_parts),
+            )
+
+        # Store applied config on the ticket
+        await self._update_fields(
+            ticket_id,
+            {
+                "system_config_applied": applied,
+                "system_config_errors": errors,
+            },
+        )
+
     async def _auto_complete_jumpstarter(
         self,
         ticket_id: str,
@@ -205,9 +365,27 @@ class ProvisioningAgent(AgentBase):
         if is_jumpstarter and (not harness or harness in self._SELF_INSTALLING):
             # Platform agent already provisioned the
             # board. For self-installing harnesses,
-            # there's nothing more to do.
+            # there's nothing more to do — unless
+            # system_config directives require post-
+            # flash configuration.
             if cf.get("platform_ready") and cf.get("hosts_provisioned"):
-                await self._auto_complete_jumpstarter(ticket_id, cf)
+                directives = cf.get("directives", {})
+                system_config = directives.get(
+                    "system_config",
+                    [],
+                )
+                if system_config:
+                    hosts = cf["hosts_provisioned"]
+                    await self._apply_system_config(
+                        ticket_id,
+                        hosts,
+                        system_config,
+                        cf,
+                    )
+                await self._auto_complete_jumpstarter(
+                    ticket_id,
+                    cf,
+                )
                 await mcp.disconnect()
                 self._mcp = None
                 return
