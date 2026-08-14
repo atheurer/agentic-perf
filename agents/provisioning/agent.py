@@ -370,9 +370,8 @@ class ProvisioningAgent(AgentBase):
             # flash configuration.
             if cf.get("platform_ready") and cf.get("hosts_provisioned"):
                 directives = cf.get("directives", {})
-                system_config = directives.get(
-                    "system_config",
-                    [],
+                system_config = directives.get("system_config", []) or cf.get(
+                    "system_config", []
                 )
                 if system_config:
                     hosts = cf["hosts_provisioned"]
