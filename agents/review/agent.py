@@ -359,8 +359,10 @@ class ReviewAgent(AgentBase):
                     f"Do NOT use SSH.\n"
                     f"\nTop-level files:\n"
                 )
-                for fn in top_level:
+                for fn in top_level[:20]:
                     content += f"- `{fn}`\n"
+                if len(top_level) > 20:
+                    content += f"- ... and {len(top_level) - 20} more top-level files\n"
                 if nested:
                     content += f"\nPer-sample files ({len(nested)} total):\n"
                     for fn in nested[:10]:
