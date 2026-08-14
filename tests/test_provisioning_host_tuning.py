@@ -285,7 +285,9 @@ class TestPinIrq:
             host="10.0.0.1", interface="ens1f0np0", cpus=[2]
         )
         assert result["status"] == "ok"
-        affinity_writes = [c for c in commands_run if "smp_affinity_list" in c and "echo" in c]
+        affinity_writes = [
+            c for c in commands_run if "smp_affinity_list" in c and "echo" in c
+        ]
         assert len(affinity_writes) == 1
         assert "echo 2 >" in affinity_writes[0]
         assert "smp_affinity_list" in affinity_writes[0]
@@ -349,7 +351,9 @@ class TestPinIrq:
         Only vectors present in /proc/irq/ should be pinned."""
         ssh = MockSSHExecutor(
             results={
-                "msi_irqs": SSHResult(stdout="\n".join(str(i) for i in range(1306, 1370))),
+                "msi_irqs": SSHResult(
+                    stdout="\n".join(str(i) for i in range(1306, 1370))
+                ),
                 "ls /proc/irq/": SSHResult(stdout="0\n1\n1306\n1307\n1308\n"),
                 "smp_affinity_list": SSHResult(stdout="192", exit_code=0),
                 "base64": SSHResult(stdout="1306 1307 1308"),
@@ -614,7 +618,9 @@ class TestResetIrqPinning:
         assert any("restored to default" in a for a in result["applied"])
         assert any("unmasked and restarted" in a for a in result["applied"])
         # Stale config-file ban entries from older runs must be scrubbed.
-        assert any("IRQBALANCE_BANNED_INTERRUPTS" in c and "sed" in c for c in commands_run)
+        assert any(
+            "IRQBALANCE_BANNED_INTERRUPTS" in c and "sed" in c for c in commands_run
+        )
 
     @pytest.mark.asyncio
     async def test_reset_clears_banned_cpus_when_given(self):

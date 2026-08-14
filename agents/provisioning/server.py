@@ -1624,7 +1624,9 @@ async def _discover_irqs(
             # Filter to only vectors the kernel has created irq dirs for.
             ra = await _ssh.run(host, "ls /proc/irq/ 2>/dev/null")
             active = {int(tok) for tok in ra.stdout.split() if tok.isdigit()}
-            irq_numbers = sorted(n for n in candidates if n in active) if active else candidates
+            irq_numbers = (
+                sorted(n for n in candidates if n in active) if active else candidates
+            )
 
     if not irq_numbers and (interface or resolved_pci):
         ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
@@ -1807,9 +1809,7 @@ async def _pin_irq_one(
             continue
         # Verify the write actually landed — read back and confirm the CPU
         # appears (managed IRQs on some drivers silently ignore the write).
-        rv = await _ssh.run(
-            host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1"
-        )
+        rv = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
         actual = rv.stdout.strip()
         if str(cpu) not in actual.split(","):
             errors.append(
