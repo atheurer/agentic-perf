@@ -13,10 +13,12 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import sys
+import textwrap
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -1614,7 +1616,17 @@ async def _discover_irqs(
     irq_numbers: list[int] = []
     if device_path:
         rm = await _ssh.run(host, f"ls {device_path}/msi_irqs/ 2>&1")
-        irq_numbers = sorted(int(tok) for tok in rm.stdout.split() if tok.isdigit())
+        candidates = sorted(int(tok) for tok in rm.stdout.split() if tok.isdigit())
+        if candidates:
+            # msi_irqs/ lists ALL allocated MSI-X vectors, including inactive
+            # ones the driver has not bound to a queue. Inactive vectors have
+            # no /proc/irq/N/ entry and smp_affinity writes fail against them.
+            # Filter to only vectors the kernel has created irq dirs for.
+            ra = await _ssh.run(host, "ls /proc/irq/ 2>/dev/null")
+            active = {int(tok) for tok in ra.stdout.split() if tok.isdigit()}
+            irq_numbers = (
+                sorted(n for n in candidates if n in active) if active else candidates
+            )
 
     if not irq_numbers and (interface or resolved_pci):
         ri = await _ssh.run(host, "cat /proc/interrupts 2>&1")
@@ -1720,29 +1732,13 @@ async def _pin_irq_one(
             "errors": cpu_errors,
         }
 
-    assignments: list[dict] = []
-    for i, irq in enumerate(irq_numbers):
-        cpu = cpu_list[i % len(cpu_list)]
-        # /proc/irq/N/smp_affinity rejects a "0x"-prefixed mask on systems
-        # with enough CPUs to need the comma-grouped 32-bit-word format
-        # (e.g. 128 CPUs) — confirmed live: `echo 0x4 > smp_affinity` fails
-        # with exit 1, `echo 4 > smp_affinity` succeeds and the kernel
-        # zero-pads/groups it automatically. hex()'s "0x" prefix is for
-        # display only; strip it before writing.
-        mask_hex = format(1 << cpu, "x")
-        r2 = await _ssh.run(
-            host, f"echo {mask_hex} > /proc/irq/{irq}/smp_affinity 2>&1"
-        )
-        if r2.exit_code == 0:
-            applied.append(f"IRQ {irq} → CPU {cpu} (mask 0x{mask_hex})")
-            assignments.append({"irq": irq, "cpu": cpu})
-        else:
-            errors.append(
-                f"smp_affinity write failed for IRQ {irq}: {r2.stdout.strip()}"
-            )
-
-    used_cpus = sorted({a["cpu"] for a in assignments})
-
+    # Apply irqbalance ban/disable BEFORE writing affinities. On a busy host
+    # irqbalance fires every 10 seconds; writing 64 IRQs one-by-one takes
+    # ~25 seconds of sequential SSH ops, so irqbalance races against the writes
+    # and overrides early assignments before the ban lands. Stopping/banning
+    # first ensures the writes are never overridden during the loop.
+    # ban_cpu is the exception — it needs used_cpus from assignments, so it
+    # runs after the write loop (below).
     ib_result = {"mode": irqbalance_mode}
     if irqbalance_mode == "disable":
         r3 = await _ssh.run(
@@ -1753,32 +1749,80 @@ async def _pin_irq_one(
             errors.append(f"irqbalance disable failed: {r3.stdout.strip()}")
 
     elif irqbalance_mode == "ban_irq":
-        rb = await _ssh.run(
-            host,
-            "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
-        )
-        existing = ""
-        for line in rb.stdout.splitlines():
-            if "IRQBALANCE_BANNED_INTERRUPTS" in line:
-                existing = line.split("=", 1)[-1].strip().strip('"')
-        # Dedupe against whatever's already banned — re-running pin_irq
-        # against the same device (e.g. a retry, or a prior run that failed
-        # partway through) must not keep appending the same IRQ numbers.
-        existing_irqs = {int(tok) for tok in existing.split() if tok.isdigit()}
-        merged_irqs = sorted(existing_irqs | set(irq_numbers))
-        new_val = " ".join(str(i) for i in merged_irqs)
+        # Use the irqbalance socket API to ban IRQs at runtime without
+        # restarting the daemon. irqbalance 1.9.x no longer reads
+        # IRQBALANCE_BANNED_INTERRUPTS from the environment; the socket
+        # command "settings ban irqs ..." is the only reliable mechanism.
+        # Runtime bans are cleared automatically when irqbalance restarts,
+        # so reset_irq_pinning just needs to restart the daemon — no config
+        # file cleanup required for bans set this way.
+        irq_set_literal = "{" + ", ".join(str(i) for i in irq_numbers) + "}"
+        script = textwrap.dedent(f"""\
+            import socket, struct, os, re, subprocess
+            pid = subprocess.run(
+                ["pgrep", "irqbalance"], capture_output=True, text=True
+            ).stdout.strip()
+            if not pid:
+                raise SystemExit("irqbalance not running")
+            sock = "/run/irqbalance/irqbalance" + pid + ".sock"
+            new_irqs = {irq_set_literal}
+            def rpc(msg):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(sock)
+                creds = struct.pack("iii", os.getpid(), os.getuid(), os.getgid())
+                s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, creds)])
+                data = s.recv(65536).decode()
+                s.close()
+                return data
+            existing = {{int(m) for m in re.findall(r"IRQ (\\d+)", rpc(b"setup"))}}
+            merged = sorted(existing | new_irqs)
+            rpc(("settings ban irqs " + " ".join(str(i) for i in merged)).encode())
+            print(" ".join(str(i) for i in merged))
+        """)
+        encoded = base64.b64encode(script.encode()).decode()
         r4 = await _ssh.run(
             host,
-            f"sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
-            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
-            f"systemctl restart irqbalance 2>&1",
+            f"python3 -c 'import base64; exec(base64.b64decode(\"{encoded}\").decode())'",
         )
-        ib_result["banned_interrupts"] = new_val
-        ib_result["status"] = "restarted" if r4.exit_code == 0 else "error"
         if r4.exit_code != 0:
             errors.append(f"irqbalance ban_irq failed: {r4.stdout.strip()}")
+            ib_result["status"] = "error"
+        else:
+            ib_result["banned_interrupts"] = r4.stdout.strip()
+            ib_result["status"] = "banned"
 
-    elif irqbalance_mode == "ban_cpu":
+    assignments: list[dict] = []
+    for i, irq in enumerate(irq_numbers):
+        cpu = cpu_list[i % len(cpu_list)]
+        # Use smp_affinity_list (plain CPU number) rather than smp_affinity
+        # (hex bitmask). The bitmask format requires comma-grouped 32-bit words
+        # on systems with >32 CPUs (e.g. CPU 192 needs a 24-group mask), and a
+        # raw large hex number is silently rejected. smp_affinity_list accepts
+        # a plain integer regardless of CPU count — confirmed live on 768-CPU host.
+        r2 = await _ssh.run(
+            host, f"echo {cpu} > /proc/irq/{irq}/smp_affinity_list 2>&1"
+        )
+        if r2.exit_code != 0:
+            errors.append(
+                f"smp_affinity_list write failed for IRQ {irq}: {r2.stdout.strip()}"
+            )
+            continue
+        # Verify the write actually landed — read back and confirm the CPU
+        # appears (managed IRQs on some drivers silently ignore the write).
+        rv = await _ssh.run(host, f"cat /proc/irq/{irq}/smp_affinity_list 2>&1")
+        actual = rv.stdout.strip()
+        if str(cpu) not in actual.split(","):
+            errors.append(
+                f"smp_affinity_list verify failed for IRQ {irq}: "
+                f"wrote {cpu}, got '{actual}'"
+            )
+        else:
+            applied.append(f"IRQ {irq} → CPU {cpu}")
+            assignments.append({"irq": irq, "cpu": cpu})
+
+    used_cpus = sorted({a["cpu"] for a in assignments})
+
+    if irqbalance_mode == "ban_cpu":
         # Bans the union of all CPUs actually used for this device's IRQs
         # (round-robin pinning can spread IRQs across several CPUs, not
         # just one).
@@ -1903,34 +1947,18 @@ async def _reset_irq_pinning_one(
                 f"restore smp_affinity failed for IRQ {irq}: {r2.stdout.strip()}"
             )
 
-    rb = await _ssh.run(
-        host,
-        "grep -s IRQBALANCE_BANNED_INTERRUPTS /etc/sysconfig/irqbalance || echo ''",
-    )
-    existing = ""
-    for line in rb.stdout.splitlines():
-        if "IRQBALANCE_BANNED_INTERRUPTS" in line:
-            existing = line.split("=", 1)[-1].strip().strip('"')
-    remaining = [
-        tok for tok in existing.split() if tok.isdigit() and int(tok) not in irq_numbers
-    ]
-    new_val = " ".join(remaining)
+    # Socket-based bans (set by the current ban_irq implementation) are runtime-
+    # only and cleared automatically when irqbalance restarts below. Just scrub
+    # any stale config-file entries left by older runs of this code.
     r3 = await _ssh.run(
         host,
-        "sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d' /etc/sysconfig/irqbalance 2>/dev/null; "
-        + (
-            f"echo 'IRQBALANCE_BANNED_INTERRUPTS=\"{new_val}\"' >> /etc/sysconfig/irqbalance; "
-            if new_val
-            else ""
-        )
-        + "true",
+        "sed -i '/IRQBALANCE_BANNED_INTERRUPTS/d;/IRQBALANCE_ARGS=/d' "
+        "/etc/sysconfig/irqbalance 2>/dev/null; true",
     )
     if r3.exit_code != 0:
-        errors.append(
-            f"clearing IRQBALANCE_BANNED_INTERRUPTS failed: {r3.stdout.strip()}"
-        )
+        errors.append(f"clearing irqbalance config entries failed: {r3.stdout.strip()}")
     else:
-        applied.append(f"IRQBALANCE_BANNED_INTERRUPTS cleared for IRQs {irq_numbers}")
+        applied.append("irqbalance stale ban config cleared")
 
     if cpus:
         rbc = await _ssh.run(
