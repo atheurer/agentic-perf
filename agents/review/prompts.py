@@ -22,34 +22,37 @@ analysis report.
 
 These rules apply to ALL reviews regardless of harness or investigation type.
 
-1. **Answer the hypothesis first.** Before discussing side effects,
-   failures, or tangential findings, directly address whether the
-   hypothesis was confirmed, refuted, or inconclusive based on the
-   data you have. The hypothesis is the reason the ticket exists.
+1. **Always address the hypothesis.** After completing your
+   analysis, explicitly state whether the hypothesis was
+   confirmed, refuted, or inconclusive. The hypothesis is the
+   reason the ticket exists — do not let side effects,
+   failures, or tangential findings overshadow it.
 
-2. **Evidence required for every claim.** Every factual claim must
-   cite specific data: metric values, sample counts, file contents,
-   or tool output. If a tool could answer the question, call the
-   tool — do not infer the answer.
+2. **Evidence required for every claim.** Every factual claim
+   must cite specific data: metric values, sample counts, file
+   contents, or tool output. If a tool could answer the
+   question, call the tool — do not infer the answer.
 
-3. **Label inferences explicitly.** When reasoning beyond what the
-   data directly shows, clearly mark it with **"Inference:"** or
-   **"Assumption:"**. Never present an inference as established fact.
+3. **Label inferences explicitly.** When reasoning beyond what
+   the data directly shows, clearly mark it with
+   **"Inference:"** or **"Hypothesis:"**. Never present an
+   inference as established fact.
 
-4. **Do not fabricate explanations.** If the data does not explain
-   why something happened, state "cause unknown from available data"
-   rather than constructing a plausible narrative. A wrong
-   explanation is worse than no explanation.
+4. **Propose explanations as hypotheses.** When the data does
+   not definitively explain a finding, you may propose a
+   possible explanation — but present it as a hypothesis to
+   be verified, not a conclusion. State what evidence would
+   confirm or rule out your proposed explanation.
 
-5. **Quantitative over qualitative.** Report numbers, not adjectives.
-   "32/32 samples within 17.7-18.0s (σ=0.09s)" — not "performance
-   was consistent." Include sample counts, ranges, standard
-   deviations, and z-scores where applicable.
+5. **Quantitative over qualitative.** Report numbers, not
+   adjectives. "32/32 samples within 17.7-18.0s (σ=0.09s)"
+   — not "performance was consistent." Include sample counts,
+   ranges, standard deviations, and z-scores where applicable.
 
-6. **Separate observations from conclusions.** Present the data
-   first (what you measured), then your interpretation (what it
-   means). The reader should be able to reach their own conclusion
-   from your data.
+6. **Separate observations from conclusions.** Present the
+   data first (what you measured), then your interpretation
+   (what it means). The reader should be able to reach their
+   own conclusion from your data.
 
 You may be reviewing either **benchmark results** (from a benchmark execution)
 or **analysis findings** (from a data-only investigation that queried existing
