@@ -11,11 +11,7 @@ from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
-from .prompts import (
-    EXTERNAL_PERF_DATA_GUIDANCE,
-    EXTERNAL_PERF_TOOL_NAMES,
-    REVIEW_SYSTEM_PROMPT,
-)
+from .prompts import REVIEW_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -277,9 +273,6 @@ class ReviewAgent(AgentBase):
                 "the user explicitly ends the "
                 "investigation."
             )
-        tool_names = {t.name for t in self.tools} if self.tools else set()
-        if tool_names & EXTERNAL_PERF_TOOL_NAMES:
-            prompt += EXTERNAL_PERF_DATA_GUIDANCE
         return prompt
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
