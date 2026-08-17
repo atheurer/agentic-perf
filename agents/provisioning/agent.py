@@ -160,15 +160,23 @@ class ProvisioningAgent(AgentBase):
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await _asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
-            )
-            return (
-                proc.returncode or 0,
-                stdout.decode(errors="replace"),
-                stderr.decode(errors="replace"),
-            )
+            try:
+                stdout, stderr = await _asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=timeout,
+                )
+                return (
+                    proc.returncode or 0,
+                    stdout.decode(errors="replace"),
+                    stderr.decode(errors="replace"),
+                )
+            except _asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                raise
 
         # Use first host (controller) for config
         host = hosts[0] if hosts else None
@@ -192,10 +200,27 @@ class ProvisioningAgent(AgentBase):
                 )
                 return
 
+        if not isinstance(config_ops, list):
+            logger.warning(
+                f"[provisioning] {ticket_id}: system_config "
+                f"must be a list, got {type(config_ops).__name__}"
+            )
+            await self._add_comment(
+                ticket_id,
+                f"**System Configuration Error:** system_config must be a list, got `{type(config_ops).__name__}`",
+            )
+            return
+
         applied: list[str] = []
         errors: list[str] = []
 
         for i, op in enumerate(config_ops):
+            if not isinstance(op, dict):
+                errors.append(
+                    f"Op {i}: expected dictionary configuration, got {type(op).__name__}"
+                )
+                continue
+
             action = op.get("action", "")
             try:
                 if action == "write_file":
@@ -204,17 +229,21 @@ class ProvisioningAgent(AgentBase):
                     if not path:
                         errors.append(f"Op {i}: write_file missing path")
                         continue
+
+                    import base64
+
+                    escaped_path = path.replace("'", "'\\''")
+
                     # Create parent directory
-                    mkdir_cmd = f"mkdir -p $(dirname '{path}')"
+                    mkdir_cmd = f"mkdir -p $(dirname '{escaped_path}')"
                     await _ssh_run(
                         host,
                         mkdir_cmd,
                         timeout=10,
                     )
-                    # Write file via heredoc
-                    write_cmd = (
-                        f"cat > '{path}' << 'SYSCONFIG_EOF'\n{content}\nSYSCONFIG_EOF"
-                    )
+                    # Write file via base64 to prevent heredoc/quoting issues
+                    encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+                    write_cmd = f"echo '{encoded}' | base64 -d > '{escaped_path}'"
                     rc, out, err = await _ssh_run(
                         host,
                         write_cmd,
