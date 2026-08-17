@@ -4,11 +4,18 @@ Jumpstarter provides physical boards and virtual machines via
 gRPC-based device leasing from a controller. Devices are identified
 by label selectors returned by `list_jumpstarter_targets`.
 
-1. Call check_available_resources with provider "jumpstarter" and
+1. Call `check_available_resources` with provider "jumpstarter" and
    requirements from the ticket. Include:
    - `jumpstarter_selector`: the `board_selector` from the ticket
      directives, passed VERBATIM — do NOT modify, normalize, or
      substitute a different selector
+   - If no `board_selector` directive exists, call
+     `list_jumpstarter_targets` to see available device types.
+     Match the user's platform description (e.g., "R-Car S4",
+     "SA8775P", "Qualcomm Ride4") to the correct target selector.
+     If NO target matches, call `request_clarification` — do NOT
+     fall back to a different platform. Getting the wrong board
+     type wastes a physical hardware lease.
    - `count`: number of devices needed (usually 1)
    The results only include devices the system considers available
    (online, enabled, in the open pool, and not already leased).
