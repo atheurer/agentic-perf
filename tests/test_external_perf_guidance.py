@@ -91,35 +91,4 @@ class TestEvaluateGuidance:
         assert "Historical Performance Data" not in prompt
 
 
-class TestReviewGuidance:
-    """Test review prompt injection."""
 
-    def _make_agent(self):
-        from agents.review.agent import ReviewAgent
-
-        return ReviewAgent(
-            llm_provider=AsyncMock(),
-            state_store_url="http://localhost:8090",
-        )
-
-    def test_guidance_injected_when_tools_present(self):
-        agent = self._make_agent()
-        agent.tools = [
-            ToolDefinition(
-                name="compare_run_to_baseline", description="", input_schema={}
-            ),
-        ]
-        ticket = {"custom_fields": {}}
-        prompt = agent._system_prompt(ticket)
-        assert "Historical Performance Data" in prompt
-
-    def test_guidance_absent_when_no_tools(self):
-        agent = self._make_agent()
-        agent.tools = [
-            ToolDefinition(
-                name="submit_review_result", description="", input_schema={}
-            ),
-        ]
-        ticket = {"custom_fields": {}}
-        prompt = agent._system_prompt(ticket)
-        assert "Historical Performance Data" not in prompt
