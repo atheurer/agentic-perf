@@ -89,6 +89,3 @@ class TestEvaluateGuidance:
         ticket = {"custom_fields": {}}
         prompt = agent._system_prompt(ticket)
         assert "Historical Performance Data" not in prompt
-
-
-
