@@ -231,14 +231,21 @@ class ProvisioningAgent(AgentBase):
                     if not command:
                         errors.append(f"Op {i}: run_command missing command")
                         continue
-                    timeout = op.get("timeout", 30)
+                    timeout = op.get("timeout", 120)
                     rc, out, err = await _ssh_run(
                         host,
                         command,
                         timeout=timeout,
                     )
+                    # Capture output for visibility
+                    output_summary = out.strip()
+                    if len(output_summary) > 500:
+                        output_summary = output_summary[-500:]
                     if rc == 0:
-                        applied.append(f"run_command: {command}")
+                        entry = f"run_command: {command}"
+                        if output_summary:
+                            entry += f" -> {output_summary}"
+                        applied.append(entry)
                         logger.info(f"[provisioning] {ticket_id}: ran: {command}")
                     else:
                         errors.append(
@@ -248,6 +255,10 @@ class ProvisioningAgent(AgentBase):
                 else:
                     errors.append(f"Op {i}: unknown action '{action}'")
 
+            except _asyncio.TimeoutError:
+                errors.append(
+                    f"Op {i}: {action} timed out after {op.get('timeout', 120)}s"
+                )
             except Exception as e:
                 errors.append(f"Op {i}: {action} error: {e}")
 
@@ -381,6 +392,29 @@ class ProvisioningAgent(AgentBase):
                         system_config,
                         cf,
                     )
+                    # Abort if any system_config operation
+                    # failed — proceeding to benchmark with
+                    # incomplete configuration is meaningless.
+                    updated = await self._get_ticket(ticket_id)
+                    config_errors = updated.get("custom_fields", {}).get(
+                        "system_config_errors", []
+                    )
+                    if config_errors:
+                        await self._add_comment(
+                            ticket_id,
+                            "**Provisioning aborted:** "
+                            "system_config errors prevent "
+                            "meaningful benchmark execution.",
+                        )
+                        await self._request_guidance(
+                            ticket_id,
+                            "System configuration failed. "
+                            "Review errors above and decide "
+                            "whether to retry or abort.",
+                        )
+                        await mcp.disconnect()
+                        self._mcp = None
+                        return
                 await self._auto_complete_jumpstarter(
                     ticket_id,
                     cf,
