@@ -239,13 +239,20 @@ _LOCAL_TOOLS = [
                     "type": "object",
                     "description": (
                         "Agent-scoped context partitioned from the user's "
-                        "request. Each key is an agent role (resource, "
-                        "provisioning, benchmark, review) or 'shared' for "
-                        "context relevant to all agents. Values are natural "
-                        "language summaries of the portions of the request "
-                        "relevant to that agent. Agent-prefixed directives "
-                        "(e.g., 'provision agent: install nmap-ncat') go in "
-                        "the corresponding agent's section."
+                        "request. Each key is an agent role ('resource', "
+                        "'provision', 'benchmark', 'review') or 'shared' "
+                        "for context relevant to all agents. "
+                        "IMPORTANT: if the ticket contains a verbatim "
+                        "agent:* fenced block for a key (shown in "
+                        "'Pre-parsed Verbatim Directives' above), that "
+                        "block is already delivered to the agent verbatim "
+                        "— do NOT restate or summarize it here. Only write "
+                        "a value for that key if you have genuinely "
+                        "additive context the verbatim block does not "
+                        "cover (e.g. something you inferred, a constraint "
+                        "from another part of the ticket, or a resolved "
+                        "ambiguity). If there is nothing additive to say, "
+                        "omit the key entirely."
                     ),
                     "properties": {
                         "shared": {
@@ -267,25 +274,25 @@ _LOCAL_TOOLS = [
                         "provision": {
                             "type": "string",
                             "description": (
-                                "Context for the provision agent "
-                                "(installation instructions, package "
-                                "requirements, setup directives)"
+                                "Supplemental context for the provision "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:provision block."
                             ),
                         },
                         "benchmark": {
                             "type": "string",
                             "description": (
-                                "Context for the benchmark agent "
-                                "(test parameters, workload details, "
-                                "connectivity requirements, run approval)"
+                                "Supplemental context for the benchmark "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:benchmark block."
                             ),
                         },
                         "review": {
                             "type": "string",
                             "description": (
-                                "Context for the review agent "
-                                "(analysis expectations, comparison "
-                                "criteria, reporting requirements)"
+                                "Supplemental context for the review "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:review block."
                             ),
                         },
                     },
