@@ -612,6 +612,9 @@ class ProvisioningAgent(AgentBase):
             fields["k3s_version"] = result.get("k3s_version", "unknown")
 
         # Derive ssh_hardware_ips from hosts_provisioned.
+        # This is the provisioning agent's own output — it
+        # reflects which hosts were actually SSH-provisioned
+        # (often controller-only for multi-host tickets).
         ssh_ips = result.get("ssh_hardware_ips")
         if not ssh_ips and fields.get("hosts_provisioned"):
             hosts = fields["hosts_provisioned"]
@@ -623,9 +626,18 @@ class ProvisioningAgent(AgentBase):
                 }
         if ssh_ips:
             fields["ssh_hardware_ips"] = ssh_ips
-            fields["assigned_hardware_ips"] = result.get(
-                "assigned_hardware_ips",
-                ssh_ips,
+
+        # Never write assigned_hardware_ips — that field is
+        # owned by the resource agent (and the platform agent
+        # for Jumpstarter).  The submit tool schema does not
+        # include it, so the LLM never provides it.  If a
+        # deterministic caller somehow does, log and discard.
+        if "assigned_hardware_ips" in result:
+            logger.warning(
+                "[provisioning] %s: ignoring unexpected "
+                "assigned_hardware_ips in provisioning result "
+                "(field owned by resource/platform agent)",
+                ticket_id,
             )
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]

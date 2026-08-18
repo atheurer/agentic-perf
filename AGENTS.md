@@ -239,6 +239,9 @@ a guardrail. Existing examples to follow:
 - Jumpstarter deterministic provisioning (platform agent runs
   flash/boot/verify via Python SDK — no LLM reasoning on the
   provisioning steps themselves, only on what to provision)
+- Field ownership enforcement (`assigned_hardware_ips` is written
+  by the resource agent and platform agent only — provisioning
+  reads it but never writes it)
 
 ### Security Model & Current Limitations
 
