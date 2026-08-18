@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from agents.triage.agent import _KNOWN_SCOPED_CONTEXT_KEYS, _discover_scoped_context_keys
+from agents.triage.agent import (
+    _KNOWN_SCOPED_CONTEXT_KEYS,
+    _discover_scoped_context_keys,
+)
 
 
 class TestKnownScopedContextKeys:
