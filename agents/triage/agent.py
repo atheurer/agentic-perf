@@ -422,7 +422,9 @@ class TriageAgent(AgentBase):
         summary = ticket["summary"]
         description = ticket["description"]
         if summary == description or description.startswith(summary):
-            header = f"**Ticket ID:** {ticket['id']}\n\n**Description:**\n{description}\n"
+            header = (
+                f"**Ticket ID:** {ticket['id']}\n\n**Description:**\n{description}\n"
+            )
         else:
             header = (
                 f"**Ticket ID:** {ticket['id']}\n"

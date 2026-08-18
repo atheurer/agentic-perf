@@ -162,11 +162,7 @@ class RetrospectiveAgent(AgentBase):
         summary = ticket["summary"]
         description = ticket.get("description", "")
         # Use a short summary if available; fall back to first line of description.
-        display_summary = (
-            summary
-            if summary != description
-            else summary.split("\n")[0]
-        )
+        display_summary = summary if summary != description else summary.split("\n")[0]
         content = (
             f"## Ticket Retrospective\n\n"
             f"**Ticket ID:** {ticket['id']}\n"
