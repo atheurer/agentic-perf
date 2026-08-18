@@ -518,9 +518,16 @@ async def get_interface_inventory(
         filters_applied["numa_node"] = numa_node
 
     filtered = _apply_iface_filters(
-        interfaces, name_regex, link,
-        min_speed_gbps, max_speed_gbps,
-        min_mtu, max_mtu, ipv4, ipv6, numa_node,
+        interfaces,
+        name_regex,
+        link,
+        min_speed_gbps,
+        max_speed_gbps,
+        min_mtu,
+        max_mtu,
+        ipv4,
+        ipv6,
+        numa_node,
     )
     # Ensure speed_gbps on unfiltered items too
     for iface in filtered:

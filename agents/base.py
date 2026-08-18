@@ -897,9 +897,7 @@ class AgentBase(ABC):
         Agent and system handoff messages are pipeline noise and should
         not be injected into any agent's initial context.
         """
-        return [
-            c for c in (ticket.get("comments") or []) if c.get("author") == "user"
-        ]
+        return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
 
     @staticmethod
     def _load_prompt_fragments(
