@@ -614,6 +614,10 @@ async def test_all_tools_use_hosts_or_targets():
             "reset_irq_pinning",
             "verify_host_tuning",
             # Per-host NM tools — parameters vary per host so no hosts array
+            # Per-host flow steering — rules vary per host/interface
+            "configure_flow_steering",
+            "reset_flow_steering",
+            # Per-host NM tools — parameters vary per host so no hosts array
             "nm_set_mtu",
             "nm_set_ip",
             "nm_set_dhcp",
