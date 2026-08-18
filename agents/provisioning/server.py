@@ -1461,6 +1461,207 @@ async def tune_nic(
     )
 
 
+def _build_flow_rule_cmd(interface: str, rule: dict) -> str:
+    """Build an ethtool -N command string from a flow rule dict.
+
+    Supported rule keys:
+      flow_type   : "ether"|"ip4"|"tcp4"|"udp4"|"sctp4"|"ip6"|"tcp6"|"udp6"|"sctp6"
+                    |"ah4"|"esp4"|"ah6"|"esp6"  (required)
+      queue       : int — destination queue, or -1 to drop  (required)
+      src_mac / src_mac_mask  : MAC address strings (ether only)
+      dst_mac / dst_mac_mask  : MAC address strings (ether only)
+      vlan_ether_type         : hex string e.g. "0x0800" (ether only)
+      src_ip / src_ip_mask    : IPv4/IPv6 address strings
+      dst_ip / dst_ip_mask    : IPv4/IPv6 address strings
+      tos / tos_mask          : int (IPv4 TOS / IPv6 traffic class)
+      src_port / src_port_mask: int (TCP/UDP/SCTP only)
+      dst_port / dst_port_mask: int (TCP/UDP/SCTP only)
+    Omitting a mask uses the NIC default (exact match for most drivers).
+    """
+    ft = rule["flow_type"]
+    parts = [f"ethtool -N {interface} flow-type {ft}"]
+
+    def _field(key: str, arg: str, mask_key: str | None = None) -> None:
+        val = rule.get(key)
+        if val is None:
+            return
+        parts.append(f"{arg} {val}")
+        if mask_key:
+            mask = rule.get(mask_key)
+            if mask is not None:
+                parts.append(f"m {mask}")
+
+    # L2 fields (ether flow type)
+    _field("src_mac", "src-mac", "src_mac_mask")
+    _field("dst_mac", "dst-mac", "dst_mac_mask")
+    _field("vlan_ether_type", "vlan-ether-type")
+
+    # L3 fields
+    _field("src_ip", "src-ip", "src_ip_mask")
+    _field("dst_ip", "dst-ip", "dst_ip_mask")
+    _field("tos", "tos", "tos_mask")
+
+    # L4 fields
+    _field("src_port", "src-port", "src_port_mask")
+    _field("dst_port", "dst-port", "dst_port_mask")
+
+    parts.append(f"action {rule['queue']}")
+    return " ".join(parts)
+
+
+async def _configure_flow_steering_one(
+    host: str,
+    interface: str,
+    rules: list[dict],
+    clear_existing: bool = True,
+) -> dict:
+    applied: list[str] = []
+    errors: list[str] = []
+
+    # Enable ntuple filtering
+    r = await _ssh.run(host, f"ethtool -K {interface} ntuple on 2>&1")
+    if r.exit_code != 0:
+        errors.append(f"failed to enable ntuple: {r.stdout.strip()}")
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "applied": applied,
+            "errors": errors,
+        }
+    applied.append("ntuple-filters: enabled")
+
+    # Clear existing rules if requested
+    if clear_existing:
+        r2 = await _ssh.run(host, f"ethtool -n {interface} 2>&1")
+        rule_ids = []
+        for line in r2.stdout.splitlines():
+            if line.strip().startswith("Filter:"):
+                try:
+                    rule_ids.append(int(line.split()[-1]))
+                except ValueError:
+                    pass
+        for rid in rule_ids:
+            await _ssh.run(host, f"ethtool -N {interface} delete {rid} 2>&1")
+        if rule_ids:
+            applied.append(f"cleared {len(rule_ids)} existing rule(s)")
+
+    # Add new rules
+    rule_ids_added = []
+    for i, rule in enumerate(rules):
+        try:
+            cmd = _build_flow_rule_cmd(interface, rule)
+        except (KeyError, TypeError) as e:
+            errors.append(f"rule[{i}] invalid: {e}")
+            continue
+        r3 = await _ssh.run(host, f"{cmd} 2>&1")
+        if r3.exit_code == 0:
+            # Extract assigned rule ID from output
+            rule_id = None
+            for line in r3.stdout.splitlines():
+                if "Added rule with ID" in line:
+                    try:
+                        rule_id = int(line.split()[-1])
+                    except ValueError:
+                        pass
+            rule_ids_added.append(rule_id)
+            applied.append(
+                f"rule[{i}]: {rule.get('flow_type')} "
+                f"dst-port={rule.get('dst_port', '*')} → queue {rule.get('queue')} "
+                f"(id={rule_id})"
+            )
+        else:
+            errors.append(f"rule[{i}] failed: {r3.stdout.strip()}")
+
+    return {
+        "host": host,
+        "interface": interface,
+        "status": "error" if errors else "ok",
+        "applied": applied,
+        "errors": errors,
+        "rule_ids": rule_ids_added,
+    }
+
+
+async def _reset_flow_steering_one(host: str, interface: str) -> dict:
+    """Remove all ntuple flow steering rules and disable ntuple filtering."""
+    applied: list[str] = []
+    errors: list[str] = []
+
+    r = await _ssh.run(host, f"ethtool -n {interface} 2>&1")
+    rule_ids = []
+    for line in r.stdout.splitlines():
+        if line.strip().startswith("Filter:"):
+            try:
+                rule_ids.append(int(line.split()[-1]))
+            except ValueError:
+                pass
+    for rid in rule_ids:
+        await _ssh.run(host, f"ethtool -N {interface} delete {rid} 2>&1")
+    if rule_ids:
+        applied.append(f"deleted {len(rule_ids)} rule(s)")
+
+    r2 = await _ssh.run(host, f"ethtool -K {interface} ntuple off 2>&1")
+    if r2.exit_code == 0:
+        applied.append("ntuple-filters: disabled")
+    else:
+        errors.append(f"failed to disable ntuple: {r2.stdout.strip()}")
+
+    return {
+        "host": host,
+        "interface": interface,
+        "status": "error" if errors else "ok",
+        "applied": applied,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def configure_flow_steering(
+    host: str,
+    interface: str,
+    rules: list[dict],
+    clear_existing: bool = True,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Configure ethtool ntuple flow steering rules on a NIC to direct specific
+    traffic to specific RX queues. Enables ntuple filtering, optionally clears
+    existing rules, then adds the provided rules in order.
+
+    Each rule is a dict with:
+      flow_type (required): "ether"|"ip4"|"tcp4"|"udp4"|"sctp4"|"ip6"|"tcp6"|
+                            "udp6"|"sctp6"|"ah4"|"esp4"|"ah6"|"esp6"
+      queue     (required): int — destination RX queue, or -1 to drop
+      src_mac / src_mac_mask, dst_mac / dst_mac_mask: MAC addr strings (ether)
+      vlan_ether_type: hex string e.g. "0x0800" (ether)
+      src_ip / src_ip_mask, dst_ip / dst_ip_mask: IP address strings
+      tos / tos_mask: int (IPv4 TOS or IPv6 traffic class)
+      src_port / src_port_mask, dst_port / dst_port_mask: int (L4 types only)
+    Omitting a mask uses the NIC driver default (exact match for most drivers).
+
+    MUST be called AFTER tune_nic (changing channel count invalidates rules)
+    and BEFORE pin_irq. Use reset_flow_steering to undo."""
+    await _ensure_init()
+    return json.dumps(
+        await _configure_flow_steering_one(host, interface, rules, clear_existing)
+    )
+
+
+@mcp.tool()
+async def reset_flow_steering(
+    host: str,
+    interface: str,
+    user: str = "root",
+    ssh_key_path: str = "",
+) -> str:
+    """Remove all ntuple flow steering rules from the interface and disable
+    ntuple filtering. Call this before re-tuning a host that may have stale
+    flow rules from a previous ticket."""
+    await _ensure_init()
+    return json.dumps(await _reset_flow_steering_one(host, interface))
+
+
 async def _tune_tcp_one(
     host: str,
     interface: str | None = None,
@@ -2189,6 +2390,18 @@ async def tune_hosts(targets: list[dict]) -> str:
                 wmem_max=t.get("wmem_max"),
             )
             steps.append({"tune_tcp": r})
+            if r.get("status") == "error":
+                errors.extend(r.get("errors", []))
+
+        # Flow steering — must run after tune_nic, before pin_irq
+        if t.get("flow_steering_rules"):
+            r = await _configure_flow_steering_one(
+                host=h,
+                interface=iface,
+                rules=t["flow_steering_rules"],
+                clear_existing=t.get("flow_steering_clear_existing", True),
+            )
+            steps.append({"configure_flow_steering": r})
             if r.get("status") == "error":
                 errors.extend(r.get("errors", []))
 
