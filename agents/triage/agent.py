@@ -13,6 +13,10 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+_KNOWN_SCOPED_CONTEXT_KEYS = frozenset(
+    {"shared", "resource", "provision", "benchmark", "review"}
+)
+
 _LOCAL_TOOLS = [
     ToolDefinition(
         name="request_clarification",
@@ -267,7 +271,7 @@ _LOCAL_TOOLS = [
                             ),
                         },
                     },
-                    "additionalProperties": True,
+                    "additionalProperties": False,
                 },
                 "reference_tickets": {
                     "type": "array",
@@ -484,6 +488,17 @@ class TriageAgent(AgentBase):
 
         scoped_context = result.get("scoped_context")
         if scoped_context and isinstance(scoped_context, dict):
+            unknown = set(scoped_context) - _KNOWN_SCOPED_CONTEXT_KEYS
+            if unknown:
+                logger.warning(
+                    "scoped_context contains unknown keys %s — dropping",
+                    sorted(unknown),
+                )
+                scoped_context = {
+                    k: v
+                    for k, v in scoped_context.items()
+                    if k in _KNOWN_SCOPED_CONTEXT_KEYS
+                }
             fields["scoped_context"] = scoped_context
 
         reference_tickets = result.get("reference_tickets")
