@@ -404,12 +404,19 @@ class TriageAgent(AgentBase):
         return False
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
-        content = (
-            f"## Performance Test Request\n\n"
-            f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n\n"
-            f"**Description:**\n{ticket['description']}\n"
-        )
+        # Skip Summary when it duplicates the description (cli.py submit
+        # uses description as summary when no -d flag is given).
+        summary = ticket["summary"]
+        description = ticket["description"]
+        if summary == description or description.startswith(summary):
+            header = f"**Ticket ID:** {ticket['id']}\n\n**Description:**\n{description}\n"
+        else:
+            header = (
+                f"**Ticket ID:** {ticket['id']}\n"
+                f"**Summary:** {summary}\n\n"
+                f"**Description:**\n{description}\n"
+            )
+        content = f"## Performance Test Request\n\n{header}"
 
         # Tell triage whether external data tools are available
         has_data_tools = self._has_external_data_tools()

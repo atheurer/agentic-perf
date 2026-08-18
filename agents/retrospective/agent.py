@@ -159,10 +159,18 @@ class RetrospectiveAgent(AgentBase):
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
+        summary = ticket["summary"]
+        description = ticket.get("description", "")
+        # Use a short summary if available; fall back to first line of description.
+        display_summary = (
+            summary
+            if summary != description
+            else summary.split("\n")[0]
+        )
         content = (
             f"## Ticket Retrospective\n\n"
             f"**Ticket ID:** {ticket['id']}\n"
-            f"**Summary:** {ticket['summary']}\n\n"
+            f"**Summary:** {display_summary}\n\n"
         )
 
         if cf.get("harness_name"):
