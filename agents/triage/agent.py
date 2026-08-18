@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,26 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_KNOWN_SCOPED_CONTEXT_KEYS = frozenset(
-    {"shared", "resource", "provision", "benchmark", "review"}
+_SCOPED_CONTEXT_CALL_RE = re.compile(
+    r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
 )
+
+
+def _discover_scoped_context_keys() -> frozenset[str]:
+    """Scan agent modules for _get_scoped_context calls to find valid keys.
+
+    Runs once at import time so the set stays in sync automatically when
+    new agents are added without requiring a manual update here.
+    """
+    keys: set[str] = {"shared"}
+    agents_dir = Path(__file__).parent.parent
+    for agent_file in sorted(agents_dir.glob("*/agent.py")):
+        for match in _SCOPED_CONTEXT_CALL_RE.finditer(agent_file.read_text()):
+            keys.add(match.group(1))
+    return frozenset(keys)
+
+
+_KNOWN_SCOPED_CONTEXT_KEYS = _discover_scoped_context_keys()
 
 _LOCAL_TOOLS = [
     ToolDefinition(
