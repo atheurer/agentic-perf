@@ -266,15 +266,28 @@ _LOCAL_TOOLS = [
                             "description": (
                                 "Context relevant to all agents "
                                 "(environment, general constraints, "
-                                "test objective summary)"
+                                "test objective summary). Do NOT use "
+                                "geographic labels or shorthand in place "
+                                "of hostnames — always use the exact "
+                                "FQDNs or IPs from the ticket."
                             ),
                         },
                         "resource": {
                             "type": "string",
                             "description": (
-                                "Context for the resource agent "
-                                "(host requirements, provider preferences, "
-                                "instance types, regions)"
+                                "Context for the resource agent. REQUIRED "
+                                "whenever required_hosts is non-empty. "
+                                "For user-provided hosts: quote every "
+                                "hostname, FQDN, and IP address VERBATIM "
+                                "from the ticket — do NOT paraphrase as "
+                                "geographic labels (e.g. 'BOS controller') "
+                                "or invent shorthand names. The resource "
+                                "agent uses these exact strings to SSH into "
+                                "the hosts; a paraphrase causes it to "
+                                "invent bogus hostnames. "
+                                "For cloud/QUADS: include provider, "
+                                "instance type, region, and any constraints "
+                                "the user specified."
                             ),
                         },
                         "provision": {
