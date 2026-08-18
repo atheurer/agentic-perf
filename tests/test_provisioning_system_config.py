@@ -65,7 +65,7 @@ class TestProvisioningSystemConfig:
             {
                 "system_config_applied": [
                     "write_file: /etc/foo.conf",
-                    "run_command: systemctl daemon-reload",
+                    "run_command: systemctl daemon-reload -> stdout_msg",
                 ],
                 "system_config_errors": [],
             },
@@ -223,6 +223,6 @@ class TestProvisioningSystemConfig:
             "T123",
             {
                 "system_config_applied": [],
-                "system_config_errors": ["Op 0: run_command error: "],
+                "system_config_errors": ["Op 0: run_command timed out after 1s"],
             },
         )
