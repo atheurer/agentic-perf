@@ -885,9 +885,7 @@ class AgentBase(ABC):
         parts = []
         if shared:
             parts.append(shared)
-        parts.append(
-            f"## Directives (authoritative — follow exactly):\n{verbatim}"
-        )
+        parts.append(f"## Directives (authoritative — follow exactly):\n{verbatim}")
         if supplemental:
             parts.append(f"## Additional context:\n{supplemental}")
         return "\n\n".join(parts)
