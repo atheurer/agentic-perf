@@ -293,6 +293,7 @@ guardrail:
 | **Platform contract check** | OS/package incompatibilities before attempting install |
 | **PID lock file** | Duplicate orchestrator instances stepping on each other |
 | **Structured output (submit_result)** | Every agent ends by calling a structured tool, not free-text |
+| **Field ownership** | Provisioning never writes `assigned_hardware_ips` — that field is owned by the resource agent (and the platform agent for Jumpstarter) |
 
 ### Why structured output matters
 
