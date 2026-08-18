@@ -706,6 +706,7 @@ details > .content { padding: 12px 16px; }
 .outcome-fail { color: var(--red); }
 .outcome-inconclusive { color: var(--yellow, #e2b340); }
 .outcome-none { color: var(--text-muted); }
+.outcome-abort { color: var(--text-muted); font-style: italic; }
 .ticket-outcome { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 
 .result-summary {
@@ -1594,6 +1595,15 @@ function ticketOutcome(ticket) {
   }
   if (analysis && !analysis.conclusive) {
     return '<span class="outcome outcome-inconclusive">NEEDS DATA</span>';
+  }
+
+  // Aborted / cancelled
+  var status = ticket.status || '';
+  if (cf.abort_requested || cf.stop_requested) {
+    return '<span class="outcome outcome-abort">ABORTED</span>';
+  }
+  if (status === 'closed' || status === 'awaiting_teardown') {
+    return '<span class="outcome outcome-abort">CANCELLED</span>';
   }
 
   return '<span class="outcome outcome-none">\u2014</span>';
