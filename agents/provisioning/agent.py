@@ -517,10 +517,6 @@ class ProvisioningAgent(AgentBase):
             )
         if cf.get("directives"):
             content += f"\n## User Directives\n```json\n{json.dumps(cf['directives'], indent=2)}\n```\n"
-        # Skip parsed_specs when verbatim directives are present — they are
-        # a triage-derived re-statement of the same content and add noise.
-        if cf.get("parsed_specs") and not cf.get("verbatim_directives"):
-            content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("resource_provider_metadata"):
@@ -568,11 +564,12 @@ class ProvisioningAgent(AgentBase):
                             f"{json.dumps(flash['available_variants'])}\n"
                         )
 
-        comments = ticket.get("comments") or []
-        # When verbatim directives are present, agent/system handoff
-        # comments are redundant noise — only surface user comments.
-        if cf.get("verbatim_directives"):
-            comments = [c for c in comments if c.get("author") == "user"]
+        # Agent/system handoff comments are pipeline noise — only surface
+        # user comments so the agent focuses on human intent, not its own
+        # prior outputs.
+        comments = [
+            c for c in (ticket.get("comments") or []) if c.get("author") == "user"
+        ]
         if comments:
             content += "\n## Previous Comments\n"
             for comment in comments:
