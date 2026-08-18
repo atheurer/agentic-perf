@@ -134,11 +134,11 @@ class TestReviewSubmittedMarker:
         assert "review_submitted" not in _HEAVY_FIELDS
 
     def test_verdict_is_in_heavy_fields(self):
-        """verdict IS in _HEAVY_FIELDS — this is why we can't
-        use it as the re-dispatch guard marker."""
+        """verdict is NOT in _HEAVY_FIELDS — we removed it to allow list
+        responses to contain it for the dashboard Outcome column."""
         from state_store.api.tickets import _HEAVY_FIELDS
 
-        assert "verdict" in _HEAVY_FIELDS
+        assert "verdict" not in _HEAVY_FIELDS
 
 
 # ── 2. Poll-loop re-dispatch guard ──────────────────────
