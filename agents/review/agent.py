@@ -11,11 +11,7 @@ from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
-from .prompts import (
-    EXTERNAL_PERF_DATA_GUIDANCE,
-    EXTERNAL_PERF_TOOL_NAMES,
-    REVIEW_SYSTEM_PROMPT,
-)
+from .prompts import REVIEW_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -277,9 +273,6 @@ class ReviewAgent(AgentBase):
                 "the user explicitly ends the "
                 "investigation."
             )
-        tool_names = {t.name for t in self.tools} if self.tools else set()
-        if tool_names & EXTERNAL_PERF_TOOL_NAMES:
-            prompt += EXTERNAL_PERF_DATA_GUIDANCE
         return prompt
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
@@ -345,17 +338,36 @@ class ReviewAgent(AgentBase):
                     ]
                 except OSError:
                     files = []
+                # Show top-level files first (metadata,
+                # merged results, serial capture), then
+                # a sample of per-sample files.
+                top_level = [f for f in files if "/" not in f]
+                nested = [f for f in files if "/" in f]
                 content += (
                     f"\n## Local Artifacts\n"
-                    f"Results are stored locally at `{output_dir}`.\n"
-                    f"Use `read_benchmark_artifact` with this "
-                    f"output_dir to read files. Do NOT use SSH.\n"
-                    f"\nAvailable files ({len(files)}):\n"
+                    f"Results are stored locally at "
+                    f"`{output_dir}`.\n"
+                    f"Use `read_benchmark_artifact` with "
+                    f"this output_dir to read files. "
+                    f"Do NOT use SSH.\n"
+                    f"\nTop-level files:\n"
                 )
-                for fn in files[:30]:
+                for fn in top_level[:20]:
                     content += f"- `{fn}`\n"
-                if len(files) > 30:
-                    content += f"- ... and {len(files) - 30} more\n"
+                if len(top_level) > 20:
+                    content += f"- ... and {len(top_level) - 20} more top-level files\n"
+                if nested:
+                    content += f"\nPer-sample files ({len(nested)} total):\n"
+                    for fn in nested[:10]:
+                        content += f"- `{fn}`\n"
+                    if len(nested) > 10:
+                        content += (
+                            f"- ... and "
+                            f"{len(nested) - 10} more "
+                            f"— use "
+                            f"`list_benchmark_artifacts` "
+                            f"to see all files\n"
+                        )
 
         harness = cf.get("harness_name") or cf.get("directives", {}).get(
             "harness", "crucible"

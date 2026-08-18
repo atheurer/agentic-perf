@@ -112,6 +112,43 @@ To target a specific board instance:
 |---|---|---|
 | `jumpstarter_serial` | Enable serial capture during boot test | `true`, `false` |
 | `ssh_password` | Override default SSH password | `password` |
+| `system_config` | Post-flash system configuration operations | See below |
+
+### System Configuration
+
+The `system_config` directive applies structured configuration
+changes to provisioned hosts before the benchmark starts. This
+runs deterministically in code — no LLM is involved.
+
+Supported actions:
+
+| Action | Fields | Description |
+|---|---|---|
+| `write_file` | `path`, `content` | Write content to a file (creates parent dirs) |
+| `run_command` | `command`, `timeout` (optional, default 30s) | Execute a shell command |
+
+Example — delay a systemd service:
+
+```json
+{
+  "system_config": [
+    {
+      "action": "write_file",
+      "path": "/etc/systemd/system/podman-clean-transient.service.d/delay.conf",
+      "content": "[Service]\nExecStartPre=/usr/bin/sleep 60"
+    },
+    {
+      "action": "run_command",
+      "command": "systemctl daemon-reload"
+    }
+  ]
+}
+```
+
+The provisioning agent applies these operations via SSH after
+the platform agent has flashed and verified the board, but
+before the benchmark starts. Results are recorded in
+`system_config_applied` and `system_config_errors` on the ticket.
 
 ### HITL Control
 
