@@ -39,7 +39,6 @@ _HEAVY_FIELDS = {
     "key_metrics",
     "configuration_applied",
     "follow_up_needed",
-    "verdict",
 }
 
 
@@ -145,6 +144,19 @@ def create_ticket(body: CreateTicketRequest, request: Request):
 
 _SUMMARY_FIELDS = ("id", "summary", "status", "owners", "created_at", "updated_at")
 
+# Outcome-relevant custom_fields included in summary responses
+# so the dashboard can render the Outcome column without fetching
+# full ticket data.
+_OUTCOME_FIELDS = {
+    "verdict",
+    "dedup_result",
+    "synthesis_result",
+    "evaluation_result",
+    "analysis_result",
+    "abort_requested",
+    "stop_requested",
+}
+
 
 @router.get("")
 def list_tickets(
@@ -158,9 +170,16 @@ def list_tickets(
     if exclude_status is not None:
         tickets = [t for t in tickets if t.status != exclude_status]
     if fields == "summary":
-        return [
-            {k: t.model_dump(mode="json")[k] for k in _SUMMARY_FIELDS} for t in tickets
-        ]
+        result = []
+        for t in tickets:
+            d = t.model_dump(mode="json")
+            row = {k: d[k] for k in _SUMMARY_FIELDS}
+            cf = d.get("custom_fields", {})
+            outcome_cf = {k: v for k, v in cf.items() if k in _OUTCOME_FIELDS}
+            if outcome_cf:
+                row["custom_fields"] = outcome_cf
+            result.append(row)
+        return result
     return [_strip_heavy_fields(t.model_dump(mode="json")) for t in tickets]
 
 

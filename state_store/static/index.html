@@ -701,6 +701,14 @@ details > .content { padding: 12px 16px; }
 .result-verdict.fail { color: var(--red); }
 .result-verdict.inconclusive { color: var(--yellow, #e2b340); }
 
+.outcome { font-size: 11px; font-weight: 600; white-space: nowrap; }
+.outcome-pass { color: var(--green); }
+.outcome-fail { color: var(--red); }
+.outcome-inconclusive { color: var(--yellow, #e2b340); }
+.outcome-none { color: var(--text-muted); }
+.outcome-abort { color: var(--text-muted); font-style: italic; }
+.ticket-outcome { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+
 .result-summary {
   font-size: 14px;
   color: var(--text-bright);
@@ -1535,6 +1543,72 @@ function statusBadge(status) {
   return '<span class="badge badge-' + status + '">' + label + '</span>';
 }
 
+function ticketOutcome(ticket) {
+  var cf = ticket.custom_fields || {};
+  var verdict = cf.verdict;
+  var dedup = cf.dedup_result;
+  var synth = cf.synthesis_result;
+  var evalR = cf.evaluation_result;
+  var analysis = cf.analysis_result;
+
+  // Verdict from review agent
+  if (verdict) {
+    var v = String(verdict).toLowerCase();
+    var cls = 'inconclusive';
+    if (v === 'hypothesis_confirmed' || v === 'pass' || v === 'passed' ||
+        v === 'meets_expectations') cls = 'pass';
+    else if (v === 'hypothesis_refuted' || v === 'fail' || v === 'failed' ||
+        v === 'below_expectations') cls = 'fail';
+    return '<span class="outcome outcome-' + cls + '">' +
+      escHtml(String(verdict).toUpperCase()) + '</span>';
+  }
+
+  // Dedup match
+  if (dedup && dedup.decision === 'MATCH_FOUND') {
+    return '<span class="outcome outcome-pass">DEDUP \u2014 ' +
+      escHtml(String(dedup.matched_investigation_id)) + '</span>';
+  }
+
+  // Synthesis outcome
+  if (synth) {
+    var sOutcome = String(synth.convergence_outcome || '').toUpperCase();
+    var sCls = 'inconclusive';
+    if (sOutcome === 'ISOLATION' || sOutcome === 'EXPECTED_REGRESSION') sCls = 'pass';
+    else if (sOutcome === 'ENTROPY_STALL' || sOutcome === 'MAX_ITERATIONS') sCls = 'fail';
+    return '<span class="outcome outcome-' + sCls + '">' +
+      escHtml(sOutcome || 'COMPLETE') + '</span>';
+  }
+
+  // Evaluation result (pre-synthesis)
+  if (evalR) {
+    var eOutcome = String(evalR.decision || '').toUpperCase();
+    var eCls = 'inconclusive';
+    if (eOutcome === 'CONVERGED') eCls = 'pass';
+    else if (eOutcome === 'STALLED') eCls = 'fail';
+    return '<span class="outcome outcome-' + eCls + '">' +
+      escHtml(eOutcome) + '</span>';
+  }
+
+  // Analysis-only conclusion
+  if (analysis && analysis.conclusive) {
+    return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
+  }
+  if (analysis && !analysis.conclusive) {
+    return '<span class="outcome outcome-inconclusive">NEEDS DATA</span>';
+  }
+
+  // Aborted / cancelled
+  var status = ticket.status || '';
+  if (cf.abort_requested || cf.stop_requested) {
+    return '<span class="outcome outcome-abort">ABORTED</span>';
+  }
+  if (status === 'closed' || status === 'awaiting_teardown') {
+    return '<span class="outcome outcome-abort">CANCELLED</span>';
+  }
+
+  return '<span class="outcome outcome-none">\u2014</span>';
+}
+
 function escHtml(s) {
   if (typeof s !== 'string') s = String(s);
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1704,6 +1778,7 @@ async function loadTickets() {
           '<td class="ticket-id">' + escHtml(t.id) + '</td>' +
           '<td class="ticket-summary">' + escHtml(t.summary) + '</td>' +
           '<td>' + statusBadge(t.status) + '</td>' +
+          '<td class="ticket-outcome">' + ticketOutcome(t) + '</td>' +
           (_isMultiUser ? '<td class="ticket-owners">' + ownersHtml + '</td>' : '') +
           '<td class="ticket-tokens">' + tokHtml + '</td>' +
           '<td class="ticket-cost">' + costHtml + '</td>' +
@@ -1715,7 +1790,7 @@ async function loadTickets() {
     el.innerHTML =
       '<table>' +
         '<thead><tr>' +
-          '<th>Ticket</th><th>Summary</th><th>Status</th>' +
+          '<th>Ticket</th><th>Summary</th><th>Status</th><th>Outcome</th>' +
           (_isMultiUser ? '<th>Owners</th>' : '') +
           '<th class="col-right">Tokens</th><th class="col-right">Cost</th>' +
           '<th>Created</th><th>Updated</th>' +
