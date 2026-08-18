@@ -131,22 +131,11 @@ class PlatformAgent(AgentBase):
                 f"{json.dumps(cf['anomaly_context'], indent=2)}\n"
             )
 
-        # Include relevant comments for context
-        if ticket.get("comments"):
-            relevant = [
-                c
-                for c in ticket["comments"]
-                if c["author"]
-                in (
-                    "gathering-context-agent",
-                    "resource-agent",
-                    "orchestrator",
-                )
-            ]
-            if relevant:
-                content += "\n## Prior Agent Notes\n"
-                for c in relevant[-3:]:
-                    content += f"\n**{c['author']}:** {c['body'][:300]}\n"
+        user_comments = self._user_comments(ticket)
+        if user_comments:
+            content += "\n## Previous Comments\n"
+            for comment in user_comments:
+                content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]
 

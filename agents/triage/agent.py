@@ -432,9 +432,15 @@ class TriageAgent(AgentBase):
                 "comparison.\n"
             )
 
-        if ticket.get("comments"):
+        _TRIAGE_NOISE_AUTHORS = frozenset({"system", "orchestrator"})
+        relevant_comments = [
+            c
+            for c in (ticket.get("comments") or [])
+            if c.get("author") not in _TRIAGE_NOISE_AUTHORS
+        ]
+        if relevant_comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in relevant_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         cf = ticket.get("custom_fields", {})

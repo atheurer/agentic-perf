@@ -593,10 +593,6 @@ class ResourceAgent(AgentBase):
             )
 
         fields = ticket.get("custom_fields", {})
-        specs = fields.get("parsed_specs")
-        if specs:
-            content += f"\n## Parsed Specifications\n```json\n{specs}\n```\n"
-
         directives = fields.get("directives", {})
         if directives:
             content += "\n## Directives\n"
@@ -624,9 +620,10 @@ class ResourceAgent(AgentBase):
                 content += "- **Endpoint type:** kube (workloads run as pods)\n"
                 content += "- **Total hosts to provision:** 1 (single host: controller + K8s cluster)\n"
 
-        if ticket.get("comments"):
+        user_comments = self._user_comments(ticket)
+        if user_comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in user_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]

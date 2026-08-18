@@ -891,6 +891,17 @@ class AgentBase(ABC):
         return "\n\n".join(parts)
 
     @staticmethod
+    def _user_comments(ticket: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return only user-authored comments from a ticket.
+
+        Agent and system handoff messages are pipeline noise and should
+        not be injected into any agent's initial context.
+        """
+        return [
+            c for c in (ticket.get("comments") or []) if c.get("author") == "user"
+        ]
+
+    @staticmethod
     def _load_prompt_fragments(
         agent_dir: Path,
         resource_provider: str | None = None,

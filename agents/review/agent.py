@@ -376,8 +376,6 @@ class ReviewAgent(AgentBase):
 
         if cf.get("benchmark_duration"):
             content += f"**Duration:** {cf['benchmark_duration']}s\n"
-        if cf.get("parsed_specs"):
-            content += f"\n## Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("run_file_used"):
             content += f"\n## Run File\n```json\n{json.dumps(cf['run_file_used'], indent=2)}\n```\n"
 
@@ -450,9 +448,10 @@ class ReviewAgent(AgentBase):
                 for doc in docs:
                     content += f"- `{doc['path']}`\n"
 
-        if ticket.get("comments"):
+        user_comments = self._user_comments(ticket)
+        if user_comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in user_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]
