@@ -415,6 +415,21 @@ class TriageAgent(AgentBase):
             for comment in ticket["comments"]:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
+        cf = ticket.get("custom_fields", {})
+        verbatim_directives = cf.get("verbatim_directives") or {}
+        if verbatim_directives:
+            content += "\n## Pre-parsed Verbatim Directives\n\n"
+            content += (
+                "The following directives were extracted verbatim from the "
+                "ticket description and will be delivered directly to each "
+                "target agent. Do NOT summarize or paraphrase these in "
+                "`scoped_context` — your `scoped_context` entries should "
+                "contain only supplemental context that these blocks do not "
+                "already cover.\n\n"
+            )
+            for target, text in verbatim_directives.items():
+                content += f"**agent:{target}:**\n```\n{text}\n```\n\n"
+
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
