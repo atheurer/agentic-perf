@@ -641,7 +641,8 @@ See [Secrets Management](secrets.md) for full details.
 ```json
 {
     "auth": {
-        "multi_user": false
+        "multi_user": false,
+        "anonymous_read": false
     }
 }
 ```
@@ -650,6 +651,7 @@ See [Secrets Management](secrets.md) for full details.
 |---|---|---|---|
 | `multi_user` | bool | `false` | Enable per-user authentication. When `true`, each API caller needs a personal bearer token (created via the admin API). The existing deployment token becomes the service principal used by the orchestrator and agents. When `false`, behavior is identical to a single-token deployment. |
 | `token_ttl_days` | int | `0` | Maximum age (in days) for user tokens. `0` disables expiry. Applies only in multi-user mode. The deployment token is always exempt. When a token older than this value is presented, the server returns `401 Unauthorized`. Expired users must have their token rotated by an admin. |
+| `anonymous_read` | bool | `false` | Allow unauthenticated read-only access to the dashboard and GET API endpoints. When `true`, GET, HEAD, and OPTIONS requests bypass bearer token authentication. All write operations (POST, PATCH, DELETE) still require a valid token. Useful for sharing dashboard links with stakeholders who need to observe but not interact. |
 
 See [Multi-User Guide](multi-user.md) for bootstrap instructions and
 the full feature walkthrough.

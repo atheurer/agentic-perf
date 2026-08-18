@@ -38,9 +38,16 @@ TOKEN_ENV_VAR = "AGENTIC_PERF_API_TOKEN"
 class Principal:
     """Identity of the authenticated caller."""
 
-    kind: Literal["user", "service"]
+    kind: Literal["user", "service", "anonymous"]
     username: str
     is_admin: bool
+
+
+ANONYMOUS_PRINCIPAL = Principal(
+    kind="anonymous",
+    username="anonymous",
+    is_admin=False,
+)
 
 
 def load_or_generate_token() -> str:
@@ -93,6 +100,7 @@ def make_auth_dependency(
     user_store: UserStore | None = None,
     token_ttl_days: int = 0,
     auth_failure_limiter: AuthFailureLimiter | None = None,
+    anonymous_read: bool = False,
 ):
     """Create a FastAPI dependency that validates bearer tokens.
 
@@ -119,6 +127,11 @@ def make_auth_dependency(
         return HTTPException(status_code=401, detail=detail)
 
     async def verify_token(request: Request) -> Principal:
+        # Allow anonymous read-only access when configured
+        if anonymous_read and request.method in ("GET", "HEAD", "OPTIONS"):
+            request.state.principal = ANONYMOUS_PRINCIPAL
+            return ANONYMOUS_PRINCIPAL
+
         if auth_failure_limiter is not None:
             from .ratelimit import _clamp_retry_after
 
@@ -235,6 +248,11 @@ def require_write_access(
     - principal's username is in the ticket's owners list
     - ticket has no owners (unclaimed — any user can write)
     """
+    if principal.kind == "anonymous":
+        raise HTTPException(
+            status_code=403,
+            detail="Anonymous read-only access cannot modify tickets",
+        )
     if not multi_user:
         return
     if principal.kind == "service":

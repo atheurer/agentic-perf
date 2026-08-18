@@ -244,3 +244,28 @@ Service accounts differ from regular users:
 | Dashboard access | Yes | No (token only) |
 
 See [Webhook Ingestion](webhook-ingestion.md) for full details.
+
+## Anonymous Read-Only Access
+
+To share the dashboard with stakeholders who need to observe but
+not interact, enable anonymous read access:
+
+```json
+{
+    "auth": {
+        "anonymous_read": true
+    }
+}
+```
+
+When enabled, GET requests to the API (and the dashboard itself)
+do not require a bearer token. All write operations (creating
+tickets, transitions, comments, field updates) still require
+authentication.
+
+This works independently of `multi_user` — you can enable it in
+single-token mode or multi-user mode.
+
+**Security note:** ticket data may contain infrastructure details
+(hostnames, IPs, benchmark configurations). Enable this only on
+trusted networks or behind appropriate access controls.

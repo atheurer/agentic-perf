@@ -89,11 +89,15 @@ def create_app() -> FastAPI:
     cfg = _load_config_file()
     auth_cfg = cfg.get("auth", {})
     multi_user = auth_cfg.get("multi_user", False)
+    anonymous_read = auth_cfg.get("anonymous_read", False)
     token_ttl_days = _validate_positive_int(
         auth_cfg.get("token_ttl_days", 0),
         "auth.token_ttl_days",
     )
     app.state.multi_user = multi_user
+    app.state.anonymous_read = anonymous_read
+    if anonymous_read:
+        logger.info("Anonymous read-only access enabled")
 
     user_store = None
     if multi_user:
@@ -179,6 +183,7 @@ def create_app() -> FastAPI:
         user_store=user_store,
         token_ttl_days=token_ttl_days,
         auth_failure_limiter=auth_failure_limiter,
+        anonymous_read=anonymous_read,
     )
     app.state.auth_dependency = auth
 
