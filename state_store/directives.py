@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-_FENCE_RE = re.compile(r"```agent:([\w,\s]+)\n(.*?)```", re.DOTALL)
+_FENCE_RE = re.compile(r"```agent:([^\n]+)\n(.*?)```", re.DOTALL)
 
 
 def parse_verbatim_directives(description: str) -> dict[str, str]:

@@ -105,11 +105,11 @@ Your job is to analyze a performance test request ticket and:
      key should always be present.
    - "resource": Host/hardware requirements, provider preferences, instance
      types, counts, regions, availability zones, RAM requirements.
-   - "provisioning": Harness installation instructions, user-requested
+   - "provision": Harness installation instructions, user-requested
      packages (e.g., "install nmap-ncat"). Do NOT include benchmark tool
      names (uperf, fio, trafficgen, etc.), benchmark parameters, test
      configs, connectivity testing, SSH key setup, or reporting
-     expectations. The provisioning agent installs the harness only —
+     expectations. The provision agent installs the harness only —
      benchmark tools run inside the harness's containers and do not need
      host-level installation.
    - "benchmark": Test parameters (message sizes, thread counts, protocols,
@@ -180,7 +180,7 @@ Any step can include an optional **scoped_context** dict in its params to provid
 step-specific natural language context for the agent. This replaces the ticket-level
 scoped_context for that agent's section. Use this when different iterations need
 different instructions — for example, a resource step for RHEL10 should NOT include
-RHEL9 instructions. Keys match agent roles: "resource", "provisioning", "benchmark",
+RHEL9 instructions. Keys match agent roles: "resource", "provision", "benchmark",
 "review". If omitted, the orchestrator clears the agent's section so the agent relies
 on structured data (required_hosts, directives) instead of stale ticket-level text.
 

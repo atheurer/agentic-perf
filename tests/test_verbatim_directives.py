@@ -70,18 +70,18 @@ class TestGetScopedContextWithVerbatim:
 
     def test_verbatim_only(self):
         ticket = self._make_ticket(
-            verbatim={"provisioning": "- 32 combined queues"},
+            verbatim={"provision": "- 32 combined queues"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert "Directives (authoritative" in result
         assert "32 combined queues" in result
 
     def test_verbatim_with_supplemental(self):
         ticket = self._make_ticket(
-            verbatim={"provisioning": "- 32 queues"},
-            scoped={"provisioning": "Also set MTU 9000"},
+            verbatim={"provision": "- 32 queues"},
+            scoped={"provision": "Also set MTU 9000"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert "Directives (authoritative" in result
         assert "32 queues" in result
         assert "Additional context" in result
@@ -89,26 +89,26 @@ class TestGetScopedContextWithVerbatim:
 
     def test_verbatim_before_supplemental(self):
         ticket = self._make_ticket(
-            verbatim={"provisioning": "VERBATIM"},
-            scoped={"provisioning": "SUPPLEMENTAL"},
+            verbatim={"provision": "VERBATIM"},
+            scoped={"provision": "SUPPLEMENTAL"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert result.index("VERBATIM") < result.index("SUPPLEMENTAL")
 
     def test_shared_before_verbatim(self):
         ticket = self._make_ticket(
-            verbatim={"provisioning": "VERBATIM"},
-            scoped={"shared": "SHARED", "provisioning": "SUPPLEMENTAL"},
+            verbatim={"provision": "VERBATIM"},
+            scoped={"shared": "SHARED", "provision": "SUPPLEMENTAL"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert result.index("SHARED") < result.index("VERBATIM")
 
     def test_no_verbatim_legacy_format(self):
         """Without verbatim directives, output is plain text (no headers)."""
         ticket = self._make_ticket(
-            scoped={"shared": "AWS env", "provisioning": "Install nmap"},
+            scoped={"shared": "AWS env", "provision": "Install nmap"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert result == "AWS env\n\nInstall nmap"
         assert "Directives" not in result
 
@@ -116,9 +116,9 @@ class TestGetScopedContextWithVerbatim:
         """Verbatim for a different agent does not affect this agent."""
         ticket = self._make_ticket(
             verbatim={"benchmark": "- run fast"},
-            scoped={"provisioning": "Install nmap"},
+            scoped={"provision": "Install nmap"},
         )
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert result == "Install nmap"
         assert "Directives" not in result
 

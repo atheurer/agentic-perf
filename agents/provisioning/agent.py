@@ -487,7 +487,7 @@ class ProvisioningAgent(AgentBase):
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
-        scoped = self._get_scoped_context(ticket, "provisioning")
+        scoped = self._get_scoped_context(ticket, "provision")
         if scoped is not None:
             content = (
                 f"## Performance Test Request\n\n"

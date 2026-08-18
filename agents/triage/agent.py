@@ -242,10 +242,10 @@ _LOCAL_TOOLS = [
                                 "instance types, regions)"
                             ),
                         },
-                        "provisioning": {
+                        "provision": {
                             "type": "string",
                             "description": (
-                                "Context for the provisioning agent "
+                                "Context for the provision agent "
                                 "(installation instructions, package "
                                 "requirements, setup directives)"
                             ),
@@ -585,7 +585,7 @@ class TriageAgent(AgentBase):
         # text.
         agent_key_map = {
             "resource": "resource",
-            "provision": "provisioning",
+            "provision": "provision",
             "benchmark": "benchmark",
             "review": "review",
         }
