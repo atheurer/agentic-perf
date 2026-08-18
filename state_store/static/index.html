@@ -1580,10 +1580,10 @@ function ticketOutcome(ticket) {
 
   // Evaluation result (pre-synthesis)
   if (evalR) {
-    var eOutcome = String(evalR.outcome || '').toUpperCase();
+    var eOutcome = String(evalR.decision || '').toUpperCase();
     var eCls = 'inconclusive';
     if (eOutcome === 'CONVERGED') eCls = 'pass';
-    else if (eOutcome === 'STALLED' || eOutcome === 'FAILED') eCls = 'fail';
+    else if (eOutcome === 'STALLED') eCls = 'fail';
     return '<span class="outcome outcome-' + eCls + '">' +
       escHtml(eOutcome) + '</span>';
   }
