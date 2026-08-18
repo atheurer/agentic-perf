@@ -523,14 +523,7 @@ class TriageAgent(AgentBase):
                     for k, v in scoped_context.items()
                     if k in _KNOWN_SCOPED_CONTEXT_KEYS
                 }
-            # Drop triage summaries for any agent that already has verbatim
-            # directives — the verbatim block is authoritative and the
-            # summary is redundant by definition.
-            verbatim = cf.get("verbatim_directives") or {}
-            for key in verbatim:
-                scoped_context.pop(key, None)
-            if scoped_context:
-                fields["scoped_context"] = scoped_context
+            fields["scoped_context"] = scoped_context
 
         reference_tickets = result.get("reference_tickets")
         if reference_tickets and isinstance(reference_tickets, list):
