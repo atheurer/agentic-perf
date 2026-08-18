@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from tests.conftest import MockSSHExecutor, SSHResult
 
 HOST = "test-host.example.com"
