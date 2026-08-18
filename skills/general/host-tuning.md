@@ -15,8 +15,9 @@ Settings scoped to a specific network interface via ethtool:
 Changing the channel count changes which IRQ numbers the NIC has. If you pin
 an IRQ and then change the channel count, the pin is on the wrong IRQ.
 
-Typical value for single-stream benchmarks: `channels=1` (one combined queue,
-one IRQ to pin).
+**Always use the channel count specified in the ticket.** Do not apply a
+default — the right value depends on the test design and the ticket author
+knows what they need.
 
 ### 2. TCP/Network Stack Tuning (`tune_tcp`)
 TCP stack settings — sysctl values plus direct interface qdisc via `tc`.
@@ -68,9 +69,6 @@ on those NICs).
   across its CPUs. Use this when you just want "the right node" without
   looking up NUMA topology yourself.
 
-For a single-queue NIC (the common case for single-stream benchmarks), any
-of these modes reduces to pinning that one IRQ to one CPU — pass a
-single-element `cpus` list for that.
 
 **Undoing a pin:** use `reset_irq_pinning` (same device-selection params) to
 restore default `smp_affinity`, clear the IRQ from
@@ -114,7 +112,7 @@ Example (AMD R7725, ConnectX-7 NIC on NUMA node 1):
 ## Correct Tuning Order
 
 ```
-1. tune_nic(host, interface, channels=1)       # Set channel count first
+1. tune_nic(host, interface, channels=<from_ticket>)  # Set channel count first — use value from ticket
 2. tune_tcp(host, congestion_control="bbr",    # TCP stack (order vs nic doesn't matter,
             qdisc="fq")                        # but must be before benchmark starts)
 3. result = pin_irq(host, interface, cpus=[194],  # Pin IRQ after channel count is set
@@ -123,7 +121,7 @@ Example (AMD R7725, ConnectX-7 NIC on NUMA node 1):
    expected={
        "congestion_control": "bbr",
        "qdisc": "fq",
-       "channels": 1,
+       "channels": <from_ticket>,
        "irq_assignments": result["assignments"],  # e.g. [{"irq": 42, "cpu": 194}]
    })
 ```
