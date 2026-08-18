@@ -856,19 +856,48 @@ class AgentBase(ABC):
         ticket: dict[str, Any],
         agent_key: str,
     ) -> str | None:
-        """Return agent-scoped context, or None to fall back to full text."""
+        """Return agent-scoped context, or None to fall back to full text.
+
+        When verbatim_directives exist for the agent key, they are injected
+        first under an authoritative header, followed by any triage-generated
+        supplemental context. Without verbatim directives the legacy plain-
+        text format is preserved so existing tests are unaffected.
+        """
         cf = ticket.get("custom_fields", {})
+        verbatim_directives = cf.get("verbatim_directives") or {}
+        verbatim = verbatim_directives.get(agent_key, "")
+
         scoped = cf.get("scoped_context")
-        if not scoped or not isinstance(scoped, dict):
-            return None
+        has_scoped = bool(scoped and isinstance(scoped, dict))
+        shared = (scoped.get("shared") if has_scoped else None) or ""
+        supplemental = (scoped.get(agent_key) if has_scoped else None) or ""
+
+        if not verbatim:
+            # Legacy path: plain concatenation, no headers.
+            parts = []
+            if shared:
+                parts.append(shared)
+            if supplemental:
+                parts.append(supplemental)
+            return "\n\n".join(parts) if parts else None
+
+        # Verbatim path: inject authoritative block first.
         parts = []
-        shared = scoped.get("shared")
         if shared:
             parts.append(shared)
-        agent_section = scoped.get(agent_key)
-        if agent_section:
-            parts.append(agent_section)
-        return "\n\n".join(parts) if parts else None
+        parts.append(f"## Directives (authoritative — follow exactly):\n{verbatim}")
+        if supplemental:
+            parts.append(f"## Additional context:\n{supplemental}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _user_comments(ticket: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return only user-authored comments from a ticket.
+
+        Agent and system handoff messages are pipeline noise and should
+        not be injected into any agent's initial context.
+        """
+        return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
 
     @staticmethod
     def _load_prompt_fragments(

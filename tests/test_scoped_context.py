@@ -41,7 +41,7 @@ class TestGetScopedContext:
                 },
             },
         }
-        result = AgentBase._get_scoped_context(ticket, "provisioning")
+        result = AgentBase._get_scoped_context(ticket, "provision")
         assert result == "AWS m5n.4xlarge, RHEL9"
 
     def test_returns_only_agent_section_when_no_shared(self):
@@ -84,7 +84,7 @@ class TestProvisioningAgentScopedContext:
         ticket = _make_ticket(
             {
                 "shared": "AWS RHEL9 environment",
-                "provisioning": "Install nmap-ncat on all hosts",
+                "provision": "Install nmap-ncat on all hosts",
             }
         )
         agent = ProvisioningAgent.__new__(ProvisioningAgent)
@@ -210,7 +210,7 @@ class TestTriageHandleCompletionPersistsContext:
             "directives": {},
             "scoped_context": {
                 "shared": "AWS environment",
-                "provisioning": "Install nmap-ncat",
+                "provision": "Install nmap-ncat",
                 "benchmark": "Run uperf stream",
             },
         }
@@ -225,7 +225,7 @@ class TestTriageHandleCompletionPersistsContext:
 
         assert "scoped_context" in fields
         assert fields["scoped_context"]["shared"] == "AWS environment"
-        assert fields["scoped_context"]["provisioning"] == "Install nmap-ncat"
+        assert fields["scoped_context"]["provision"] == "Install nmap-ncat"
         assert fields["scoped_context"]["benchmark"] == "Run uperf stream"
 
     def test_scoped_context_not_included_when_absent(self):

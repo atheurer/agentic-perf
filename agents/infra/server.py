@@ -367,6 +367,184 @@ async def list_interfaces(host: str) -> str:
     return json.dumps(interfaces)
 
 
+_IFACE_SCRIPT = (
+    "import json,os,subprocess\n"
+    "net='/sys/class/net'\n"
+    "result=[]\n"
+    "for iface in sorted(os.listdir(net)):\n"
+    " if iface=='lo':continue\n"
+    " d={'name':iface}\n"
+    " def rd(p,dfl=None,iface=iface):\n"
+    "  try:return open(f'{net}/{iface}/{p}').read().strip()\n"
+    "  except:return dfl\n"
+    " d['link']=rd('operstate','unknown')\n"
+    " try:d['speed_mbps']=int(rd('speed','-1'))\n"
+    " except:d['speed_mbps']=-1\n"
+    " try:d['mtu']=int(rd('mtu','-1'))\n"
+    " except:d['mtu']=-1\n"
+    " try:d['numa_node']=int(rd('device/numa_node','-1'))\n"
+    " except:d['numa_node']=-1\n"
+    " d['mac']=rd('address','')\n"
+    " result.append(d)\n"
+    "proc=subprocess.run(['ip','-j','addr','show'],capture_output=True,text=True)\n"
+    "addrs={a['ifname']:a for a in json.loads(proc.stdout or '[]')}\n"
+    "for d in result:\n"
+    " ai=addrs.get(d['name'],{}).get('addr_info',[])\n"
+    " d['ipv4']=[x['local']+'/'+str(x['prefixlen']) for x in ai if x.get('family')=='inet']\n"
+    " d['ipv6']=[x['local']+'/'+str(x['prefixlen']) for x in ai"
+    " if x.get('family')=='inet6' and not x.get('local','').startswith('fe80')]\n"
+    " d['ipv6_link_local']=[x['local']+'/'+str(x['prefixlen']) for x in ai"
+    " if x.get('family')=='inet6' and x.get('local','').startswith('fe80')]\n"
+    "print(json.dumps(result))"
+)
+
+
+def _apply_iface_filters(
+    interfaces: list[dict[str, Any]],
+    name_regex: str,
+    link: str,
+    min_speed_gbps: float,
+    max_speed_gbps: float,
+    min_mtu: int,
+    max_mtu: int,
+    ipv4: str,
+    ipv6: str,
+    numa_node: int,
+) -> list[dict[str, Any]]:
+    out = []
+    for iface in interfaces:
+        if name_regex and not re.search(name_regex, iface["name"]):
+            continue
+        if link and iface["link"].lower() != link.lower():
+            continue
+        spd = iface["speed_mbps"]
+        if min_speed_gbps > 0:
+            if spd < 0 or spd < min_speed_gbps * 1000:
+                continue
+        if max_speed_gbps > 0:
+            if spd < 0 or spd > max_speed_gbps * 1000:
+                continue
+        if min_mtu > 0 and iface["mtu"] < min_mtu:
+            continue
+        if max_mtu > 0 and iface["mtu"] > max_mtu:
+            continue
+        if ipv4:
+            addrs = iface.get("ipv4", [])
+            if ipv4 == "present" and not addrs:
+                continue
+            if ipv4 == "absent" and addrs:
+                continue
+            if ipv4 not in ("present", "absent"):
+                if not any(re.search(ipv4, a) for a in addrs):
+                    continue
+        if ipv6:
+            addrs = iface.get("ipv6", [])
+            if ipv6 == "present" and not addrs:
+                continue
+            if ipv6 == "absent" and addrs:
+                continue
+            if ipv6 not in ("present", "absent"):
+                if not any(re.search(ipv6, a) for a in addrs):
+                    continue
+        # -2 sentinel means no filter; -1 is a valid numa_node value
+        if numa_node != -2 and iface["numa_node"] != numa_node:
+            continue
+        iface["speed_gbps"] = round(spd / 1000, 3) if spd >= 0 else -1
+        out.append(iface)
+    return out
+
+
+@mcp.tool()
+async def get_interface_inventory(
+    host: str,
+    name_regex: str = "",
+    link: str = "",
+    min_speed_gbps: float = 0,
+    max_speed_gbps: float = 0,
+    min_mtu: int = 0,
+    max_mtu: int = 0,
+    ipv4: str = "",
+    ipv6: str = "",
+    numa_node: int = -2,
+) -> str:
+    """Get a comprehensive inventory of network interfaces on a remote host.
+
+    Returns per-interface: name, link state, speed (Mbps and Gbps), MTU,
+    NUMA node, MAC, IPv4 addresses, IPv6 addresses (global and link-local).
+
+    All data is collected in a single SSH call. Optional server-side filters
+    let the caller narrow results without multiple round-trips:
+
+      name_regex        — regex matched against interface name
+      link              — "up" or "down"
+      min/max_speed_gbps — speed range in Gbps (0 = no limit)
+      min/max_mtu       — MTU range (0 = no limit)
+      ipv4              — "present", "absent", or regex against address strings
+      ipv6              — same for non-link-local IPv6
+      numa_node         — exact NUMA node match (-2 = no filter)
+
+    Example — find all UP 400G interfaces on NUMA node 1:
+      get_interface_inventory(host, link="up", min_speed_gbps=400,
+                              max_speed_gbps=400, numa_node=1)
+    """
+    ssh = _get_ssh()
+    cmd = f"python3 -c {shlex.quote(_IFACE_SCRIPT)}"
+    result = await ssh.run(host, cmd, timeout=20)
+    if result.exit_code != 0:
+        return json.dumps({"error": result.stderr or result.stdout, "host": host})
+    try:
+        interfaces = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"parse error: {exc}", "host": host})
+
+    filters_applied: dict[str, Any] = {}
+    if name_regex:
+        filters_applied["name_regex"] = name_regex
+    if link:
+        filters_applied["link"] = link
+    if min_speed_gbps:
+        filters_applied["min_speed_gbps"] = min_speed_gbps
+    if max_speed_gbps:
+        filters_applied["max_speed_gbps"] = max_speed_gbps
+    if min_mtu:
+        filters_applied["min_mtu"] = min_mtu
+    if max_mtu:
+        filters_applied["max_mtu"] = max_mtu
+    if ipv4:
+        filters_applied["ipv4"] = ipv4
+    if ipv6:
+        filters_applied["ipv6"] = ipv6
+    if numa_node != -2:
+        filters_applied["numa_node"] = numa_node
+
+    filtered = _apply_iface_filters(
+        interfaces,
+        name_regex,
+        link,
+        min_speed_gbps,
+        max_speed_gbps,
+        min_mtu,
+        max_mtu,
+        ipv4,
+        ipv6,
+        numa_node,
+    )
+    # Ensure speed_gbps on unfiltered items too
+    for iface in filtered:
+        if "speed_gbps" not in iface:
+            spd = iface["speed_mbps"]
+            iface["speed_gbps"] = round(spd / 1000, 3) if spd >= 0 else -1
+
+    return json.dumps(
+        {
+            "host": host,
+            "interfaces": filtered,
+            "count": len(filtered),
+            "filters_applied": filters_applied,
+        }
+    )
+
+
 @mcp.tool()
 async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     """Deploy a secret file to a remote host.

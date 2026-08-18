@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,27 @@ from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from .prompts import TRIAGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_SCOPED_CONTEXT_CALL_RE = re.compile(
+    r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
+)
+
+
+def _discover_scoped_context_keys() -> frozenset[str]:
+    """Scan agent modules for _get_scoped_context calls to find valid keys.
+
+    Runs once at import time so the set stays in sync automatically when
+    new agents are added without requiring a manual update here.
+    """
+    keys: set[str] = {"shared"}
+    agents_dir = Path(__file__).parent.parent
+    for agent_file in sorted(agents_dir.glob("*/agent.py")):
+        for match in _SCOPED_CONTEXT_CALL_RE.finditer(agent_file.read_text()):
+            keys.add(match.group(1))
+    return frozenset(keys)
+
+
+_KNOWN_SCOPED_CONTEXT_KEYS = _discover_scoped_context_keys()
 
 _LOCAL_TOOLS = [
     ToolDefinition(
@@ -217,13 +239,26 @@ _LOCAL_TOOLS = [
                     "type": "object",
                     "description": (
                         "Agent-scoped context partitioned from the user's "
-                        "request. Each key is an agent role (resource, "
-                        "provisioning, benchmark, review) or 'shared' for "
-                        "context relevant to all agents. Values are natural "
-                        "language summaries of the portions of the request "
-                        "relevant to that agent. Agent-prefixed directives "
-                        "(e.g., 'provision agent: install nmap-ncat') go in "
-                        "the corresponding agent's section."
+                        "request. Each key is an agent role ('resource', "
+                        "'provision', 'benchmark', 'review') or 'shared' "
+                        "for context relevant to all agents. "
+                        "IMPORTANT: if the ticket contains a verbatim "
+                        "agent:* fenced block for a key (shown in "
+                        "'Pre-parsed Verbatim Directives' above), that "
+                        "block is already delivered to the agent verbatim "
+                        "— do NOT restate, rephrase, reformat, or "
+                        "summarize any of its content here, in any form "
+                        "(not as prose, not as a numbered list, not as "
+                        "bullet points). Reformatting is still restating. "
+                        "Only write a value for that key if you have "
+                        "information from OTHER parts of the ticket that "
+                        "the verbatim block does not mention at all — "
+                        "for example: a directive resolved from the "
+                        "ticket's custom_fields (like on_existing_install), "
+                        "a constraint inferred from the host inventory, or "
+                        "an ambiguity you resolved. If the only thing you "
+                        "could write is a restatement of the verbatim "
+                        "block, omit the key entirely."
                     ),
                     "properties": {
                         "shared": {
@@ -242,32 +277,32 @@ _LOCAL_TOOLS = [
                                 "instance types, regions)"
                             ),
                         },
-                        "provisioning": {
+                        "provision": {
                             "type": "string",
                             "description": (
-                                "Context for the provisioning agent "
-                                "(installation instructions, package "
-                                "requirements, setup directives)"
+                                "Supplemental context for the provision "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:provision block."
                             ),
                         },
                         "benchmark": {
                             "type": "string",
                             "description": (
-                                "Context for the benchmark agent "
-                                "(test parameters, workload details, "
-                                "connectivity requirements, run approval)"
+                                "Supplemental context for the benchmark "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:benchmark block."
                             ),
                         },
                         "review": {
                             "type": "string",
                             "description": (
-                                "Context for the review agent "
-                                "(analysis expectations, comparison "
-                                "criteria, reporting requirements)"
+                                "Supplemental context for the review "
+                                "agent — only if genuinely additive beyond "
+                                "any verbatim agent:review block."
                             ),
                         },
                     },
-                    "additionalProperties": True,
+                    "additionalProperties": False,
                 },
                 "reference_tickets": {
                     "type": "array",
@@ -410,10 +445,31 @@ class TriageAgent(AgentBase):
                 "comparison.\n"
             )
 
-        if ticket.get("comments"):
+        _TRIAGE_NOISE_AUTHORS = frozenset({"system", "orchestrator"})
+        relevant_comments = [
+            c
+            for c in (ticket.get("comments") or [])
+            if c.get("author") not in _TRIAGE_NOISE_AUTHORS
+        ]
+        if relevant_comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in relevant_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
+
+        cf = ticket.get("custom_fields", {})
+        verbatim_directives = cf.get("verbatim_directives") or {}
+        if verbatim_directives:
+            content += "\n## Pre-parsed Verbatim Directives\n\n"
+            content += (
+                "The following directives were extracted verbatim from the "
+                "ticket description and will be delivered directly to each "
+                "target agent. Do NOT summarize or paraphrase these in "
+                "`scoped_context` — your `scoped_context` entries should "
+                "contain only supplemental context that these blocks do not "
+                "already cover.\n\n"
+            )
+            for target, text in verbatim_directives.items():
+                content += f"**agent:{target}:**\n```\n{text}\n```\n\n"
 
         return [{"role": "user", "content": content}]
 
@@ -469,6 +525,17 @@ class TriageAgent(AgentBase):
 
         scoped_context = result.get("scoped_context")
         if scoped_context and isinstance(scoped_context, dict):
+            unknown = set(scoped_context) - _KNOWN_SCOPED_CONTEXT_KEYS
+            if unknown:
+                logger.warning(
+                    "scoped_context contains unknown keys %s — dropping",
+                    sorted(unknown),
+                )
+                scoped_context = {
+                    k: v
+                    for k, v in scoped_context.items()
+                    if k in _KNOWN_SCOPED_CONTEXT_KEYS
+                }
             fields["scoped_context"] = scoped_context
 
         reference_tickets = result.get("reference_tickets")
@@ -570,7 +637,7 @@ class TriageAgent(AgentBase):
         # text.
         agent_key_map = {
             "resource": "resource",
-            "provision": "provisioning",
+            "provision": "provision",
             "benchmark": "benchmark",
             "review": "review",
         }

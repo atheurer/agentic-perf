@@ -9,6 +9,7 @@ from pathlib import Path
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
 
 from .audit import AuditLog
+from .directives import parse_verbatim_directives
 from .models import (
     VALID_TRANSITIONS,
     AddCommentRequest,
@@ -59,11 +60,15 @@ class TicketStore:
     ) -> Ticket:
         with self._lock:
             self._global_seq += 1
+            custom_fields = dict(request.custom_fields)
+            verbatim = parse_verbatim_directives(request.description)
+            if verbatim:
+                custom_fields["verbatim_directives"] = verbatim
             ticket = Ticket(
                 id=f"PERF-{uuid.uuid4().hex[:8].upper()}",
                 summary=request.summary,
                 description=request.description,
-                custom_fields=request.custom_fields,
+                custom_fields=custom_fields,
                 status=TicketStatus.NEW,
                 transition_seq=self._global_seq,
                 created_by=created_by,

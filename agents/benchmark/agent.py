@@ -274,8 +274,6 @@ class BenchmarkAgent(AgentBase):
                 f"**Description:**\n{ticket['description']}\n"
             )
 
-        if cf.get("parsed_specs"):
-            content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("absent_suite"):
@@ -379,9 +377,10 @@ class BenchmarkAgent(AgentBase):
                     "run-file.*\n"
                 )
 
-        if ticket.get("comments"):
+        user_comments = self._user_comments(ticket)
+        if user_comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in user_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]

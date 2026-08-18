@@ -487,7 +487,7 @@ class ProvisioningAgent(AgentBase):
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
-        scoped = self._get_scoped_context(ticket, "provisioning")
+        scoped = self._get_scoped_context(ticket, "provision")
         if scoped is not None:
             content = (
                 f"## Performance Test Request\n\n"
@@ -517,8 +517,6 @@ class ProvisioningAgent(AgentBase):
             )
         if cf.get("directives"):
             content += f"\n## User Directives\n```json\n{json.dumps(cf['directives'], indent=2)}\n```\n"
-        if cf.get("parsed_specs"):
-            content += f"\n## Parsed Specifications\n```json\n{json.dumps(cf['parsed_specs'], indent=2)}\n```\n"
         if cf.get("benchmark_suite"):
             content += f"\n**Benchmark Suite:** {cf['benchmark_suite']}\n"
         if cf.get("resource_provider_metadata"):
@@ -566,9 +564,15 @@ class ProvisioningAgent(AgentBase):
                             f"{json.dumps(flash['available_variants'])}\n"
                         )
 
-        if ticket.get("comments"):
+        # Agent/system handoff comments are pipeline noise — only surface
+        # user comments so the agent focuses on human intent, not its own
+        # prior outputs.
+        comments = [
+            c for c in (ticket.get("comments") or []) if c.get("author") == "user"
+        ]
+        if comments:
             content += "\n## Previous Comments\n"
-            for comment in ticket["comments"]:
+            for comment in comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
         return [{"role": "user", "content": content}]
