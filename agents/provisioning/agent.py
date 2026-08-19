@@ -435,11 +435,15 @@ class ProvisioningAgent(AgentBase):
                             "system_config errors prevent "
                             "meaningful benchmark execution.",
                         )
-                        await self._request_guidance(
+                        await self._transition_ticket(
                             ticket_id,
-                            "System configuration failed. "
-                            "Review errors above and decide "
-                            "whether to retry or abort.",
+                            "awaiting_customer_guidance",
+                            comment=(
+                                "System configuration failed. "
+                                "Review errors above and "
+                                "decide whether to retry "
+                                "or abort."
+                            ),
                         )
                         await mcp.disconnect()
                         self._mcp = None
