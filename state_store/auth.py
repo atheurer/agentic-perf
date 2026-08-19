@@ -127,8 +127,16 @@ def make_auth_dependency(
         return HTTPException(status_code=401, detail=detail)
 
     async def verify_token(request: Request) -> Principal:
-        # Allow anonymous read-only access when configured
-        if anonymous_read and request.method in ("GET", "HEAD", "OPTIONS"):
+        # Allow anonymous read-only access when configured,
+        # but only if no bearer token is provided. When a
+        # token IS present, authenticate normally so /whoami
+        # and ownership checks work correctly.
+        auth_header = request.headers.get("authorization", "")
+        if (
+            anonymous_read
+            and request.method in ("GET", "HEAD", "OPTIONS")
+            and not auth_header.startswith("Bearer ")
+        ):
             request.state.principal = ANONYMOUS_PRINCIPAL
             return ANONYMOUS_PRINCIPAL
 
