@@ -367,15 +367,15 @@ class TestConfigResolution:
         assert result == {"provider": "claude", "model": "claude-haiku-4-5"}
 
     @patch("orchestrator.config._load_config_file", return_value={})
-    def test_builtin_defaults_apply(self, _mock_cfg):
-        """Reasoning-heavy agents get Sonnet by default, others get global."""
+    def test_global_model_applies_everywhere(self, _mock_cfg):
+        """All agents get the global model — no builtin overrides."""
         from orchestrator.config import OrchestratorConfig
 
         config = OrchestratorConfig(llm_provider="claude", llm_model="claude-haiku-4-5")
         for agent in ("triage", "evaluating_convergence", "retrospective"):
             result = config.get_agent_llm_config(agent)
-            assert result == {"provider": "claude", "model": "claude-sonnet-4-6"}, (
-                f"{agent} should default to Sonnet"
+            assert result["model"] == "claude-haiku-4-5", (
+                f"{agent} should use global model"
             )
         result = config.get_agent_llm_config("benchmark")
         assert result["model"] == "claude-haiku-4-5", (
@@ -383,14 +383,14 @@ class TestConfigResolution:
         )
 
     @patch("orchestrator.config._load_config_file", return_value={})
-    def test_builtin_defaults_inherit_provider(self, _mock_cfg):
-        """Built-in defaults use the global provider, not a hardcoded one."""
+    def test_global_model_applies_to_all_agents(self, _mock_cfg):
+        """Global model is used for all agents — no builtin overrides."""
         from orchestrator.config import OrchestratorConfig
 
         config = OrchestratorConfig(llm_provider="gemini", llm_model="gemini-2.5-flash")
         result = config.get_agent_llm_config("triage")
         assert result["provider"] == "gemini"
-        assert result["model"] == "claude-sonnet-4-6"
+        assert result["model"] == "gemini-2.5-flash"
 
     def test_explicit_config_overrides_builtin(self, tmp_path):
         """User's agent_models.<type> takes priority over built-in defaults."""
@@ -419,15 +419,14 @@ class TestConfigResolution:
         try:
             config = OrchestratorConfig()
             assert config.get_agent_llm_config("triage")["model"] == "claude-opus-4-8"
-            assert (
-                config.get_agent_llm_config("evaluating_convergence")["model"]
-                == "claude-sonnet-4-6"
-            )
+            # Other agents get the global default (empty
+            # since no llm.model was set in config)
+            assert config.get_agent_llm_config("evaluating_convergence")["model"] == ""
         finally:
             cfg_mod.CONFIG_PATH = original
 
-    def test_default_config_overrides_builtin(self, tmp_path):
-        """User's agent_models.default takes priority over built-in defaults."""
+    def test_default_config_ignored(self, tmp_path):
+        """agent_models.default is no longer applied."""
         import json
 
         from orchestrator.config import OrchestratorConfig
@@ -452,11 +451,10 @@ class TestConfigResolution:
         cfg_mod.CONFIG_PATH = config_file
         try:
             config = OrchestratorConfig()
-            assert config.get_agent_llm_config("triage")["model"] == "gemini-2.5-flash"
-            assert (
-                config.get_agent_llm_config("retrospective")["model"]
-                == "gemini-2.5-flash"
-            )
+            # agent_models.default is ignored — agents get
+            # the global default (empty, no llm.model set)
+            assert config.get_agent_llm_config("triage")["model"] == ""
+            assert config.get_agent_llm_config("retrospective")["model"] == ""
         finally:
             cfg_mod.CONFIG_PATH = original
 

@@ -34,17 +34,10 @@ environment variable (defaults to `~/.agentic-perf`).
     },
     "agent_models": {
         "review": {
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
             "reasoning_effort": "high"
         },
-        "benchmark": {
-            "provider": "gemini",
-            "model": "gemini-2.5-flash"
-        },
-        "default": {
-            "provider": "claude",
-            "model": "claude-sonnet-4-6"
+        "introspection": {
+            "model": "claude-haiku-4-5"
         }
     },
     "state_store": {
@@ -89,7 +82,7 @@ overridden by `agent_models`.
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `provider` | string | `"mock"` | `LLM_PROVIDER` | Provider name (see [Supported Providers](#supported-providers)) |
-| `model` | string | `"claude-sonnet-4-6"` | `LLM_MODEL` | Model identifier |
+| `model` | string | **(required)** | `LLM_MODEL` | Model identifier. No default — must be set when provider is not `mock`. |
 | `backend` | string | — | `LLM_BACKEND` | `"vertex"` for Vertex AI, `"direct"` for direct API |
 | `project_id` | string | — | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID (Vertex AI backends) |
 | `region` | string | — | `CLOUD_ML_REGION` | Cloud region (Vertex AI backends) |
@@ -123,51 +116,46 @@ overridden by `agent_models`.
 
 Override the LLM provider and model for specific agent types. This
 lets you run different agents on different models — for example, a
-cheaper model for triage and a more capable one for review.
+cheaper model for introspection.
+
+`llm.model` is the default for **all** agents. Use `agent_models`
+only when you want a specific agent to use a different model.
 
 ```json
 {
     "agent_models": {
-        "review": {
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
-            "reasoning_effort": "high"
-        },
         "introspection": {
-            "model": "claude-haiku-4-5",
-            "reasoning_effort": "low"
+            "model": "claude-haiku-4-5"
         },
-        "default": {
-            "provider": "gemini",
-            "model": "gemini-2.5-flash"
+        "review": {
+            "reasoning_effort": "high"
         }
     }
 }
 ```
 
 **Resolution order:**
-1. `agent_models.<agent_type>` — exact match for the agent
-2. `agent_models.default` — fallback if no exact match
-3. Built-in agent defaults — reasoning-heavy agents default to Sonnet
-4. Top-level `llm.provider` / `llm.model` — global default
+1. `agent_models.<agent_type>` — per-agent override
+2. `llm.*` — global default
 
-Each override object supports `provider`, `model`, and `reasoning_effort`
-keys.
+Each override object supports `provider`, `model`, `reasoning_effort`,
+and `max_tokens` keys.
 
-#### Built-in Agent Defaults
+> **Breaking change:** `agent_models.default` and built-in per-agent
+> model overrides have been removed. All agents now use `llm.model`
+> unless explicitly overridden via `agent_models.<type>`.  If your
+> config relied on `agent_models.default` or on built-in model
+> assignments (e.g., triage defaulting to Sonnet), set `llm.model`
+> to your desired default model.
 
-Some agents perform reasoning-heavy work and default to a more capable
-model even when the global default is set to a cheaper model. These
-built-in defaults apply only when no `agent_models` configuration is
-present — any explicit `agent_models` entry (including `default`)
-takes priority.
+#### Capability Defaults
 
-| Agent type | Built-in model |
-|---|---|
-| `triage` | `claude-sonnet-4-6` |
-| `evaluating_convergence` | `claude-sonnet-4-6` |
-| `retrospective` | `claude-sonnet-4-6` |
-| `introspection` | `claude-haiku-4-5` |
+Some agents have built-in output budget defaults that are always
+applied (these do NOT override model or provider):
+
+| Agent type | Capability | Value |
+|---|---|---|
+| `review` | `max_tokens` | `32000` |
 
 #### Agent Type Names
 

@@ -13,7 +13,7 @@ DEFAULT_LLM_TIMEOUT: float = 120.0
 # extended thinking (reasoning_effort set) share this budget
 # between thinking tokens and visible output, so agents doing
 # heavy analysis (e.g. review) are given a much higher value
-# via _BUILTIN_AGENT_MODELS in orchestrator/config.py.
+# via _BUILTIN_AGENT_CAPABILITIES in orchestrator/config.py.
 DEFAULT_LLM_MAX_TOKENS: int = 8000
 
 
