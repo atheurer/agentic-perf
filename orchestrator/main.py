@@ -69,6 +69,55 @@ def _make_llm_factory(config: OrchestratorConfig):
     return factory
 
 
+async def _validate_models(config: OrchestratorConfig) -> None:
+    """Make a minimal test call for each distinct LLM configuration at startup.
+
+    Catches model/region mismatches before any tickets are processed.
+    Logs errors but never blocks startup.
+    """
+    # Collect all agent types to check, including the default (empty string).
+    agent_types: list[str] = [""] + list(config.raw.get("agent_models", {}).keys())
+
+    seen: set[tuple[str, str, str]] = set()
+    for agent_type in agent_types:
+        if agent_type:
+            cfg = config.get_agent_llm_config(agent_type)
+        else:
+            cfg = {"provider": config.llm_provider, "model": config.llm_model}
+
+        provider_name = cfg.get("provider", config.llm_provider) or ""
+        model_name = cfg.get("model", config.llm_model) or ""
+        region = config.llm_region or ""
+        key = (provider_name, model_name, region)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = f"{provider_name}/{model_name}" + (f" [{region}]" if region else "")
+        try:
+            provider = _make_llm_provider(
+                config,
+                provider=cfg.get("provider", ""),
+                model=cfg.get("model", ""),
+            )
+            await asyncio.wait_for(
+                provider.complete(
+                    system_prompt="",
+                    messages=[{"role": "user", "content": "ping"}],
+                    tools=[],
+                    max_tokens=1,
+                ),
+                timeout=10.0,
+            )
+            logger.info("Model check OK: %s", label)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Model check TIMED OUT (10s): %s — verify region/endpoint", label
+            )
+        except Exception as exc:
+            logger.error("Model check FAILED: %s — %s", label, exc)
+
+
 PLAN_AGENT_STATUS = {
     "teardown": "awaiting_teardown",
     "resource": "awaiting_hardware",
@@ -1089,6 +1138,8 @@ def _check_dispatch_quota(
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
+    await _validate_models(config)
+
     llm = _make_llm_provider(config)
     llm.default_timeout = config.llm_timeout
     if config.llm_reasoning_effort:
