@@ -26,19 +26,14 @@ class OrchestratorConfig:
         "analyze": 0,
     }
 
-    _BUILTIN_AGENT_MODELS: dict[str, dict[str, str]] = {
-        "triage": {"model": "claude-sonnet-4-6"},
-        "evaluating_convergence": {"model": "claude-sonnet-4-6"},
-        "retrospective": {"model": "claude-sonnet-4-6"},
-        # Introspection is a lightweight observer — default to
-        # a cheap model since it makes periodic narrative calls
-        # across the full ticket lifecycle.
-        "introspection": {"model": "claude-haiku-4-5"},
-        # Review does heavy analysis (multi-metric interpretation,
-        # markdown tables, structured key_metrics) and typically
-        # runs with reasoning_effort set, where thinking tokens
-        # share the max_tokens budget with visible output. Give
-        # it much more headroom than the global default.
+    # Per-agent capability defaults. These set output budget
+    # requirements, NOT model preferences. The user's
+    # llm.model is the default for all agents — override
+    # per-agent via agent_models.<type> in config.
+    _BUILTIN_AGENT_CAPABILITIES: dict[str, dict[str, str]] = {
+        # Review generates long markdown reports with tables,
+        # charts, and detailed analysis. With reasoning_effort
+        # set, thinking tokens share the max_tokens budget.
         "review": {"max_tokens": "32000"},
     }
 
@@ -75,10 +70,13 @@ class OrchestratorConfig:
             or llm_cfg.get("provider", "mock")
         )
         self.llm_model = (
-            llm_model
-            or os.environ.get("LLM_MODEL")
-            or llm_cfg.get("model", "claude-haiku-4-5")
+            llm_model or os.environ.get("LLM_MODEL") or llm_cfg.get("model", "")
         )
+        if self.llm_provider != "mock" and not self.llm_model:
+            logger.warning(
+                "No LLM model configured. Set llm.model in "
+                "config.json or LLM_MODEL env var."
+            )
         self.llm_backend = os.environ.get("LLM_BACKEND") or llm_cfg.get("backend")
         self.llm_project_id = os.environ.get(
             "ANTHROPIC_VERTEX_PROJECT_ID"
@@ -131,6 +129,13 @@ class OrchestratorConfig:
             "ssh_key_vault_secret"
         )
         self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
+        if "default" in self._agent_models:
+            logger.warning(
+                "agent_models.default is deprecated and "
+                "ignored. Set llm.model for the global "
+                "default. Use agent_models.<type> for "
+                "per-agent overrides."
+            )
         self._agent_iterations: dict[str, int] = cfg.get("agent_iterations", {})
 
         # Bridge legacy jumpstarter_images.provisioning_max_iterations
@@ -179,7 +184,7 @@ class OrchestratorConfig:
 
         # Max output tokens for a single LLM completion. Applies
         # to agents without a more specific override (see
-        # _BUILTIN_AGENT_MODELS and agent_models.<type>.max_tokens
+        # _BUILTIN_AGENT_CAPABILITIES and agent_models.<type>.max_tokens
         # in config.json).
         self.llm_max_tokens: int = int(
             _env_or_cfg(
@@ -241,25 +246,25 @@ class OrchestratorConfig:
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 
-        Layers, later ones filling in keys the earlier ones didn't set:
-        1. top-level llm config        — global default (provider, model)
-        2. _BUILTIN_AGENT_MODELS.<type> — built-in defaults for
-           reasoning-heavy agents (e.g. Sonnet for triage, a higher
-           max_tokens for review)
-        3. agent_models.default        — explicit catch-all config
-        4. agent_models.<type>         — explicit per-agent config
+        Layers (later wins per-key):
+        1. ``llm.*``                       — global default
+        2. ``_BUILTIN_AGENT_CAPABILITIES`` — per-agent output
+           budget (e.g. max_tokens). Never touches model.
+        3. ``agent_models.<type>``         — per-agent override
 
-        Explicit config keys always win over built-in defaults, but an
-        explicit override for one key (e.g. review's model) doesn't
-        erase a built-in default for another key (e.g. review's
-        max_tokens) the way a wholesale dict replacement would.
+        ``llm.model`` is the default for ALL agents. Use
+        ``agent_models.<type>`` only when a specific agent
+        needs a different model (e.g. a cheaper model for
+        introspection).
         """
         base = {"provider": self.llm_provider, "model": self.llm_model}
-        builtin = self._BUILTIN_AGENT_MODELS.get(agent_type)
-        if builtin:
-            base.update(builtin)
-        if "default" in self._agent_models:
-            base.update(self._agent_models["default"])
+
+        # Capability defaults (max_tokens etc) — always applied.
+        capabilities = self._BUILTIN_AGENT_CAPABILITIES.get(agent_type)
+        if capabilities:
+            base.update(capabilities)
+
+        # Explicit per-agent overrides from config.
         if agent_type in self._agent_models:
             base.update(self._agent_models[agent_type])
         return base
