@@ -45,6 +45,7 @@ STATUS_AGENT_MAP = {
     "gathering_context": "gathering_context",
     "planning_investigation": "planning_investigation",
     "evaluating_convergence": "evaluating_convergence",
+    "coordinating_fleet": "fleet_coordinator",
     "synthesizing_results": "synthesizing_results",
 }
 
@@ -486,6 +487,15 @@ class Dispatcher:
         elif agent_type == "synthesizing_results":
             agent = SynthesisAgent(
                 llm_provider=llm,
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+        elif agent_type == "fleet_coordinator":
+            from agents.fleet.agent import (
+                FleetCoordinatorAgent,
+            )
+
+            agent = FleetCoordinatorAgent(
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )

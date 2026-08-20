@@ -27,6 +27,7 @@ class TicketStatus(str, Enum):
     GATHERING_CONTEXT = "gathering_context"
     PLANNING_INVESTIGATION = "planning_investigation"
     EVALUATING_CONVERGENCE = "evaluating_convergence"
+    COORDINATING_FLEET = "coordinating_fleet"
     SYNTHESIZING_RESULTS = "synthesizing_results"
 
 
@@ -47,10 +48,12 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.PREPARING_PLATFORM,
         TicketStatus.AWAITING_PROVISION,  # providers that return ready hosts
         TicketStatus.GATHERING_CONTEXT,  # investigation redirect
+        TicketStatus.COORDINATING_FLEET,  # fleet: no boards available
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.PREPARING_PLATFORM: [
         TicketStatus.AWAITING_PROVISION,
+        TicketStatus.COORDINATING_FLEET,  # fleet: flash failed
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.AWAITING_PROVISION: [
@@ -63,6 +66,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.EXECUTING_BENCHMARK: [
         TicketStatus.AWAITING_REVIEW,
         TicketStatus.EVALUATING_CONVERGENCE,  # investigation path
+        TicketStatus.COORDINATING_FLEET,  # fleet iteration
         TicketStatus.AWAITING_PROVISION,  # handoff retry
         TicketStatus.AWAITING_TEARDOWN,  # plan-driven teardown after benchmark
         TicketStatus.AWAITING_HARDWARE,  # plan-driven infrastructure cycle
@@ -130,6 +134,13 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.AWAITING_PROVISION,  # re-install harness only
         TicketStatus.SYNTHESIZING_RESULTS,  # convergence gate met
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # manual interrupt
+    ],
+    # Fleet coordinator: record host result, check exhaustion,
+    # route to next board or convergence evaluation.
+    TicketStatus.COORDINATING_FLEET: [
+        TicketStatus.AWAITING_HARDWARE,  # next board
+        TicketStatus.EVALUATING_CONVERGENCE,  # fleet complete
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # error
     ],
     # Synthesizing results: produce Investigation Record,
     # action handoff.

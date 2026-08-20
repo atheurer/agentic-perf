@@ -305,6 +305,7 @@ class JumpstarterResourceProvider(ResourceProvider):
             }
 
         key, _, value = selector.partition("=")
+
         matching = [
             d for d in all_devices if d["labels"].get(key) == value and d["available"]
         ]
@@ -421,6 +422,8 @@ class JumpstarterResourceProvider(ResourceProvider):
                 selector = f"{selector},{_ENABLED_KEY}=true"
             if _POOL_KEY not in selector:
                 selector = f"{selector},{_POOL_KEY}=open"
+
+        # Fleet: target a specific exporter by name if set.
 
         # Prefer explicit seconds from selection, else use
         # duration_hours converted, else default.
