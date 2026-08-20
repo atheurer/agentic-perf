@@ -214,6 +214,32 @@ class ResourceAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
+        # Fleet: if the agent escalated to HITL (via any
+        # path — request_clarification or end_turn), redirect
+        # to the fleet coordinator.
+        from providers.fleet import is_fleet_investigation
+
+        try:
+            ticket = await self._get_ticket(ticket_id)
+            if ticket.get(
+                "status"
+            ) == "awaiting_customer_guidance" and is_fleet_investigation(
+                ticket.get("custom_fields", {})
+            ):
+                await self._add_comment(
+                    ticket_id,
+                    "**Fleet: resource agent could not "
+                    "acquire a board — routing to "
+                    "coordinator.**",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "coordinating_fleet",
+                    comment=("Fleet: resource exhaustion, coordinating"),
+                )
+        except Exception:
+            pass
+
     async def _run_teardown(self, ticket_id: str) -> None:
         logger.info(f"[resource-agent] Teardown for ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)

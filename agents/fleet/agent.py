@@ -103,11 +103,34 @@ class FleetCoordinatorAgent:
         platform_ready = cf.get("platform_ready", False)
         benchmark_status = cf.get("benchmark_status")
 
-        # Duplicate board detection: if Jumpstarter assigned
-        # a board we already tested (can happen when the pool
-        # has limited availability), treat as soft exhaustion.
+        # No board assigned — resource agent couldn't
+        # find one and routed here directly.
+        if board == "unknown" or not board:
+            fleet = dict(cf.get("fleet_investigation", {}))
+            fleet["fleet_exhausted"] = {"hard": True}
+            await self._update_fields(
+                ticket_id,
+                {"fleet_investigation": fleet},
+            )
+            progress = get_fleet_progress({"fleet_investigation": fleet})
+            await self._add_comment(
+                ticket_id,
+                f"**Fleet complete:** "
+                f"{progress['tested']} hosts tested. "
+                f"No boards available.",
+            )
+            await self._transition(
+                ticket_id,
+                "evaluating_convergence",
+                "Fleet exhaustion: no board assigned",
+            )
+            return
+
+        # Duplicate board detection: if the provider assigned
+        # a board we already tested, treat as soft exhaustion.
         tested_ids = get_tested_host_ids(cf)
-        if board != "unknown" and board in tested_ids:
+        just_recorded = False
+        if board in tested_ids:
             fleet = dict(cf.get("fleet_investigation", {}))
             fleet["fleet_exhausted"] = {
                 "soft": True,
@@ -149,6 +172,7 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (provisioning failure).",
             )
+            just_recorded = True
         elif benchmark_status == "failed":
             # Benchmark failed — record partial with any data.
             notes = cf.get("benchmark_notes", "benchmark failed")
@@ -167,6 +191,7 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (benchmark failure).",
             )
+            just_recorded = True
         else:
             # Benchmark succeeded — record completed.
             await record_host_result(
@@ -183,6 +208,7 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as completed.",
             )
+            just_recorded = True  # noqa: F841
 
         # Route to the next step. The coordinator handles
         # two entry paths:
@@ -203,16 +229,12 @@ class FleetCoordinatorAgent:
         cf = ticket.get("custom_fields", {})
         progress = get_fleet_progress(cf)
 
-        # Check if we just came from resource exhaustion:
-        # the current platform_board is already in tested_hosts
-        # (no new board was provisioned since last iteration).
-        tested_ids = get_tested_host_ids(cf)
-        current_board = cf.get("platform_board", "")
-        from_resource_exhaustion = (
-            current_board in tested_ids
-            and not platform_ready
-            and benchmark_status is None
-        )
+        # Distinguish path A (just tested a board) from
+        # path B (resource agent couldn't find a board).
+        # If we just recorded a result above, it's path A.
+        # If we didn't record anything, we came from the
+        # resource agent's fleet HITL intercept (path B).
+        from_resource_exhaustion = not just_recorded
 
         if from_resource_exhaustion:
             # Resource agent couldn't find an untested board.
@@ -313,6 +335,7 @@ class FleetCoordinatorAgent:
         if self._events:
             self._events.emit(
                 ticket_id,
+                self.agent_name,
                 event_type,
-                {**data, "agent": self.agent_name},
+                {**data},
             )

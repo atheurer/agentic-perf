@@ -38,6 +38,10 @@ _ssh = None
 _ticket: dict[str, Any] = {}
 _registry = None
 
+# Fleet: first available untested device from check_available.
+# Set by check_available_resources, read by reserve_resources.
+_fleet_next_device: str | None = None
+
 # Accumulates provider metadata across multiple reserve_resources calls
 # (e.g., separate calls for controller and endpoints).
 _last_reservation: dict[str, Any] = {}
@@ -146,6 +150,18 @@ async def check_available_resources(
     await _ensure_init()
     prov = await _registry.get_provider(provider)
 
+    # Code-enforce the directive's board_selector for
+    # Jumpstarter. The LLM may use a wrong selector key.
+    if provider == "jumpstarter":
+        directives = _ticket.get("custom_fields", {}).get("directives", {})
+        directive_selector = directives.get("board_selector", "")
+        if directive_selector:
+            req = requirements or {}
+            llm_selector = req.get("jumpstarter_selector", "")
+            if llm_selector != directive_selector:
+                requirements = dict(req)
+                requirements["jumpstarter_selector"] = directive_selector
+
     # Fleet investigation: automatically exclude already-tested
     # hosts so the resource agent acquires a new board each
     # iteration. Code-enforced — the LLM doesn't need to know.
@@ -197,6 +213,14 @@ async def check_available_resources(
             }
         )
     result = await prov.check_available(requirements or {})
+
+    # Fleet: remember the first available device so
+    # reserve_resources can target it by name.
+    global _fleet_next_device
+    if is_fleet_investigation(fresh_cf):
+        devices = result.get("devices", [])
+        _fleet_next_device = devices[0]["name"] if devices else None
+
     return json.dumps(result)
 
 
@@ -251,6 +275,15 @@ async def reserve_resources(
                 )
                 selection = dict(selection)
                 selection["jumpstarter_selector"] = directive_selector
+
+    # Fleet: target a specific device by name to ensure
+    # we get an untested board. The name was determined
+    # during check_available_resources from the filtered
+    # device list.
+    if _fleet_next_device:
+        selection = dict(selection)
+        selection["exporter_name"] = _fleet_next_device
+        logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
     result = await prov.reserve(
