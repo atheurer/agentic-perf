@@ -140,11 +140,58 @@ class TestPlatformAgent:
                 "_transition_ticket",
                 new_callable=AsyncMock,
             ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={"custom_fields": {}},
+            ),
         ):
             await agent._handle_completion("T-1", response)
             assert (
                 agent._transition_ticket.call_args[0][1] == "awaiting_customer_guidance"
             )
+
+    async def test_handle_completion_failure_fleet(self):
+        """Fleet failure routes to coordinating_fleet, not HITL."""
+        agent = self._make_agent()
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={
+                    "platform_ready": False,
+                    "diagnostics": "Flash failed",
+                    "board_name": "board-03",
+                },
+            )
+        ]
+
+        with (
+            patch.object(agent, "_update_fields", new_callable=AsyncMock),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "fleet_investigation": {
+                            "enabled": True,
+                            "tested_hosts": [],
+                        },
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("T-1", response)
+            assert agent._transition_ticket.call_args[0][1] == "coordinating_fleet"
 
 
 class TestProvisionJumpstarter:

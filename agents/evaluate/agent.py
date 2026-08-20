@@ -332,6 +332,10 @@ class EvaluateAgent(AgentBase):
         # is still captured in the ledger but the transition
         # decision is code-enforced.
         det = getattr(self, "_deterministic_outcome", "")
+        # Enforce deterministic convergence — code overrides
+        # the LLM if a hard gate fired. The LLM's analysis
+        # is still captured in the ledger but the transition
+        # decision is code-enforced.
         if det and decision in ("loop_plan", "loop_provision"):
             logger.info(
                 f"[{self.agent_name}] Overriding LLM decision "
@@ -578,6 +582,35 @@ class EvaluateAgent(AgentBase):
                 ticket_id,
                 "awaiting_provision",
                 comment="Loop back: re-provisioning hardware",
+            )
+
+        elif decision == "loop_fleet":
+            # Fleet iteration: get a new board and repeat.
+            # Transition to awaiting_hardware so the resource
+            # agent allocates the next untested device.
+            from providers.fleet import get_fleet_progress
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            progress = get_fleet_progress(cf)
+            summary = (
+                f"**Fleet Iteration: Next Board**\n\n"
+                f"- **Tested:** {progress['tested']} "
+                f"({progress['completed']} completed, "
+                f"{progress['partial']} partial)\n"
+                f"- **Info Gain:** {info_gain}\n"
+            )
+            if notes:
+                summary += f"- **Notes:** {notes}\n"
+            await self._add_comment(ticket_id, summary)
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_hardware",
+                comment=(
+                    f"Fleet iteration: "
+                    f"{progress['tested']} hosts tested, "
+                    f"acquiring next board"
+                ),
             )
 
         else:

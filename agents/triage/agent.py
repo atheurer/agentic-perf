@@ -331,6 +331,17 @@ _LOCAL_TOOLS = [
                     "type": "string",
                     "description": "Additional notes about the triage",
                 },
+                "fleet_investigation": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true when the user requests testing "
+                        "across multiple boards/hosts of the same type "
+                        "(e.g. 'test all S32G boards', 'fleet-wide "
+                        "boot time', 'compare across boards'). "
+                        "Each board will be tested individually and "
+                        "results compared."
+                    ),
+                },
             },
             "required": [
                 "parsed_specs",
@@ -670,6 +681,20 @@ class TriageAgent(AgentBase):
             and first_key in fields["scoped_context"]
         ):
             del fields["scoped_context"][first_key]
+
+        # Fleet investigation: set up tracking state if
+        # the triage agent detected a fleet request or the
+        # user explicitly set fleet_investigation in cf.
+        is_fleet = result.get("fleet_investigation", False)
+        if not is_fleet:
+            is_fleet = cf.get("fleet_investigation", {}).get("enabled", False)
+        if is_fleet:
+            existing_fleet = cf.get("fleet_investigation", {})
+            fields["fleet_investigation"] = {
+                **existing_fleet,
+                "enabled": True,
+                "tested_hosts": existing_fleet.get("tested_hosts", []),
+            }
 
         await self._update_fields(ticket_id, fields)
 

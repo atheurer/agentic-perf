@@ -141,6 +141,17 @@ Your job is to analyze a performance test request ticket and:
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the required_hosts list built from the benchmark roles.
 
+## Fleet Investigation
+
+When the user requests testing across multiple boards or hosts of the
+same type (e.g., "test all S32G boards", "fleet-wide boot time",
+"compare boot times across boards"), set `fleet_investigation: true`
+in your triage result. The system will automatically iterate through
+available devices, running the benchmark on each and comparing results.
+
+Fleet investigations use a single required_hosts entry — the system
+acquires one board at a time, tests it, then acquires the next.
+
 ## Execution Plans
 
 EVERY ticket gets an execution_plan that covers the full lifecycle.

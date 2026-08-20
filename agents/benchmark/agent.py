@@ -129,10 +129,36 @@ class BenchmarkAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Fleet investigation: failures are data points.
+            # Auto-submit as failed instead of escalating
+            # to HITL — the fleet coordinator will record
+            # the result and route to the next board.
+            from providers.fleet import is_fleet_investigation
+
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if is_fleet_investigation(cf):
+                await self._add_comment(
+                    self._ticket_id,
+                    "**Fleet: auto-routing to coordinator**"
+                    f"\n\nAgent wanted clarification:"
+                    f"\n{question[:500]}",
+                )
+                await self._transition_ticket(
+                    self._ticket_id,
+                    "coordinating_fleet",
+                    comment=("Fleet: benchmark issue, routing to coordinator"),
+                )
+                # Raise HITLDriftError to exit the LLM
+                # loop cleanly. The base class catches
+                # this and returns without error.
+                from agents.base import HITLDriftError
+
+                raise HITLDriftError("Fleet: routed to coordinator")
+
             # Collect Jumpstarter diagnostics before
             # clarification. Serial logs and tunnel data
             # are critical for diagnosing node failures.
-            ticket = await self._get_ticket(self._ticket_id)
             cf = ticket.get("custom_fields", {})
             if cf.get("resource_provider") == "jumpstarter":
                 diag = await self._collect_jumpstarter_diagnostics()
@@ -482,19 +508,40 @@ class BenchmarkAgent(AgentBase):
         await self._add_comment(ticket_id, summary)
 
         if status == "failed":
-            # Failed benchmarks need human review to
-            # determine next steps.
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_customer_guidance",
-                comment="Benchmark failed — needs investigation",
-            )
-        else:
-            # Route based on whether this is an investigation
-            # ticket. Same code-enforced pattern as triage.
+            from providers.fleet import is_fleet_investigation
+
             ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
-            if cf.get("investigation_ledger") or cf.get("anomaly_context"):
+            if is_fleet_investigation(cf):
+                # Fleet: coordinator handles recording and routing.
+                await self._transition_ticket(
+                    ticket_id,
+                    "coordinating_fleet",
+                    comment="Fleet: benchmark failed, coordinating",
+                )
+            else:
+                # Non-fleet: failed benchmarks need human
+                # review to determine next steps.
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment="Benchmark failed — needs investigation",
+                )
+        else:
+            # Route based on whether this is an investigation
+            # or fleet ticket. Code-enforced pattern.
+            from providers.fleet import is_fleet_investigation
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if is_fleet_investigation(cf):
+                # Fleet: coordinator handles recording and routing.
+                await self._transition_ticket(
+                    ticket_id,
+                    "coordinating_fleet",
+                    comment="Fleet: benchmark completed, coordinating",
+                )
+            elif cf.get("investigation_ledger") or cf.get("anomaly_context"):
                 await self._transition_ticket(
                     ticket_id,
                     "evaluating_convergence",

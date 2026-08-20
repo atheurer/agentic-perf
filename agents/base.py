@@ -122,7 +122,13 @@ class AgentBase(ABC):
         await self._client.aclose()
 
     def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
-        """Count previous iterations (llm_request events) from the ticket's jsonl log file."""
+        """Count previous iterations (llm_request events) from the ticket's jsonl log file.
+
+        For fleet investigations, only counts iterations AFTER
+        the last ``fleet_iteration_epoch`` event. This resets
+        the per-agent budget each fleet iteration so agents
+        don't exhaust their budget across the full fleet.
+        """
         import json
 
         log_dir = self._events._log_dir if self._events else None
@@ -143,7 +149,11 @@ class AgentBase(ABC):
                         continue
                     try:
                         evt = json.loads(line)
-                        if evt.get("event_type") == "llm_request":
+                        if evt.get("event_type") == "fleet_iteration_epoch":
+                            # Reset counts — new fleet iteration
+                            agent_iters = 0
+                            global_iters = 0
+                        elif evt.get("event_type") == "llm_request":
                             global_iters += 1
                             if evt.get("agent") == self.agent_name:
                                 agent_iters += 1

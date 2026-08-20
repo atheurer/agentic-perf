@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -144,9 +145,46 @@ async def check_available_resources(
     """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
     await _ensure_init()
     prov = await _registry.get_provider(provider)
+
+    # Fleet investigation: automatically exclude already-tested
+    # hosts so the resource agent acquires a new board each
+    # iteration. Code-enforced — the LLM doesn't need to know.
+    # Re-fetch ticket for fresh fleet state (the cached _ticket
+    # may not have tested_hosts from the coordinator).
+    from providers.fleet import get_tested_host_ids, is_fleet_investigation
+
+    fresh_cf = _ticket.get("custom_fields", {})
+    ticket_id = os.environ.get("TICKET_ID", "")
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    if ticket_id:
+        try:
+            import httpx
+
+            from state_store.auth import read_token_from_file
+
+            token = read_token_from_file()
+            async with httpx.AsyncClient(
+                base_url=store_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            ) as client:
+                r = await client.get(f"/api/v1/tickets/{ticket_id}")
+                if r.status_code == 200:
+                    fresh_cf = r.json().get("custom_fields", {})
+        except Exception:
+            pass
+    if is_fleet_investigation(fresh_cf):
+        exclude = get_tested_host_ids(fresh_cf)
+        if exclude:
+            requirements = dict(requirements or {})
+            requirements["exclude_hosts"] = exclude
+
     if required_hosts:
         recommendations = []
         for host_req in required_hosts:
+            if is_fleet_investigation(fresh_cf) and exclude:
+                host_req = dict(host_req)
+                host_req["exclude_hosts"] = exclude
             result = await prov.check_available(host_req)
             rec = dict(host_req)
             if result.get("options"):
