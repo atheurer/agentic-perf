@@ -401,6 +401,7 @@ live in `providers/ledger.py`.
 ```
 pending → in_progress → completed
                       → failed
+        → skipped
 ```
 
 - **Completed steps** are immutable — results (run_id, benchmark_status)
@@ -408,6 +409,9 @@ pending → in_progress → completed
 - **Pending steps** can be modified, reordered, or deleted by the user
   via HITL (`awaiting_customer_guidance`), or extended by agents.
 - **In-progress steps** are locked while the agent is running.
+- **Skipped steps** are pending steps that were retired when an
+  investigation concluded early (e.g., hypothesis answered before
+  all planned steps executed). This is normal and expected.
 
 #### Orchestrator plan advancement
 

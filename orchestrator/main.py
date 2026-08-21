@@ -496,6 +496,40 @@ async def run_agent_task(
         except Exception:
             pass  # proceed with default iterations
 
+        # Retire pending plan steps when entering synthesis.
+        # When an investigation concludes early (e.g., review
+        # refutes hypothesis before all steps run), remaining
+        # steps stay "pending" which misleads the synthesis
+        # agent into thinking the investigation is incomplete.
+        if status == "synthesizing_results":
+            try:
+                async with httpx.AsyncClient(
+                    timeout=10.0, headers=_auth_headers()
+                ) as client:
+                    r = await client.get(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                    )
+                    if r.status_code == 200:
+                        cf = r.json().get("custom_fields", {})
+                        plan = cf.get("execution_plan") or {}
+                        steps = plan.get("steps") or []
+                        changed = False
+                        for s in steps:
+                            if s.get("status") == "pending":
+                                s["status"] = "skipped"
+                                changed = True
+                        if changed:
+                            await client.patch(
+                                f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
+                                json={"fields": {"execution_plan": plan}},
+                            )
+            except Exception:
+                logger.warning(
+                    "Failed to retire pending plan steps for %s",
+                    ticket_id,
+                    exc_info=True,
+                )
+
         # Jumpstarter: resolve image URLs before platform
         # setup. This is a deterministic HTTP lookup — no
         # LLM needed. Runs for both preparing_platform
