@@ -701,6 +701,7 @@ variable overrides, which take precedence over the file.
 | Variable | Config equivalent |
 |---|---|
 | `AGENTIC_PERF_HOME` | Base directory (default `~/.agentic-perf`) |
+| `AGENTIC_PERF_ARTIFACTS` | Benchmark artifact directory (default `$AGENTIC_PERF_HOME/artifacts`) |
 | `LLM_PROVIDER` | `llm.provider` |
 | `LLM_MODEL` | `llm.model` |
 | `LLM_BACKEND` | `llm.backend` |

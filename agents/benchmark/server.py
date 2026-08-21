@@ -1916,7 +1916,20 @@ async def execute_boot_time_test(
     import asyncio as _asyncio
 
     run_uuid = uuid.uuid4().hex[:8]
-    output_dir = Path(tempfile.mkdtemp(prefix=f"boot-time-{run_uuid}-"))
+
+    # Use ticket-ID-based artifact directory so artifacts
+    # are discoverable by ticket ID without querying the
+    # state store. Configurable via AGENTIC_PERF_ARTIFACTS.
+    from paths import ARTIFACT_DIR
+
+    _ticket_id = os.environ.get("TICKET_ID", "")
+    if _ticket_id:
+        artifact_base = ARTIFACT_DIR / _ticket_id
+        artifact_base.mkdir(parents=True, exist_ok=True)
+        output_dir = artifact_base / f"run-{run_uuid}"
+        output_dir.mkdir()
+    else:
+        output_dir = Path(tempfile.mkdtemp(prefix=f"run-{run_uuid}-"))
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -2322,8 +2335,6 @@ async def execute_boot_time_test(
     # runs so all artifacts remain accessible.
     if _ticket and response.get("output_dir"):
         try:
-            import os
-
             import httpx
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")

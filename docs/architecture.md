@@ -1120,6 +1120,9 @@ REST API and the web dashboard.
 | POST | `/api/v1/tickets/{id}/comments` | Add comment |
 | GET | `/api/v1/tickets/{id}/comments` | List comments |
 | GET | `/api/v1/tickets/{id}/events` | Get events (pagination via `?since=&limit=`) |
+| GET | `/api/v1/tickets/{id}/artifacts` | List artifact files for a ticket |
+| GET | `/api/v1/tickets/{id}/artifacts/download/{path}` | Download a specific artifact file |
+| GET | `/api/v1/tickets/{id}/artifacts/archive` | Download all artifacts as .tar.gz |
 
 ### Ticket Model
 

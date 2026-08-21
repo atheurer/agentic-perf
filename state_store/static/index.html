@@ -1873,6 +1873,10 @@ async function renderDetail(ticketId) {
             renderDescription(ticket) +
             ownershipHtml +
             '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
+            '<div class="left-panel-section" id="artifacts-card" style="display:none">' +
+              '<h4>Artifacts</h4>' +
+              '<div id="artifacts-content"></div>' +
+            '</div>' +
             '<div id="result-section">' + renderCustomFields(ticket) + '</div>' +
             '<div class="left-panel-section">' +
               '<h4>Events</h4>' +
@@ -1935,11 +1939,57 @@ async function renderDetail(ticketId) {
       console.warn('Initial event load failed:', e);
     }
 
+    // Load artifacts
+    loadArtifacts(ticketId);
+
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
   } catch (err) {
     app.innerHTML =
       '<div class="breadcrumb"><a href="#/">Dashboard</a> / ' + escHtml(ticketId) + '</div>' +
       '<p style="color:var(--red); margin-top:20px;">Error: ' + escHtml(err.message) + '</p>';
+  }
+}
+
+async function loadArtifacts(ticketId) {
+  var card = document.getElementById('artifacts-card');
+  var content = document.getElementById('artifacts-content');
+  if (!card || !content) return;
+  try {
+    var data = await api('/tickets/' + ticketId + '/artifacts');
+    var artifacts = data.artifacts || [];
+    if (artifacts.length === 0) return;
+    card.style.display = '';
+    var totalKB = Math.round(data.total_bytes / 1024);
+    var baseUrl = API + '/tickets/' + ticketId + '/artifacts';
+    var html = '<div style="font-size:12px; color:var(--text-muted); margin-bottom:8px">' +
+      artifacts.length + ' files (' + totalKB + ' KB) ' +
+      '<a href="' + baseUrl + '/archive" style="color:var(--accent)" download>Download All</a>' +
+      '</div>';
+    html += '<details style="margin-top:4px"><summary style="font-size:11px; color:var(--text-muted); cursor:pointer">Show files</summary>';
+    // Group by run
+    var runs = {};
+    artifacts.forEach(function(a) {
+      var run = a.run || '(root)';
+      if (!runs[run]) runs[run] = [];
+      runs[run].push(a);
+    });
+    Object.keys(runs).sort().forEach(function(run) {
+      if (run !== '(root)') {
+        html += '<div style="font-size:11px; color:var(--text-muted); margin-top:6px; font-weight:600">' + escHtml(run) + '</div>';
+      }
+      runs[run].forEach(function(a) {
+        var name = a.path.split('/').pop();
+        var kb = Math.round(a.size_bytes / 1024) || '<1';
+        html += '<div style="font-size:11px; margin:2px 0">' +
+          '<a href="' + baseUrl + '/download/' + encodeURIComponent(a.path) + '" ' +
+          'style="color:var(--text-bright)" download>' + escHtml(name) + '</a>' +
+          ' <span style="color:var(--text-muted)">(' + kb + ' KB)</span></div>';
+      });
+    });
+    html += '</details>';
+    content.innerHTML = html;
+  } catch (e) {
+    // No artifacts or API error — hide section
   }
 }
 
