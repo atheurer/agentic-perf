@@ -129,7 +129,6 @@ class FleetCoordinatorAgent:
         # Duplicate board detection: if the provider assigned
         # a board we already tested, treat as soft exhaustion.
         tested_ids = get_tested_host_ids(cf)
-        just_recorded = False
         if board in tested_ids:
             fleet = dict(cf.get("fleet_investigation", {}))
             fleet["fleet_exhausted"] = {
@@ -172,7 +171,6 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (provisioning failure).",
             )
-            just_recorded = True
         elif benchmark_status == "failed":
             # Benchmark failed — record partial with any data.
             notes = cf.get("benchmark_notes", "benchmark failed")
@@ -191,7 +189,6 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (benchmark failure).",
             )
-            just_recorded = True
         else:
             # Benchmark succeeded — record completed.
             await record_host_result(
@@ -208,75 +205,32 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as completed.",
             )
-            just_recorded = True  # noqa: F841
 
-        # Route to the next step. The coordinator handles
-        # two entry paths:
-        #
-        # A. After benchmark/platform: a host was just tested.
-        #    Route to awaiting_hardware for the next board.
-        #    The resource agent will use exclude_hosts to
-        #    acquire an untested device.
-        #
-        # B. After resource exhaustion: the resource agent
-        #    couldn't find untested boards (routed here via
-        #    fleet HITL intercept). Set fleet_exhausted and
-        #    route to evaluating_convergence.
-        #
-        # We distinguish A from B by checking whether a new
-        # host was just recorded (tested_hosts grew).
+        # Route to the next board. All resource-exhaustion
+        # cases are handled above (no board assigned,
+        # duplicate detection). If we reach here, a host
+        # was just recorded — acquire the next one.
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
         progress = get_fleet_progress(cf)
 
-        # Distinguish path A (just tested a board) from
-        # path B (resource agent couldn't find a board).
-        # If we just recorded a result above, it's path A.
-        # If we didn't record anything, we came from the
-        # resource agent's fleet HITL intercept (path B).
-        from_resource_exhaustion = not just_recorded
-
-        if from_resource_exhaustion:
-            # Resource agent couldn't find an untested board.
-            fleet = dict(cf.get("fleet_investigation", {}))
-            fleet["fleet_exhausted"] = {"hard": True}
-            await self._update_fields(
-                ticket_id,
-                {"fleet_investigation": fleet},
-            )
-            progress = get_fleet_progress({"fleet_investigation": fleet})
-            await self._add_comment(
-                ticket_id,
-                f"**Fleet complete:** {progress['tested']} "
-                f"hosts tested ({progress['completed']} "
-                f"completed, {progress['partial']} partial). "
-                f"No untested boards available.",
-            )
-            await self._transition(
-                ticket_id,
-                "evaluating_convergence",
-                f"Fleet complete: {progress['tested']} hosts tested",
-            )
-        else:
-            # Host was just tested — get the next one.
-            await self._add_comment(
-                ticket_id,
-                f"**Fleet iteration {progress['tested']}** "
-                f"complete. Acquiring next board.",
-            )
-            # Emit epoch marker so agents in the next
-            # iteration don't count previous iterations
-            # against their per-agent budget.
-            self._emit(
-                ticket_id,
-                "fleet_iteration_epoch",
-                {"iteration": progress["tested"]},
-            )
-            await self._transition(
-                ticket_id,
-                "awaiting_hardware",
-                f"Fleet: {progress['tested']} tested, acquiring next board",
-            )
+        await self._add_comment(
+            ticket_id,
+            f"**Fleet iteration {progress['tested']}** complete. Acquiring next board.",
+        )
+        # Emit epoch marker so agents in the next
+        # iteration don't count previous iterations
+        # against their per-agent budget.
+        self._emit(
+            ticket_id,
+            "fleet_iteration_epoch",
+            {"iteration": progress["tested"]},
+        )
+        await self._transition(
+            ticket_id,
+            "awaiting_hardware",
+            f"Fleet: {progress['tested']} tested, acquiring next board",
+        )
 
     def _get_latest_diagnostic(self, ticket: dict[str, Any]) -> str:
         """Extract the most recent failure diagnostic."""
