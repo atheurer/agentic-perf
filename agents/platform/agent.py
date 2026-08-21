@@ -195,13 +195,27 @@ class PlatformAgent(AgentBase):
                 )
         else:
             diag = result.get("diagnostics", "No details")
+            board = result.get("board_name", "unknown")
             summary = f"**Platform Setup Failed**\n\n- **Diagnostics:** {diag}\n"
-            if result.get("board_name"):
-                summary += f"- **Board:** {result['board_name']}\n"
+            if board != "unknown":
+                summary += f"- **Board:** {board}\n"
             await self._add_comment(ticket_id, summary)
 
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_customer_guidance",
-                comment="Platform setup failed",
-            )
+            # Fleet investigation: coordinator handles
+            # recording and routing to next board.
+            from providers.fleet import is_fleet_investigation
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if is_fleet_investigation(cf):
+                await self._transition_ticket(
+                    ticket_id,
+                    "coordinating_fleet",
+                    comment=(f"Fleet: {board} provisioning failed, coordinating"),
+                )
+            else:
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment="Platform setup failed",
+                )

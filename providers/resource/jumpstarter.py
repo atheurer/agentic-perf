@@ -305,6 +305,7 @@ class JumpstarterResourceProvider(ResourceProvider):
             }
 
         key, _, value = selector.partition("=")
+
         matching = [
             d for d in all_devices if d["labels"].get(key) == value and d["available"]
         ]
@@ -422,6 +423,11 @@ class JumpstarterResourceProvider(ResourceProvider):
             if _POOL_KEY not in selector:
                 selector = f"{selector},{_POOL_KEY}=open"
 
+        # Target a specific exporter by name when provided.
+        # Used by fleet investigations to deterministically
+        # select untested boards.
+        target_exporter = selection.get("exporter_name")
+
         # Prefer explicit seconds from selection, else use
         # duration_hours converted, else default.
         duration_sec = selection.get(
@@ -449,6 +455,7 @@ class JumpstarterResourceProvider(ResourceProvider):
                         selector=selector,
                         duration=duration,
                         lease_id=lease_id,
+                        exporter_name=target_exporter,
                     )
                     break
                 except Exception as exc:
@@ -485,6 +492,7 @@ class JumpstarterResourceProvider(ResourceProvider):
                 selector=selector,
                 duration=duration,
                 lease_id=lease_id,
+                exporter_name=target_exporter,
             )
 
         lease_name = lease.name if hasattr(lease, "name") else str(lease)

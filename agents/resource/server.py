@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -36,6 +37,10 @@ _initialized = False
 _ssh = None
 _ticket: dict[str, Any] = {}
 _registry = None
+
+# Fleet: first available untested device from check_available.
+# Set by check_available_resources, read by reserve_resources.
+_fleet_next_device: str | None = None
 
 # Accumulates provider metadata across multiple reserve_resources calls
 # (e.g., separate calls for controller and endpoints).
@@ -144,9 +149,58 @@ async def check_available_resources(
     """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
     await _ensure_init()
     prov = await _registry.get_provider(provider)
+
+    # Code-enforce the directive's board_selector for
+    # Jumpstarter. The LLM may use a wrong selector key.
+    if provider == "jumpstarter":
+        directives = _ticket.get("custom_fields", {}).get("directives", {})
+        directive_selector = directives.get("board_selector", "")
+        if directive_selector:
+            req = requirements or {}
+            llm_selector = req.get("jumpstarter_selector", "")
+            if llm_selector != directive_selector:
+                requirements = dict(req)
+                requirements["jumpstarter_selector"] = directive_selector
+
+    # Fleet investigation: automatically exclude already-tested
+    # hosts so the resource agent acquires a new board each
+    # iteration. Code-enforced — the LLM doesn't need to know.
+    # Re-fetch ticket for fresh fleet state (the cached _ticket
+    # may not have tested_hosts from the coordinator).
+    from providers.fleet import get_tested_host_ids, is_fleet_investigation
+
+    fresh_cf = _ticket.get("custom_fields", {})
+    ticket_id = os.environ.get("TICKET_ID", "")
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    if ticket_id:
+        try:
+            import httpx
+
+            from state_store.auth import read_token_from_file
+
+            token = read_token_from_file()
+            async with httpx.AsyncClient(
+                base_url=store_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            ) as client:
+                r = await client.get(f"/api/v1/tickets/{ticket_id}")
+                if r.status_code == 200:
+                    fresh_cf = r.json().get("custom_fields", {})
+        except Exception:
+            pass
+    if is_fleet_investigation(fresh_cf):
+        exclude = get_tested_host_ids(fresh_cf)
+        if exclude:
+            requirements = dict(requirements or {})
+            requirements["exclude_hosts"] = exclude
+
     if required_hosts:
         recommendations = []
         for host_req in required_hosts:
+            if is_fleet_investigation(fresh_cf) and exclude:
+                host_req = dict(host_req)
+                host_req["exclude_hosts"] = exclude
             result = await prov.check_available(host_req)
             rec = dict(host_req)
             if result.get("options"):
@@ -159,6 +213,14 @@ async def check_available_resources(
             }
         )
     result = await prov.check_available(requirements or {})
+
+    # Fleet: remember the first available device so
+    # reserve_resources can target it by name.
+    global _fleet_next_device
+    if is_fleet_investigation(fresh_cf):
+        devices = result.get("devices", [])
+        _fleet_next_device = devices[0]["name"] if devices else None
+
     return json.dumps(result)
 
 
@@ -213,6 +275,15 @@ async def reserve_resources(
                 )
                 selection = dict(selection)
                 selection["jumpstarter_selector"] = directive_selector
+
+    # Fleet: target a specific device by name to ensure
+    # we get an untested board. The name was determined
+    # during check_available_resources from the filtered
+    # device list.
+    if _fleet_next_device:
+        selection = dict(selection)
+        selection["exporter_name"] = _fleet_next_device
+        logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
     result = await prov.reserve(

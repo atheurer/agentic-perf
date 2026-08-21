@@ -106,6 +106,55 @@ To target a specific board instance:
 | `firewall_policy` | Firewall handling | `flush` |
 | `skip_teardown` | Keep hosts after run | `true` |
 
+### Fleet Investigation
+
+| Field | Description | Values |
+|---|---|---|
+| `fleet_investigation` | Test across all boards of a type | `{"enabled": true}` |
+
+Fleet investigation iterates across every available device matching
+the `board_selector`, running the benchmark on each board individually
+and comparing results. The system automatically:
+
+- Excludes already-tested boards when acquiring hardware
+- Records failures as data points (doesn't stop on one bad board)
+- Converges when all available devices have been tested
+  (hard exhaustion) or remaining devices are unavailable
+  (soft exhaustion)
+
+Set in `custom_fields` (not `directives`) since it controls
+pipeline behavior, not harness configuration:
+
+```json
+{
+  "custom_fields": {
+    "fleet_investigation": {"enabled": true},
+    "board_selector": "board-type=nxp-s32g-vnp-rdb3",
+    "harness": "boot-time",
+    "samples": 10
+  }
+}
+```
+
+Or describe it naturally — the triage agent will detect fleet
+requests like "test boot time across all S32G boards" and set
+the flag automatically.
+
+Progress is tracked in `custom_fields.fleet_investigation`:
+
+```json
+{
+  "fleet_investigation": {
+    "enabled": true,
+    "tested_hosts": [
+      {"host_id": "board-01", "status": "completed", "kpis": {...}},
+      {"host_id": "board-02", "status": "partial", "failure_reason": "..."}
+    ],
+    "fleet_exhausted": {"hard": true}
+  }
+}
+```
+
 ### Boot-Time Specific
 
 | Directive | Description | Examples |
@@ -236,6 +285,21 @@ provides the anomaly details:
       "image_version": "RHIVOS-2",
       "board_selector": "board-type=qc8775"
     }
+  }
+}
+```
+
+### Fleet investigation across all boards
+
+```json
+{
+  "summary": "Fleet boot time comparison across all S32G boards",
+  "description": "Run 10 boot time samples on every available S32G board and compare results.",
+  "custom_fields": {
+    "fleet_investigation": {"enabled": true},
+    "harness": "boot-time",
+    "board_selector": "board-type=nxp-s32g-vnp-rdb3",
+    "samples": 10
   }
 }
 ```

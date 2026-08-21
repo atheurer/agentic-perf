@@ -160,6 +160,26 @@ class ResourceAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
+            # Fleet investigation: if the resource agent
+            # can't find boards, route to coordinator to
+            # set fleet_exhausted. Don't ask the user.
+            from providers.fleet import is_fleet_investigation
+
+            ticket = await self._get_ticket(self._ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if is_fleet_investigation(cf):
+                await self._add_comment(
+                    self._ticket_id,
+                    f"**Fleet: no more boards available**\n\n{question[:500]}",
+                )
+                await self._transition_ticket(
+                    self._ticket_id,
+                    "coordinating_fleet",
+                    comment=("Fleet: no resources available, coordinating exhaustion"),
+                )
+                from agents.base import HITLDriftError
+
+                raise HITLDriftError("Fleet: routed to coordinator")
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
@@ -193,6 +213,32 @@ class ResourceAgent(AgentBase):
         finally:
             await mcp.disconnect()
             self._mcp = None
+
+        # Fleet: if the agent escalated to HITL (via any
+        # path — request_clarification or end_turn), redirect
+        # to the fleet coordinator.
+        from providers.fleet import is_fleet_investigation
+
+        try:
+            ticket = await self._get_ticket(ticket_id)
+            if ticket.get(
+                "status"
+            ) == "awaiting_customer_guidance" and is_fleet_investigation(
+                ticket.get("custom_fields", {})
+            ):
+                await self._add_comment(
+                    ticket_id,
+                    "**Fleet: resource agent could not "
+                    "acquire a board — routing to "
+                    "coordinator.**",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "coordinating_fleet",
+                    comment=("Fleet: resource exhaustion, coordinating"),
+                )
+        except Exception:
+            pass
 
     async def _run_teardown(self, ticket_id: str) -> None:
         logger.info(f"[resource-agent] Teardown for ticket {ticket_id}")
@@ -619,6 +665,28 @@ class ResourceAgent(AgentBase):
             if endpoint_type == "kube":
                 content += "- **Endpoint type:** kube (workloads run as pods)\n"
                 content += "- **Total hosts to provision:** 1 (single host: controller + K8s cluster)\n"
+
+        # Fleet investigation context
+        fleet = fields.get("fleet_investigation", {})
+        if fleet.get("enabled"):
+            tested = fleet.get("tested_hosts", [])
+            if tested:
+                content += "\n## Fleet Investigation\n"
+                content += (
+                    f"This is a fleet investigation "
+                    f"(iteration {len(tested) + 1}). "
+                    f"Already tested {len(tested)} host(s). "
+                    f"Acquire the NEXT untested board. "
+                    f"Exclude hosts are handled automatically "
+                    f"by the system.\n"
+                )
+            else:
+                content += "\n## Fleet Investigation\n"
+                content += (
+                    "This is a fleet investigation "
+                    "(first iteration). Acquire one board "
+                    "to begin testing.\n"
+                )
 
         user_comments = self._user_comments(ticket)
         if user_comments:

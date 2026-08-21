@@ -141,6 +141,28 @@ Your job is to analyze a performance test request ticket and:
 When you have completed your analysis, call the submit_triage_result tool with your
 findings, including the required_hosts list built from the benchmark roles.
 
+## Fleet Investigation
+
+When the user requests testing across multiple hosts or devices of the
+same type, set `fleet_investigation: true` in your triage result. The
+system will automatically iterate through available devices, running
+the benchmark on each and comparing results.
+
+Examples of fleet requests:
+- "test all S32G boards" / "run across the R-Car S4 fleet"
+- "compare boot times across boards"
+- "run uperf on every available QUADS host"
+- "benchmark all nodes in the cluster"
+- "fleet-wide stress-ng comparison"
+
+Fleet works with ANY harness and ANY resource provider — not just
+Jumpstarter or boot-time. The system acquires one host at a time,
+runs the benchmark, records the result (including failures as data
+points), then acquires the next host.
+
+Fleet investigations use a single required_hosts entry — the system
+acquires one host at a time, tests it, then acquires the next.
+
 ## Execution Plans
 
 EVERY ticket gets an execution_plan that covers the full lifecycle.
