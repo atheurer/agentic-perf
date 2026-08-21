@@ -1950,6 +1950,24 @@ async function renderDetail(ticketId) {
   }
 }
 
+function downloadWithAuth(url, filename) {
+  fetch(url, { headers: getAuthHeaders() })
+    .then(function(r) {
+      if (!r.ok) throw new Error('Download failed: ' + r.status);
+      return r.blob();
+    })
+    .then(function(blob) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function(e) { alert('Download failed: ' + e.message); });
+}
+
 async function loadArtifacts(ticketId) {
   var card = document.getElementById('artifacts-card');
   var content = document.getElementById('artifacts-content');
@@ -1963,7 +1981,7 @@ async function loadArtifacts(ticketId) {
     var baseUrl = API + '/tickets/' + ticketId + '/artifacts';
     var html = '<div style="font-size:12px; color:var(--text-muted); margin-bottom:8px">' +
       artifacts.length + ' files (' + totalKB + ' KB) ' +
-      '<a href="' + baseUrl + '/archive" style="color:var(--accent)" download>Download All</a>' +
+      '<a href="#" onclick="downloadWithAuth(\'' + baseUrl + '/archive\', \'' + escHtml(ticketId) + '-artifacts.tar.gz\'); return false;" style="color:var(--accent)">Download All</a>' +
       '</div>';
     html += '<details style="margin-top:4px"><summary style="font-size:11px; color:var(--text-muted); cursor:pointer">Show files</summary>';
     // Group by run
@@ -1981,8 +1999,8 @@ async function loadArtifacts(ticketId) {
         var name = a.path.split('/').pop();
         var kb = Math.round(a.size_bytes / 1024) || '<1';
         html += '<div style="font-size:11px; margin:2px 0">' +
-          '<a href="' + baseUrl + '/download/' + encodeURIComponent(a.path) + '" ' +
-          'style="color:var(--text-bright)" download>' + escHtml(name) + '</a>' +
+          '<a href="#" onclick="downloadWithAuth(\'' + baseUrl + '/download/' + encodeURIComponent(a.path) + '\', \'' + escHtml(name) + '\'); return false;" ' +
+          'style="color:var(--text-bright)">' + escHtml(name) + '</a>' +
           ' <span style="color:var(--text-muted)">(' + kb + ' KB)</span></div>';
       });
     });

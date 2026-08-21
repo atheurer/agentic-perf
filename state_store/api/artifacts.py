@@ -7,7 +7,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -31,7 +31,7 @@ def _ticket_artifact_dir(ticket_id: str) -> Path:
 
 
 @router.get("")
-def list_artifacts(ticket_id: str, request: Request):
+def list_artifacts(ticket_id: str):
     """List all artifacts for a ticket.
 
     Returns a list of files with names, sizes, modification
@@ -65,7 +65,7 @@ def list_artifacts(ticket_id: str, request: Request):
 
 
 @router.get("/download/{file_path:path}")
-def download_artifact(ticket_id: str, file_path: str, request: Request):
+def download_artifact(ticket_id: str, file_path: str):
     """Download a specific artifact file."""
     artifact_dir = _ticket_artifact_dir(ticket_id)
     full_path = artifact_dir / file_path
@@ -93,7 +93,7 @@ def download_artifact(ticket_id: str, file_path: str, request: Request):
 
 
 @router.get("/archive")
-def download_archive(ticket_id: str, request: Request):
+def download_archive(ticket_id: str):
     """Download all artifacts as a .tar.gz archive.
 
     Streams via a temporary file to avoid memory exhaustion

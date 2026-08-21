@@ -83,7 +83,7 @@ def create_artifact_dir(
 ) -> Path:
     """Create and return an artifact directory for a run.
 
-    Structure: ARTIFACT_DIR/<ticket-id>/run-<run-id>/
+    Structure: ARTIFACT_DIR/<ticket-id>/<run-id>/
 
     Falls back to a temp directory if ticket_id is not set.
     """

@@ -127,13 +127,16 @@ file listing grouped by run, with individual download links.
 
 ```bash
 # List artifacts for a ticket
-curl $AP_URL/api/v1/tickets/PERF-123/artifacts
+curl -H "Authorization: Bearer $TOKEN" \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts
 
 # Download a specific file
-curl -O $AP_URL/api/v1/tickets/PERF-123/artifacts/download/boot-time-fa75d469/merged-results.json
+curl -H "Authorization: Bearer $TOKEN" -O \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts/download/boot-time-fa75d469/merged-results.json
 
 # Download all artifacts as an archive
-curl -O $AP_URL/api/v1/tickets/PERF-123/artifacts/archive
+curl -H "Authorization: Bearer $TOKEN" -O \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts/archive
 ```
 
 The artifact directory is configurable via `AGENTIC_PERF_ARTIFACTS`
