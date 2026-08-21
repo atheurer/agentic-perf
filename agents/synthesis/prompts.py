@@ -47,4 +47,11 @@ by calling submit_synthesis_result with:
   what was established and what remains unknown.
 - The info_gain_trajectory from the ledger should be preserved — it
   shows how the investigation progressed.
+- **Skipped plan steps are normal.** When an investigation concludes
+  early (e.g., the review agent refutes a hypothesis before all
+  planned steps execute), remaining steps are marked "skipped."
+  This is a SUCCESS — the investigation answered the question
+  efficiently. Do NOT treat skipped steps as evidence of failure
+  or stalling. Base your outcome on the substantive findings from
+  the agents that DID run, especially the review verdict.
 """

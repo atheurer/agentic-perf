@@ -500,6 +500,36 @@ async def run_agent_task(
         # setup. This is a deterministic HTTP lookup — no
         # LLM needed. Runs for both preparing_platform
         # (new path) and awaiting_provision (legacy/direct).
+        # Retire pending plan steps when entering synthesis.
+        # When an investigation concludes early (e.g., review
+        # refutes hypothesis before all steps run), remaining
+        # steps stay "pending" which misleads the synthesis
+        # agent into thinking the investigation is incomplete.
+        if status == "synthesizing_results":
+            try:
+                async with httpx.AsyncClient(
+                    timeout=10.0, headers=_auth_headers()
+                ) as client:
+                    r = await client.get(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                    )
+                    if r.status_code == 200:
+                        cf = r.json().get("custom_fields", {})
+                        plan = cf.get("execution_plan", {})
+                        steps = plan.get("steps", [])
+                        changed = False
+                        for s in steps:
+                            if s.get("status") == "pending":
+                                s["status"] = "skipped"
+                                changed = True
+                        if changed:
+                            await client.patch(
+                                f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
+                                json={"fields": {"execution_plan": plan}},
+                            )
+            except Exception:
+                pass
+
         if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 

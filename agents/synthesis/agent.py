@@ -92,10 +92,16 @@ class SynthesisAgent(AgentBase):
 
         steps = plan.get("steps", [])
         if steps:
-            content += (
-                f"**Plan:** {len(steps)} steps, "
-                f"{sum(1 for s in steps if s.get('status') == 'completed')} completed\n\n"
-            )
+            completed = sum(1 for s in steps if s.get("status") == "completed")
+            skipped = sum(1 for s in steps if s.get("status") == "skipped")
+            content += f"**Plan:** {len(steps)} steps"
+            content += f", {completed} completed"
+            if skipped:
+                content += (
+                    f", {skipped} skipped (investigation "
+                    f"concluded before these were needed)"
+                )
+            content += "\n\n"
 
         if change_ctx:
             content += (
