@@ -462,6 +462,7 @@ class TestSkippedPlanSteps:
     @pytest.mark.asyncio
     async def test_orchestrator_retires_pending_steps(self):
         from unittest.mock import MagicMock
+
         from orchestrator.main import run_agent_task
 
         plan = {
@@ -501,6 +502,7 @@ class TestSkippedPlanSteps:
 
         with pytest.MonkeyPatch.context() as mp:
             import httpx
+
             mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
             await run_agent_task(
                 dispatcher,
@@ -520,6 +522,7 @@ class TestSkippedPlanSteps:
     @pytest.mark.asyncio
     async def test_orchestrator_handles_none_execution_plan(self):
         from unittest.mock import MagicMock
+
         from orchestrator.main import run_agent_task
 
         mock_agent = MagicMock()
@@ -546,6 +549,7 @@ class TestSkippedPlanSteps:
 
         with pytest.MonkeyPatch.context() as mp:
             import httpx
+
             mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
             await run_agent_task(
                 dispatcher,
@@ -555,4 +559,3 @@ class TestSkippedPlanSteps:
             )
 
         mock_client.patch.assert_not_called()
-
