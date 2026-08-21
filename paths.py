@@ -22,6 +22,9 @@ PRICING_PATH = AGENTIC_PERF_HOME / "pricing.yaml"
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")
 )
+ARTIFACT_DIR = Path(
+    os.environ.get("AGENTIC_PERF_ARTIFACTS", AGENTIC_PERF_HOME / "artifacts")
+)
 PRIVATE_SKILLS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SKILLS", AGENTIC_PERF_HOME / "private-skills")
 )
@@ -72,3 +75,22 @@ def get_default_ssh_key() -> str:
         except (json.JSONDecodeError, OSError):
             pass
     return "~/.ssh/id_ed25519"
+
+
+def create_artifact_dir(
+    ticket_id: str,
+    run_id: str,
+) -> Path:
+    """Create and return an artifact directory for a run.
+
+    Structure: ARTIFACT_DIR/<ticket-id>/<run-id>/
+
+    Falls back to a temp directory if ticket_id is not set.
+    """
+    import tempfile
+
+    if ticket_id:
+        artifact_dir = ARTIFACT_DIR / ticket_id / run_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return artifact_dir
+    return Path(tempfile.mkdtemp(prefix=f"{run_id}-"))

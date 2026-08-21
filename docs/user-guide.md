@@ -130,6 +130,39 @@ works for any agent in any active (non-terminal, non-paused) status.
 If the ticket is at `awaiting_customer_guidance`, use the
 standard HITL reply flow (post comment + transition) instead.
 
+### Downloading Artifacts
+
+Benchmark artifacts (result files, boot logs, serial captures)
+are stored in a ticket-ID-based directory and accessible via
+the dashboard and API.
+
+**Dashboard:** When artifacts exist for a ticket, an Artifacts
+section appears in the ticket detail view between the Hypothesis
+card and Custom Fields. It shows a file count, total size, and
+a "Download All" link. Click "Show files" to expand the full
+file listing grouped by run, with individual download links.
+
+**API:**
+
+```bash
+# List artifacts for a ticket
+curl -H "Authorization: Bearer $TOKEN" \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts
+
+# Download a specific file
+curl -H "Authorization: Bearer $TOKEN" -O \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts/download/boot-time-fa75d469/merged-results.json
+
+# Download all artifacts as an archive
+curl -H "Authorization: Bearer $TOKEN" -O \
+  $AP_URL/api/v1/tickets/PERF-123/artifacts/archive
+```
+
+The artifact directory is configurable via `AGENTIC_PERF_ARTIFACTS`
+environment variable (default: `$AGENTIC_PERF_HOME/artifacts`).
+Mount persistent storage at this path to retain artifacts across
+restarts.
+
 ---
 
 ## What Agents Do (and Don't Do)
