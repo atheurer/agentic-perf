@@ -386,3 +386,75 @@ class TestDispatcherIntegration:
         agent = dispatcher.create_agent("synthesizing_results")
         assert isinstance(agent, SynthesisAgent)
         assert agent.agent_name == "synthesis-agent"
+
+
+class TestSkippedPlanSteps:
+    """Synthesis context correctly reports skipped steps."""
+
+    def test_skipped_steps_in_context(self):
+        from agents.synthesis.agent import SynthesisAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = SynthesisAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "summary": "Test skipped steps",
+            "custom_fields": {
+                "execution_plan": {
+                    "steps": [
+                        {"id": 0, "agent_type": "analyze", "status": "completed"},
+                        {"id": 1, "agent_type": "resource", "status": "completed"},
+                        {"id": 2, "agent_type": "benchmark", "status": "skipped"},
+                        {"id": 3, "agent_type": "review", "status": "skipped"},
+                        {"id": 4, "agent_type": "teardown", "status": "skipped"},
+                    ],
+                },
+            },
+        }
+        msgs = agent._build_messages(ticket)
+        content = msgs[0]["content"]
+        assert "2 completed" in content
+        assert "3 skipped" in content
+        assert "concluded before" in content
+
+    def test_no_skipped_steps(self):
+        from agents.synthesis.agent import SynthesisAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = SynthesisAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "summary": "All completed",
+            "custom_fields": {
+                "execution_plan": {
+                    "steps": [
+                        {"id": 0, "agent_type": "resource", "status": "completed"},
+                        {"id": 1, "agent_type": "benchmark", "status": "completed"},
+                    ],
+                },
+            },
+        }
+        msgs = agent._build_messages(ticket)
+        content = msgs[0]["content"]
+        assert "2 completed" in content
+        assert "skipped" not in content
+
+    def test_no_plan(self):
+        from agents.synthesis.agent import SynthesisAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = SynthesisAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "summary": "No plan",
+            "custom_fields": {},
+        }
+        msgs = agent._build_messages(ticket)
+        content = msgs[0]["content"]
+        assert "Plan" not in content

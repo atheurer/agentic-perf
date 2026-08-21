@@ -528,7 +528,11 @@ async def run_agent_task(
                                 json={"fields": {"execution_plan": plan}},
                             )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to retire pending plan steps for %s",
+                    ticket_id,
+                    exc_info=True,
+                )
 
         if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
