@@ -111,6 +111,25 @@ agentic-perf show ticket-abc123
 
 Results include the agent's verdict, metric comparisons, and recommendations—all with audit trail and source citations.
 
+### Sending Hints to Running Agents
+
+You can inject a hint into an agent's conversation while it's
+actively running — without pausing it:
+
+```bash
+curl -X POST $AP_URL/api/v1/tickets/PERF-123/interject \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Check per-CPU utilization, not system-wide averages"}'
+```
+
+The agent will see `[USER INTERJECTION] Check per-CPU utilization,
+not system-wide averages` injected into its next LLM call. This
+works for any agent in any active (non-terminal, non-paused) status.
+
+If the ticket is at `awaiting_customer_guidance`, use the
+standard HITL reply flow (post comment + transition) instead.
+
 ---
 
 ## What Agents Do (and Don't Do)
