@@ -458,3 +458,101 @@ class TestSkippedPlanSteps:
         msgs = agent._build_messages(ticket)
         content = msgs[0]["content"]
         assert "Plan" not in content
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_retires_pending_steps(self):
+        from unittest.mock import MagicMock
+        from orchestrator.main import run_agent_task
+
+        plan = {
+            "current_step": 1,
+            "steps": [
+                {"id": 0, "agent_type": "analyze", "status": "completed"},
+                {"id": 1, "agent_type": "review", "status": "completed"},
+                {"id": 2, "agent_type": "benchmark", "status": "pending"},
+                {"id": 3, "agent_type": "teardown", "status": "pending"},
+            ],
+        }
+
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock()
+        mock_agent.close = AsyncMock()
+
+        dispatcher = MagicMock()
+        dispatcher.create_agent.return_value = mock_agent
+        dispatcher.store_url = "http://localhost:8090"
+        dispatcher.events = None
+
+        mock_get = MagicMock()
+        mock_get.status_code = 200
+        mock_get.json.return_value = {
+            "id": "PERF-123",
+            "custom_fields": {"execution_plan": plan},
+        }
+
+        mock_patch = MagicMock()
+        mock_patch.status_code = 200
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=mock_get)
+        mock_client.patch = AsyncMock(return_value=mock_patch)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with pytest.MonkeyPatch.context() as mp:
+            import httpx
+            mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
+            await run_agent_task(
+                dispatcher,
+                "synthesizing_results",
+                "PERF-123",
+                agent_task_timeout=0,
+            )
+
+        assert mock_client.patch.called
+        patch_kwargs = mock_client.patch.call_args[1]
+        patched_steps = patch_kwargs["json"]["fields"]["execution_plan"]["steps"]
+        assert patched_steps[0]["status"] == "completed"
+        assert patched_steps[1]["status"] == "completed"
+        assert patched_steps[2]["status"] == "skipped"
+        assert patched_steps[3]["status"] == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_handles_none_execution_plan(self):
+        from unittest.mock import MagicMock
+        from orchestrator.main import run_agent_task
+
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock()
+        mock_agent.close = AsyncMock()
+
+        dispatcher = MagicMock()
+        dispatcher.create_agent.return_value = mock_agent
+        dispatcher.store_url = "http://localhost:8090"
+        dispatcher.events = None
+
+        mock_get = MagicMock()
+        mock_get.status_code = 200
+        mock_get.json.return_value = {
+            "id": "PERF-123",
+            "custom_fields": {"execution_plan": None},
+        }
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=mock_get)
+        mock_client.patch = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with pytest.MonkeyPatch.context() as mp:
+            import httpx
+            mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
+            await run_agent_task(
+                dispatcher,
+                "synthesizing_results",
+                "PERF-123",
+                agent_task_timeout=0,
+            )
+
+        mock_client.patch.assert_not_called()
+

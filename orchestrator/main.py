@@ -496,10 +496,6 @@ async def run_agent_task(
         except Exception:
             pass  # proceed with default iterations
 
-        # Jumpstarter: resolve image URLs before platform
-        # setup. This is a deterministic HTTP lookup — no
-        # LLM needed. Runs for both preparing_platform
-        # (new path) and awaiting_provision (legacy/direct).
         # Retire pending plan steps when entering synthesis.
         # When an investigation concludes early (e.g., review
         # refutes hypothesis before all steps run), remaining
@@ -515,8 +511,8 @@ async def run_agent_task(
                     )
                     if r.status_code == 200:
                         cf = r.json().get("custom_fields", {})
-                        plan = cf.get("execution_plan", {})
-                        steps = plan.get("steps", [])
+                        plan = cf.get("execution_plan") or {}
+                        steps = plan.get("steps") or []
                         changed = False
                         for s in steps:
                             if s.get("status") == "pending":
@@ -534,6 +530,10 @@ async def run_agent_task(
                     exc_info=True,
                 )
 
+        # Jumpstarter: resolve image URLs before platform
+        # setup. This is a deterministic HTTP lookup — no
+        # LLM needed. Runs for both preparing_platform
+        # (new path) and awaiting_provision (legacy/direct).
         if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 
