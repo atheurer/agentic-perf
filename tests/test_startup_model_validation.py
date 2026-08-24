@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from orchestrator.main import _validate_models
 
 
@@ -52,9 +50,7 @@ class TestValidateModels:
     async def test_failed_model_logs_error(self, caplog):
         config = _make_config()
         mock_provider = AsyncMock()
-        mock_provider.complete = AsyncMock(
-            side_effect=Exception("404 model not found")
-        )
+        mock_provider.complete = AsyncMock(side_effect=Exception("404 model not found"))
 
         with patch("orchestrator.main._make_llm_provider", return_value=mock_provider):
             with caplog.at_level("ERROR", logger="orchestrator.main"):
