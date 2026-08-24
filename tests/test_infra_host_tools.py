@@ -236,3 +236,96 @@ class TestReadRemoteDir:
         data = json.loads(result)
         assert data["success"] is False
         assert "no such file" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# get_cache_topology
+# ---------------------------------------------------------------------------
+
+
+class TestGetCacheTopology:
+    @pytest.mark.asyncio
+    async def test_success(self, patch_ssh):
+        topology_payload = {
+            "cpus": {
+                0: {
+                    "cpu_id": 0,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 0,
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3",
+                        }
+                    ],
+                },
+                1: {
+                    "cpu_id": 1,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 1,
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3",
+                        }
+                    ],
+                },
+                2: {
+                    "cpu_id": 2,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 2,
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3",
+                        }
+                    ],
+                },
+                3: {
+                    "cpu_id": 3,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 3,
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3",
+                        }
+                    ],
+                },
+            },
+            "nodes": {0: "0-3"},
+            "system": {
+                "arch": "x86_64",
+                "vendor": "AuthenticAMD",
+                "model": "AMD EPYC",
+            },
+        }
+        patch_ssh._results["python3 -c"] = SSHResult(
+            exit_code=0,
+            stdout=json.dumps(topology_payload),
+        )
+        result = await srv.get_cache_topology("10.0.0.1", socket=0)
+        data = json.loads(result)
+        assert data["host"] == "10.0.0.1"
+        assert data["socket"] == 0
+        assert data["total_ccds"] == 1
+        assert data["ccds"]["0"] == [0, 1, 2, 3]
+        assert data["domains"][0]["cpu_list"] == "0-3"
+        assert data["domains"][0]["size"] == "32M"
+

@@ -84,6 +84,11 @@ def mock_infra_server(tmp_path: Path) -> Path:
             return json.dumps({"nic_numa_node": "0", "node_cpu_lists": "mock", "iface": iface})
 
         @mcp.tool()
+        async def get_cache_topology(host: str, socket: int = None) -> str:
+            \"\"\"Discover CPU cache / CCD topology for a host.\"\"\"
+            return json.dumps({"host": host, "socket": socket, "ccds": {"0": [0, 1]}, "domains": [], "total_ccds": 1, "total_cpus": 2})
+
+        @mcp.tool()
         async def verify_ssh_path(host: str, target_host: str) -> str:
             \"\"\"Verify SSH reachability from one host to another.\"\"\"
             return json.dumps({"reachable": True, "from": host, "to": target_host, "hostname": "mock-host"})
@@ -179,6 +184,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "get_ethtool_info",
             "get_sysctl_values",
             "query_numa_topology",
+            "get_cache_topology",
             "verify_ssh_path",
             "list_interfaces",
             "deploy_secret",
@@ -272,7 +278,8 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "resolve_benchmark" in names
         assert "set_ssh_context" in names
         assert "get_ethtool_info" in names
-        assert len(names) == 16
+        assert "get_cache_topology" in names
+        assert len(names) == 17
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -323,7 +330,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 16
+    assert len(client._tool_routing) == 17
 
     await client.disconnect()
     assert len(client._servers) == 0
