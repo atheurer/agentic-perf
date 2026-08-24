@@ -7,7 +7,7 @@
 # Model names use prefix matching: "claude-sonnet-4" matches
 # "claude-sonnet-4-6", "claude-sonnet-4-20260501", etc.
 #
-# Last updated: 2026-06-25
+# Last updated: 2026-08-24
 #
 # Pricing sources:
 #   Anthropic: https://www.anthropic.com/pricing
@@ -73,6 +73,25 @@ models:
   # --- Google ---
   # Source: https://ai.google.dev/pricing
   # Cache: ~90% discount on reads
+  gemini-3.7-flash:
+    input_per_token: 0.00000075       # $0.75 / 1M tokens
+    cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
+    output_per_token: 0.00000375      # $3.75 / 1M tokens
+
+  gemini-3.5-flash:
+    input_per_token: 0.0000015        # $1.50 / 1M tokens
+    cache_read_per_token: 0.00000015  # $0.15 / 1M tokens
+    output_per_token: 0.000009        # $9.00 / 1M tokens
+
+  gemini-3.5-flash-lite:
+    input_per_token: 0.0000003        # $0.30 / 1M tokens
+    output_per_token: 0.0000025       # $2.50 / 1M tokens
+
+  gemini-3.1-pro:
+    input_per_token: 0.000002         # $2.00 / 1M tokens (<= 200k)
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.000012        # $12.00 / 1M tokens
+
   gemini-2.5-pro:
     input_per_token: 0.00000125     # $1.25 / 1M tokens
     cache_read_per_token: 0.000000315  # $0.315 / 1M tokens

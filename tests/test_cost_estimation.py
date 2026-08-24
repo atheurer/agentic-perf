@@ -54,6 +54,10 @@ def test_google_model():
     c = estimate_cost("gemini-2.5-pro", 1000, 500)
     assert c > 0
 
+    c_flash37 = estimate_cost("gemini-3.7-flash", 1000, 500)
+    # 1000 * 0.75/1M + 500 * 3.75/1M = 0.00075 + 0.001875 = 0.002625
+    assert abs(c_flash37 - 0.002625) < 0.00001
+
 
 def test_cumulative_cost():
     """Estimate from a CumulativeUsage dict."""
