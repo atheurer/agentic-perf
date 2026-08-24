@@ -27,13 +27,85 @@ fallback:
 
 models:
   # --- Anthropic ---
-  # Source: https://www.anthropic.com/pricing
-  # Cache: 90% discount on reads, 25% premium on writes (5-min TTL)
+  # Source: https://platform.claude.com/docs/en/about-claude/pricing
+  # Cache: 90% discount on reads (0.1x), 25% premium on 5m writes (1.25x)
+  claude-fable-5:
+    input_per_token: 0.00001        # $10.00 / 1M tokens
+    cache_read_per_token: 0.000001  # $1.00 / 1M tokens
+    cache_write_per_token: 0.0000125 # $12.50 / 1M tokens
+    output_per_token: 0.00005       # $50.00 / 1M tokens
+
+  claude-mythos-5:
+    input_per_token: 0.00001        # $10.00 / 1M tokens
+    cache_read_per_token: 0.000001  # $1.00 / 1M tokens
+    cache_write_per_token: 0.0000125 # $12.50 / 1M tokens
+    output_per_token: 0.00005       # $50.00 / 1M tokens
+
+  claude-opus-5:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4-8:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4.8:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4-7:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4.7:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4-6:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4.6:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4-5:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
+  claude-opus-4.5:
+    input_per_token: 0.000005       # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
+    output_per_token: 0.000025      # $25.00 / 1M tokens
+
   claude-opus-4:
-    input_per_token: 0.000015       # $15.00 / 1M tokens
+    input_per_token: 0.000015       # $15.00 / 1M tokens (legacy 4.0 / 4.1)
     cache_read_per_token: 0.0000015  # $1.50 / 1M tokens (90% off)
     cache_write_per_token: 0.00001875  # $18.75 / 1M tokens (1.25x)
     output_per_token: 0.000075      # $75.00 / 1M tokens
+
+  claude-sonnet-5:
+    input_per_token: 0.000002       # $2.00 / 1M tokens
+    cache_read_per_token: 0.0000002 # $0.20 / 1M tokens
+    cache_write_per_token: 0.0000025 # $2.50 / 1M tokens
+    output_per_token: 0.00001       # $10.00 / 1M tokens
 
   claude-sonnet-4:
     input_per_token: 0.000003       # $3.00 / 1M tokens
@@ -46,6 +118,36 @@ models:
     cache_read_per_token: 0.0000001  # $0.10 / 1M tokens (90% off)
     cache_write_per_token: 0.00000125  # $1.25 / 1M tokens (1.25x)
     output_per_token: 0.000005      # $5.00 / 1M tokens
+
+  claude-3-7-sonnet:
+    input_per_token: 0.000003       # $3.00 / 1M tokens
+    cache_read_per_token: 0.0000003 # $0.30 / 1M tokens (90% off)
+    cache_write_per_token: 0.00000375 # $3.75 / 1M tokens (1.25x)
+    output_per_token: 0.000015      # $15.00 / 1M tokens
+
+  claude-3-5-sonnet:
+    input_per_token: 0.000003       # $3.00 / 1M tokens
+    cache_read_per_token: 0.0000003 # $0.30 / 1M tokens (90% off)
+    cache_write_per_token: 0.00000375 # $3.75 / 1M tokens (1.25x)
+    output_per_token: 0.000015      # $15.00 / 1M tokens
+
+  claude-3-5-haiku:
+    input_per_token: 0.0000008      # $0.80 / 1M tokens
+    cache_read_per_token: 0.00000008 # $0.08 / 1M tokens (90% off)
+    cache_write_per_token: 0.000001 # $1.00 / 1M tokens (1.25x)
+    output_per_token: 0.000004      # $4.00 / 1M tokens
+
+  claude-3-opus:
+    input_per_token: 0.000015       # $15.00 / 1M tokens
+    cache_read_per_token: 0.0000015 # $1.50 / 1M tokens (90% off)
+    cache_write_per_token: 0.00001875 # $18.75 / 1M tokens (1.25x)
+    output_per_token: 0.000075      # $75.00 / 1M tokens
+
+  claude-haiku-3-5:
+    input_per_token: 0.0000008      # $0.80 / 1M tokens
+    cache_read_per_token: 0.00000008  # $0.08 / 1M tokens (90% off)
+    cache_write_per_token: 0.000001  # $1.00 / 1M tokens (1.25x)
+    output_per_token: 0.000004      # $4.00 / 1M tokens
 
   claude-haiku-3.5:
     input_per_token: 0.0000008      # $0.80 / 1M tokens

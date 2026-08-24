@@ -23,11 +23,23 @@ def test_known_model_pricing():
     # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075
     assert abs(c - 0.0105) < 0.0001
 
+    c_sonnet5 = estimate_cost("claude-sonnet-5", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 10.0/1M = 0.002 + 0.005 = 0.007
+    assert abs(c_sonnet5 - 0.007) < 0.0001
+
+    c_opus5 = estimate_cost("claude-opus-5", 1000, 500)
+    # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
+    assert abs(c_opus5 - 0.0175) < 0.0001
+
 
 def test_versioned_model_prefix_match():
     """Model names with version suffixes match by prefix."""
     c = estimate_cost("claude-sonnet-4-6", 1000, 500)
     assert abs(c - 0.0105) < 0.0001
+
+    c_opus46 = estimate_cost("claude-opus-4-6", 1000, 500)
+    # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
+    assert abs(c_opus46 - 0.0175) < 0.0001
 
 
 def test_unknown_model_uses_fallback():
