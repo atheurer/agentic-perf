@@ -223,6 +223,26 @@ class IntrospectionAgent:
                 if stale:
                     anomalies.append(stale)
 
+                # Emit new high-severity anomalies to the
+                # event stream so they appear in the dashboard.
+                if self._events and len(anomalies) > self._prev_anomaly_count:
+                    new_anomalies = anomalies[self._prev_anomaly_count :]
+                    for a in new_anomalies:
+                        if a.get("severity") in (
+                            "high",
+                            "critical",
+                        ):
+                            self._events.emit(
+                                ticket_id,
+                                "introspection-agent",
+                                "anomaly_detected",
+                                {
+                                    "type": a.get("type", ""),
+                                    "severity": a["severity"],
+                                    "description": a.get("description", ""),
+                                },
+                            )
+
                 if new_events or stale:
                     # Check if LLM narrative is warranted.
                     llm_narrative = await self._maybe_narrate(
