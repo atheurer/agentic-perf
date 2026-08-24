@@ -280,3 +280,54 @@ models:
     input_per_token: 0.00000015     # $0.15 / 1M tokens
     cache_read_per_token: 0.0000000375  # $0.0375 / 1M tokens
     output_per_token: 0.0000006     # $0.60 / 1M tokens
+
+  # --- xAI (Grok) ---
+  # Source: https://docs.x.ai/docs/overview
+  # Cache: 75% - 85% discount on reads
+  grok-4.6:
+    input_per_token: 0.000002         # $2.00 / 1M tokens
+    cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
+    output_per_token: 0.000006        # $6.00 / 1M tokens
+
+  grok-4.5:
+    input_per_token: 0.000002         # $2.00 / 1M tokens
+    cache_read_per_token: 0.0000003   # $0.30 / 1M tokens
+    output_per_token: 0.000006        # $6.00 / 1M tokens
+
+  grok-4.3:
+    input_per_token: 0.00000125       # $1.25 / 1M tokens
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.0000025       # $2.50 / 1M tokens
+
+  grok-4.20:
+    input_per_token: 0.00000125       # $1.25 / 1M tokens
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.0000025       # $2.50 / 1M tokens
+
+  grok-code-fast:
+    input_per_token: 0.000001         # $1.00 / 1M tokens
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.000002        # $2.00 / 1M tokens
+
+  grok-build:
+    input_per_token: 0.000001         # $1.00 / 1M tokens
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.000002        # $2.00 / 1M tokens
+
+  grok-3-mini:
+    input_per_token: 0.0000003        # $0.30 / 1M tokens
+    cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
+    output_per_token: 0.0000015       # $1.50 / 1M tokens
+
+  grok-3:
+    input_per_token: 0.000003         # $3.00 / 1M tokens
+    cache_read_per_token: 0.00000075  # $0.75 / 1M tokens
+    output_per_token: 0.000015        # $15.00 / 1M tokens
+
+  grok-2:
+    input_per_token: 0.000002         # $2.00 / 1M tokens
+    output_per_token: 0.00001         # $10.00 / 1M tokens
+
+  grok-beta:
+    input_per_token: 0.000005         # $5.00 / 1M tokens
+    output_per_token: 0.000015        # $15.00 / 1M tokens

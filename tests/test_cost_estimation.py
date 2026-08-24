@@ -79,6 +79,23 @@ def test_google_model():
     assert abs(c_flash37 - 0.002625) < 0.00001
 
 
+def test_xai_grok_model():
+    """xAI (Grok) models have their own pricing."""
+    c_grok46 = estimate_cost("grok-4.6", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 6.0/1M = 0.002 + 0.003 = 0.005
+    assert abs(c_grok46 - 0.005) < 0.0001
+
+    c_grok3 = estimate_cost("grok-3", 1000, 500)
+    # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075 = 0.0105
+    assert abs(c_grok3 - 0.0105) < 0.0001
+
+    c_cached = estimate_cost("grok-4.6", 1000, 500, cache_read_input_tokens=800)
+    # (1000 - 800) * 2.0/1M + 800 * 0.50/1M + 500 * 6.0/1M
+    # = 200 * 0.000002 + 800 * 0.0000005 + 500 * 0.000006
+    # = 0.0004 + 0.0004 + 0.003 = 0.0038
+    assert abs(c_cached - 0.0038) < 0.0001
+
+
 def test_cumulative_cost():
     """Estimate from a CumulativeUsage dict."""
     usage = {
