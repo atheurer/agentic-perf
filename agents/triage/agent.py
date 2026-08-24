@@ -342,6 +342,42 @@ _LOCAL_TOOLS = [
                         "results compared."
                     ),
                 },
+                "image_build": {
+                    "type": "object",
+                    "description": (
+                        "Custom image build specification. "
+                        "Set when the user requests a custom "
+                        "OS image with package overrides, "
+                        "service changes, or specific build "
+                        "parameters. The system will build "
+                        "the image before acquiring hardware."
+                    ),
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Image build provider name. Omit to use the default."
+                            ),
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": (
+                                "Build target platform. Omit "
+                                "to auto-resolve from "
+                                "board_selector."
+                            ),
+                        },
+                        "customizations": {
+                            "type": "object",
+                            "description": (
+                                "Image customizations: rpms, "
+                                "repos, enabled_services, "
+                                "disabled_services, "
+                                "masked_services, kernel"
+                            ),
+                        },
+                    },
+                },
             },
             "required": [
                 "parsed_specs",
@@ -695,6 +731,39 @@ class TriageAgent(AgentBase):
                 "enabled": True,
                 "tested_hosts": existing_fleet.get("tested_hosts", []),
             }
+        # Custom image build: store spec and prepend
+        # a build_image step to the execution plan.
+        # Merge triage image_build with user-provided values;
+        # user-provided fields take precedence.
+        image_build = cf.get("image_build", {})
+        triage_build = result.get("image_build", {})
+        if triage_build or image_build:
+            merged_build = {**triage_build, **image_build}
+            if "customizations" in triage_build and "customizations" in image_build:
+                merged_build["customizations"] = {
+                    **triage_build["customizations"],
+                    **image_build["customizations"],
+                }
+            fields["image_build"] = merged_build
+            # Prepend build step before resource step
+            plan = fields.get("execution_plan", {})
+            steps = plan.get("steps", [])
+            build_step = {
+                "id": 0,
+                "agent_type": "build_image",
+                "status": "in_progress",
+                "params": {},
+                "results": {},
+            }
+            # Renumber existing steps
+            for i, s in enumerate(steps):
+                s["id"] = i + 1
+                if i == 0:
+                    s["status"] = "pending"
+            steps.insert(0, build_step)
+            plan["steps"] = steps
+            plan["current_step"] = 0
+            fields["execution_plan"] = plan
 
         await self._update_fields(ticket_id, fields)
 
@@ -747,6 +816,7 @@ class TriageAgent(AgentBase):
             _TRIAGE_EXIT_STATUSES = {
                 "resource": "awaiting_hardware",
                 "analyze": "analyzing",
+                "build_image": "building_image",
             }
             first_step_type = steps[0]["agent_type"]
             first_status = _TRIAGE_EXIT_STATUSES.get(

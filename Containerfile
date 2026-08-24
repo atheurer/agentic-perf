@@ -92,6 +92,12 @@ RUN PTH=$(find /opt/app-root -name 'jumpstarter.pth' 2>/dev/null | head -1) && \
         echo "Fixed .pth to $PYVER"; \
     fi
 
+# CAIB (Cloud Automotive Image Builder) CLI
+RUN CAIB_VERSION="v0.2.0" && \
+    curl -sSL "https://raw.githubusercontent.com/centos-automotive-suite/automotive-dev-operator/${CAIB_VERSION}/hack/install-caib.sh" \
+    | bash -s -- "${CAIB_VERSION}" || \
+    echo 'WARNING: CAIB install failed (custom image builds will be unavailable)'
+
 # Runtime configuration
 ENV AGENTIC_PERF_HOME=/data/agentic-perf
 ENV PYTHONUNBUFFERED=1

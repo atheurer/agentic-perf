@@ -19,6 +19,7 @@ install tooling, execute benchmarks, and deliver structured analysis.
 | `agents/{name}/server.py` | FastMCP tool server (runtime MCP subprocess) |
 | `agents/introspection/agent.py` | Continuous passive observer (not AgentBase) |
 | `agents/fleet/agent.py` | Fleet coordinator — deterministic iteration lifecycle (not AgentBase) |
+| `agents/image_builder/agent.py` | Custom image builds via pluggable providers (not AgentBase) |
 | `agents/mcp_client.py` | MCP client for multi-server tool routing |
 | `orchestrator/dispatcher.py` | Status → agent mapping, dispatch logic |
 | `orchestrator/main.py` | Poll loop, provider initialization |

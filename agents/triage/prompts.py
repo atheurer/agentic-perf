@@ -162,6 +162,27 @@ points), then acquires the next host.
 
 Fleet investigations use a single required_hosts entry — the system
 acquires one host at a time, tests it, then acquires the next.
+## Custom Image Build
+
+When the user requests testing with a custom OS image — package
+overrides, service changes, building from a specific commit, or
+using a non-standard image — set `image_build` in your triage
+result. The system will build the image before acquiring hardware.
+
+Examples of custom build requests:
+- "test with podman from this COPR repo"
+- "build an image with this service disabled"
+- "use the latest automotive-image-builder main branch"
+- "install these extra packages in the image"
+
+Set `image_build.customizations` with the changes needed:
+- `rpms`: extra packages to install
+- `repos`: custom RPM repositories
+- `enabled_services` / `disabled_services` / `masked_services`
+- `kernel`: kernel command line or package overrides
+
+The build step runs BEFORE hardware acquisition to avoid holding
+a device lease during the build (~10-30 minutes).
 
 ## Execution Plans
 

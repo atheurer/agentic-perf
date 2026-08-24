@@ -273,6 +273,46 @@ async def resolve_images(
         if cf.get("jumpstarter_flash"):
             return
 
+        # Custom CAIB build: use the built image instead
+        # of resolving from the nightly server.
+        build_result = cf.get("image_build_result", {})
+        if build_result.get("status") == "completed":
+            build_name = build_result.get("build_name", "")
+            image_url = build_result.get("image_url", "")
+            logger.info(
+                "[jumpstarter-images] Using custom build: %s",
+                build_name,
+            )
+            if image_url:
+                # Store as a standard flash target so the
+                # platform agent's existing code handles it.
+                board_target = cf.get("resource_provider_metadata", {}).get(
+                    "board_target", ""
+                )
+                async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+                    await client.patch(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                        json={
+                            "fields": {
+                                "jumpstarter_flash": {
+                                    "custom_build": True,
+                                    "build_name": build_name,
+                                    "flash_targets": [
+                                        {
+                                            "partition": "default",
+                                            "url": f"oci://{image_url}",
+                                        }
+                                    ],
+                                    "flash_command": (
+                                        f"j storage flash oci://{image_url}"
+                                    ),
+                                    "board_target": board_target,
+                                },
+                            },
+                        },
+                    )
+            return
+
         directives = cf.get("directives", {})
         metadata = cf.get("resource_provider_metadata", {})
 
@@ -373,7 +413,7 @@ async def resolve_images(
         # exporter's `target` label (set by reserve()),
         # which matches the manifest key exactly. Fall
         # back to selector parsing only for legacy paths.
-        board_target = metadata.get("board_target", "")
+        board_target = cf.get("resource_provider_metadata", {}).get("board_target", "")
         if not board_target:
             # Fallback: derive from selector.
             selector = (

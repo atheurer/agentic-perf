@@ -124,6 +124,18 @@ and comparing results. The system automatically:
 
 Set in `custom_fields` (not `directives`) since it controls
 pipeline behavior, not harness configuration:
+### Custom Image Build
+
+| Field | Description | Values |
+|---|---|---|
+| `image_build` | Build a custom OS image before provisioning | See below |
+
+When `image_build` is set in `custom_fields`, the pipeline builds
+a custom AutoSD image before acquiring hardware. The build runs
+and the resulting image
+replaces the default nightly for flashing.
+
+Set in `custom_fields` (not `directives`):
 
 ```json
 {
@@ -132,6 +144,15 @@ pipeline behavior, not harness configuration:
     "board_selector": "board-type=nxp-s32g-vnp-rdb3",
     "harness": "boot-time",
     "samples": 10
+    "image_build": {
+      "target": "ebbr",
+      "customizations": {
+        "rpms": ["custom-package"],
+        "repos": [{"name": "copr", "baseurl": "https://..."}],
+        "masked_services": ["unwanted.service"],
+        "enabled_services": ["custom.service"]
+      }
+    }
   }
 }
 ```
@@ -154,6 +175,8 @@ Progress is tracked in `custom_fields.fleet_investigation`:
   }
 }
 ```
+Or describe it naturally — the triage agent will detect custom
+build requirements and set the directives.
 
 ### Boot-Time Specific
 

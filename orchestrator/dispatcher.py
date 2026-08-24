@@ -41,6 +41,7 @@ STATUS_AGENT_MAP = {
     "retrospective_pending": "retrospective",
     # Data analysis path
     "analyzing": "analyze",
+    "building_image": "image_builder",
     # Recursive investigation loop
     "gathering_context": "gathering_context",
     "planning_investigation": "planning_investigation",
@@ -496,6 +497,15 @@ class Dispatcher:
             )
 
             agent = FleetCoordinatorAgent(
+                state_store_url=self.store_url,
+                event_bus=self.events,
+            )
+        elif agent_type == "image_builder":
+            from agents.image_builder.agent import (
+                ImageBuilderAgent,
+            )
+
+            agent = ImageBuilderAgent(
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )

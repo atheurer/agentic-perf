@@ -488,6 +488,116 @@ Jumpstarter also requires:
 
 ---
 
+### `image_build` — Custom Image Building (CAIB)
+
+Configuration for building custom OS images via the
+[CAIB](https://gitlab.com/CentOS/automotive/infra/caib) pipeline.
+When a ticket includes `image_build` directives, the image builder
+agent uses these settings to build, push, and manage images.
+
+```json
+{
+    "image_build": {
+        "push_registry": "quay.io/redhat-performance/rhivos-agentic-perf-caib",
+        "tag_expiration_days": 14
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `push_registry` | string | — | Quay.io registry path for pushing built images. Required for CAIB builds. |
+| `tag_expiration_days` | int | `14` | Days before Quay auto-deletes the image tag. Set via Quay API after push. |
+
+#### Secrets
+
+| Path | Description |
+|---|---|
+| `secrets/caib/token` | CAIB API authentication token |
+| `secrets/caib/registry-auth.json` | Docker auth.json for pushing images to the registry (robot account) |
+| `secrets/quay/api-token` | *(Optional)* Quay OAuth token with "Administer Repositories" scope |
+
+**Tag expiration** uses the Quay REST API (Bearer auth). The token
+is resolved in order:
+
+1. **Robot account token** from `registry-auth.json` — preferred
+   because it is already repo-scoped. The robot account must have
+   admin access to the target repository.
+2. **Dedicated OAuth token** from `secrets/quay/api-token` —
+   fallback, requires "Administer Repositories" scope.
+
+If neither is available, tag expiration is silently skipped.
+
+#### Ticket Directives
+
+Custom image builds are requested via `image_build` in the ticket's
+`custom_fields`:
+
+```json
+{
+    "custom_fields": {
+        "image_build": {
+            "provider": "caib",
+            "target": "ebbr",
+            "customizations": {
+                "masked_services": ["podman-clean-transient.service"],
+                "additional_rpms": ["strace", "perf"]
+            }
+        }
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `provider` | string | `"caib"` | Image build provider name |
+| `target` | string | auto-resolved | CAIB target (e.g., `ebbr` for S32G/R-Car S4). Auto-resolved from `board_selector` if omitted. |
+| `customizations` | object | `{}` | Provider-specific customizations (masked services, RPMs, etc.) |
+| `build_mode` | string | auto-resolved | CAIB build mode (`build-dev` for package, `build` for bootc) |
+| `ttl` | string | `"168h"` | CAIB build record time-to-live |
+
+#### OpenShift Deployment
+
+For OCP, create the secrets and mount them:
+
+```bash
+# CAIB token
+oc create secret generic agentic-perf-caib \
+  --from-file=token=secrets/caib/token \
+  --from-file=registry-auth.json=secrets/caib/registry-auth.json
+
+# Quay API token (for tag expiration)
+oc create secret generic agentic-perf-quay \
+  --from-file=api-token=secrets/quay/api-token
+```
+
+Add volume mounts to the deployment:
+
+```yaml
+volumeMounts:
+  - name: caib-secrets
+    mountPath: /data/agentic-perf/secrets/caib/token
+    subPath: token
+    readOnly: true
+  - name: caib-secrets
+    mountPath: /data/agentic-perf/secrets/caib/registry-auth.json
+    subPath: registry-auth.json
+    readOnly: true
+  - name: quay-secrets
+    mountPath: /data/agentic-perf/secrets/quay/api-token
+    subPath: api-token
+    readOnly: true
+volumes:
+  - name: caib-secrets
+    secret:
+      secretName: agentic-perf-caib
+  - name: quay-secrets
+    secret:
+      secretName: agentic-perf-quay
+```
+
+---
+
 ### `external_mcp_servers` — Remote MCP Servers
 
 Connect agents to remote MCP servers via SSE or StreamableHTTP.
