@@ -23,11 +23,23 @@ def test_known_model_pricing():
     # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075
     assert abs(c - 0.0105) < 0.0001
 
+    c_sonnet5 = estimate_cost("claude-sonnet-5", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 10.0/1M = 0.002 + 0.005 = 0.007
+    assert abs(c_sonnet5 - 0.007) < 0.0001
+
+    c_opus5 = estimate_cost("claude-opus-5", 1000, 500)
+    # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
+    assert abs(c_opus5 - 0.0175) < 0.0001
+
 
 def test_versioned_model_prefix_match():
     """Model names with version suffixes match by prefix."""
     c = estimate_cost("claude-sonnet-4-6", 1000, 500)
     assert abs(c - 0.0105) < 0.0001
+
+    c_opus46 = estimate_cost("claude-opus-4-6", 1000, 500)
+    # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
+    assert abs(c_opus46 - 0.0175) < 0.0001
 
 
 def test_unknown_model_uses_fallback():
@@ -48,11 +60,40 @@ def test_openai_model():
     # 1000 * 2.5/1M + 500 * 10.0/1M = 0.0025 + 0.005
     assert abs(c - 0.0075) < 0.0001
 
+    c_gpt56 = estimate_cost("gpt-5.6-sol", 1000, 500)
+    # 1000 * 4.0/1M + 500 * 20.0/1M = 0.004 + 0.010 = 0.014
+    assert abs(c_gpt56 - 0.014) < 0.0001
+
+    c_o3 = estimate_cost("o3", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 8.0/1M = 0.002 + 0.004 = 0.006
+    assert abs(c_o3 - 0.006) < 0.0001
+
 
 def test_google_model():
     """Google models have their own pricing."""
     c = estimate_cost("gemini-2.5-pro", 1000, 500)
     assert c > 0
+
+    c_flash37 = estimate_cost("gemini-3.7-flash", 1000, 500)
+    # 1000 * 0.75/1M + 500 * 3.75/1M = 0.00075 + 0.001875 = 0.002625
+    assert abs(c_flash37 - 0.002625) < 0.00001
+
+
+def test_xai_grok_model():
+    """xAI (Grok) models have their own pricing."""
+    c_grok46 = estimate_cost("grok-4.6", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 6.0/1M = 0.002 + 0.003 = 0.005
+    assert abs(c_grok46 - 0.005) < 0.0001
+
+    c_grok3 = estimate_cost("grok-3", 1000, 500)
+    # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075 = 0.0105
+    assert abs(c_grok3 - 0.0105) < 0.0001
+
+    c_cached = estimate_cost("grok-4.6", 1000, 500, cache_read_input_tokens=800)
+    # (1000 - 800) * 2.0/1M + 800 * 0.50/1M + 500 * 6.0/1M
+    # = 200 * 0.000002 + 800 * 0.0000005 + 500 * 0.000006
+    # = 0.0004 + 0.0004 + 0.003 = 0.0038
+    assert abs(c_cached - 0.0038) < 0.0001
 
 
 def test_cumulative_cost():
