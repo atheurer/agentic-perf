@@ -48,6 +48,14 @@ def test_openai_model():
     # 1000 * 2.5/1M + 500 * 10.0/1M = 0.0025 + 0.005
     assert abs(c - 0.0075) < 0.0001
 
+    c_gpt56 = estimate_cost("gpt-5.6-sol", 1000, 500)
+    # 1000 * 4.0/1M + 500 * 20.0/1M = 0.004 + 0.010 = 0.014
+    assert abs(c_gpt56 - 0.014) < 0.0001
+
+    c_o3 = estimate_cost("o3", 1000, 500)
+    # 1000 * 2.0/1M + 500 * 8.0/1M = 0.002 + 0.004 = 0.006
+    assert abs(c_o3 - 0.006) < 0.0001
+
 
 def test_google_model():
     """Google models have their own pricing."""
