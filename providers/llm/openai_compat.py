@@ -75,7 +75,7 @@ class OpenAICompatLLMProvider(LLMProvider):
             response = await asyncio.to_thread(
                 self._client.chat.completions.create, **kwargs
             )
-            return self._parse_response(response)
+            return self._parse_response(response, model=self._model)
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(self._client.chat.completions.create, **kwargs),
@@ -89,7 +89,7 @@ class OpenAICompatLLMProvider(LLMProvider):
             if type(e).__name__ == "RateLimitError":
                 raise LLMRateLimitError(f"openai/{self._model}") from None
             raise
-        return self._parse_response(response)
+        return self._parse_response(response, model=self._model)
 
     @staticmethod
     def _convert_messages(
@@ -162,7 +162,7 @@ class OpenAICompatLLMProvider(LLMProvider):
         ]
 
     @staticmethod
-    def _parse_response(response) -> LLMResponse:
+    def _parse_response(response, model: str = "") -> LLMResponse:
         choice = response.choices[0]
         message = choice.message
 
@@ -211,7 +211,7 @@ class OpenAICompatLLMProvider(LLMProvider):
                 "output_tokens": getattr(u, "completion_tokens", 0) or 0,
                 "cache_read_input_tokens": 0,
                 "cache_creation_input_tokens": 0,
-                "model": "",
+                "model": getattr(response, "model", None) or model,
             }
 
         return LLMResponse(
