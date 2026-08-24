@@ -112,6 +112,7 @@ header h1 span { color: var(--accent); }
 .badge-awaiting_teardown { background: #3a2a20; color: var(--orange); }
 /* Investigation loop statuses use the same color categories */
 .badge-analyzing { background: #2d3a5c; color: var(--cyan); }
+.badge-building_image { background: #3a3520; color: var(--yellow); }
 .badge-gathering_context { background: #2d3a5c; color: var(--cyan); }
 .badge-planning_investigation { background: #2d3a5c; color: var(--cyan); }
 .badge-evaluating_convergence { background: #352a3a; color: var(--purple); }
@@ -1943,6 +1944,8 @@ async function renderDetail(ticketId) {
     loadArtifacts(ticketId);
 
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
+    // Re-check artifacts periodically (created during ticket run)
+    setInterval(function() { loadArtifacts(ticketId); }, 10000);
   } catch (err) {
     app.innerHTML =
       '<div class="breadcrumb"><a href="#/">Dashboard</a> / ' + escHtml(ticketId) + '</div>' +
@@ -2760,6 +2763,30 @@ function renderEvent(evt) {
         '<span style="color:var(--text-muted)">' + escHtml(data.tool || '?') + ': ' + escHtml(data.reason || '') + '</span>' +
       '</div>';
 
+    case 'build_complete':
+      return '<div class="event">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:var(--green);color:#fff">BUILD COMPLETE</span>' +
+        '<span>' + escHtml(data.build_name || '') + '</span>' +
+        (data.image_url ? '<div style="font-size:11px;color:var(--text-muted);margin-left:70px">' + escHtml(data.image_url) + '</div>' : '') +
+      '</div>';
+
+    case 'build_failed':
+      return '<div class="event">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label label-error">BUILD FAILED</span>' +
+        '<span>' + escHtml(data.error || 'Unknown error') + '</span>' +
+      '</div>';
+
+    case 'anomaly_detected':
+      var aSev = (data.severity || 'medium').toUpperCase();
+      var aColor = aSev === 'CRITICAL' ? '#d32f2f' : (aSev === 'HIGH' ? '#e65100' : 'var(--accent)');
+      return '<div class="event" style="border-left:3px solid ' + aColor + ';padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:' + aColor + ';color:#fff">⚠ ' + aSev + '</span>' +
+        '<span>' + escHtml(data.description || data.type || 'Anomaly detected') + '</span>' +
+      '</div>';
+
     case 'transition':
     case 'status_change':
       return '';
@@ -2812,12 +2839,28 @@ function renderAgentStarted(evt, ts, agent, data) {
       '</details>';
   }
 
+  // Deterministic agents (no system_prompt) — show data fields
+  var dataHtml = '';
+  if (!sysPrompt && !initialMsgs.length) {
+    var keys = Object.keys(data);
+    if (keys.length > 0) {
+      dataHtml = '<div style="font-size:12px; color:var(--text-muted); margin-top:4px">';
+      keys.forEach(function(k) {
+        var v = data[k];
+        var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
+        if (display.length > 200) display = display.substring(0, 200) + '...';
+        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + escHtml(display) + '</div>';
+      });
+      dataHtml += '</div>';
+    }
+  }
+
   return '<details class="agent-section" open>' +
     '<summary>' +
       '<span class="agent-name">' + escHtml(agent) + '</span>' +
       '<span style="color:var(--text-muted); font-size:12px; margin-left:auto;">' + ts + '</span>' +
     '</summary>' +
-    '<div class="content">' + promptHtml + msgsHtml + '</div>' +
+    '<div class="content">' + promptHtml + msgsHtml + dataHtml + '</div>' +
   '</details>';
 }
 
