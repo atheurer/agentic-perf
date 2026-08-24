@@ -148,7 +148,7 @@ class GeminiLLMProvider(LLMProvider):
                 contents=contents,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
-            return self._parse_response(response, tool_call_names)
+            return self._parse_response(response, tool_call_names, model=self._model)
         try:
             response = await asyncio.wait_for(
                 self._client.aio.models.generate_content(
@@ -160,7 +160,7 @@ class GeminiLLMProvider(LLMProvider):
             )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"gemini/{self._model}") from None
-        return self._parse_response(response, tool_call_names)
+        return self._parse_response(response, tool_call_names, model=self._model)
 
     @staticmethod
     def _convert_messages(
@@ -273,6 +273,7 @@ class GeminiLLMProvider(LLMProvider):
     def _parse_response(
         response: Any,
         tool_call_names: dict[str, str],
+        model: str = "",
     ) -> LLMResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -323,7 +324,7 @@ class GeminiLLMProvider(LLMProvider):
                 "cache_read_input_tokens": getattr(um, "cached_content_token_count", 0)
                 or 0,
                 "cache_creation_input_tokens": 0,
-                "model": "",
+                "model": model,
             }
 
         return LLMResponse(

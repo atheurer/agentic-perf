@@ -46,8 +46,16 @@ class _Candidate:
 
 
 @dataclass
+class _UsageMetadata:
+    prompt_token_count: int = 0
+    candidates_token_count: int = 0
+    cached_content_token_count: int = 0
+
+
+@dataclass
 class _Response:
     candidates: list[_Candidate] | None = None
+    usage_metadata: _UsageMetadata | None = None
 
 
 class TestMessageConversion:
@@ -546,6 +554,49 @@ class TestResponseParsing:
         )
         result = GeminiLLMProvider._parse_response(response, {})
         assert result.tool_calls[0].input == {}
+
+    def test_usage_metadata_parsing(self):
+        response = _Response(
+            candidates=[
+                _Candidate(
+                    content=_Content(
+                        role="model",
+                        parts=[_Part(text="Hello")],
+                    ),
+                )
+            ],
+            usage_metadata=_UsageMetadata(
+                prompt_token_count=100,
+                candidates_token_count=50,
+                cached_content_token_count=20,
+            ),
+        )
+        result = GeminiLLMProvider._parse_response(
+            response, {}, model="gemini-2.5-flash"
+        )
+        assert result.usage is not None
+        assert result.usage["input_tokens"] == 100
+        assert result.usage["output_tokens"] == 50
+        assert result.usage["cache_read_input_tokens"] == 20
+        assert result.usage["cache_creation_input_tokens"] == 0
+        assert result.usage["model"] == "gemini-2.5-flash"
+
+    def test_usage_none_when_metadata_absent(self):
+        response = _Response(
+            candidates=[
+                _Candidate(
+                    content=_Content(
+                        role="model",
+                        parts=[_Part(text="Hello")],
+                    ),
+                )
+            ],
+            usage_metadata=None,
+        )
+        result = GeminiLLMProvider._parse_response(
+            response, {}, model="gemini-2.5-flash"
+        )
+        assert result.usage is None
 
 
 class TestLLMFactory:

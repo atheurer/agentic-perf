@@ -240,6 +240,8 @@ class TestResponseParsing:
         content: str | None = None,
         tool_calls: list | None = None,
         finish_reason: str = "stop",
+        usage: dict | None = None,
+        model: str | None = None,
     ):
         @dataclass
         class _Function:
@@ -264,8 +266,15 @@ class TestResponseParsing:
             finish_reason: str = "stop"
 
         @dataclass
+        class _Usage:
+            prompt_tokens: int = 0
+            completion_tokens: int = 0
+
+        @dataclass
         class _Response:
             choices: list = field(default_factory=list)
+            usage: _Usage | None = None
+            model: str | None = None
 
         tc_objects = None
         if tool_calls:
@@ -277,13 +286,19 @@ class TestResponseParsing:
                 for tc in tool_calls
             ]
 
+        usage_obj = None
+        if usage:
+            usage_obj = _Usage(**usage)
+
         return _Response(
             choices=[
                 _Choice(
                     message=_Message(content=content, tool_calls=tc_objects),
                     finish_reason=finish_reason,
                 )
-            ]
+            ],
+            usage=usage_obj,
+            model=model,
         )
 
     def test_text_response(self):
@@ -353,6 +368,37 @@ class TestResponseParsing:
         )
         result = OpenAICompatLLMProvider._parse_response(response)
         assert result.tool_calls[0].input == {}
+
+    def test_usage_parsing_with_response_model(self):
+        response = self._make_response(
+            content="Hello!",
+            usage={"prompt_tokens": 120, "completion_tokens": 45},
+            model="gpt-4o-2024-05-13",
+        )
+        result = OpenAICompatLLMProvider._parse_response(response, model="gpt-4o")
+        assert result.usage is not None
+        assert result.usage["input_tokens"] == 120
+        assert result.usage["output_tokens"] == 45
+        assert result.usage["cache_read_input_tokens"] == 0
+        assert result.usage["cache_creation_input_tokens"] == 0
+        assert result.usage["model"] == "gpt-4o-2024-05-13"
+
+    def test_usage_parsing_fallback_to_provider_model(self):
+        response = self._make_response(
+            content="Hello!",
+            usage={"prompt_tokens": 80, "completion_tokens": 30},
+            model=None,
+        )
+        result = OpenAICompatLLMProvider._parse_response(response, model="gpt-4o-mini")
+        assert result.usage is not None
+        assert result.usage["input_tokens"] == 80
+        assert result.usage["output_tokens"] == 30
+        assert result.usage["model"] == "gpt-4o-mini"
+
+    def test_usage_none_when_not_provided(self):
+        response = self._make_response(content="Hello!", usage=None)
+        result = OpenAICompatLLMProvider._parse_response(response, model="gpt-4o")
+        assert result.usage is None
 
 
 class TestConfigResolution:
