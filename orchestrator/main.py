@@ -519,6 +519,7 @@ async def run_agent_task(
                     max_iter_override = cf.get("max_iterations_override")
                     if max_iter_override is not None:
                         agent.max_iterations = int(max_iter_override)
+                        agent._max_iterations_is_override = True
                         logger.info(
                             f"Max iterations override for {ticket_id}:"
                             f" {max_iter_override}"
@@ -632,14 +633,22 @@ async def run_agent_task(
                 async with httpx.AsyncClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
+                    # Preserve max_iterations_override when the
+                    # agent paused (awaiting_customer_guidance) so
+                    # re-dispatch after HITL reuses the override.
+                    clear_fields: dict[str, Any] = {"llm_override": None}
+                    r = await client.get(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}",
+                    )
+                    if r.status_code == 200:
+                        post_status = r.json().get("status", "")
+                        if post_status != "awaiting_customer_guidance":
+                            clear_fields["max_iterations_override"] = None
+                    # On failed status read, preserve override (fail safe)
+
                     await client.patch(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={
-                            "fields": {
-                                "llm_override": None,
-                                "max_iterations_override": None,
-                            },
-                        },
+                        json={"fields": clear_fields},
                     )
             except Exception:
                 pass

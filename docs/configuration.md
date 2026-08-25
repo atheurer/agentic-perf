@@ -252,14 +252,19 @@ Individual tickets can override this via
 
 Individual tickets can override the per-agent limit at runtime via
 `custom_fields.max_iterations_override`. This takes precedence over
-both config and built-in defaults:
+both config and built-in defaults. The override is **additive**: it
+grants N new iterations on top of what the agent already consumed in
+prior runs, so setting `max_iterations_override=40` after a 20-iteration
+run gives the agent 40 fresh iterations on re-dispatch.
 
 ```bash
-curl -X PATCH .../api/v1/tickets/PERF-123 \
-  -d '{"custom_fields": {"max_iterations_override": 200}}'
+curl -X PATCH .../api/v1/tickets/PERF-123/fields \
+  -d '{"fields": {"max_iterations_override": 40}}'
 ```
 
-The override is cleared after the agent completes.
+The override is preserved while the ticket is paused
+(`awaiting_customer_guidance`) and cleared after the agent
+completes successfully.
 
 #### Migration Note
 
