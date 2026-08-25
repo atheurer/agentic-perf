@@ -119,6 +119,7 @@ class IntrospectionAgent:
         self._all_events: list[dict[str, Any]] = []
         self._narrative_log: list[str] = []
         self._prev_anomaly_count = 0
+        self._emitted_anomaly_count = 0
         self._prev_status = ""
         self._llm_call_count = 0
         self._stop_requested = False
@@ -225,12 +226,11 @@ class IntrospectionAgent:
 
                 # Emit new high-severity anomalies to the
                 # event stream so they appear in the dashboard.
-                # Update _prev_anomaly_count here (not only in
-                # _maybe_narrate) to prevent re-emission when
-                # LLM narration is disabled or fails.
-                if len(anomalies) > self._prev_anomaly_count:
-                    new_anomalies = anomalies[self._prev_anomaly_count :]
-                    self._prev_anomaly_count = len(anomalies)
+                # Uses a separate counter from _prev_anomaly_count
+                # so LLM narration triggers are not affected.
+                if len(anomalies) > self._emitted_anomaly_count:
+                    new_anomalies = anomalies[self._emitted_anomaly_count :]
+                    self._emitted_anomaly_count = len(anomalies)
                     if self._events:
                         for a in new_anomalies:
                             if a.get("severity") in (
