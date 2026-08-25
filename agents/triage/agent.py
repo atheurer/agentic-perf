@@ -391,6 +391,25 @@ _LOCAL_TOOLS = [
 ]
 
 
+def merge_image_build(
+    user_build: dict[str, Any],
+    triage_build: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge triage image_build with user-provided values.
+
+    User-provided fields take precedence. Customizations are
+    merged deeply so both user and triage customizations are
+    preserved.
+    """
+    merged = {**triage_build, **user_build}
+    if "customizations" in triage_build and "customizations" in user_build:
+        merged["customizations"] = {
+            **triage_build["customizations"],
+            **user_build["customizations"],
+        }
+    return merged
+
+
 class TriageAgent(AgentBase):
     def __init__(
         self,
@@ -738,13 +757,7 @@ class TriageAgent(AgentBase):
         image_build = cf.get("image_build", {})
         triage_build = result.get("image_build", {})
         if triage_build or image_build:
-            merged_build = {**triage_build, **image_build}
-            if "customizations" in triage_build and "customizations" in image_build:
-                merged_build["customizations"] = {
-                    **triage_build["customizations"],
-                    **image_build["customizations"],
-                }
-            fields["image_build"] = merged_build
+            fields["image_build"] = merge_image_build(image_build, triage_build)
             # Prepend build step before resource step
             plan = fields.get("execution_plan", {})
             steps = plan.get("steps", [])

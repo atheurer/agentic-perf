@@ -1319,6 +1319,7 @@ let currentView = 'list';
 let currentTicketId = null;
 let statusFilter = '';
 let pollTimer = null;
+let artifactTimer = null;
 let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
@@ -1945,7 +1946,7 @@ async function renderDetail(ticketId) {
 
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
     // Re-check artifacts periodically (created during ticket run)
-    setInterval(function() { loadArtifacts(ticketId); }, 10000);
+    artifactTimer = setInterval(function() { loadArtifacts(ticketId); }, 10000);
   } catch (err) {
     app.innerHTML =
       '<div class="breadcrumb"><a href="#/">Dashboard</a> / ' + escHtml(ticketId) + '</div>' +
@@ -3088,6 +3089,10 @@ function stopPolling() {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (artifactTimer) {
+    clearInterval(artifactTimer);
+    artifactTimer = null;
   }
   pollPaused = false;
   lastSeq = 0;

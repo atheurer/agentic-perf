@@ -225,23 +225,31 @@ class IntrospectionAgent:
 
                 # Emit new high-severity anomalies to the
                 # event stream so they appear in the dashboard.
-                if self._events and len(anomalies) > self._prev_anomaly_count:
+                # Update _prev_anomaly_count here (not only in
+                # _maybe_narrate) to prevent re-emission when
+                # LLM narration is disabled or fails.
+                if len(anomalies) > self._prev_anomaly_count:
                     new_anomalies = anomalies[self._prev_anomaly_count :]
-                    for a in new_anomalies:
-                        if a.get("severity") in (
-                            "high",
-                            "critical",
-                        ):
-                            self._events.emit(
-                                ticket_id,
-                                "introspection-agent",
-                                "anomaly_detected",
-                                {
-                                    "type": a.get("type", ""),
-                                    "severity": a["severity"],
-                                    "description": a.get("description", ""),
-                                },
-                            )
+                    self._prev_anomaly_count = len(anomalies)
+                    if self._events:
+                        for a in new_anomalies:
+                            if a.get("severity") in (
+                                "high",
+                                "critical",
+                            ):
+                                self._events.emit(
+                                    ticket_id,
+                                    "introspection-agent",
+                                    "anomaly_detected",
+                                    {
+                                        "type": a.get("type", ""),
+                                        "severity": a["severity"],
+                                        "description": a.get(
+                                            "description",
+                                            "",
+                                        ),
+                                    },
+                                )
 
                 if new_events or stale:
                     # Check if LLM narrative is warranted.

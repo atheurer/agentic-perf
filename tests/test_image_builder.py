@@ -54,7 +54,7 @@ def _mock_get(ticket):
     resp.status_code = 200
     # .json() is sync in httpx, so use MagicMock
     resp.json = MagicMock(return_value=ticket)
-    resp.raise_for_status = AsyncMock()
+    resp.raise_for_status = MagicMock()
     return resp
 
 
@@ -62,7 +62,7 @@ def _mock_post():
     """Create a mock POST response."""
     resp = AsyncMock()
     resp.status_code = 200
-    resp.raise_for_status = AsyncMock()
+    resp.raise_for_status = MagicMock()
     return resp
 
 
@@ -190,39 +190,52 @@ class TestAgentErrorHandling:
 
 
 class TestTriageMerge:
-    """Test that user-provided image_build fields take precedence."""
+    """Test merge_image_build — user-provided fields take precedence."""
 
-    async def test_user_target_preserved(self):
+    def test_user_target_preserved(self):
         """User-provided target should not be overwritten by triage."""
+        from agents.triage.agent import merge_image_build
 
-        # The merge logic is in _process_result; test it indirectly
-        # by checking the merge behavior
-        user_build = {"provider": "caib", "target": "ebbr"}
-        triage_build = {"provider": "caib", "target": "rcar_s4"}
-
-        # User fields take precedence
-        merged = {**triage_build, **user_build}
+        merged = merge_image_build(
+            user_build={"provider": "caib", "target": "ebbr"},
+            triage_build={"provider": "caib", "target": "rcar_s4"},
+        )
         assert merged["target"] == "ebbr"
 
-    async def test_customizations_merge_deeply(self):
-        """Customizations should merge, not replace."""
-        user_build = {
-            "customizations": {"masked_services": ["foo.service"]},
-        }
-        triage_build = {
-            "customizations": {"rpms": ["strace"]},
-        }
+    def test_customizations_merge_deeply(self):
+        """Customizations from both sides should be preserved."""
+        from agents.triage.agent import merge_image_build
 
-        # Deep merge
-        merged = {**triage_build, **user_build}
-        if "customizations" in triage_build and "customizations" in user_build:
-            merged["customizations"] = {
-                **triage_build["customizations"],
-                **user_build["customizations"],
-            }
-
+        merged = merge_image_build(
+            user_build={
+                "customizations": {"masked_services": ["foo.service"]},
+            },
+            triage_build={
+                "customizations": {"rpms": ["strace"]},
+            },
+        )
         assert "masked_services" in merged["customizations"]
         assert "rpms" in merged["customizations"]
+
+    def test_user_only(self):
+        """Works when triage provides no image_build."""
+        from agents.triage.agent import merge_image_build
+
+        merged = merge_image_build(
+            user_build={"provider": "caib", "target": "ebbr"},
+            triage_build={},
+        )
+        assert merged["target"] == "ebbr"
+
+    def test_triage_only(self):
+        """Works when user provides no image_build."""
+        from agents.triage.agent import merge_image_build
+
+        merged = merge_image_build(
+            user_build={},
+            triage_build={"provider": "caib", "target": "ebbr"},
+        )
+        assert merged["target"] == "ebbr"
 
 
 # --- Quay token resolution ---

@@ -300,11 +300,11 @@ async def resolve_images(
                                     "flash_targets": [
                                         {
                                             "partition": "default",
-                                            "url": f"oci://{image_url}",
+                                            "url": f"oci://{image_url.removeprefix('oci://')}",
                                         }
                                     ],
                                     "flash_command": (
-                                        f"j storage flash oci://{image_url}"
+                                        f"j storage flash oci://{image_url.removeprefix('oci://')}"
                                     ),
                                     "board_target": board_target,
                                 },
