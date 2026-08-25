@@ -11,6 +11,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,8 @@ async def read_run_results(
       all result/tool files in the run directory. Use this first to
       see what is available, then request specific files.
     - Reading mode (with file_path): returns the contents of one file.
+      file_path can be an absolute path (under /var/lib/crucible/run)
+      or a relative path within the run directory (e.g. 'config/tool-params.json').
       Automatically decompresses .xz files. Use max_bytes to control
       how much data is returned (default 4000 for a preview; call
       again with a larger value if you need more).
@@ -209,23 +212,88 @@ async def read_run_results(
             }
         )
 
-    if not file_path.startswith("/var/lib/crucible/run"):
+    if not file_path.startswith("/"):
+        resolved_path = os.path.normpath(os.path.join(run_dir, file_path))
+        try:
+            if os.path.commonpath([resolved_path, run_dir]) != run_dir:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "run_id": run_id,
+                        "file_path": file_path,
+                        "message": (
+                            f"Access denied. Path '{file_path}' traverses "
+                            f"outside run directory {run_dir}."
+                        ),
+                    }
+                )
+        except ValueError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "run_id": run_id,
+                    "file_path": file_path,
+                    "message": f"Access denied. Invalid path '{file_path}'.",
+                }
+            )
+    else:
+        resolved_path = os.path.normpath(file_path)
+        try:
+            if (
+                os.path.commonpath([resolved_path, "/var/lib/crucible/run"])
+                != "/var/lib/crucible/run"
+            ):
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "run_id": run_id,
+                        "file_path": file_path,
+                        "message": (
+                            "Access denied. Only paths under "
+                            "/var/lib/crucible/run are permitted."
+                        ),
+                    }
+                )
+        except ValueError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "run_id": run_id,
+                    "file_path": file_path,
+                    "message": (
+                        "Access denied. Only paths under "
+                        "/var/lib/crucible/run are permitted."
+                    ),
+                }
+            )
+
+    check_file = await _ssh.run(
+        controller,
+        f"test -f '{resolved_path}'",
+        timeout=10,
+    )
+    if check_file.exit_code != 0:
         return json.dumps(
             {
-                "status": "error",
+                "status": "not_found",
+                "run_id": run_id,
+                "run_dir": run_dir,
+                "file_path": file_path,
+                "resolved_path": resolved_path,
                 "message": (
-                    "Access denied. Only paths under "
-                    "/var/lib/crucible/run are permitted."
+                    f"File '{file_path}' not found in {run_dir}"
+                    if not file_path.startswith("/")
+                    else f"File not found: {resolved_path}"
                 ),
             }
         )
 
     limit_bytes = min(max(max_bytes, 100), 50000)
-    is_xz = file_path.endswith(".xz")
+    is_xz = resolved_path.endswith(".xz")
     if is_xz:
-        cmd = f"xzcat '{file_path}' 2>/dev/null | head -c {limit_bytes}"
+        cmd = f"xzcat '{resolved_path}' 2>/dev/null | head -c {limit_bytes}"
     else:
-        cmd = f"head -c {limit_bytes} '{file_path}'"
+        cmd = f"head -c {limit_bytes} '{resolved_path}'"
 
     read_result = await _ssh.run(controller, cmd, timeout=30)
     if read_result.exit_code != 0:
@@ -234,13 +302,14 @@ async def read_run_results(
                 "status": "error",
                 "run_id": run_id,
                 "file_path": file_path,
-                "message": f"Failed to read {file_path}",
+                "resolved_path": resolved_path,
+                "message": f"Failed to read {resolved_path}",
                 "stderr": (read_result.stderr[:500] if read_result.stderr else ""),
             }
         )
 
     content = read_result.stdout or ""
-    file_size_cmd = f"stat --printf='%s' '{file_path}'"
+    file_size_cmd = f"stat --printf='%s' '{resolved_path}'"
     file_size_result = await _ssh.run(
         controller,
         file_size_cmd,
@@ -256,6 +325,7 @@ async def read_run_results(
             "status": "ok",
             "run_id": run_id,
             "file_path": file_path,
+            "resolved_path": resolved_path,
             "is_compressed": is_xz,
             "bytes_read": len(content),
             "file_size": file_size,
