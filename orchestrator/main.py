@@ -126,6 +126,7 @@ PLAN_AGENT_STATUS = {
     "review": "awaiting_review",
     "analyze": "analyzing",
     "synthesis": "synthesizing_results",
+    "build_image": "building_image",
 }
 
 

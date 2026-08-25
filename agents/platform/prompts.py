@@ -34,6 +34,12 @@ Before calling the tool, review the ticket context:
   identify a recovery action (power cycle, retry with different
   parameters), try it. Otherwise call `submit_platform_result` with
   `platform_ready=false` and include the diagnostics
+- **Unrecoverable errors** — these will NOT succeed on retry. Submit
+  `platform_ready=false` immediately:
+  - "not authorized" / "unauthorized" (registry auth failure)
+  - "denied" / "forbidden" (permission denied)
+  - "not found" (image doesn't exist)
+  - "FLASH_FAILED" after retry (hardware issue)
 
 ## Important
 
