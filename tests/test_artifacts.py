@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import tarfile
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,10 +22,10 @@ class TestCreateArtifactDir:
         assert d.exists()
         assert d == tmp_path / "PERF-123" / "abc123"
 
-    def test_without_ticket_id(self, monkeypatch):
+    def test_without_ticket_id(self, tmp_path, monkeypatch):
         import paths
 
-        monkeypatch.setattr(paths, "ARTIFACT_DIR", Path("/tmp/test-artifacts"))
+        monkeypatch.setattr(paths, "ARTIFACT_DIR", tmp_path)
 
         from paths import create_artifact_dir
 
