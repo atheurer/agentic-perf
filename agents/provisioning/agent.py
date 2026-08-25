@@ -622,19 +622,40 @@ class ProvisioningAgent(AgentBase):
             fields["k3s_installed"] = True
             fields["k3s_version"] = result.get("k3s_version", "unknown")
 
-        # Derive ssh_hardware_ips from hosts_provisioned.
-        # This is the provisioning agent's own output — it
-        # reflects which hosts were actually SSH-provisioned
-        # (often controller-only for multi-host tickets).
+        # Derive ssh_hardware_ips from hosts_provisioned by
+        # projecting onto assigned_hardware_ips role map.  The
+        # resource agent owns the role assignments; provisioning
+        # only narrows to hosts that were actually SSH-provisioned.
         ssh_ips = result.get("ssh_hardware_ips")
         if not ssh_ips and fields.get("hosts_provisioned"):
-            hosts = fields["hosts_provisioned"]
-            first_ip = str(hosts[0]) if hosts else ""
-            if first_ip:
-                ssh_ips = {
-                    "controller": first_ip,
-                    "targets": [first_ip],
-                }
+            try:
+                ticket = await self._get_ticket(ticket_id)
+                assigned = ticket.get("custom_fields", {}).get(
+                    "assigned_hardware_ips", {}
+                )
+            except Exception:
+                assigned = {}
+            hosts = [str(h) for h in fields["hosts_provisioned"]]
+            host_set = set(hosts)
+            if assigned:
+                ssh_ips = {}
+                if assigned.get("controller") in host_set:
+                    ssh_ips["controller"] = assigned["controller"]
+                ssh_ips["targets"] = [
+                    t for t in assigned.get("targets", []) if t in host_set
+                ]
+                if not ssh_ips.get("controller") and not ssh_ips.get("targets"):
+                    ssh_ips = {}
+            else:
+                # No role map available — fall back to first
+                # provisioned host as controller (role-blind
+                # but self-consistent; better than stale data).
+                first_ip = hosts[0] if hosts else ""
+                if first_ip:
+                    ssh_ips = {
+                        "controller": first_ip,
+                        "targets": [first_ip],
+                    }
         if ssh_ips:
             fields["ssh_hardware_ips"] = ssh_ips
 

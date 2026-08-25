@@ -166,6 +166,8 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             "harness_name": cf.get("harness_name", ""),
             "harness_version": cf.get("harness_version", ""),
             "configuration_applied": cf.get("configuration_applied", {}),
+            "ssh_hardware_ips": cf.get("ssh_hardware_ips", {}),
+            "assigned_hardware_ips": cf.get("assigned_hardware_ips", {}),
         }
     elif agent_type == "teardown":
         return {"teardown_complete": True}

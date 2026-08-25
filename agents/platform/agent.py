@@ -162,10 +162,20 @@ class PlatformAgent(AgentBase):
         }
         if hosts:
             fields["hosts_provisioned"] = hosts
-            fields["assigned_hardware_ips"] = {
-                "controller": hosts[0],
-                "targets": hosts,
-            }
+            # Only write assigned_hardware_ips for Jumpstarter
+            # — that provider owns hardware identity. Other
+            # providers already have roles set by the resource
+            # agent (AGENTS.md field-ownership rule).
+            try:
+                ticket = await self._get_ticket(ticket_id)
+                provider = ticket.get("custom_fields", {}).get("resource_provider", "")
+            except Exception:
+                provider = ""
+            if provider == "jumpstarter":
+                fields["assigned_hardware_ips"] = {
+                    "controller": hosts[0],
+                    "targets": [h for h in hosts[1:] if h != hosts[0]],
+                }
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
         if result.get("ssh_key_path"):
