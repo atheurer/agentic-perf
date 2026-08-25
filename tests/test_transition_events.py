@@ -8,6 +8,7 @@ orchestrator) no longer emit their own copies.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -90,9 +91,10 @@ async def test_agent_transition_does_not_emit(
 
 async def test_store_transition_emits_exactly_one_event(
     event_bus: EventBus,
+    tmp_path: Path,
 ) -> None:
     """One store transition → exactly one transition event in the log."""
-    store = TicketStore(event_bus=event_bus)
+    store = TicketStore(event_bus=event_bus, persist_dir=tmp_path)
     ticket = store.create_ticket(
         CreateTicketRequest(summary="Test ticket", description="test"),
     )
@@ -146,9 +148,10 @@ async def test_no_event_without_event_bus() -> None:
 
 async def test_store_no_double_emit_on_consecutive_transitions(
     event_bus: EventBus,
+    tmp_path: Path,
 ) -> None:
     """Three consecutive transitions produce exactly three transition events."""
-    store = TicketStore(event_bus=event_bus)
+    store = TicketStore(event_bus=event_bus, persist_dir=tmp_path)
     ticket = store.create_ticket(
         CreateTicketRequest(summary="Test ticket", description="test"),
     )

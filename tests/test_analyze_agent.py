@@ -37,9 +37,9 @@ def test_gathering_context_can_transition_to_analyzing():
     assert TicketStatus.ANALYZING in allowed
 
 
-def test_store_transition_to_analyzing():
+def test_store_transition_to_analyzing(tmp_path):
     """Ticket can transition from triage_pending to analyzing."""
-    store = TicketStore()
+    store = TicketStore(persist_dir=tmp_path)
     ticket = store.create_ticket(
         CreateTicketRequest(summary="Test analysis", description="test"),
     )
@@ -56,9 +56,9 @@ def test_store_transition_to_analyzing():
     assert ticket.status == TicketStatus.ANALYZING
 
 
-def test_analyzing_to_review_conclusive():
+def test_analyzing_to_review_conclusive(tmp_path):
     """Conclusive analysis transitions to awaiting_review."""
-    store = TicketStore()
+    store = TicketStore(persist_dir=tmp_path)
     ticket = store.create_ticket(
         CreateTicketRequest(summary="Test analysis", description="test"),
     )
@@ -82,9 +82,9 @@ def test_analyzing_to_review_conclusive():
     assert ticket.status == TicketStatus.AWAITING_REVIEW
 
 
-def test_analyzing_to_hardware_inconclusive():
+def test_analyzing_to_hardware_inconclusive(tmp_path):
     """Inconclusive analysis transitions to awaiting_hardware."""
-    store = TicketStore()
+    store = TicketStore(persist_dir=tmp_path)
     ticket = store.create_ticket(
         CreateTicketRequest(summary="Test analysis", description="test"),
     )
