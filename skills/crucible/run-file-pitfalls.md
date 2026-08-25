@@ -210,6 +210,9 @@ script. Any other top-level fields on the tool-params object
 are silently ignored by crucible, so the tool starts with no
 arguments and does nothing.
 
+Use `get_tool_params(tool)` to discover valid parameters, presets,
+and subtools for each tool.
+
 ## mv-params is mandatory
 
 Every benchmark object in the `benchmarks` array MUST include

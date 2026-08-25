@@ -115,6 +115,10 @@ async def _make_crucible_ssh(
     async def _run(host, command, timeout=300):
         if "crucible-valkey" in command:
             return _FakeSSHResult(exit_code=0, stdout="OK")
+        if "crucible-opensearch" in command:
+            return _FakeSSHResult(exit_code=0, stdout="GONE")
+        if "crucible start opensearch" in command:
+            return _FakeSSHResult(exit_code=0, stdout="Successfully started OpenSearch")
         if "result-summary.json" in command:
             if summary_found:
                 return _FakeSSHResult(exit_code=0, stdout=summary_content)
@@ -275,3 +279,36 @@ class TestValidateRunCommand:
         assert not allowed
         allowed, _ = _validate_run_command("crucible", "zathras")
         assert not allowed
+
+
+@pytest.mark.asyncio
+async def test_get_tool_params_found():
+    provider = MockSkillProvider(
+        tool_params={
+            "sysstat": {
+                "presets": {"defaults": {"interval": "3", "subtools": "mpstat,sar"}},
+                "validations": {"interval": {"type": "positive_integer"}},
+            }
+        },
+        tool_metadata={
+            "sysstat": {
+                "description": "Wrapper for sar, mpstat, iostat, pidstat",
+            }
+        },
+    )
+    h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
+    res = await h["get_tool_params"](tool="sysstat", harness="crucible")
+    assert res["found"] is True
+    assert res["tool"] == "sysstat"
+    assert res["harness"] == "crucible"
+    assert res["params"]["presets"]["defaults"]["interval"] == "3"
+    assert res["metadata"]["description"] == "Wrapper for sar, mpstat, iostat, pidstat"
+
+
+@pytest.mark.asyncio
+async def test_get_tool_params_not_found():
+    provider = MockSkillProvider()
+    h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
+    res = await h["get_tool_params"](tool="nonexistent_tool", harness="crucible")
+    assert res["found"] is False
+    assert "No parameter definitions or metadata" in res["message"]

@@ -90,6 +90,9 @@ class MockSkillProvider(SkillProvider):
         private_config: dict[str, dict[str, Any]] | None = None,
         runfile_schema: dict[str, Any] | None = None,
         benchmark_params: dict[str, dict[str, Any]] | None = None,
+        tool_params: dict[str, dict[str, Any]] | None = None,
+        tool_metadata: dict[str, dict[str, Any]] | None = None,
+        tools: list[str] | None = None,
         example_runfiles: dict[str, dict[str, Any]] | None = None,
         validation_result: dict[str, Any] | None = None,
     ) -> None:
@@ -99,6 +102,9 @@ class MockSkillProvider(SkillProvider):
         self._private_config = private_config or {}
         self._runfile_schema = runfile_schema
         self._benchmark_params = benchmark_params or {}
+        self._tool_params = tool_params or {}
+        self._tool_metadata = tool_metadata or {}
+        self._tools = tools or []
         self._example_runfiles = example_runfiles or {}
         self._validation_result = validation_result
 
@@ -127,6 +133,15 @@ class MockSkillProvider(SkillProvider):
 
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         return self._benchmark_params.get(benchmark)
+
+    async def list_tools(self) -> list[str]:
+        return list(self._tools)
+
+    async def get_tool_params(self, tool: str) -> dict[str, Any] | None:
+        return self._tool_params.get(tool)
+
+    async def get_tool_metadata(self, tool: str) -> dict[str, Any] | None:
+        return self._tool_metadata.get(tool)
 
     async def get_example_runfile(
         self, benchmark: str, endpoint_type: str = "remotehosts"
