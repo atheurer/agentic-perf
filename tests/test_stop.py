@@ -265,7 +265,7 @@ class TestAgentStopFlag:
         agent.store_url = "http://localhost:8090"
         agent.max_iterations = 10
         agent.DEFAULT_GLOBAL_MAX_ITERATIONS = 100
-        agent._budget_grace = False
+        agent._wrapup_reason = None
 
         agent._emit = MagicMock()
         agent._transition_ticket = AsyncMock()

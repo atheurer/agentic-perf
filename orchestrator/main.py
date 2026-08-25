@@ -110,6 +110,18 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                 timeout=10.0,
             )
             logger.info("Model check OK: %s", label)
+            try:
+                from providers.cost import get_context_window
+
+                window = get_context_window(model_name)
+                if window == 128000 and not model_name.startswith("gpt-4"):
+                    logger.warning(
+                        "Model %s has no context_window in pricing.yaml"
+                        " — context guard will use fallback (128k)",
+                        model_name,
+                    )
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             logger.error(
                 "Model check TIMED OUT (10s): %s — verify region/endpoint", label

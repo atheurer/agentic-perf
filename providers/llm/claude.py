@@ -84,15 +84,15 @@ class ClaudeLLMProvider(LLMProvider):
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            input_t = getattr(u, "input_tokens", 0) or 0
+            cache_read_t = getattr(u, "cache_read_input_tokens", 0) or 0
+            cache_create_t = getattr(u, "cache_creation_input_tokens", 0) or 0
             usage = {
-                "input_tokens": getattr(u, "input_tokens", 0) or 0,
+                "input_tokens": input_t,
                 "output_tokens": getattr(u, "output_tokens", 0) or 0,
-                "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0)
-                or 0,
-                "cache_creation_input_tokens": getattr(
-                    u, "cache_creation_input_tokens", 0
-                )
-                or 0,
+                "cache_read_input_tokens": cache_read_t,
+                "cache_creation_input_tokens": cache_create_t,
+                "context_tokens": input_t + cache_read_t + cache_create_t,
                 "model": self._model,
             }
 

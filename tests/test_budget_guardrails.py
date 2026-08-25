@@ -395,4 +395,4 @@ class TestBudgetGracefulDegradation:
         # iter 3 (pause again, hard stop)
         # Grace gives one more iteration, so 3-4 total
         assert call_count <= 5
-        assert agent._budget_grace is True
+        assert agent._wrapup_reason == "budget"
