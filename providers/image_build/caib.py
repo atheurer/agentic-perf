@@ -123,9 +123,21 @@ def generate_manifest(
     if masked:
         manifest["content"]["systemd"]["masked_services"] = masked
 
-    kernel = customizations.get("kernel", {})
+    kernel = customizations.get("kernel")
     if kernel:
-        manifest["kernel"] = kernel
+        if isinstance(kernel, str):
+            # Triage may infer a kernel package name as a
+            # string, but AIB expects an object with fields
+            # like {"package": ..., "version": ...}.
+            # Convert common string patterns.
+            manifest["kernel"] = {"package": kernel}
+        elif isinstance(kernel, dict):
+            manifest["kernel"] = kernel
+        else:
+            logger.warning(
+                "[caib] Ignoring invalid kernel field (expected dict, got %s)",
+                type(kernel).__name__,
+            )
 
     return manifest
 

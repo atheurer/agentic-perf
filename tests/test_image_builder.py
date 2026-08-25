@@ -299,3 +299,24 @@ class TestQuayTokenResolution:
 
         token = provider._resolve_quay_token(tmp_path)
         assert token == "robot-token"
+
+
+class TestKernelValidation:
+    def test_kernel_string_converted_to_object(self):
+        manifest = generate_manifest(
+            {"kernel": "kernel-automotive-6.12.0-253.cntvct"},
+        )
+        assert manifest["kernel"] == {
+            "package": "kernel-automotive-6.12.0-253.cntvct",
+        }
+
+    def test_kernel_dict_passed_through(self):
+        manifest = generate_manifest(
+            {"kernel": {"package": "kernel-rt", "version": "6.12"}},
+        )
+        assert manifest["kernel"]["package"] == "kernel-rt"
+        assert manifest["kernel"]["version"] == "6.12"
+
+    def test_kernel_invalid_type_ignored(self):
+        manifest = generate_manifest({"kernel": 42})
+        assert "kernel" not in manifest
