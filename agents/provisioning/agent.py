@@ -410,9 +410,12 @@ class ProvisioningAgent(AgentBase):
             # flash configuration.
             if cf.get("platform_ready") and cf.get("hosts_provisioned"):
                 directives = cf.get("directives", {})
-                system_config = directives.get("system_config", []) or cf.get(
-                    "system_config", []
-                )
+                system_config = directives.get("system_config")
+                # Fall back to custom_fields.system_config when
+                # directives has no system_config, or triage
+                # stored a description string instead of a list.
+                if not isinstance(system_config, list) or not system_config:
+                    system_config = cf.get("system_config", [])
                 if system_config:
                     hosts = cf["hosts_provisioned"]
                     await self._apply_system_config(
