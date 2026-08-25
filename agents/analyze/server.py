@@ -18,6 +18,8 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
+from agents.server_utils import read_skill_document
+
 mcp = FastMCP("analyze-agent")
 
 SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
@@ -35,7 +37,7 @@ def _headers() -> dict[str, str]:
 
 @mcp.tool()
 async def read_skill(category: str, filename: str) -> str:
-    """Read an investigation methodology skill document.
+    """Read an investigation methodology skill document (e.g. category='boot-time', filename='investigation-methodology.md').
 
     Skill docs contain domain-specific knowledge for
     investigating anomalies (e.g., boot-time phase analysis,
@@ -45,22 +47,21 @@ async def read_skill(category: str, filename: str) -> str:
         category: Skill category (e.g., 'boot-time', 'jumpstarter').
         filename: Filename within the skill directory.
     """
-    skill_path = SKILLS_DIR / category / filename
-    if not skill_path.is_file():
+    res = read_skill_document(SKILLS_DIR, category, filename)
+    if not res.get("found"):
         return json.dumps(
             {
                 "found": False,
-                "message": f"Skill not found: {category}/{filename}",
+                "message": res.get(
+                    "message", f"Skill not found: {category}/{filename}"
+                ),
             },
         )
-    resolved = skill_path.resolve()
-    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
-        return json.dumps({"found": False, "message": "Invalid path"})
     return json.dumps(
         {
             "found": True,
-            "filename": filename,
-            "content": skill_path.read_text(),
+            "filename": res["filename"],
+            "content": res["content"],
         },
     )
 

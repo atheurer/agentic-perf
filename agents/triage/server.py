@@ -21,7 +21,7 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_skill_provider
+from agents.server_utils import build_skill_provider, read_skill_document
 
 mcp = FastMCP("triage-agent")
 
@@ -63,7 +63,7 @@ _STANDALONE_BENCHMARKS = [
 
 @mcp.tool()
 async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document for a harness or provider.
+    """Read a skill document for a harness or provider (e.g. harness='jumpstarter', filename='image-selection.md').
 
     Skill docs contain domain-specific knowledge for
     directive resolution (e.g., image selection guidance
@@ -73,16 +73,20 @@ async def read_skill(harness: str, filename: str) -> str:
         harness: Skill category (e.g., 'jumpstarter', 'boot-time').
         filename: Filename within the skill directory.
     """
-    skill_path = SKILLS_DIR / harness / filename
-    if not skill_path.is_file():
+    res = read_skill_document(SKILLS_DIR, harness, filename)
+    if not res.get("found"):
         return json.dumps(
-            {"found": False, "message": f"Skill not found: {harness}/{filename}"},
+            {
+                "found": False,
+                "message": res.get("message", f"Skill not found: {harness}/{filename}"),
+            },
         )
-    resolved = skill_path.resolve()
-    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
-        return json.dumps({"found": False, "message": "Invalid path"})
     return json.dumps(
-        {"found": True, "filename": filename, "content": skill_path.read_text()},
+        {
+            "found": True,
+            "filename": res["filename"],
+            "content": res["content"],
+        },
     )
 
 

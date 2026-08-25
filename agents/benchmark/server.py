@@ -32,6 +32,7 @@ from agents.server_utils import (
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
+    read_skill_document,
     tool_progress,
 )
 
@@ -213,61 +214,27 @@ async def _ensure_init():
 # ---------------------------------------------------------------------------
 
 
+def _read_skill_one(harness: str, filename: str) -> dict:
+    return read_skill_document(SKILLS_DIR, harness, filename)
+
+
 @mcp.tool()
 async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document containing critical lessons learned from prior benchmark runs. These are listed in the 'Skills' section of the ticket context. Read ALL skill docs before constructing a run file — they contain pitfalls that will cause failures."""
+    """Read a skill document containing critical lessons learned from prior benchmark runs (e.g. harness='crucible', filename='run-file-pitfalls.md'). These are listed in the 'Skills' section of the ticket context. Read ALL skill docs before constructing a run file — they contain pitfalls that will cause failures."""
     await _ensure_init()
-    skill_path = SKILLS_DIR / harness / filename
-    if not skill_path.is_file():
-        return json.dumps(
-            {"found": False, "message": f"Skill not found: {harness}/{filename}"}
-        )
-    resolved = skill_path.resolve()
-    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
-        return json.dumps({"found": False, "message": "Invalid path"})
-    return json.dumps(
-        {"found": True, "filename": filename, "content": skill_path.read_text()}
-    )
+    return json.dumps(_read_skill_one(harness, filename))
 
 
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read multiple skill documents in one call. Each entry must have 'harness' and 'filename'. Use this instead of calling read_skill repeatedly — it saves iterations when you need several docs (e.g. host-tuning + uperf-run-file + run-file-pitfalls in one call)."""
+    """Read multiple skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}, {'harness': 'crucible', 'filename': 'uperf-run-file.md'}]). Use this instead of calling read_skill repeatedly — saves iterations when you need several docs at once."""
     await _ensure_init()
     results = []
     for doc in docs:
         harness = doc.get("harness", "")
-        filename = doc.get("filename", "")
-        skill_path = SKILLS_DIR / harness / filename
-        if not skill_path.is_file():
-            results.append(
-                {
-                    "harness": harness,
-                    "filename": filename,
-                    "found": False,
-                    "message": f"Skill not found: {harness}/{filename}",
-                }
-            )
-            continue
-        resolved = skill_path.resolve()
-        if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
-            results.append(
-                {
-                    "harness": harness,
-                    "filename": filename,
-                    "found": False,
-                    "message": "Invalid path",
-                }
-            )
-            continue
-        results.append(
-            {
-                "harness": harness,
-                "filename": filename,
-                "found": True,
-                "content": skill_path.read_text(),
-            }
-        )
+        filename = doc.get("filename", "") or doc.get("name", "")
+        result = _read_skill_one(harness, filename)
+        results.append(result)
     return json.dumps(results)
 
 
@@ -287,10 +254,12 @@ async def list_harness_docs(harness: str) -> str:
 
 @mcp.tool()
 async def read_harness_doc(harness: str, doc_path: str) -> str:
-    """Read a documentation file from a benchmark harness repository. Use this to learn about run-file format, endpoint structure, benchmark parameters, or any other harness-specific details. Call list_harness_docs first to see available files."""
+    """Read a documentation file from a benchmark harness repository (e.g. harness='crucible', doc_path='docs/how-run-files-work.md'). Use this to learn about run-file format, endpoint structure, benchmark parameters, or any other harness-specific details. Call list_harness_docs first to see available files."""
     await _ensure_init()
     if not _repo_cache:
         return json.dumps({"found": False, "message": "No repo cache configured"})
+    if not harness and "/" in doc_path:
+        harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps(

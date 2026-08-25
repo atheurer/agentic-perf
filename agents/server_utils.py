@@ -486,3 +486,91 @@ def build_investigation_provider():
     )
 
     return create_record_provider()
+
+
+def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
+    """Read a skill document from skills_dir, normalizing redundant prefixes in harness and filename.
+
+    Handles:
+    - Stripping leading 'skills/' from filename
+    - Stripping redundant f'{harness}/' from filename
+    - Splitting category/filename when harness is empty and filename contains '/'
+    - Fallback to Path(filename).name if not found directly
+    - Resolving when filename contains another valid harness category
+    """
+    orig_harness = harness or ""
+    orig_filename = filename or ""
+
+    harness = str(harness or "").strip().strip("/")
+    filename = str(filename or "").strip().strip("/")
+
+    if filename.startswith("skills/"):
+        filename = filename[len("skills/") :].lstrip("/")
+
+    if harness and filename.startswith(f"{harness}/"):
+        filename = filename[len(f"{harness}/") :].lstrip("/")
+
+    if not harness and "/" in filename:
+        parts = filename.split("/", 1)
+        harness = parts[0]
+        filename = parts[1]
+
+    skill_path = skills_dir / harness / filename
+    if not skill_path.is_file():
+        # Fallback 1: if filename contains directory parts that failed, try base name under harness
+        name_only = Path(filename).name
+        if name_only and (skills_dir / harness / name_only).is_file():
+            skill_path = skills_dir / harness / name_only
+            filename = name_only
+        elif "/" in filename:
+            # Fallback 2: check if filename itself matches cat/file relative to skills_dir
+            cat, fn = filename.split("/", 1)
+            cat = cat.strip("/")
+            fn = fn.strip("/")
+            if (skills_dir / cat / fn).is_file():
+                harness = cat
+                filename = fn
+                skill_path = skills_dir / harness / filename
+            elif (skills_dir / cat / Path(fn).name).is_file():
+                harness = cat
+                filename = Path(fn).name
+                skill_path = skills_dir / harness / filename
+
+    if not skill_path.is_file():
+        display_harness = harness or orig_harness
+        display_filename = filename or orig_filename
+        msg_path = (
+            f"{display_harness}/{display_filename}"
+            if display_harness
+            else display_filename
+        )
+        return {
+            "found": False,
+            "harness": display_harness,
+            "filename": display_filename,
+            "message": f"Skill not found: {msg_path}",
+        }
+
+    try:
+        resolved = skill_path.resolve()
+        if not str(resolved).startswith(str(skills_dir.resolve())):
+            return {
+                "found": False,
+                "harness": harness,
+                "filename": filename,
+                "message": "Invalid path",
+            }
+    except (OSError, ValueError):
+        return {
+            "found": False,
+            "harness": harness,
+            "filename": filename,
+            "message": "Invalid path",
+        }
+
+    return {
+        "found": True,
+        "harness": harness,
+        "filename": filename,
+        "content": skill_path.read_text(),
+    }
