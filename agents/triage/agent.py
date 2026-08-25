@@ -754,8 +754,20 @@ class TriageAgent(AgentBase):
         # a build_image step to the execution plan.
         # Merge triage image_build with user-provided values;
         # user-provided fields take precedence.
+        # Do NOT add image_build if the user didn't request one
+        # and system_config is present — system_config means
+        # post-flash configuration, not a custom build.
         image_build = cf.get("image_build", {})
         triage_build = result.get("image_build", {})
+        if triage_build and not image_build:
+            # Triage inferred a build the user didn't request.
+            # Block if system_config is present.
+            if cf.get("system_config"):
+                logger.info(
+                    "[triage] Ignoring triage-inferred "
+                    "image_build — system_config present"
+                )
+                triage_build = {}
         if triage_build or image_build:
             fields["image_build"] = merge_image_build(image_build, triage_build)
             # Prepend build step before resource step

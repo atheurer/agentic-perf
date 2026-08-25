@@ -184,6 +184,13 @@ Set `image_build.customizations` with the changes needed:
 The build step runs BEFORE hardware acquisition to avoid holding
 a device lease during the build (~10-30 minutes).
 
+**Do NOT set `image_build` when `system_config` is present in the
+ticket.** `system_config` means the user wants post-flash
+configuration (e.g., installing RPMs from a lab server after
+flashing the standard nightly image). These are different
+approaches — do not combine them unless the user explicitly
+requests both.
+
 ## Execution Plans
 
 EVERY ticket gets an execution_plan that covers the full lifecycle.
