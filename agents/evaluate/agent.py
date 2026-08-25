@@ -96,7 +96,7 @@ class EvaluateAgent(AgentBase):
         # the LLM. If a hard gate fires, the outcome is
         # included as context but also enforced in code
         # in _handle_completion via _deterministic_outcome.
-        self._deterministic_outcome = self._check_deterministic(cf)
+        self._deterministic_outcome = self._check_deterministic(cf, ticket)
         if self._deterministic_outcome:
             content += (
                 f"**⚠️ Deterministic convergence check: "
@@ -197,6 +197,7 @@ class EvaluateAgent(AgentBase):
     def _check_deterministic(
         self,
         custom_fields: dict[str, Any],
+        ticket: dict[str, Any] | None = None,
     ) -> str:
         """Run deterministic convergence checks.
 
@@ -228,7 +229,7 @@ class EvaluateAgent(AgentBase):
         # Budget exhaustion: if the previous agent was
         # paused due to budget, treat as a resource
         # exhaustion convergence signal.
-        comments = custom_fields.get("comments", [])
+        comments = (ticket or {}).get("comments") or []
         if any(
             "budget exhausted" in str(c).lower()
             for c in (
