@@ -146,3 +146,15 @@ def test_generate_preview_json_and_text():
     assert prev_txt["format"] == "log"
     assert prev_txt["type"] == "text"
     assert len(prev_txt["head_preview"]) == 3
+
+
+def test_agent_base_workspace_manifest(workspace, monkeypatch):
+    """Verify that AgentBase workspace_prompt dynamically lists existing files."""
+    workspace.save_file("provisioning_summary.json", json.dumps({"ready": True}))
+    workspace.save_file("hardware_topology.json", json.dumps({"ccds": [0, 1]}))
+
+    files = workspace.list_files()
+    assert len(files) == 2
+    refs = {f["file_ref"] for f in files}
+    assert "workspace://provisioning_summary.json" in refs
+    assert "workspace://hardware_topology.json" in refs

@@ -278,6 +278,26 @@ class AgentBase(ABC):
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
             "to slice and return the exact data in a single turn without multi-step querying."
         )
+        try:
+            from providers.workspace.manager import WorkspaceManager
+
+            ws_mgr = WorkspaceManager(ticket_id=ticket_id)
+            ws_files = ws_mgr.list_files()
+            if ws_files:
+                file_lines = []
+                for f in ws_files:
+                    f_ref = f.get("file_ref", f.get("filename", ""))
+                    size = f.get("size_bytes", 0)
+                    fmt = f.get("format", "raw")
+                    file_lines.append(f"  - `{f_ref}` ({size} bytes, format: {fmt})")
+                workspace_prompt += (
+                    "\n\n## Available Workspace Files from Prior Steps\n"
+                    "The following files are already present in this ticket's workspace. "
+                    "Use `jq_query` (for JSON) or `read_file_slice` / `grep_file` (for text) to inspect them directly:\n"
+                    + "\n".join(file_lines)
+                )
+        except Exception as e:
+            logger.debug(f"Failed to list workspace files for initial prompt: {e}")
         if "## Scratchpad Workspace" not in system_prompt:
             system_prompt = f"{system_prompt}{workspace_prompt}"
         if cf.get("remember_previous") and cf.get("previous_messages"):

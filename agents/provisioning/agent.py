@@ -678,6 +678,29 @@ class ProvisioningAgent(AgentBase):
 
         await self._update_fields(ticket_id, fields)
 
+        try:
+            from providers.workspace.manager import WorkspaceManager
+
+            ws_mgr = WorkspaceManager(ticket_id=ticket_id)
+            summary_payload = {
+                "provisioning_complete": prov_complete,
+                "hosts_provisioned": fields.get("hosts_provisioned", []),
+                "harness_name": harness,
+                "harness_version": fields.get("harness_version", "unknown"),
+                "configuration_applied": fields.get("configuration_applied", {}),
+                "ssh_hardware_ips": fields.get("ssh_hardware_ips", {}),
+                "notes": result.get("notes", ""),
+            }
+            ws_mgr.save_file(
+                "provisioning_summary.json",
+                json.dumps(summary_payload, indent=2),
+                overwrite=True,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[provisioning] Failed to save workspace provisioning summary: {e}"
+            )
+
         hosts = [
             str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))
             for h in fields["hosts_provisioned"]

@@ -113,41 +113,6 @@ class TestGetSysctlValues:
 
 
 # ---------------------------------------------------------------------------
-# query_numa_topology
-# ---------------------------------------------------------------------------
-
-
-class TestQueryNumaTopology:
-    @pytest.mark.asyncio
-    async def test_success(self, patch_ssh):
-        patch_ssh._results["numa_node"] = SSHResult(exit_code=0, stdout="1\n")
-        patch_ssh._results["cpulist"] = SSHResult(
-            exit_code=0,
-            stdout=(
-                "/sys/devices/system/node/node0/cpulist: 0-383\n"
-                "/sys/devices/system/node/node1/cpulist: 384-767\n"
-            ),
-        )
-        result = await srv.query_numa_topology("10.0.0.1", "eno16695np0")
-        data = json.loads(result)
-        assert data["nic_numa_node"] == "1"
-        assert "node0" in data["node_cpu_lists"]
-        assert data["iface"] == "eno16695np0"
-
-    @pytest.mark.asyncio
-    async def test_nic_node_failure(self, patch_ssh):
-        patch_ssh._results["numa_node"] = SSHResult(
-            exit_code=1,
-            stdout="",
-            stderr="No such file or directory",
-        )
-        result = await srv.query_numa_topology("10.0.0.1", "eth99")
-        data = json.loads(result)
-        assert "error" in data
-        assert "NIC NUMA node" in data["error"]
-
-
-# ---------------------------------------------------------------------------
 # list_interfaces
 # ---------------------------------------------------------------------------
 

@@ -225,7 +225,7 @@ SSH command executor. Each tool has a fixed, validated code path:
 
 - `get_ethtool_info` — NIC offload features or stats (ethtool)
 - `get_sysctl_values` — kernel parameters (validated key format)
-- `query_numa_topology` — NIC NUMA node and per-node CPU lists
+- `get_hardware_topology` — comprehensive hardware layout (NUMA, CCDs, SMT thread siblings, NIC locality)
 - `get_cache_topology` — CPU cache / CCD domains and per-CCD CPU lists
 - `list_interfaces` — UP interfaces with IP addresses
 - `verify_ssh_path` — SSH reachability between hosts

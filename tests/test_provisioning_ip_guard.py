@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import paths
 from agents.provisioning.agent import ProvisioningAgent
 
 
@@ -580,3 +581,49 @@ class TestPlatformIPScoping:
 
             fields = mock_fields.call_args[0][1]
             assert "assigned_hardware_ips" not in fields
+
+    @pytest.mark.asyncio
+    async def test_provisioning_summary_saved_to_workspace(self, tmp_path, monkeypatch):
+        """Verify that _handle_completion saves provisioning_summary.json to workspace."""
+        monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+        agent = _make_agent()
+
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+                "configuration_applied": {
+                    "10.0.0.1": ["tuned nic", "pinned irqs"],
+                },
+            }
+        )
+
+        with (
+            patch.object(agent, "_update_fields", new_callable=AsyncMock),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(agent, "_transition_ticket", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.1",
+                            "targets": ["10.0.0.2"],
+                        }
+                    }
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST-PROV", response)
+
+        from providers.workspace.manager import WorkspaceManager
+
+        mgr = WorkspaceManager(ticket_id="PERF-TEST-PROV")
+        assert mgr.resolve_path("workspace://provisioning_summary.json").exists()
+        files = mgr.list_files()
+        assert len(files) == 1
+        assert files[0]["filename"] == "provisioning_summary.json"
