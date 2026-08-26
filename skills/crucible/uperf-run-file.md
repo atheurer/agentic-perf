@@ -69,8 +69,10 @@ For multiple pairs, pair 2 uses 30004/30005, pair 3 uses
 
 When the user specifies non-management NICs, you need to
 discover what's available on the hosts. Call
-`list_interfaces(host)` on each of the client and server hosts
-to get all UP interfaces with their IP addresses. Look for:
+`get_hardware_topology(host)` (or `list_interfaces(host)`) on each of the
+client and server hosts. `get_hardware_topology` returns all network interfaces
+in `netdevs` with their operstate, driver, link speed, MAC, NUMA node, PCI address,
+and assigned IP addresses in a single call. Look for:
 - Interfaces with IPs on a shared private subnet (e.g.,
   10.10.x.x on both hosts) — these are likely the test
   network
@@ -86,11 +88,8 @@ the access IP, but don't default to that: check what's already
 in `assigned_hardware_ips` for the endpoint `host` field before
 reaching for whatever you just discovered here.
 
-You can also identify NIC types:
-```
-ethtool -i <interface> | grep driver
-ethtool <interface> | grep Speed
-```
+You can also pass `jq_filter` directly in `get_hardware_topology` to slice
+active interfaces (e.g., `jq_filter=".netdevs | to_entries[] | select(.value.operstate == \"up\")"`).
 
 ### Choosing remotehost vs ifname
 
