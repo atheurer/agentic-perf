@@ -32,6 +32,7 @@ _HEAVY_FIELDS = {
     "host_inventory",
     "parsed_specs",
     "chart_data",
+    "chart_ref",
     "retrospective",
     "scoped_context",
     "hypothesis",

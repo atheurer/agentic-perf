@@ -99,4 +99,65 @@ WORKSPACE_TOOLS = [
             "properties": {},
         },
     ),
+    ToolDefinition(
+        name="generate_chart_from_workspace",
+        description="Extract and generate a declarative Chart.js/Recharts performance chart from a workspace JSON or CSV file without needing to output raw numbers or code. Automatically saves chart specification to workspace://charts/<output_name>.json and returns chart summary.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "file_ref": {
+                    "type": "string",
+                    "description": "workspace:// URI or relative filename (e.g. 'workspace://cdm_metric_1.json')",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Chart title (e.g. 'Server CPU Busy % by Core' or 'Throughput vs Thread Count')",
+                },
+                "chart_type": {
+                    "type": "string",
+                    "enum": ["bar", "line", "doughnut"],
+                    "description": "Chart type (default 'bar')",
+                    "default": "bar",
+                },
+                "harness": {
+                    "type": "string",
+                    "description": "Optional benchmark harness name ('crucible', 'kube-burner', 'k8s-netperf', etc.) for harness-specific parsing",
+                },
+                "output_name": {
+                    "type": "string",
+                    "description": "Optional output JSON filename under workspace://charts/ (e.g. 'cpu_busy')",
+                },
+                "x_field": {
+                    "type": "string",
+                    "description": "Field name for X-axis labels (e.g. 'cpu', 'threads', 'time')",
+                },
+                "y_field": {
+                    "type": "string",
+                    "description": "Field name for Y-axis numeric values (e.g. 'busy_pct', 'gbps', 'iops')",
+                },
+                "group_by": {
+                    "type": "string",
+                    "description": "Field name to group multiple series by (e.g. 'host', 'queue')",
+                },
+                "metric": {
+                    "type": "string",
+                    "description": "Metric name for CDM/Crucible data (e.g. 'mpstat::Busy-CPU' or 'uperf::Gbps')",
+                },
+                "unit": {
+                    "type": "string",
+                    "description": "Metric unit (e.g. 'Gbps', '%', 'IOPS', 'ms')",
+                },
+                "max_points": {
+                    "type": "integer",
+                    "description": "Maximum data points to plot for line charts (default 60)",
+                    "default": 60,
+                },
+                "jq_filter": {
+                    "type": "string",
+                    "description": "Optional in-flight jq expression to filter file content before charting",
+                },
+            },
+            "required": ["file_ref"],
+        },
+    ),
 ]

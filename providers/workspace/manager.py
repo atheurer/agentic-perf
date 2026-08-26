@@ -390,3 +390,96 @@ class WorkspaceManager:
             "total_lines_approx": len(raw_bytes.split(b"\n")),
             "head_preview": lines[:3],
         }
+
+    def generate_chart(
+        self,
+        file_ref: str,
+        title: str = "Performance Metric Chart",
+        chart_type: str = "bar",
+        harness: str | None = None,
+        output_name: str | None = None,
+        x_field: str | None = None,
+        y_field: str | None = None,
+        group_by: str | None = None,
+        metric: str | None = None,
+        breakout: str | None = None,
+        unit: str | None = None,
+        max_points: int = 60,
+        jq_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate a declarative Chart.js/Recharts specification from a workspace file and save it to workspace://charts/.
+
+        Returns a dictionary containing the chart spec, file_ref, and preview metadata.
+        """
+        path = self.resolve_path(file_ref)
+        if not path.exists():
+            return {
+                "status": "error",
+                "error": f"File '{file_ref}' does not exist in workspace",
+            }
+
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+        data: Any = None
+        if path.suffix.lower() == ".json":
+            try:
+                if jq_filter and shutil.which("jq"):
+                    proc = subprocess.run(
+                        ["jq", "-c", jq_filter],
+                        input=raw_text.encode("utf-8"),
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    if proc.returncode == 0:
+                        data = json.loads(proc.stdout.decode("utf-8"))
+                    else:
+                        data = json.loads(raw_text)
+                else:
+                    data = json.loads(raw_text)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to parse JSON for chart generation from {file_ref}: {e}"
+                )
+                data = raw_text
+        elif path.suffix.lower() == ".csv":
+            data = raw_text
+        else:
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                data = raw_text
+
+        from providers.workspace.charts import get_chart_registry
+
+        registry = get_chart_registry()
+        spec = registry.generate_chart_spec(
+            data,
+            harness=harness,
+            title=title,
+            chart_type=chart_type,
+            x_field=x_field,
+            y_field=y_field,
+            group_by=group_by,
+            metric=metric,
+            breakout=breakout,
+            unit=unit,
+            max_points=max_points,
+            source_file=file_ref,
+        )
+
+        if not output_name:
+            safe_title = re.sub(r"[^a-zA-Z0-9_]+", "_", title.lower()).strip("_")
+            output_name = f"charts/{safe_title or 'chart'}.json"
+        elif not output_name.endswith(".json"):
+            output_name = f"{output_name}.json"
+        if not output_name.startswith("charts/"):
+            output_name = f"charts/{output_name}"
+
+        spec_dict = spec.to_dict()
+        chart_ref, _ = self.save_file(output_name, json.dumps(spec_dict, indent=2))
+
+        return {
+            "status": "ok",
+            "chart_ref": chart_ref,
+            "chart_data": spec_dict,
+            "summary": f"Generated {spec.type} chart '{spec.title}' with {len(spec.labels)} labels and {len(spec.datasets)} datasets.",
+        }
