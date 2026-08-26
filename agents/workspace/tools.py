@@ -5,7 +5,7 @@ from providers.llm.base import ToolDefinition
 WORKSPACE_TOOLS = [
     ToolDefinition(
         name="jq_query",
-        description="Execute a jq filter expression on a structured JSON workspace file to extract keys, arrays, or compute aggregated values.",
+        description="Execute a jq filter expression on a structured JSON workspace file to extract keys, arrays, or compute aggregated values. For large arrays, use slice ranges (e.g. '.values[0:50]', next chunk: '.values[50:100]') to paginate.",
         input_schema={
             "type": "object",
             "properties": {
@@ -15,7 +15,7 @@ WORKSPACE_TOOLS = [
                 },
                 "filter": {
                     "type": "string",
-                    "description": "jq expression (e.g. '.uperf_100.values' or '.[] | {name, status}')",
+                    "description": "jq expression (e.g. '.uperf_100.values[0:50]' or '.[] | {name, status}')",
                 },
                 "limit": {
                     "type": "integer",
@@ -61,7 +61,7 @@ WORKSPACE_TOOLS = [
     ),
     ToolDefinition(
         name="read_file_slice",
-        description="Read a slice or chunk of a workspace file by lines or bytes.",
+        description="Read a slice or chunk of a workspace file by lines or bytes. Returns 'next_start_line' and 'next_offset_bytes' to easily fetch the next chunk without re-reading previous data.",
         input_schema={
             "type": "object",
             "properties": {
@@ -71,7 +71,7 @@ WORKSPACE_TOOLS = [
                 },
                 "offset_bytes": {
                     "type": "integer",
-                    "description": "Byte offset to start reading from (default 0)",
+                    "description": "Byte offset to start reading from. Set to previous result's 'next_offset_bytes' for the next chunk.",
                     "default": 0,
                 },
                 "max_bytes": {
@@ -81,7 +81,7 @@ WORKSPACE_TOOLS = [
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Optional 1-based line number to start reading from",
+                    "description": "Optional 1-based line number to start reading from. Set to previous result's 'next_start_line' for the next chunk.",
                 },
                 "max_lines": {
                     "type": "integer",

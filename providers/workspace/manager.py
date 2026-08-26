@@ -311,6 +311,7 @@ class WorkspaceManager:
                 "lines_returned": len(slice_lines),
                 "total_lines": total_lines,
                 "eof": end_idx >= total_lines,
+                "next_start_line": end_idx + 1 if end_idx < total_lines else None,
             }
 
         # Byte-oriented reading
@@ -319,6 +320,7 @@ class WorkspaceManager:
             data = f.read(max_bytes)
 
         text = data.decode("utf-8", errors="replace")
+        next_offset = offset_bytes + len(data)
         return {
             "status": "ok",
             "file_ref": file_ref,
@@ -326,7 +328,8 @@ class WorkspaceManager:
             "offset_bytes": offset_bytes,
             "bytes_returned": len(data),
             "total_bytes": total_bytes,
-            "eof": (offset_bytes + len(data)) >= total_bytes,
+            "eof": next_offset >= total_bytes,
+            "next_offset_bytes": next_offset if next_offset < total_bytes else None,
         }
 
     @staticmethod
