@@ -12,6 +12,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 import json
 import logging
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -178,7 +179,9 @@ async def read_run_results(
                 }
             )
 
-        size_cmd = "stat --printf='%s %n\\n' " + " ".join(f"'{p}'" for p in raw_paths)
+        size_cmd = "stat --printf='%s %n\\n' " + " ".join(
+            shlex.quote(p) for p in raw_paths
+        )
         size_result = await _ssh.run(controller, size_cmd, timeout=20)
         files = []
         if size_result.exit_code == 0 and size_result.stdout.strip():
@@ -267,9 +270,10 @@ async def read_run_results(
                 }
             )
 
+    qpath = shlex.quote(resolved_path)
     check_file = await _ssh.run(
         controller,
-        f"test -f '{resolved_path}'",
+        f"test -f {qpath}",
         timeout=10,
     )
     if check_file.exit_code != 0:
@@ -291,9 +295,9 @@ async def read_run_results(
     limit_bytes = min(max(max_bytes, 100), 50000)
     is_xz = resolved_path.endswith(".xz")
     if is_xz:
-        cmd = f"xzcat '{resolved_path}' 2>/dev/null | head -c {limit_bytes}"
+        cmd = f"xzcat {qpath} 2>/dev/null | head -c {limit_bytes}"
     else:
-        cmd = f"head -c {limit_bytes} '{resolved_path}'"
+        cmd = f"head -c {limit_bytes} {qpath}"
 
     read_result = await _ssh.run(controller, cmd, timeout=30)
     if read_result.exit_code != 0:
@@ -309,7 +313,7 @@ async def read_run_results(
         )
 
     content = read_result.stdout or ""
-    file_size_cmd = f"stat --printf='%s' '{resolved_path}'"
+    file_size_cmd = f"stat --printf='%s' {qpath}"
     file_size_result = await _ssh.run(
         controller,
         file_size_cmd,

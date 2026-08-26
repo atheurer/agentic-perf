@@ -60,15 +60,15 @@ async def test_read_run_results_relative_path_success(patch_review_server):
             exit_code=0,
             stdout="/var/lib/crucible/run/uperf-run-123\n",
         ),
-        "test -f '/var/lib/crucible/run/uperf-run-123/config/tool-params.json'": SSHResult(
+        "test -f /var/lib/crucible/run/uperf-run-123/config/tool-params.json": SSHResult(
             exit_code=0,
             stdout="",
         ),
-        "head -c 4000 '/var/lib/crucible/run/uperf-run-123/config/tool-params.json'": SSHResult(
+        "head -c 4000 /var/lib/crucible/run/uperf-run-123/config/tool-params.json": SSHResult(
             exit_code=0,
             stdout='{"sample": 1}',
         ),
-        "stat --printf='%s' '/var/lib/crucible/run/uperf-run-123/config/tool-params.json'": SSHResult(
+        "stat --printf='%s' /var/lib/crucible/run/uperf-run-123/config/tool-params.json": SSHResult(
             exit_code=0,
             stdout="13\n",
         ),
@@ -100,15 +100,15 @@ async def test_read_run_results_relative_path_compressed(patch_review_server):
             exit_code=0,
             stdout="/var/lib/crucible/run/uperf-run-123\n",
         ),
-        "test -f '/var/lib/crucible/run/uperf-run-123/turbostat.txt.xz'": SSHResult(
+        "test -f /var/lib/crucible/run/uperf-run-123/turbostat.txt.xz": SSHResult(
             exit_code=0,
             stdout="",
         ),
-        "xzcat '/var/lib/crucible/run/uperf-run-123/turbostat.txt.xz'": SSHResult(
+        "xzcat /var/lib/crucible/run/uperf-run-123/turbostat.txt.xz 2>/dev/null | head -c 4000": SSHResult(
             exit_code=0,
             stdout="CPU stats output line",
         ),
-        "stat --printf='%s' '/var/lib/crucible/run/uperf-run-123/turbostat.txt.xz'": SSHResult(
+        "stat --printf='%s' /var/lib/crucible/run/uperf-run-123/turbostat.txt.xz": SSHResult(
             exit_code=0,
             stdout="250\n",
         ),
@@ -135,15 +135,15 @@ async def test_read_run_results_absolute_path_success(patch_review_server):
             exit_code=0,
             stdout="/var/lib/crucible/run/uperf-run-123\n",
         ),
-        "test -f '/var/lib/crucible/run/uperf-run-123/result.json'": SSHResult(
+        "test -f /var/lib/crucible/run/uperf-run-123/result.json": SSHResult(
             exit_code=0,
             stdout="",
         ),
-        "head -c 4000 '/var/lib/crucible/run/uperf-run-123/result.json'": SSHResult(
+        "head -c 4000 /var/lib/crucible/run/uperf-run-123/result.json": SSHResult(
             exit_code=0,
             stdout='{"result": "pass"}',
         ),
-        "stat --printf='%s' '/var/lib/crucible/run/uperf-run-123/result.json'": SSHResult(
+        "stat --printf='%s' /var/lib/crucible/run/uperf-run-123/result.json": SSHResult(
             exit_code=0,
             stdout="18\n",
         ),
@@ -210,7 +210,7 @@ async def test_read_run_results_relative_file_not_found(patch_review_server):
             exit_code=0,
             stdout="/var/lib/crucible/run/uperf-run-123\n",
         ),
-        "test -f '/var/lib/crucible/run/uperf-run-123/config/nonexistent.json'": SSHResult(
+        "test -f /var/lib/crucible/run/uperf-run-123/config/nonexistent.json": SSHResult(
             exit_code=1,
             stdout="",
             stderr="",
@@ -241,7 +241,7 @@ async def test_read_run_results_absolute_file_not_found(patch_review_server):
             exit_code=0,
             stdout="/var/lib/crucible/run/uperf-run-123\n",
         ),
-        "test -f '/var/lib/crucible/run/uperf-run-123/nonexistent.json'": SSHResult(
+        "test -f /var/lib/crucible/run/uperf-run-123/nonexistent.json": SSHResult(
             exit_code=1,
             stdout="",
             stderr="",
@@ -279,3 +279,34 @@ async def test_read_run_results_run_dir_not_found(patch_review_server):
     data = json.loads(raw)
     assert data["status"] == "not_found"
     assert "No run directory found" in data["message"]
+
+
+@pytest.mark.asyncio
+async def test_read_run_results_path_with_single_quote_quoted(patch_review_server):
+    patch_review_server._results = {
+        "ls -d /var/lib/crucible/run/*run-123*": SSHResult(
+            exit_code=0,
+            stdout="/var/lib/crucible/run/uperf-run-123\n",
+        ),
+        "test -f '/var/lib/crucible/run/uperf-run-123/file'\"'\"'name.json'": SSHResult(
+            exit_code=0,
+            stdout="",
+        ),
+        "head -c 4000 '/var/lib/crucible/run/uperf-run-123/file'\"'\"'name.json'": SSHResult(
+            exit_code=0,
+            stdout='{"safe": true}',
+        ),
+        "stat --printf='%s' '/var/lib/crucible/run/uperf-run-123/file'\"'\"'name.json'": SSHResult(
+            exit_code=0,
+            stdout="15\n",
+        ),
+    }
+
+    raw = await review_server.read_run_results(
+        controller="10.0.0.1",
+        run_id="run-123",
+        file_path="file'name.json",
+    )
+    data = json.loads(raw)
+    assert data["status"] == "ok"
+    assert data["content"] == '{"safe": true}'
