@@ -140,8 +140,8 @@ Call submit_review_result with:
   findings from all HITL rounds, not just the last one
 - Key metrics with values and assessments
 - Recommendations for follow-up actions or tuning changes
-- chart_data with a visualization of the most informative finding:
-  - **bar** — comparing values across categories
+- **Chart Visualization**: To save tokens and avoid generating raw arrays or HTML/JS, use `generate_chart_from_workspace(file_ref="workspace://...", ...)` to extract and save a declarative chart specification, then pass `chart_ref="workspace://charts/<output_name>.json"`. Alternatively, pass `chart_data` directly:
+  - **bar** — comparing values across categories / CPU breakout
   - **line** — trends over time or swept parameter
   - **doughnut** — proportions (CPU breakdown, time distribution)
 - results_url if a harness-specific viewer is available

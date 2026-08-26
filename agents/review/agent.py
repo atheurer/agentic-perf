@@ -95,6 +95,14 @@ _LOCAL_TOOLS = [
                     },
                     "required": ["title", "type", "labels", "datasets"],
                 },
+                "chart_ref": {
+                    "type": "string",
+                    "description": (
+                        "Optional workspace file reference to a chart specification generated via "
+                        "generate_chart_from_workspace (e.g. 'workspace://charts/cpu_busy.json'). "
+                        "When provided, chart data is automatically loaded from the workspace file."
+                    ),
+                },
                 "results_url": {
                     "type": "string",
                     "description": (
@@ -478,7 +486,23 @@ class ReviewAgent(AgentBase):
             "follow_up_needed": result.get("follow_up_needed", False),
             "review_submitted": True,
         }
-        if result.get("chart_data"):
+        if result.get("chart_ref"):
+            chart_ref = result["chart_ref"]
+            fields["chart_ref"] = chart_ref
+            try:
+                from providers.workspace.manager import WorkspaceManager
+
+                mgr = WorkspaceManager(ticket_id=ticket_id)
+                chart_path = mgr.resolve_path(chart_ref)
+                if chart_path.exists():
+                    fields["chart_data"] = json.loads(
+                        chart_path.read_text(encoding="utf-8")
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.agent_name}] Failed to load chart from {chart_ref}: {e}"
+                )
+        elif result.get("chart_data"):
             fields["chart_data"] = result["chart_data"]
         if result.get("results_url"):
             fields["results_url"] = result["results_url"]

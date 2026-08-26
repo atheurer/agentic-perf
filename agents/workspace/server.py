@@ -122,5 +122,56 @@ async def list_workspace_files() -> str:
     return json.dumps({"status": "ok", "files": files, "count": len(files)}, indent=2)
 
 
+@mcp.tool()
+async def generate_chart_from_workspace(
+    file_ref: str,
+    title: str = "Performance Metric Chart",
+    chart_type: str = "bar",
+    harness: str | None = None,
+    output_name: str | None = None,
+    x_field: str | None = None,
+    y_field: str | None = None,
+    group_by: str | None = None,
+    metric: str | None = None,
+    breakout: str | None = None,
+    unit: str | None = None,
+    max_points: int = 60,
+    jq_filter: str | None = None,
+) -> str:
+    """Extract and generate a declarative Chart.js/Recharts performance chart from a workspace JSON/CSV file.
+
+    Args:
+        file_ref: workspace:// URI or relative filename (e.g. 'workspace://cdm_metric_1.json')
+        title: chart title (e.g. 'Server CPU Busy % by Core')
+        chart_type: chart type ('bar', 'line', 'doughnut')
+        harness: optional benchmark harness name ('crucible', 'kube-burner', etc.)
+        output_name: optional output JSON filename under workspace://charts/
+        x_field: field name for X-axis labels (e.g. 'cpu', 'threads', 'time')
+        y_field: field name for Y-axis numeric values (e.g. 'busy_pct', 'gbps', 'iops')
+        group_by: field name to group multiple series by (e.g. 'host', 'queue')
+        metric: metric name for CDM/Crucible data (e.g. 'mpstat::Busy-CPU')
+        unit: metric unit (e.g. 'Gbps', '%', 'IOPS', 'ms')
+        max_points: maximum data points to plot for line charts (default 60)
+        jq_filter: optional in-flight jq expression to filter file content before charting
+    """
+    manager = _get_manager()
+    res = manager.generate_chart(
+        file_ref=file_ref,
+        title=title,
+        chart_type=chart_type,
+        harness=harness,
+        output_name=output_name,
+        x_field=x_field,
+        y_field=y_field,
+        group_by=group_by,
+        metric=metric,
+        breakout=breakout,
+        unit=unit,
+        max_points=max_points,
+        jq_filter=jq_filter,
+    )
+    return json.dumps(res, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()
