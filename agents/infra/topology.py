@@ -615,7 +615,9 @@ def parse_topology_data(
         thread_siblings: dict[str, list[int]] = {}
         thread_siblings_list: dict[str, str] = {}
         for cpu_id, cpu_info in sorted(cpus_dict.items()):
-            s_list = cpu_info.get("thread_siblings_list") or cpu_info.get("core_cpus_list")
+            s_list = cpu_info.get("thread_siblings_list") or cpu_info.get(
+                "core_cpus_list"
+            )
             if s_list is not None:
                 s_str = str(s_list).strip()
                 thread_siblings_list[str(cpu_id)] = s_str

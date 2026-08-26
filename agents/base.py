@@ -1178,7 +1178,9 @@ class AgentBase(ABC):
             "request_human_input",
             "present_runfile_for_approval",
         }
-        if (tool_name in exempt_tools or tool_name.startswith("submit_")) and not jq_filter:
+        if (
+            tool_name in exempt_tools or tool_name.startswith("submit_")
+        ) and not jq_filter:
             return content
 
         try:
@@ -1298,7 +1300,9 @@ class AgentBase(ABC):
         call_input = dict(tool_call.input) if tool_call.input else {}
         jq_filter = None
         if tool_call.name != "jq_query":
-            jq_filter = call_input.pop("jq_filter", None) or call_input.pop("jq_query", None)
+            jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
+                "jq_query", None
+            )
             if jq_filter is not None:
                 jq_filter = str(jq_filter).strip() or None
 
@@ -1314,7 +1318,9 @@ class AgentBase(ABC):
                     content = result
                 else:
                     content = json.dumps(result, default=str)
-                content = self._spill_tool_output(tool_call.name, content, jq_filter=jq_filter)
+                content = self._spill_tool_output(
+                    tool_call.name, content, jq_filter=jq_filter
+                )
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise
@@ -1333,7 +1339,9 @@ class AgentBase(ABC):
                 except Exception:
                     content = await self._mcp.call_tool(tool_call.name, tool_call.input)
 
-                content = self._spill_tool_output(tool_call.name, content, jq_filter=jq_filter)
+                content = self._spill_tool_output(
+                    tool_call.name, content, jq_filter=jq_filter
+                )
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise

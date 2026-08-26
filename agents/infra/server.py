@@ -230,7 +230,11 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
     """Parse ethtool output (either native JSON or text format) into structured dict."""
     try:
         parsed = json.loads(stdout)
-        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+        if (
+            isinstance(parsed, list)
+            and len(parsed) == 1
+            and isinstance(parsed[0], dict)
+        ):
             return parsed[0]
         return parsed
     except Exception:
@@ -239,7 +243,11 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
     for line in stdout.splitlines():
         line = line.strip()
-        if not line or line.startswith("NIC statistics:") or line.startswith("Features for"):
+        if (
+            not line
+            or line.startswith("NIC statistics:")
+            or line.startswith("Features for")
+        ):
             continue
         if ":" in line:
             key, val = line.split(":", 1)

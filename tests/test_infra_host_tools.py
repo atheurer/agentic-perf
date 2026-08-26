@@ -444,5 +444,3 @@ class TestGetHardwareTopology:
         assert data["nic"]["iface"] == "eth0"
         assert data["nic"]["numa_node_int"] == 0
         assert data["nic"]["pci_address"] == "0000:c1:00.0"
-
-

@@ -148,7 +148,12 @@ async def test_in_flight_jq_filter_returns_data_in_same_turn(agent):
     # Large 50KB payload containing detailed objects
     large_data = {
         "domains": [
-            {"ccd_id": i, "cpus": [i * 2, i * 2 + 1], "numa_node": i % 2, "extra": "x" * 500}
+            {
+                "ccd_id": i,
+                "cpus": [i * 2, i * 2 + 1],
+                "numa_node": i % 2,
+                "extra": "x" * 500,
+            }
             for i in range(50)
         ]
     }
@@ -192,4 +197,3 @@ async def test_in_flight_jq_filter_invalid_query_returns_error_descriptor(agent)
     assert parsed["status"] == "filter_error"
     assert parsed["file_ref"].startswith("workspace://get_items_")
     assert "error" in parsed
-
