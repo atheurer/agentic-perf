@@ -34,18 +34,33 @@ class TestGetEthtoolInfo:
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "rx-checksumming" in data["stdout"]
+        assert data["data"]["rx-checksumming"]["active"] is True
         assert any("ethtool -k" in c["command"] for c in patch_ssh.calls)
 
     @pytest.mark.asyncio
-    async def test_stats_mode(self, patch_ssh):
+    async def test_native_json_mode(self, patch_ssh):
+        patch_ssh._results["ethtool --json -S"] = SSHResult(
+            exit_code=0,
+            stdout=json.dumps([{"rx_packets": 100000, "tx_packets": 200000}]),
+        )
+        result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="stats")
+        data = json.loads(result)
+        assert data["exit_code"] == 0
+        assert data["data"]["rx_packets"] == 100000
+        assert data["data"]["tx_packets"] == 200000
+
+    @pytest.mark.asyncio
+    async def test_stats_mode_fallback_parsing(self, patch_ssh):
         patch_ssh._results["ethtool -S"] = SSHResult(
             exit_code=0,
-            stdout="rx_packets: 12345\ngro_packets: 678\n",
+            stdout="NIC statistics:\n     rx_packets: 12345\n     gro_packets: 678\n",
         )
         result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="stats")
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "gro_packets" in data["stdout"]
+        assert data["data"]["rx_packets"] == 12345
+        assert data["data"]["gro_packets"] == 678
         assert any("ethtool -S" in c["command"] for c in patch_ssh.calls)
 
     @pytest.mark.asyncio
