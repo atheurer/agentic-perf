@@ -1,0 +1,1 @@
+"""Workspace MCP server package."""
