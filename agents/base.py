@@ -84,6 +84,9 @@ class AgentBase(ABC):
     # backoff (min 15s, doubling each attempt, capped at 5m).
     LLM_RATE_LIMIT_RETRIES = 5
 
+    # Class-level default for mock spec compatibility
+    _max_iterations_is_override = False
+
     def __init__(
         self,
         agent_name: str,
@@ -114,6 +117,7 @@ class AgentBase(ABC):
             else self.DEFAULT_MAX_ITERATIONS
         )
         self._stop_requested = False
+        self._max_iterations_is_override = False
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -199,6 +203,7 @@ class AgentBase(ABC):
                 "initial_messages": messages,
             },
         )
+        configured_max = self.max_iterations
         try:
             try:
                 previous_agent_iterations, previous_global_iterations = (
@@ -207,6 +212,20 @@ class AgentBase(ABC):
             except Exception:
                 previous_agent_iterations, previous_global_iterations = 0, 0
             iteration = previous_agent_iterations
+
+            # Override is additive: grant N new iterations on
+            # top of what was already consumed in prior runs.
+            if (
+                self._max_iterations_is_override
+                and previous_agent_iterations > 0
+                and configured_max > 0
+            ):
+                self.max_iterations = configured_max + previous_agent_iterations
+                logger.info(
+                    f"[{self.agent_name}] Additive override:"
+                    f" {configured_max} new iterations"
+                    f" (effective limit {self.max_iterations})"
+                )
 
             if self.max_iterations > 0:
                 remaining_agent = max(
@@ -849,6 +868,9 @@ class AgentBase(ABC):
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
             raise
+        finally:
+            self.max_iterations = configured_max
+            self._max_iterations_is_override = False
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
