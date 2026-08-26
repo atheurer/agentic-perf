@@ -147,6 +147,55 @@ class MultiHarnessSkillProvider(SkillProvider):
 
         return None
 
+    async def list_tools(self, harness: str | None = None) -> list[str]:
+        harness_name = harness or self._default
+        provider = self._harnesses.get(harness_name)
+        if provider:
+            return await provider.list_tools()
+        return []
+
+    async def get_tool_params(
+        self, tool: str, harness: str | None = None
+    ) -> dict[str, Any] | None:
+        if harness:
+            provider = self._harnesses.get(harness)
+            return await provider.get_tool_params(tool) if provider else None
+
+        if self._default in self._harnesses:
+            res = await self._harnesses[self._default].get_tool_params(tool)
+            if res is not None:
+                return res
+
+        for harness_name, provider in self._harnesses.items():
+            if harness_name == self._default:
+                continue
+            res = await provider.get_tool_params(tool)
+            if res is not None:
+                return res
+
+        return None
+
+    async def get_tool_metadata(
+        self, tool: str, harness: str | None = None
+    ) -> dict[str, Any] | None:
+        if harness:
+            provider = self._harnesses.get(harness)
+            return await provider.get_tool_metadata(tool) if provider else None
+
+        if self._default in self._harnesses:
+            res = await self._harnesses[self._default].get_tool_metadata(tool)
+            if res is not None:
+                return res
+
+        for harness_name, provider in self._harnesses.items():
+            if harness_name == self._default:
+                continue
+            res = await provider.get_tool_metadata(tool)
+            if res is not None:
+                return res
+
+        return None
+
     async def get_example_runfile(
         self, benchmark: str, harness: str | None = None
     ) -> dict[str, Any] | None:

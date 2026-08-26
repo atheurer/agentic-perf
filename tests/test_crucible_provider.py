@@ -105,6 +105,47 @@ async def test_get_benchmark_params_nonexistent():
 
 
 @pytest.mark.asyncio
+async def test_get_tool_params_nonexistent():
+    provider = CrucibleSkillProvider("/nonexistent")
+    params = await provider.get_tool_params("sysstat")
+    assert params is None
+
+
+@pytest.mark.asyncio
+async def test_get_tool_metadata_nonexistent():
+    provider = CrucibleSkillProvider("/nonexistent")
+    meta = await provider.get_tool_metadata("sysstat")
+    assert meta is None
+
+
+@pytest.mark.asyncio
+async def test_list_tools_nonexistent():
+    provider = CrucibleSkillProvider("/nonexistent")
+    tools = await provider.list_tools()
+    assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_tool_params_and_metadata_discovery(tmp_path):
+    tools_dir = tmp_path / "subprojects" / "tools" / "sysstat"
+    tools_dir.mkdir(parents=True)
+    multiplex_json = tools_dir / "multiplex.json"
+    multiplex_json.write_text('{"presets": {"defaults": {"interval": "3"}}}')
+    metadata_json = tools_dir / "tool-metadata.json"
+    metadata_json.write_text('{"description": "sysstat profiler"}')
+
+    provider = CrucibleSkillProvider(tmp_path)
+    tools = await provider.list_tools()
+    assert "sysstat" in tools
+
+    params = await provider.get_tool_params("sysstat")
+    assert params == {"presets": {"defaults": {"interval": "3"}}}
+
+    meta = await provider.get_tool_metadata("sysstat")
+    assert meta == {"description": "sysstat profiler"}
+
+
+@pytest.mark.asyncio
 async def test_get_example_runfile_missing():
     provider = CrucibleSkillProvider("/nonexistent")
     example = await provider.get_example_runfile("fio")

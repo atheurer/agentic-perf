@@ -32,6 +32,7 @@ class CrucibleSkillProvider(SkillProvider):
     def __init__(self, crucible_home: str | Path) -> None:
         self._home = Path(crucible_home)
         self._benchmarks_dir = self._home / "subprojects" / "benchmarks"
+        self._tools_dir = self._home / "subprojects" / "tools"
         self._examples_dir = (
             self._home / "subprojects" / "docs" / "examples" / "runfile"
         )
@@ -45,9 +46,59 @@ class CrucibleSkillProvider(SkillProvider):
             if d.is_dir() or d.is_symlink()
         ]
 
-    def _load_benchmark_meta(self, name: str) -> dict[str, Any]:
-        bench_dir = self._benchmarks_dir / name
+    def _discover_tools(self) -> list[str]:
+        if not self._tools_dir.exists():
+            return []
+        return [
+            d.name
+            for d in sorted(self._tools_dir.iterdir())
+            if d.is_dir() or d.is_symlink()
+        ]
+
+    def _load_tool_meta(self, name: str) -> dict[str, Any]:
         meta: dict[str, Any] = {"name": name}
+        if not name or not self._tools_dir.exists():
+            return meta
+        tool_dir = (self._tools_dir / name).resolve()
+        try:
+            if not tool_dir.is_relative_to(self._tools_dir.resolve()):
+                return meta
+        except (ValueError, AttributeError):
+            return meta
+
+        multiplex = tool_dir / "multiplex.json"
+        if multiplex.exists():
+            try:
+                meta["multiplex"] = json.loads(multiplex.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        tool_meta = tool_dir / "tool-metadata.json"
+        if tool_meta.exists():
+            try:
+                meta["metadata"] = json.loads(tool_meta.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        rickshaw = tool_dir / "rickshaw.json"
+        if rickshaw.exists():
+            try:
+                meta["rickshaw"] = json.loads(rickshaw.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return meta
+
+    def _load_benchmark_meta(self, name: str) -> dict[str, Any]:
+        meta: dict[str, Any] = {"name": name}
+        if not name or not self._benchmarks_dir.exists():
+            return meta
+        bench_dir = (self._benchmarks_dir / name).resolve()
+        try:
+            if not bench_dir.is_relative_to(self._benchmarks_dir.resolve()):
+                return meta
+        except (ValueError, AttributeError):
+            return meta
 
         multiplex = bench_dir / "multiplex.json"
         if multiplex.exists():
@@ -325,6 +376,17 @@ class CrucibleSkillProvider(SkillProvider):
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         meta = self._load_benchmark_meta(benchmark)
         return meta.get("multiplex")
+
+    async def list_tools(self) -> list[str]:
+        return self._discover_tools()
+
+    async def get_tool_params(self, tool: str) -> dict[str, Any] | None:
+        meta = self._load_tool_meta(tool)
+        return meta.get("multiplex")
+
+    async def get_tool_metadata(self, tool: str) -> dict[str, Any] | None:
+        meta = self._load_tool_meta(tool)
+        return meta.get("metadata")
 
     async def get_example_runfile(
         self, benchmark: str, endpoint_type: str = "remotehosts"

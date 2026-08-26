@@ -338,3 +338,32 @@ async def test_private_config_delegation():
     )
     result = await multi.get_private_config("crucible", "execution")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_tool_params_delegation():
+    crucible = MockSkillProvider(
+        tools=["sysstat", "procstat"],
+        tool_params={"sysstat": {"presets": {"defaults": {"interval": "3"}}}},
+        tool_metadata={"sysstat": {"description": "sysstat profiler"}},
+    )
+    multi = MultiHarnessSkillProvider(
+        harnesses={"crucible": crucible},
+        default_harness="crucible",
+    )
+    tools = await multi.list_tools()
+    assert tools == ["sysstat", "procstat"]
+
+    params = await multi.get_tool_params("sysstat")
+    assert params == {"presets": {"defaults": {"interval": "3"}}}
+
+    meta = await multi.get_tool_metadata("sysstat")
+    assert meta == {"description": "sysstat profiler"}
+
+    # Test explicit harness parameter
+    params_explicit = await multi.get_tool_params("sysstat", harness="crucible")
+    assert params_explicit == {"presets": {"defaults": {"interval": "3"}}}
+
+    # Test unknown harness
+    assert await multi.get_tool_params("sysstat", harness="unknown") is None
+    assert await multi.list_tools(harness="unknown") == []

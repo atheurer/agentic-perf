@@ -434,6 +434,47 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
 
 
 @mcp.tool()
+async def get_tool_params(tool: str, harness: str = "crucible") -> str:
+    """Get parameter definitions (multiplex.json) and metadata for a performance profiling tool (e.g. 'sysstat', 'procstat', 'ethtool', 'forkstat'). Returns presets (default arguments) and validations (regex patterns for allowed argument values) along with tool description and CDM metric info. Use this to construct valid 'tool-params' entries in the run-file."""
+    await _ensure_init()
+    harness_name = harness or "crucible"
+    if hasattr(_skill_provider, "get_provider"):
+        provider = _skill_provider.get_provider(harness_name)
+        params = await provider.get_tool_params(tool) if provider else None
+        metadata = (
+            await provider.get_tool_metadata(tool)
+            if provider and hasattr(provider, "get_tool_metadata")
+            else None
+        )
+    else:
+        params = await _skill_provider.get_tool_params(tool)
+        metadata = (
+            await _skill_provider.get_tool_metadata(tool)
+            if hasattr(_skill_provider, "get_tool_metadata")
+            else None
+        )
+
+    if params is None and metadata is None:
+        return json.dumps(
+            {
+                "found": False,
+                "message": f"No parameter definitions or metadata for tool '{tool}' in '{harness_name}'",
+            }
+        )
+
+    response: dict[str, Any] = {
+        "found": True,
+        "tool": tool,
+        "harness": harness_name,
+    }
+    if params is not None:
+        response["params"] = params
+    if metadata is not None:
+        response["metadata"] = metadata
+    return json.dumps(response)
+
+
+@mcp.tool()
 async def get_example_runfile(
     benchmark: str, harness: str = "crucible", endpoint_type: str = "remotehosts"
 ) -> str:

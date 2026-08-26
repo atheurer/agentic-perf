@@ -92,17 +92,21 @@ to construct a correct run file — getting the format right is critical.
 
    b. Call `get_benchmark_params(benchmark)` to see valid parameters and presets.
 
-   c. Call `get_example_runfile(benchmark, endpoint_type=...)` for a structural
+   c. Call `get_tool_params(tool)` for profiling tools configured under
+      `tool-params` (e.g., `sysstat`, `procstat`, `ethtool`, `forkstat`) to discover
+      valid parameters, defaults, and allowed values.
+
+   d. Call `get_example_runfile(benchmark, endpoint_type=...)` for a structural
       reference that shows the correct nesting of fields.
 
-   d. Read the harness's run-file documentation for format details.
+   e. Read the harness's run-file documentation for format details.
 
-   e. **Choosing IPs for the run-file:** Use IPs, never hostnames (IPv6
+   f. **Choosing IPs for the run-file:** Use IPs, never hostnames (IPv6
       link-local causes timeouts). If both `ssh_hardware_ips` and
       `assigned_hardware_ips` are present, use `assigned_hardware_ips` for
       run-file entries and benchmark parameters like `remotehost`.
 
-   f. **Check directives for `test_interfaces`** — if the user requested specific
+   g. **Check directives for `test_interfaces`** — if the user requested specific
       NICs or a non-management network, you MUST discover the actual interface
       names and IPs on the hosts before constructing the run-file. Read the
       benchmark's skill doc for guidance on network discovery and how to use
@@ -166,6 +170,9 @@ to construct a correct run file — getting the format right is critical.
 - `osruntime: podman` needs `host-mounts` for DPDK workloads (e.g., /dev/hugepages)
 - Every benchmark object MUST include `mv-params` — it is required by the schema.
   Use `get_benchmark_params` to see available parameters and presets.
+- Tools in `tool-params` use `params: [{"arg": ..., "val": ...}]`. Do NOT invent
+  custom top-level keys inside tool objects (e.g., `subtool: "turbostat"` is wrong).
+  Use `get_tool_params(tool)` to discover valid parameters, presets, and subtools.
 - `num-samples` belongs in `run-params` (top level), NOT inside a benchmark object.
   The benchmark schema has `additionalProperties: false` — only `name`, `ids`, and
   `mv-params` are allowed inside each benchmark entry. Always call `get_runfile_schema`
