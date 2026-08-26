@@ -60,39 +60,49 @@ def _load_pricing() -> dict[str, Any]:
         return {}
 
 
-def _match_model(model: str, pricing: dict[str, Any]) -> dict[str, float]:
-    """Find pricing for a model, with prefix matching.
+def _match_model_entry(model: str, pricing: dict[str, Any]) -> dict[str, Any]:
+    """Find the pricing entry for a model, with prefix matching.
 
     Model names from APIs often include version suffixes
     (e.g., claude-sonnet-4-6, gpt-4o-2024-05-13). We match
     by checking if a pricing key is a prefix of the model.
 
-    Returns input, output, cache_read, and cache_write rates.
-    Cache rates fall back to the input rate when not specified.
+    Returns the raw entry dict (rates + context_window).
     """
     models = pricing.get("models", {})
 
-    def _rates(entry: dict[str, Any]) -> dict[str, float]:
-        input_rate = entry.get("input_per_token", 0)
-        return {
-            "input": input_rate,
-            "output": entry.get("output_per_token", 0),
-            "cache_read": entry.get("cache_read_per_token", input_rate),
-            "cache_write": entry.get("cache_write_per_token", input_rate),
-        }
-
     # Exact match
     if model in models:
-        return _rates(models[model])
+        return models[model]
 
-    # Prefix match
-    for key, entry in models.items():
+    # Prefix match — longest prefix first so "gpt-5.4-mini"
+    # matches before "gpt-5.4" for "gpt-5.4-mini-2026-08-01".
+    for key, entry in sorted(
+        models.items(),
+        key=lambda x: len(x[0]),
+        reverse=True,
+    ):
         if model.startswith(key):
-            return _rates(entry)
+            return entry
 
     # Fallback
-    fallback = pricing.get("fallback", {})
-    return _rates(fallback)
+    return pricing.get("fallback", {})
+
+
+def _match_model(model: str, pricing: dict[str, Any]) -> dict[str, float]:
+    """Find pricing rates for a model.
+
+    Returns input, output, cache_read, and cache_write rates.
+    Cache rates fall back to the input rate when not specified.
+    """
+    entry = _match_model_entry(model, pricing)
+    input_rate = entry.get("input_per_token", 0)
+    return {
+        "input": input_rate,
+        "output": entry.get("output_per_token", 0),
+        "cache_read": entry.get("cache_read_per_token", input_rate),
+        "cache_write": entry.get("cache_write_per_token", input_rate),
+    }
 
 
 def estimate_cost(
@@ -146,6 +156,32 @@ def estimate_cumulative_cost(
         cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0)),
         cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0)),
     )
+
+
+def get_context_window(model: str) -> int:
+    """Return the context window size (tokens) for a model.
+
+    Looks up context_window in pricing.yaml per-model entries
+    first, then falls back to the fallback entry. User pricing
+    files that lack context_window fall back per-key (not
+    per-file) to the bundled default.
+    """
+    pricing = _load_pricing()
+    entry = _match_model_entry(model, pricing)
+    window = entry.get("context_window")
+    if window is not None:
+        return int(window)
+    # User pricing file may lack context_window — fall back
+    # to bundled entry for this model.
+    try:
+        bundled = yaml.safe_load(_BUNDLED_PRICING.read_text(encoding="utf-8"))
+        bundled_entry = _match_model_entry(model, bundled)
+        window = bundled_entry.get("context_window")
+        if window is not None:
+            return int(window)
+    except Exception:
+        pass
+    return 128000
 
 
 def reload_pricing() -> None:

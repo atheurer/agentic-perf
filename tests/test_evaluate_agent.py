@@ -181,6 +181,107 @@ class TestDeterministicCheck:
         )
         assert agent._check_deterministic({}) == ""
 
+    def test_budget_exhausted_from_ticket_comment(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "comments": [
+                {
+                    "author": "benchmark-agent",
+                    "body": "Budget exhausted after 3 iterations",
+                },
+            ],
+        }
+        outcome = agent._check_deterministic({}, ticket=ticket)
+        assert "BUDGET_EXHAUSTED" in outcome
+
+    def test_budget_exhausted_from_benchmark_status(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {"benchmark_status": "budget exhausted"}
+        outcome = agent._check_deterministic(cf, ticket=None)
+        assert "BUDGET_EXHAUSTED" in outcome
+
+    def test_budget_exhausted_from_system_comment(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "comments": [
+                {
+                    "author": "system",
+                    "body": "Budget Exhausted — token limit reached",
+                },
+            ],
+        }
+        outcome = agent._check_deterministic({}, ticket=ticket)
+        assert "BUDGET_EXHAUSTED" in outcome
+
+    def test_unrelated_comments_return_empty(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "comments": [
+                {"author": "user", "body": "Looking good so far"},
+                {"author": "benchmark-agent", "body": "Run completed"},
+            ],
+        }
+        outcome = agent._check_deterministic({}, ticket=ticket)
+        assert outcome == ""
+
+    def test_no_ticket_no_comments_returns_empty(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        outcome = agent._check_deterministic({}, ticket=None)
+        assert outcome == ""
+
+    def test_build_messages_sets_deterministic_outcome(self):
+        """Integration: _build_messages propagates ticket to _check_deterministic."""
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        ticket = {
+            "summary": "budget test",
+            "custom_fields": {"hypothesis": "test"},
+            "comments": [
+                {
+                    "author": "benchmark-agent",
+                    "body": "Budget exhausted after 3 iterations",
+                },
+            ],
+        }
+        msgs = agent._build_messages(ticket)
+        assert "BUDGET_EXHAUSTED" in agent._deterministic_outcome
+        assert "BUDGET_EXHAUSTED" in msgs[0]["content"]
+
 
 # --- Handle completion ---
 

@@ -24,6 +24,7 @@
 fallback:
   input_per_token: 0.000003    # $3.00 / 1M tokens
   output_per_token: 0.000015   # $15.00 / 1M tokens
+  context_window: 128000
 
 models:
   # --- Anthropic ---
@@ -34,126 +35,147 @@ models:
     cache_read_per_token: 0.000001  # $1.00 / 1M tokens
     cache_write_per_token: 0.0000125 # $12.50 / 1M tokens
     output_per_token: 0.00005       # $50.00 / 1M tokens
+    context_window: 200000
 
   claude-mythos-5:
     input_per_token: 0.00001        # $10.00 / 1M tokens
     cache_read_per_token: 0.000001  # $1.00 / 1M tokens
     cache_write_per_token: 0.0000125 # $12.50 / 1M tokens
     output_per_token: 0.00005       # $50.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-5:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4-8:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4.8:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4-7:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4.7:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4-6:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4.6:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4-5:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4.5:
     input_per_token: 0.000005       # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
     cache_write_per_token: 0.00000625 # $6.25 / 1M tokens
     output_per_token: 0.000025      # $25.00 / 1M tokens
+    context_window: 200000
 
   claude-opus-4:
     input_per_token: 0.000015       # $15.00 / 1M tokens (legacy 4.0 / 4.1)
     cache_read_per_token: 0.0000015  # $1.50 / 1M tokens (90% off)
     cache_write_per_token: 0.00001875  # $18.75 / 1M tokens (1.25x)
     output_per_token: 0.000075      # $75.00 / 1M tokens
+    context_window: 200000
 
   claude-sonnet-5:
     input_per_token: 0.000002       # $2.00 / 1M tokens
     cache_read_per_token: 0.0000002 # $0.20 / 1M tokens
     cache_write_per_token: 0.0000025 # $2.50 / 1M tokens
     output_per_token: 0.00001       # $10.00 / 1M tokens
+    context_window: 200000
 
   claude-sonnet-4:
     input_per_token: 0.000003       # $3.00 / 1M tokens
     cache_read_per_token: 0.0000003  # $0.30 / 1M tokens (90% off)
     cache_write_per_token: 0.00000375  # $3.75 / 1M tokens (1.25x)
     output_per_token: 0.000015      # $15.00 / 1M tokens
+    context_window: 200000
 
   claude-haiku-4:
     input_per_token: 0.000001       # $1.00 / 1M tokens
     cache_read_per_token: 0.0000001  # $0.10 / 1M tokens (90% off)
     cache_write_per_token: 0.00000125  # $1.25 / 1M tokens (1.25x)
     output_per_token: 0.000005      # $5.00 / 1M tokens
+    context_window: 200000
 
   claude-3-7-sonnet:
     input_per_token: 0.000003       # $3.00 / 1M tokens
     cache_read_per_token: 0.0000003 # $0.30 / 1M tokens (90% off)
     cache_write_per_token: 0.00000375 # $3.75 / 1M tokens (1.25x)
     output_per_token: 0.000015      # $15.00 / 1M tokens
+    context_window: 200000
 
   claude-3-5-sonnet:
     input_per_token: 0.000003       # $3.00 / 1M tokens
     cache_read_per_token: 0.0000003 # $0.30 / 1M tokens (90% off)
     cache_write_per_token: 0.00000375 # $3.75 / 1M tokens (1.25x)
     output_per_token: 0.000015      # $15.00 / 1M tokens
+    context_window: 200000
 
   claude-3-5-haiku:
     input_per_token: 0.0000008      # $0.80 / 1M tokens
     cache_read_per_token: 0.00000008 # $0.08 / 1M tokens (90% off)
     cache_write_per_token: 0.000001 # $1.00 / 1M tokens (1.25x)
     output_per_token: 0.000004      # $4.00 / 1M tokens
+    context_window: 200000
 
   claude-3-opus:
     input_per_token: 0.000015       # $15.00 / 1M tokens
     cache_read_per_token: 0.0000015 # $1.50 / 1M tokens (90% off)
     cache_write_per_token: 0.00001875 # $18.75 / 1M tokens (1.25x)
     output_per_token: 0.000075      # $75.00 / 1M tokens
+    context_window: 200000
 
   claude-haiku-3-5:
     input_per_token: 0.0000008      # $0.80 / 1M tokens
     cache_read_per_token: 0.00000008  # $0.08 / 1M tokens (90% off)
     cache_write_per_token: 0.000001  # $1.00 / 1M tokens (1.25x)
     output_per_token: 0.000004      # $4.00 / 1M tokens
+    context_window: 200000
 
   claude-haiku-3.5:
     input_per_token: 0.0000008      # $0.80 / 1M tokens
     cache_read_per_token: 0.00000008  # $0.08 / 1M tokens (90% off)
     cache_write_per_token: 0.000001  # $1.00 / 1M tokens (1.25x)
     output_per_token: 0.000004      # $4.00 / 1M tokens
+    context_window: 200000
 
   # --- OpenAI ---
   # Source: https://developers.openai.com/api/docs/pricing
@@ -163,91 +185,109 @@ models:
     cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
     cache_write_per_token: 0.000005   # $5.00 / 1M tokens
     output_per_token: 0.00002         # $20.00 / 1M tokens
+    context_window: 1048576
 
   gpt-5.6-terra:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     cache_write_per_token: 0.0000025  # $2.50 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
+    context_window: 1048576
 
   gpt-5.6-luna:
     input_per_token: 0.0000002        # $0.20 / 1M tokens
     cache_read_per_token: 0.00000002  # $0.02 / 1M tokens
     cache_write_per_token: 0.00000025 # $0.25 / 1M tokens
     output_per_token: 0.0000012       # $1.20 / 1M tokens
+    context_window: 1048576
 
   gpt-5.5:
     input_per_token: 0.000005         # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.00003         # $30.00 / 1M tokens
+    context_window: 256000
 
   gpt-5.4:
     input_per_token: 0.0000025        # $2.50 / 1M tokens
     cache_read_per_token: 0.00000025  # $0.25 / 1M tokens
     output_per_token: 0.000015        # $15.00 / 1M tokens
+    context_window: 256000
 
   gpt-5.4-mini:
     input_per_token: 0.00000075       # $0.75 / 1M tokens
     cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
     output_per_token: 0.0000045       # $4.50 / 1M tokens
+    context_window: 1048576
 
   gpt-5:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
     cache_read_per_token: 0.000000125 # $0.125 / 1M tokens
     output_per_token: 0.00001         # $10.00 / 1M tokens
+    context_window: 128000
 
   gpt-5-mini:
     input_per_token: 0.00000025       # $0.25 / 1M tokens
     cache_read_per_token: 0.000000025 # $0.025 / 1M tokens
     output_per_token: 0.000002        # $2.00 / 1M tokens
+    context_window: 128000
 
   o3:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.000008        # $8.00 / 1M tokens
+    context_window: 200000
 
   o3-pro:
     input_per_token: 0.00002          # $20.00 / 1M tokens
     output_per_token: 0.00008         # $80.00 / 1M tokens
+    context_window: 200000
 
   o4-mini:
     input_per_token: 0.0000011        # $1.10 / 1M tokens
     cache_read_per_token: 0.000000275 # $0.275 / 1M tokens
     output_per_token: 0.0000044       # $4.40 / 1M tokens
+    context_window: 200000
 
   o3-mini:
     input_per_token: 0.0000011        # $1.10 / 1M tokens
     cache_read_per_token: 0.00000055  # $0.55 / 1M tokens
     output_per_token: 0.0000044       # $4.40 / 1M tokens
+    context_window: 200000
 
   o1:
     input_per_token: 0.000015         # $15.00 / 1M tokens
     cache_read_per_token: 0.0000075   # $7.50 / 1M tokens
     output_per_token: 0.00006         # $60.00 / 1M tokens
+    context_window: 200000
 
   gpt-4.1:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.000008        # $8.00 / 1M tokens
+    context_window: 1048576
 
   gpt-4.1-mini:
     input_per_token: 0.0000004        # $0.40 / 1M tokens
     cache_read_per_token: 0.0000001   # $0.10 / 1M tokens
     output_per_token: 0.0000016       # $1.60 / 1M tokens
+    context_window: 1048576
 
   gpt-4o:
     input_per_token: 0.0000025      # $2.50 / 1M tokens
     cache_read_per_token: 0.00000125  # $1.25 / 1M tokens (50% off)
     output_per_token: 0.00001       # $10.00 / 1M tokens
+    context_window: 128000
 
   gpt-4o-mini:
     input_per_token: 0.00000015     # $0.15 / 1M tokens
     cache_read_per_token: 0.000000075  # $0.075 / 1M tokens (50% off)
     output_per_token: 0.0000006     # $0.60 / 1M tokens
+    context_window: 128000
 
   gpt-4-turbo:
     input_per_token: 0.00001        # $10.00 / 1M tokens
     output_per_token: 0.00003       # $30.00 / 1M tokens
+    context_window: 128000
 
   # --- Google ---
   # Source: https://ai.google.dev/pricing
@@ -256,30 +296,36 @@ models:
     input_per_token: 0.00000075       # $0.75 / 1M tokens
     cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
     output_per_token: 0.00000375      # $3.75 / 1M tokens
+    context_window: 1048576
 
   gemini-3.5-flash:
     input_per_token: 0.0000015        # $1.50 / 1M tokens
     cache_read_per_token: 0.00000015  # $0.15 / 1M tokens
     output_per_token: 0.000009        # $9.00 / 1M tokens
+    context_window: 1048576
 
   gemini-3.5-flash-lite:
     input_per_token: 0.0000003        # $0.30 / 1M tokens
     output_per_token: 0.0000025       # $2.50 / 1M tokens
+    context_window: 1048576
 
   gemini-3.1-pro:
     input_per_token: 0.000002         # $2.00 / 1M tokens (<= 200k)
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
+    context_window: 2097152
 
   gemini-2.5-pro:
     input_per_token: 0.00000125     # $1.25 / 1M tokens
     cache_read_per_token: 0.000000315  # $0.315 / 1M tokens
     output_per_token: 0.00001       # $10.00 / 1M tokens
+    context_window: 1048576
 
   gemini-2.5-flash:
     input_per_token: 0.00000015     # $0.15 / 1M tokens
     cache_read_per_token: 0.0000000375  # $0.0375 / 1M tokens
     output_per_token: 0.0000006     # $0.60 / 1M tokens
+    context_window: 1048576
 
   # --- xAI (Grok) ---
   # Source: https://docs.x.ai/docs/overview
@@ -288,46 +334,56 @@ models:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.000006        # $6.00 / 1M tokens
+    context_window: 1048576
 
   grok-4.5:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000003   # $0.30 / 1M tokens
     output_per_token: 0.000006        # $6.00 / 1M tokens
+    context_window: 1048576
 
   grok-4.3:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.0000025       # $2.50 / 1M tokens
+    context_window: 1048576
 
   grok-4.20:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.0000025       # $2.50 / 1M tokens
+    context_window: 1048576
 
   grok-code-fast:
     input_per_token: 0.000001         # $1.00 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000002        # $2.00 / 1M tokens
+    context_window: 1048576
 
   grok-build:
     input_per_token: 0.000001         # $1.00 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000002        # $2.00 / 1M tokens
+    context_window: 1048576
 
   grok-3-mini:
     input_per_token: 0.0000003        # $0.30 / 1M tokens
     cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
     output_per_token: 0.0000015       # $1.50 / 1M tokens
+    context_window: 131072
 
   grok-3:
     input_per_token: 0.000003         # $3.00 / 1M tokens
     cache_read_per_token: 0.00000075  # $0.75 / 1M tokens
     output_per_token: 0.000015        # $15.00 / 1M tokens
+    context_window: 131072
 
   grok-2:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     output_per_token: 0.00001         # $10.00 / 1M tokens
+    context_window: 131072
 
   grok-beta:
     input_per_token: 0.000005         # $5.00 / 1M tokens
     output_per_token: 0.000015        # $15.00 / 1M tokens
+    context_window: 131072

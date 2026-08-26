@@ -110,6 +110,18 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                 timeout=10.0,
             )
             logger.info("Model check OK: %s", label)
+            try:
+                from providers.cost import get_context_window
+
+                window = get_context_window(model_name)
+                if window == 128000 and not model_name.startswith("gpt-4"):
+                    logger.warning(
+                        "Model %s has no context_window in pricing.yaml"
+                        " — context guard will use fallback (128k)",
+                        model_name,
+                    )
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             logger.error(
                 "Model check TIMED OUT (10s): %s — verify region/endpoint", label
@@ -126,6 +138,7 @@ PLAN_AGENT_STATUS = {
     "review": "awaiting_review",
     "analyze": "analyzing",
     "synthesis": "synthesizing_results",
+    "build_image": "building_image",
 }
 
 
@@ -165,6 +178,8 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             "harness_name": cf.get("harness_name", ""),
             "harness_version": cf.get("harness_version", ""),
             "configuration_applied": cf.get("configuration_applied", {}),
+            "ssh_hardware_ips": cf.get("ssh_hardware_ips", {}),
+            "assigned_hardware_ips": cf.get("assigned_hardware_ips", {}),
         }
     elif agent_type == "teardown":
         return {"teardown_complete": True}
@@ -517,11 +532,18 @@ async def run_agent_task(
                         agent.max_iterations = 0
                     max_iter_override = cf.get("max_iterations_override")
                     if max_iter_override is not None:
-                        agent.max_iterations = int(max_iter_override)
-                        logger.info(
-                            f"Max iterations override for {ticket_id}:"
-                            f" {max_iter_override}"
-                        )
+                        try:
+                            agent.max_iterations = int(max_iter_override)
+                            agent._max_iterations_is_override = True
+                            logger.info(
+                                f"Max iterations override for {ticket_id}:"
+                                f" {max_iter_override}"
+                            )
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                f"Invalid max_iterations_override for {ticket_id}:"
+                                f" {max_iter_override!r}"
+                            )
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
                         override_llm = _make_llm_provider(
@@ -631,14 +653,22 @@ async def run_agent_task(
                 async with httpx.AsyncClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
+                    # Preserve max_iterations_override when the
+                    # agent paused (awaiting_customer_guidance) so
+                    # re-dispatch after HITL reuses the override.
+                    clear_fields: dict[str, Any] = {"llm_override": None}
+                    r = await client.get(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}",
+                    )
+                    if r.status_code == 200:
+                        post_status = r.json().get("status", "")
+                        if post_status != "awaiting_customer_guidance":
+                            clear_fields["max_iterations_override"] = None
+                    # On failed status read, preserve override (fail safe)
+
                     await client.patch(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={
-                            "fields": {
-                                "llm_override": None,
-                                "max_iterations_override": None,
-                            },
-                        },
+                        json={"fields": clear_fields},
                     )
             except Exception:
                 pass

@@ -444,8 +444,8 @@ class ResourceAgent(AgentBase):
             if keep_controller and controller:
                 new_hw["controller"] = assigned.get("controller", controller)
                 new_ssh_hw["controller"] = controller
-            new_hw["targets"] = []
-            new_ssh_hw["targets"] = []
+            new_hw["targets"] = [t for t in assigned_targets if t not in teardown_set]
+            new_ssh_hw["targets"] = [t for t in targets if t not in teardown_set]
 
             # Update provider_metadata to only track kept instances
             new_metadata = dict(provider_metadata)

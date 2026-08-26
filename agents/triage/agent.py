@@ -342,6 +342,42 @@ _LOCAL_TOOLS = [
                         "results compared."
                     ),
                 },
+                "image_build": {
+                    "type": "object",
+                    "description": (
+                        "Custom image build specification. "
+                        "Set when the user requests a custom "
+                        "OS image with package overrides, "
+                        "service changes, or specific build "
+                        "parameters. The system will build "
+                        "the image before acquiring hardware."
+                    ),
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Image build provider name. Omit to use the default."
+                            ),
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": (
+                                "Build target platform. Omit "
+                                "to auto-resolve from "
+                                "board_selector."
+                            ),
+                        },
+                        "customizations": {
+                            "type": "object",
+                            "description": (
+                                "Image customizations: rpms, "
+                                "repos, enabled_services, "
+                                "disabled_services, "
+                                "masked_services, kernel"
+                            ),
+                        },
+                    },
+                },
             },
             "required": [
                 "parsed_specs",
@@ -353,6 +389,25 @@ _LOCAL_TOOLS = [
         },
     ),
 ]
+
+
+def merge_image_build(
+    user_build: dict[str, Any],
+    triage_build: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge triage image_build with user-provided values.
+
+    User-provided fields take precedence. Customizations are
+    merged deeply so both user and triage customizations are
+    preserved.
+    """
+    merged = {**triage_build, **user_build}
+    if "customizations" in triage_build and "customizations" in user_build:
+        merged["customizations"] = {
+            **triage_build["customizations"],
+            **user_build["customizations"],
+        }
+    return merged
 
 
 class TriageAgent(AgentBase):
@@ -695,6 +750,45 @@ class TriageAgent(AgentBase):
                 "enabled": True,
                 "tested_hosts": existing_fleet.get("tested_hosts", []),
             }
+        # Custom image build: store spec and prepend
+        # a build_image step to the execution plan.
+        # Merge triage image_build with user-provided values;
+        # user-provided fields take precedence.
+        # Do NOT add image_build if the user didn't request one
+        # and system_config is present — system_config means
+        # post-flash configuration, not a custom build.
+        image_build = cf.get("image_build", {})
+        triage_build = result.get("image_build", {})
+        if triage_build and not image_build:
+            # Triage inferred a build the user didn't request.
+            # Block if system_config is present.
+            if cf.get("system_config"):
+                logger.info(
+                    "[triage] Ignoring triage-inferred "
+                    "image_build — system_config present"
+                )
+                triage_build = {}
+        if triage_build or image_build:
+            fields["image_build"] = merge_image_build(image_build, triage_build)
+            # Prepend build step before resource step
+            plan = fields.get("execution_plan", {})
+            steps = plan.get("steps", [])
+            build_step = {
+                "id": 0,
+                "agent_type": "build_image",
+                "status": "in_progress",
+                "params": {},
+                "results": {},
+            }
+            # Renumber existing steps
+            for i, s in enumerate(steps):
+                s["id"] = i + 1
+                if i == 0:
+                    s["status"] = "pending"
+            steps.insert(0, build_step)
+            plan["steps"] = steps
+            plan["current_step"] = 0
+            fields["execution_plan"] = plan
 
         await self._update_fields(ticket_id, fields)
 
@@ -747,6 +841,7 @@ class TriageAgent(AgentBase):
             _TRIAGE_EXIT_STATUSES = {
                 "resource": "awaiting_hardware",
                 "analyze": "analyzing",
+                "build_image": "building_image",
             }
             first_step_type = steps[0]["agent_type"]
             first_status = _TRIAGE_EXIT_STATUSES.get(
