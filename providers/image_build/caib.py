@@ -69,12 +69,11 @@ _BOARD_TO_TARGET: dict[str, str] = {
     "qc8775": "ride4_sa8775p_sx",
 }
 
-# Map board selectors to build mode
-_BOARD_TO_MODE: dict[str, str] = {
-    "nxp-s32g-vnp-rdb3": "build-dev",
-    "renesas-rcar-s4": "build-dev",
-    "qc8775": "build",
-}
+# Default build mode. Both package (build-dev) and bootc (build)
+# work on ALL targets. Default to package mode because it
+# produces a mutable rootfs that supports post-deploy
+# modifications (dnf install, config changes).
+_DEFAULT_BUILD_MODE = "build-dev"
 
 
 def resolve_target(board_selector: str) -> str:
@@ -87,12 +86,12 @@ def resolve_target(board_selector: str) -> str:
 
 
 def resolve_build_mode(board_selector: str) -> str:
-    """Resolve a board selector to a CAIB build mode."""
-    if "=" in board_selector:
-        board_type = board_selector.split("=", 1)[1]
-        board_type = board_type.split(",")[0]
-        return _BOARD_TO_MODE.get(board_type, "build-dev")
-    return "build-dev"
+    """Resolve a board selector to a CAIB build mode.
+
+    Both package (build-dev) and bootc (build) modes work on
+    all targets. Default to package mode for mutability.
+    """
+    return _DEFAULT_BUILD_MODE
 
 
 def generate_manifest(

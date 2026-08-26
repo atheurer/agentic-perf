@@ -16,44 +16,62 @@ changes, kernel config, or building from a specific AIB commit.
 - Custom kernel configurations or service modifications
 - Reproducing a specific build environment
 
+## Concepts
+
+### Targets vs Build Modes
+
+**Target** = the hardware platform. It determines the partition
+layout, bootloader format, and flash procedure:
+
+| Target | Boards | Partition layout |
+|---|---|---|
+| `ebbr` | S32G, R-Car S4, TI (J784S4) | Single partition, EBBR firmware |
+| `ride4_sa8775p_sx` | SA8775P (QC8775) ES2.1 v2/v2.5 | 4 partitions: system_a, system_b, boot_a, boot_b (aboot) |
+| `ride4_sa8775p_sx_r3` | SA8775P (QC8775) ES2.1 v3 | 4 partitions (aboot) |
+
+**Build mode** = the image type. It determines how packages are
+managed on the running system. **Both modes work on all targets**:
+
+| Mode | CLI | Image type | Package management | Use when |
+|---|---|---|---|---|
+| Package | `build-dev --mode package` | `regular` | `dnf` — persistent installs, mutable rootfs | Post-deploy modifications needed (kernel swaps, RPM installs, config changes) |
+| Bootc/OSTree | `build --disk` or `build-dev --mode image` | `ostree` | `rpm-ostree` — atomic, immutable rootfs | Production-like testing, integrity verification |
+
+Target and build mode are **independent choices**. A QC8775 board
+can run either a package-mode or bootc image. An EBBR board can
+run either type. Choose based on what the test requires, not the
+hardware.
+
 ## Build Modes
 
-### Package mode (EBBR)
+### Package mode
 
-For S32G and TI boards using package-based EBBR images:
+Produces a mutable image with traditional `dnf` package management.
+Use when you need to install RPMs or modify config post-flash:
 
 ```bash
 caib image build-dev manifest.aib.yml \
   --mode package \
   --format simg \
-  --target ebbr \
-  --internal-registry \
+  --target <target> \
+  --push <registry-url> \
   --wait \
   --output-format json
 ```
 
-### Bootc mode
+### Bootc/OSTree mode
 
-For SA8775P and other boards using bootc container images:
+Produces an immutable image with atomic updates:
 
 ```bash
 caib image build manifest.aib.yml \
   --format simg \
-  --target ride4_sa8775p_sx_r3 \
-  --internal-registry \
+  --target <target> \
   --disk \
+  --push <registry-url> \
   --wait \
   --output-format json
 ```
-
-## Target Mappings
-
-| Target | Boards | Flash command |
-|---|---|---|
-| `ebbr` | S32G, TI (J784S4) | `j storage flash oci://{image_uri}` |
-| `rcar_s4` | Renesas R-Car S4 | `j storage flash oci://{image_uri}` |
-| `ride4_sa8775p_sx` | SA8775P ES2.1 v2/v2.5 | `j storage flash oci://{image_uri}` |
-| `ride4_sa8775p_sx_r3` | SA8775P ES2.1 v3 | `j storage flash oci://{image_uri}` |
 
 ## AIB Manifest Format
 
