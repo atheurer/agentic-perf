@@ -1026,3 +1026,117 @@ def test_triage_normalizes_infrastructure_steps():
     assert plan["steps"][5]["agent_type"] == "review"
     assert plan["steps"][0]["status"] == "in_progress"
     assert all(s["status"] == "pending" for s in plan["steps"][1:])
+
+
+# --- stop_after_step ---
+
+
+def test_advance_plan_stop_after_step_closes_ticket():
+    """When stop_after_step matches the completed step, ticket is force-closed."""
+    from orchestrator.main import _advance_plan
+
+    plan = {
+        "current_step": 0,
+        "run_ids": [],
+        "steps": [
+            {
+                "id": 0,
+                "agent_type": "benchmark",
+                "status": "in_progress",
+                "params": {"label": "run-1"},
+                "results": {},
+            },
+            {
+                "id": 1,
+                "agent_type": "review",
+                "status": "pending",
+                "params": {},
+                "results": {},
+            },
+        ],
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "custom_fields": {
+            "run_id": "RUN-001",
+            "benchmark_status": "completed",
+            "stop_after_step": "benchmark",
+            "execution_plan": plan,
+        },
+    }
+
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+
+    # Plan should be persisted with step marked completed.
+    patch_call = client.patch.call_args
+    assert patch_call is not None
+    updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
+    assert updated_plan["steps"][0]["status"] == "completed"
+
+    # force-close must be called; no transition to the next step.
+    post_urls = [str(c) for c in client.post.call_args_list]
+    assert any("force-close" in u for u in post_urls)
+    transition_calls = [c for c in client.post.call_args_list if "transition" in str(c)]
+    assert transition_calls == [], "Must not transition to next step when halting"
+
+
+def test_advance_plan_stop_after_step_no_match_advances_normally():
+    """stop_after_step for a different step does not halt early."""
+    from orchestrator.main import _advance_plan
+
+    plan = {
+        "current_step": 0,
+        "run_ids": [],
+        "steps": [
+            {
+                "id": 0,
+                "agent_type": "benchmark",
+                "status": "in_progress",
+                "params": {"label": "run-1"},
+                "results": {},
+            },
+            {
+                "id": 1,
+                "agent_type": "review",
+                "status": "pending",
+                "params": {},
+                "results": {},
+            },
+        ],
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "custom_fields": {
+            "run_id": "RUN-001",
+            "benchmark_status": "completed",
+            # stop_after_step is "review", not "benchmark" — should not halt yet.
+            "stop_after_step": "review",
+            "execution_plan": plan,
+        },
+    }
+
+    client = MagicMock()
+    client.get.return_value = mock_response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+
+    # Ticket must NOT be force-closed; the normal transition runs.
+    post_urls = [str(c) for c in client.post.call_args_list]
+    assert not any("force-close" in u for u in post_urls)
+    transition_calls = [c for c in client.post.call_args_list if "transition" in str(c)]
+    assert transition_calls, (
+        "Must transition to next step when stop_after doesn't match"
+    )

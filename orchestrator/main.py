@@ -388,6 +388,31 @@ def _advance_plan(
             run_ids.append(cf["run_id"])
         plan["run_ids"] = run_ids
 
+        # Debug halt: close the ticket instead of advancing to the
+        # next step when stop_after_step matches the completed step.
+        # Uses force-close to bypass state-machine constraints
+        # (the ticket may be in any status at this point).
+        stop_after = cf.get("stop_after_step")
+        if stop_after and step.get("agent_type") == stop_after:
+            client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": {"execution_plan": plan}},
+            )
+            client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Debug halt:** `stop_after_step={stop_after}` — "
+                        f"closing after {stop_after} step as requested."
+                    ),
+                },
+            )
+            client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/force-close",
+            )
+            return
+
         next_idx = current + 1
 
         # Conclusive analysis: skip hardware/benchmark steps.
@@ -754,6 +779,45 @@ async def run_agent_task(
                 )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
+
+        # Debug halt for triage: triage_pending is not in
+        # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
+        # The triage agent transitions the ticket to awaiting_hardware
+        # itself; we force-close here if stop_after_step == "triage".
+        if success and status == "triage_pending":
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(
+                    timeout=10.0, headers=_auth_headers()
+                ) as _stop_client:
+                    r = await _stop_client.get(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                    )
+                    if r.status_code == 200:
+                        stop_after = (
+                            r.json().get("custom_fields", {}).get("stop_after_step")
+                        )
+                        if stop_after == "triage":
+                            await _stop_client.post(
+                                f"{dispatcher.store_url}"
+                                f"/api/v1/tickets/{ticket_id}/comments",
+                                json={
+                                    "author": "orchestrator",
+                                    "body": (
+                                        "**Debug halt:** `stop_after_step=triage` — "
+                                        "closing after triage step as requested."
+                                    ),
+                                },
+                            )
+                            await _stop_client.post(
+                                f"{dispatcher.store_url}"
+                                f"/api/v1/tickets/{ticket_id}/force-close",
+                            )
+                            logger.info(f"stop_after_step=triage: closed {ticket_id}")
+            except Exception:
+                logger.exception(f"stop_after_step triage check failed for {ticket_id}")
+
         dispatcher.clear_agent(ticket_id)
         dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
