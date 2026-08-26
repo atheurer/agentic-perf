@@ -418,6 +418,52 @@ async def query_numa_topology(host: str, iface: str) -> str:
 
 
 @mcp.tool()
+async def get_hardware_topology(
+    host: str,
+    iface: str | None = None,
+    socket: int | None = None,
+) -> str:
+    """Discover comprehensive hardware topology for a host.
+
+    Discovers:
+    - CPU / Cache / CCD topology: L3 cache domains, cores, thread counts, total CPUs
+    - SMT Thread Siblings: exact SMT sibling CPU lists for all cores (e.g. {"0": [0, 384], ...})
+    - NUMA node mapping: per-node CPU lists and NUMA node assignment
+    - NIC / PCI locality: NUMA node and PCI information if `iface` is specified.
+
+    Returns structured hardware topology JSON.
+    """
+    ssh = _get_ssh()
+    result = await discover_cache_topology(ssh, host, socket=socket)
+
+    if iface:
+        quoted = shlex.quote(iface)
+        node_res = await ssh.run(
+            host, f"cat /sys/class/net/{quoted}/device/numa_node", timeout=15
+        )
+        pci_res = await ssh.run(
+            host, f"readlink -f /sys/class/net/{quoted}/device", timeout=15
+        )
+        nic_numa = node_res.stdout.strip() if node_res.exit_code == 0 else "unknown"
+        pci_path = pci_res.stdout.strip() if pci_res.exit_code == 0 else ""
+        pci_addr = os.path.basename(pci_path) if pci_path else ""
+
+        try:
+            nic_numa_int = int(nic_numa)
+        except ValueError:
+            nic_numa_int = nic_numa
+
+        result["nic"] = {
+            "iface": iface,
+            "numa_node": nic_numa,
+            "numa_node_int": nic_numa_int,
+            "pci_address": pci_addr,
+        }
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def get_cache_topology(
     host: str,
     socket: int | None = None,

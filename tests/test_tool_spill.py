@@ -142,3 +142,54 @@ async def test_caller_configured_threshold(tmp_path, monkeypatch):
     parsed = json.loads(res.content)
     assert parsed["status"] == "spilled_to_workspace"
     assert parsed["file_ref"].startswith("workspace://get_data_")
+
+
+async def test_in_flight_jq_filter_returns_data_in_same_turn(agent):
+    # Large 50KB payload containing detailed objects
+    large_data = {
+        "domains": [
+            {"ccd_id": i, "cpus": [i * 2, i * 2 + 1], "numa_node": i % 2, "extra": "x" * 500}
+            for i in range(50)
+        ]
+    }
+    agent._tool_handlers["get_cache_topology"] = AsyncMock(
+        return_value=json.dumps(large_data)
+    )
+
+    # Tool call with in-flight jq_filter to extract only ccd_id and cpus
+    call = ToolCall(
+        id="call_inflight",
+        name="get_cache_topology",
+        input={"host": "10.0.0.1", "jq_filter": ".domains[0:2] | map({ccd_id, cpus})"},
+    )
+    res = await agent._execute_tool(call)
+
+    assert not res.is_error
+    parsed = json.loads(res.content)
+    assert parsed["status"] == "filtered"
+    assert parsed["file_ref"].startswith("workspace://get_cache_topology_")
+    assert parsed["jq_filter"] == ".domains[0:2] | map({ccd_id, cpus})"
+    assert parsed["data"] == [
+        {"ccd_id": 0, "cpus": [0, 1]},
+        {"ccd_id": 1, "cpus": [2, 3]},
+    ]
+    assert parsed["full_size_bytes"] > 20000
+
+
+async def test_in_flight_jq_filter_invalid_query_returns_error_descriptor(agent):
+    data = {"status": "ok", "items": [1, 2, 3]}
+    agent._tool_handlers["get_items"] = AsyncMock(return_value=json.dumps(data))
+
+    call = ToolCall(
+        id="call_err",
+        name="get_items",
+        input={"jq_filter": ".[invalid-syntax]"},
+    )
+    res = await agent._execute_tool(call)
+
+    assert not res.is_error
+    parsed = json.loads(res.content)
+    assert parsed["status"] == "filter_error"
+    assert parsed["file_ref"].startswith("workspace://get_items_")
+    assert "error" in parsed
+

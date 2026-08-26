@@ -134,6 +134,20 @@ class CacheTopologyResult:
     model: str | None = None
     architecture: str | None = None
     error: str | None = None
+    thread_siblings: dict[str, list[int]] = None  # type: ignore[assignment]
+    thread_siblings_list: dict[str, str] = None  # type: ignore[assignment]
+    netdevs: dict[str, Any] = None  # type: ignore[assignment]
+    block_devices: dict[str, Any] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.thread_siblings is None:
+            self.thread_siblings = {}
+        if self.thread_siblings_list is None:
+            self.thread_siblings_list = {}
+        if self.netdevs is None:
+            self.netdevs = {}
+        if self.block_devices is None:
+            self.block_devices = {}
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -146,6 +160,14 @@ class CacheTopologyResult:
             "total_ccds": self.total_ccds,
             "total_cpus": self.total_cpus,
         }
+        if self.thread_siblings:
+            d["thread_siblings"] = self.thread_siblings
+        if self.thread_siblings_list:
+            d["thread_siblings_list"] = self.thread_siblings_list
+        if self.netdevs:
+            d["netdevs"] = self.netdevs
+        if self.block_devices:
+            d["block_devices"] = self.block_devices
         if self.vendor:
             d["vendor"] = self.vendor
         if self.model:
@@ -161,7 +183,7 @@ _TOPOLOGY_COLLECTOR_SCRIPT = r"""
 import glob, os, json, subprocess, sys
 
 def collect():
-    data = {'cpus': {}, 'nodes': {}, 'system': {}, 'cpuinfo': []}
+    data = {'cpus': {}, 'nodes': {}, 'system': {}, 'cpuinfo': [], 'netdevs': {}}
     try:
         data['system']['arch'] = os.uname().machine
         data['system']['kernel'] = os.uname().release
@@ -265,6 +287,140 @@ def collect():
                 data['lscpu'] = json.loads(res.stdout).get('cpus', [])
         except Exception:
             pass
+
+    # Network devices (netdevs) from sysfs and ip
+    try:
+        for net_p in sorted(glob.glob('/sys/class/net/*')):
+            ifname = os.path.basename(net_p)
+            if ifname == 'lo':
+                continue
+            dev_info = {'iface': ifname}
+
+            # operstate
+            try:
+                with open(os.path.join(net_p, 'operstate')) as f:
+                    dev_info['operstate'] = f.read().strip()
+            except Exception:
+                dev_info['operstate'] = 'unknown'
+
+            # address (MAC)
+            try:
+                with open(os.path.join(net_p, 'address')) as f:
+                    dev_info['mac'] = f.read().strip()
+            except Exception:
+                pass
+
+            # speed
+            try:
+                with open(os.path.join(net_p, 'speed')) as f:
+                    s_val = f.read().strip()
+                    dev_info['speed_mbps'] = int(s_val) if s_val.isdigit() else s_val
+            except Exception:
+                pass
+
+            # NUMA node
+            dev_node_p = os.path.join(net_p, 'device/numa_node')
+            if os.path.exists(dev_node_p):
+                try:
+                    with open(dev_node_p) as f:
+                        node_val = f.read().strip()
+                        dev_info['numa_node'] = int(node_val) if (node_val.isdigit() or (node_val.startswith('-') and node_val[1:].isdigit())) else node_val
+                except Exception:
+                    pass
+
+            # PCI path & address
+            dev_link_p = os.path.join(net_p, 'device')
+            if os.path.exists(dev_link_p):
+                try:
+                    pci_target = os.path.realpath(dev_link_p)
+                    dev_info['pci_address'] = os.path.basename(pci_target)
+                except Exception:
+                    pass
+
+            # Driver
+            driver_link_p = os.path.join(net_p, 'device/driver')
+            if os.path.exists(driver_link_p):
+                try:
+                    driver_target = os.path.realpath(driver_link_p)
+                    dev_info['driver'] = os.path.basename(driver_target)
+                except Exception:
+                    pass
+
+            data['netdevs'][ifname] = dev_info
+    except Exception:
+        pass
+
+    # Resolve IP addresses if ip tool is available
+    try:
+        res = subprocess.run(['ip', '-j', 'addr', 'show'], capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            for if_entry in json.loads(res.stdout):
+                ifname = if_entry.get('ifname')
+                if ifname and ifname in data['netdevs']:
+                    ips = []
+                    for addr_info in if_entry.get('addr_info', []):
+                        local_ip = addr_info.get('local')
+                        if local_ip:
+                            ips.append(local_ip)
+                    if ips:
+                        data['netdevs'][ifname]['ip_addresses'] = ips
+    except Exception:
+        pass
+
+    # Storage devices (block_devices) from sysfs
+    data['block_devices'] = {}
+    try:
+        for blk_p in sorted(glob.glob('/sys/block/*')):
+            devname = os.path.basename(blk_p)
+            if devname.startswith(('loop', 'ram', 'dm-')):
+                continue
+            b_info = {'device': devname}
+
+            try:
+                with open(os.path.join(blk_p, 'size')) as f:
+                    sectors = int(f.read().strip())
+                    b_info['size_bytes'] = sectors * 512
+                    b_info['size_gb'] = round((sectors * 512) / (1024**3), 2)
+            except Exception:
+                pass
+
+            try:
+                with open(os.path.join(blk_p, 'queue/rotational')) as f:
+                    rot = f.read().strip()
+                    b_info['rotational'] = (rot == '1')
+                    b_info['type'] = 'HDD' if rot == '1' else 'SSD/NVMe'
+            except Exception:
+                pass
+
+            b_node_p = os.path.join(blk_p, 'device/numa_node')
+            if os.path.exists(b_node_p):
+                try:
+                    with open(b_node_p) as f:
+                        n_val = f.read().strip()
+                        b_info['numa_node'] = int(n_val) if (n_val.isdigit() or (n_val.startswith('-') and n_val[1:].isdigit())) else n_val
+                except Exception:
+                    pass
+
+            b_dev_p = os.path.join(blk_p, 'device')
+            if os.path.exists(b_dev_p):
+                try:
+                    pci_target = os.path.realpath(b_dev_p)
+                    b_info['pci_address'] = os.path.basename(pci_target)
+                except Exception:
+                    pass
+
+            for attr in ('model', 'vendor'):
+                attr_p = os.path.join(blk_p, f'device/{attr}')
+                if os.path.exists(attr_p):
+                    try:
+                        with open(attr_p) as f:
+                            b_info[attr] = f.read().strip()
+                    except Exception:
+                        pass
+
+            data['block_devices'][devname] = b_info
+    except Exception:
+        pass
 
     print(json.dumps(data))
 
@@ -456,6 +612,18 @@ def parse_topology_data(
             )
             domains.append(domain)
 
+        thread_siblings: dict[str, list[int]] = {}
+        thread_siblings_list: dict[str, str] = {}
+        for cpu_id, cpu_info in sorted(cpus_dict.items()):
+            s_list = cpu_info.get("thread_siblings_list") or cpu_info.get("core_cpus_list")
+            if s_list is not None:
+                s_str = str(s_list).strip()
+                thread_siblings_list[str(cpu_id)] = s_str
+                thread_siblings[str(cpu_id)] = parse_cpu_list(s_str)
+
+        netdevs = data.get("netdevs", {})
+        block_devices = data.get("block_devices", {})
+
         return CacheTopologyResult(
             host=host,
             socket=target_socket,
@@ -468,6 +636,10 @@ def parse_topology_data(
             vendor=vendor,
             model=model,
             architecture=architecture,
+            thread_siblings=thread_siblings,
+            thread_siblings_list=thread_siblings_list,
+            netdevs=netdevs,
+            block_devices=block_devices,
         )
 
     # Step 2: Fallback to lscpu output if available
