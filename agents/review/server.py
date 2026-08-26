@@ -27,6 +27,7 @@ from agents.server_utils import (
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
+    read_skill_document,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,26 +65,28 @@ async def _ensure_init():
 
 @mcp.tool()
 async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document containing lessons learned from prior benchmark runs. These may contain guidance on interpreting results for specific harnesses or benchmarks."""
+    """Read a skill document containing lessons learned from prior benchmark runs (e.g. harness='crucible', filename='result-parsing.md'). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
-    skill_path = SKILLS_DIR / harness / filename
-    if not skill_path.is_file():
+    res = read_skill_document(SKILLS_DIR, harness, filename)
+    if not res.get("found"):
         available = []
-        harness_dir = SKILLS_DIR / harness
+        target_harness = res.get("harness") or harness
+        harness_dir = SKILLS_DIR / target_harness
         if harness_dir.is_dir():
             available = [f.name for f in harness_dir.glob("*.md")]
+        target_filename = res.get("filename") or filename
         return json.dumps(
             {
                 "status": "not_found",
-                "path": str(skill_path),
+                "path": str(SKILLS_DIR / target_harness / target_filename),
                 "available": available,
             }
         )
     return json.dumps(
         {
             "status": "ok",
-            "filename": filename,
-            "content": skill_path.read_text(),
+            "filename": res["filename"],
+            "content": res["content"],
         }
     )
 
@@ -100,10 +103,12 @@ async def list_harness_docs(harness: str) -> str:
 
 @mcp.tool()
 async def read_harness_doc(harness: str, doc_path: str) -> str:
-    """Read a documentation file from a benchmark harness repository. Use this to learn about result formats, metric interpretation, or any other harness-specific details."""
+    """Read a documentation file from a benchmark harness repository (e.g. harness='crucible', doc_path='docs/how-run-files-work.md'). Use this to learn about result formats, metric interpretation, or any other harness-specific details."""
     await _ensure_init()
     if not _repo_cache:
         return json.dumps({"status": "error", "message": "No repo cache configured"})
+    if not harness and "/" in doc_path:
+        harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps({"status": "not_found", "harness": harness, "path": doc_path})

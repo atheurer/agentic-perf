@@ -68,11 +68,59 @@ class RepoCache:
         return sorted(results, key=lambda d: d["path"])
 
     def read_file(self, name: str, rel_path: str) -> str | None:
+        if not name:
+            return None
         repo_path = self._dir / name
-        target = repo_path / rel_path
-        if not target.is_file():
+        if not repo_path.exists():
             return None
-        resolved = target.resolve()
-        if not str(resolved).startswith(str(repo_path.resolve())):
-            return None
-        return target.read_text()
+
+        clean_path = str(rel_path or "").strip().lstrip("/")
+        if clean_path.startswith(f"{name}/"):
+            clean_path = clean_path[len(f"{name}/") :].lstrip("/")
+
+        candidates = [
+            repo_path / clean_path,
+            repo_path / "docs" / clean_path,
+            repo_path / "config" / clean_path,
+        ]
+
+        if clean_path.startswith("docs/"):
+            stripped = clean_path[len("docs/") :].lstrip("/")
+            candidates.append(repo_path / stripped)
+            candidates.append(repo_path / "docs" / stripped)
+        if clean_path.startswith("config/"):
+            stripped = clean_path[len("config/") :].lstrip("/")
+            candidates.append(repo_path / stripped)
+            candidates.append(repo_path / "config" / stripped)
+
+        name_only = Path(clean_path).name
+        if name_only:
+            candidates.append(repo_path / "docs" / name_only)
+            candidates.append(repo_path / "config" / name_only)
+            candidates.append(repo_path / name_only)
+
+        repo_resolved = repo_path.resolve()
+        for target in candidates:
+            try:
+                resolved = target.resolve()
+                if not resolved.is_relative_to(repo_resolved):
+                    continue
+                if target.is_file():
+                    return target.read_text()
+            except (OSError, ValueError):
+                continue
+
+        if name_only:
+            for subdir in ("docs", "config"):
+                sub_path = repo_path / subdir
+                if sub_path.is_dir():
+                    for f in sub_path.rglob(name_only):
+                        if f.is_file():
+                            try:
+                                resolved = f.resolve()
+                                if resolved.is_relative_to(repo_resolved):
+                                    return f.read_text()
+                            except (OSError, ValueError):
+                                continue
+
+        return None
