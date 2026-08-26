@@ -681,8 +681,8 @@ async def run_agent_task(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
                     )
                     if r.status_code == 200:
-                        stop_after = r.json().get("custom_fields", {}).get(
-                            "stop_after_step"
+                        stop_after = (
+                            r.json().get("custom_fields", {}).get("stop_after_step")
                         )
                         if stop_after == "triage":
                             await _stop_client.post(
@@ -700,13 +700,9 @@ async def run_agent_task(
                                 f"{dispatcher.store_url}"
                                 f"/api/v1/tickets/{ticket_id}/force-close",
                             )
-                            logger.info(
-                                f"stop_after_step=triage: closed {ticket_id}"
-                            )
+                            logger.info(f"stop_after_step=triage: closed {ticket_id}")
             except Exception:
-                logger.exception(
-                    f"stop_after_step triage check failed for {ticket_id}"
-                )
+                logger.exception(f"stop_after_step triage check failed for {ticket_id}")
 
         dispatcher.clear_agent(ticket_id)
         dispatcher.mark_done(ticket_id)

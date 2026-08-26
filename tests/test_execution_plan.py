@@ -1084,9 +1084,7 @@ def test_advance_plan_stop_after_step_closes_ticket():
     # force-close must be called; no transition to the next step.
     post_urls = [str(c) for c in client.post.call_args_list]
     assert any("force-close" in u for u in post_urls)
-    transition_calls = [
-        c for c in client.post.call_args_list if "transition" in str(c)
-    ]
+    transition_calls = [c for c in client.post.call_args_list if "transition" in str(c)]
     assert transition_calls == [], "Must not transition to next step when halting"
 
 
@@ -1138,7 +1136,7 @@ def test_advance_plan_stop_after_step_no_match_advances_normally():
     # Ticket must NOT be force-closed; the normal transition runs.
     post_urls = [str(c) for c in client.post.call_args_list]
     assert not any("force-close" in u for u in post_urls)
-    transition_calls = [
-        c for c in client.post.call_args_list if "transition" in str(c)
-    ]
-    assert transition_calls, "Must transition to next step when stop_after doesn't match"
+    transition_calls = [c for c in client.post.call_args_list if "transition" in str(c)]
+    assert transition_calls, (
+        "Must transition to next step when stop_after doesn't match"
+    )
