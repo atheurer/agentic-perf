@@ -84,6 +84,10 @@ class AgentBase(ABC):
     # backoff (min 15s, doubling each attempt, capped at 5m).
     LLM_RATE_LIMIT_RETRIES = 5
 
+    # Default maximum tool response size (in bytes) before spilling
+    # to the ticket scratchpad workspace to optimize LLM tokens.
+    DEFAULT_TOOL_SPILL_THRESHOLD = 4096
+
     # Class-level default for mock spec compatibility
     _max_iterations_is_override = False
 
@@ -96,6 +100,7 @@ class AgentBase(ABC):
         tool_handlers: dict[str, Callable] | None = None,
         event_bus: EventBus | None = None,
         max_iterations: int | None = None,
+        tool_spill_threshold: int | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.llm = llm_provider
@@ -118,6 +123,79 @@ class AgentBase(ABC):
         )
         self._stop_requested = False
         self._max_iterations_is_override = False
+        self._current_ticket_id: str | None = None
+        self._tool_call_seq: int = 0
+        self._spill_threshold: int = (
+            tool_spill_threshold
+            if tool_spill_threshold is not None
+            else self._load_tool_spill_threshold()
+        )
+        self._register_workspace_tools()
+
+    def _register_workspace_tools(self) -> None:
+        """Register native workspace tools on the agent."""
+        from agents.workspace.tools import WORKSPACE_TOOLS
+
+        def _get_manager():
+            from providers.workspace.manager import WorkspaceManager
+
+            return WorkspaceManager(ticket_id=self._current_ticket_id)
+
+        async def _jq_query(file_ref: str, filter: str, limit: int = 50) -> str:
+            res = _get_manager().jq_query(file_ref, filter, limit=limit)
+            return json.dumps(res, indent=2)
+
+        async def _grep_file(
+            file_ref: str,
+            pattern: str,
+            max_lines: int = 50,
+            context_lines: int = 0,
+            case_insensitive: bool = True,
+        ) -> str:
+            res = _get_manager().grep_file(
+                file_ref,
+                pattern,
+                max_lines=max_lines,
+                context_lines=context_lines,
+                case_insensitive=case_insensitive,
+            )
+            return json.dumps(res, indent=2)
+
+        async def _read_file_slice(
+            file_ref: str,
+            offset_bytes: int = 0,
+            max_bytes: int = 4096,
+            start_line: int | None = None,
+            max_lines: int | None = None,
+        ) -> str:
+            res = _get_manager().read_file_slice(
+                file_ref,
+                offset_bytes=offset_bytes,
+                max_bytes=max_bytes,
+                start_line=start_line,
+                max_lines=max_lines,
+            )
+            return json.dumps(res, indent=2)
+
+        async def _list_workspace_files() -> str:
+            res = _get_manager().list_files()
+            return json.dumps(res, indent=2)
+
+        ws_handlers = {
+            "jq_query": _jq_query,
+            "grep_file": _grep_file,
+            "read_file_slice": _read_file_slice,
+            "list_workspace_files": _list_workspace_files,
+        }
+
+        for name, handler in ws_handlers.items():
+            if name not in self._tool_handlers:
+                self._tool_handlers[name] = handler
+
+        existing_names = {t.name for t in self.tools}
+        for tool_def in WORKSPACE_TOOLS:
+            if tool_def.name not in existing_names:
+                self.tools.append(tool_def)
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -174,6 +252,7 @@ class AgentBase(ABC):
             self._events.emit(ticket_id, self.agent_name, event_type, data)
 
     async def run(self, ticket_id: str) -> None:
+        self._current_ticket_id = ticket_id
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
         self._dispatched_status = ticket.get("status", "")
@@ -181,6 +260,26 @@ class AgentBase(ABC):
         self._last_interject_ticket: dict[str, Any] | None = None
         system_prompt = self._system_prompt(ticket)
         cf = ticket.get("custom_fields", {})
+        spill_threshold = getattr(
+            self, "_spill_threshold", getattr(self, "DEFAULT_SPILL_THRESHOLD", 4096)
+        )
+        if "tool_spill_threshold" in cf and cf["tool_spill_threshold"] is not None:
+            try:
+                spill_threshold = int(cf["tool_spill_threshold"])
+                self._spill_threshold = spill_threshold
+            except (ValueError, TypeError):
+                pass
+        workspace_prompt = (
+            "\n\n## Scratchpad Workspace & Tool Querying\n"
+            f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
+            "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_query` to query JSON fields, "
+            "`read_file_slice` to paginate text/logs, and `grep_file` to search.\n"
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` (or `jq_query`) directly in ANY JSON-returning "
+            "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
+            "to slice and return the exact data in a single turn without multi-step querying."
+        )
+        if "## Scratchpad Workspace" not in system_prompt:
+            system_prompt = f"{system_prompt}{workspace_prompt}"
         if cf.get("remember_previous") and cf.get("previous_messages"):
             messages = cf["previous_messages"]
             logger.info(
@@ -1027,6 +1126,162 @@ class AgentBase(ABC):
         except Exception:
             return self.DEFAULT_TOOL_MIN_INTERVAL
 
+    def _load_tool_spill_threshold(self) -> int:
+        """Load tool spill threshold (in bytes) from environment or config."""
+        env_val = os.environ.get("TOOL_SPILL_THRESHOLD")
+        if env_val:
+            try:
+                return int(env_val)
+            except ValueError:
+                pass
+        try:
+            from orchestrator.config import _load_config_file
+
+            cfg = _load_config_file()
+            return int(
+                cfg.get("tool_spill_threshold", self.DEFAULT_TOOL_SPILL_THRESHOLD)
+            )
+        except Exception:
+            return self.DEFAULT_TOOL_SPILL_THRESHOLD
+
+    def _spill_tool_output(
+        self, tool_name: str, content: str, jq_filter: str | None = None
+    ) -> str:
+        """Spill large tool output to the ticket workspace if it exceeds threshold.
+
+        If jq_filter is provided by the caller on a JSON output, the full output
+        is saved to the workspace and the jq_filter is applied in-flight, returning
+        the filtered result directly (or a preview if still large) in the same turn.
+        """
+        if not content:
+            return content
+
+        raw_bytes = content.encode("utf-8")
+        if not jq_filter and len(raw_bytes) <= self._spill_threshold:
+            return content
+
+        # Exclude workspace inspection, skill/doc loading, user interaction, and submission tools
+        exempt_tools = {
+            # Workspace inspection
+            "jq_query",
+            "grep_file",
+            "read_file_slice",
+            "list_workspace_files",
+            # Skill & documentation reading
+            "read_skill",
+            "read_skills",
+            "read_harness_doc",
+            "get_review_config",
+            "get_execution_config",
+            "get_example_runfile",
+            "get_tool_params",
+            # File reading with existing caller control
+            "read_remote_file",
+            # User interaction & checkpoints
+            "request_clarification",
+            "request_human_input",
+            "present_runfile_for_approval",
+        }
+        if (
+            tool_name in exempt_tools or tool_name.startswith("submit_")
+        ) and not jq_filter:
+            return content
+
+        try:
+            from providers.workspace.manager import WorkspaceManager
+
+            manager = WorkspaceManager(ticket_id=self._current_ticket_id)
+            self._tool_call_seq += 1
+
+            # Determine extension
+            is_json = False
+            try:
+                stripped = content.strip()
+                if stripped.startswith(("{", "[")):
+                    json.loads(stripped)
+                    is_json = True
+            except Exception:
+                is_json = False
+
+            ext = "json" if is_json else "txt"
+            filename = f"{tool_name}_{self._tool_call_seq}.{ext}"
+            file_ref, _ = manager.save_file(filename, content)
+
+            # If caller passed a jq_filter and content is JSON, execute filter in-flight
+            if jq_filter and is_json:
+                q_res = manager.jq_query(
+                    file_ref, jq_filter, limit=100, max_bytes=self._spill_threshold
+                )
+                if q_res.get("status") == "ok":
+                    filtered_data = q_res.get("result")
+                    filtered_json = json.dumps(
+                        {
+                            "status": "filtered",
+                            "file_ref": file_ref,
+                            "jq_filter": jq_filter,
+                            "data": filtered_data,
+                            "truncated": q_res.get("truncated", False),
+                            "total_items": q_res.get("total_items"),
+                            "full_size_bytes": len(raw_bytes),
+                        },
+                        indent=2,
+                    )
+                    if len(filtered_json.encode("utf-8")) <= self._spill_threshold:
+                        logger.info(
+                            f"[{self.agent_name}] In-flight jq_filter '{jq_filter}' on {tool_name} returned {len(filtered_json)} bytes (full: {file_ref})"
+                        )
+                        return filtered_json
+                    else:
+                        preview = manager.generate_preview(filename, filtered_json)
+                        descriptor = {
+                            "status": "spilled_to_workspace",
+                            "tool_name": tool_name,
+                            "file_ref": file_ref,
+                            "jq_filter": jq_filter,
+                            "format": ext,
+                            "size_bytes": len(raw_bytes),
+                            "preview": preview,
+                            "message": (
+                                f"Full output saved to '{file_ref}'. Filtered result ({len(filtered_json)} bytes) "
+                                f"exceeds threshold. Refine jq_query or read slices."
+                            ),
+                        }
+                        return json.dumps(descriptor, indent=2)
+                else:
+                    preview = manager.generate_preview(filename, content)
+                    descriptor = {
+                        "status": "filter_error",
+                        "tool_name": tool_name,
+                        "file_ref": file_ref,
+                        "jq_filter": jq_filter,
+                        "error": q_res.get("error"),
+                        "preview": preview,
+                    }
+                    return json.dumps(descriptor, indent=2)
+
+            preview = manager.generate_preview(filename, content)
+            descriptor = {
+                "status": "spilled_to_workspace",
+                "tool_name": tool_name,
+                "file_ref": file_ref,
+                "format": ext,
+                "size_bytes": len(raw_bytes),
+                "preview": preview,
+                "message": (
+                    f"Tool output ({len(raw_bytes)} bytes) was saved to workspace as '{file_ref}'. "
+                    f"Use jq_query (for JSON) or grep_file / read_file_slice (for text) to inspect relevant parts."
+                ),
+            }
+            logger.info(
+                f"[{self.agent_name}] Spilled {len(raw_bytes)} bytes from tool '{tool_name}' to {file_ref}"
+            )
+            return json.dumps(descriptor, indent=2)
+        except Exception as e:
+            logger.warning(
+                f"[{self.agent_name}] Failed to spill tool output for {tool_name}: {e}"
+            )
+            return content
+
     async def _throttle_tool_call(self) -> None:
         """Enforce minimum interval between tool calls.
 
@@ -1045,14 +1300,31 @@ class AgentBase(ABC):
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         await self._throttle_tool_call()
+
+        call_input = dict(tool_call.input) if tool_call.input else {}
+        jq_filter = None
+        if tool_call.name != "jq_query":
+            jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
+                "jq_query", None
+            )
+            if jq_filter is not None:
+                jq_filter = str(jq_filter).strip() or None
+
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
             try:
-                result = await handler(**tool_call.input)
+                try:
+                    result = await handler(**call_input)
+                except TypeError:
+                    result = await handler(**tool_call.input)
+
                 if isinstance(result, str):
                     content = result
                 else:
                     content = json.dumps(result, default=str)
+                content = self._spill_tool_output(
+                    tool_call.name, content, jq_filter=jq_filter
+                )
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise
@@ -1066,7 +1338,14 @@ class AgentBase(ABC):
 
         if self._mcp is not None:
             try:
-                content = await self._mcp.call_tool(tool_call.name, tool_call.input)
+                try:
+                    content = await self._mcp.call_tool(tool_call.name, call_input)
+                except Exception:
+                    content = await self._mcp.call_tool(tool_call.name, tool_call.input)
+
+                content = self._spill_tool_output(
+                    tool_call.name, content, jq_filter=jq_filter
+                )
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise

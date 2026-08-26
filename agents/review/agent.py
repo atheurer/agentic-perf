@@ -128,6 +128,7 @@ class ReviewAgent(AgentBase):
         skill_provider=None,
         event_bus: EventBus | None = None,
         repo_cache: RepoCache | None = None,
+        tool_spill_threshold: int | None = None,
     ) -> None:
         self._skill_provider = skill_provider
         self._repo_cache = repo_cache
@@ -154,6 +155,7 @@ class ReviewAgent(AgentBase):
             tool_handlers=local_handlers,
             event_bus=event_bus,
             max_iterations=50,
+            tool_spill_threshold=tool_spill_threshold,
         )
 
     async def _do_request_clarification(self, question: str) -> str:

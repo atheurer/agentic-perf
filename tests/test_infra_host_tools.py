@@ -34,18 +34,33 @@ class TestGetEthtoolInfo:
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "rx-checksumming" in data["stdout"]
+        assert data["data"]["rx-checksumming"]["active"] is True
         assert any("ethtool -k" in c["command"] for c in patch_ssh.calls)
 
     @pytest.mark.asyncio
-    async def test_stats_mode(self, patch_ssh):
+    async def test_native_json_mode(self, patch_ssh):
+        patch_ssh._results["ethtool --json -S"] = SSHResult(
+            exit_code=0,
+            stdout=json.dumps([{"rx_packets": 100000, "tx_packets": 200000}]),
+        )
+        result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="stats")
+        data = json.loads(result)
+        assert data["exit_code"] == 0
+        assert data["data"]["rx_packets"] == 100000
+        assert data["data"]["tx_packets"] == 200000
+
+    @pytest.mark.asyncio
+    async def test_stats_mode_fallback_parsing(self, patch_ssh):
         patch_ssh._results["ethtool -S"] = SSHResult(
             exit_code=0,
-            stdout="rx_packets: 12345\ngro_packets: 678\n",
+            stdout="NIC statistics:\n     rx_packets: 12345\n     gro_packets: 678\n",
         )
         result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="stats")
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "gro_packets" in data["stdout"]
+        assert data["data"]["rx_packets"] == 12345
+        assert data["data"]["gro_packets"] == 678
         assert any("ethtool -S" in c["command"] for c in patch_ssh.calls)
 
     @pytest.mark.asyncio
@@ -328,3 +343,104 @@ class TestGetCacheTopology:
         assert data["ccds"]["0"] == [0, 1, 2, 3]
         assert data["domains"][0]["cpu_list"] == "0-3"
         assert data["domains"][0]["size"] == "32M"
+
+
+# ---------------------------------------------------------------------------
+# get_hardware_topology
+# ---------------------------------------------------------------------------
+
+
+class TestGetHardwareTopology:
+    @pytest.mark.asyncio
+    async def test_hardware_topology_with_nic(self, patch_ssh):
+        topology_payload = {
+            "cpus": {
+                0: {
+                    "cpu_id": 0,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 0,
+                    "thread_siblings_list": "0,4",
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3,4-7",
+                        }
+                    ],
+                },
+                4: {
+                    "cpu_id": 4,
+                    "online": True,
+                    "physical_package_id": 0,
+                    "core_id": 0,
+                    "thread_siblings_list": "0,4",
+                    "caches": [
+                        {
+                            "level": 3,
+                            "type": "Unified",
+                            "id": 0,
+                            "size": "32M",
+                            "shared_cpu_list": "0-3,4-7",
+                        }
+                    ],
+                },
+            },
+            "nodes": {0: "0-7"},
+            "system": {
+                "arch": "x86_64",
+                "vendor": "AuthenticAMD",
+                "model": "AMD EPYC",
+            },
+            "netdevs": {
+                "eno1": {
+                    "iface": "eno1",
+                    "operstate": "up",
+                    "mac": "52:54:00:12:34:56",
+                    "speed_mbps": 10000,
+                    "numa_node": 0,
+                    "pci_address": "0000:01:00.0",
+                    "driver": "ixgbe",
+                    "ip_addresses": ["192.168.1.100"],
+                }
+            },
+            "block_devices": {
+                "nvme0n1": {
+                    "device": "nvme0n1",
+                    "size_gb": 1000.0,
+                    "type": "SSD/NVMe",
+                    "rotational": False,
+                    "numa_node": 0,
+                    "pci_address": "0000:04:00.0",
+                    "model": "Samsung SSD 980 PRO",
+                }
+            },
+        }
+        patch_ssh._results["python3 -c"] = SSHResult(
+            exit_code=0,
+            stdout=json.dumps(topology_payload),
+        )
+        patch_ssh._results["cat /sys/class/net/eth0/device/numa_node"] = SSHResult(
+            exit_code=0,
+            stdout="0\n",
+        )
+        patch_ssh._results["readlink -f /sys/class/net/eth0/device"] = SSHResult(
+            exit_code=0,
+            stdout="/sys/devices/pci0000:c0/0000:c0:01.1/0000:c1:00.0\n",
+        )
+
+        result = await srv.get_hardware_topology("10.0.0.1", iface="eth0")
+        data = json.loads(result)
+        assert data["host"] == "10.0.0.1"
+        assert data["thread_siblings"]["0"] == [0, 4]
+        assert data["thread_siblings_list"]["0"] == "0,4"
+        assert data["netdevs"]["eno1"]["operstate"] == "up"
+        assert data["netdevs"]["eno1"]["driver"] == "ixgbe"
+        assert data["netdevs"]["eno1"]["speed_mbps"] == 10000
+        assert data["block_devices"]["nvme0n1"]["type"] == "SSD/NVMe"
+        assert data["block_devices"]["nvme0n1"]["size_gb"] == 1000.0
+        assert data["nic"]["iface"] == "eth0"
+        assert data["nic"]["numa_node_int"] == 0
+        assert data["nic"]["pci_address"] == "0000:c1:00.0"

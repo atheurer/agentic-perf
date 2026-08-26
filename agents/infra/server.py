@@ -226,19 +226,67 @@ async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str
     return json.dumps({"success": True, "local_path": local_dir})
 
 
+def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
+    """Parse ethtool output (either native JSON or text format) into structured dict."""
+    try:
+        parsed = json.loads(stdout)
+        if (
+            isinstance(parsed, list)
+            and len(parsed) == 1
+            and isinstance(parsed[0], dict)
+        ):
+            return parsed[0]
+        return parsed
+    except Exception:
+        pass
+
+    data: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if (
+            not line
+            or line.startswith("NIC statistics:")
+            or line.startswith("Features for")
+        ):
+            continue
+        if ":" in line:
+            key, val = line.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            if mode == "stats":
+                try:
+                    if "." in val:
+                        data[key] = float(val)
+                    else:
+                        data[key] = int(val)
+                except ValueError:
+                    data[key] = val
+            elif mode == "features":
+                is_on = val.startswith("on")
+                is_fixed = "[fixed]" in val
+                data[key] = {
+                    "active": is_on,
+                    "fixed": is_fixed,
+                    "raw": val,
+                }
+            else:
+                data[key] = val
+    return data
+
+
 @mcp.tool()
 async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str:
-    """Get ethtool information for a network interface.
+    """Get ethtool information for a network interface as structured JSON.
 
-    mode='features' returns offload feature flags (ethtool -k),
-    mode='stats' returns NIC statistics (ethtool -S).
+    mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
+    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S).
     """
     ssh = _get_ssh()
     quoted = shlex.quote(iface)
     if mode == "features":
-        result = await ssh.run(host, f"ethtool -k {quoted}", timeout=30)
+        flag = "-k"
     elif mode == "stats":
-        result = await ssh.run(host, f"ethtool -S {quoted}", timeout=30)
+        flag = "-S"
     else:
         return json.dumps(
             {
@@ -246,12 +294,33 @@ async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str
                 "error": f"Unknown mode {mode!r}. Use 'features' or 'stats'.",
             }
         )
-    return _format_result(result)
+
+    # Try native JSON output first
+    result = await ssh.run(host, f"ethtool --json {flag} {quoted}", timeout=30)
+    if result.exit_code != 0 or not result.stdout.strip().startswith(("{", "[")):
+        # Fallback to standard ethtool
+        result = await ssh.run(host, f"ethtool {flag} {quoted}", timeout=30)
+
+    if result.exit_code != 0:
+        return _format_result(result)
+
+    parsed_data = _parse_ethtool_output(result.stdout, mode)
+    return json.dumps(
+        {
+            "host": host,
+            "iface": iface,
+            "mode": mode,
+            "exit_code": result.exit_code,
+            "data": parsed_data,
+            "stdout": result.stdout,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
 async def get_sysctl_values(host: str, params: list[str]) -> str:
-    """Read sysctl parameter values from a remote host.
+    """Read sysctl parameter values from a remote host as structured JSON.
 
     Pass a list of sysctl key names
     (e.g. ['net.core.rmem_max', 'net.ipv4.tcp_wmem']).
@@ -268,7 +337,24 @@ async def get_sysctl_values(host: str, params: list[str]) -> str:
             )
     cmd = "sysctl " + " ".join(shlex.quote(p) for p in params)
     result = await ssh.run(host, cmd, timeout=30)
-    return _format_result(result)
+    if result.exit_code != 0 and not result.stdout.strip():
+        return _format_result(result)
+
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            values[k.strip()] = v.strip()
+
+    return json.dumps(
+        {
+            "host": host,
+            "exit_code": result.exit_code,
+            "values": values,
+            "stdout": result.stdout,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -311,13 +397,78 @@ async def query_numa_topology(host: str, iface: str) -> str:
             }
         )
 
+    node_cpu_lists = {}
+    for line in cpulist_result.stdout.splitlines():
+        m = re.search(r"node(\d+)/cpulist:\s*(.*)", line)
+        if m:
+            nid = m.group(1)
+            cpus = m.group(2).strip()
+            node_cpu_lists[nid] = cpus
+            node_cpu_lists[f"node{nid}"] = cpus
+
+    nic_numa_node = node_result.stdout.strip()
+    try:
+        nic_numa_node_int = int(nic_numa_node)
+    except ValueError:
+        nic_numa_node_int = nic_numa_node
+
     return json.dumps(
         {
-            "nic_numa_node": node_result.stdout.strip(),
-            "node_cpu_lists": cpulist_result.stdout.strip(),
+            "host": host,
             "iface": iface,
-        }
+            "nic_numa_node": nic_numa_node,
+            "nic_numa_node_int": nic_numa_node_int,
+            "node_cpu_lists": node_cpu_lists,
+            "node_cpu_lists_raw": cpulist_result.stdout.strip(),
+        },
+        indent=2,
     )
+
+
+@mcp.tool()
+async def get_hardware_topology(
+    host: str,
+    iface: str | None = None,
+    socket: int | None = None,
+) -> str:
+    """Discover comprehensive hardware topology for a host.
+
+    Discovers:
+    - CPU / Cache / CCD topology: L3 cache domains, cores, thread counts, total CPUs
+    - SMT Thread Siblings: exact SMT sibling CPU lists for all cores (e.g. {"0": [0, 384], ...})
+    - NUMA node mapping: per-node CPU lists and NUMA node assignment
+    - NIC / PCI locality: NUMA node and PCI information if `iface` is specified.
+
+    Returns structured hardware topology JSON.
+    """
+    ssh = _get_ssh()
+    result = await discover_cache_topology(ssh, host, socket=socket)
+
+    if iface:
+        quoted = shlex.quote(iface)
+        node_res = await ssh.run(
+            host, f"cat /sys/class/net/{quoted}/device/numa_node", timeout=15
+        )
+        pci_res = await ssh.run(
+            host, f"readlink -f /sys/class/net/{quoted}/device", timeout=15
+        )
+        nic_numa = node_res.stdout.strip() if node_res.exit_code == 0 else "unknown"
+        pci_path = pci_res.stdout.strip() if pci_res.exit_code == 0 else ""
+        pci_addr = os.path.basename(pci_path) if pci_path else ""
+
+        try:
+            nic_numa_int = int(nic_numa)
+        except ValueError:
+            nic_numa_int = nic_numa
+
+        result["nic"] = {
+            "iface": iface,
+            "numa_node": nic_numa,
+            "numa_node_int": nic_numa_int,
+            "pci_address": pci_addr,
+        }
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()

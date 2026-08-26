@@ -94,3 +94,26 @@ def create_artifact_dir(
         artifact_dir.mkdir(parents=True, exist_ok=True)
         return artifact_dir
     return Path(tempfile.mkdtemp(prefix=f"{run_id}-"))
+
+
+def get_ticket_workspace_dir(
+    ticket_id: str,
+    create: bool = True,
+) -> Path:
+    """Return the scratchpad workspace directory for a ticket.
+
+    Structure: TICKET_DIR/<ticket-id>/workspace/
+
+    Falls back to a temp directory if ticket_id is not set.
+    """
+    import tempfile
+
+    if ticket_id:
+        ws_dir = TICKET_DIR / ticket_id / "workspace"
+        if create:
+            ws_dir.mkdir(parents=True, exist_ok=True)
+        return ws_dir
+    temp_dir = Path(tempfile.gettempdir()) / "agentic-perf-workspace-scratch"
+    if create:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir

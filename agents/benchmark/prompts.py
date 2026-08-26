@@ -8,7 +8,14 @@ The ticket's metadata tells you which harness and benchmark to use.
 
 ## Efficient Tool Usage
 
-Use batch tools to minimize iterations:
+Use batch and discovery tools to minimize iterations:
+- **get_hardware_topology(host, iface=..., jq_filter=...)** (or **get_cache_topology**) — discover
+  the complete hardware layout in a single call, including CCD domains, NUMA nodes, core counts,
+  and exact `thread_siblings` SMT pairings (`{"0": [0, 384], ...}`). Do NOT read individual
+  `/sys/devices/system/cpu/cpu*/topology/` files one by one.
+- **In-flight `jq_filter` parameter** — you can pass `jq_filter` in ANY JSON-returning tool call
+  (e.g., `get_hardware_topology(host=..., jq_filter=".domains[0:2]")` or `get_tool_params(...)`)
+  to receive the exact filtered slice immediately in the same turn without multi-step querying.
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
   (not check_host per host)
 - **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**

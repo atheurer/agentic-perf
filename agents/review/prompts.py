@@ -104,6 +104,15 @@ For harnesses that provide a structured API (indicated in the review config),
 you may also have access to tools like get_run_summary or cdm_api_request.
 The review config will tell you when these are applicable.
 
+### Scratchpad Workspace & Large Tool Outputs
+When tools return large outputs (> 4 KB by default, configurable via `custom_fields.tool_spill_threshold`), they are automatically saved into your ticket workspace as files (e.g. `workspace://cdm_api_requests_1.json`).
+
+- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`) to receive the exact filtered slice immediately in the same turn without multi-step querying.
+- **JSON files**: Use `jq_query` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
+- **Text & Log files**: Use `read_file_slice` to paginate. The response provides `next_start_line` and `next_offset_bytes`. To read the next chunk without re-reading previous lines, simply pass `start_line=next_start_line` or `offset_bytes=next_offset_bytes`.
+- **Searching**: Use `grep_file` to jump directly to errors, drops, or specific pattern matches in large log files.
+- **Listing**: Use `list_workspace_files` to see all saved files in the ticket workspace.
+
 ## Step 4: Analysis
 
 Once you have the benchmark data:
