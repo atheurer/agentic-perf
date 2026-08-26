@@ -553,7 +553,7 @@ Custom image builds are requested via `image_build` in the ticket's
 | `provider` | string | `"caib"` | Image build provider name |
 | `target` | string | auto-resolved | CAIB target (e.g., `ebbr` for S32G/R-Car S4). Auto-resolved from `board_selector` if omitted. |
 | `customizations` | object | `{}` | Provider-specific customizations (masked services, RPMs, etc.) |
-| `build_mode` | string | auto-resolved | CAIB build mode (`build-dev` for package, `build` for bootc) |
+| `build_mode` | string | `build-dev` | CAIB command: `build-dev` for standalone disk images (supports `--mode package` or `--mode image`), `build` for bootc container images. Both work on all targets. Default `build-dev` produces mutable package-mode images. |
 | `ttl` | string | `"168h"` | CAIB build record time-to-live |
 
 #### OpenShift Deployment

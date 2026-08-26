@@ -142,6 +142,10 @@ class ImageBuilderAgent:
         # Resolve target and build mode via provider interface
         board_selector = directives.get("board_selector", "")
         target = image_build.get("target", provider.resolve_target(board_selector))
+        # Build mode: explicit from directives, or provider
+        # default. Both package (build-dev) and bootc (build)
+        # work on all targets — the choice depends on test
+        # requirements, not hardware.
         build_mode = image_build.get(
             "build_mode",
             provider.resolve_build_mode(board_selector),
@@ -149,10 +153,7 @@ class ImageBuilderAgent:
 
         # Build the spec
         # Build a descriptive tag for the image:
-        # <target>-<mode>-<release>-<ticket>
-        image_version = (
-            directives.get("image_version", "autosd").lower().replace(" ", "-")
-        )
+        # <short_target>-<mode>-<timestamp>-<ticket>
         image_mode = (
             "package"
             if directives.get("image_type", "regular") in ("regular", "package")
@@ -162,7 +163,11 @@ class ImageBuilderAgent:
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
         ticket_short = ticket_id.lower().replace("_", "-")
-        build_name = f"{target}-{image_mode}-{image_version}-{timestamp}-{ticket_short}"
+        # Keep build name under 50 chars to avoid Kubernetes
+        # Secret name length limits (63 chars, CAIB appends
+        # a suffix). Use abbreviated components.
+        short_target = target.replace("ride4_sa8775p_", "r4-").replace("_", "-")
+        build_name = f"{short_target}-{image_mode[:3]}-{timestamp}-{ticket_short}"
         # Read image_build config from config file
         from orchestrator.config import _load_config_file
 

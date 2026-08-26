@@ -87,14 +87,18 @@ class TestTargetResolution:
 
 
 class TestBuildModeResolution:
-    def test_s32g_uses_build_dev(self):
+    """Build mode defaults to build-dev for all boards.
+
+    Both package (build-dev) and bootc (build) work on all
+    targets. The choice depends on test needs, not hardware.
+    """
+
+    def test_all_boards_default_to_build_dev(self):
         assert resolve_build_mode("board-type=nxp-s32g-vnp-rdb3") == "build-dev"
-
-    def test_qc8775_uses_build(self):
-        assert resolve_build_mode("board-type=qc8775") == "build"
-
-    def test_unknown_defaults_to_build_dev(self):
+        assert resolve_build_mode("board-type=qc8775") == "build-dev"
+        assert resolve_build_mode("board-type=renesas-rcar-s4") == "build-dev"
         assert resolve_build_mode("board-type=unknown") == "build-dev"
+        assert resolve_build_mode("") == "build-dev"
 
 
 # --- Manifest generation ---
