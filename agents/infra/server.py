@@ -28,6 +28,7 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
+from agents.infra.topology import discover_cache_topology
 from agents.server_utils import (
     _resolve_vault_secret_name,
     resolve_ssh_key,
@@ -317,6 +318,45 @@ async def query_numa_topology(host: str, iface: str) -> str:
             "iface": iface,
         }
     )
+
+
+@mcp.tool()
+async def get_cache_topology(
+    host: str,
+    socket: int | None = None,
+) -> str:
+    """Discover CPU cache / CCD (Core Complex Die) topology for a host.
+
+    Discovers L3 cache domains (or LLC) and which CPUs belong to each CCD/cache slice.
+    Supports filtering by socket.
+
+    Returns structured CCD map and cache domain details:
+      {
+        "host": host,
+        "socket": socket,
+        "ccds": {"0": [192, 193, ...], "1": [208, 209, ...]},
+        "domains": [
+          {
+            "ccd_id": 0,
+            "cache_id": 0,
+            "socket_id": 1,
+            "numa_node": 1,
+            "cpus": [192, 193, ...],
+            "cpu_list": "192-207,576-591",
+            "core_count": 16,
+            "thread_count": 32,
+            "size": "32M",
+            ...
+          }
+        ],
+        "total_ccds": 24,
+        "total_cpus": 768,
+        "source": "sysfs"
+      }
+    """
+    ssh = _get_ssh()
+    result = await discover_cache_topology(ssh, host, socket=socket)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
