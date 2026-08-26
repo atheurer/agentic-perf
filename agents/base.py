@@ -265,6 +265,17 @@ class AgentBase(ABC):
                 self._spill_threshold = int(cf["tool_spill_threshold"])
             except (ValueError, TypeError):
                 pass
+        workspace_prompt = (
+            "\n\n## Scratchpad Workspace & Tool Querying\n"
+            f"- **Automatic Spilling**: Tool outputs exceeding {self._spill_threshold} bytes are automatically saved "
+            "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_query` to query JSON fields, "
+            "`read_file_slice` to paginate text/logs, and `grep_file` to search.\n"
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` (or `jq_query`) directly in ANY JSON-returning "
+            "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
+            "to slice and return the exact data in a single turn without multi-step querying."
+        )
+        if "## Scratchpad Workspace" not in system_prompt:
+            system_prompt = f"{system_prompt}{workspace_prompt}"
         if cf.get("remember_previous") and cf.get("previous_messages"):
             messages = cf["previous_messages"]
             logger.info(
