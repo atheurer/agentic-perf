@@ -362,6 +362,68 @@ creator.
 
 ---
 
+### `context_guard` — Context-Window Guardrails
+
+Monitors per-call context token usage against the model's
+context window and pauses the agent before it hits the
+provider's hard limit. Without this, a context overflow
+surfaces as an opaque API error, wasting the iteration.
+
+```json
+{
+    "context_guard": {
+        "enabled": true,
+        "warn_pct": 60,
+        "pause_pct": 80,
+        "default_context_window": 200000
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable the context guard globally. |
+| `warn_pct` | float | `60` | Percentage of context window at which the agent receives a wrap-up warning. Set to `0` to disable. |
+| `pause_pct` | float | `80` | Percentage of context window at which the agent is paused. Set to `0` to disable. |
+| `default_context_window` | int | `0` | Fallback context window when the model is unknown. `0` uses the pricing.yaml fallback (128k). |
+
+**Context window discovery:** window sizes are looked up from
+`providers/cost/pricing.yaml` using the model name from the
+LLM response usage. Users can also add `context_window` to
+their custom `~/.agentic-perf/pricing.yaml`. If a user pricing
+file lacks `context_window` for a model, the bundled default is
+used (per-key fallback, not per-file).
+
+**Per-ticket override:** individual tickets can override
+`warn_pct`, `pause_pct`, and `enabled` via
+`custom_fields.context_guard`:
+
+```bash
+curl -X PATCH .../api/v1/tickets/PERF-123 \
+  -d '{"fields": {"context_guard": {"warn_pct": 70, "pause_pct": 90}}}'
+```
+
+**Behavior:**
+
+- **Warn:** injects a `[SYSTEM] Context warning` message into
+  the conversation (once per run). The agent can start wrapping
+  up proactively.
+- **Pause:** grants one grace iteration with a final-call
+  message, then saves conversation state and transitions to
+  `awaiting_customer_guidance`. The pause comment explicitly
+  notes that raising `llm_budget` will not help — the
+  conversation is too large for the model's input window.
+
+**Check order:** context → budget → iteration. Only one grace
+iteration is granted regardless of which guardrail fires first.
+
+**Investigation agents (`max_iterations=0`):** the context
+guard fires normally. This is the primary safety net for
+unlimited-iteration agents that would otherwise hit the
+provider's hard context limit.
+
+---
+
 ### `introspection` — Introspection Agent
 
 The introspection agent is a continuous passive observer that runs
