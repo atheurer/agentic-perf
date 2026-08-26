@@ -31,12 +31,19 @@ _BASE_MANIFEST: dict[str, Any] = {
         "rpms": [
             # Remote access
             "openssh-server",
-            # Time sync (required for accurate measurements)
+            "openssh-clients",
+            "sshpass",
+            # Network configuration — without NetworkManager,
+            # Linux interfaces are not brought up even if
+            # firmware assigns an IP via DHCP
+            "NetworkManager",
+            "dhcpcd",
+            # Time sync (accurate measurements)
             "chrony",
             # Network diagnostics
             "iproute",
-            # Container runtime (core AutoSD component,
-            # needed by boot-time TTFC and other harnesses)
+            "iproute-tc",
+            # Container runtime (boot-time TTFC, workloads)
             "podman",
         ],
         "systemd": {
