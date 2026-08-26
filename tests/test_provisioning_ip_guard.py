@@ -627,4 +627,3 @@ class TestPlatformIPScoping:
         files = mgr.list_files()
         assert len(files) == 1
         assert files[0]["filename"] == "provisioning_summary.json"
-

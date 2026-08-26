@@ -158,4 +158,3 @@ def test_agent_base_workspace_manifest(workspace, monkeypatch):
     refs = {f["file_ref"] for f in files}
     assert "workspace://provisioning_summary.json" in refs
     assert "workspace://hardware_topology.json" in refs
-
