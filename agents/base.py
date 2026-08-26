@@ -260,14 +260,18 @@ class AgentBase(ABC):
         self._last_interject_ticket: dict[str, Any] | None = None
         system_prompt = self._system_prompt(ticket)
         cf = ticket.get("custom_fields", {})
+        spill_threshold = getattr(
+            self, "_spill_threshold", getattr(self, "DEFAULT_SPILL_THRESHOLD", 4096)
+        )
         if "tool_spill_threshold" in cf and cf["tool_spill_threshold"] is not None:
             try:
-                self._spill_threshold = int(cf["tool_spill_threshold"])
+                spill_threshold = int(cf["tool_spill_threshold"])
+                self._spill_threshold = spill_threshold
             except (ValueError, TypeError):
                 pass
         workspace_prompt = (
             "\n\n## Scratchpad Workspace & Tool Querying\n"
-            f"- **Automatic Spilling**: Tool outputs exceeding {self._spill_threshold} bytes are automatically saved "
+            f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_query` to query JSON fields, "
             "`read_file_slice` to paginate text/logs, and `grep_file` to search.\n"
             "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` (or `jq_query`) directly in ANY JSON-returning "
