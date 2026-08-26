@@ -84,6 +84,10 @@ class AgentBase(ABC):
     # backoff (min 15s, doubling each attempt, capped at 5m).
     LLM_RATE_LIMIT_RETRIES = 5
 
+    # Default maximum tool response size (in bytes) before spilling
+    # to the ticket scratchpad workspace to optimize LLM tokens.
+    DEFAULT_TOOL_SPILL_THRESHOLD = 4096
+
     # Class-level default for mock spec compatibility
     _max_iterations_is_override = False
 
@@ -96,6 +100,7 @@ class AgentBase(ABC):
         tool_handlers: dict[str, Callable] | None = None,
         event_bus: EventBus | None = None,
         max_iterations: int | None = None,
+        tool_spill_threshold: int | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.llm = llm_provider
@@ -118,6 +123,13 @@ class AgentBase(ABC):
         )
         self._stop_requested = False
         self._max_iterations_is_override = False
+        self._current_ticket_id: str | None = None
+        self._tool_call_seq: int = 0
+        self._spill_threshold: int = (
+            tool_spill_threshold
+            if tool_spill_threshold is not None
+            else self._load_tool_spill_threshold()
+        )
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -174,6 +186,7 @@ class AgentBase(ABC):
             self._events.emit(ticket_id, self.agent_name, event_type, data)
 
     async def run(self, ticket_id: str) -> None:
+        self._current_ticket_id = ticket_id
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
         self._dispatched_status = ticket.get("status", "")
@@ -181,6 +194,11 @@ class AgentBase(ABC):
         self._last_interject_ticket: dict[str, Any] | None = None
         system_prompt = self._system_prompt(ticket)
         cf = ticket.get("custom_fields", {})
+        if "tool_spill_threshold" in cf and cf["tool_spill_threshold"] is not None:
+            try:
+                self._spill_threshold = int(cf["tool_spill_threshold"])
+            except (ValueError, TypeError):
+                pass
         if cf.get("remember_previous") and cf.get("previous_messages"):
             messages = cf["previous_messages"]
             logger.info(
@@ -1027,6 +1045,90 @@ class AgentBase(ABC):
         except Exception:
             return self.DEFAULT_TOOL_MIN_INTERVAL
 
+    def _load_tool_spill_threshold(self) -> int:
+        """Load tool spill threshold (in bytes) from environment or config."""
+        env_val = os.environ.get("TOOL_SPILL_THRESHOLD")
+        if env_val:
+            try:
+                return int(env_val)
+            except ValueError:
+                pass
+        try:
+            from orchestrator.config import _load_config_file
+
+            cfg = _load_config_file()
+            return int(
+                cfg.get("tool_spill_threshold", self.DEFAULT_TOOL_SPILL_THRESHOLD)
+            )
+        except Exception:
+            return self.DEFAULT_TOOL_SPILL_THRESHOLD
+
+    def _spill_tool_output(self, tool_name: str, content: str) -> str:
+        """Spill large tool output to the ticket workspace if it exceeds threshold.
+
+        Returns original content if under threshold or if spilling is not applicable,
+        or a JSON descriptor string pointing to the saved workspace file.
+        """
+        if not content:
+            return content
+
+        raw_bytes = content.encode("utf-8")
+        if len(raw_bytes) <= self._spill_threshold:
+            return content
+
+        # Exclude internal inspection tools, clarify, and submission tools
+        if tool_name in (
+            "jq_query",
+            "grep_file",
+            "read_file_slice",
+            "list_workspace_files",
+            "request_clarification",
+        ) or tool_name.startswith("submit_"):
+            return content
+
+        try:
+            from providers.workspace.manager import WorkspaceManager
+
+            manager = WorkspaceManager(ticket_id=self._current_ticket_id)
+            self._tool_call_seq += 1
+
+            # Determine extension
+            is_json = False
+            try:
+                stripped = content.strip()
+                if stripped.startswith(("{", "[")):
+                    json.loads(stripped)
+                    is_json = True
+            except Exception:
+                is_json = False
+
+            ext = "json" if is_json else "txt"
+            filename = f"{tool_name}_{self._tool_call_seq}.{ext}"
+            file_ref, _ = manager.save_file(filename, content)
+            preview = manager.generate_preview(filename, content)
+
+            descriptor = {
+                "status": "spilled_to_workspace",
+                "tool_name": tool_name,
+                "file_ref": file_ref,
+                "format": ext,
+                "size_bytes": len(raw_bytes),
+                "preview": preview,
+                "message": (
+                    f"Tool output ({len(raw_bytes)} bytes) was saved to workspace as '{file_ref}'. "
+                    f"Use jq_query (for JSON) or grep_file / read_file_slice (for text) to inspect relevant parts."
+                ),
+            }
+            logger.info(
+                f"[{self.agent_name}] Spilled {len(raw_bytes)} bytes from tool '{tool_name}' to {file_ref}"
+            )
+            return json.dumps(descriptor, indent=2)
+        except Exception as e:
+            logger.warning(
+                f"[{self.agent_name}] Failed to spill tool output for {tool_name}: {e}"
+            )
+            return content
+
     async def _throttle_tool_call(self) -> None:
         """Enforce minimum interval between tool calls.
 
@@ -1053,6 +1155,7 @@ class AgentBase(ABC):
                     content = result
                 else:
                     content = json.dumps(result, default=str)
+                content = self._spill_tool_output(tool_call.name, content)
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise
@@ -1067,6 +1170,7 @@ class AgentBase(ABC):
         if self._mcp is not None:
             try:
                 content = await self._mcp.call_tool(tool_call.name, tool_call.input)
+                content = self._spill_tool_output(tool_call.name, content)
                 return ToolResult(tool_use_id=tool_call.id, content=content)
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise

@@ -128,6 +128,7 @@ class ReviewAgent(AgentBase):
         skill_provider=None,
         event_bus: EventBus | None = None,
         repo_cache: RepoCache | None = None,
+        tool_spill_threshold: int | None = None,
     ) -> None:
         self._skill_provider = skill_provider
         self._repo_cache = repo_cache
@@ -154,6 +155,7 @@ class ReviewAgent(AgentBase):
             tool_handlers=local_handlers,
             event_bus=event_bus,
             max_iterations=50,
+            tool_spill_threshold=tool_spill_threshold,
         )
 
     async def _do_request_clarification(self, question: str) -> str:
@@ -212,6 +214,7 @@ class ReviewAgent(AgentBase):
         review_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
         eval_server = str(Path(__file__).parent.parent / "evaluate" / "server.py")
+        workspace_server = str(Path(__file__).parent.parent / "workspace" / "server.py")
 
         mcp = AgentMCPClient()
         await mcp.connect(
@@ -221,6 +224,11 @@ class ReviewAgent(AgentBase):
         )
         await mcp.connect(infra_server, name="infra")
         await mcp.connect(eval_server, name="evaluate-tools")
+        await mcp.connect(
+            workspace_server,
+            name="workspace",
+            env={"TICKET_ID": ticket_id},
+        )
 
         # Connect any configured external MCP servers
         # (e.g., historical baselines for comparison).

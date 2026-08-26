@@ -104,6 +104,13 @@ For harnesses that provide a structured API (indicated in the review config),
 you may also have access to tools like get_run_summary or cdm_api_request.
 The review config will tell you when these are applicable.
 
+### Scratchpad Workspace & Large Tool Outputs
+When tools return large outputs (> 4 KB), they are automatically saved into your ticket workspace as files (e.g. `workspace://cdm_api_requests_1.json`).
+When you receive a `spilled_to_workspace` response:
+- Use `jq_query` to extract nested keys, arrays, or compute values from JSON files (e.g. `jq_query(file_ref="workspace://...", filter=".uperf_100.values[0:10]")`).
+- Use `grep_file` or `read_file_slice` to search or inspect large log/text outputs.
+- Use `list_workspace_files` to see all saved files in the workspace.
+
 ## Step 4: Analysis
 
 Once you have the benchmark data:
