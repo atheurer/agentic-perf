@@ -19,7 +19,7 @@ Follow this order unless the user directs otherwise:
 4. **Check TCP stack tuning** — buffer sizes (net.core.rmem_max, net.core.wmem_max, net.ipv4.tcp_rmem, net.ipv4.tcp_wmem), congestion control algorithm, GSO/GRO/TSO status on the interface.
 5. **Check NUMA & Hardware topology** — is the test NIC on the same NUMA node as the CPUs handling its traffic? Cross-NUMA memory access adds latency.
    - **Use host inventory first.** If the ticket includes a Host Inventory section, it contains the authoritative NUMA topology: node count, CPU-to-node mapping, and NIC-to-node mapping. Use this data.
-   - If no inventory, call `get_hardware_topology(host, iface=...)` (or `query_numa_topology(host, iface)`) to get the NIC's NUMA node, SMT thread siblings, and per-node CPU lists directly.
+   - If no inventory, call `get_hardware_topology(host, iface=...)` to get the NIC's NUMA node, SMT thread siblings, and per-node CPU lists directly.
    - The `package` breakout in CDM procstat data maps to NUMA node / CPU socket. Use it to correlate interrupt-processing CPUs with NIC locality.
    - Do NOT assume NUMA node count. A system with 768 CPUs may have only 2 NUMA nodes. Read the actual count from inventory or sysfs.
    - Do NOT confuse CPU numbers with NUMA node numbers. CPU 511 is not on NUMA node 511 — look up which node owns that CPU.
@@ -41,14 +41,14 @@ When using sar-net, packet counts reflect **wire-level packets** which are alway
 Every claim must be backed by queried data. If a tool can answer the question, call the tool — do not say "likely", "almost certainly", or "probably" when a CDM query or one of the host-query tools would give the answer.
 
 Before concluding about:
-- **NUMA / Hardware locality** — query host inventory or call `get_hardware_topology(host)` / `query_numa_topology(host, iface)`
+- **NUMA / Hardware locality** — query host inventory or call `get_hardware_topology(host, iface=...)`
 - **Interrupt affinity** — query procstat `interrupts-sec` with `hostname+irq+cpu` breakout, not assumptions about default behavior
 - **GRO/GSO status** — call `get_ethtool_info(host, iface, mode="features")` and `get_ethtool_info(host, iface, mode="stats")` (returns structured JSON)
 - **TCP tuning** — call `get_sysctl_values(host, ["net.core.rmem_max", "net.core.wmem_max", "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"])` (returns structured JSON)
 
 Present actual numbers in findings, not qualitative descriptions. "CPU 341 at 72% soft" is useful. "The CPU appears busy" is not.
 
-To query host state when results are on a remote controller, first call `set_ssh_context` with the ticket ID to initialize SSH credentials, then use the appropriate host-query tool (`get_hardware_topology`, `get_ethtool_info`, `get_sysctl_values`, `query_numa_topology`, `list_interfaces`, `read_remote_file`, `read_remote_dir`). Pass optional `jq_filter` in any JSON tool call to slice exact properties in a single turn. Do NOT use SSH tools if local artifacts are available — if you already have a Local Artifacts section in your context, all data is accessible via `read_benchmark_artifact` without SSH.
+To query host state when results are on a remote controller, first call `set_ssh_context` with the ticket ID to initialize SSH credentials, then use the appropriate host-query tool (`get_hardware_topology`, `get_ethtool_info`, `get_sysctl_values`, `list_interfaces`, `read_remote_file`, `read_remote_dir`). Pass optional `jq_filter` in any JSON tool call to slice exact properties in a single turn. Do NOT use SSH tools if local artifacts are available — if you already have a Local Artifacts section in your context, all data is accessible via `read_benchmark_artifact` without SSH.
 
 ### Using CDM API for metric queries
 

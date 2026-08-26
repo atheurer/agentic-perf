@@ -263,7 +263,7 @@ should understand what is enforced today and what is not.
 
 - **Purpose-built host-query tools** — instead of a generic SSH
   command executor, the infra server exposes targeted read-only tools
-  (`get_ethtool_info`, `get_sysctl_values`, `query_numa_topology`,
+  (`get_hardware_topology`, `get_ethtool_info`, `get_sysctl_values`,
   `list_interfaces`, `verify_ssh_path`, `read_remote_dir`). Each tool
   has a fixed, validated code path — no free-form shell injection.
 - **Bearer token auth** (`state_store/auth.py`) — every API request

@@ -79,9 +79,9 @@ def mock_infra_server(tmp_path: Path) -> Path:
             return json.dumps({"exit_code": 0, "stdout": "net.core.rmem_max = 4194304"})
 
         @mcp.tool()
-        async def query_numa_topology(host: str, iface: str) -> str:
-            \"\"\"Query NUMA topology for a host.\"\"\"
-            return json.dumps({"nic_numa_node": "0", "node_cpu_lists": "mock", "iface": iface})
+        async def get_hardware_topology(host: str, iface: str = None, socket: int = None) -> str:
+            \"\"\"Discover comprehensive hardware topology for a host.\"\"\"
+            return json.dumps({"host": host, "iface": iface, "socket": socket, "total_cpus": 2})
 
         @mcp.tool()
         async def get_cache_topology(host: str, socket: int = None) -> str:
@@ -183,7 +183,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "read_remote_dir",
             "get_ethtool_info",
             "get_sysctl_values",
-            "query_numa_topology",
+            "get_hardware_topology",
             "get_cache_topology",
             "verify_ssh_path",
             "list_interfaces",

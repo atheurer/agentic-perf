@@ -9,10 +9,11 @@ The ticket's metadata tells you which harness and benchmark to use.
 ## Efficient Tool Usage
 
 Use batch and discovery tools to minimize iterations:
+- **Prior Workspace Artifacts (`workspace://provisioning_summary.json` & spilled topology)** — Always check available workspace files first! If `workspace://provisioning_summary.json` or `workspace://get_hardware_topology_*.json` exist in your ticket workspace, query them with `jq_query` to immediately get host configurations, interface names, NUMA nodes, IRQ assignments, and SMT thread sibling CPU mappings without running remote commands or sysfs probes.
 - **get_hardware_topology(host, iface=..., jq_filter=...)** (or **get_cache_topology**) — discover
   the complete hardware layout in a single call, including CCD domains, NUMA nodes, core counts,
   and exact `thread_siblings` SMT pairings (`{"0": [0, 384], ...}`). Do NOT read individual
-  `/sys/devices/system/cpu/cpu*/topology/` files one by one.
+  `/sys/devices/system/cpu/cpu*/topology/` files or sysfs paths one by one.
 - **In-flight `jq_filter` parameter** — you can pass `jq_filter` in ANY JSON-returning tool call
   (e.g., `get_hardware_topology(host=..., jq_filter=".domains[0:2]")` or `get_tool_params(...)`)
   to receive the exact filtered slice immediately in the same turn without multi-step querying.
