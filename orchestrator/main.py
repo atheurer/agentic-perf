@@ -518,12 +518,18 @@ async def run_agent_task(
                         agent.max_iterations = 0
                     max_iter_override = cf.get("max_iterations_override")
                     if max_iter_override is not None:
-                        agent.max_iterations = int(max_iter_override)
-                        agent._max_iterations_is_override = True
-                        logger.info(
-                            f"Max iterations override for {ticket_id}:"
-                            f" {max_iter_override}"
-                        )
+                        try:
+                            agent.max_iterations = int(max_iter_override)
+                            agent._max_iterations_is_override = True
+                            logger.info(
+                                f"Max iterations override for {ticket_id}:"
+                                f" {max_iter_override}"
+                            )
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                f"Invalid max_iterations_override for {ticket_id}:"
+                                f" {max_iter_override!r}"
+                            )
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
                         override_llm = _make_llm_provider(

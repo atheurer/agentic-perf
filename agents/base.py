@@ -84,6 +84,9 @@ class AgentBase(ABC):
     # backoff (min 15s, doubling each attempt, capped at 5m).
     LLM_RATE_LIMIT_RETRIES = 5
 
+    # Class-level default for mock spec compatibility
+    _max_iterations_is_override = False
+
     def __init__(
         self,
         agent_name: str,
@@ -812,6 +815,7 @@ class AgentBase(ABC):
             raise
         finally:
             self.max_iterations = configured_max
+            self._max_iterations_is_override = False
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
