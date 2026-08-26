@@ -8,8 +8,6 @@ from typing import Any
 import pytest
 
 from agents.infra.topology import (
-    CacheDomain,
-    CacheTopologyResult,
     discover_cache_topology,
     format_cpu_list,
     parse_cpu_list,
@@ -17,7 +15,6 @@ from agents.infra.topology import (
     parse_topology_data,
 )
 from tests.conftest import MockSSHExecutor, SSHResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers to build mock topology data
@@ -131,15 +128,9 @@ def make_intel_xeon_mock_data() -> dict[str, Any]:
 
     for socket_id in (0, 1):
         for core in range(32):
-            cpu0 = (
-                socket_id * 32 + core
-            )  # Socket 0: 0-31; Socket 1: 32-63
-            cpu1 = (
-                64 + socket_id * 32 + core
-            )  # Socket 0: 64-95; Socket 1: 96-127
-            shared_str = (
-                "0-31,64-95" if socket_id == 0 else "32-63,96-127"
-            )
+            cpu0 = socket_id * 32 + core  # Socket 0: 0-31; Socket 1: 32-63
+            cpu1 = 64 + socket_id * 32 + core  # Socket 0: 64-95; Socket 1: 96-127
+            shared_str = "0-31,64-95" if socket_id == 0 else "32-63,96-127"
 
             for cpu in (cpu0, cpu1):
                 cpus[cpu] = {
@@ -225,10 +216,7 @@ class TestCpuListFormatting:
         assert format_cpu_list([0, 1, 2, 3]) == "0-3"
 
     def test_mixed_ranges(self):
-        assert (
-            format_cpu_list([0, 1, 2, 3, 8, 10, 11, 12])
-            == "0-3,8,10-12"
-        )
+        assert format_cpu_list([0, 1, 2, 3, 8, 10, 11, 12]) == "0-3,8,10-12"
 
     def test_turin_ccd_formatting(self):
         cpus = list(range(192, 208)) + list(range(576, 592))
@@ -489,23 +477,15 @@ class TestDiscoverCacheTopologySSH:
     async def test_ssh_success(self):
         mock_data = make_turin_mock_data()
         mock_ssh = MockSSHExecutor(
-            results={
-                "python3 -c": SSHResult(
-                    exit_code=0, stdout=json.dumps(mock_data)
-                )
-            }
+            results={"python3 -c": SSHResult(exit_code=0, stdout=json.dumps(mock_data))}
         )
 
-        res = await discover_cache_topology(
-            mock_ssh, "10.0.0.1", socket=1
-        )
+        res = await discover_cache_topology(mock_ssh, "10.0.0.1", socket=1)
         assert res["host"] == "10.0.0.1"
         assert res["socket"] == 1
         assert res["total_ccds"] == 24
         assert "0" in res["ccds"]
-        assert res["ccds"]["0"] == list(range(192, 208)) + list(
-            range(576, 592)
-        )
+        assert res["ccds"]["0"] == list(range(192, 208)) + list(range(576, 592))
 
     @pytest.mark.asyncio
     async def test_ssh_script_fail_lscpu_fallback(self):
@@ -531,9 +511,7 @@ class TestDiscoverCacheTopologySSH:
         )
         mock_ssh = MockSSHExecutor(
             results={
-                "python3 -c": SSHResult(
-                    exit_code=1, stderr="python3 not found"
-                ),
+                "python3 -c": SSHResult(exit_code=1, stderr="python3 not found"),
                 "lscpu -e -J": SSHResult(exit_code=0, stdout=lscpu_json),
             }
         )
@@ -547,12 +525,8 @@ class TestDiscoverCacheTopologySSH:
     async def test_ssh_all_fail(self):
         mock_ssh = MockSSHExecutor(
             results={
-                "python3 -c": SSHResult(
-                    exit_code=1, stderr="SSH connection failed"
-                ),
-                "lscpu -e -J": SSHResult(
-                    exit_code=1, stderr="Command not found"
-                ),
+                "python3 -c": SSHResult(exit_code=1, stderr="SSH connection failed"),
+                "lscpu -e -J": SSHResult(exit_code=1, stderr="Command not found"),
             }
         )
 

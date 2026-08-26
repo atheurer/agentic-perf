@@ -328,4 +328,3 @@ class TestGetCacheTopology:
         assert data["ccds"]["0"] == [0, 1, 2, 3]
         assert data["domains"][0]["cpu_list"] == "0-3"
         assert data["domains"][0]["size"] == "32M"
-

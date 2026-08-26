@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shlex
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
-from providers.ssh import SSHExecutor, SSHResult
+from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -292,9 +291,7 @@ def parse_topology_data(
     vendor = system_info.get("vendor")
     model = system_info.get("model")
     architecture = system_info.get("arch")
-    nodes: dict[int, str] = {
-        int(k): str(v) for k, v in data.get("nodes", {}).items()
-    }
+    nodes: dict[int, str] = {int(k): str(v) for k, v in data.get("nodes", {}).items()}
     cpus_dict: dict[int, dict[str, Any]] = {
         int(k): v for k, v in data.get("cpus", {}).items()
     }
@@ -390,10 +387,7 @@ def parse_topology_data(
                         domain_map[key]["size"] = size
                     if die_id is not None and domain_map[key]["die_id"] is None:
                         domain_map[key]["die_id"] = die_id
-                    if (
-                        cluster_id is not None
-                        and domain_map[key]["cluster_id"] is None
-                    ):
+                    if cluster_id is not None and domain_map[key]["cluster_id"] is None:
                         domain_map[key]["cluster_id"] = cluster_id
             else:
                 # No cache entry for this CPU, fallback to cluster/die or core
@@ -446,9 +440,7 @@ def parse_topology_data(
             ccds[ccd_id] = cpu_list_sorted
             domain = CacheDomain(
                 ccd_id=ccd_id,
-                cache_id=d_info["cache_id"]
-                if d_info["cache_id"] is not None
-                else idx,
+                cache_id=d_info["cache_id"] if d_info["cache_id"] is not None else idx,
                 socket_id=d_info["socket_id"],
                 numa_node=numa_node,
                 cpus=cpu_list_sorted,
@@ -626,9 +618,7 @@ def _parse_lscpu_cpus(
         ccds[ccd_id] = cpu_list_sorted
         domain = CacheDomain(
             ccd_id=ccd_id,
-            cache_id=d_info["cache_id"]
-            if d_info["cache_id"] is not None
-            else idx,
+            cache_id=d_info["cache_id"] if d_info["cache_id"] is not None else idx,
             socket_id=d_info["socket_id"],
             numa_node=d_info["numa_node"],
             cpus=cpu_list_sorted,
