@@ -206,11 +206,13 @@ class OpenAICompatLLMProvider(LLMProvider):
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            prompt_t = getattr(u, "prompt_tokens", 0) or 0
             usage = {
-                "input_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                "input_tokens": prompt_t,
                 "output_tokens": getattr(u, "completion_tokens", 0) or 0,
                 "cache_read_input_tokens": 0,
                 "cache_creation_input_tokens": 0,
+                "context_tokens": prompt_t,
                 "model": getattr(response, "model", None) or model,
             }
 

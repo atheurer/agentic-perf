@@ -84,6 +84,9 @@ class AgentBase(ABC):
     # backoff (min 15s, doubling each attempt, capped at 5m).
     LLM_RATE_LIMIT_RETRIES = 5
 
+    # Class-level default for mock spec compatibility
+    _max_iterations_is_override = False
+
     def __init__(
         self,
         agent_name: str,
@@ -114,6 +117,7 @@ class AgentBase(ABC):
             else self.DEFAULT_MAX_ITERATIONS
         )
         self._stop_requested = False
+        self._max_iterations_is_override = False
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -199,6 +203,7 @@ class AgentBase(ABC):
                 "initial_messages": messages,
             },
         )
+        configured_max = self.max_iterations
         try:
             try:
                 previous_agent_iterations, previous_global_iterations = (
@@ -207,6 +212,20 @@ class AgentBase(ABC):
             except Exception:
                 previous_agent_iterations, previous_global_iterations = 0, 0
             iteration = previous_agent_iterations
+
+            # Override is additive: grant N new iterations on
+            # top of what was already consumed in prior runs.
+            if (
+                self._max_iterations_is_override
+                and previous_agent_iterations > 0
+                and configured_max > 0
+            ):
+                self.max_iterations = configured_max + previous_agent_iterations
+                logger.info(
+                    f"[{self.agent_name}] Additive override:"
+                    f" {configured_max} new iterations"
+                    f" (effective limit {self.max_iterations})"
+                )
 
             if self.max_iterations > 0:
                 remaining_agent = max(
@@ -230,12 +249,14 @@ class AgentBase(ABC):
                     }
                 )
 
-            self._budget_grace = False
-            self._iteration_grace = False
+            self._wrapup_reason: str | None = None
+            self._context_warned = False
             while (
                 self.max_iterations == 0
                 or iteration < self.max_iterations
-                or (self._iteration_grace and iteration == self.max_iterations)
+                or (
+                    self._wrapup_reason is not None and iteration == self.max_iterations
+                )
             ):
                 if self._stop_requested:
                     self._emit(
@@ -491,16 +512,70 @@ class AgentBase(ABC):
                         response.usage,
                     )
 
+                # --- Context guard (checked first) ---
+                if (
+                    response.usage
+                    and self._events
+                    and iteration >= 1
+                    and self._wrapup_reason is None
+                ):
+                    ctx_action = await self._check_context(
+                        ticket_id,
+                        response.usage,
+                    )
+                    if ctx_action == "pause":
+                        if self._wrapup_reason is None:
+                            self._wrapup_reason = "context"
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your context window "
+                                        "is nearly full. You MUST wrap "
+                                        "up immediately: submit your "
+                                        "best result now using your "
+                                        "submit_* tool, even if "
+                                        "incomplete. Raising the token "
+                                        "budget will NOT help — this "
+                                        "is a model input-size limit. "
+                                        "This is your final LLM call."
+                                    ),
+                                }
+                            )
+                            continue
+                    elif ctx_action == "warn":
+                        if not getattr(self, "_context_warned", False):
+                            self._context_warned = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Context warning: "
+                                        "your conversation is "
+                                        "approaching the model's "
+                                        "context window limit. Begin "
+                                        "wrapping up your work. "
+                                        "Finish critical in-progress "
+                                        "steps, then submit results."
+                                    ),
+                                }
+                            )
+
+                # Context grace used — hard stop (before budget
+                # so the right handler fires).
+                if self._wrapup_reason == "context":
+                    await self._save_messages(ticket_id, messages)
+                    await self._handle_context_pause(ticket_id)
+                    break
+
+                # --- Budget guard ---
                 if self._events and iteration > 1:
                     budget_status = await self._check_budget(
                         ticket_id,
                     )
                     if budget_status == "pause":
-                        # Inject a final system message so the
-                        # LLM can wrap up gracefully before we
-                        # cut it off on the next iteration.
-                        if not getattr(self, "_budget_grace", False):
-                            self._budget_grace = True
+                        if self._wrapup_reason is None:
+                            self._wrapup_reason = "budget"
                             messages.append(
                                 {
                                     "role": "user",
@@ -518,14 +593,12 @@ class AgentBase(ABC):
                                     ),
                                 }
                             )
-                            continue  # one more LLM call
+                            continue
                         # Grace iteration used — hard stop.
                         await self._save_messages(ticket_id, messages)
                         await self._handle_budget_pause(ticket_id)
                         break
                     if budget_status == "warn":
-                        # Soft limit: inform the LLM so it can
-                        # start winding down proactively.
                         messages.append(
                             {
                                 "role": "user",
@@ -541,6 +614,7 @@ class AgentBase(ABC):
                             }
                         )
 
+                # --- Iteration guard ---
                 if self.max_iterations > 0 and iteration > 1:
                     remaining = self.max_iterations - iteration
                     warn_at = max(1, self.max_iterations * 3 // 4)
@@ -560,8 +634,8 @@ class AgentBase(ABC):
                             }
                         )
                     elif remaining == 0:
-                        if not self._iteration_grace:
-                            self._iteration_grace = True
+                        if self._wrapup_reason is None:
+                            self._wrapup_reason = "iteration"
                             messages.append(
                                 {
                                     "role": "user",
@@ -794,6 +868,9 @@ class AgentBase(ABC):
         except Exception as e:
             self._emit(ticket_id, "agent_error", {"reason": str(e)})
             raise
+        finally:
+            self.max_iterations = configured_max
+            self._max_iterations_is_override = False
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
@@ -1029,6 +1106,110 @@ class AgentBase(ABC):
             "awaiting_customer_guidance",
             comment=(f"{self.agent_name} budget exhausted — pausing for guidance"),
         )
+
+    async def _handle_context_pause(self, ticket_id: str) -> None:
+        """Handle context-window pause during agent execution.
+
+        Delegates to _handle_budget_pause for the transition
+        but posts a distinct comment so the user knows
+        raising llm_budget will not help.
+        """
+        await self._add_comment(
+            ticket_id,
+            f"**Agent {self.agent_name} paused: context "
+            f"window nearly full.**\n\n"
+            f"The model's input context window is approaching "
+            f"its limit. Raising the token budget will not "
+            f"help — the conversation history is too large "
+            f"for the model. Partial results may be available.",
+        )
+        await self._transition_ticket(
+            ticket_id,
+            "awaiting_customer_guidance",
+            comment=(f"{self.agent_name} context window full — pausing for guidance"),
+        )
+
+    async def _check_context(
+        self,
+        ticket_id: str,
+        usage: dict[str, Any],
+    ) -> str:
+        """Check context usage against the model's window.
+
+        Returns 'ok', 'warn', or 'pause'.
+        """
+        try:
+            from orchestrator.config import _load_config_file
+            from providers.context_guard import (
+                ContextAction,
+                check_context_usage,
+                context_guard_from_config,
+                context_guard_from_custom_fields,
+            )
+            from providers.cost import get_context_window
+
+            config = _load_config_file()
+            guard_cfg = context_guard_from_config(config)
+
+            if not guard_cfg.get("enabled", True):
+                return "ok"
+
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            guard = context_guard_from_custom_fields(cf, guard_cfg)
+
+            if not guard.get("enabled", True):
+                return "ok"
+
+            context_tokens = usage.get("context_tokens", 0)
+            if context_tokens <= 0:
+                return "ok"
+
+            model = usage.get("model", "")
+            config_default = guard.get("default_context_window", 0)
+            if model:
+                context_window = max(
+                    get_context_window(model),
+                    config_default,
+                )
+            else:
+                context_window = config_default
+            if context_window <= 0:
+                return "ok"
+
+            action, reason = check_context_usage(
+                context_tokens,
+                context_window,
+                warn_pct=guard.get("warn_pct", 60.0),
+                pause_pct=guard.get("pause_pct", 80.0),
+            )
+
+            if action == ContextAction.PAUSE:
+                self._emit(
+                    ticket_id,
+                    "agent_error",
+                    {
+                        "reason": "context_window_full",
+                        "detail": reason,
+                    },
+                )
+                logger.warning(
+                    f"[{self.agent_name}] Context window full on {ticket_id}: {reason}"
+                )
+                return "pause"
+
+            if action == ContextAction.WARN:
+                logger.info(
+                    f"[{self.agent_name}] Context warning on {ticket_id}: {reason}"
+                )
+                return "warn"
+
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(f"[{self.agent_name}] Context check failed")
+
+        return "ok"
 
     async def _check_budget(self, ticket_id: str) -> str:
         """Check per-ticket LLM budget and per-user quota.

@@ -82,6 +82,19 @@ class TestHandleCompletionIPGuard:
                 "_plan_controls_next_transition",
                 return_value=False,
             ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.1",
+                            "targets": ["10.0.0.1"],
+                        },
+                    },
+                },
+            ),
         ):
             await agent._handle_completion("PERF-TEST", response)
 
@@ -140,15 +153,15 @@ class TestHandleCompletionIPGuard:
             assert "assigned_hardware_ips" not in fields
 
     @pytest.mark.asyncio
-    async def test_ssh_hardware_ips_derived_from_hosts_provisioned(self):
-        """ssh_hardware_ips is provisioning's own output and should
-        reflect which hosts were actually SSH-provisioned."""
+    async def test_ssh_hardware_ips_projects_onto_assigned_roles(self):
+        """ssh_hardware_ips is derived by projecting hosts_provisioned
+        onto assigned_hardware_ips role map from the resource agent."""
         agent = _make_agent()
 
         response = _make_response(
             {
                 "provisioning_complete": True,
-                "hosts_provisioned": ["10.0.0.5"],
+                "hosts_provisioned": ["10.0.0.5", "10.0.0.6"],
                 "harness_name": "crucible",
                 "harness_version": "1.0",
             }
@@ -175,19 +188,32 @@ class TestHandleCompletionIPGuard:
                 "_plan_controls_next_transition",
                 return_value=False,
             ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.5",
+                            "targets": ["10.0.0.5", "10.0.0.6"],
+                        },
+                    },
+                },
+            ),
         ):
             await agent._handle_completion("PERF-TEST", response)
 
             fields = mock_fields.call_args[0][1]
             assert fields["ssh_hardware_ips"] == {
                 "controller": "10.0.0.5",
-                "targets": ["10.0.0.5"],
+                "targets": ["10.0.0.5", "10.0.0.6"],
             }
 
     @pytest.mark.asyncio
-    async def test_get_ticket_not_called_for_normal_submission(self):
-        """Normal submissions (no assigned_hardware_ips in result)
-        should not make extra HTTP calls to read the ticket."""
+    async def test_get_ticket_called_for_role_projection(self):
+        """Provisioning reads the ticket to project hosts onto
+        assigned_hardware_ips role map."""
         agent = _make_agent()
 
         response = _make_response(
@@ -224,10 +250,18 @@ class TestHandleCompletionIPGuard:
                 agent,
                 "_get_ticket",
                 new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.1",
+                            "targets": [],
+                        },
+                    },
+                },
             ) as mock_get,
         ):
             await agent._handle_completion("PERF-TEST", response)
-            mock_get.assert_not_called()
+            mock_get.assert_called_once()
 
 
 # ------------------------------------------------------------------
@@ -301,3 +335,248 @@ class TestHandoffAfterFix:
         }
         ok, reason = check_handoff("awaiting_provision", ticket)
         assert ok, f"Single-host should pass: {reason}"
+
+
+# ------------------------------------------------------------------
+# ssh_hardware_ips role projection: controller-only provisioning
+# on a multi-host ticket (#577)
+# ------------------------------------------------------------------
+
+
+class TestRoleProjection:
+    @pytest.mark.asyncio
+    async def test_controller_only_provisioned_multi_host(self):
+        """When only the controller was provisioned on a 3-host
+        ticket, ssh_hardware_ips reflects controller only."""
+        agent = _make_agent()
+
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.1"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+            }
+        )
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_plan_controls_next_transition",
+                return_value=False,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.1",
+                            "targets": ["10.0.0.2", "10.0.0.3"],
+                        },
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert fields["ssh_hardware_ips"] == {
+                "controller": "10.0.0.1",
+                "targets": [],
+            }
+
+    @pytest.mark.asyncio
+    async def test_no_assigned_ips_falls_back_to_first_host(self):
+        """When ticket has no assigned_hardware_ips, provisioning
+        falls back to first provisioned host as controller."""
+        agent = _make_agent()
+
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.99"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+            }
+        )
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_plan_controls_next_transition",
+                return_value=False,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={"custom_fields": {}},
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert fields["ssh_hardware_ips"] == {
+                "controller": "10.0.0.99",
+                "targets": ["10.0.0.99"],
+            }
+
+
+# ------------------------------------------------------------------
+# Platform agent: assigned_hardware_ips scoping (#577)
+# ------------------------------------------------------------------
+
+
+class TestPlatformIPScoping:
+    @pytest.mark.asyncio
+    async def test_jumpstarter_writes_assigned_ips(self):
+        """Platform agent writes assigned_hardware_ips only for
+        jumpstarter provider."""
+        from agents.platform.agent import PlatformAgent
+
+        agent = PlatformAgent.__new__(PlatformAgent)
+        agent.agent_name = "platform-agent"
+        agent.llm = MagicMock()
+        agent.store_url = "http://localhost:8090"
+        agent.tools = []
+        agent._tool_handlers = {}
+        agent._events = None
+        agent._mcp = None
+        agent._stop_requested = False
+        agent._client = AsyncMock()
+
+        tc = MagicMock()
+        tc.name = "submit_platform_result"
+        tc.input = {
+            "platform_ready": True,
+            "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+        }
+        response = MagicMock()
+        response.text = ""
+        response.tool_calls = [tc]
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "jumpstarter",
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert fields["assigned_hardware_ips"] == {
+                "controller": "10.0.0.1",
+                "targets": ["10.0.0.2"],
+            }
+
+    @pytest.mark.asyncio
+    async def test_non_jumpstarter_skips_assigned_ips(self):
+        """Platform agent does NOT write assigned_hardware_ips for
+        non-jumpstarter providers (field owned by resource agent)."""
+        from agents.platform.agent import PlatformAgent
+
+        agent = PlatformAgent.__new__(PlatformAgent)
+        agent.agent_name = "platform-agent"
+        agent.llm = MagicMock()
+        agent.store_url = "http://localhost:8090"
+        agent.tools = []
+        agent._tool_handlers = {}
+        agent._events = None
+        agent._mcp = None
+        agent._stop_requested = False
+        agent._client = AsyncMock()
+
+        tc = MagicMock()
+        tc.name = "submit_platform_result"
+        tc.input = {
+            "platform_ready": True,
+            "hosts_provisioned": ["10.0.0.1"],
+        }
+        response = MagicMock()
+        response.text = ""
+        response.tool_calls = [tc]
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "user_provided",
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert "assigned_hardware_ips" not in fields

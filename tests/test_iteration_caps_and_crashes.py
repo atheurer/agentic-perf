@@ -1,4 +1,4 @@
-"""Tests for cumulative agent iterations, global iteration caps, and EventBus budget state recovery."""
+"""Tests for cumulative agent iterations, global iteration caps, override semantics, and EventBus budget state recovery."""
 
 from __future__ import annotations
 
@@ -261,3 +261,128 @@ def test_event_bus_loads_cumulative_from_file(tmp_path):
     assert "other-agent" in agent_usage
     assert agent_usage["other-agent"]["input_tokens"] == 200
     assert agent_usage["other-agent"]["output_tokens"] == 80
+
+
+# --- Override additive semantics ---
+
+
+def _prewrite_events(path, agent_name, count):
+    """Write count llm_request events to a JSONL log file."""
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(count):
+            f.write(
+                json.dumps(
+                    {
+                        "seq": i + 1,
+                        "agent": agent_name,
+                        "event_type": "llm_request",
+                        "data": {"iteration": i},
+                    }
+                )
+                + "\n"
+            )
+
+
+def _make_agent(llm, event_bus, max_iterations=5):
+    agent = _StubAgent(
+        agent_name="test-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=event_bus,
+        max_iterations=max_iterations,
+    )
+    return agent
+
+
+def _mock_client(ticket_id, custom_fields=None):
+    """Return a mock httpx client wired to a ticket."""
+    ticket_data = {
+        "id": ticket_id,
+        "status": "triage_pending",
+        "summary": "test",
+        "custom_fields": custom_fields or {},
+    }
+    client = AsyncMock()
+    client.get = AsyncMock(
+        return_value=AsyncMock(
+            status_code=200,
+            json=lambda: ticket_data,
+            raise_for_status=lambda: None,
+        ),
+    )
+    client.post = AsyncMock(
+        return_value=AsyncMock(
+            status_code=200,
+            json=lambda: {},
+            raise_for_status=lambda: None,
+        ),
+    )
+    client.patch = AsyncMock(
+        return_value=AsyncMock(
+            status_code=200,
+            json=lambda: {},
+            raise_for_status=lambda: None,
+        ),
+    )
+    return client
+
+
+@pytest.mark.asyncio
+async def test_override_is_additive(tmp_path):
+    """Override=10 after 20 prior iterations grants 10 NEW iterations, not 10 total."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ticket_id = "PERF-OVERRIDE"
+    _prewrite_events(log_dir / f"{ticket_id}.jsonl", "test-agent", 20)
+
+    event_bus = EventBus(log_dir=log_dir)
+    llm = _InfiniteToolLLM()
+    agent = _make_agent(llm, event_bus, max_iterations=10)
+    agent._max_iterations_is_override = True
+    agent._client = _mock_client(ticket_id)
+
+    await agent.run(ticket_id)
+
+    # 10 new + 1 grace = 11 LLM calls
+    assert llm.call_count == 11
+    # Configured value is restored after run (no mutation)
+    assert agent.max_iterations == 10
+
+
+@pytest.mark.asyncio
+async def test_override_without_prior_iterations(tmp_path):
+    """Override on a fresh ticket works like an absolute limit."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ticket_id = "PERF-FRESH"
+
+    event_bus = EventBus(log_dir=log_dir)
+    llm = _InfiniteToolLLM()
+    agent = _make_agent(llm, event_bus, max_iterations=5)
+    agent._max_iterations_is_override = True
+    agent._client = _mock_client(ticket_id)
+
+    await agent.run(ticket_id)
+
+    # No prior iterations, so 5 + 1 grace = 6 calls
+    assert llm.call_count == 6
+
+
+@pytest.mark.asyncio
+async def test_non_override_retains_lifetime_semantics(tmp_path):
+    """Without the override flag, max_iterations is still a lifetime total."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ticket_id = "PERF-LIFETIME"
+    _prewrite_events(log_dir / f"{ticket_id}.jsonl", "test-agent", 3)
+
+    event_bus = EventBus(log_dir=log_dir)
+    llm = _InfiniteToolLLM()
+    agent = _make_agent(llm, event_bus, max_iterations=5)
+    # NOT setting _max_iterations_is_override — default path
+    agent._client = _mock_client(ticket_id)
+
+    await agent.run(ticket_id)
+
+    # Lifetime: 5 total - 3 prior = 2 remaining + 1 grace = 3 calls
+    assert llm.call_count == 3

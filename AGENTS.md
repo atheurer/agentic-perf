@@ -19,6 +19,7 @@ install tooling, execute benchmarks, and deliver structured analysis.
 | `agents/{name}/server.py` | FastMCP tool server (runtime MCP subprocess) |
 | `agents/introspection/agent.py` | Continuous passive observer (not AgentBase) |
 | `agents/fleet/agent.py` | Fleet coordinator — deterministic iteration lifecycle (not AgentBase) |
+| `agents/image_builder/agent.py` | Custom image builds via pluggable providers (not AgentBase) |
 | `agents/mcp_client.py` | MCP client for multi-server tool routing |
 | `orchestrator/dispatcher.py` | Status → agent mapping, dispatch logic |
 | `orchestrator/main.py` | Poll loop, provider initialization |
@@ -143,7 +144,7 @@ Always include `AI-assisted-by: <model>` when AI was used.
 ### Testing
 
 - **Framework:** pytest + pytest-asyncio (asyncio_mode = auto)
-- **Coverage:** pytest-cov, threshold 40% (baseline ~41%)
+- **Coverage:** pytest-cov, threshold 33% (see `pyproject.toml`)
 - **Mock LLM:** `providers/llm/mock.py` — no API keys needed
 - **Scripts:** `./scripts/test.sh`, `./scripts/lint.sh`,
   `./scripts/validate.sh` (CI and debugging use only)
@@ -159,6 +160,14 @@ name so the hook can find them:
 
 Generic source names (`agent.py`, `server.py`, `prompts.py`)
 fall back to matching on the parent directory name.
+
+**Test isolation:** Tests run against a temporary
+`AGENTIC_PERF_HOME` directory created by `tests/conftest.py`.
+Never construct `TicketStore`, `AuditLog`, or `EventBus` without
+an explicit `persist_dir`/`log_dir` (or `tmp_path`), except in
+tests that deliberately verify the sandboxed defaults (see
+`test_path_isolation.py`). Never assert on global ticket
+counts — other tests in the same session share the sandbox.
 
 ### Git Hooks
 

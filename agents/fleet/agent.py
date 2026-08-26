@@ -63,8 +63,21 @@ class FleetCoordinatorAgent:
 
     async def run(self, ticket_id: str) -> None:
         """Coordinate one fleet iteration step."""
-        self._emit(ticket_id, "agent_started", {})
         try:
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            from providers.fleet import get_fleet_progress
+
+            progress = get_fleet_progress(cf)
+            self._emit(
+                ticket_id,
+                "agent_started",
+                {
+                    "tested": progress["tested"],
+                    "completed": progress["completed"],
+                    "partial": progress["partial"],
+                },
+            )
             await self._coordinate(ticket_id)
         except Exception as e:
             logger.error(

@@ -318,12 +318,14 @@ class GeminiLLMProvider(LLMProvider):
         usage = None
         um = getattr(response, "usage_metadata", None)
         if um is not None:
+            prompt_t = getattr(um, "prompt_token_count", 0) or 0
             usage = {
-                "input_tokens": getattr(um, "prompt_token_count", 0) or 0,
+                "input_tokens": prompt_t,
                 "output_tokens": getattr(um, "candidates_token_count", 0) or 0,
                 "cache_read_input_tokens": getattr(um, "cached_content_token_count", 0)
                 or 0,
                 "cache_creation_input_tokens": 0,
+                "context_tokens": prompt_t,
                 "model": model,
             }
 

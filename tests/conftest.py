@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import atexit
+import os as _os
+import shutil as _shutil
+import tempfile as _tempfile
+import warnings as _warnings
+
+_TEST_HOME = _tempfile.mkdtemp(prefix="agentic-perf-tests-")
+_os.environ["AGENTIC_PERF_HOME"] = _TEST_HOME
+_os.environ["AGENTIC_PERF_SECRETS"] = _os.path.join(_TEST_HOME, "secrets")
+_os.environ["AGENTIC_PERF_SKILLS"] = _os.path.join(_TEST_HOME, "private-skills")
+_os.environ["AGENTIC_PERF_ARTIFACTS"] = _os.path.join(_TEST_HOME, "artifacts")
+
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -354,3 +366,29 @@ def make_resource_handlers(
             return _wrapper
 
     return _Handlers()
+
+
+# ---------------------------------------------------------------------------
+# Test sandbox cleanup
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_test_home() -> None:
+    """Best-effort removal of the per-session sandbox directory."""
+    try:
+        _shutil.rmtree(_TEST_HOME)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _warnings.warn(
+            f"Could not remove test sandbox {_TEST_HOME}: {exc}",
+            stacklevel=1,
+        )
+
+
+atexit.register(_cleanup_test_home)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Clean up the test sandbox directory at session end."""
+    _cleanup_test_home()

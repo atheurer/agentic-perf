@@ -252,14 +252,19 @@ Individual tickets can override this via
 
 Individual tickets can override the per-agent limit at runtime via
 `custom_fields.max_iterations_override`. This takes precedence over
-both config and built-in defaults:
+both config and built-in defaults. The override is **additive**: it
+grants N new iterations on top of what the agent already consumed in
+prior runs, so setting `max_iterations_override=40` after a 20-iteration
+run gives the agent 40 fresh iterations on re-dispatch.
 
 ```bash
-curl -X PATCH .../api/v1/tickets/PERF-123 \
-  -d '{"custom_fields": {"max_iterations_override": 200}}'
+curl -X PATCH .../api/v1/tickets/PERF-123/fields \
+  -d '{"fields": {"max_iterations_override": 40}}'
 ```
 
-The override is cleared after the agent completes.
+The override is preserved while the ticket is paused
+(`awaiting_customer_guidance`) and cleared after the agent
+completes successfully.
 
 #### Migration Note
 
@@ -359,6 +364,68 @@ creator.
 
 **Legacy mode:** quotas are a no-op when `multi_user` is false
 (`created_by` is always empty).
+
+---
+
+### `context_guard` — Context-Window Guardrails
+
+Monitors per-call context token usage against the model's
+context window and pauses the agent before it hits the
+provider's hard limit. Without this, a context overflow
+surfaces as an opaque API error, wasting the iteration.
+
+```json
+{
+    "context_guard": {
+        "enabled": true,
+        "warn_pct": 60,
+        "pause_pct": 80,
+        "default_context_window": 200000
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable the context guard globally. |
+| `warn_pct` | float | `60` | Percentage of context window at which the agent receives a wrap-up warning. Set to `0` to disable. |
+| `pause_pct` | float | `80` | Percentage of context window at which the agent is paused. Set to `0` to disable. |
+| `default_context_window` | int | `0` | Fallback context window when the model is unknown. `0` uses the pricing.yaml fallback (128k). |
+
+**Context window discovery:** window sizes are looked up from
+`providers/cost/pricing.yaml` using the model name from the
+LLM response usage. Users can also add `context_window` to
+their custom `~/.agentic-perf/pricing.yaml`. If a user pricing
+file lacks `context_window` for a model, the bundled default is
+used (per-key fallback, not per-file).
+
+**Per-ticket override:** individual tickets can override
+`warn_pct`, `pause_pct`, and `enabled` via
+`custom_fields.context_guard`:
+
+```bash
+curl -X PATCH .../api/v1/tickets/PERF-123 \
+  -d '{"fields": {"context_guard": {"warn_pct": 70, "pause_pct": 90}}}'
+```
+
+**Behavior:**
+
+- **Warn:** injects a `[SYSTEM] Context warning` message into
+  the conversation (once per run). The agent can start wrapping
+  up proactively.
+- **Pause:** grants one grace iteration with a final-call
+  message, then saves conversation state and transitions to
+  `awaiting_customer_guidance`. The pause comment explicitly
+  notes that raising `llm_budget` will not help — the
+  conversation is too large for the model's input window.
+
+**Check order:** context → budget → iteration. Only one grace
+iteration is granted regardless of which guardrail fires first.
+
+**Investigation agents (`max_iterations=0`):** the context
+guard fires normally. This is the primary safety net for
+unlimited-iteration agents that would otherwise hit the
+provider's hard context limit.
 
 ---
 
@@ -485,6 +552,116 @@ provisioning.
 Jumpstarter also requires:
 - **Secrets:** `~/.agentic-perf/secrets/jumpstarter/config.json` with `{"client_name": "<name>"}` matching the jmp CLI client config.
 - **CLI config:** `~/.config/jumpstarter/clients/<name>.yaml` with controller endpoint and token.
+
+---
+
+### `image_build` — Custom Image Building (CAIB)
+
+Configuration for building custom OS images via the
+[CAIB](https://gitlab.com/CentOS/automotive/infra/caib) pipeline.
+When a ticket includes `image_build` directives, the image builder
+agent uses these settings to build, push, and manage images.
+
+```json
+{
+    "image_build": {
+        "push_registry": "quay.io/redhat-performance/rhivos-agentic-perf-caib",
+        "tag_expiration_days": 14
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `push_registry` | string | — | Quay.io registry path for pushing built images. Required for CAIB builds. |
+| `tag_expiration_days` | int | `14` | Days before Quay auto-deletes the image tag. Set via Quay API after push. |
+
+#### Secrets
+
+| Path | Description |
+|---|---|
+| `secrets/caib/token` | CAIB API authentication token |
+| `secrets/caib/registry-auth.json` | Docker auth.json for pushing images to the registry (robot account) |
+| `secrets/quay/api-token` | *(Optional)* Quay OAuth token with "Administer Repositories" scope |
+
+**Tag expiration** uses the Quay REST API (Bearer auth). The token
+is resolved in order:
+
+1. **Robot account token** from `registry-auth.json` — preferred
+   because it is already repo-scoped. The robot account must have
+   admin access to the target repository.
+2. **Dedicated OAuth token** from `secrets/quay/api-token` —
+   fallback, requires "Administer Repositories" scope.
+
+If neither is available, tag expiration is silently skipped.
+
+#### Ticket Directives
+
+Custom image builds are requested via `image_build` in the ticket's
+`custom_fields`:
+
+```json
+{
+    "custom_fields": {
+        "image_build": {
+            "provider": "caib",
+            "target": "ebbr",
+            "customizations": {
+                "masked_services": ["podman-clean-transient.service"],
+                "additional_rpms": ["strace", "perf"]
+            }
+        }
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `provider` | string | `"caib"` | Image build provider name |
+| `target` | string | auto-resolved | CAIB target (e.g., `ebbr` for S32G/R-Car S4). Auto-resolved from `board_selector` if omitted. |
+| `customizations` | object | `{}` | Provider-specific customizations (masked services, RPMs, etc.) |
+| `build_mode` | string | `build-dev` | CAIB command: `build-dev` for standalone disk images (supports `--mode package` or `--mode image`), `build` for bootc container images. Both work on all targets. Default `build-dev` produces mutable package-mode images. |
+| `ttl` | string | `"168h"` | CAIB build record time-to-live |
+
+#### OpenShift Deployment
+
+For OCP, create the secrets and mount them:
+
+```bash
+# CAIB token
+oc create secret generic agentic-perf-caib \
+  --from-file=token=secrets/caib/token \
+  --from-file=registry-auth.json=secrets/caib/registry-auth.json
+
+# Quay API token (for tag expiration)
+oc create secret generic agentic-perf-quay \
+  --from-file=api-token=secrets/quay/api-token
+```
+
+Add volume mounts to the deployment:
+
+```yaml
+volumeMounts:
+  - name: caib-secrets
+    mountPath: /data/agentic-perf/secrets/caib/token
+    subPath: token
+    readOnly: true
+  - name: caib-secrets
+    mountPath: /data/agentic-perf/secrets/caib/registry-auth.json
+    subPath: registry-auth.json
+    readOnly: true
+  - name: quay-secrets
+    mountPath: /data/agentic-perf/secrets/quay/api-token
+    subPath: api-token
+    readOnly: true
+volumes:
+  - name: caib-secrets
+    secret:
+      secretName: agentic-perf-caib
+  - name: quay-secrets
+    secret:
+      secretName: agentic-perf-quay
+```
 
 ---
 

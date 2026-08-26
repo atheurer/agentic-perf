@@ -23,6 +23,9 @@ class TicketStatus(str, Enum):
     # Data analysis before hardware provisioning
     ANALYZING = "analyzing"
 
+    # Custom image build before hardware provisioning
+    BUILDING_IMAGE = "building_image"
+
     # Recursive investigation loop statuses (RHIVOS 03A)
     GATHERING_CONTEXT = "gathering_context"
     PLANNING_INVESTIGATION = "planning_investigation"
@@ -41,6 +44,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.TRIAGE_PENDING: [
         TicketStatus.AWAITING_HARDWARE,
         TicketStatus.ANALYZING,  # data analysis path
+        TicketStatus.BUILDING_IMAGE,  # custom image build
         TicketStatus.GATHERING_CONTEXT,  # investigation path
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
@@ -104,7 +108,13 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.ANALYZING: [
         TicketStatus.AWAITING_REVIEW,  # analysis conclusive
         TicketStatus.AWAITING_HARDWARE,  # need benchmark data
+        TicketStatus.BUILDING_IMAGE,  # custom build needed
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+    ],
+    # Custom image build: deterministic, no LLM.
+    TicketStatus.BUILDING_IMAGE: [
+        TicketStatus.AWAITING_HARDWARE,  # build complete
+        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,  # build failed
     ],
     # --- Recursive investigation loop ---
     # Gathering context: check Investigation Records for dedup,
