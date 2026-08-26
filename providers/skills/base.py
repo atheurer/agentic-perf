@@ -68,4 +68,3 @@ class SkillProvider(ABC):
         self, run_file: dict[str, Any], harness: str | None = None
     ) -> dict[str, Any]:
         return {"valid": True, "errors": []}
-

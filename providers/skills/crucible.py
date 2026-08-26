@@ -56,8 +56,15 @@ class CrucibleSkillProvider(SkillProvider):
         ]
 
     def _load_tool_meta(self, name: str) -> dict[str, Any]:
-        tool_dir = self._tools_dir / name
         meta: dict[str, Any] = {"name": name}
+        if not name or not self._tools_dir.exists():
+            return meta
+        tool_dir = (self._tools_dir / name).resolve()
+        try:
+            if not tool_dir.is_relative_to(self._tools_dir.resolve()):
+                return meta
+        except (ValueError, AttributeError):
+            return meta
 
         multiplex = tool_dir / "multiplex.json"
         if multiplex.exists():
@@ -83,8 +90,15 @@ class CrucibleSkillProvider(SkillProvider):
         return meta
 
     def _load_benchmark_meta(self, name: str) -> dict[str, Any]:
-        bench_dir = self._benchmarks_dir / name
         meta: dict[str, Any] = {"name": name}
+        if not name or not self._benchmarks_dir.exists():
+            return meta
+        bench_dir = (self._benchmarks_dir / name).resolve()
+        try:
+            if not bench_dir.is_relative_to(self._benchmarks_dir.resolve()):
+                return meta
+        except (ValueError, AttributeError):
+            return meta
 
         multiplex = bench_dir / "multiplex.json"
         if multiplex.exists():
