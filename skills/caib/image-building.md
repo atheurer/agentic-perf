@@ -197,3 +197,54 @@ j storage flash oci://<registry>/<image>:<tag>
 
 The build step occurs BEFORE hardware acquisition to avoid
 holding a Jumpstarter lease during the build (~10-30 min).
+
+## Required Packages by Target
+
+The AIB base for each target is minimal. The nightly images add
+many packages via their build profiles (qa, ps). When building
+custom images, you must include packages that the nightly profile
+would normally add.
+
+### Packages required for remote access and testing
+
+These must be in `content.rpms` for any custom build that needs
+SSH access and benchmarking:
+
+```yaml
+content:
+  rpms:
+    - openssh-server
+    - chrony
+    - iproute
+    - podman
+    - NetworkManager       # critical — without this, network
+                           #   interfaces are not configured
+                           #   in Linux even if firmware assigns
+                           #   an IP via DHCP
+```
+
+### QC8775 / SA8775P (ride4_sa8775p_sx) specifics
+
+The nightly `qa/regular` image for this target uses
+`kernel-ivos-qualcomm` (NOT `kernel-automotive`). Key packages:
+
+| Package | Purpose |
+|---|---|
+| `kernel-ivos-qualcomm` | Qualcomm-specific kernel |
+| `kernel-ivos-qualcomm-modules-extra` | Additional kernel modules |
+| `kernel-ivos-qualcomm-modules-internal` | Internal kernel modules |
+| `downstream-dtbs` | Device tree blobs for SA8775P |
+| `kmod-qcom-scmi` | Qualcomm SCMI kernel module |
+| `NetworkManager` | Network interface configuration |
+| `dhcpcd` | DHCP client |
+
+When overriding the kernel via the `kernel` manifest field for
+QC8775, you must also provide matching DTBs (either via the
+kernel RPM or a separate `downstream-dtbs-*` package in
+`content.rpms`).
+
+### EBBR boards (S32G, R-Car S4) specifics
+
+EBBR boards use `kernel-automotive` and single-partition flash.
+The base package set is simpler but still requires `NetworkManager`
+for network access.
