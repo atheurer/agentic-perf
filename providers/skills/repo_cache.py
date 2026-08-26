@@ -68,6 +68,8 @@ class RepoCache:
         return sorted(results, key=lambda d: d["path"])
 
     def read_file(self, name: str, rel_path: str) -> str | None:
+        if not name:
+            return None
         repo_path = self._dir / name
         if not repo_path.exists():
             return None
@@ -101,7 +103,7 @@ class RepoCache:
         for target in candidates:
             try:
                 resolved = target.resolve()
-                if not str(resolved).startswith(str(repo_resolved)):
+                if not resolved.is_relative_to(repo_resolved):
                     continue
                 if target.is_file():
                     return target.read_text()
@@ -116,7 +118,7 @@ class RepoCache:
                         if f.is_file():
                             try:
                                 resolved = f.resolve()
-                                if str(resolved).startswith(str(repo_resolved)):
+                                if resolved.is_relative_to(repo_resolved):
                                     return f.read_text()
                             except (OSError, ValueError):
                                 continue

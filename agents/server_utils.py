@@ -553,7 +553,7 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
 
     try:
         resolved = skill_path.resolve()
-        if not str(resolved).startswith(str(skills_dir.resolve())):
+        if not resolved.is_relative_to(skills_dir.resolve()):
             return {
                 "found": False,
                 "harness": harness,

@@ -1,34 +1,26 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agents.benchmark.server import (
-    read_harness_doc as benchmark_read_harness_doc,
-)
-from agents.benchmark.server import (
-    read_skill as benchmark_read_skill,
-)
-from agents.benchmark.server import (
-    read_skills as benchmark_read_skills,
-)
-from agents.provisioning.server import (
-    read_skill as provisioning_read_skill,
-)
-from agents.provisioning.server import (
-    read_skills as provisioning_read_skills,
-)
-from agents.review.server import (
-    read_harness_doc as review_read_harness_doc,
-)
-from agents.review.server import (
-    read_skill as review_read_skill,
-)
 from agents.server_utils import read_skill_document
 from providers.skills.repo_cache import RepoCache
+
+
+def _benchmark_server():
+    return importlib.import_module("agents.benchmark.server")
+
+
+def _provisioning_server():
+    return importlib.import_module("agents.provisioning.server")
+
+
+def _review_server():
+    return importlib.import_module("agents.review.server")
 
 
 @pytest.fixture
@@ -125,7 +117,9 @@ class TestProvisioningSkillTools:
     @pytest.mark.asyncio
     async def test_read_skill_normalization(self, mock_skills_dir: Path):
         with patch("agents.provisioning.server._SKILLS_DIR", mock_skills_dir):
-            res_str = await provisioning_read_skill("general", "general/host-tuning.md")
+            res_str = await _provisioning_server().read_skill(
+                "general", "general/host-tuning.md"
+            )
             res = json.loads(res_str)
             assert res["found"] is True
             assert "Host Tuning Guide" in res["content"]
@@ -138,7 +132,7 @@ class TestProvisioningSkillTools:
                 {"harness": "", "filename": "general/network-manager.md"},
                 {"name": "skills/crucible/run-file-pitfalls.md"},
             ]
-            res_str = await provisioning_read_skills(docs)
+            res_str = await _provisioning_server().read_skills(docs)
             res = json.loads(res_str)
             assert len(res) == 3
             assert res[0]["found"] is True
@@ -156,7 +150,7 @@ class TestBenchmarkSkillAndDocTools:
             patch("agents.benchmark.server.SKILLS_DIR", mock_skills_dir),
             patch("agents.benchmark.server._ensure_init", new_callable=AsyncMock),
         ):
-            res_str = await benchmark_read_skill(
+            res_str = await _benchmark_server().read_skill(
                 "crucible", "skills/crucible/run-file-pitfalls.md"
             )
             res = json.loads(res_str)
@@ -173,7 +167,7 @@ class TestBenchmarkSkillAndDocTools:
                 {"harness": "crucible", "filename": "crucible/run-file-pitfalls.md"},
                 {"harness": "general", "filename": "general/host-tuning.md"},
             ]
-            res_str = await benchmark_read_skills(docs)
+            res_str = await _benchmark_server().read_skills(docs)
             res = json.loads(res_str)
             assert len(res) == 2
             assert res[0]["found"] is True
@@ -187,7 +181,7 @@ class TestBenchmarkSkillAndDocTools:
         ):
             # Exact path with docs/
             res1 = json.loads(
-                await benchmark_read_harness_doc(
+                await _benchmark_server().read_harness_doc(
                     "crucible", "docs/how-run-files-work.md"
                 )
             )
@@ -196,14 +190,16 @@ class TestBenchmarkSkillAndDocTools:
 
             # Missing docs/
             res2 = json.loads(
-                await benchmark_read_harness_doc("crucible", "how-run-files-work.md")
+                await _benchmark_server().read_harness_doc(
+                    "crucible", "how-run-files-work.md"
+                )
             )
             assert res2["found"] is True
             assert "How Run Files Work" in res2["content"]
 
             # Redundant harness prefix
             res3 = json.loads(
-                await benchmark_read_harness_doc(
+                await _benchmark_server().read_harness_doc(
                     "crucible", "crucible/docs/how-run-files-work.md"
                 )
             )
@@ -211,7 +207,7 @@ class TestBenchmarkSkillAndDocTools:
 
             # Empty harness with full path
             res4 = json.loads(
-                await benchmark_read_harness_doc(
+                await _benchmark_server().read_harness_doc(
                     "", "crucible/docs/how-run-files-work.md"
                 )
             )
@@ -271,6 +267,10 @@ class TestRepoCacheReadFile:
         content = mock_repo_cache.read_file("crucible", "../../../etc/passwd")
         assert content is None
 
+    def test_empty_repo_name(self, mock_repo_cache: RepoCache):
+        content = mock_repo_cache.read_file("", "docs/foo.md")
+        assert content is None
+
 
 class TestReviewDocTools:
     @pytest.mark.asyncio
@@ -279,7 +279,9 @@ class TestReviewDocTools:
             patch("agents.review.server.SKILLS_DIR", mock_skills_dir),
             patch("agents.review.server._ensure_init", new_callable=AsyncMock),
         ):
-            res_str = await review_read_skill("general", "general/host-tuning.md")
+            res_str = await _review_server().read_skill(
+                "general", "general/host-tuning.md"
+            )
             res = json.loads(res_str)
             assert res["status"] == "ok"
             assert "Host Tuning Guide" in res["content"]
@@ -290,7 +292,9 @@ class TestReviewDocTools:
             patch("agents.review.server._repo_cache", mock_repo_cache),
             patch("agents.review.server._ensure_init", new_callable=AsyncMock),
         ):
-            res_str = await review_read_harness_doc("crucible", "how-run-files-work.md")
+            res_str = await _review_server().read_harness_doc(
+                "crucible", "how-run-files-work.md"
+            )
             res = json.loads(res_str)
             assert res["status"] == "ok"
             assert "How Run Files Work" in res["content"]
