@@ -214,7 +214,6 @@ class ReviewAgent(AgentBase):
         review_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
         eval_server = str(Path(__file__).parent.parent / "evaluate" / "server.py")
-        workspace_server = str(Path(__file__).parent.parent / "workspace" / "server.py")
 
         mcp = AgentMCPClient()
         await mcp.connect(
@@ -224,11 +223,6 @@ class ReviewAgent(AgentBase):
         )
         await mcp.connect(infra_server, name="infra")
         await mcp.connect(eval_server, name="evaluate-tools")
-        await mcp.connect(
-            workspace_server,
-            name="workspace",
-            env={"TICKET_ID": ticket_id},
-        )
 
         # Connect any configured external MCP servers
         # (e.g., historical baselines for comparison).

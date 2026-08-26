@@ -130,6 +130,72 @@ class AgentBase(ABC):
             if tool_spill_threshold is not None
             else self._load_tool_spill_threshold()
         )
+        self._register_workspace_tools()
+
+    def _register_workspace_tools(self) -> None:
+        """Register native workspace tools on the agent."""
+        from agents.workspace.tools import WORKSPACE_TOOLS
+
+        def _get_manager():
+            from providers.workspace.manager import WorkspaceManager
+
+            return WorkspaceManager(ticket_id=self._current_ticket_id)
+
+        async def _jq_query(file_ref: str, filter: str, limit: int = 50) -> str:
+            res = _get_manager().jq_query(file_ref, filter, limit=limit)
+            return json.dumps(res, indent=2)
+
+        async def _grep_file(
+            file_ref: str,
+            pattern: str,
+            max_lines: int = 50,
+            context_lines: int = 0,
+            case_insensitive: bool = True,
+        ) -> str:
+            res = _get_manager().grep_file(
+                file_ref,
+                pattern,
+                max_lines=max_lines,
+                context_lines=context_lines,
+                case_insensitive=case_insensitive,
+            )
+            return json.dumps(res, indent=2)
+
+        async def _read_file_slice(
+            file_ref: str,
+            offset_bytes: int = 0,
+            max_bytes: int = 4096,
+            start_line: int | None = None,
+            max_lines: int | None = None,
+        ) -> str:
+            res = _get_manager().read_file_slice(
+                file_ref,
+                offset_bytes=offset_bytes,
+                max_bytes=max_bytes,
+                start_line=start_line,
+                max_lines=max_lines,
+            )
+            return json.dumps(res, indent=2)
+
+        async def _list_workspace_files() -> str:
+            res = _get_manager().list_files()
+            return json.dumps(res, indent=2)
+
+        ws_handlers = {
+            "jq_query": _jq_query,
+            "grep_file": _grep_file,
+            "read_file_slice": _read_file_slice,
+            "list_workspace_files": _list_workspace_files,
+        }
+
+        for name, handler in ws_handlers.items():
+            if name not in self._tool_handlers:
+                self._tool_handlers[name] = handler
+
+        existing_names = {t.name for t in self.tools}
+        for tool_def in WORKSPACE_TOOLS:
+            if tool_def.name not in existing_names:
+                self.tools.append(tool_def)
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -1076,14 +1142,29 @@ class AgentBase(ABC):
         if len(raw_bytes) <= self._spill_threshold:
             return content
 
-        # Exclude internal inspection tools, clarify, and submission tools
-        if tool_name in (
+        # Exclude workspace inspection, skill/doc loading, user interaction, and submission tools
+        exempt_tools = {
+            # Workspace inspection
             "jq_query",
             "grep_file",
             "read_file_slice",
             "list_workspace_files",
+            # Skill & documentation reading
+            "read_skill",
+            "read_skills",
+            "read_harness_doc",
+            "get_review_config",
+            "get_execution_config",
+            "get_example_runfile",
+            "get_tool_params",
+            # File reading with existing caller control
+            "read_remote_file",
+            # User interaction & checkpoints
             "request_clarification",
-        ) or tool_name.startswith("submit_"):
+            "request_human_input",
+            "present_runfile_for_approval",
+        }
+        if tool_name in exempt_tools or tool_name.startswith("submit_"):
             return content
 
         try:
