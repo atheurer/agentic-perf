@@ -98,12 +98,15 @@ content:
     masked_services:
       - unwanted.service
 
-> **Known limitation:** `masked_services` causes build failures when
-> the masked service is conditionally enabled by AIB based on an RPM
-> in the manifest (e.g., masking `podman-clean-transient.service`
-> while `podman` is in the RPM list). Use `disabled_services` instead
-> — it prevents the service from running without conflicting with
-> AIB's conditional enablement logic.
+> **Important:** `masked_services` is NOT supported by the AIB
+> manifest schema. It will be silently converted to
+> `disabled_services`. Only `enabled_services` and
+> `disabled_services` are valid in the `systemd` section.
+
+> **Network:** The manifest must include a `network` section.
+> Use `network: { dynamic: {} }` for NetworkManager-based DHCP
+> (the default). Without this, network interfaces may not be
+> configured even if NetworkManager is installed.
 
 image:
   image_size: 8 GiB
