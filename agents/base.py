@@ -181,11 +181,16 @@ class AgentBase(ABC):
             res = _get_manager().list_files()
             return json.dumps(res, indent=2)
 
+        async def _generate_chart_from_workspace(**kwargs: Any) -> str:
+            res = _get_manager().generate_chart(**kwargs)
+            return json.dumps(res, indent=2)
+
         ws_handlers = {
             "jq_query": _jq_query,
             "grep_file": _grep_file,
             "read_file_slice": _read_file_slice,
             "list_workspace_files": _list_workspace_files,
+            "generate_chart_from_workspace": _generate_chart_from_workspace,
         }
 
         for name, handler in ws_handlers.items():
@@ -1078,19 +1083,30 @@ class AgentBase(ABC):
         shared = (scoped.get("shared") if has_scoped else None) or ""
         supplemental = (scoped.get(agent_key) if has_scoped else None) or ""
 
+        parsed_specs = cf.get("parsed_specs")
+        specs_block = ""
+        if parsed_specs and isinstance(parsed_specs, dict) and parsed_specs:
+            specs_block = (
+                f"## Parsed Specifications\n```json\n{json.dumps(parsed_specs, indent=2)}\n```"
+            )
+
         if not verbatim:
-            # Legacy path: plain concatenation, no headers.
+            # Legacy path: plain concatenation.
             parts = []
             if shared:
                 parts.append(shared)
+            if specs_block:
+                parts.append(specs_block)
             if supplemental:
                 parts.append(supplemental)
             return "\n\n".join(parts) if parts else None
 
-        # Verbatim path: inject authoritative block first.
+        # Verbatim path: inject authoritative block with parsed specs.
         parts = []
         if shared:
             parts.append(shared)
+        if specs_block:
+            parts.append(specs_block)
         parts.append(f"## Directives (authoritative — follow exactly):\n{verbatim}")
         if supplemental:
             parts.append(f"## Additional context:\n{supplemental}")

@@ -14,7 +14,7 @@ class CdmChartAdapter(BaseChartAdapter):
         if harness and harness.lower() in ("crucible", "cdm"):
             return True
         if isinstance(data, dict):
-            # Check for CDM response structures
+            # Check for direct CDM response structures
             if "values" in data and (
                 "usedBreakouts" in data or "remainingBreakouts" in data
             ):
@@ -22,6 +22,14 @@ class CdmChartAdapter(BaseChartAdapter):
             if "datapoints" in data and isinstance(data.get("label"), str):
                 return True
             if "primaryMetrics" in data or "periodNames" in data:
+                return True
+            # Check for batched CDM query dictionary (e.g. {"query_name": {"values": ...}})
+            if any(
+                isinstance(v, dict)
+                and "values" in v
+                and ("usedBreakouts" in v or "remainingBreakouts" in v)
+                for v in data.values()
+            ):
                 return True
         return False
 
@@ -36,13 +44,98 @@ class CdmChartAdapter(BaseChartAdapter):
         max_points: int = 60,
         **kwargs: Any,
     ) -> ChartSpec:
+        # Handle batched query dictionary: extract target subquery
+        if isinstance(data, dict) and "values" not in data:
+            if metric and metric in data:
+                data = data[metric]
+            elif any(
+                isinstance(v, dict) and "values" in v and "usedBreakouts" in v
+                for v in data.values()
+            ):
+                # Pick metric matching keyword or first timeseries subquery
+                matched = None
+                for k, v in data.items():
+                    if isinstance(v, dict) and "values" in v:
+                        if metric and metric.lower() in k.lower():
+                            matched = v
+                            break
+                        if matched is None and isinstance(v.get("values"), dict):
+                            matched = v
+                if matched:
+                    data = matched
+
         if isinstance(data, dict) and "values" in data:
             raw_vals = data["values"]
             used_bo = data.get("usedBreakouts", {})
 
-            # Case 1: Time series metric data [{time, value}] or [{timestamp, value}]
+            # Case 1: Breakout dictionary mapping series keys -> time series list
+            # e.g. {"<1>": [{"begin": 1787..., "value": 23.9}, ...], ...}
+            if isinstance(raw_vals, dict) and raw_vals:
+                datasets: list[ChartDataset] = []
+                labels: list[str] = []
+
+                # Determine reference timeline from the first non-empty series
+                first_series = next(
+                    (s for s in raw_vals.values() if isinstance(s, list) and s), []
+                )
+                n_pts = len(first_series)
+                step = math.ceil(n_pts / max_points) if n_pts > max_points else 1
+
+                if first_series and isinstance(first_series[0], dict):
+                    if "begin" in first_series[0]:
+                        t0 = first_series[0]["begin"]
+                        for pt in first_series[::step]:
+                            rel_s = round((pt["begin"] - t0) / 1000)
+                            labels.append(f"{rel_s}s")
+                    elif any(
+                        k in first_series[0] for k in ("time", "timestamp", "date")
+                    ):
+                        t_field = (
+                            "time"
+                            if "time" in first_series[0]
+                            else (
+                                "timestamp"
+                                if "timestamp" in first_series[0]
+                                else "date"
+                            )
+                        )
+                        labels = [str(pt.get(t_field, "")) for pt in first_series[::step]]
+                if not labels:
+                    labels = [f"{i}s" for i in range(len(first_series[::step]))]
+
+                for raw_key, pts in raw_vals.items():
+                    if not isinstance(pts, list):
+                        continue
+                    ds_label = _clean_cdm_label(str(raw_key), metric or "")
+                    values: list[float] = []
+                    for pt in pts[::step]:
+                        if isinstance(pt, dict):
+                            val = pt.get("value", pt.get("val", 0.0))
+                        else:
+                            val = pt
+                        try:
+                            values.append(round(float(val), 4))
+                        except (ValueError, TypeError):
+                            values.append(0.0)
+
+                    datasets.append(ChartDataset(label=ds_label, values=values, unit=unit))
+
+                resolved_title = title or f"{metric or 'Crucible Metric'} Telemetry"
+                resolved_type = chart_type or "line"
+                return ChartSpec(
+                    title=resolved_title,
+                    type=resolved_type,
+                    labels=labels,
+                    datasets=datasets,
+                    x_label="Time",
+                    y_label=unit or (metric or "Value"),
+                    unit=unit,
+                )
+
+            # Case 2: Time series metric data [{time, value}] or [{timestamp, value}]
             if (
                 raw_vals
+                and isinstance(raw_vals, list)
                 and isinstance(raw_vals[0], dict)
                 and any(k in raw_vals[0] for k in ("time", "timestamp", "date"))
             ):
@@ -65,7 +158,7 @@ class CdmChartAdapter(BaseChartAdapter):
                     pts = pts[::step]
 
                 labels = [f"{i}s" for i in range(len(pts))] if pts else []
-                values = [p[1] for p in pts]
+                values = [round(p[1], 2) for p in pts]
 
                 ds_label = metric or "Value"
                 if used_bo:
@@ -85,7 +178,7 @@ class CdmChartAdapter(BaseChartAdapter):
                     unit=unit,
                 )
 
-            # Case 2: Multi-core or breakout values (e.g. per-CPU busy %, per-NIC throughput)
+            # Case 3: Multi-core or breakout values (e.g. per-CPU busy %, per-NIC throughput)
             if raw_vals and isinstance(raw_vals, list):
                 labels = []
                 values = []
@@ -108,7 +201,7 @@ class CdmChartAdapter(BaseChartAdapter):
                         lbl = f"Item {i}"
                         val = item
                     try:
-                        values.append(float(val))
+                        values.append(round(float(val), 2))
                         labels.append(lbl)
                     except (ValueError, TypeError):
                         pass
@@ -135,3 +228,20 @@ class CdmChartAdapter(BaseChartAdapter):
             max_points=max_points,
             **kwargs,
         )
+
+
+def _clean_cdm_label(raw_key: str, metric_hint: str = "") -> str:
+    """Format CDM breakout identifiers into human-readable series labels."""
+    parts = [p.strip("<>") for p in raw_key.split(">-<")]
+    if len(parts) == 1:
+        if parts[0].isdigit():
+            prefix = "uperf ID" if "uperf" in metric_hint.lower() else "ID"
+            return f"{prefix} {parts[0]}"
+        return parts[0]
+    elif len(parts) == 2:
+        host, val = parts[0], parts[1]
+        host_short = host.split(".")[0]
+        if val.isdigit():
+            return f"{host_short} CPU {val}"
+        return f"{host_short} {val}"
+    return raw_key
