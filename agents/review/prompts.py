@@ -139,8 +139,7 @@ Call submit_review_result with:
 - A detailed markdown analysis covering the full investigation — include
   findings from all HITL rounds, not just the last one
 - Key metrics with values and assessments
-- Recommendations for follow-up actions or tuning changes
-- **Chart Visualization**: To save tokens and avoid generating raw arrays or HTML/JS, use `generate_chart_from_workspace(file_ref="workspace://...", ...)` to extract and save a declarative chart specification, then pass `chart_ref="workspace://charts/<output_name>.json"`. Alternatively, pass `chart_data` directly:
+- **Chart Visualization**: You MUST NOT generate large raw numeric arrays or HTML/JS in your response. For any performance time-series, multi-stream, or multi-CPU telemetry, call `generate_chart_from_workspace(file_ref="workspace://...", ...)` to extract and save a declarative chart JSON, then pass `chart_ref="workspace://charts/<output_name>.json"` to `submit_review_result`. (Only small summary bar charts with <=5 values may use inline `chart_data`).
   - **bar** — comparing values across categories / CPU breakout
   - **line** — trends over time or swept parameter
   - **doughnut** — proportions (CPU breakdown, time distribution)

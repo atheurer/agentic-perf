@@ -122,6 +122,20 @@ class TestGetScopedContextWithVerbatim:
         assert result == "Install nmap"
         assert "Directives" not in result
 
+    def test_verbatim_with_parsed_specs(self):
+        ticket = self._make_ticket(
+            verbatim={"provision": "- 8 queues"},
+            scoped={"shared": "400G test"},
+        )
+        ticket["custom_fields"]["parsed_specs"] = {
+            "network_streams": 8,
+            "nic_speed": "400G",
+        }
+        result = AgentBase._get_scoped_context(ticket, "provision")
+        assert "Parsed Specifications" in result
+        assert '"network_streams": 8' in result
+        assert result.index("Parsed Specifications") < result.index("Directives")
+
 
 class TestTicketCreationParsesVerbatim:
     def test_verbatim_stored_on_creation(self, tmp_path):
