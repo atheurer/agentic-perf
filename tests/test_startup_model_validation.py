@@ -44,6 +44,7 @@ class TestValidateModels:
                 await _validate_models(config)
 
         assert mock_provider.complete.call_count == 1
+        assert mock_provider.complete.call_args.kwargs["max_tokens"] == 1024
         assert any("OK" in r.message for r in caplog.records)
         assert not any("FAILED" in r.message for r in caplog.records)
 
