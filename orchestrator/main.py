@@ -36,6 +36,8 @@ from .poller import fetch_all_tickets
 
 logger = logging.getLogger(__name__)
 
+MODEL_CHECK_MAX_TOKENS = 1024
+
 
 def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: str = ""):
     return create_llm_provider(
@@ -105,7 +107,11 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                     system_prompt="",
                     messages=[{"role": "user", "content": "ping"}],
                     tools=[],
-                    max_tokens=1,
+                    # Reasoning models can consume hidden reasoning tokens
+                    # before producing even a one-token visible response.
+                    # A token limit of one therefore reports a false model
+                    # failure even when the endpoint and credentials work.
+                    max_tokens=MODEL_CHECK_MAX_TOKENS,
                 ),
                 timeout=10.0,
             )

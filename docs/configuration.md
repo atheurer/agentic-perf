@@ -110,6 +110,10 @@ overridden by `agent_models`.
 | Gemini (Vertex) | `gcloud auth application-default login` + set `project_id` and `region` |
 | OpenAI | Set `OPENAI_API_KEY` env var |
 
+The OpenAI provider uses `max_completion_tokens` for GPT-5 and o-series
+models, which reject the legacy `max_tokens` parameter. Older
+OpenAI-compatible endpoints continue to receive `max_tokens`.
+
 ---
 
 ### `agent_models` — Per-Agent LLM Overrides

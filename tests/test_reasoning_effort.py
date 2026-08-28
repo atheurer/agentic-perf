@@ -144,6 +144,34 @@ class TestOpenAIReasoningEffort:
         kwargs = client.chat.completions.create.call_args[1]
         assert "reasoning_effort" not in kwargs
 
+    @pytest.mark.asyncio
+    async def test_reasoning_model_uses_max_completion_tokens(self):
+        provider, client = self._make_provider(None)
+        provider._model = "gpt-5.6-luna"
+        provider.max_tokens = 1234
+        await provider.complete(
+            system_prompt="test",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=0,
+        )
+        kwargs = client.chat.completions.create.call_args[1]
+        assert kwargs["max_completion_tokens"] == 1234
+        assert "max_tokens" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_legacy_model_uses_max_tokens(self):
+        provider, client = self._make_provider(None)
+        provider._model = "gpt-4o"
+        provider.max_tokens = 5678
+        await provider.complete(
+            system_prompt="test",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=0,
+        )
+        kwargs = client.chat.completions.create.call_args[1]
+        assert kwargs["max_tokens"] == 5678
+        assert "max_completion_tokens" not in kwargs
+
 
 class TestGeminiReasoningEffort:
     """Test Gemini provider passes thinking_config."""
