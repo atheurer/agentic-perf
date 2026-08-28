@@ -1086,9 +1086,7 @@ class AgentBase(ABC):
         parsed_specs = cf.get("parsed_specs")
         specs_block = ""
         if parsed_specs and isinstance(parsed_specs, dict) and parsed_specs:
-            specs_block = (
-                f"## Parsed Specifications\n```json\n{json.dumps(parsed_specs, indent=2)}\n```"
-            )
+            specs_block = f"## Parsed Specifications\n```json\n{json.dumps(parsed_specs, indent=2)}\n```"
 
         if not verbatim:
             # Legacy path: plain concatenation.

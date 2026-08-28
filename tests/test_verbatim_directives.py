@@ -127,7 +127,10 @@ class TestGetScopedContextWithVerbatim:
             verbatim={"provision": "- 8 queues"},
             scoped={"shared": "400G test"},
         )
-        ticket["custom_fields"]["parsed_specs"] = {"network_streams": 8, "nic_speed": "400G"}
+        ticket["custom_fields"]["parsed_specs"] = {
+            "network_streams": 8,
+            "nic_speed": "400G",
+        }
         result = AgentBase._get_scoped_context(ticket, "provision")
         assert "Parsed Specifications" in result
         assert '"network_streams": 8' in result
