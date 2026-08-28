@@ -177,6 +177,42 @@ class TestCdmChartAdapter:
         # Raw data values preserved without arbitrary scaling
         assert spec.datasets[0].values == [0.942]
 
+    def test_cdm_multi_metric_stacked_panels(self):
+        adapter = CdmChartAdapter()
+        data = {
+            "uperf::Gbps": {
+                "usedBreakouts": ["engine-id"],
+                "values": {
+                    "<1>": [{"begin": 1000000, "end": 1003000, "value": 23.99}],
+                    "<2>": [{"begin": 1000000, "end": 1003000, "value": 24.15}],
+                },
+            },
+            "mpstat::Busy-CPU": {
+                "usedBreakouts": ["hostname", "num"],
+                "values": {
+                    "<server.bos2.dc.redhat.com>-<0>": [
+                        {"begin": 1000000, "end": 1003000, "value": 0.45}
+                    ],
+                },
+            },
+        }
+        spec = adapter.build_chart(
+            data,
+            metrics=["uperf", "mpstat"],
+            title="Throughput and CPU Busy",
+        )
+        assert spec.title == "Throughput and CPU Busy"
+        assert spec.sync_id == "cdm-timeline"
+        assert len(spec.panels) == 2
+        assert spec.panels[0].title == "Uperf"
+        assert spec.panels[0].unit == "Gbps"
+        assert len(spec.panels[0].datasets) == 2
+        assert spec.panels[1].title == "Mpstat"
+        assert spec.panels[1].unit is None
+        assert len(spec.panels[1].datasets) == 1
+        assert spec.panels[1].datasets[0].label == "server CPU 0"
+        assert spec.panels[1].datasets[0].values == [0.45]
+
 
 class TestKubeBurnerChartAdapter:
     def test_kubeburner_quantiles(self):
@@ -256,6 +292,33 @@ class TestWorkspaceManagerGenerateChart:
         assert res["status"] == "ok"
         assert res["chart_data"]["labels"] == ["4k", "64k"]
         assert res["chart_data"]["datasets"][0]["values"] == [120000.0, 45000.0]
+
+    def test_chart_spec_with_panels(self):
+        from providers.workspace.charts.models import (
+            ChartDataset,
+            ChartPanel,
+            ChartSpec,
+        )
+
+        ds1 = ChartDataset(label="Stream 1", values=[23.5, 24.1], unit="Gbps")
+        ds2 = ChartDataset(label="CPU 0", values=[4.5, 5.2], unit="%")
+        panel1 = ChartPanel(title="Throughput", unit="Gbps", datasets=[ds1])
+        panel2 = ChartPanel(title="CPU Busy", unit="%", datasets=[ds2])
+        spec = ChartSpec(
+            title="Multi-Panel Summary",
+            labels=["0s", "3s"],
+            panels=[panel1, panel2],
+            sync_id="timeline-1",
+        )
+        d = spec.to_dict()
+        assert d["title"] == "Multi-Panel Summary"
+        assert d["sync_id"] == "timeline-1"
+        assert "panels" in d
+        assert len(d["panels"]) == 2
+        assert d["panels"][0]["title"] == "Throughput"
+        assert d["panels"][0]["unit"] == "Gbps"
+        assert d["panels"][1]["title"] == "CPU Busy"
+        assert d["panels"][1]["unit"] == "%"
 
 
 @pytest.mark.asyncio

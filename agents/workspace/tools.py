@@ -101,7 +101,7 @@ WORKSPACE_TOOLS = [
     ),
     ToolDefinition(
         name="generate_chart_from_workspace",
-        description="Extract and generate a declarative Chart.js/Recharts performance chart from a workspace JSON or CSV file without needing to output raw numbers or code. Automatically saves chart specification to workspace://charts/<output_name>.json and returns chart summary.",
+        description="Extract and generate a declarative Chart.js/Recharts performance chart from a workspace JSON or CSV file without needing to output raw numbers or code. Supports single-metric charts as well as multi-metric stacked panels with synchronized X-axis timelines (e.g. uperf throughput + mpstat CPU busy). Automatically saves chart specification to workspace://charts/<output_name>.json and returns chart summary.",
         input_schema={
             "type": "object",
             "properties": {
@@ -111,12 +111,12 @@ WORKSPACE_TOOLS = [
                 },
                 "title": {
                     "type": "string",
-                    "description": "Chart title (e.g. 'Server CPU Busy % by Core' or 'Throughput vs Thread Count')",
+                    "description": "Chart title (e.g. 'Network Throughput & CPU Utilization' or 'Server CPU Busy % by Core')",
                 },
                 "chart_type": {
                     "type": "string",
                     "enum": ["bar", "line", "doughnut"],
-                    "description": "Chart type (default 'bar')",
+                    "description": "Chart type (default 'line' for timeseries, 'bar' for breakouts)",
                     "default": "bar",
                 },
                 "harness": {
@@ -141,7 +141,12 @@ WORKSPACE_TOOLS = [
                 },
                 "metric": {
                     "type": "string",
-                    "description": "Metric name for CDM/Crucible data (e.g. 'mpstat::Busy-CPU' or 'uperf::Gbps')",
+                    "description": "Metric name for CDM/Crucible data (e.g. 'mpstat::Busy-CPU' or 'uperf::Gbps'). Can also be comma-separated list of metrics.",
+                },
+                "metrics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of multiple metric names (e.g. ['uperf::Gbps', 'mpstat::Busy-CPU']) to generate synchronized stacked chart panels.",
                 },
                 "unit": {
                     "type": "string",

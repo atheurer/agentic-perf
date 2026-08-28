@@ -787,11 +787,169 @@ details > .content { padding: 12px 16px; }
 
 .result-chart {
   margin-top: 16px;
-  max-width: 600px;
+  width: 100%;
 }
 
 .result-chart canvas {
   max-height: 300px;
+}
+
+/* CDM-style DeepDive chart cards and multi-panel styling */
+.cdm-chart-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 14px;
+  width: 100%;
+}
+
+.cdm-chart-header-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #292e42;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+}
+
+.cdm-chart-main-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #c0caf5;
+  letter-spacing: 0.2px;
+}
+
+.cdm-sync-badge {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  background: rgba(122, 162, 247, 0.15);
+  color: #7aa2f7;
+  border: 1px solid rgba(122, 162, 247, 0.3);
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.cdm-panel-card {
+  background: #16161e;
+  border: 1px solid #292e42;
+  border-radius: 8px;
+  padding: 12px 16px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cdm-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cdm-panel-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cdm-metric-badge {
+  font-size: 13px;
+  font-weight: 700;
+  color: #c0caf5;
+  font-family: var(--font-mono);
+}
+
+.cdm-unit-chip {
+  font-size: 11px;
+  font-weight: 600;
+  background: #24283b;
+  color: #9aa5ce;
+  border: 1px solid #3b4261;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.cdm-series-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.cdm-cursor-display {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: #7dcfff;
+  background: #1f2335;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #3b4261;
+}
+
+.cdm-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 250px;
+}
+
+.cdm-breakout-matrix {
+  max-height: 150px;
+  overflow-y: auto;
+  margin-top: 6px;
+  border-top: 1px solid #24283b;
+  padding-top: 8px;
+}
+
+.cdm-matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 4px 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.cdm-matrix-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #1a1b26;
+  border: 1px solid #24283b;
+  cursor: pointer;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.cdm-matrix-item:hover {
+  background: #24283b;
+}
+
+.cdm-matrix-item.hidden-series {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
+
+.cdm-series-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+.cdm-series-name {
+  color: #c0caf5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 4px;
+}
+
+.cdm-series-val {
+  color: #7aa2f7;
+  font-weight: 600;
+  flex-shrink: 0;
 }
 
 .results-link {
@@ -2053,7 +2211,49 @@ function renderHypothesisCard(ticket) {
       }
       var chartId = 'hypo-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
       if (chartData) {
-        html += '<div class="result-chart"><canvas id="' + chartId + '"></canvas></div>';
+        if (chartData.panels && chartData.panels.length > 1) {
+          html += '<div class="cdm-chart-container">';
+          if (chartData.title) {
+            html += '<div class="cdm-chart-header-main">' +
+              '<span class="cdm-chart-main-title">' + escHtml(chartData.title) + '</span>' +
+              (chartData.sync_id ? '<span class="cdm-sync-badge">SYNCED TIMELINE</span>' : '') +
+            '</div>';
+          }
+          chartData.panels.forEach(function(p, pi) {
+            var unitBadge = p.unit ? '<span class="cdm-unit-chip">' + escHtml(p.unit) + '</span>' : '';
+            var countBadge = '<span class="cdm-series-count">' + (p.datasets ? p.datasets.length : 0) + ' series</span>';
+            var cursorId = 'cdm-cursor-' + chartId + '-p' + pi;
+            var matrixId = 'cdm-matrix-' + chartId + '-p' + pi;
+            html += '<div class="cdm-panel-card">' +
+              '<div class="cdm-panel-header">' +
+                '<div class="cdm-panel-title-wrap">' +
+                  '<span class="cdm-metric-badge">' + escHtml(p.title || ('Panel ' + (pi + 1))) + '</span>' +
+                  unitBadge + countBadge +
+                '</div>' +
+                '<div class="cdm-cursor-display" id="' + cursorId + '">Hover to inspect</div>' +
+              '</div>' +
+              '<div class="cdm-canvas-wrap"><canvas id="' + chartId + '-panel-' + pi + '"></canvas></div>' +
+              '<div class="cdm-breakout-matrix" id="' + matrixId + '"></div>' +
+            '</div>';
+          });
+          html += '</div>';
+        } else {
+          var unitBadge = chartData.unit ? '<span class="cdm-unit-chip">' + escHtml(chartData.unit) + '</span>' : '';
+          var countBadge = '<span class="cdm-series-count">' + (chartData.datasets ? chartData.datasets.length : 0) + ' series</span>';
+          var cursorId = 'cdm-cursor-' + chartId;
+          var matrixId = 'cdm-matrix-' + chartId;
+          html += '<div class="cdm-panel-card" style="margin-top:12px;">' +
+            '<div class="cdm-panel-header">' +
+              '<div class="cdm-panel-title-wrap">' +
+                '<span class="cdm-metric-badge">' + escHtml(chartData.title || 'Telemetry Chart') + '</span>' +
+                unitBadge + countBadge +
+              '</div>' +
+              '<div class="cdm-cursor-display" id="' + cursorId + '">Hover to inspect</div>' +
+            '</div>' +
+            '<div class="cdm-canvas-wrap"><canvas id="' + chartId + '"></canvas></div>' +
+            '<div class="cdm-breakout-matrix" id="' + matrixId + '"></div>' +
+          '</div>';
+        }
       }
       if (resultsUrl) {
         html += '<a class="results-link" href="' + escHtml(String(resultsUrl)) +
@@ -2138,32 +2338,315 @@ function renderDescription(ticket) {
   '</details>';
 }
 
-var CHART_COLORS = ['#7aa2f7', '#9ece6a', '#e0af68', '#ff9e64', '#bb9af7', '#7dcfff', '#f7768e'];
+// CDM Theme Palettes (matching Crucible CommonDataModel ITER_THEMES)
+var CDM_COLOR_THEMES = [
+  ['#5b8def', '#3a6fd4', '#7ca4f5', '#9dbcfa', '#bdd4ff', '#4a7de0', '#6991e8', '#89a8f0'],
+  ['#ef5b5b', '#d43a3a', '#f57c7c', '#fa9d9d', '#ffbdbd', '#e04a4a', '#e86969', '#f08989'],
+  ['#5bef8d', '#3ad46a', '#7cf5a4', '#9dfabc', '#bdffd4', '#4ae07a', '#69e891', '#89f0a8'],
+  ['#b85bef', '#9a3ad4', '#cc7cf5', '#dd9dfa', '#eebdff', '#a84ae0', '#bc69e8', '#cf89f0'],
+  ['#5bcdef', '#3ab4d4', '#7cd8f5', '#9de4fa', '#bdf0ff', '#4ac2e0', '#69cce8', '#89d6f0'],
+  ['#efb85b', '#d49a3a', '#f5cc7c', '#fadd9d', '#ffeebf', '#e0a84a', '#e8bc69', '#f0cf89']
+];
+
+function getCdmColor(themeIdx, shadeIdx) {
+  var theme = CDM_COLOR_THEMES[themeIdx % CDM_COLOR_THEMES.length];
+  return theme[shadeIdx % theme.length];
+}
+
+function formatCdmNumber(v) {
+  if (v == null) return '-';
+  var n = Number(v);
+  if (isNaN(n)) return String(v);
+  if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  if (Math.abs(n) >= 10) return n.toFixed(2);
+  if (Math.abs(n) >= 1) return n.toFixed(3);
+  return n.toPrecision(3);
+}
+
+// Synchronized crosshair plugin for Chart.js
+var cdmCrosshairPlugin = {
+  id: 'cdmCrosshair',
+  afterDraw: function(chart) {
+    if (chart.crosshairIndex != null && chart.crosshairIndex >= 0) {
+      var meta = chart.getDatasetMeta(0);
+      if (meta && meta.data && meta.data[chart.crosshairIndex]) {
+        var x = meta.data[chart.crosshairIndex].x;
+        var yAxis = chart.scales.y;
+        var ctx = chart.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.setLineDash([4, 4]);
+        ctx.moveTo(x, yAxis.top);
+        ctx.lineTo(x, yAxis.bottom);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(125, 207, 255, 0.7)';
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+};
+
+window._cdmSyncGroups = window._cdmSyncGroups || {};
 
 function mountChart(containerId, chartData) {
+  if (!chartData) return;
+
+  var syncGroupId = chartData.sync_id || containerId;
+  window._cdmSyncGroups[syncGroupId] = [];
+
+  function updateSyncCrosshair(activeIndex) {
+    var group = window._cdmSyncGroups[syncGroupId] || [];
+    var timeLabel = (chartData.labels && chartData.labels[activeIndex]) ? chartData.labels[activeIndex] : '';
+
+    group.forEach(function(item) {
+      item.chart.crosshairIndex = activeIndex;
+      item.chart.draw();
+
+      // Update cursor display
+      if (item.cursorEl) {
+        if (activeIndex != null && activeIndex >= 0) {
+          item.cursorEl.textContent = 'Time: ' + timeLabel;
+        } else {
+          item.cursorEl.textContent = 'Hover to inspect';
+        }
+      }
+
+      // Update matrix values
+      if (item.matrixEl && item.panelData) {
+        var valSpans = item.matrixEl.querySelectorAll('.cdm-series-val');
+        (item.panelData.datasets || []).forEach(function(ds, dsi) {
+          if (valSpans[dsi]) {
+            if (activeIndex != null && activeIndex >= 0 && ds.values && ds.values[activeIndex] != null) {
+              valSpans[dsi].textContent = formatCdmNumber(ds.values[activeIndex]);
+            } else {
+              var lastVal = ds.values && ds.values.length ? ds.values[ds.values.length - 1] : '-';
+              valSpans[dsi].textContent = formatCdmNumber(lastVal);
+            }
+          }
+        });
+      }
+    });
+  }
+
+  function renderMatrix(matrixEl, panelData, chartInstance, themeIdx, unit) {
+    if (!matrixEl || !panelData || !panelData.datasets) return;
+    var html = '<div class="cdm-matrix-grid">';
+    panelData.datasets.forEach(function(ds, dsi) {
+      var color = getCdmColor(themeIdx, dsi);
+      var lastVal = ds.values && ds.values.length ? ds.values[ds.values.length - 1] : '-';
+      html += '<div class="cdm-matrix-item" data-dsi="' + dsi + '" title="Click to toggle series">' +
+        '<div style="display:flex; align-items:center; overflow:hidden;">' +
+          '<span class="cdm-series-dot" style="background:' + color + '"></span>' +
+          '<span class="cdm-series-name">' + escHtml(ds.label || ('Series ' + (dsi + 1))) + '</span>' +
+        '</div>' +
+        '<span class="cdm-series-val">' + formatCdmNumber(lastVal) + '</span>' +
+      '</div>';
+    });
+    html += '</div>';
+    matrixEl.innerHTML = html;
+
+    // Click handler to toggle series
+    matrixEl.querySelectorAll('.cdm-matrix-item').forEach(function(itemEl) {
+      itemEl.addEventListener('click', function() {
+        var dsi = parseInt(itemEl.getAttribute('data-dsi'), 10);
+        var meta = chartInstance.getDatasetMeta(dsi);
+        meta.hidden = meta.hidden === null ? !chartInstance.data.datasets[dsi].hidden : null;
+        if (meta.hidden) {
+          itemEl.classList.add('hidden-series');
+        } else {
+          itemEl.classList.remove('hidden-series');
+        }
+        chartInstance.update();
+      });
+    });
+  }
+
+  // Multi-panel layout
+  if (chartData.panels && chartData.panels.length > 1) {
+    chartData.panels.forEach(function(panel, pi) {
+      var panelCanvasId = containerId + '-panel-' + pi;
+      var canvas = document.getElementById(panelCanvasId);
+      if (!canvas) return;
+
+      var cursorEl = document.getElementById('cdm-cursor-' + containerId + '-p' + pi);
+      var matrixEl = document.getElementById('cdm-matrix-' + containerId + '-p' + pi);
+
+      var datasets = (panel.datasets || []).map(function(ds, i) {
+        var color = getCdmColor(pi, i);
+        var cfg = {
+          label: ds.label,
+          data: ds.values,
+          borderColor: color,
+          backgroundColor: color,
+          pointRadius: panel.datasets.length > 12 ? 0 : 2,
+          pointHoverRadius: 5,
+          borderWidth: 1.8,
+        };
+        if ((panel.type || chartData.type) === 'line') {
+          cfg.fill = false;
+          cfg.tension = 0.2;
+        }
+        return cfg;
+      });
+
+      var chartInstance = new Chart(canvas, {
+        type: panel.type || chartData.type || 'line',
+        data: { labels: chartData.labels || [], datasets: datasets },
+        plugins: [cdmCrosshairPlugin],
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          animation: { duration: 300 },
+          plugins: {
+            title: { display: false },
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: 'rgba(22, 22, 30, 0.95)',
+              titleColor: '#c0caf5',
+              bodyColor: '#c0caf5',
+              borderColor: '#3b4261',
+              borderWidth: 1,
+              padding: 8,
+              boxPadding: 4,
+            }
+          },
+          scales: {
+            x: {
+              ticks: { color: '#565f89', font: { family: 'ui-monospace, monospace', size: 10 } },
+              grid: { color: 'rgba(41, 46, 66, 0.6)' },
+              title: {
+                display: pi === chartData.panels.length - 1,
+                text: chartData.x_label || 'Elapsed Time',
+                color: '#565f89',
+                font: { family: 'ui-monospace, monospace', size: 11, weight: '600' }
+              }
+            },
+            y: {
+              ticks: { color: '#565f89', font: { family: 'ui-monospace, monospace', size: 10 } },
+              grid: { color: 'rgba(41, 46, 66, 0.6)' },
+              title: {
+                display: !!panel.unit,
+                text: panel.unit || '',
+                color: '#7aa2f7',
+                font: { family: 'ui-monospace, monospace', size: 11, weight: '600' }
+              }
+            },
+          },
+          onHover: function(evt, activeElements) {
+            if (activeElements && activeElements.length > 0) {
+              updateSyncCrosshair(activeElements[0].index);
+            }
+          }
+        },
+      });
+
+      canvas.addEventListener('mouseleave', function() {
+        updateSyncCrosshair(null);
+      });
+
+      renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
+      window._cdmSyncGroups[syncGroupId].push({
+        chart: chartInstance,
+        cursorEl: cursorEl,
+        matrixEl: matrixEl,
+        panelData: panel
+      });
+    });
+    return;
+  }
+
+  // Single panel chart
   var canvas = document.getElementById(containerId);
-  if (!canvas || !chartData) return;
+  if (!canvas) return;
+
+  var cursorEl = document.getElementById('cdm-cursor-' + containerId);
+  var matrixEl = document.getElementById('cdm-matrix-' + containerId);
+
   var datasets = (chartData.datasets || []).map(function(ds, i) {
-    var color = CHART_COLORS[i % CHART_COLORS.length];
-    var cfg = { label: ds.label, data: ds.values, backgroundColor: color, borderColor: color };
-    if (chartData.type === 'line') { cfg.fill = false; cfg.tension = 0.3; }
-    if (chartData.type === 'doughnut') { cfg.backgroundColor = CHART_COLORS.slice(0, (ds.values || []).length); }
+    var color = getCdmColor(0, i);
+    var cfg = {
+      label: ds.label,
+      data: ds.values,
+      borderColor: color,
+      backgroundColor: color,
+      pointRadius: (chartData.datasets || []).length > 12 ? 0 : 2,
+      pointHoverRadius: 5,
+      borderWidth: 1.8,
+    };
+    if (chartData.type === 'line') {
+      cfg.fill = false;
+      cfg.tension = 0.2;
+    }
+    if (chartData.type === 'doughnut') {
+      cfg.backgroundColor = CDM_COLOR_THEMES[0].slice(0, (ds.values || []).length);
+    }
     return cfg;
   });
-  new Chart(canvas, {
+
+  var chartInstance = new Chart(canvas, {
     type: chartData.type || 'bar',
     data: { labels: chartData.labels || [], datasets: datasets },
+    plugins: [cdmCrosshairPlugin],
     options: {
       responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      animation: { duration: 300 },
       plugins: {
-        title: { display: !!chartData.title, text: chartData.title || '', color: '#c0caf5' },
-        legend: { labels: { color: '#c0caf5' } },
+        title: { display: false },
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: 'rgba(22, 22, 30, 0.95)',
+          titleColor: '#c0caf5',
+          bodyColor: '#c0caf5',
+          borderColor: '#3b4261',
+          borderWidth: 1,
+          padding: 8,
+          boxPadding: 4,
+        }
       },
       scales: chartData.type === 'doughnut' ? {} : {
-        x: { ticks: { color: '#565f89' }, grid: { color: 'rgba(59,66,97,0.5)' } },
-        y: { ticks: { color: '#565f89' }, grid: { color: 'rgba(59,66,97,0.5)' } },
+        x: {
+          ticks: { color: '#565f89', font: { family: 'ui-monospace, monospace', size: 10 } },
+          grid: { color: 'rgba(41, 46, 66, 0.6)' },
+          title: {
+            display: !!chartData.x_label,
+            text: chartData.x_label || 'Elapsed Time',
+            color: '#565f89',
+            font: { family: 'ui-monospace, monospace', size: 11, weight: '600' }
+          }
+        },
+        y: {
+          ticks: { color: '#565f89', font: { family: 'ui-monospace, monospace', size: 10 } },
+          grid: { color: 'rgba(41, 46, 66, 0.6)' },
+          title: {
+            display: !!chartData.unit,
+            text: chartData.unit || '',
+            color: '#7aa2f7',
+            font: { family: 'ui-monospace, monospace', size: 11, weight: '600' }
+          }
+        },
       },
+      onHover: function(evt, activeElements) {
+        if (activeElements && activeElements.length > 0) {
+          updateSyncCrosshair(activeElements[0].index);
+        }
+      }
     },
+  });
+
+  canvas.addEventListener('mouseleave', function() {
+    updateSyncCrosshair(null);
+  });
+
+  renderMatrix(matrixEl, chartData, chartInstance, 0, chartData.unit);
+  window._cdmSyncGroups[syncGroupId].push({
+    chart: chartInstance,
+    cursorEl: cursorEl,
+    matrixEl: matrixEl,
+    panelData: chartData
   });
 }
 
