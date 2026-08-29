@@ -36,6 +36,10 @@ from .poller import fetch_all_tickets
 
 logger = logging.getLogger(__name__)
 
+# Reasoning models may spend part of this budget on hidden reasoning tokens,
+# and the Responses API requires max_output_tokens to be at least 16.
+MODEL_CHECK_MAX_TOKENS = 1024
+
 
 def _make_llm_provider(
     config: OrchestratorConfig, provider: str = "", model: str = "", api: str = ""
@@ -115,7 +119,7 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                     system_prompt="",
                     messages=[{"role": "user", "content": "ping"}],
                     tools=[],
-                    max_tokens=1,
+                    max_tokens=MODEL_CHECK_MAX_TOKENS,
                 ),
                 timeout=10.0,
             )
