@@ -318,9 +318,15 @@ class TestResponseParsing:
             finish_reason: str = "stop"
 
         @dataclass
+        class _TokenDetails:
+            cached_tokens: int = 0
+            cache_write_tokens: int = 0
+
+        @dataclass
         class _Usage:
             prompt_tokens: int = 0
             completion_tokens: int = 0
+            prompt_tokens_details: _TokenDetails | None = None
 
         @dataclass
         class _Response:
@@ -340,7 +346,14 @@ class TestResponseParsing:
 
         usage_obj = None
         if usage:
-            usage_obj = _Usage(**usage)
+            usage_obj = _Usage(
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                prompt_tokens_details=_TokenDetails(
+                    cached_tokens=usage.get("cached_tokens", 0),
+                    cache_write_tokens=usage.get("cache_write_tokens", 0),
+                ),
+            )
 
         return _Response(
             choices=[
@@ -431,6 +444,20 @@ class TestResponseParsing:
         assert result.usage is not None
         assert result.usage["input_tokens"] == 120
 
+    def test_chat_usage_includes_cache_details(self):
+        response = self._make_response(
+            content="Hello!",
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cached_tokens": 70,
+                "cache_write_tokens": 5,
+            },
+        )
+        result = OpenAICompatLLMProvider._parse_response(response)
+        assert result.usage["cache_read_input_tokens"] == 70
+        assert result.usage["cache_creation_input_tokens"] == 5
+
     def test_responses_response_parsing(self):
         response = SimpleNamespace(
             model="gpt-5.6-luna",
@@ -450,6 +477,22 @@ class TestResponseParsing:
         assert result.tool_calls[0].id == "call_1"
         assert result.tool_calls[0].input == {"host": "host1"}
         assert result.usage["output_tokens"] == 8
+
+    def test_responses_usage_includes_cache_details(self):
+        response = SimpleNamespace(
+            output=[],
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=20,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=70,
+                    cache_write_tokens=5,
+                ),
+            ),
+        )
+        result = OpenAICompatLLMProvider._parse_responses_response(response)
+        assert result.usage["cache_read_input_tokens"] == 70
+        assert result.usage["cache_creation_input_tokens"] == 5
 
     def test_responses_text_parsing(self):
         response = SimpleNamespace(
