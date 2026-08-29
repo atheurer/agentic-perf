@@ -1252,8 +1252,11 @@ def main():
     )
     parser.add_argument(
         "--store-url",
-        default=DEFAULT_STORE_URL,
-        help=f"State store URL (default: {DEFAULT_STORE_URL})",
+        default=os.environ.get("STATE_STORE_URL", DEFAULT_STORE_URL),
+        help=(
+            "State store URL (default: STATE_STORE_URL environment variable "
+            f"or {DEFAULT_STORE_URL})"
+        ),
     )
     sub = parser.add_subparsers(dest="command")
 

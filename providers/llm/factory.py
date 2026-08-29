@@ -34,6 +34,7 @@ def create_llm_provider(
             api_key=config.get("api_key"),
             model=model or "gpt-4o",
             base_url=config.get("base_url"),
+            api=config.get("api", "chat_completions"),
         )
 
     if provider in ("gemini", "google"):

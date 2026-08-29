@@ -162,6 +162,9 @@ class OrchestratorConfig:
         self._openai_base_url = os.environ.get("OPENAI_BASE_URL") or llm_cfg.get(
             "base_url"
         )
+        self.llm_api = os.environ.get("OPENAI_API") or llm_cfg.get(
+            "api", "chat_completions"
+        )
 
         # LLM budget guardrails (per orchestrator session)
         budget_cfg = cfg.get("llm_budget", {})
@@ -258,6 +261,8 @@ class OrchestratorConfig:
         introspection).
         """
         base = {"provider": self.llm_provider, "model": self.llm_model}
+        if self.llm_provider == "openai":
+            base["api"] = self.llm_api
 
         # Capability defaults (max_tokens etc) — always applied.
         capabilities = self._BUILTIN_AGENT_CAPABILITIES.get(agent_type)
@@ -267,6 +272,8 @@ class OrchestratorConfig:
         # Explicit per-agent overrides from config.
         if agent_type in self._agent_models:
             base.update(self._agent_models[agent_type])
+        if base.get("provider") == "openai" and "api" not in base:
+            base["api"] = self.llm_api
         return base
 
     def get_agent_max_iterations(self, agent_type: str) -> int | None:
