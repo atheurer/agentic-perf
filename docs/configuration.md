@@ -28,6 +28,7 @@ environment variable (defaults to `~/.agentic-perf`).
         "project_id": "my-gcp-project",
         "region": "us-east5",
         "base_url": null,
+        "api": "chat_completions",
         "gemini_api_key": null,
         "timeout": 120,
         "reasoning_effort": "medium"
@@ -87,6 +88,7 @@ overridden by `agent_models`.
 | `project_id` | string | — | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID (Vertex AI backends) |
 | `region` | string | — | `CLOUD_ML_REGION` | Cloud region (Vertex AI backends) |
 | `base_url` | string | — | `OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoints |
+| `api` | string | `"chat_completions"` | `OPENAI_API` | OpenAI API mode: `"chat_completions"` or `"responses"`. Applies only to the `openai` provider. |
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
 | `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). |
@@ -142,8 +144,9 @@ only when you want a specific agent to use a different model.
 1. `agent_models.<agent_type>` — per-agent override
 2. `llm.*` — global default
 
-Each override object supports `provider`, `model`, `reasoning_effort`,
-and `max_tokens` keys.
+Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
+and `max_tokens` keys. The `api` key is used when the override selects the
+`openai` provider.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`

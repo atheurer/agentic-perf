@@ -36,10 +36,14 @@ from .poller import fetch_all_tickets
 
 logger = logging.getLogger(__name__)
 
+# Reasoning models may spend part of this budget on hidden reasoning tokens,
+# and the Responses API requires max_output_tokens to be at least 16.
 MODEL_CHECK_MAX_TOKENS = 1024
 
 
-def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: str = ""):
+def _make_llm_provider(
+    config: OrchestratorConfig, provider: str = "", model: str = "", api: str = ""
+):
     return create_llm_provider(
         provider=provider or config.llm_provider,
         model=model or config.llm_model,
@@ -48,6 +52,7 @@ def _make_llm_provider(config: OrchestratorConfig, provider: str = "", model: st
         project_id=config.llm_project_id,
         region=config.llm_region,
         base_url=config._openai_base_url,
+        api=api or getattr(config, "llm_api", "chat_completions"),
         gemini_api_key=config._gemini_api_key,
     )
 
@@ -80,17 +85,23 @@ async def _validate_models(config: OrchestratorConfig) -> None:
     # Collect all agent types to check, including the default (empty string).
     agent_types: list[str] = [""] + list(config.raw.get("agent_models", {}).keys())
 
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for agent_type in agent_types:
         if agent_type:
             cfg = config.get_agent_llm_config(agent_type)
         else:
-            cfg = {"provider": config.llm_provider, "model": config.llm_model}
+            cfg = {
+                "provider": config.llm_provider,
+                "model": config.llm_model,
+                "api": getattr(config, "llm_api", "chat_completions"),
+            }
 
         provider_name = cfg.get("provider", config.llm_provider) or ""
         model_name = cfg.get("model", config.llm_model) or ""
         region = config.llm_region or ""
-        key = (provider_name, model_name, region)
+        default_api = getattr(config, "llm_api", "chat_completions")
+        api_name = cfg.get("api", default_api) or default_api
+        key = (provider_name, model_name, region, api_name)
         if key in seen:
             continue
         seen.add(key)
@@ -101,6 +112,7 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                 config,
                 provider=cfg.get("provider", ""),
                 model=cfg.get("model", ""),
+                api=api_name,
             )
             await asyncio.wait_for(
                 provider.complete(
@@ -581,6 +593,7 @@ async def run_agent_task(
                             config,
                             provider=llm_override.get("provider", ""),
                             model=llm_override.get("model", ""),
+                            api=llm_override.get("api", ""),
                         )
                         override_effort = llm_override.get("reasoning_effort")
                         if override_effort:

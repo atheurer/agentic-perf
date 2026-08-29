@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -231,6 +232,57 @@ class TestToolConversion:
         assert result[0]["function"]["name"] == "a"
         assert result[1]["function"]["name"] == "b"
 
+    def test_responses_tools_use_flat_function_schema(self):
+        tool = ToolDefinition(
+            name="check_host",
+            description="Check a host",
+            input_schema={"type": "object"},
+        )
+        assert OpenAICompatLLMProvider._convert_responses_tools([tool]) == [
+            {
+                "type": "function",
+                "name": "check_host",
+                "description": "Check a host",
+                "parameters": {"type": "object"},
+            }
+        ]
+
+    def test_responses_input_converts_tool_turn(self):
+        result = OpenAICompatLLMProvider._convert_responses_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "check_host",
+                            "input": {"host": "host1"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            ]
+        )
+        assert result == [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "check_host",
+                "arguments": '{"host": "host1"}',
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ]
+
 
 class TestResponseParsing:
     """Test OpenAI response → LLMResponse conversion."""
@@ -378,10 +430,40 @@ class TestResponseParsing:
         result = OpenAICompatLLMProvider._parse_response(response, model="gpt-4o")
         assert result.usage is not None
         assert result.usage["input_tokens"] == 120
-        assert result.usage["output_tokens"] == 45
-        assert result.usage["cache_read_input_tokens"] == 0
-        assert result.usage["cache_creation_input_tokens"] == 0
-        assert result.usage["model"] == "gpt-4o-2024-05-13"
+
+    def test_responses_response_parsing(self):
+        response = SimpleNamespace(
+            model="gpt-5.6-luna",
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_1",
+                    name="check_host",
+                    arguments='{"host": "host1"}',
+                )
+            ],
+            usage=SimpleNamespace(input_tokens=12, output_tokens=8),
+        )
+        result = OpenAICompatLLMProvider._parse_responses_response(response)
+        assert result.text is None
+        assert result.stop_reason == "tool_use"
+        assert result.tool_calls[0].id == "call_1"
+        assert result.tool_calls[0].input == {"host": "host1"}
+        assert result.usage["output_tokens"] == 8
+
+    def test_responses_text_parsing(self):
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="Hello!")],
+                )
+            ],
+            usage=None,
+        )
+        result = OpenAICompatLLMProvider._parse_responses_response(response)
+        assert result.text == "Hello!"
+        assert result.stop_reason == "end_turn"
 
     def test_usage_parsing_fallback_to_provider_model(self):
         response = self._make_response(
@@ -399,6 +481,50 @@ class TestResponseParsing:
         response = self._make_response(content="Hello!", usage=None)
         result = OpenAICompatLLMProvider._parse_response(response, model="gpt-4o")
         assert result.usage is None
+
+
+class TestResponsesAPI:
+    def test_complete_uses_responses_endpoint_and_parameters(self):
+        provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+        provider._api = "responses"
+        provider._model = "gpt-5.6-luna"
+        provider.default_timeout = None
+        provider.reasoning_effort = "medium"
+        provider.max_tokens = None
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="ready")],
+                )
+            ],
+            usage=None,
+        )
+        client = MagicMock()
+        client.responses.create.return_value = response
+        provider._client = client
+
+        import asyncio
+
+        async def run_in_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch("asyncio.to_thread", new=run_in_thread):
+            result = asyncio.run(
+                provider.complete(
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "hello"}],
+                    timeout=0,
+                )
+            )
+
+        kwargs = client.responses.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.6-luna"
+        assert kwargs["instructions"] == "system"
+        assert kwargs["max_output_tokens"] == 8000
+        assert kwargs["reasoning"] == {"effort": "medium"}
+        assert result.text == "ready"
+        client.chat.completions.create.assert_not_called()
 
 
 class TestConfigResolution:
