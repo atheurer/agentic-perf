@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAICompatLLMProvider(LLMProvider):
+    @staticmethod
+    def _uses_max_completion_tokens(model: str) -> bool:
+        """Return whether a model uses the newer completion-token parameter.
+
+        OpenAI reasoning-model families reject the legacy ``max_tokens``
+        parameter. Keep the legacy spelling for older OpenAI-compatible
+        endpoints such as vLLM and Ollama.
+        """
+        normalized = model.lower()
+        return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -75,9 +86,15 @@ class OpenAICompatLLMProvider(LLMProvider):
 
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": self._resolve_max_tokens(max_tokens),
             "messages": oai_messages,
         }
+        token_limit = self._resolve_max_tokens(max_tokens)
+        token_parameter = (
+            "max_completion_tokens"
+            if self._uses_max_completion_tokens(self._model)
+            else "max_tokens"
+        )
+        kwargs[token_parameter] = token_limit
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
         if self.reasoning_effort is not None:

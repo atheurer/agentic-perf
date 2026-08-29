@@ -119,6 +119,10 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                     system_prompt="",
                     messages=[{"role": "user", "content": "ping"}],
                     tools=[],
+                    # Reasoning models can consume hidden reasoning tokens
+                    # before producing even a one-token visible response.
+                    # A token limit of one therefore reports a false model
+                    # failure even when the endpoint and credentials work.
                     max_tokens=MODEL_CHECK_MAX_TOKENS,
                 ),
                 timeout=10.0,
