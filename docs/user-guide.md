@@ -312,7 +312,12 @@ Use same hardware/config, just swap qdisc."
 ### Agent Paused Without Asking
 **Symptom**: Ticket stuck at `awaiting_customer_guidance` with no clear message.
 
-**Fix**: View the ticket details to see what the agent was trying to do, then reply with clarification:
+**Fix**: If introspection is enabled, check `guidance_summary` in the
+ticket's custom fields or look for the 💡 GUIDANCE event in the
+dashboard feed. It explains why the agent stopped and suggests
+actions. If introspection is disabled, view the ticket details
+to see what the agent was trying to do, then reply with
+clarification:
 
 ```bash
 agentic-perf show ticket-abc123

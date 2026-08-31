@@ -3271,6 +3271,24 @@ function renderEvent(evt) {
         '<span>' + escHtml(data.description || data.type || 'Anomaly detected') + '</span>' +
       '</div>';
 
+    case 'guidance_summary':
+      var gActions = (data.suggested_actions || []).map(function(a) {
+        return '<li>' + escHtml(a) + '</li>';
+      }).join('');
+      var gSuggestion = data.suggested_response
+        ? '<div style="margin-top:6px;padding:6px;background:var(--bg-alt);border-radius:4px;font-size:12px"><strong>Suggestion:</strong> ' + escHtml(data.suggested_response) + '</div>'
+        : '';
+      return '<div class="event" style="border-left:3px solid #1565c0;padding-left:8px;margin:4px 0">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#1565c0;color:#fff">💡 GUIDANCE</span>' +
+        '<div style="margin-top:4px">' +
+          '<strong>' + escHtml(data.agent || '?') + '</strong>: ' + escHtml(data.reason || 'needs guidance') +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
+          (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
+          gSuggestion +
+        '</div>' +
+      '</div>';
+
     case 'transition':
     case 'status_change':
       return '';
