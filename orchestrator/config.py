@@ -246,6 +246,12 @@ class OrchestratorConfig:
             os.environ.get("INTROSPECTION_ENABLED", "").lower() in ("1", "true", "yes")
         ) or introspection_cfg.get("enabled", False)
 
+        # Whether introspection uses LLM for narrative and
+        # guidance suggestions. When False, introspection runs
+        # deterministic-only (anomaly detection, event counting,
+        # guidance summary classification) without LLM calls.
+        self.introspection_llm: bool = introspection_cfg.get("llm", True)
+
     def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
         """Get LLM provider/model config for an agent type.
 

@@ -537,6 +537,13 @@ The introspection agent:
   purpose-built tools (e.g., using `execute_benchmark` for known
   harnesses), manual schema exploration via SSH, and manual container
   orchestration via SSH
+- Produces a structured **guidance summary** when a ticket
+  transitions to `awaiting_customer_guidance` — classifies why
+  the ticket stopped (timeout, error, needs_input, auth_failure,
+  build_failure, handoff_blocked, resource_exhaustion), suggests
+  user actions, and optionally generates an LLM-suggested
+  response. Written to `custom_fields.guidance_summary` and
+  emitted as a `guidance_summary` event for the dashboard.
 - Stops automatically when the ticket reaches a terminal status
 - Never transitions ticket state or modifies agent behavior (Phase 1)
 

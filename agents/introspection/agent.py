@@ -121,6 +121,7 @@ class IntrospectionAgent:
         self._prev_anomaly_count = 0
         self._emitted_anomaly_count = 0
         self._prev_status = ""
+        self._guidance_produced = False
         self._llm_call_count = 0
         self._stop_requested = False
         self._error_patterns = load_error_patterns()
@@ -161,7 +162,10 @@ class IntrospectionAgent:
                 ticket_id,
                 "introspection-agent",
                 "agent_started",
-                {"mode": "continuous_observer"},
+                {
+                    "mode": "continuous_observer",
+                    "llm_enabled": self._llm is not None,
+                },
             )
 
         reached_terminal = False
@@ -250,6 +254,26 @@ class IntrospectionAgent:
                                         ),
                                     },
                                 )
+
+                # Produce guidance summary when ticket
+                # transitions to awaiting_customer_guidance.
+                # Use a flag to prevent re-emission on every
+                # poll cycle — _prev_status is only updated
+                # inside _maybe_narrate which may not run.
+                if (
+                    status == "awaiting_customer_guidance"
+                    and not self._guidance_produced
+                ):
+                    self._guidance_produced = True
+                    await self._produce_guidance_summary(
+                        ticket_id,
+                        ticket,
+                        anomalies,
+                    )
+                elif status != "awaiting_customer_guidance":
+                    # Reset when ticket leaves guidance
+                    # (allows re-triggering if it returns)
+                    self._guidance_produced = False
 
                 if new_events or stale:
                     # Check if LLM narrative is warranted.
@@ -773,6 +797,7 @@ class IntrospectionAgent:
             "status_summary": status_summary,
             "total_events": len(self._all_events),
             "agents_seen": agent_counts,
+            "llm_enabled": self._llm is not None,
         }
 
     # --- Startup seeding ---
@@ -798,11 +823,11 @@ class IntrospectionAgent:
         except Exception:
             return
 
+        cf = ticket.get("custom_fields", {})
         status = ticket.get("status", "")
         if status:
             self._prev_status = status
 
-        cf = ticket.get("custom_fields", {})
         intro = cf.get("introspection", {})
 
         # Restore narrative history.
@@ -835,6 +860,196 @@ class IntrospectionAgent:
             logger.debug(
                 f"[introspection] Failed to update observation for {ticket_id}"
             )
+
+    async def _produce_guidance_summary(
+        self,
+        ticket_id: str,
+        ticket: dict[str, Any],
+        anomalies: list[dict[str, Any]],
+    ) -> None:
+        """Produce a structured summary when a ticket needs guidance.
+
+        Analyzes recent events to determine why the ticket stopped
+        and what the user can do. Writes the summary to
+        ``introspection.guidance_summary`` and emits a
+        ``guidance_summary`` event.
+        """
+        summary = self._build_guidance_summary_deterministic(ticket, anomalies)
+
+        # Optional LLM enhancement
+        if self._llm and summary.get("reason"):
+            try:
+                llm_suggestion = await self._llm_guidance_suggestion(
+                    ticket_id, ticket, summary
+                )
+                if llm_suggestion:
+                    summary["suggested_response"] = llm_suggestion
+            except Exception:
+                logger.debug(
+                    "[introspection] LLM guidance suggestion "
+                    "failed, using deterministic only",
+                    exc_info=True,
+                )
+
+        # Write to ticket
+        try:
+            await self._client.patch(
+                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={
+                    "fields": {
+                        "guidance_summary": summary,
+                    }
+                },
+            )
+        except Exception:
+            logger.debug(
+                "[introspection] Failed to write guidance_summary for %s",
+                ticket_id,
+            )
+
+        # Emit event for dashboard
+        if self._events:
+            self._events.emit(
+                ticket_id,
+                "introspection-agent",
+                "guidance_summary",
+                summary,
+            )
+
+        logger.info(
+            "[introspection] Guidance summary for %s: %s",
+            ticket_id,
+            summary.get("reason", "unknown"),
+        )
+
+    def _build_guidance_summary_deterministic(
+        self,
+        ticket: dict[str, Any],
+        anomalies: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build guidance summary from event stream deterministically."""
+        comments = ticket.get("comments", [])
+
+        # Find the last agent comment (the one requesting guidance)
+        last_agent = ""
+        last_agent_message = ""
+        for c in reversed(comments):
+            author = c.get("author", "")
+            if author not in ("system", ""):
+                if not author.startswith("user"):
+                    last_agent = author
+                    last_agent_message = c.get("body", "")[:500]
+                    break
+
+        # Classify the reason
+        reason = "unknown"
+        details = last_agent_message
+
+        lower_msg = last_agent_message.lower()
+        if "timeout" in lower_msg or "timed out" in lower_msg:
+            reason = "timeout"
+        elif "input needed" in lower_msg or "needs clarification" in lower_msg:
+            reason = "needs_input"
+        elif "not authorized" in lower_msg or "denied" in lower_msg:
+            reason = "auth_failure"
+        elif "handoff blocked" in lower_msg:
+            reason = "handoff_blocked"
+        elif "build failed" in lower_msg or "build_failure" in lower_msg:
+            reason = "build_failure"
+        elif "no" in lower_msg and ("board" in lower_msg or "available" in lower_msg):
+            reason = "resource_exhaustion"
+        elif "failed" in lower_msg or "error" in lower_msg:
+            reason = "error"
+        elif last_agent_message:
+            reason = "agent_stopped"
+
+        # Build suggested actions
+        suggested_actions = []
+        if reason == "timeout":
+            suggested_actions = [
+                "Retry — the LLM call may succeed on a second attempt",
+                "Increase llm.timeout in config if this recurs",
+                "Abort if the ticket is no longer needed",
+            ]
+        elif reason == "error":
+            suggested_actions = [
+                "Review the error details above",
+                "Fix the underlying issue and retry",
+                "Abort if unrecoverable",
+            ]
+        elif reason == "needs_input":
+            suggested_actions = [
+                "Provide the requested information via comment",
+                "Abort if the question is not answerable",
+            ]
+        elif reason == "auth_failure":
+            suggested_actions = [
+                "Check credentials and permissions",
+                "This is likely unrecoverable without config changes",
+            ]
+        elif reason == "build_failure":
+            suggested_actions = [
+                "Check the build error details",
+                "Verify manifest and repo configuration",
+                "Abort and resubmit with corrections",
+            ]
+        elif reason == "handoff_blocked":
+            suggested_actions = [
+                "The previous agent's output didn't meet handoff preconditions",
+                "Check if the execution plan matches the ticket's intent",
+                "Transition manually to the appropriate status",
+            ]
+        else:
+            suggested_actions = [
+                "Review the last agent comment for context",
+                "Reply with guidance or abort",
+            ]
+
+        # Include relevant anomalies
+        high_anomalies = [
+            a.get("description", "")
+            for a in anomalies
+            if a.get("severity") in ("high", "critical")
+        ]
+
+        return {
+            "agent": last_agent,
+            "reason": reason,
+            "details": details,
+            "suggested_actions": suggested_actions,
+            "anomalies": high_anomalies[:3],
+        }
+
+    async def _llm_guidance_suggestion(
+        self,
+        ticket_id: str,
+        ticket: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> str | None:
+        """Use LLM to generate a suggested response."""
+        if not self._llm:
+            return None
+
+        prompt = (
+            f"A performance testing ticket ({ticket_id}) has "
+            f"paused for user guidance.\n\n"
+            f"Agent: {summary.get('agent', 'unknown')}\n"
+            f"Reason: {summary.get('reason', 'unknown')}\n"
+            f"Details: {summary.get('details', '')}\n\n"
+            f"Ticket summary: {ticket.get('summary', '')}\n\n"
+            f"In 1-2 sentences, suggest what the user should "
+            f"do to resolve this. Be specific and actionable."
+        )
+
+        response = await self._llm.complete(
+            system="You are a concise technical advisor. "
+            "Suggest a specific action in 1-2 sentences.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+        )
+
+        self._record_usage(ticket_id, response)
+        return response.text.strip() if response.text else None
 
     async def _get_ticket(
         self,

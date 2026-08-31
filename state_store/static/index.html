@@ -2050,7 +2050,7 @@ async function renderDetail(ticketId) {
               '</div>' +
             '</div>' +
             '<div class="left-panel-section introspection-hidden" id="introspection-card">' +
-              '<h4 style="color:var(--purple)">Introspection</h4>' +
+              '<h4 style="color:var(--purple)">Introspection <span id="introspection-llm-badge" style="font-size:10px;font-weight:normal;padding:1px 6px;border-radius:3px;margin-left:6px"></span></h4>' +
               '<div id="introspection-content"></div>' +
             '</div>' +
           '</div>' +
@@ -2843,6 +2843,14 @@ function renderIntrospectionContent(intro) {
   var html = '';
   var anomalies = intro.anomalies || [];
 
+  // Update LLM badge from config-driven field
+  var badge = document.getElementById('introspection-llm-badge');
+  if (badge && intro.llm_enabled !== undefined) {
+    badge.textContent = intro.llm_enabled ? 'LLM' : 'deterministic';
+    badge.style.background = intro.llm_enabled ? 'var(--purple)' : 'var(--bg-alt)';
+    badge.style.color = intro.llm_enabled ? '#fff' : 'var(--text-muted)';
+  }
+
   // Anomaly summary
   if (anomalies.length > 0) {
     var high = 0, med = 0, low = 0;
@@ -3201,7 +3209,7 @@ function renderEvent(evt) {
 
   // Introspection agent events are shown in the dedicated
   // introspection card, not in the main event stream.
-  if (agent === 'introspection-agent') return '';
+  if (agent === 'introspection-agent' && etype !== 'guidance_summary') return '';
 
   switch (etype) {
     case 'agent_started':
@@ -3269,6 +3277,24 @@ function renderEvent(evt) {
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label" style="background:' + aColor + ';color:#fff">⚠ ' + aSev + '</span>' +
         '<span>' + escHtml(data.description || data.type || 'Anomaly detected') + '</span>' +
+      '</div>';
+
+    case 'guidance_summary':
+      var gActions = (data.suggested_actions || []).map(function(a) {
+        return '<li>' + escHtml(a) + '</li>';
+      }).join('');
+      var gSuggestion = data.suggested_response
+        ? '<div style="margin-top:6px;padding:6px;background:var(--bg-alt);border-radius:4px;font-size:12px"><strong>Suggestion:</strong> ' + escHtml(data.suggested_response) + '</div>'
+        : '';
+      return '<div class="event" style="border-left:3px solid #1565c0;padding-left:8px;margin:4px 0">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#1565c0;color:#fff">💡 GUIDANCE</span>' +
+        '<div style="margin-top:4px">' +
+          '<strong>' + escHtml(data.agent || '?') + '</strong>: ' + escHtml(data.reason || 'needs guidance') +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
+          (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
+          gSuggestion +
+        '</div>' +
       '</div>';
 
     case 'transition':

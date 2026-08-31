@@ -70,8 +70,10 @@ class Dispatcher:
         secrets_root: Path | None = None,
         vault_config: dict | None = None,
         redactor: Any | None = None,
+        introspection_llm: bool = True,
     ) -> None:
         self.store_url = state_store_url
+        self._introspection_llm = introspection_llm
         self.llm = llm_provider
         self.skills = skill_provider
         self.secrets = secrets_provider
@@ -271,7 +273,7 @@ class Dispatcher:
 
         from agents.introspection.agent import IntrospectionAgent
 
-        llm = self._get_llm("introspection")
+        llm = self._get_llm("introspection") if self._introspection_llm else None
         agent = IntrospectionAgent(
             state_store_url=self.store_url,
             event_bus=self.events,
