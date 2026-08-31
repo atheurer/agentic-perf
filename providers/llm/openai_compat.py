@@ -158,6 +158,22 @@ class OpenAICompatLLMProvider(LLMProvider):
         return self._parse_responses_response(response, model=self._model)
 
     @staticmethod
+    def _parse_cache_details(details: Any) -> tuple[int, int]:
+        """Return cached and cache-written input tokens from provider usage."""
+        if details is None:
+            return 0, 0
+
+        def value(name: str) -> int:
+            raw = (
+                details.get(name, 0)
+                if isinstance(details, dict)
+                else getattr(details, name, 0)
+            )
+            return int(raw or 0)
+
+        return value("cached_tokens"), value("cache_write_tokens")
+
+    @staticmethod
     def _convert_messages(
         system_prompt: str, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -336,11 +352,14 @@ class OpenAICompatLLMProvider(LLMProvider):
         if hasattr(response, "usage") and response.usage:
             u = response.usage
             prompt_t = getattr(u, "prompt_tokens", 0) or 0
+            cache_read, cache_write = OpenAICompatLLMProvider._parse_cache_details(
+                getattr(u, "prompt_tokens_details", None)
+            )
             usage = {
                 "input_tokens": prompt_t,
                 "output_tokens": getattr(u, "completion_tokens", 0) or 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write,
                 "context_tokens": prompt_t,
                 "model": getattr(response, "model", None) or model,
             }
@@ -390,11 +409,14 @@ class OpenAICompatLLMProvider(LLMProvider):
         response_usage = getattr(response, "usage", None)
         if response_usage:
             input_tokens = getattr(response_usage, "input_tokens", 0) or 0
+            cache_read, cache_write = OpenAICompatLLMProvider._parse_cache_details(
+                getattr(response_usage, "input_tokens_details", None)
+            )
             usage = {
                 "input_tokens": input_tokens,
                 "output_tokens": getattr(response_usage, "output_tokens", 0) or 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write,
                 "context_tokens": input_tokens,
                 "model": getattr(response, "model", None) or model,
             }
