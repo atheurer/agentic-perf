@@ -2050,7 +2050,7 @@ async function renderDetail(ticketId) {
               '</div>' +
             '</div>' +
             '<div class="left-panel-section introspection-hidden" id="introspection-card">' +
-              '<h4 style="color:var(--purple)">Introspection</h4>' +
+              '<h4 style="color:var(--purple)">Introspection <span id="introspection-llm-badge" style="font-size:10px;font-weight:normal;padding:1px 6px;border-radius:3px;margin-left:6px"></span></h4>' +
               '<div id="introspection-content"></div>' +
             '</div>' +
           '</div>' +
@@ -2842,6 +2842,14 @@ function updateIntrospectionCard(ticketId) {
 function renderIntrospectionContent(intro) {
   var html = '';
   var anomalies = intro.anomalies || [];
+
+  // Update LLM badge from config-driven field
+  var badge = document.getElementById('introspection-llm-badge');
+  if (badge && intro.llm_enabled !== undefined) {
+    badge.textContent = intro.llm_enabled ? 'LLM' : 'deterministic';
+    badge.style.background = intro.llm_enabled ? 'var(--purple)' : 'var(--bg-alt)';
+    badge.style.color = intro.llm_enabled ? '#fff' : 'var(--text-muted)';
+  }
 
   // Anomaly summary
   if (anomalies.length > 0) {

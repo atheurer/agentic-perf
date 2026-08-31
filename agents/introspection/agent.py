@@ -162,7 +162,10 @@ class IntrospectionAgent:
                 ticket_id,
                 "introspection-agent",
                 "agent_started",
-                {"mode": "continuous_observer"},
+                {
+                    "mode": "continuous_observer",
+                    "llm_enabled": self._llm is not None,
+                },
             )
 
         reached_terminal = False
@@ -794,6 +797,7 @@ class IntrospectionAgent:
             "status_summary": status_summary,
             "total_events": len(self._all_events),
             "agents_seen": agent_counts,
+            "llm_enabled": self._llm is not None,
         }
 
     # --- Startup seeding ---

@@ -1418,6 +1418,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         secrets_root=secrets_root,
         vault_config=vault_config,
         redactor=redactor,
+        introspection_llm=config.introspection_llm,
     )
 
     logger.info(

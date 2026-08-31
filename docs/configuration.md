@@ -453,6 +453,7 @@ and writing observations to `custom_fields.introspection`.
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `enabled` | bool | `false` | `INTROSPECTION_ENABLED` | Enable introspection for all tickets globally |
+| `llm` | bool | `true` | — | Use LLM for narrative and guidance suggestions. When `false`, introspection runs deterministic-only: anomaly detection, event counting, and guidance summary reason classification still work, but LLM-generated narratives and suggested responses are skipped. |
 
 #### Per-Ticket Override
 
