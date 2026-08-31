@@ -1049,11 +1049,7 @@ class IntrospectionAgent:
         )
 
         self._record_usage(ticket_id, response)
-        text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                text += block.text
-        return text.strip() if text.strip() else None
+        return response.text.strip() if response.text else None
 
     async def _get_ticket(
         self,

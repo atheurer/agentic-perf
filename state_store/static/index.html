@@ -3209,7 +3209,7 @@ function renderEvent(evt) {
 
   // Introspection agent events are shown in the dedicated
   // introspection card, not in the main event stream.
-  if (agent === 'introspection-agent') return '';
+  if (agent === 'introspection-agent' && etype !== 'guidance_summary') return '';
 
   switch (etype) {
     case 'agent_started':
