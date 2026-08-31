@@ -49,8 +49,19 @@ _BASE_MANIFEST: dict[str, Any] = {
         "systemd": {
             "enabled_services": [
                 "sshd.service",
+                # osbuild does not run systemd presets,
+                # so services must be explicitly enabled
+                "NetworkManager.service",
+                "chronyd.service",
             ],
         },
+    },
+    # Explicit dynamic network — AIB schema defaults to
+    # dynamic but may not apply the default when the field
+    # is absent. Without this, NetworkManager is not
+    # configured and interfaces stay down.
+    "network": {
+        "dynamic": {},
     },
     "image": {
         "image_size": "8 GiB",
@@ -125,9 +136,17 @@ def generate_manifest(
     if disabled:
         manifest["content"]["systemd"]["disabled_services"] = disabled
 
+    # NOTE: masked_services is NOT supported by the AIB
+    # manifest schema. Use disabled_services instead.
     masked = customizations.get("masked_services", [])
     if masked:
-        manifest["content"]["systemd"]["masked_services"] = masked
+        logger.warning(
+            "[caib] masked_services is not supported by AIB. "
+            "Converting to disabled_services."
+        )
+        disabled = manifest["content"]["systemd"].get("disabled_services", [])
+        disabled.extend(masked)
+        manifest["content"]["systemd"]["disabled_services"] = disabled
 
     kernel = customizations.get("kernel")
     if kernel:

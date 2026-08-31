@@ -107,11 +107,22 @@ class TestBuildModeResolution:
 class TestManifestGeneration:
     def test_basic_manifest(self):
         manifest = generate_manifest(
-            {"masked_services": ["foo.service"]},
+            {"disabled_services": ["foo.service"]},
             name="test-build",
         )
         assert manifest["name"] == "test-build"
-        assert "foo.service" in manifest["content"]["systemd"]["masked_services"]
+        assert "foo.service" in manifest["content"]["systemd"]["disabled_services"]
+
+    def test_masked_services_converted_to_disabled(self):
+        manifest = generate_manifest(
+            {"masked_services": ["bar.service"]},
+        )
+        assert "bar.service" in manifest["content"]["systemd"]["disabled_services"]
+        assert "masked_services" not in manifest["content"]["systemd"]
+
+    def test_network_dynamic_in_manifest(self):
+        manifest = generate_manifest({})
+        assert manifest["network"] == {"dynamic": {}}
 
     def test_rpms_in_manifest(self):
         manifest = generate_manifest(
