@@ -50,6 +50,12 @@ The methodology skill teaches you domain-specific knowledge:
 which metrics to check, what patterns are known, how to interpret
 phase breakdowns, and when to declare conclusive vs inconclusive.
 
+**Skills are evidence-based, not infallible.** Documented patterns
+reflect analysis at a point in time. If your data contradicts a
+skill's documented pattern, investigate the discrepancy — do not
+dismiss your data to preserve the skill's claim. Report the
+conflict explicitly in your findings.
+
 ## Rules
 
 - **Never provision hardware or run benchmarks.** You analyze
