@@ -114,7 +114,7 @@ Structured **provisioning result** with:
 ### Read Tools
 - **get_harness_schema(harness)** — Get JSON schema for run configuration
 - **get_harness_defaults(harness)** — Get recommended default parameters
-- **read_skill_doc(skill_id, doc_name)** — Read harness-specific documentation (run-file pitfalls, best practices)
+- **read_skills(docs)** — Read one or more skill documents in a single call (run-file pitfalls, best practices)
 
 ### Write Tools
 - **validate_runfile(harness, runfile)** — Validate run configuration against schema
@@ -153,7 +153,7 @@ Structured **benchmark result** with:
 - **get_benchmark_results(run_id)** — Retrieve complete result data
 - **query_metrics(run_id, metric_name)** — Query specific metrics (throughput, latency, variance, etc.)
 - **compare_results(run_id1, run_id2, metric_list)** — Compare two benchmark runs
-- **read_skill_doc(skill_id, doc_name)** — Read analysis guidance and interpretation rules
+- **read_skills(docs)** — Read one or more skill documents for analysis guidance and interpretation rules
 
 ### External APIs
 - Metrics database (query, aggregation, statistical analysis)

@@ -220,13 +220,13 @@ class BenchmarkAgent(AgentBase):
     # scope creep (upstream #201).
     _HARNESS_TOOLS: dict[str, set[str]] = {
         "boot-time": {
-            "read_skill",
+            "read_skills",
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",
         },
         "arcaflow-plugins": {
-            "read_skill",
+            "read_skills",
             "set_ssh_context",
             "check_host",
             "get_execution_config",
@@ -326,7 +326,11 @@ class BenchmarkAgent(AgentBase):
             content += "These contain critical lessons from prior runs:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
                 content += f"- `{f.name}`\n"
-            content += "\nUse `read_skill` to read each one.\n"
+            content += (
+                "\nUse `read_skills(docs=[{'harness': '"
+                + harness
+                + "', 'filename': '...'}])` to read.\n"
+            )
 
         general_dir = (
             Path(__file__).resolve().parent.parent.parent / "skills" / "general"
@@ -337,9 +341,7 @@ class BenchmarkAgent(AgentBase):
                 content += "\n## General Skills\n"
                 for f in general_files:
                     content += f"- `{f.name}`\n"
-                content += (
-                    "\nUse `read_skill(harness='general', filename='...')` to read.\n"
-                )
+                content += "\nUse `read_skills(docs=[{'harness': 'general', 'filename': '...'}])` to read.\n"
 
         if self._repo_cache:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])

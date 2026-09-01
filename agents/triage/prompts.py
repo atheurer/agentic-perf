@@ -81,8 +81,9 @@ Your job is to analyze a performance test request ticket and:
 
    **Image selection:** When the ticket involves Jumpstarter hardware (embedded
    boards, lab-managed devices) and the user mentions an image type (e.g.,
-   "bootc", "ostree", "package", "regular"), call `read_skill` with
-   harness `jumpstarter` and filename `image-selection.md` to learn the
+   "bootc", "ostree", "package", "regular"), call
+   `read_skills(docs=[{"harness": "jumpstarter", "filename": "image-selection.md"}])`
+   to learn the
    correct `image_name` and `image_type` directive values.
 
    **Echoing directives:** When the user provides explicit directives in

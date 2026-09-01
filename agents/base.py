@@ -1202,7 +1202,6 @@ class AgentBase(ABC):
             "read_file_slice",
             "list_workspace_files",
             # Skill & documentation reading
-            "read_skill",
             "read_skills",
             "read_harness_doc",
             "get_review_config",

@@ -21,7 +21,7 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_skill_provider, read_skill_document
+from agents.server_utils import build_skill_provider, read_skill_documents
 
 mcp = FastMCP("triage-agent")
 
@@ -62,32 +62,9 @@ _STANDALONE_BENCHMARKS = [
 
 
 @mcp.tool()
-async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document for a harness or provider (e.g. harness='jumpstarter', filename='image-selection.md').
-
-    Skill docs contain domain-specific knowledge for
-    directive resolution (e.g., image selection guidance
-    for Jumpstarter boards).
-
-    Args:
-        harness: Skill category (e.g., 'jumpstarter', 'boot-time').
-        filename: Filename within the skill directory.
-    """
-    res = read_skill_document(SKILLS_DIR, harness, filename)
-    if not res.get("found"):
-        return json.dumps(
-            {
-                "found": False,
-                "message": res.get("message", f"Skill not found: {harness}/{filename}"),
-            },
-        )
-    return json.dumps(
-        {
-            "found": True,
-            "filename": res["filename"],
-            "content": res["content"],
-        },
-    )
+async def read_skills(docs: list[dict]) -> str:
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'jumpstarter', 'filename': 'image-selection.md'}]). Skill docs contain domain-specific knowledge for directive resolution."""
+    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
 
 @mcp.tool()

@@ -604,7 +604,7 @@ async def test_all_tools_use_hosts_or_targets():
             "submit_provisioning_result",
             # Skill doc tools — no host param at all
             "list_skill_docs",
-            "read_skill",
+            "read_skills",
             # Per-host tuning tools — parameters vary per host (CPU, interface)
             # so batching via a hosts array doesn't fit; each call is intentionally
             # for one host with its specific tuning values.

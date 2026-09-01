@@ -435,7 +435,11 @@ class ReviewAgent(AgentBase):
             content += "These contain lessons from prior runs that may help interpret results:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
                 content += f"- `{f.name}`\n"
-            content += "\nUse `read_skill` to read any of these.\n"
+            content += (
+                "\nUse `read_skills(docs=[{'harness': '"
+                + harness
+                + "', 'filename': '...'}])` to read.\n"
+            )
 
         general_dir = (
             Path(__file__).resolve().parent.parent.parent / "skills" / "general"
@@ -446,9 +450,7 @@ class ReviewAgent(AgentBase):
                 content += "\n## General Skills\n"
                 for f in general_files:
                     content += f"- `{f.name}`\n"
-                content += (
-                    "\nUse `read_skill(harness='general', filename='...')` to read.\n"
-                )
+                content += "\nUse `read_skills(docs=[{'harness': 'general', 'filename': '...'}])` to read.\n"
 
         if self._repo_cache:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])

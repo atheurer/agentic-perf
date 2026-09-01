@@ -45,7 +45,7 @@ The following are the valid endpoints on the CDM service:
 
 ### Essential Skills Reference
 To learn how to discover breakouts, apply threshold filters on high-core systems, perform per-pair parallel analyses, and construct optimized CDM query payloads, read the sibling guide:
-* **Tool Call:** `read_skill(harness="crucible", filename="cdm-query-guide.md")`
+* **Tool Call:** `read_skills(docs=[{"harness": "crucible", "filename": "cdm-query-guide.md"}])`
 
 ### Quick CDM Queries
 * **To find active iterations and periods:**

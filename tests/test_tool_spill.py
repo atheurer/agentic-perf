@@ -96,7 +96,6 @@ async def test_exempt_tools_not_spilled(agent, monkeypatch):
         "grep_file",
         "read_file_slice",
         "list_workspace_files",
-        "read_skill",
         "read_skills",
         "read_harness_doc",
         "get_review_config",

@@ -33,7 +33,7 @@ from agents.server_utils import (
     build_secrets_provider,
     build_skill_provider,
     build_ssh_from_ticket,
-    read_skill_document,
+    read_skill_documents,
 )
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
@@ -1277,26 +1277,10 @@ async def list_skill_docs(harness: str) -> str:
     return json.dumps({"found": True, "harness": harness, "files": files})
 
 
-def _read_skill_one(harness: str, filename: str) -> dict:
-    return read_skill_document(_SKILLS_DIR, harness, filename)
-
-
-@mcp.tool()
-async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document (e.g. harness='general', filename='host-tuning.md'). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
-    return json.dumps(_read_skill_one(harness, filename))
-
-
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read multiple skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}, {'harness': 'crucible', 'filename': 'uperf-run-file.md'}]). Use this instead of calling read_skill repeatedly — saves iterations when you need several docs at once."""
-    results = []
-    for doc in docs:
-        harness = doc.get("harness", "")
-        filename = doc.get("filename", "") or doc.get("name", "")
-        result = _read_skill_one(harness, filename)
-        results.append(result)
-    return json.dumps(results)
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}]). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
+    return json.dumps(read_skill_documents(_SKILLS_DIR, docs))
 
 
 @mcp.tool()

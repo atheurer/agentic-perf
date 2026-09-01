@@ -90,7 +90,7 @@ raw files. Use `read_run_results` (reading mode, with file_path) to read
 specific files — it auto-decompresses .xz files and defaults to 4000 bytes.
 Request more if needed.
 
-**Always read the harness skill file** (via `read_skill`) before deciding
+**Always read the harness skill file** (via `read_skills`) before deciding
 how to retrieve results. The skill file will tell you where results are
 stored for that harness.
 
@@ -122,7 +122,7 @@ Once you have the benchmark data:
 2. Evaluate the result level — is performance where you'd expect it, or is
    something clearly limiting it?
 3. Read and follow the harness-specific methodology and query guidelines from the
-   harness skill files (via `read_skill`) to investigate potential bottlenecks and root causes.
+   harness skill files (via `read_skills`) to investigate potential bottlenecks and root causes.
 4. Proceed directly to Step 5 (submit your review).
 
 Do NOT call request_clarification. If you cannot retrieve results
