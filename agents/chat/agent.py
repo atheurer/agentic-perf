@@ -117,22 +117,22 @@ class ChatSessionStore:
             return {
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "cache_read_tokens": 0,
-                "cache_creation_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": 0,
                 "llm_calls": 0,
-                "model": "",
             }
-        total = session.total_input_tokens + session.total_output_tokens
-        cache_total = session.cache_read_tokens + session.cache_creation_tokens
+        cache_read = session.cache_read_tokens
+        cache_create = session.cache_creation_tokens
+        context_in = session.total_input_tokens + cache_read + cache_create
+        total = context_in + session.total_output_tokens
         return {
             "input_tokens": session.total_input_tokens,
             "output_tokens": session.total_output_tokens,
-            "cache_read_tokens": session.cache_read_tokens,
-            "cache_creation_tokens": session.cache_creation_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_create,
             "total_tokens": total,
             "llm_calls": session.llm_calls,
-            "model": "",
-            "cache_pct": (round(cache_total / total * 100, 1) if total > 0 else 0),
         }
 
 
@@ -427,8 +427,32 @@ class ChatAgent:
             # Skip tool_use/tool_result entries in display
         return history
 
-    def get_usage(self, user: str) -> dict[str, int]:
-        return self._sessions.get_usage(user)
+    def get_usage(self, user: str) -> dict[str, Any]:
+        usage = self._sessions.get_usage(user)
+        model = getattr(self._llm, "_model", "") or ""
+        usage["model"] = model
+        if model and usage.get("total_tokens", 0) > 0:
+            try:
+                from providers.cost import estimate_cost
+
+                usage["estimated_cost_usd"] = estimate_cost(
+                    model=model,
+                    input_tokens=usage["input_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    cache_read_input_tokens=usage.get(
+                        "cache_read_input_tokens",
+                        0,
+                    ),
+                    cache_creation_input_tokens=usage.get(
+                        "cache_creation_input_tokens",
+                        0,
+                    ),
+                )
+            except Exception:
+                usage["estimated_cost_usd"] = 0.0
+        else:
+            usage["estimated_cost_usd"] = 0.0
+        return usage
 
     def clear_session(self, user: str) -> bool:
         return self._sessions.delete(user)

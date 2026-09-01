@@ -3867,13 +3867,13 @@ function updateChatCost(usage, elId) {
   if (!el || !usage) return;
   var calls = usage.llm_calls || 0;
   if (calls === 0) { el.innerHTML = ''; return; }
-  var total = usage.total_tokens || ((usage.input_tokens||0) + (usage.output_tokens||0));
-  var cachePct = usage.cache_pct || 0;
+  var total = usage.total_tokens || 0;
   var model = usage.model || '';
+  var cachePctStr = fmtCachePct(usage);
   var parts = [];
   if (model) parts.push('<span style="color:var(--text-muted)">' + escHtml(model) + '</span>');
   parts.push('<span style="color:var(--cyan)">' + total.toLocaleString() + '</span> tokens');
-  if (cachePct > 0) parts.push('<span style="color:var(--text-muted)">(' + cachePct + '% cached)</span>');
+  if (cachePctStr) parts.push('<span style="color:var(--text-muted)">(' + cachePctStr + ')</span>');
   parts.push('<span style="color:var(--green)">' + calls + '</span> calls');
   var cost = usage.estimated_cost_usd || 0;
   if (cost > 0) parts.push('<span style="color:var(--yellow)">' + fmtCost(cost) + '</span>');
