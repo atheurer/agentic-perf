@@ -29,6 +29,7 @@ EVENT_TYPES = {
     "agent_stopped",
     "user_interjection",
     "escalation",
+    "circuit_breaker",
 }
 
 
