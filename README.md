@@ -92,8 +92,32 @@ Adding a new harness means adding a skill provider — no agent code changes.
 ```bash
 git clone https://github.com/atheurer/agentic-perf.git
 cd agentic-perf
-pip install -e .
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -e .
+python3 cli.py --help
 ```
+
+The repository does not currently install an `agentic-perf` console script;
+use `python3 cli.py` from the checkout for every CLI command. Optional
+dependencies are grouped by deployment feature:
+
+| Extra | Use |
+|---|---|
+| `vertex` | Anthropic through Google Cloud Vertex AI |
+| `openai` | OpenAI provider |
+| `gemini` | Gemini provider |
+| `telemetry` | OpenTelemetry instrumentation |
+| `telemetry-export` | OTLP/gRPC export (also install `telemetry`) |
+| `bitwarden` | Bitwarden-backed secrets |
+| `jumpstarter` | Jumpstarter hardware and flashing |
+| `dev` | Tests, coverage, and linting |
+
+For example: `python3 -m pip install -e '.[vertex,jumpstarter]'`.
+After starting the service, verify the installation with
+`python3 cli.py health`. See the [CLI reference](docs/cli-reference.md),
+[E2E testing guide](docs/e2e-testing.md), and
+[configuration guide](docs/configuration.md) for details.
 
 ## Configuration
 
@@ -168,7 +192,7 @@ The web dashboard is available at `http://localhost:8090`.
 ### Submit a request
 
 ```bash
-agentic-perf submit \
+python3 cli.py submit \
   "Run a 4K random read fio test on my storage server" \
   -d "Controller: 198.51.100.1. Endpoint: 198.51.100.2. SSH key: ~/.ssh/id_ed25519. Use crucible."
 ```
@@ -176,40 +200,40 @@ agentic-perf submit \
 ### Watch progress
 
 ```bash
-agentic-perf watch <TICKET_ID> -f        # Follow mode
-agentic-perf watch <TICKET_ID> -f -v     # Verbose: show tool calls and LLM interactions
+python3 cli.py watch <TICKET_ID> -f        # Follow mode
+python3 cli.py watch <TICKET_ID> -f -v     # Verbose: show tool calls and LLM interactions
 ```
 
 ### Respond to agent questions
 
 ```bash
-agentic-perf reply <TICKET_ID> "Approved"
+python3 cli.py reply <TICKET_ID> "Approved"
 ```
 
 ### Abort a paused ticket
 
 ```bash
-agentic-perf abort <TICKET_ID>                   # Skip to teardown
-agentic-perf abort <TICKET_ID> "wrong config"     # With reason
+python3 cli.py abort <TICKET_ID>                   # Skip to teardown
+python3 cli.py abort <TICKET_ID> "wrong config"     # With reason
 ```
 
 ### View agent conversation transcript
 
 ```bash
-agentic-perf transcript <TICKET_ID>               # Full conversation
-agentic-perf transcript <TICKET_ID> --agent triage-agent   # Single agent
-agentic-perf transcript <TICKET_ID> --json         # Raw events as JSON
+python3 cli.py transcript <TICKET_ID>               # Full conversation
+python3 cli.py transcript <TICKET_ID> --agent triage-agent   # Single agent
+python3 cli.py transcript <TICKET_ID> --json         # Raw events as JSON
 ```
 
 ### Other commands
 
 ```bash
-agentic-perf list                          # List all tickets
-agentic-perf list -s executing_benchmark   # Filter by status
-agentic-perf show <TICKET_ID>             # Show ticket details and custom fields
-agentic-perf health                        # Check state store (ticket counts)
-agentic-perf cleanup --older-than 24       # Find orphaned AWS instances
-agentic-perf cleanup --terminate -y        # Terminate orphaned instances
+python3 cli.py list                          # All tickets
+python3 cli.py list -s executing_benchmark   # Filter by status
+python3 cli.py show <TICKET_ID>             # Ticket details and custom fields
+python3 cli.py health                        # State-store health
+python3 cli.py cleanup --older-than 24       # Find orphaned AWS instances
+python3 cli.py cleanup --terminate -y        # Terminate orphaned instances
 ```
 
 ## Web Dashboard
