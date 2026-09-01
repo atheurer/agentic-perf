@@ -15,16 +15,20 @@ testing well, but can't handle the variability of investigative work.
 
 ## The Approach
 
-Five specialized agents collaborate through a shared ticket (a structured JSON
+Specialized agents and deterministic coordinators collaborate through a shared ticket (a structured JSON
 document that serves as the single source of truth):
 
-| Agent | Role | Scoped Tools |
+| Handler | Role | Execution |
 |---|---|---|
 | **Triage** | Parse user intent, form hypothesis, select benchmark | Benchmark discovery, resolution |
 | **Resource** | Find and reserve hardware from providers | QUADS API, AWS EC2, PSAP Control Center |
 | **Provisioning** | Install benchmark harness on hosts via SSH | SSH, platform contracts, K3s |
 | **Benchmark** | Construct run configuration, execute, monitor | Harness docs, schema validation, CLI |
 | **Review** | Analyze results, produce verdict | Metric query, result comparison |
+| **Platform / image builder** | Prepare platforms and custom images | deterministic |
+| **Investigation / fleet / synthesis** | Context, convergence, fleet routing, final record | mixed |
+| **Retrospective** | Post-run findings | LLM |
+| **Introspection** | Optional event observer and guidance summary | configurable |
 
 Each agent has its own MCP tool server with scoped capabilities — the review
 agent cannot SSH, and the provisioning agent cannot query metrics. Agents are
@@ -32,26 +36,31 @@ stateless and crash-recoverable: all durable state lives on the ticket.
 
 ## Ticket Lifecycle
 
+The complete mapping and current MCP inventory are in
+[docs/capabilities.md](docs/capabilities.md).
+
 ### Ad-hoc test execution
 
 ```
-new → triage_pending → awaiting_hardware → awaiting_provision →
-executing_benchmark → awaiting_review → awaiting_teardown → closed
+new → triage_pending → awaiting_hardware → preparing_platform? →
+awaiting_provision → executing_benchmark → awaiting_review →
+awaiting_teardown → retrospective_pending → closed
 ```
 
 ### Recursive investigation
 
 ```
-new → triage_pending → gathering_context → planning_investigation →
+new → triage_pending → gathering_context → analyzing? →
+planning_investigation → awaiting_hardware → preparing_platform? →
 awaiting_provision → executing_benchmark → evaluating_convergence →
     │── loop back to planning_investigation (refine params)
     │── loop back to awaiting_provision (re-flash hardware)
     └── synthesizing_results → awaiting_teardown → closed
 ```
 
-Both paths can pause at `awaiting_customer_guidance` for human input, and the
-user can reply to resume. Tickets can also be aborted to skip directly to
-teardown.
+Both paths can pause at `awaiting_customer_guidance`; `reply` resumes without
+restarting the orchestrator. Stop, hard-stop, stop-all, abort, and administrative
+force-close controls are documented in [docs/status-lifecycle.md](docs/status-lifecycle.md).
 
 ## Supported Benchmark Harnesses
 
@@ -84,8 +93,7 @@ Adding a new harness means adding a skill provider — no agent code changes.
 ## Prerequisites
 
 - Python 3.12+
-- Credentials for the selected LLM provider (Anthropic, OpenAI-compatible,
-  or Gemini); Vertex AI additionally requires the vertex extra and ADC
+- An Anthropic API key (direct API or Google Cloud Vertex AI)
 - SSH access to target hosts (for benchmark execution)
 
 ## Installation
@@ -93,32 +101,8 @@ Adding a new harness means adding a skill provider — no agent code changes.
 ```bash
 git clone https://github.com/atheurer/agentic-perf.git
 cd agentic-perf
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install -e .
-python3 cli.py --help
+pip install -e .
 ```
-
-The repository does not currently install an `agentic-perf` console script;
-use `python3 cli.py` from the checkout for every CLI command. Optional
-dependencies are grouped by deployment feature:
-
-| Extra | Use |
-|---|---|
-| `vertex` | Anthropic through Google Cloud Vertex AI |
-| `openai` | OpenAI provider |
-| `gemini` | Gemini provider |
-| `telemetry` | OpenTelemetry instrumentation |
-| `telemetry-export` | OTLP/gRPC export (also install `telemetry`) |
-| `bitwarden` | Bitwarden-backed secrets |
-| `jumpstarter` | Jumpstarter hardware and flashing |
-| `dev` | Tests, coverage, and linting |
-
-For example: `python3 -m pip install -e '.[vertex,jumpstarter]'`.
-After starting the service, verify the installation with
-`python3 cli.py health`. See the [CLI reference](docs/cli-reference.md),
-[E2E testing guide](docs/e2e-testing.md), and
-[configuration guide](docs/configuration.md) for details.
 
 ## Configuration
 
@@ -131,8 +115,7 @@ Create `~/.agentic-perf/config.json`:
         "model": "claude-haiku-4-5",
         "backend": "vertex",
         "project_id": "your-gcp-project",
-        "region": "us-east5",
-        "max_tokens": 8000
+        "region": "us-east5"
     },
     "state_store": {
         "url": "http://localhost:8090",
@@ -194,7 +177,7 @@ The web dashboard is available at `http://localhost:8090`.
 ### Submit a request
 
 ```bash
-python3 cli.py submit \
+agentic-perf submit \
   "Run a 4K random read fio test on my storage server" \
   -d "Controller: 198.51.100.1. Endpoint: 198.51.100.2. SSH key: ~/.ssh/id_ed25519. Use crucible."
 ```
@@ -202,40 +185,43 @@ python3 cli.py submit \
 ### Watch progress
 
 ```bash
-python3 cli.py watch <TICKET_ID> -f        # Follow mode
-python3 cli.py watch <TICKET_ID> -f -v     # Verbose: show tool calls and LLM interactions
+agentic-perf watch <TICKET_ID> -f        # Follow mode
+agentic-perf watch <TICKET_ID> -f -v     # Verbose: show tool calls and LLM interactions
 ```
 
 ### Respond to agent questions
 
 ```bash
-python3 cli.py reply <TICKET_ID> "Approved"
+agentic-perf reply <TICKET_ID> "Approved"
 ```
 
 ### Abort a paused ticket
 
 ```bash
-python3 cli.py abort <TICKET_ID>                   # Skip to teardown
-python3 cli.py abort <TICKET_ID> "wrong config"     # With reason
+agentic-perf abort <TICKET_ID>                   # Skip to teardown
+agentic-perf abort <TICKET_ID> "wrong config"     # With reason
 ```
 
 ### View agent conversation transcript
 
 ```bash
-python3 cli.py transcript <TICKET_ID>               # Full conversation
-python3 cli.py transcript <TICKET_ID> --agent triage-agent   # Single agent
-python3 cli.py transcript <TICKET_ID> --json         # Raw events as JSON
+agentic-perf transcript <TICKET_ID>               # Full conversation
+agentic-perf transcript <TICKET_ID> --agent triage-agent   # Single agent
+agentic-perf transcript <TICKET_ID> --json         # Raw events as JSON
 ```
 
 ### Other commands
 
 ```bash
-python3 cli.py list                          # All tickets
-python3 cli.py list -s executing_benchmark   # Filter by status
-python3 cli.py show <TICKET_ID>             # Ticket details and custom fields
-python3 cli.py health                        # State-store health
-python3 cli.py cleanup --older-than 24       # Find orphaned AWS instances
-python3 cli.py cleanup --terminate -y        # Terminate orphaned instances
+agentic-perf list                          # List all tickets
+agentic-perf list -s executing_benchmark   # Filter by status
+agentic-perf show <TICKET_ID>             # Show ticket details and custom fields
+agentic-perf health                        # Check state store (ticket counts)
+agentic-perf cleanup --older-than 24       # Find orphaned AWS instances
+agentic-perf cleanup --terminate -y        # Terminate orphaned instances
+agentic-perf archive <TICKET_ID>           # Archive a closed ticket
+agentic-perf stop <TICKET_ID> --hard       # Cancel the running task
+agentic-perf stop-all --yes --hard         # Emergency stop all tasks
 ```
 
 ## Web Dashboard
@@ -268,7 +254,7 @@ agentic-perf/
   state_store/             # FastAPI REST API + ticket store + web dashboard
     static/                #   Single-page web dashboard
   providers/
-    llm/                   #   Claude, OpenAI-compatible, Gemini, and mock providers
+    llm/                   #   Claude (direct + Vertex) and mock providers
     resource/              #   QUADS, AWS EC2, PSAP Control Center, provider registry
     investigation/         #   Investigation Record storage (pluggable backends)
     secrets/               #   File-based local secrets
@@ -328,17 +314,42 @@ For end-to-end testing with real infrastructure, see
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system architecture, agents, providers, state machine
-- [Design Philosophy](docs/design-philosophy.md) — why the system is designed the way it is
-- [CLI Reference](docs/cli-reference.md) — complete command reference with examples
-- [Adding a Harness](docs/adding-a-harness.md) — how to add a new benchmark harness
-- [LLM Run-File Generation](docs/design-llm-runfile-generation.md) — how benchmark agents construct run configurations
-- [E2E Testing Guide](docs/e2e-testing.md) — running the full pipeline against real hardware
-- [CDM API Reference](docs/cdm-api-reference.md) — querying Crucible's metric storage
-- [Collaborative Negotiation](docs/collaborative-negotiation.md) — future design for multi-agent planning
-- [Jira Integration](docs/jira-polling-integration.md) — replacing the local state store with Jira Cloud
-- [Web Dashboard](docs/web-ui.md) — dashboard architecture and event stream
-- [Presentation](docs/presentation-agentic-perf.md) — overview slides explaining the project's motivation and results
+### Users
+
+- [User guide](docs/user-guide.md) — current submission and usage guide
+- [CLI reference](docs/cli-reference.md) — current command reference
+- [Ticket directives](docs/ticket-directives.md) — current ticket controls
+- [E2E testing](docs/e2e-testing.md) — reproducible smoke and real-pipeline checks
+- [Web dashboard](docs/web-ui.md) — current views and controls
+- [CDM API](docs/cdm-api-reference.md) — current metric queries
+
+### Operators
+
+- [Configuration](docs/configuration.md) — current settings
+- [Secrets](docs/secrets.md) — current secret providers and resolution
+- [Monitoring runbook](docs/monitoring.md) — current recovery procedures
+- [Multi-user](docs/multi-user.md) — current identity and ownership
+- [Multi-instance](docs/multi-instance.md) — current isolated deployments and claims
+- [Deployment](docs/container-deployment.md), [OpenShift](docs/openshift-deployment.md), [Beaker](docs/beaker-integration.md)
+- [Retention and dataflow](docs/dataflow.md) — current archive/redaction behavior
+- [Release and upgrade guide](docs/releases-and-upgrades.md) — operator checklist
+
+### Developers and architecture
+
+- [Architecture](docs/architecture.md), [lifecycle](docs/status-lifecycle.md), [capabilities](docs/capabilities.md)
+- [REST API reference](docs/rest-api-reference.md) — all mounted API routes
+- [Workspace and charts](docs/workspaces-and-charts.md) — current spill/chart contracts
+- [Fleet investigation](docs/fleet-investigation.md) — current fleet workflow
+- [Adding a harness](docs/adding-a-harness.md) — extension guide
+- [Design philosophy](docs/design-philosophy.md), [dataflow](docs/dataflow.md)
+- [Webhook ingestion](docs/webhook-ingestion.md), [Jira integration](docs/jira-polling-integration.md)
+- [TUI concept](docs/tui-concept.md) and [TUI implementation plan](docs/tui-implementation-plan.md) — draft/planning
+- [LLM run-file design](docs/design-llm-runfile-generation.md) and [collaborative negotiation](docs/collaborative-negotiation.md) — design documents; verify implementation status
+- [Presentation](docs/presentation-agentic-perf.md) — historical overview
+
+Skill-specific workload/configuration pages live under `skills/`; internal
+notes under `docs/internal/` are not public contracts. This index is the
+canonical navigation page; each linked page carries its status marker.
 
 ## License
 
