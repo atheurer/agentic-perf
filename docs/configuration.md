@@ -91,7 +91,7 @@ overridden by `agent_models`.
 | `api` | string | `"chat_completions"` | `OPENAI_API` | OpenAI API mode: `"chat_completions"` or `"responses"`. Applies only to the `openai` provider. |
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
-| `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). |
+| `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). Startup validation probes each model with its configured effort; an incompatible combination (e.g. `reasoning_effort` on a model without extended thinking) logs an error naming the affected agents. |
 
 #### Supported Providers
 
@@ -146,7 +146,10 @@ only when you want a specific agent to use a different model.
 
 Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
 and `max_tokens` keys. The `api` key is used when the override selects the
-`openai` provider.
+`openai` provider. A per-agent `reasoning_effort` is probed at startup
+alongside the model; if the model does not support it, the log names the
+affected agent(s) and suggests removing `reasoning_effort` or switching
+models.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`
