@@ -375,6 +375,32 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
+
+            # --- Circuit breaker state (per-run) ---
+            from providers.circuit_breaker import (
+                _DEFAULTS as _CB_DEFAULTS,
+            )
+            from providers.circuit_breaker import (
+                CircuitBreakerState,
+                circuit_breaker_from_config,
+                circuit_breaker_from_custom_fields,
+                classify_result,
+            )
+
+            cb_state = CircuitBreakerState()
+            try:
+                from orchestrator.config import _load_config_file
+
+                cb_cfg = circuit_breaker_from_config(
+                    _load_config_file(),
+                )
+                cb_cfg = circuit_breaker_from_custom_fields(
+                    cf,
+                    cb_cfg,
+                )
+            except Exception:
+                cb_cfg = dict(_CB_DEFAULTS)
+            cb_enabled = cb_cfg.get("enabled", True)
             while (
                 self.max_iterations == 0
                 or iteration < self.max_iterations
@@ -941,6 +967,13 @@ class AgentBase(ABC):
                             "is_error": result.is_error,
                         }
                     )
+                    if cb_enabled:
+                        is_failure = classify_result(
+                            tc.name,
+                            result.content,
+                            result.is_error,
+                        )
+                        cb_state.record(tc.name, is_failure)
                 for tc in response.tool_calls:
                     if tc not in calls_to_run:
                         tool_results_content.append(
@@ -953,6 +986,79 @@ class AgentBase(ABC):
                         )
 
                 messages.append({"role": "user", "content": tool_results_content})
+
+                # --- Circuit breaker: inject after tool results ---
+                if cb_enabled:
+                    cb_checked: set[str] = set()
+                    for tc in calls_to_run:
+                        if tc.name in cb_checked:
+                            continue
+                        cb_checked.add(tc.name)
+                        tripped, consec = cb_state.check(
+                            tc.name,
+                            cb_cfg.get("threshold", 3),
+                            cb_cfg.get("max_trips_per_tool", 2),
+                            cb_cfg.get("exempt_tools", []),
+                        )
+                        if tripped:
+                            excerpt = "(empty)"
+                            tc_ids = {c.id for c in calls_to_run if c.name == tc.name}
+                            for item in reversed(tool_results_content):
+                                if item.get("tool_use_id") in tc_ids:
+                                    raw = item.get("content", "")
+                                    excerpt = raw[:300] if raw else "(empty)"
+                                    break
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"[SYSTEM] Circuit breaker:"
+                                        f" tool '{tc.name}' has failed"
+                                        f" {consec} consecutive times."
+                                        f" Last result:\n"
+                                        f"<tool_output>\n"
+                                        f"{excerpt}\n"
+                                        f"</tool_output>\n\n"
+                                        f"You MUST try a fundamentally"
+                                        f" different approach. Do NOT"
+                                        f" call {tc.name} with the"
+                                        f" same or similar arguments."
+                                        f" Consider:\n"
+                                        f"- Use the information in"
+                                        f" the result above\n"
+                                        f"- Try a different tool or"
+                                        f" different arguments\n"
+                                        f"- Submit partial results if"
+                                        f" you have some data"
+                                    ),
+                                }
+                            )
+                            self._emit(
+                                ticket_id,
+                                "circuit_breaker",
+                                {
+                                    "tool": tc.name,
+                                    "consecutive": consec,
+                                    "trips": cb_state.trips.get(
+                                        tc.name,
+                                        0,
+                                    ),
+                                    "threshold": cb_cfg.get(
+                                        "threshold",
+                                        3,
+                                    ),
+                                },
+                            )
+                            logger.warning(
+                                "[%s] Circuit breaker tripped for"
+                                " tool '%s' (%d consecutive"
+                                " failures) on %s",
+                                self.agent_name,
+                                tc.name,
+                                consec,
+                                ticket_id,
+                            )
+
             else:
                 # while loop exhausted (max_iterations reached)
                 await self._save_messages(ticket_id, messages)
