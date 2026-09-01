@@ -1482,6 +1482,7 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
+var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
@@ -1909,6 +1910,8 @@ async function loadTickets() {
     var el = document.getElementById('ticket-table');
     if (!el) return;
 
+    // Clear previous table to release DOM references
+    el.innerHTML = '';
     if (!tickets || tickets.length === 0) {
       el.innerHTML =
         '<div class="empty-state">' +
@@ -2089,7 +2092,7 @@ async function renderDetail(ticketId) {
     // Initial load: fetch ALL events at once for complete
     // breadcrumbs and history. Only poll for NEW events after.
     try {
-      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=10000');
+      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=1000');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
         lastSeq = initData.latest_seq;
@@ -2490,6 +2493,12 @@ function mountChart(containerId, chartData) {
         return cfg;
       });
 
+      // Destroy previous chart on this canvas to prevent leak
+      var canvasId = canvas.id || canvas.getAttribute('data-chart-id') || ('chart-' + Math.random());
+      canvas.setAttribute('data-chart-id', canvasId);
+      if (_chartInstances[canvasId]) {
+        _chartInstances[canvasId].destroy();
+      }
       var chartInstance = new Chart(canvas, {
         type: panel.type || chartData.type || 'line',
         data: { labels: chartData.labels || [], datasets: datasets },
@@ -2546,6 +2555,7 @@ function mountChart(containerId, chartData) {
         updateSyncCrosshair(null);
       });
 
+      _chartInstances[canvasId] = chartInstance;
       renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
       window._cdmSyncGroups[syncGroupId].push({
         chart: chartInstance,
@@ -2585,6 +2595,9 @@ function mountChart(containerId, chartData) {
     return cfg;
   });
 
+  // Destroy previous chart on this canvas
+  var cid = canvas.id || 'usage-chart';
+  if (_chartInstances[cid]) { _chartInstances[cid].destroy(); }
   var chartInstance = new Chart(canvas, {
     type: chartData.type || 'bar',
     data: { labels: chartData.labels || [], datasets: datasets },
@@ -3121,6 +3134,10 @@ function renderNewEvents(events) {
     var evt = events[i];
     if (renderedEvents.indexOf(evt.seq) !== -1) continue;
     renderedEvents.push(evt.seq);
+    // Cap rendered events to prevent memory leak
+    if (renderedEvents.length > 2000) {
+      renderedEvents = renderedEvents.slice(-1000);
+    }
     var html = renderEvent(evt);
     if (html) container.insertAdjacentHTML('beforeend', html);
   }
@@ -3606,6 +3623,14 @@ function stopPolling() {
   pollPaused = false;
   lastSeq = 0;
   renderedEvents = [];
+
+  // Destroy all chart instances to prevent memory leak
+  for (var cid in _chartInstances) {
+    if (_chartInstances[cid]) {
+      _chartInstances[cid].destroy();
+    }
+  }
+  _chartInstances = {};
 }
 
 // ── Main render ──
