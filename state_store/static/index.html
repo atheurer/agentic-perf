@@ -3134,6 +3134,10 @@ function renderNewEvents(events) {
     renderedEvents.push(evt.seq);
     // Cap DOM nodes to prevent memory leak from accumulated
     // event elements. Remove oldest DOM children when over limit.
+    // Tradeoff: oldest events become unviewable without a page
+    // refresh. Scroll position may shift if the user is reading
+    // older events. A virtualized scroll approach would be ideal
+    // but requires a significant JS refactor.
     if (container.children.length > 2000) {
       while (container.children.length > 1500) {
         container.removeChild(container.firstChild);
