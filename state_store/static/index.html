@@ -1283,9 +1283,141 @@ th.col-right { text-align: right; }
 .disclaimer-close:hover {
   opacity: 1;
 }
+
+/* Chat UI */
+.chat-card {
+  background: var(--bg-surface);
+  border: 1px solid rgba(0, 150, 255, 0.4);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 12px;
+  margin-bottom: 10px;
+  box-shadow: 0 0 12px rgba(0, 150, 255, 0.15),
+              0 0 4px rgba(0, 150, 255, 0.1);
+}
+/* Ticket-detail chat also gets the glow */
+#ticket-chat-section {
+  border-color: rgba(0, 150, 255, 0.4) !important;
+  box-shadow: 0 0 12px rgba(0, 150, 255, 0.15),
+              0 0 4px rgba(0, 150, 255, 0.1);
+}
+.chat-card h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0 0 8px 0;
+  color: var(--accent);
+}
+.chat-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.chat-bar input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-bright);
+  padding: 8px 12px;
+  font-size: 14px;
+  font-family: inherit;
+}
+.chat-bar input:focus { outline: none; border-color: var(--accent); }
+.chat-bar button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.chat-bar button:hover { opacity: 0.9; }
+.chat-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+.chat-messages {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 4px 0;
+  font-size: 13px;
+}
+.chat-msg {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  max-width: 85%;
+  width: fit-content;
+  line-height: 1.4;
+  word-wrap: break-word;
+}
+.chat-msg.user {
+  background: var(--accent);
+  color: #fff;
+  margin-left: auto;
+  text-align: right;
+}
+.chat-msg.assistant {
+  background: var(--bg-alt);
+  color: var(--text-bright);
+  overflow-x: auto;
+}
+.chat-msg.assistant pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-width: 100%;
+}
+.chat-msg.assistant code {
+  word-break: break-all;
+}
+.chat-msg.assistant table {
+  font-size: 11px;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+.chat-msg.system {
+  background: transparent;
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 11px;
+  text-align: center;
+  max-width: 100%;
+}
+.chat-help-icon {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: bold;
+  border-radius: 50%;
+  background: var(--text-muted);
+  color: var(--bg);
+  cursor: help;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.chat-cost {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.chat-typing {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+  padding: 4px 16px;
+}
+.chat-section {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
 <body>
 
@@ -1307,6 +1439,15 @@ th.col-right { text-align: right; }
 </div>
 
 <div class="container">
+  <div id="chat-container" class="chat-card" style="display:none">
+    <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
+    <div class="chat-messages" id="chat-messages"></div>
+    <div class="chat-bar">
+      <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
+      <button id="chat-send" onclick="sendChatMessage()">Send</button>
+      <span class="chat-cost" id="chat-cost"></span>
+    </div>
+  </div>
   <div id="app"></div>
 </div>
 
@@ -1482,6 +1623,7 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
+var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
@@ -1858,6 +2000,12 @@ refreshHealth();
 // ── Ticket List ──
 
 async function renderList() {
+  // Restore global chat when returning to dashboard
+  if (chatEnabled) {
+    var globalChat = document.getElementById('chat-container');
+    if (globalChat) globalChat.style.display = 'block';
+    currentTicketForChat = null;
+  }
   const app = document.getElementById('app');
   app.innerHTML =
     '<div class="filters">' +
@@ -2030,6 +2178,14 @@ async function renderDetail(ticketId) {
         '</div>' +
         '<div class="detail-panels" id="detail-panels">' +
           '<div class="detail-left-panel" id="detail-left-panel">' +
+            '<div class="left-panel-section" id="ticket-chat-section" style="display:none">' +
+              '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
+              '<div class="chat-messages" id="ticket-chat-messages"></div>' +
+              '<div class="chat-bar">' +
+                '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
+                '<button onclick="sendTicketChatMessage()">Send</button>' +
+              '</div>' +
+            '</div>' +
             renderDescription(ticket) +
             ownershipHtml +
             '<div id="hypothesis-section">' + renderHypothesisCard(ticket) + '</div>' +
@@ -2101,6 +2257,16 @@ async function renderDetail(ticketId) {
 
     // Load artifacts
     loadArtifacts(ticketId);
+
+    // Show ticket-scoped chat if chat is enabled;
+    // hide global chat to avoid double UI
+    if (chatEnabled) {
+      currentTicketForChat = ticketId;
+      var chatSection = document.getElementById('ticket-chat-section');
+      if (chatSection) chatSection.style.display = 'block';
+      var globalChat = document.getElementById('chat-container');
+      if (globalChat) globalChat.style.display = 'none';
+    }
 
     pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
     // Re-check artifacts periodically (created during ticket run)
@@ -2490,6 +2656,12 @@ function mountChart(containerId, chartData) {
         return cfg;
       });
 
+      // Destroy previous chart on this canvas to prevent leak
+      var canvasId = canvas.id || canvas.getAttribute('data-chart-id') || ('chart-' + Math.random());
+      canvas.setAttribute('data-chart-id', canvasId);
+      if (_chartInstances[canvasId]) {
+        _chartInstances[canvasId].destroy();
+      }
       var chartInstance = new Chart(canvas, {
         type: panel.type || chartData.type || 'line',
         data: { labels: chartData.labels || [], datasets: datasets },
@@ -2546,6 +2718,7 @@ function mountChart(containerId, chartData) {
         updateSyncCrosshair(null);
       });
 
+      _chartInstances[canvasId] = chartInstance;
       renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
       window._cdmSyncGroups[syncGroupId].push({
         chart: chartInstance,
@@ -2585,6 +2758,9 @@ function mountChart(containerId, chartData) {
     return cfg;
   });
 
+  // Destroy previous chart on this canvas
+  var cid = canvas.id || 'usage-chart';
+  if (_chartInstances[cid]) { _chartInstances[cid].destroy(); }
   var chartInstance = new Chart(canvas, {
     type: chartData.type || 'bar',
     data: { labels: chartData.labels || [], datasets: datasets },
@@ -2781,6 +2957,24 @@ async function pollEvents(ticketId) {
     refreshResultSection(ticketId);
     updateUsageSidebar(ticketId);
     updateIntrospectionCard(ticketId);
+
+    // Proactive HITL: notify chat when ticket needs guidance
+    if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
+      var cf = ticket.custom_fields || {};
+      var gs = cf.guidance_summary;
+      if (gs && !document.getElementById('chat-guidance-' + ticketId)) {
+        var guidanceMsg = '\ud83d\udd14 **' + ticketId + '** needs guidance\n\n';
+        guidanceMsg += '**Agent:** ' + (gs.agent || '?') + '\n';
+        guidanceMsg += '**Reason:** ' + (gs.reason || 'unknown') + '\n';
+        if (gs.details) guidanceMsg += '\n' + gs.details.substring(0, 300) + '\n';
+        if (gs.suggested_response) guidanceMsg += '\n**Suggestion:** ' + gs.suggested_response;
+        var container = document.getElementById('ticket-chat-messages') || document.getElementById('chat-messages');
+        if (container) {
+          container.innerHTML += '<div class="chat-msg assistant" id="chat-guidance-' + escHtml(ticketId) + '">' + chatRender(guidanceMsg, 'assistant') + '</div>';
+          container.scrollTop = container.scrollHeight;
+        }
+      }
+    }
   } catch {}
 }
 
@@ -3121,6 +3315,17 @@ function renderNewEvents(events) {
     var evt = events[i];
     if (renderedEvents.indexOf(evt.seq) !== -1) continue;
     renderedEvents.push(evt.seq);
+    // Cap DOM nodes to prevent memory leak from accumulated
+    // event elements. Remove oldest DOM children when over limit.
+    // Tradeoff: oldest events become unviewable without a page
+    // refresh. Scroll position may shift if the user is reading
+    // older events. A virtualized scroll approach would be ideal
+    // but requires a significant JS refactor.
+    if (container.children.length > 2000) {
+      while (container.children.length > 1500) {
+        container.removeChild(container.firstChild);
+      }
+    }
     var html = renderEvent(evt);
     if (html) container.insertAdjacentHTML('beforeend', html);
   }
@@ -3288,9 +3493,9 @@ function renderEvent(evt) {
         : '';
       return '<div class="event" style="border-left:3px solid #1565c0;padding-left:8px;margin:4px 0">' +
         '<span class="event-ts">' + ts + '</span>' +
-        '<span class="event-label" style="background:#1565c0;color:#fff">💡 GUIDANCE</span>' +
+        '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
-          '<strong>' + escHtml(data.agent || '?') + '</strong>: ' + escHtml(data.reason || 'needs guidance') +
+          (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
           '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
@@ -3606,6 +3811,14 @@ function stopPolling() {
   pollPaused = false;
   lastSeq = 0;
   renderedEvents = [];
+
+  // Destroy all chart instances to prevent memory leak
+  for (var cid in _chartInstances) {
+    if (_chartInstances[cid]) {
+      _chartInstances[cid].destroy();
+    }
+  }
+  _chartInstances = {};
 }
 
 // ── Main render ──
@@ -3623,6 +3836,157 @@ function render() {
 }
 
 render();
+
+// ── Chat UI ──────────────────────────────────────────────
+
+var chatEnabled = false;
+var currentTicketForChat = null;
+
+async function initChat() {
+  // Check if chat API is available. Authenticated users get
+  // full access; anonymous users get read-only if enabled.
+  try {
+    var headers = getAuthHeaders();
+    var r = await fetch(API + '/chat/history', { headers: headers });
+    if (r.ok) {
+      chatEnabled = true;
+      document.getElementById('chat-container').style.display = 'block';
+      var data = await r.json();
+      renderChatMessages('chat-messages', data.messages || []);
+      updateChatCost(data.usage || {});
+    }
+  } catch(e) { /* chat not available */ }
+}
+
+function chatRender(text, role) {
+  // Render markdown for assistant messages, escape for user/system
+  if (role === 'assistant' && typeof marked !== 'undefined' && marked.parse) {
+    try {
+      var html = marked.parse(text);
+      // Sanitize to prevent XSS from LLM-generated HTML
+      if (typeof DOMPurify !== 'undefined') {
+        html = DOMPurify.sanitize(html);
+      }
+      return html;
+    } catch(e) { /* fall through */ }
+  }
+  return escHtml(text);
+}
+
+function renderChatMessages(containerId, messages) {
+  var el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = messages.map(function(m) {
+    var cls = m.role === 'user' ? 'user' : 'assistant';
+    return '<div class="chat-msg ' + cls + '">' + chatRender(m.text || '', m.role) + '</div>';
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendChatMessage(containerId, role, text) {
+  var el = document.getElementById(containerId);
+  if (!el) return;
+  var cls = role === 'user' ? 'user' : (role === 'system' ? 'system' : 'assistant');
+  el.innerHTML += '<div class="chat-msg ' + cls + '">' + chatRender(text, role) + '</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateChatCost(usage) {
+  var el = document.getElementById('chat-cost');
+  if (el && usage) {
+    var tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0);
+    el.textContent = tokens > 0 ? tokens.toLocaleString() + ' tokens' : '';
+  }
+}
+
+async function sendChatMessage() {
+  var input = document.getElementById('chat-input');
+  var btn = document.getElementById('chat-send');
+  var msg = (input.value || '').trim();
+  if (!msg) return;
+
+  input.value = '';
+  btn.disabled = true;
+  appendChatMessage('chat-messages', 'user', msg);
+  appendChatMessage('chat-messages', 'system', 'Thinking...');
+
+  try {
+    var r = await fetch(API + '/chat/message', {
+      method: 'POST',
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
+      body: JSON.stringify({ message: msg })
+    });
+    // Remove 'Thinking...' indicator
+    var container = document.getElementById('chat-messages');
+    var thinking = container.querySelector('.chat-msg.system:last-child');
+    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+
+    if (r.ok) {
+      var data = await r.json();
+      appendChatMessage('chat-messages', 'assistant', data.response || '');
+      updateChatCost(data.usage || {});
+    } else {
+      appendChatMessage('chat-messages', 'system', 'Error: ' + r.status);
+    }
+  } catch(e) {
+    var container = document.getElementById('chat-messages');
+    var thinking = container.querySelector('.chat-msg.system:last-child');
+    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+    appendChatMessage('chat-messages', 'system', 'Connection error');
+  }
+  btn.disabled = false;
+  input.focus();
+}
+
+async function sendTicketChatMessage() {
+  var input = document.getElementById('ticket-chat-input');
+  var msg = (input.value || '').trim();
+  if (!msg || !currentTicketForChat) return;
+
+  input.value = '';
+  appendChatMessage('ticket-chat-messages', 'user', msg);
+  appendChatMessage('ticket-chat-messages', 'system', 'Thinking...');
+
+  try {
+    var r = await fetch(API + '/chat/message', {
+      method: 'POST',
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
+      body: JSON.stringify({ message: msg, ticket_context: currentTicketForChat })
+    });
+    var container = document.getElementById('ticket-chat-messages');
+    var thinking = container.querySelector('.chat-msg.system:last-child');
+    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+
+    if (r.ok) {
+      var data = await r.json();
+      appendChatMessage('ticket-chat-messages', 'assistant', data.response || '');
+    } else {
+      appendChatMessage('ticket-chat-messages', 'system', 'Error: ' + r.status);
+    }
+  } catch(e) {
+    var container = document.getElementById('ticket-chat-messages');
+    var thinking = container.querySelector('.chat-msg.system:last-child');
+    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+    appendChatMessage('ticket-chat-messages', 'system', 'Connection error');
+  }
+  input.focus();
+}
+
+// Enter key support
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.target.id === 'chat-input') {
+      e.preventDefault();
+      sendChatMessage();
+    } else if (e.target.id === 'ticket-chat-input') {
+      e.preventDefault();
+      sendTicketChatMessage();
+    }
+  }
+});
+
+// Initialize chat on page load
+initChat();
 </script>
 </body>
 </html>
