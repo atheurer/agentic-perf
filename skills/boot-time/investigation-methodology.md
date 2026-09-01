@@ -77,14 +77,14 @@ Boot time consists of distinct phases. Isolate which phase changed:
 
 For kernel phase variance specifically:
 
-- **Pre-timer section** (~250 kernel messages at monotonic time 0):
+- **Pre-timer activity** (~250 kernel messages at monotonic time 0):
   Device tree parsing, reserved memory setup, GIC init, early CPU
-  init. On SA8775P this takes 0.5-0.8s and accounts for most
-  kernel phase variance. Cannot be further broken down without
-  the CNTVCT kernel module.
-- **Post-timer section** (driver probes, IOMMU, SCMI, UFS, etc.):
-  Typically stable (~0.2s ± 0.012s on SA8775P). If this varies,
-  look at specific driver probe times.
+  init. This is part of System Init, not `kernel_ms`. Cannot be
+  broken down without the CNTVCT kernel module.
+- **Post-timer / kernel phase** (`kernel_ms` from `systemd-analyze`):
+  Driver probes, deferred probes, IOMMU, SCMI, UFS init, module
+  loading. This is where `kernel_ms` variance originates. Use
+  `initcall_debug` to attribute variance to specific subsystems.
 - **Cold vs warm boot**: Power cycle (cold) produces different
   firmware behavior than SSH reboot (warm). Nightly CI uses warm
   reboot. If comparing data from different reboot methods, note
@@ -162,12 +162,15 @@ Power On
   │    ~210 messages on SA8775P.              │ │
   │                                           │ │
   ├─── Kernel Timer Start ────────────────────┘─┘
-  │    dmesg timestamps begin incrementing.
-  │    This is the boundary between pre-timer
-  │    and post-timer.
+  │    Kernel monotonic clock initializes.
+  │    Corresponds to KernelTimestampMonotonic
+  │    in systemd. Note: the first dmesg entry
+  │    with timestamp > 0 may appear AFTER this
+  │    point — dmesg does not define the boundary.
   │
   ├─── Kernel Post-Timer ─────────────────────┐
-  │    dmesg timestamps > 0.                  │
+  │    KernelTimestampMonotonic to             │
+  │    InitRDTimestampMonotonic.               │
   │    Includes: driver probes, deferred      │ "Kernel Phase"
   │    probes, IOMMU init, UFS init,          │ (systemd-analyze
   │    module loading, initcall chain.         │  measures this)
@@ -197,7 +200,7 @@ message.
 
 | Measurement | systemd-analyze field | Horreum labels | Tool output field | What it covers |
 |---|---|---|---|---|
-| **System Init** | N/A (CNTVCT derived) | `BOOT0 - SystemInit Duration *`, `boot.phase.system_init_ms` | `satime.sysinit` | Power-on to `KernelTimestampMonotonic`. Includes firmware + bootloader + kernel pre-timer. CNTVCT kernel module can separate firmware from kernel pre-timer; serial console can subdivide firmware phases. |
+| **System Init** | N/A (CNTVCT derived) | `BOOT0 - SystemInit Duration *`, `boot.phase.system_init_ms` | `satime.sysinit` | Power-on to kernel monotonic clock initialization. The CNTVCT userspace service derives this by comparing the hardware counter to the kernel clock. Includes firmware + bootloader + kernel pre-timer. CNTVCT kernel module can separate firmware from kernel pre-timer; serial console can subdivide firmware phases. |
 | **Kernel Phase** | `kernel` | `BOOT2 - Kernel Post-Timer Duration *`, `boot.phase.kernel_ms` | `satime.kernel`, `avg_kernel_s` | `KernelTimestampMonotonic` to `InitRDTimestampMonotonic`. ENTIRELY post-timer. Does NOT include pre-timer. |
 | **InitRD / Initramfs** | `initrd` | `BOOT3 - Initrd Duration *`, `boot.phase.initrd_ms` | `satime.initrd`, `avg_initrd_s` | `InitRDTimestampMonotonic` to switchroot. Terms used interchangeably. |
 | **Userspace / Switchroot** | `userspace` | `BOOT4 - Switchroot Duration *`, `boot.phase.switchroot_ms` | `satime.userspace`, `avg_userspace_s` | After switchroot to boot target. `systemd-analyze` labels this "userspace." |

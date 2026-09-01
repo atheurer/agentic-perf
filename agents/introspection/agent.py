@@ -264,7 +264,6 @@ class IntrospectionAgent:
                     status == "awaiting_customer_guidance"
                     and not self._guidance_produced
                 ):
-                    self._guidance_produced = True
                     await self._produce_guidance_summary(
                         ticket_id,
                         ticket,
@@ -843,6 +842,17 @@ class IntrospectionAgent:
         if isinstance(anomalies, list):
             self._prev_anomaly_count = len(anomalies)
 
+        # If ticket is already at guidance and no summary
+        # exists, mark as needing production on first poll.
+        # If a summary already exists, mark as produced.
+        if status == "awaiting_customer_guidance":
+            if cf.get("guidance_summary"):
+                self._guidance_produced = True
+            # else: leave _guidance_produced False so the
+            # first poll cycle produces the summary
+        else:
+            self._guidance_produced = False
+
     # --- HTTP helpers ---
 
     async def _update_observation(
@@ -891,7 +901,9 @@ class IntrospectionAgent:
                     exc_info=True,
                 )
 
-        # Write to ticket
+        # Write to ticket — only mark as produced after
+        # successful persistence so transient failures allow
+        # retry on the next poll cycle.
         try:
             await self._client.patch(
                 f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
@@ -901,6 +913,7 @@ class IntrospectionAgent:
                     }
                 },
             )
+            self._guidance_produced = True
         except Exception:
             logger.debug(
                 "[introspection] Failed to write guidance_summary for %s",
@@ -1042,8 +1055,10 @@ class IntrospectionAgent:
         )
 
         response = await self._llm.complete(
-            system="You are a concise technical advisor. "
-            "Suggest a specific action in 1-2 sentences.",
+            system_prompt=(
+                "You are a concise technical advisor. "
+                "Suggest a specific action in 1-2 sentences."
+            ),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
