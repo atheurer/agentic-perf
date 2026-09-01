@@ -1,289 +1,178 @@
-# Adding a New Benchmark Harness
+# Adding a Benchmark Harness
 
-This guide walks through adding a new benchmark harness to agentic-perf.
-The design philosophy calls this "the acid test" — if the layering is right,
-adding a new harness requires no changes to agent code.
+Adding a harness is a contract exercise. Harness-specific knowledge belongs
+in a `SkillProvider` and its `skills/<harness>/` documents; agent prompts,
+dispatcher logic, and the state machine should not need harness branches.
 
-In practice, adding a harness involves five deliverables:
+## Provider contract
 
-1. Skill provider (Python class)
-2. Skill documentation (markdown files)
-3. Registration in the orchestrator
-4. Tests
-5. Config and repo references
-
-## 1. Skill Provider
-
-Create a new file at `providers/skills/<harness>.py` that extends
-`SkillProvider`. This is the main deliverable — it teaches the system what
-your harness can do.
-
-### Required Methods
+Subclass `providers.skills.base.SkillProvider`. These four methods are
+required:
 
 ```python
-from providers.skills.base import BenchmarkSuite, RunfileTemplate, SkillProvider
-
-class MyHarnessSkillProvider(SkillProvider):
-
-    async def list_benchmarks(self) -> list[BenchmarkSuite]:
-        """Return all benchmarks this harness supports."""
-        ...
-
-    async def get_benchmark(self, name: str) -> BenchmarkSuite | None:
-        """Return a single benchmark by name, or None."""
-        ...
-
-    async def resolve_benchmark(self, requirements: dict) -> str | None:
-        """Match natural-language requirements to a benchmark name."""
-        ...
-
-    async def generate_runfile(self, benchmark: str, params: dict) -> RunfileTemplate:
-        """Produce a run-file template for the benchmark."""
-        ...
+async def list_benchmarks(self) -> list[BenchmarkSuite]: ...
+async def get_benchmark(self, name: str) -> BenchmarkSuite | None: ...
+async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None: ...
+async def generate_runfile(
+    self, benchmark: str, params: dict[str, Any]
+) -> RunfileTemplate: ...
 ```
 
-### BenchmarkSuite Fields
+`BenchmarkSuite` must provide a stable name, description, supported parameter
+schema, endpoint types (`remotehosts` and/or `kube`), roles, minimum host
+count, and a `harness` value equal to the registration key. Set `visibility`
+when the suite is private or has a public/private variant.
 
-Each benchmark is described by a `BenchmarkSuite`:
+The optional methods are the rest of the public contract:
 
-| Field | Type | Purpose |
-|---|---|---|
-| `name` | str | Unique identifier (e.g., `"vstorm-containerdisk"`) |
-| `description` | str | Human-readable description of what it tests |
-| `supported_params` | dict | Parameters the benchmark accepts (name → type/default/description) |
-| `endpoint_types` | list[str] | `"remotehosts"`, `"kube"`, or both |
-| `roles` | list[str] | Host roles needed (e.g., `["client", "server"]`) |
-| `min_hosts` | int | Minimum hosts required |
-| `harness` | str | Harness name (must match registration key) |
+| Method | Implement when |
+|---|---|
+| `get_default_config()` | Always, for provisioning/execution defaults |
+| `get_private_config(suite, key)` | The provider has private overrides (normally inherited) |
+| `get_runfile_schema()` | The harness has a schema that can reject malformed run files |
+| `get_benchmark_params(benchmark)` | Parameters differ by benchmark |
+| `get_tool_params(tool)` | A tool has valid flags, presets, or subtools |
+| `get_tool_metadata(tool)` | The tool exposes descriptions, units, or capability metadata |
+| `list_tools()` | The harness has discoverable profiling/measurement tools |
+| `get_example_runfile(benchmark, endpoint_type)` | An example materially improves generation |
+| `validate_runfile(run_file, harness)` | Validation can catch errors before execution |
 
-### Optional Methods
+Use `get_tool_params` before constructing a tool invocation when the tool's
+accepted values are not static or are supplied by a checked-out repository.
+Use `get_tool_metadata` for human/LLM-facing semantics; `list_tools` is the
+discovery gate. Do not invent flags from memory. `get_example_runfile` must
+return the actual endpoint shape, and `validate_runfile` should return
+`{"valid": bool, "errors": list[str]}`.
 
-These enable the LLM-driven run-file construction pipeline. Implement them
-to get better run-file quality:
+## A current provider shape
+
+`providers/skills/k8s_netperf.py` is a useful reference because it supplies
+benchmark parameters, defaults, a schema, an example, and validation:
 
 ```python
-    async def get_default_config(self) -> dict:
-        """Return provisioning and execution config for this harness.
-
-        This is the public default. Organization-specific overrides go in
-        private-skills configs (~/.agentic-perf/private-skills/<harness>.json).
-        """
+class MyHarnessSkillProvider(SkillProvider):
+    async def get_default_config(self) -> dict[str, Any]:
         return {
             "provisioning": {
-                "install_method": "git_clone",  # or "package", "script"
-                "git_url": "https://github.com/...",
-                "install_target_path": "/opt/myharness",
-                "verify_command": "/opt/myharness/bin/myharness --version",
-                "on_existing_install": "skip",  # skip, update, reinstall
+                "install_method": "binary_download",
+                "controller_only_install": True,
+                "install_command": "...",
+                "install_target_path": "/usr/local/bin",
+                "verify_command": "myharness --help",
+                "on_existing_install": "skip",
             },
             "execution": {
                 "controller_required": True,
-                "run_command": "/opt/myharness/bin/run",
+                "run_command": "myharness",
                 "endpoint_type": "remotehosts",
-                "run_file_format": "json",  # or "yaml", "cli_args"
+                "run_file_format": "json",
             },
         }
 
-    async def get_runfile_schema(self) -> dict | None:
-        """JSON schema for the harness run-file format."""
-        ...
-
-    async def get_benchmark_params(self, benchmark: str) -> dict | None:
-        """Valid parameters for a specific benchmark."""
-        ...
-
-    async def get_example_runfile(self, benchmark: str, endpoint_type: str) -> dict | None:
-        """An example run-file the LLM can use as a reference."""
-        ...
-
-    async def validate_runfile(self, run_file: dict, harness: str | None = None) -> dict:
-        """Validate a run-file. Return {"valid": bool, "errors": [str]}."""
-        ...
+    async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None: ...
+    async def get_runfile_schema(self) -> dict[str, Any] | None: ...
+    async def get_example_runfile(
+        self, benchmark: str, endpoint_type: str = "remotehosts"
+    ) -> dict[str, Any] | None: ...
+    async def validate_runfile(
+        self, run_file: dict[str, Any], harness: str | None = None
+    ) -> dict[str, Any]: ...
 ```
 
-### Keyword Resolution
+The default config is merged with
+`~/.agentic-perf/private-skills/<harness>.json`; keep organization URLs,
+registries, credentials, supported OS constraints, and platform contracts in
+that private config. Provisioning checks `platform_contract` before install;
+document supported OS/repos/packages there rather than hiding them in a
+prompt.
 
-The `resolve_benchmark` method maps natural language to benchmark names.
-The standard pattern uses a keyword map:
+## Provisioning, execution, results, and review
 
-```python
-KEYWORD_MAP = {
-    "network": ["myharness-iperf", "myharness-netperf"],
-    "storage": ["myharness-fio"],
-    "io": ["myharness-fio"],
-    "latency": ["myharness-netperf"],
-}
+`provisioning` describes how to install and verify the harness on the
+controller. `execution` identifies the command, endpoint type, user, and
+run-file format. The benchmark agent validates and executes the generated
+file, then stores run status, run ID, and the file used on the ticket.
 
-async def resolve_benchmark(self, requirements: dict) -> str | None:
-    description = str(requirements.get("description", "")).lower()
-    workload_type = str(requirements.get("workload_type", "")).lower()
-    search_text = f"{description} {workload_type}"
+Result retrieval is harness-specific. The review agent first calls
+`get_review_config(harness_name)`, which reads the private `review` contract:
+result location/API, retrieval commands, parsing guidance, and interpretation
+notes. Provide that configuration and document expected success/failure
+artifacts; do not assume every harness has `result-summary.json`.
 
-    scores: dict[str, int] = {}
-    for keyword, benchmarks in KEYWORD_MAP.items():
-        if keyword in search_text:
-            for bench in benchmarks:
-                scores[bench] = scores.get(bench, 0) + 1
+Results and intermediate files should be copied into the ticket workspace
+(`workspace://...`) or the persistent artifact directory. The workspace
+manager supports JSON/jq queries, grep, bounded reads, and chart generation.
+Harness-specific chart adapters are optional: implement a
+`BaseChartAdapter` (`can_handle` and `build_chart` returning `ChartSpec`) and
+register it with the chart registry when generic JSON/CSV handling is not
+enough. Review submissions should reference generated chart files rather than
+embedding large numeric arrays.
 
-    if not scores:
-        return None
-    return max(scores, key=scores.get)
-```
+## Availability and platform compatibility
 
-### Complete Example
+`list_benchmarks` is the availability declaration: return only suites the
+provider can actually run in the current checkout. `endpoint_types`, `roles`,
+and `min_hosts` drive resource planning. `find_capable_harnesses` reports
+these fields and supported parameters when multiple providers can satisfy a
+request. Resolve only names discovered by the provider.
 
-See `providers/skills/vstorm.py` for a clean, self-contained example.
-It defines three benchmarks with a keyword map, parameter schemas,
-default config, and validation — all in about 280 lines.
+Put OS, repository, package, controller, Kubernetes, architecture, and
+privilege requirements in merged private config (`constraints` and
+`platform_contract`). The provisioning agent treats OS/repository mismatches
+as hard failures and missing packages as installable warnings. Keep
+availability checks deterministic and provider-backed; do not claim a cloud,
+cluster, board, or tool is available merely because it is documented.
 
-## 2. Skill Documentation
+## Registration and synchronization
 
-Create a directory at `skills/<harness>/` with markdown files that agents
-read at runtime. These are the "skills" layer — agents learn about your
-harness by reading these docs, not from hardcoded prompts.
-
-Recommended files:
-
-| File | Purpose | Used By |
-|---|---|---|
-| `workloads.md` | Available benchmarks, what they test, key parameters | Triage, Benchmark |
-| `config-guide.md` | Configuration reference, CLI flags, file formats | Benchmark |
-
-Additional files for complex harnesses:
-
-| File | Purpose |
-|---|---|
-| `run-file-pitfalls.md` | Common mistakes and solutions |
-| `endpoints.md` | Endpoint types and configuration |
-| `result-format.md` | How to retrieve and interpret results |
-
-Agents discover these via `list_harness_docs` and read them via
-`read_harness_doc`. Write them as if the reader is an LLM that needs
-to construct a valid configuration — be explicit about formats, required
-fields, and common errors.
-
-## 3. Registration
-
-### Orchestrator (`orchestrator/main.py`)
-
-Import and register your provider:
+Import and register the provider in `orchestrator/main.py` (the current
+registry constructs `CrucibleSkillProvider` first and adds optional providers
+to the `harnesses` mapping):
 
 ```python
 from providers.skills.myharness import MyHarnessSkillProvider
 
-# In poll_loop(), add to the harnesses dict:
 harnesses["myharness"] = MyHarnessSkillProvider()
+skills = MultiHarnessSkillProvider(
+    harnesses, PrivateSkillProvider(), default_harness="crucible"
+)
 ```
 
-### Config (`orchestrator/config.py`)
+Add the harness repository to the repo-cache defaults when provisioning needs
+to clone it, and add a `sample-private-skills` template if it has private
+URLs, credentials, or platform constraints.
 
-Add the git repo to the default repos so the repo cache can clone it:
+Synchronize all of these surfaces:
 
-```python
-default_repos = {
-    # ... existing repos ...
-    "myharness": "https://github.com/.../myharness.git",
-}
+- `skills/<harness>/workloads.md`, `config-guide.md`, and result/review docs;
+- provider benchmark names, parameters, endpoints, tool metadata, and schemas;
+- `capabilities`/agent-facing documentation and any required prompt context;
+- provisioning `platform_contract`, private constraints, and `review` config;
+- workspace/artifact paths and chart adapters;
+- tests and the public README/docs index.
+
+Coordinate setup and availability behavior with [#331](https://github.com/atheurer/agentic-perf/issues/331),
+and use [#651](https://github.com/atheurer/agentic-perf/issues/651) as the
+parity check: every provider must expose equivalent discovery, parameter,
+execution, result, and review information where its harness supports it.
+
+## Tests and checklist
+
+At minimum test benchmark listing/fields, exact and unknown resolution,
+run-file generation, schema validation, endpoint examples, tool discovery and
+delegation, result/review configuration, platform constraints, and chart
+handling where implemented. Run the focused provider tests and the full suite.
+
+```bash
+python3 -m pytest tests/test_myharness_provider.py -v
+python3 -m pytest tests/ -v
 ```
 
-### Private Skills Template
-
-Create `sample-private-skills/myharness.json` with organization-specific
-overrides:
-
-```json
-{
-    "provisioning": {
-        "container_registry": "registry.example.com",
-        "install_flags": "--with-gpu-support"
-    }
-}
-```
-
-Users copy this to `~/.agentic-perf/private-skills/myharness.json` and
-customize for their environment.
-
-## 4. Tests
-
-Create `tests/test_myharness_provider.py`:
-
-```python
-import pytest
-from providers.skills.myharness import MyHarnessSkillProvider
-
-@pytest.fixture
-def provider() -> MyHarnessSkillProvider:
-    return MyHarnessSkillProvider()
-
-@pytest.mark.asyncio
-async def test_list_benchmarks(provider):
-    benchmarks = await provider.list_benchmarks()
-    assert len(benchmarks) > 0
-    for b in benchmarks:
-        assert b.harness == "myharness"
-        assert b.name
-        assert b.description
-
-@pytest.mark.asyncio
-async def test_harness_field(provider):
-    benchmarks = await provider.list_benchmarks()
-    for b in benchmarks:
-        assert b.harness == "myharness"
-
-@pytest.mark.asyncio
-async def test_resolve_benchmark(provider):
-    result = await provider.resolve_benchmark({"description": "your keyword here"})
-    assert result is not None
-
-@pytest.mark.asyncio
-async def test_generate_runfile(provider):
-    result = await provider.generate_runfile("your-benchmark-name", {})
-    assert result.benchmark == "your-benchmark-name"
-    assert result.template
-
-@pytest.mark.asyncio
-async def test_get_benchmark_not_found(provider):
-    result = await provider.get_benchmark("nonexistent")
-    assert result is None
-
-@pytest.mark.asyncio
-async def test_resolve_no_match(provider):
-    result = await provider.resolve_benchmark({"description": "xyzzy"})
-    assert result is None
-```
-
-Run tests: `python3 -m pytest tests/test_myharness_provider.py -v`
-
-## 5. Checklist
-
-Before submitting:
-
-- [ ] Provider implements all four required methods
-- [ ] `harness` field on every `BenchmarkSuite` matches the registration key
-- [ ] `get_default_config()` returns provisioning and execution config
-- [ ] Keyword map covers the harness's natural-language domain
-- [ ] `skills/<harness>/workloads.md` describes all benchmarks
-- [ ] `skills/<harness>/config-guide.md` documents configuration
-- [ ] Provider registered in `orchestrator/main.py`
-- [ ] Git repo added to `orchestrator/config.py` default repos
-- [ ] Tests pass: `pytest tests/test_<harness>_provider.py -v`
-- [ ] `sample-private-skills/<harness>.json` template created
-- [ ] Full test suite still passes: `pytest tests/ -v`
-
-## How It All Connects
-
-When a user submits "run a network performance test":
-
-1. **Triage agent** calls `list_benchmarks()` → sees benchmarks from all
-   registered harnesses → calls `resolve_benchmark({"description": "network"})` →
-   your keyword map matches → triage selects your benchmark
-2. **Resource agent** reads `min_hosts` and `roles` from the benchmark suite →
-   acquires the right number of hosts
-3. **Provisioning agent** reads `get_default_config()` for install instructions →
-   installs your harness via SSH
-4. **Benchmark agent** calls `list_harness_docs("myharness")` → reads your
-   skill docs → constructs a run-file using the schema and examples →
-   executes via the configured run command
-5. **Review agent** reads results using the harness's result retrieval method
-
-No agent code changes required. The skill provider is the only code you write.
+- [ ] Four required methods implemented; every suite has matching `harness`.
+- [ ] Defaults cover provisioning, verification, execution, endpoint, and format.
+- [ ] Parameters, schema, examples, validation, tools, metadata, and retrieval are synchronized.
+- [ ] Availability, roles, host count, visibility, OS/platform contract, and constraints are accurate.
+- [ ] Workspace/artifact persistence and optional chart adapter are covered.
+- [ ] `skills/` workload/config/result docs and capabilities are updated.
+- [ ] Registration, repo cache, private template, prompts (only if truly shared), and README/docs are updated.
+- [ ] Tests cover the provider and parity with #651; setup/availability follows #331.
