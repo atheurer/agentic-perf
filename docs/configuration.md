@@ -309,7 +309,7 @@ for provisioning (30) matches the previous jumpstarter default.
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `url` | string | `"http://localhost:8090"` | `STATE_STORE_URL` | State store base URL |
-| `port` | int | `8090` | — | Port for the state store server |
+| `port` | int | `8090` | `STORE_PORT` | Port for the state store server |
 
 ---
 
@@ -945,6 +945,7 @@ variable overrides, which take precedence over the file.
 | `OPENAI_API_KEY` | API key for OpenAI provider |
 | `OPENAI_BASE_URL` | `llm.base_url` |
 | `STATE_STORE_URL` | `state_store.url` |
+| `STORE_PORT` | `state_store.port` |
 | `POLL_INTERVAL` | `poll_interval` |
 | `SSH_KEY` | `ssh_key` |
 | `SSH_KEY_VAULT_SECRET` | `ssh_key_vault_secret` |
