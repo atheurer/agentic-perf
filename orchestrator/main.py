@@ -108,6 +108,13 @@ async def _validate_models(config: OrchestratorConfig) -> None:
         default_api = getattr(config, "llm_api", "chat_completions")
         api_name = cfg.get("api", default_api) or default_api
         effort = cfg.get("reasoning_effort") or config.llm_reasoning_effort
+        if effort and not isinstance(effort, str):
+            logger.warning(
+                "reasoning_effort must be a string, got %s for %s — ignoring",
+                type(effort).__name__,
+                agent_type or "default",
+            )
+            effort = None
         effort_str = effort or ""
         key = (provider_name, model_name, region, api_name, effort_str)
 

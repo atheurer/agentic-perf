@@ -351,3 +351,46 @@ class TestFactoryWiring:
             factory = _make_llm_factory(config)
             provider = factory("benchmark")
             assert provider.reasoning_effort is None
+
+
+class TestValidateModelsRobustness:
+    """Ensure _validate_models handles malformed reasoning_effort values."""
+
+    @pytest.mark.asyncio
+    @patch(
+        "orchestrator.config._load_config_file",
+        return_value={
+            "llm": {
+                "provider": "mock",
+                "model": "test",
+                "reasoning_effort": ["high"],
+            },
+        },
+    )
+    async def test_list_reasoning_effort_does_not_crash(self, _mock_cfg):
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _validate_models
+
+        with patch.dict("os.environ", {}, clear=True):
+            config = OrchestratorConfig()
+            await _validate_models(config)
+
+    @pytest.mark.asyncio
+    @patch(
+        "orchestrator.config._load_config_file",
+        return_value={
+            "llm": {"provider": "mock", "model": "test"},
+            "agent_models": {
+                "review": {
+                    "reasoning_effort": {"level": "high"},
+                },
+            },
+        },
+    )
+    async def test_dict_reasoning_effort_does_not_crash(self, _mock_cfg):
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _validate_models
+
+        with patch.dict("os.environ", {}, clear=True):
+            config = OrchestratorConfig()
+            await _validate_models(config)
