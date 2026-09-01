@@ -114,7 +114,8 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                 type(effort).__name__,
                 agent_type or "default",
             )
-            effort = None
+            fallback = config.llm_reasoning_effort
+            effort = fallback if isinstance(fallback, str) else None
         effort_str = effort or ""
         key = (provider_name, model_name, region, api_name, effort_str)
 
