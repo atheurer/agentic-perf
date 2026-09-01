@@ -209,6 +209,58 @@ companion task before the first pipeline agent dispatches.
 
 See [Introspection](#introspection-agent) for details.
 
+### Chat Agent (Out-of-Band)
+
+The chat agent provides a conversational interface in the
+dashboard. It runs in the state store process (not the
+orchestrator) and is independent of the pipeline agents.
+
+- **Separate LLM context** — chat conversations are isolated
+  from ticket agent conversations. No cross-contamination.
+- **Tool-use pattern** — the LLM calls tools to search
+  tickets, create tickets, send interjections, and respond
+  to HITL prompts. All tool calls use the authenticated
+  user's bearer token.
+- **Per-user sessions** — in-memory, bounded chat history
+  per user with LRU eviction.
+- **Budget-aware** — the system prompt includes the
+  configured `max_tokens`, `timeout`, and `max_tool_rounds`
+  so the LLM self-regulates.
+- **Guidance consumption** — when a ticket is at
+  `awaiting_customer_guidance`, the chat reads the
+  `guidance_summary` produced by introspection to explain
+  the situation and suggest actions.
+
+API endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/v1/chat/message` | Send a message, get a response |
+| GET | `/api/v1/chat/history` | Get chat history for current user |
+| DELETE | `/api/v1/chat/session` | Clear current user's session |
+
+Available tools:
+
+| Tool | Description |
+|---|---|
+| `search_tickets` | Search tickets by status, keywords |
+| `get_ticket` | Get full ticket details |
+| `create_ticket` | Create and auto-start a ticket |
+| `send_interjection` | Send a message to a running ticket |
+| `reply_to_guidance` | Reply to a paused ticket |
+| `update_ticket_fields` | Update ticket directives/custom_fields |
+| `stop_ticket` | Stop a running ticket |
+| `list_users` | List users and admin status |
+| `create_user` | Create a user (admin only) |
+| `rotate_user_token` | Rotate a user's token (admin only) |
+| `list_field_options` | Get valid values for ticket fields |
+| `list_skills` | List available skill categories/files |
+| `read_skill` | Read a skill document |
+| `read_doc` | Read a documentation page |
+
+Enable via `chat.enabled: true` in config. The chat agent's
+model is configured via `agent_models.chat`.
+
 ### Special Transitions
 
 - **Rerun loop:** `awaiting_review` can transition back to `triage_pending`

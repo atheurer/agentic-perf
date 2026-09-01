@@ -436,6 +436,65 @@ provider's hard context limit.
 
 ---
 
+### `chat` — Chat Assistant
+
+The chat assistant provides a conversational interface in the
+dashboard for searching tickets, creating tests, sending
+interjections, and getting help.
+
+```json
+{
+    "chat": {
+        "enabled": true
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enable the chat assistant in the dashboard |
+
+The chat agent's model is configured via `agent_models.chat`,
+using the same options available to all agents:
+
+```json
+{
+    "agent_models": {
+        "chat": {
+            "model": "<model-name>",
+            "max_tokens": 4096,
+            "timeout": 60
+        }
+    }
+}
+```
+
+If `agent_models.chat` is not specified, the chat agent uses
+the global `llm.model` default.
+
+**Recommendations:**
+
+- Use a model with reliable tool-use and structured output.
+  The chat agent constructs JSON tool calls, reads
+  documentation, and must follow field format rules
+  precisely. Smaller/cheaper models may produce malformed
+  tool inputs or skip documentation lookups. A mid-tier
+  model with low reasoning effort is recommended over a
+  small model — the cost per chat message is minimal
+  regardless.
+- Set `max_tokens` to 4096 or lower. Chat responses should
+  be concise.
+- Set `timeout` to 60s. Chat should feel responsive.
+
+Chat sessions are per-user and ephemeral (in-memory).
+All chat tool calls use the authenticated user's bearer
+token, so actions are scoped to the user's permissions.
+High-impact actions (ticket creation, ticket stop, user
+creation, token rotation) require explicit user confirmation
+enforced in code.
+
+---
+
 ### `introspection` — Introspection Agent
 
 The introspection agent is a continuous passive observer that runs
