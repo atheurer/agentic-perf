@@ -83,8 +83,11 @@ include_default=0
 
 instance_paths() {
     [ -n "$name" ] || die "--name is required"
-    worktree="${worktree:-$dev_root/agentic-perf-$name}"
     instance_home="${instance_home:-$home_root/$name}"
+    if [ -z "$worktree" ] && [ -f "$instance_home/worktree.path" ]; then
+        worktree="$(tr -d '\n' < "$instance_home/worktree.path")"
+    fi
+    worktree="${worktree:-$dev_root/agentic-perf-$name}"
     config="$instance_home/config.json"
     store_url="http://localhost:${port:-0}"
 }
@@ -131,10 +134,18 @@ import os
 from pathlib import Path
 
 source = json.loads(Path(os.environ["SOURCE_CONFIG"]).read_text())
-for key in ("api_key", "anthropic_api_key", "gemini_api_key", "openai_api_key"):
+credential_keys = {
+    "api_key",
+    "anthropic_api_key",
+    "gemini_api_key",
+    "openai_api_key",
+}
+for key in credential_keys:
     source.pop(key, None)
 
 llm = dict(source.get("llm", {}))
+for key in credential_keys:
+    llm.pop(key, None)
 if os.environ.get("CONFIG_PROVIDER"):
     llm["provider"] = os.environ["CONFIG_PROVIDER"]
 if os.environ.get("CONFIG_MODEL"):
@@ -182,6 +193,7 @@ prepare() {
     fi
     write_config
     printf '%s\n' "$worktree" > "$instance_home/worktree.path"
+    printf '%s\n' "$clone_mode" > "$instance_home/clone.mode"
 
     cat <<EOF
 Prepared isolated instance.
@@ -367,7 +379,23 @@ cleanup() {
         }
     fi
 
-    if git -C "$script_repo" worktree list --porcelain \
+    clone_instance=0
+    if [ -f "$instance_home/clone.mode" ] \
+        && [ "$(tr -d '[:space:]' < "$instance_home/clone.mode")" = "1" ]; then
+        clone_instance=1
+    fi
+
+    if [ "$clone_instance" -eq 1 ]; then
+        if [ ! -e "$worktree" ]; then
+            echo "Clone already absent: $worktree"
+        elif [ "$force" -eq 1 ]; then
+            rm -rf -- "$worktree"
+        elif [ -n "$(git -C "$worktree" status --porcelain 2>/dev/null)" ]; then
+            die "clone is dirty; use --force to remove '$worktree'"
+        else
+            rm -rf -- "$worktree"
+        fi
+    elif git -C "$script_repo" worktree list --porcelain \
         | grep -Fqx "worktree $worktree"; then
         if [ "$force" -eq 1 ]; then
             git -C "$script_repo" worktree remove --force "$worktree"
@@ -382,7 +410,7 @@ cleanup() {
         die "worktree is not registered; use --force to remove '$worktree'"
     fi
 
-    if [ "$delete_branch" -eq 1 ]; then
+    if [ "$delete_branch" -eq 1 ] && [ "$clone_instance" -eq 0 ]; then
         if [ "$force" -eq 1 ]; then
             git -C "$script_repo" branch -D "$name"
         else
