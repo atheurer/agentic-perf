@@ -1910,8 +1910,6 @@ async function loadTickets() {
     var el = document.getElementById('ticket-table');
     if (!el) return;
 
-    // Clear previous table to release DOM references
-    el.innerHTML = '';
     if (!tickets || tickets.length === 0) {
       el.innerHTML =
         '<div class="empty-state">' +
@@ -2092,7 +2090,7 @@ async function renderDetail(ticketId) {
     // Initial load: fetch ALL events at once for complete
     // breadcrumbs and history. Only poll for NEW events after.
     try {
-      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=1000');
+      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=10000');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
         lastSeq = initData.latest_seq;
@@ -3134,9 +3132,12 @@ function renderNewEvents(events) {
     var evt = events[i];
     if (renderedEvents.indexOf(evt.seq) !== -1) continue;
     renderedEvents.push(evt.seq);
-    // Cap rendered events to prevent memory leak
-    if (renderedEvents.length > 2000) {
-      renderedEvents = renderedEvents.slice(-1000);
+    // Cap DOM nodes to prevent memory leak from accumulated
+    // event elements. Remove oldest DOM children when over limit.
+    if (container.children.length > 2000) {
+      while (container.children.length > 1500) {
+        container.removeChild(container.firstChild);
+      }
     }
     var html = renderEvent(evt);
     if (html) container.insertAdjacentHTML('beforeend', html);
