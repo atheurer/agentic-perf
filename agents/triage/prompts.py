@@ -102,9 +102,23 @@ Your job is to analyze a performance test request ticket and:
    Partition rules:
    - "shared": Brief summary of the test objective and environment info
      relevant to everyone (e.g., "AWS m5n.4xlarge instances, RHEL9"). This
-     key should always be present.
+     key should always be present. When including any host identifier
+     (hostname, FQDN, or IP address), copy it character-for-character —
+     never substitute geographic labels, shorthand, or descriptions.
    - "resource": Host/hardware requirements, provider preferences, instance
      types, counts, regions, availability zones, RAM requirements.
+     When the user assigns specific existing hosts as test infrastructure
+     (FQDNs, hostnames, or IP addresses), copy every host identifier
+     VERBATIM into this field — character-for-character, preserving case,
+     domain suffixes, and role associations. Never substitute geographic
+     labels ("BOS2", "RDU3", "lab"), shorthand ("bos-controller"),
+     descriptions, or "corrected" forms. Do not drop domain suffixes,
+     change case, resolve IPs to hostnames, or merge similar names. The
+     resource agent SSHes to these exact strings; any alteration breaks
+     the pipeline. This field is REQUIRED when the user provides specific
+     existing hosts. (Exception: if a pre-parsed agent:resource verbatim
+     directive already carries the hostnames, do not restate them — only
+     add supplemental context the verbatim block does not cover.)
    - "provision": Harness installation instructions, user-requested
      packages (e.g., "install nmap-ncat"). Do NOT include benchmark tool
      names (uperf, fio, trafficgen, etc.), benchmark parameters, test

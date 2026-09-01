@@ -1,253 +1,136 @@
 # Custom Image Building with CAIB
 
-## Overview
+CAIB (Cloud Automotive Image Builder) produces a Jumpstarter-compatible
+AutoSD image from an AIB manifest. Use the `image_build` ticket directive for
+image content that must exist at boot: RPMs, repositories, services, kernel
+packages, or a pinned AIB image. The image-builder agent runs before hardware
+acquisition, so a failed build does not consume a lease.
 
-CAIB (Cloud Automotive Image Builder) builds custom AutoSD images
-from AIB manifests. Use it when testing requires an image that
-differs from the standard nightly — package overrides, service
-changes, kernel config, or building from a specific AIB commit.
+## Prerequisites and authentication
 
-## When to Use
-
-- Testing a fix before it lands in nightly builds
-- A/B testing with package overrides (avoids system_config
-  workarounds with dnf/rpm)
-- Building from a specific automotive-image-builder commit
-- Custom kernel configurations or service modifications
-- Reproducing a specific build environment
-
-## Concepts
-
-### Targets vs Build Modes
-
-**Target** = the hardware platform. It determines the partition
-layout, bootloader format, and flash procedure:
-
-| Target | Boards | Partition layout |
-|---|---|---|
-| `ebbr` | S32G, R-Car S4, TI (J784S4) | Single partition, EBBR firmware |
-| `ride4_sa8775p_sx` | SA8775P (QC8775) ES2.1 v2/v2.5 | 4 partitions: system_a, system_b, boot_a, boot_b (aboot) |
-| `ride4_sa8775p_sx_r3` | SA8775P (QC8775) ES2.1 v3 | 4 partitions (aboot) |
-
-**Build mode** = the image type. It determines how packages are
-managed on the running system. **Both modes work on all targets**:
-
-| Mode | CLI | Image type | Package management | Use when |
-|---|---|---|---|---|
-| Package | `build-dev --mode package` | `regular` | `dnf` — persistent installs, mutable rootfs | Post-deploy modifications needed (kernel swaps, RPM installs, config changes) |
-| Bootc/OSTree | `build --disk` or `build-dev --mode image` | `ostree` | `rpm-ostree` — atomic, immutable rootfs | Production-like testing, integrity verification |
-
-Target and build mode are **independent choices**. A QC8775 board
-can run either a package-mode or bootc image. An EBBR board can
-run either type. Choose based on what the test requires, not the
-hardware.
-
-## Build Modes
-
-### Package mode
-
-Produces a mutable image with traditional `dnf` package management.
-Use when you need to install RPMs or modify config post-flash:
+Local installation requires the CAIB CLI, a working `jmp login`/Jumpstarter
+client configuration, network access to the CAIB service, and a CAIB service
+token at `~/.agentic-perf/secrets/caib/token` (or the configured
+`AGENTIC_PERF_SECRETS/caib/token`). The deployment also needs registry
+credentials with pull permission for exporters and push permission for the
+build result. Put push credentials in
+`secrets/caib/registry-auth.json`; never place tokens in a manifest or commit
+them. In the container image, CAIB is installed during the Containerfile
+build; verify with `caib --help` because that installation is warning-only.
 
 ```bash
-caib image build-dev manifest.aib.yml \
-  --mode package \
-  --format simg \
-  --target <target> \
-  --push <registry-url> \
-  --wait \
-  --output-format json
+jmp login
+caib --help
+CAIB_SECRETS_DIR="${AGENTIC_PERF_SECRETS:-$HOME/.agentic-perf/secrets}"
+test -s "$CAIB_SECRETS_DIR/caib/token"
 ```
 
-### Bootc/OSTree mode
+The provider pushes `<push_registry>:<build-name>`. Quay tags are assigned an
+expiry (14 days by default, configurable with `tag_expiration_days`); retain
+or promote the tag when it must survive cleanup.
 
-Produces an immutable image with atomic updates:
+## Targets and modes
+
+The board selector resolves as follows: `board-type=nxp-s32g-vnp-rdb3` and
+`board-type=renesas-rcar-s4` map to `ebbr`; `board-type=qc8775` maps to
+`ride4_sa8775p_sx`; unknown selectors default to `ebbr`. Override `target`
+when the provider mapping is not sufficient.
+
+Build mode and target are independent. Package mode is the default and uses
+`caib image build-dev --mode package`; it leaves a mutable `dnf` root. Bootc
+mode uses `caib image build --disk` (or `build-dev --mode image`) and produces
+an OSTree/rpm-ostree image. Use package mode for post-flash RPM/configuration
+and bootc for production-like atomic images.
+
+## Valid submission examples
+
+These are CLI equivalents of the provider's commands. `--wait` returns only
+after the remote build finishes; `--output-format json` makes the result
+machine-readable.
 
 ```bash
-caib image build manifest.aib.yml \
-  --format simg \
-  --target <target> \
-  --disk \
-  --push <registry-url> \
-  --wait \
-  --output-format json
+# Mutable package image
+caib image build-dev manifest.aib.yml --mode package --format simg \
+  --target ebbr --push quay.io/example/agentic-perf --wait \
+  --output-format json --timeout 60 --ttl 168h
+
+# Bootc/OSTree image
+caib image build manifest.aib.yml --disk --format simg \
+  --target ride4_sa8775p_sx --push quay.io/example/agentic-perf \
+  --wait --output-format json --timeout 60 --ttl 168h
 ```
 
-## AIB Manifest Format
+The agent derives a short build name from target, image mode, UTC timestamp,
+and ticket ID. Store the returned `diskImage` or the OCI URL in the ticket;
+flash it with `j storage flash oci://<registry>/<image>:<tag>`.
 
-Manifests (`.aib.yml`) define the image content:
+## Manifest and supported customizations
+
+The provider starts with required SSH, networking, time, diagnostics, and
+Podman packages, enables `sshd`, `NetworkManager`, and `chronyd`, and adds
+your customizations. A valid minimal manifest is:
 
 ```yaml
 name: custom-test-image
-
 content:
   rpms:
     - openssh-server
+    - NetworkManager
     - chrony
     - iproute
-    - custom-package
-  repos:
-    - name: custom-repo
-      baseurl: https://download.copr.fedorainfracloud.org/results/user/repo/centos-stream-10-$basearch/
   systemd:
     enabled_services:
       - sshd.service
-      - custom.service
-    disabled_services:
-      - podman-clean-transient.service
-    masked_services:
-      - unwanted.service
-
-> **Important:** `masked_services` is NOT supported by the AIB
-> manifest schema. It will be silently converted to
-> `disabled_services`. Only `enabled_services` and
-> `disabled_services` are valid in the `systemd` section.
-
-> **Network:** The manifest must include a `network` section.
-> Use `network: { dynamic: {} }` for NetworkManager-based DHCP
-> (the default). Without this, network interfaces may not be
-> configured even if NetworkManager is installed.
-
+      - NetworkManager.service
+      - chronyd.service
+network:
+  dynamic: {}
 image:
   image_size: 8 GiB
   sealed: false
-
-auth:
-  root_password: $6$...hashed...
-  sshd_config:
-    PermitRootLogin: true
-    PasswordAuthentication: true
 ```
 
-### Key Manifest Sections
+Supported `customizations` keys are `rpms`, `repos`, `enabled_services`,
+`disabled_services`, and `kernel` (a package string or AIB kernel object).
+`masked_services` is accepted for compatibility but is converted to
+`disabled_services`; it is not an AIB manifest key. Keep `network.dynamic: {}`
+for NetworkManager DHCP. For QC8775 kernel overrides, include matching DTBs
+and Qualcomm kernel modules. EBBR uses `kernel-automotive`; QC8775 nightly
+images use `kernel-ivos-qualcomm` plus its matching modules/DTBs.
 
-| Section | Purpose |
-|---|---|
-| `content.rpms` | Packages to install |
-| `content.repos` | Custom RPM repositories |
-| `content.systemd` | Service enable/disable/mask |
-| `content.add_files` | Add files (inline, path, or URL) |
-| `content.remove_files` | Remove files from the image |
-| `kernel.cmdline` | Kernel command line parameters |
-| `kernel.kernel_package` | Custom kernel package |
-| `image.image_size` | Disk image size |
-| `image.sealed` | Enable dm-verity sealing |
-| `auth` | Root password and SSH config |
+## Ticket lifecycle and outputs
 
-## Build Lifecycle
+Triage sets `custom_fields.image_build`; the orchestrator enters
+`building_image`, and the image-builder emits `agent_started`, then
+`build_complete` or `build_failed`, followed by `agent_finished`. The result
+is stored in `custom_fields.image_build_result`:
 
-1. **Submit**: `caib image build-dev` submits to the cloud
-   build service
-2. **Build**: runs osbuild in a remote environment (~10-30 min)
-3. **Push**: result pushed to internal registry or external
-   registry via `--push`
-4. **Download/Flash**: `caib image download <name>` or
-   flash directly via `j storage flash oci://<url>`
-
-## CLI Reference
-
-### Build Management
-
-```bash
-# List builds
-caib image list --output-format json
-
-# Show build details
-caib image show <build-name> --output-format json
-
-# Cancel a build
-caib image cancel <build-name>
-
-# Download artifact
-caib image download <build-name> -o <output-dir>
-
-# Follow build logs
-caib image logs <build-name>
+```json
+{
+  "provider": "caib",
+  "build_name": "ebbr-reg-202609011200-TICKET-1",
+  "image_url": "quay.io/example/agentic-perf:...",
+  "status": "completed",
+  "error": "",
+  "details": {}
+}
 ```
 
-### Key Flags
+Success transitions to `awaiting_hardware`; failure records the error and
+transitions to `awaiting_customer_guidance`. Inspect ticket comments/events
+and the CAIB build record (`caib image show <build-name> --output-format json`)
+to diagnose progress.
 
-| Flag | Purpose |
-|---|---|
-| `--wait` | Block until build completes |
-| `--internal-registry` | Push to OpenShift internal registry |
-| `--push <url>` | Push to external OCI registry |
-| `--format simg` | Produce Jumpstarter-compatible image |
-| `--target <name>` | Target platform |
-| `--name <name>` | Set build name (for caching/reuse) |
-| `--timeout <min>` | Build timeout (default: 60) |
-| `--output-format json` | Machine-readable output |
-| `-D KEY=VALUE` | Custom AIB definitions |
-| `--aib-image <ref>` | Specific AIB version |
-| `--extra-repo` | Add RPMs from workspace |
+## Recovery, cleanup, and choosing system_config
 
-## Authentication
+After a failure, correct the manifest, credentials, target, or registry
+permissions and retry the ticket/build. Cancel abandoned remote builds with
+`caib image cancel <build-name>` and remove expired local manifests; CAIB-side
+build records and tags are cleaned by their TTL. Do not hold or acquire
+hardware while waiting for CAIB.
 
-CAIB shares authentication with Jumpstarter. When
-`jmp login` is configured, `caib login` derives the
-build API endpoint automatically. The auth token is
-cached at `~/.config/caib/cli.json`.
-
-## Integration with agentic-perf
-
-Custom builds replace the standard nightly image URL in the
-provisioning flow. The platform agent flashes from the custom
-image's OCI URL instead of the default nightly:
-
-```
-j storage flash oci://<registry>/<image>:<tag>
-```
-
-The build step occurs BEFORE hardware acquisition to avoid
-holding a Jumpstarter lease during the build (~10-30 min).
-
-## Required Packages by Target
-
-The AIB base for each target is minimal. The nightly images add
-many packages via their build profiles (qa, ps). When building
-custom images, you must include packages that the nightly profile
-would normally add.
-
-### Packages required for remote access and testing
-
-These must be in `content.rpms` for any custom build that needs
-SSH access and benchmarking:
-
-```yaml
-content:
-  rpms:
-    - openssh-server
-    - chrony
-    - iproute
-    - podman
-    - NetworkManager       # critical — without this, network
-                           #   interfaces are not configured
-                           #   in Linux even if firmware assigns
-                           #   an IP via DHCP
-```
-
-### QC8775 / SA8775P (ride4_sa8775p_sx) specifics
-
-The nightly `qa/regular` image for this target uses
-`kernel-ivos-qualcomm` (NOT `kernel-automotive`). Key packages:
-
-| Package | Purpose |
-|---|---|
-| `kernel-ivos-qualcomm` | Qualcomm-specific kernel |
-| `kernel-ivos-qualcomm-modules-extra` | Additional kernel modules |
-| `kernel-ivos-qualcomm-modules-internal` | Internal kernel modules |
-| `downstream-dtbs` | Device tree blobs for SA8775P |
-| `kmod-qcom-scmi` | Qualcomm SCMI kernel module |
-| `NetworkManager` | Network interface configuration |
-| `dhcpcd` | DHCP client |
-
-When overriding the kernel via the `kernel` manifest field for
-QC8775, you must also provide matching DTBs (either via the
-kernel RPM or a separate `downstream-dtbs-*` package in
-`content.rpms`).
-
-### EBBR boards (S32G, R-Car S4) specifics
-
-EBBR boards use `kernel-automotive` and single-partition flash.
-The base package set is simpler but still requires `NetworkManager`
-for network access.
+Use `image_build` when the change belongs in the flashed base image or must be
+reproducible before allocation. Use post-flash `system_config` for a one-off
+runtime change such as installing an RPM from a lab server or changing config
+after boot. The two directives are intentionally distinct; do not combine
+them unless the request explicitly needs both.

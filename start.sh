@@ -16,8 +16,8 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
-# Read port from config (default 8090)
-STORE_PORT=$(python3 -c "
+# Read port from config (default 8090); STORE_PORT is an explicit override.
+CONFIG_STORE_PORT=$(python3 -c "
 import json, sys
 try:
     cfg = json.load(open('$CONFIG'))
@@ -25,6 +25,7 @@ try:
 except Exception:
     print(8090)
 ")
+STORE_PORT="${STORE_PORT:-$CONFIG_STORE_PORT}"
 
 STORE_PID=""
 

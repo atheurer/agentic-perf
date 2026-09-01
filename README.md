@@ -15,16 +15,20 @@ testing well, but can't handle the variability of investigative work.
 
 ## The Approach
 
-Five specialized agents collaborate through a shared ticket (a structured JSON
+Specialized agents and deterministic coordinators collaborate through a shared ticket (a structured JSON
 document that serves as the single source of truth):
 
-| Agent | Role | Scoped Tools |
+| Handler | Role | Execution |
 |---|---|---|
 | **Triage** | Parse user intent, form hypothesis, select benchmark | Benchmark discovery, resolution |
 | **Resource** | Find and reserve hardware from providers | QUADS API, AWS EC2, PSAP Control Center |
 | **Provisioning** | Install benchmark harness on hosts via SSH | SSH, platform contracts, K3s |
 | **Benchmark** | Construct run configuration, execute, monitor | Harness docs, schema validation, CLI |
 | **Review** | Analyze results, produce verdict | Metric query, result comparison |
+| **Platform / image builder** | Prepare platforms and custom images | deterministic |
+| **Investigation / fleet / synthesis** | Context, convergence, fleet routing, final record | mixed |
+| **Retrospective** | Post-run findings | LLM |
+| **Introspection** | Optional event observer and guidance summary | configurable |
 
 Each agent has its own MCP tool server with scoped capabilities — the review
 agent cannot SSH, and the provisioning agent cannot query metrics. Agents are
@@ -32,26 +36,31 @@ stateless and crash-recoverable: all durable state lives on the ticket.
 
 ## Ticket Lifecycle
 
+The complete mapping and current MCP inventory are in
+[docs/capabilities.md](docs/capabilities.md).
+
 ### Ad-hoc test execution
 
 ```
-new → triage_pending → awaiting_hardware → awaiting_provision →
-executing_benchmark → awaiting_review → awaiting_teardown → closed
+new → triage_pending → awaiting_hardware → preparing_platform? →
+awaiting_provision → executing_benchmark → awaiting_review →
+awaiting_teardown → retrospective_pending → closed
 ```
 
 ### Recursive investigation
 
 ```
-new → triage_pending → gathering_context → planning_investigation →
+new → triage_pending → gathering_context → analyzing? →
+planning_investigation → awaiting_hardware → preparing_platform? →
 awaiting_provision → executing_benchmark → evaluating_convergence →
     │── loop back to planning_investigation (refine params)
     │── loop back to awaiting_provision (re-flash hardware)
     └── synthesizing_results → awaiting_teardown → closed
 ```
 
-Both paths can pause at `awaiting_customer_guidance` for human input, and the
-user can reply to resume. Tickets can also be aborted to skip directly to
-teardown.
+Both paths can pause at `awaiting_customer_guidance`; `reply` resumes without
+restarting the orchestrator. Stop, hard-stop, stop-all, abort, and administrative
+force-close controls are documented in [docs/status-lifecycle.md](docs/status-lifecycle.md).
 
 ## Supported Benchmark Harnesses
 
@@ -210,6 +219,9 @@ agentic-perf show <TICKET_ID>             # Show ticket details and custom field
 agentic-perf health                        # Check state store (ticket counts)
 agentic-perf cleanup --older-than 24       # Find orphaned AWS instances
 agentic-perf cleanup --terminate -y        # Terminate orphaned instances
+agentic-perf archive <TICKET_ID>           # Archive a closed ticket
+agentic-perf stop <TICKET_ID> --hard       # Cancel the running task
+agentic-perf stop-all --yes --hard         # Emergency stop all tasks
 ```
 
 ## Web Dashboard
@@ -302,17 +314,42 @@ For end-to-end testing with real infrastructure, see
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system architecture, agents, providers, state machine
-- [Design Philosophy](docs/design-philosophy.md) — why the system is designed the way it is
-- [CLI Reference](docs/cli-reference.md) — complete command reference with examples
-- [Adding a Harness](docs/adding-a-harness.md) — how to add a new benchmark harness
-- [LLM Run-File Generation](docs/design-llm-runfile-generation.md) — how benchmark agents construct run configurations
-- [E2E Testing Guide](docs/e2e-testing.md) — running the full pipeline against real hardware
-- [CDM API Reference](docs/cdm-api-reference.md) — querying Crucible's metric storage
-- [Collaborative Negotiation](docs/collaborative-negotiation.md) — future design for multi-agent planning
-- [Jira Integration](docs/jira-polling-integration.md) — replacing the local state store with Jira Cloud
-- [Web Dashboard](docs/web-ui.md) — dashboard architecture and event stream
-- [Presentation](docs/presentation-agentic-perf.md) — overview slides explaining the project's motivation and results
+### Users
+
+- [User guide](docs/user-guide.md) — current submission and usage guide
+- [CLI reference](docs/cli-reference.md) — current command reference
+- [Ticket directives](docs/ticket-directives.md) — current ticket controls
+- [E2E testing](docs/e2e-testing.md) — reproducible smoke and real-pipeline checks
+- [Web dashboard](docs/web-ui.md) — current views and controls
+- [CDM API](docs/cdm-api-reference.md) — current metric queries
+
+### Operators
+
+- [Configuration](docs/configuration.md) — current settings
+- [Secrets](docs/secrets.md) — current secret providers and resolution
+- [Monitoring runbook](docs/monitoring.md) — current recovery procedures
+- [Multi-user](docs/multi-user.md) — current identity and ownership
+- [Multi-instance](docs/multi-instance.md) — current isolated deployments and claims
+- [Deployment](docs/container-deployment.md), [OpenShift](docs/openshift-deployment.md), [Beaker](docs/beaker-integration.md)
+- [Retention and dataflow](docs/dataflow.md) — current archive/redaction behavior
+- [Release and upgrade guide](docs/releases-and-upgrades.md) — operator checklist
+
+### Developers and architecture
+
+- [Architecture](docs/architecture.md), [lifecycle](docs/status-lifecycle.md), [capabilities](docs/capabilities.md)
+- [REST API reference](docs/rest-api-reference.md) — all mounted API routes
+- [Workspace and charts](docs/workspaces-and-charts.md) — current spill/chart contracts
+- [Fleet investigation](docs/fleet-investigation.md) — current fleet workflow
+- [Adding a harness](docs/adding-a-harness.md) — extension guide
+- [Design philosophy](docs/design-philosophy.md), [dataflow](docs/dataflow.md)
+- [Webhook ingestion](docs/webhook-ingestion.md), [Jira integration](docs/jira-polling-integration.md)
+- [TUI concept](docs/tui-concept.md) and [TUI implementation plan](docs/tui-implementation-plan.md) — draft/planning
+- [LLM run-file design](docs/design-llm-runfile-generation.md) and [collaborative negotiation](docs/collaborative-negotiation.md) — design documents; verify implementation status
+- [Presentation](docs/presentation-agentic-perf.md) — historical overview
+
+Skill-specific workload/configuration pages live under `skills/`; internal
+notes under `docs/internal/` are not public contracts. This index is the
+canonical navigation page; each linked page carries its status marker.
 
 ## License
 

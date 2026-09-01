@@ -588,12 +588,17 @@ Interface: `LLMProvider` (`providers/llm/base.py`)
 
 | Provider | Backend | Usage |
 |---|---|---|
-| `ClaudeLLMProvider` | Anthropic direct API or Vertex AI | Production |
+| `ClaudeLLMProvider` | Anthropic direct API or Vertex AI | Claude production workloads |
+| `OpenAICompatLLMProvider` | OpenAI-compatible Chat Completions or OpenAI Responses API | OpenAI, Azure, vLLM, Ollama, and other compatible endpoints |
+| `GeminiLLMProvider` | Google Gemini API or Vertex AI | Gemini production workloads |
 | `MockLLMProvider` | Hardcoded responses | Testing |
 
-The LLM provider handles message formatting, tool definitions, and
-response parsing. Agents call `llm.complete()` with system prompt,
-messages, and tools.
+The LLM provider handles message formatting, tool definitions, response
+parsing, and provider-specific usage extraction. Agents call
+`llm.complete()` with system prompt, messages, and tools. The OpenAI
+`api` setting selects `chat_completions` (default) or `responses`.
+Provider SDKs are optional extras: `openai`, `gemini`, and `vertex`;
+Anthropic is included in the base installation.
 
 ### Resource Providers
 
@@ -1000,29 +1005,10 @@ command reads from the JSONL files.
 
 ### LLM Usage Tracking
 
-Token usage and timing are captured via OpenTelemetry instrumentation
-of the LLM SDKs (Anthropic, OpenAI). The `opentelemetry-instrumentation-
-anthropic` and `opentelemetry-instrumentation-openai` packages
-automatically produce spans for every LLM call with token counts,
-model info, and duration.
-
-A custom `EventBusSpanProcessor` (`providers/telemetry.py`) bridges
-OTLP spans into the EventBus for per-ticket accumulation:
-
-1. The agent loop sets a ticket ID on the OpenTelemetry context before
-   each LLM call
-2. The LLM SDK instrumentation produces a span with token usage
-3. The span processor extracts usage from the span attributes,
-   calls `EventBus.record_llm_usage()` for in-memory accumulation,
-   and emits a `llm_usage` event to the JSONL log
-4. The usage API (`/api/v1/tickets/{id}/usage`) computes totals from
-   the persisted `llm_usage` events, which works across process
-   boundaries (the state store and orchestrator are separate processes)
-
-The OTLP span processor is the sole source of token accounting —
-LLM providers do not extract usage from API responses. This keeps
-the data path simple: SDK → instrumentor → span → span processor →
-EventBus.
+Token accounting comes directly from each provider's API response:
+providers return LLMResponse.usage and the agent loop records it in the
+EventBus and JSONL llm_usage events. OpenTelemetry spans are a parallel
+correlation/export path, not the source of accounting.
 
 Optionally, spans can also be exported to an external OTLP collector
 (Jaeger, Grafana Tempo, etc.) by configuring `telemetry.otlp_endpoint`
@@ -1034,9 +1020,16 @@ function matches model names by prefix (e.g., `claude-sonnet-4-6`
 matches `claude-sonnet-4`) and falls back to default pricing for
 unknown models.
 
-Telemetry dependencies are optional — install with
-`pip install -e ".[telemetry]"`. Without them, the system works
-normally but token tracking is disabled.
+The supported telemetry settings are telemetry.enabled (default true) and
+telemetry.otlp_endpoint. Headers and an otlp_exporter object are not read.
+User pricing entries use exact or longest-prefix matching; unknown models
+use the fallback entry. Pricing is cached for the process lifetime; call
+reload_pricing() after editing or restart the process. Cumulative cost uses
+the first model in models_used, so multi-model tickets are approximate.
+
+Telemetry dependencies are optional. Install the telemetry extra for spans
+and the telemetry-export extra for OTLP export. Token accounting remains
+provider-response based.
 
 ### LLM Budget Guardrails
 
@@ -1112,6 +1105,13 @@ pipeline:
 4. Prints web dashboard URL
 5. Starts orchestrator in foreground
 6. Cleanup trap kills state store on exit
+
+Before dispatching tickets, the orchestrator performs a minimal completion
+check for each distinct configured provider/model/API/region combination.
+Failures and 10-second timeouts are logged, but model validation does not
+block startup. Configure llm.model or LLM_MODEL for deterministic checks;
+provider factory fallbacks are intended for an empty model, not for
+production reproducibility.
 
 ## State Store API
 

@@ -377,19 +377,7 @@ If you find an agent's recommendation surprising, note it:
 agentic-perf reply ticket-abc123 "This result is unexpected because [reason]. Can you cross-check with [data source]?"
 ```
 
-This feedback helps improve the system.
-
----
-
-## Feedback and Support
-
-### 📊 Give Feedback on Results
-Did the agent's recommendation prove correct or wrong? Provide feedback:
-
-```bash
-agentic-perf feedback ticket-abc123 thumbs-up --comment "Recommendation saved 2 hours of manual testing."
-agentic-perf feedback ticket-abc123 thumbs-down --comment "Result didn't reproduce; hardware may have been in wrong state."
-```
+## Support
 
 ### 🆘 Report Issues
 Found a bug or unexpected behavior? Report it with:

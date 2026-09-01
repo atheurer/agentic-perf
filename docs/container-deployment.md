@@ -1,124 +1,117 @@
 # Container Deployment
 
-## Building the image
+This guide describes the image built by `Containerfile`. It runs the state
+store and orchestrator from `start.sh` as UBI's non-root user (UID 1001 in a
+local container; OpenShift may substitute an arbitrary UID in group 0).
 
-The `Containerfile` supports both podman (primary) and docker:
+## Build and verify
+
+Podman is the primary workflow; Docker uses the same Containerfile. The build
+installs Python dependencies from `requirements-dev.lock`, the application
+with the `vertex` and `telemetry` extras, runtime tools (`openssh-clients`,
+`git`, `jq`, `sshpass`, `iputils`), Jumpstarter CLI/drivers, and CAIB. CAIB
+installation is warning-only at image build time, so verify it explicitly.
 
 ```bash
-# Podman
-podman build -t agentic-perf -f Containerfile .
+podman build -t agentic-perf:local -f Containerfile .
+podman run --rm --entrypoint bash agentic-perf:local -lc \
+  'python3 --version && j --help >/dev/null && jmp --help >/dev/null && caib --help >/dev/null'
 
-# Docker
-docker build -t agentic-perf -f Containerfile .
+docker build -t agentic-perf:local -f Containerfile .
+docker run --rm --entrypoint bash agentic-perf:local -lc \
+  'python3 --version && j --help >/dev/null && jmp --help >/dev/null && caib --help >/dev/null'
 ```
 
-### Jumpstarter SDK
+The image includes the Vertex/Anthropic client and telemetry dependencies.
+OpenAI support is optional: install the `openai` extra in a derived image.
+Credentials and provider-specific network access are never baked in.
 
-The Jumpstarter SDK can be baked into the image at build time
-or installed at runtime. To include it in the image, uncomment
-the `setup-jumpstarter.sh` lines in the Containerfile before
-building. This creates a larger image (~2GB) but avoids
-runtime setup delays.
+## Run locally
 
-## Running
-
-### Minimal (no Jumpstarter)
+`start.sh` requires `$AGENTIC_PERF_HOME/config.json` and listens on port 8090
+by default.
 
 ```bash
-podman run -d --name agentic-perf \
-  -p 8090:8090 \
+podman run -d --name agentic-perf -p 8090:8090 \
   -v agentic-perf-data:/data/agentic-perf \
-  -v ./config.json:/data/agentic-perf/config.json:ro \
-  -e CLAUDE_CODE_USE_VERTEX=1 \
-  -e CLOUD_ML_REGION=global \
-  -e ANTHROPIC_VERTEX_PROJECT_ID=<project-id> \
-  agentic-perf
+  -v "$PWD/config.json:/data/agentic-perf/config.json:ro" \
+  -e CLAUDE_CODE_USE_VERTEX=1 -e CLOUD_ML_REGION=global \
+  -e 'ANTHROPIC_VERTEX_PROJECT_ID=<project-id>' agentic-perf:local
+curl -fsS http://localhost:8090/api/v1/health
 ```
 
-### With Jumpstarter
+For Docker, replace `podman` with `docker`. Use a named volume or a host
+directory writable by the container UID.
+
+## Jumpstarter and CAIB
+
+Jumpstarter is already installed; nothing must be uncommented. The application
+uses the runtime user's UBI home, normally `/opt/app-root/src`:
 
 ```bash
-podman run -d --name agentic-perf \
-  -p 8090:8090 \
+podman run -d --name agentic-perf -p 8090:8090 \
   -v agentic-perf-data:/data/agentic-perf \
-  -v ./config.json:/data/agentic-perf/config.json:ro \
-  -v ./secrets:/data/agentic-perf/secrets:ro \
-  -v ./jumpstarter-client.yaml:/home/agentic-perf/.config/jumpstarter/clients/perf-ci.yaml:ro \
-  -e CLAUDE_CODE_USE_VERTEX=1 \
-  -e CLOUD_ML_REGION=global \
-  -e ANTHROPIC_VERTEX_PROJECT_ID=<project-id> \
-  agentic-perf
+  -v "$PWD/config.json:/data/agentic-perf/config.json:ro" \
+  -v "$PWD/jumpstarter-client.yaml:/opt/app-root/src/.config/jumpstarter/clients/perf-ci.yaml:ro" \
+  -v "$PWD/jumpstarter-config.yaml:/opt/app-root/src/.config/jumpstarter/config.yaml:ro" \
+  -e CLAUDE_CODE_USE_VERTEX=1 -e CLOUD_ML_REGION=global \
+  -e 'ANTHROPIC_VERTEX_PROJECT_ID=<project-id>' agentic-perf:local
 ```
 
-## Configuration
+CAIB reads its service token from `$AGENTIC_PERF_HOME/secrets/caib/token` and
+optional registry credentials from
+`$AGENTIC_PERF_HOME/secrets/caib/registry-auth.json`. Set
+`image_build.push_registry` when Jumpstarter must pull the resulting OCI
+image. Verify both clients:
 
-### Environment variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `CLAUDE_CODE_USE_VERTEX` | Yes (Vertex) | Set to `1` for Vertex AI |
-| `CLOUD_ML_REGION` | Yes (Vertex) | Vertex AI region (e.g., `global`) |
-| `ANTHROPIC_VERTEX_PROJECT_ID` | Yes (Vertex) | GCP project ID |
-| `AGENTIC_PERF_HOME` | No | Data directory (default: `/data/agentic-perf`) |
-| `OPENAI_API_KEY` | Yes (OpenAI) | API key for OpenAI provider |
-
-### Mounted files
-
-| Path in container | Purpose |
-|---|---|
-| `/data/agentic-perf/config.json` | Main configuration |
-| `/data/agentic-perf/secrets/` | Auth tokens (API, Domain MCP, etc.) |
-| `/home/agentic-perf/.config/jumpstarter/clients/*.yaml` | Jumpstarter client config |
-
-### Persistent data
-
-Mount a volume at `/data/agentic-perf` for:
-- `tickets/` — ticket state (survives restarts)
-- `logs/` — event logs (JSONL per ticket)
-- `investigation-records/` — investigation memory
-- `secrets/api-token` — generated on first run
-
-## OpenShift deployment
-
-For a comprehensive OpenShift deployment guide covering secrets
-management, init containers, troubleshooting, and lessons learned
-from production deployment, see
-[OpenShift Deployment Guide](openshift-deployment.md).
-
-### Quick start via web UI
-
-1. **Create project:** e.g., `agentic-perf`
-2. **Add to project → Import from Git:**
-   - Git URL: `https://github.com/atheurer/agentic-perf.git`
-   - Dockerfile path: `Containerfile`
-3. **Create secrets** (Workloads → Secrets):
-   - LLM credentials (env vars)
-   - Jumpstarter client config (file)
-   - Domain MCP token (file)
-4. **Create ConfigMap** with `config.json`
-5. **Create PVC** (10Gi) for persistent data
-6. **Edit deployment** to mount secrets, ConfigMap, and PVC
-7. **Create Route** to expose port 8090
-
-### Required network egress
-
-| Destination | Purpose |
-|---|---|
-| Vertex AI API | LLM inference |
-| Jumpstarter controller | Board lease management (gRPC) |
-| AutoSD build server | OS image downloads |
-| Domain MCP server | Historical performance data |
-| Lab board IPs | SSH for benchmark execution |
-
-### Health check
-
-The state store exposes `/api/v1/health` for liveness probes:
-
-```yaml
-livenessProbe:
-  httpGet:
-    path: /api/v1/health
-    port: 8090
-  initialDelaySeconds: 10
-  periodSeconds: 30
+```bash
+podman exec agentic-perf caib --help
+podman exec agentic-perf jmp get exporters
 ```
+
+CAIB needs build-service egress and push permission. Quay tags receive a
+configurable expiry; retain or promote images needed longer.
+
+## Configuration and persistence
+
+Mount `/data/agentic-perf` for application state. `AGENTIC_PERF_HOME` defaults
+there; change the config and mount together if you override it. The optional
+`AGENTIC_PERF_ARTIFACTS` and `AGENTIC_PERF_SECRETS` variables select separate
+locations.
+
+| Path | Contents |
+|---|---|
+| `config.json` | Runtime configuration |
+| `tickets/` | Ticket state and per-ticket `workspace/` |
+| `logs/` | Audit/event JSONL logs |
+| `artifacts/<ticket>/<run>/` | Benchmark artifacts |
+| `skill-cache/`, `plugin-schema-cache/` | Skill/schema caches |
+| `investigation-records/` | File-backed records |
+| `secrets/` | API and provider tokens |
+| `private-skills/` | Private skill overrides |
+
+Keep secrets out of the image. Harnesses may still use `/tmp`; archive files
+needed after restart into the persistent artifact directory.
+
+## Non-root troubleshooting
+
+The image prepares `/data/agentic-perf` and creates SSH material as `1001:0`
+with group access for OpenShift arbitrary UIDs. For host bind mounts, grant
+the effective UID or group 0 read/write access; on SELinux hosts use Podman
+`:Z` labeling. Check:
+
+```bash
+podman logs agentic-perf
+podman exec agentic-perf id
+podman exec agentic-perf sh -c 'test -r "$AGENTIC_PERF_HOME/config.json" && test -w /data/agentic-perf'
+```
+
+An immediate exit usually means config is missing/unreadable. A CAIB failure
+usually means its token, registry auth, target, or build-service egress is
+wrong. Use `/api/v1/health` for liveness.
+
+## OpenShift
+
+Use the [OpenShift deployment guide](openshift-deployment.md). It uses a PVC
+for `/data/agentic-perf`, mounts Jumpstarter files at
+`/opt/app-root/src/.config/jumpstarter`, and handles arbitrary UIDs.

@@ -4,7 +4,7 @@ import json
 import logging
 import os
 
-from paths import CONFIG_PATH, get_instance_name
+from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +50,10 @@ class OrchestratorConfig:
         cfg = _load_config_file()
         self.raw = cfg  # Full config for subsystem access
         llm_cfg = cfg.get("llm", {})
-        store_cfg = cfg.get("state_store", {})
 
-        self.state_store_url = (
-            state_store_url
-            or os.environ.get("STATE_STORE_URL")
-            or store_cfg.get("url", "http://localhost:8090")
-        )
-        self.state_store_port = store_cfg.get("port", 8090)
+        resolved_store_url, resolved_store_port = resolve_state_store(cfg)
+        self.state_store_url = state_store_url or resolved_store_url
+        self.state_store_port = resolved_store_port
         self.poll_interval = (
             poll_interval
             or _env_float("POLL_INTERVAL")

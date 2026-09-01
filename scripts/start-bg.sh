@@ -37,7 +37,7 @@ ORCH_LOG="$LOG_DIR/orchestrator.log"
 
 mkdir -p "$LOG_DIR"
 
-# Read port from config (default 8090)
+# Read port from config (default 8090); STORE_PORT is an explicit override.
 _read_port() {
     python3 -c "
 import json
@@ -49,7 +49,7 @@ except Exception:
 " 2>/dev/null
 }
 
-STORE_PORT=$(_read_port)
+STORE_PORT="${STORE_PORT:-$(_read_port)}"
 
 _is_store_running() {
     if [ -f "$STORE_PID_FILE" ]; then
