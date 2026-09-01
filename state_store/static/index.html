@@ -1445,8 +1445,8 @@ th.col-right { text-align: right; }
     <div class="chat-bar">
       <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
-      <span class="chat-cost" id="chat-cost"></span>
     </div>
+    <div class="chat-cost" id="chat-cost"></div>
   </div>
   <div id="app"></div>
 </div>
@@ -2184,6 +2184,7 @@ async function renderDetail(ticketId) {
                 '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
               '</div>' +
+              '<div class="chat-cost" id="ticket-chat-cost"></div>' +
             '</div>' +
             renderDescription(ticket) +
             ownershipHtml +
@@ -3861,8 +3862,8 @@ function appendChatMessage(containerId, role, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-function updateChatCost(usage) {
-  var el = document.getElementById('chat-cost');
+function updateChatCost(usage, elId) {
+  var el = document.getElementById(elId || 'chat-cost');
   if (!el || !usage) return;
   var calls = usage.llm_calls || 0;
   if (calls === 0) { el.innerHTML = ''; return; }
@@ -3906,13 +3907,23 @@ async function sendChatMessage() {
       appendChatMessage('chat-messages', 'assistant', data.response || '');
       updateChatCost(data.usage || {});
     } else {
-      appendChatMessage('chat-messages', 'system', 'Error: ' + r.status);
+      var errMsg = 'Something went wrong (HTTP ' + r.status + '). ';
+      if (r.status === 504 || r.status === 408) {
+        errMsg = 'The request timed out. Try a simpler question, or break your request into smaller steps.';
+      } else if (r.status === 503) {
+        errMsg = 'Chat agent is not available. Check that chat is enabled in the configuration.';
+      } else if (r.status === 401) {
+        errMsg = 'Authentication required. Please log in to use the chat.';
+      } else if (r.status === 429) {
+        errMsg = 'Rate limit reached. Please wait a moment and try again.';
+      }
+      appendChatMessage('chat-messages', 'system', errMsg);
     }
   } catch(e) {
     var container = document.getElementById('chat-messages');
     var thinking = container.querySelector('.chat-msg.system:last-child');
     if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
-    appendChatMessage('chat-messages', 'system', 'Connection error');
+    appendChatMessage('chat-messages', 'system', 'Connection error. The server may be restarting — try again in a moment.');
   }
   btn.disabled = false;
   input.focus();
@@ -3940,8 +3951,12 @@ async function sendTicketChatMessage() {
     if (r.ok) {
       var data = await r.json();
       appendChatMessage('ticket-chat-messages', 'assistant', data.response || '');
+      updateChatCost(data.usage || {}, 'ticket-chat-cost');
     } else {
-      appendChatMessage('ticket-chat-messages', 'system', 'Error: ' + r.status);
+      var tErr = r.status === 504 || r.status === 408
+        ? 'Request timed out. Try a simpler question.'
+        : 'Something went wrong (HTTP ' + r.status + ')';
+      appendChatMessage('ticket-chat-messages', 'system', tErr);
     }
   } catch(e) {
     var container = document.getElementById('ticket-chat-messages');
