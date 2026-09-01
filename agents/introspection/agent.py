@@ -941,6 +941,21 @@ class IntrospectionAgent:
                     last_agent_message = c.get("body", "")[:500]
                     break
 
+        # Fallback: if no agent comment found, check for
+        # system error messages (e.g., unhandled exceptions)
+        if not last_agent_message:
+            for c in reversed(comments):
+                author = c.get("author", "")
+                body = c.get("body", "")
+                if author == "system" and (
+                    "exception" in body.lower()
+                    or "error" in body.lower()
+                    or "failed" in body.lower()
+                ):
+                    last_agent = "system"
+                    last_agent_message = body[:500]
+                    break
+
         # Classify the reason
         reason = "unknown"
         details = last_agent_message
