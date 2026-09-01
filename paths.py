@@ -10,6 +10,8 @@ AGENTIC_PERF_HOME = Path(
 )
 
 CONFIG_PATH = AGENTIC_PERF_HOME / "config.json"
+DEFAULT_STATE_STORE_PORT = 8090
+DEFAULT_STATE_STORE_URL = f"http://localhost:{DEFAULT_STATE_STORE_PORT}"
 LOG_DIR = AGENTIC_PERF_HOME / "logs"
 AUDIT_LOG = LOG_DIR / "store-audit.jsonl"
 TICKET_DIR = AGENTIC_PERF_HOME / "tickets"
@@ -28,6 +30,35 @@ ARTIFACT_DIR = Path(
 PRIVATE_SKILLS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SKILLS", AGENTIC_PERF_HOME / "private-skills")
 )
+
+
+def resolve_state_store(cfg: dict | None = None) -> tuple[str, int]:
+    """Resolve the state-store URL and port used by every local component.
+
+    The instance config is the default source of truth. Environment variables
+    remain explicit overrides for operators running against a different store.
+    When only a port is configured, derive the local URL so the two values
+    cannot silently diverge.
+    """
+    if cfg is None and CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    cfg = cfg or {}
+    store_cfg = cfg.get("state_store", {})
+    configured_port = int(store_cfg.get("port", DEFAULT_STATE_STORE_PORT))
+    env_port = os.environ.get("STORE_PORT")
+    port = int(env_port) if env_port else configured_port
+
+    env_url = os.environ.get("STATE_STORE_URL")
+    if env_url:
+        url = env_url
+    elif env_port:
+        url = f"http://localhost:{port}"
+    else:
+        url = store_cfg.get("url") or f"http://localhost:{port}"
+    return url, port
 
 
 def get_instance_name() -> str:

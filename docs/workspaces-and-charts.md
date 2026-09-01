@@ -36,10 +36,12 @@ HTML or JavaScript.
 }
 ```
 
-Supported chart types are `bar`, `line`, `doughnut`, and `scatter`; datasets
-may carry min/max/stddev values, and a spec may contain multiple panels.
+Supported chart types are `bar`, `line`, and `doughnut`. The chart payload
+should provide the dataset `values` consumed by the dashboard. Do not rely on
+unregistered chart types or auxiliary statistical fields being rendered.
 CDM specs can include synchronized panels/cursors through `sync_id`. The
-dashboard renders the result with Chart.js and displays the source file.
+dashboard renders the supported result with Chart.js and displays the source
+file.
 
 To add an adapter, implement `BaseChartAdapter.can_handle()` and
 `build_chart()`, register it in the chart registry, and add focused tests for

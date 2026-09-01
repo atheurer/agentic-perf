@@ -5,15 +5,15 @@ port, instance name, token, logs, and PID file.
 
 ```bash
 AGENTIC_PERF_HOME=/srv/ap-a AGENTIC_PERF_INSTANCE_NAME=lab-a \
-  ./start.sh   # config.json sets state_store.port to 8091
+  ./start.sh   # generated config contains URL/port 8091
 AGENTIC_PERF_HOME=/srv/ap-b AGENTIC_PERF_INSTANCE_NAME=lab-b \
-  ./start.sh   # config.json sets state_store.port to 8092
+  ./start.sh   # generated config contains URL/port 8092
 ```
 
-Set a different `state_store.port` in each home before starting it. The
-launcher reads that value from the selected config file; `STORE_PORT` is not
-an override accepted by `start.sh`. The orchestrator may additionally use a
-matching `state_store.url` or `STATE_STORE_URL` when the store is not local.
+The generated `config.json` is the default source of truth for the state-store
+URL and port. The launcher, orchestrator, web UI, and CLI all resolve their
+defaults from that configuration, so no per-command port flags are needed.
+`STATE_STORE_URL` and `STORE_PORT` remain available as explicit overrides.
 
 `AGENTIC_PERF_HOME` controls config, tickets, logs, cache, and PID state.
 `AGENTIC_PERF_SECRETS`, `AGENTIC_PERF_SKILLS`, and
