@@ -46,8 +46,9 @@ class OrchestratorConfig:
         anthropic_api_key: str | None = None,
         crucible_home: str | None = None,
         zathras_home: str | None = None,
+        raw_config: dict | None = None,
     ) -> None:
-        cfg = _load_config_file()
+        cfg = raw_config if raw_config is not None else _load_config_file()
         self.raw = cfg  # Full config for subsystem access
         llm_cfg = cfg.get("llm", {})
         store_cfg = cfg.get("state_store", {})

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import fcntl
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -74,6 +76,73 @@ def _make_llm_factory(config: OrchestratorConfig):
         return provider
 
     return factory
+
+
+# ---------------------------------------------------------------------------
+# Per-dispatch config snapshot
+# ---------------------------------------------------------------------------
+_last_good_config: OrchestratorConfig | None = None
+_last_good_digest: str = ""
+
+
+def _fresh_config(fallback: OrchestratorConfig) -> OrchestratorConfig:
+    """Re-read config.json and return a fresh OrchestratorConfig.
+
+    Reads and parses the file exactly once to avoid TOCTOU races
+    (e.g. an editor atomically replacing the file between a validate
+    read and the constructor read).  Falls back to the last
+    successfully loaded config on parse/OS errors.
+    """
+    global _last_good_config, _last_good_digest
+    from paths import CONFIG_PATH
+
+    raw: dict | None = None
+    if CONFIG_PATH.exists():
+        try:
+            text = CONFIG_PATH.read_text(encoding="utf-8")
+            raw = json.loads(text)
+        except (json.JSONDecodeError, OSError) as exc:
+            if _last_good_config is not None:
+                logger.warning(
+                    "Config reload failed (%s); using last good config",
+                    exc,
+                )
+                return _last_good_config
+            logger.warning(
+                "Config reload failed (%s); using startup config",
+                exc,
+            )
+            return fallback
+    elif _last_good_config is not None:
+        return _last_good_config
+
+    try:
+        config = OrchestratorConfig(raw_config=raw if raw is not None else {})
+    except Exception as exc:
+        if _last_good_config is not None:
+            logger.warning(
+                "Config construction failed (%s); using last good config",
+                exc,
+            )
+            return _last_good_config
+        logger.warning(
+            "Config construction failed (%s); using startup config",
+            exc,
+        )
+        return fallback
+
+    digest = hashlib.sha256(
+        json.dumps(config.raw, sort_keys=True).encode()
+    ).hexdigest()[:12]
+    if _last_good_digest and digest != _last_good_digest:
+        logger.info(
+            "Config snapshot changed (digest %s → %s)",
+            _last_good_digest,
+            digest,
+        )
+    _last_good_config = config
+    _last_good_digest = digest
+    return config
 
 
 async def _validate_models(config: OrchestratorConfig) -> None:
@@ -545,7 +614,14 @@ async def run_agent_task(
     success = False
 
     try:
-        agent = dispatcher.create_agent(status, ticket_data=ticket_data)
+        snapshot_factory = _make_llm_factory(config) if config else None
+        snapshot_iterations = config.get_agent_max_iterations if config else None
+        agent = dispatcher.create_agent(
+            status,
+            ticket_data=ticket_data,
+            llm_factory=snapshot_factory,
+            iterations_factory=snapshot_iterations,
+        )
         if agent is None:
             return
 
@@ -1285,6 +1361,12 @@ def _check_dispatch_quota(
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
+    global _last_good_config, _last_good_digest
+    _last_good_config = config
+    _last_good_digest = hashlib.sha256(
+        json.dumps(config.raw, sort_keys=True).encode()
+    ).hexdigest()[:12]
+
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
@@ -1668,14 +1750,15 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     tid,
                 )
 
+                snapshot = _fresh_config(config)
                 logger.info(f"Dispatching {status} agent for ticket {tid}")
                 task = asyncio.create_task(
                     run_agent_task(
                         dispatcher,
                         status,
                         tid,
-                        config=config,
-                        agent_task_timeout=config.agent_task_timeout,
+                        config=snapshot,
+                        agent_task_timeout=snapshot.agent_task_timeout,
                         ticket_data=ticket,
                     )
                 )

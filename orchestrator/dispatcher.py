@@ -394,12 +394,15 @@ class Dispatcher:
         self,
         status: str,
         ticket_data: dict | None = None,
+        llm_factory: Any | None = None,
+        iterations_factory: Any | None = None,
     ) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
             return None
 
-        llm = self._get_llm(agent_type)
+        factory = self._llm_factory if llm_factory is None else llm_factory
+        llm = factory(agent_type) if factory is not None else self.llm
         ticket_secrets = self._get_secrets_for_ticket(ticket_data)
         agent: Any = None
 
@@ -477,7 +480,7 @@ class Dispatcher:
             )
         elif agent_type == "gathering_context":
             agent = GatheringContextAgent(
-                llm_provider=self.llm,
+                llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
             )
@@ -523,11 +526,12 @@ class Dispatcher:
                 )
 
         if agent is not None and hasattr(agent, "max_iterations"):
-            resolved = (
-                self._iterations_factory(agent_type)
-                if self._iterations_factory
-                else None
+            iter_factory = (
+                self._iterations_factory
+                if iterations_factory is None
+                else iterations_factory
             )
+            resolved = iter_factory(agent_type) if iter_factory is not None else None
             if resolved is not None:
                 agent.max_iterations = resolved
 
