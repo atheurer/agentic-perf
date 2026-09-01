@@ -44,8 +44,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 
 | Method | Path | Body/query | Purpose |
 |---|---|---|---|
-| GET | `/tickets/{id}/events` | `after`, `limit` | ticket event records |
-| GET | `/tickets/{id}/transcript` | `after`, `limit` | transcript view |
+| GET | `/tickets/{id}/events` | `since`, `limit` | ticket event records after a sequence |
+| GET | `/tickets/{id}/transcript` | `agent` | transcript view, optionally filtered by agent |
 | GET | `/tickets/{id}/usage` | — | ticket usage |
 | GET | `/usage/summary` | — | aggregate usage |
 | GET | `/usage/by-user` | query filters | usage by principal |

@@ -1,17 +1,20 @@
 # Fleet investigation runbook
 
-Status: current for the implemented resource providers. Fleet mode is enabled
+Status: current for Jumpstarter fleet investigations. Fleet mode is enabled
 with `custom_fields.fleet_investigation: {"enabled": true}` and a provider
-selector such as `custom_fields.directives.board_selector`. Supported provider
-choices depend on configuration: Jumpstarter, QUADS, AWS, and user-provided
-hosts are implemented resource paths; verify availability first.
+selector such as `custom_fields.directives.board_selector`. Jumpstarter is the
+provider that currently enumerates devices and consumes `exclude_hosts` for
+all-device iteration. QUADS, AWS, and user-provided hosts can support resource
+acquisition, but do not provide the same untested-device inventory contract.
 
 ```bash
-agentic-perf submit "Boot time across S32G boards" \
-  -d "Use Jumpstarter; selector board-type=nxp-s32g-vnp-rdb3" \
-  --directive resource_provider=jumpstarter \
-  --directive board_selector=board-type=nxp-s32g-vnp-rdb3
+python3 cli.py submit "Boot time across S32G boards" \
+  -d "Run a fleet investigation with Jumpstarter across boards of type nxp-s32g-vnp-rdb3. Exclude boards already tested and continue until the fleet is exhausted."
 ```
+
+For exact structured placement, create the ticket through the API with
+`custom_fields.fleet_investigation` and `custom_fields.directives`; the CLI
+does not have a `--directive` option.
 
 The triage/resource stages set and enforce the selector. The flow is:
 `awaiting_hardware → (preparing_platform) → awaiting_provision →

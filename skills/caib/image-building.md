@@ -21,7 +21,8 @@ build; verify with `caib --help` because that installation is warning-only.
 ```bash
 jmp login
 caib --help
-test -s "$AGENTIC_PERF_SECRETS/caib/token"  # or ~/.agentic-perf/secrets/caib/token
+CAIB_SECRETS_DIR="${AGENTIC_PERF_SECRETS:-$HOME/.agentic-perf/secrets}"
+test -s "$CAIB_SECRETS_DIR/caib/token"
 ```
 
 The provider pushes `<push_registry>:<build-name>`. Quay tags are assigned an

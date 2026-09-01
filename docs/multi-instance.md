@@ -5,17 +5,22 @@ port, instance name, token, logs, and PID file.
 
 ```bash
 AGENTIC_PERF_HOME=/srv/ap-a AGENTIC_PERF_INSTANCE_NAME=lab-a \
-  STORE_PORT=8091 ./start.sh
+  ./start.sh   # config.json sets state_store.port to 8091
 AGENTIC_PERF_HOME=/srv/ap-b AGENTIC_PERF_INSTANCE_NAME=lab-b \
-  STORE_PORT=8092 ./start.sh
+  ./start.sh   # config.json sets state_store.port to 8092
 ```
+
+Set a different `state_store.port` in each home before starting it. The
+launcher reads that value from the selected config file; `STORE_PORT` is not
+an override accepted by `start.sh`. The orchestrator may additionally use a
+matching `state_store.url` or `STATE_STORE_URL` when the store is not local.
 
 `AGENTIC_PERF_HOME` controls config, tickets, logs, cache, and PID state.
 `AGENTIC_PERF_SECRETS`, `AGENTIC_PERF_SKILLS`, and
 `AGENTIC_PERF_ARTIFACTS` can separate credentials, private skills, and
 artifacts. `AGENTIC_PERF_INSTANCE_NAME` overrides `config.json`'s
 `instance_name`, which otherwise falls back to the short hostname. Use
-separate `STATE_STORE_URL`/`STORE_PORT` values and inspect each generated
+separate `state_store.port`/`state_store.url` values and inspect each generated
 `secrets/api-token` independently.
 
 The dispatcher claims tickets with its instance name and a lease (default 300

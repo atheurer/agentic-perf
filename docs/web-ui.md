@@ -17,9 +17,9 @@ stop-all (admin), interject, claim/ownership operations, and artifact download.
 The UI does not bypass API authorization. Use the CLI or
 [rest-api-reference.md](rest-api-reference.md) when an action is disabled.
 
-Result views render Chart.js `ChartSpec` data. They support bar/line/doughnut/
-scatter charts, min/max/stddev datasets, multi-panel CDM charts, synchronized
-cursors, metric matrices where the returned spec supplies them, and artifact
-links/downloads. Missing, malformed, or truncated workspace data is shown as
-an unavailable result rather than invented values. Chart generation contracts
-are in [workspaces-and-charts.md](workspaces-and-charts.md).
+Result views render Chart.js `ChartSpec` data. They support the registered
+bar, line, and doughnut chart types, synchronized CDM cursors where the
+returned spec supplies them, and artifact links/downloads. Missing, malformed,
+or truncated workspace data is shown as an unavailable result rather than
+invented values. Chart generation contracts are in
+[workspaces-and-charts.md](workspaces-and-charts.md).
