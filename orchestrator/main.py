@@ -80,12 +80,18 @@ async def _validate_models(config: OrchestratorConfig) -> None:
     """Make a minimal test call for each distinct LLM configuration at startup.
 
     Catches model/region mismatches before any tickets are processed.
+    When reasoning_effort is configured, the probe includes it so
+    incompatible model/effort combinations are detected early.
     Logs errors but never blocks startup.
     """
     # Collect all agent types to check, including the default (empty string).
     agent_types: list[str] = [""] + list(config.raw.get("agent_models", {}).keys())
 
-    seen: set[tuple[str, str, str, str]] = set()
+    # Two-pass: first collect all configs and group agent types per
+    # dedup key, then probe each unique configuration once.
+    key_to_agents: dict[tuple[str, str, str, str, str], list[str]] = {}
+    key_to_cfg: dict[tuple[str, str, str, str, str], dict] = {}
+
     for agent_type in agent_types:
         if agent_type:
             cfg = config.get_agent_llm_config(agent_type)
@@ -101,12 +107,33 @@ async def _validate_models(config: OrchestratorConfig) -> None:
         region = config.llm_region or ""
         default_api = getattr(config, "llm_api", "chat_completions")
         api_name = cfg.get("api", default_api) or default_api
-        key = (provider_name, model_name, region, api_name)
-        if key in seen:
-            continue
-        seen.add(key)
+        effort = cfg.get("reasoning_effort") or config.llm_reasoning_effort
+        if effort and not isinstance(effort, str):
+            logger.warning(
+                "reasoning_effort must be a string, got %s for %s — ignoring",
+                type(effort).__name__,
+                agent_type or "default",
+            )
+            fallback = config.llm_reasoning_effort
+            effort = fallback if isinstance(fallback, str) else None
+        effort_str = effort or ""
+        key = (provider_name, model_name, region, api_name, effort_str)
+
+        agent_label = agent_type or "default"
+        key_to_agents.setdefault(key, []).append(agent_label)
+        if key not in key_to_cfg:
+            key_to_cfg[key] = cfg
+
+    for key, agents in key_to_agents.items():
+        provider_name, model_name, region, api_name, effort_str = key
+        effort = effort_str or None
+        cfg = key_to_cfg[key]
 
         label = f"{provider_name}/{model_name}" + (f" [{region}]" if region else "")
+        if effort:
+            label += f" effort={effort}"
+        agents_str = ", ".join(agents)
+
         try:
             provider = _make_llm_provider(
                 config,
@@ -114,20 +141,18 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                 model=cfg.get("model", ""),
                 api=api_name,
             )
+            if effort:
+                provider.reasoning_effort = effort
             await asyncio.wait_for(
                 provider.complete(
                     system_prompt="",
                     messages=[{"role": "user", "content": "ping"}],
                     tools=[],
-                    # Reasoning models can consume hidden reasoning tokens
-                    # before producing even a one-token visible response.
-                    # A token limit of one therefore reports a false model
-                    # failure even when the endpoint and credentials work.
                     max_tokens=MODEL_CHECK_MAX_TOKENS,
                 ),
                 timeout=10.0,
             )
-            logger.info("Model check OK: %s", label)
+            logger.info("Model check OK: %s (agents: %s)", label, agents_str)
             try:
                 from providers.cost import get_context_window
 
@@ -141,11 +166,27 @@ async def _validate_models(config: OrchestratorConfig) -> None:
             except Exception:
                 pass
         except asyncio.TimeoutError:
-            logger.error(
-                "Model check TIMED OUT (10s): %s — verify region/endpoint", label
+            msg = (
+                f"Model check TIMED OUT (10s): {label}"
+                f" (agents: {agents_str})"
+                f" — verify region/endpoint"
             )
+            if effort:
+                msg += (
+                    f"; reasoning_effort={effort} is configured"
+                    f" — reasoning calls can be slower"
+                )
+            logger.error(msg)
         except Exception as exc:
-            logger.error("Model check FAILED: %s — %s", label, exc)
+            msg = f"Model check FAILED: {label} (agents: {agents_str}) — {exc}"
+            if effort:
+                msg += (
+                    f"\n  → reasoning_effort={effort} is configured for"
+                    f" [{agents_str}]; if the error indicates unsupported"
+                    f" reasoning, remove reasoning_effort for these"
+                    f" agents or switch to a supported model"
+                )
+            logger.error(msg)
 
 
 PLAN_AGENT_STATUS = {
