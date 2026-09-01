@@ -6,6 +6,26 @@ optional — sensible defaults are used when a field is absent.
 The config path can be changed by setting the `AGENTIC_PERF_HOME`
 environment variable (defaults to `~/.agentic-perf`).
 
+### Live config updates
+
+The orchestrator re-reads `config.json` at each agent dispatch.
+Changes to the following fields take effect on the next dispatch
+without a restart:
+
+- `llm.*` (provider, model, backend, region, timeout, max_tokens,
+  reasoning_effort)
+- `agent_models.*` (per-agent LLM overrides)
+- `agent_iterations.*` and `global_max_iterations`
+- `agent_task_timeout`
+
+All other fields (poll_interval, skills/repo-cache, secrets/vault,
+telemetry, budget, max_concurrent_agents, introspection) require a
+restart.
+
+If `config.json` is malformed or unreadable at dispatch time, the
+orchestrator logs a warning and continues with the last successfully
+loaded configuration.
+
 ## Minimal Example
 
 ```json
