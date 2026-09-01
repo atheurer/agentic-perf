@@ -156,3 +156,45 @@ class TestGuidanceProducedFlag:
         # Simulating status leaving guidance
         agent._guidance_produced = False
         assert not agent._guidance_produced
+
+
+class TestSystemErrorFallback:
+    def test_system_exception_found(self):
+        agent = _make_agent()
+        ticket = _make_ticket(
+            comments=[
+                {"author": "system", "body": "Triage complete, starting plan step 0"},
+                {
+                    "author": "system",
+                    "body": "Agent failed with an unhandled exception: 'str' object is not a mapping",
+                },
+            ]
+        )
+        summary = agent._build_guidance_summary_deterministic(ticket, [])
+        assert summary["agent"] == "system"
+        assert summary["reason"] == "error"
+        assert "exception" in summary["details"].lower()
+
+    def test_system_error_not_benign(self):
+        agent = _make_agent()
+        ticket = _make_ticket(
+            comments=[
+                {"author": "system", "body": "Triage complete, starting plan step 0"},
+                {"author": "system", "body": "Plan advancing to step 1"},
+            ]
+        )
+        summary = agent._build_guidance_summary_deterministic(ticket, [])
+        assert summary["agent"] == ""
+        assert summary["reason"] == "unknown"
+
+    def test_agent_comment_takes_priority(self):
+        agent = _make_agent()
+        ticket = _make_ticket(
+            comments=[
+                {"author": "system", "body": "Agent failed with exception"},
+                {"author": "analyze-agent", "body": "LLM call timed out"},
+            ]
+        )
+        summary = agent._build_guidance_summary_deterministic(ticket, [])
+        assert summary["agent"] == "analyze-agent"
+        assert summary["reason"] == "timeout"

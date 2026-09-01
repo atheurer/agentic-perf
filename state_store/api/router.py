@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from . import (
     artifacts,
     audit,
+    chat,
     comments,
     events,
     groups,
@@ -35,6 +36,9 @@ api_router.include_router(transitions_info.router)
 api_router.include_router(users.router)
 api_router.include_router(groups.router)
 api_router.include_router(whoami.router)
+# Chat router handles its own auth (supports anonymous read-only)
+chat_router = APIRouter(prefix="/api/v1")
+chat_router.include_router(chat.router)
 
 health_router = APIRouter(prefix="/api/v1")
 health_router.include_router(health.router)

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from orchestrator.config import _load_config_file
 from providers.events import EventBus
 
-from .api.router import api_router, health_router, webhook_router
+from .api.router import api_router, chat_router, health_router, webhook_router
 from .audit import AuditLog, set_actor
 from .auth import load_or_generate_token, make_auth_dependency
 from .ratelimit import (
@@ -67,6 +67,7 @@ def mount_routers(
     app.include_router(api_router, dependencies=deps)
     app.include_router(health_router)
     app.include_router(webhook_router)
+    app.include_router(chat_router)
 
 
 def create_app() -> FastAPI:
@@ -198,6 +199,48 @@ def create_app() -> FastAPI:
         event_bus=app.state.event_bus,
     )
     mount_routers(app, auth, rate_limit_dep)
+
+    # ── Chat agent (optional) ────────────────────────────
+    chat_cfg = cfg.get("chat", {})
+    if chat_cfg.get("enabled", False):
+        try:
+            from agents.chat.agent import ChatAgent
+
+            llm_cfg = cfg.get("llm", {})
+            chat_model_cfg = cfg.get("agent_models", {}).get("chat", {})
+            provider = llm_cfg.get("provider", "")
+            model = chat_model_cfg.get("model", llm_cfg.get("model", ""))
+
+            if provider and model:
+                from providers.llm.factory import create_llm_provider
+
+                chat_llm = create_llm_provider(
+                    provider=provider,
+                    model=model,
+                    api_key=llm_cfg.get("api_key", ""),
+                    backend=llm_cfg.get("backend", ""),
+                    project_id=llm_cfg.get("project_id", ""),
+                    region=llm_cfg.get("region", ""),
+                )
+                max_tokens = chat_model_cfg.get("max_tokens")
+                if max_tokens:
+                    chat_llm.max_tokens = int(max_tokens)
+                timeout = chat_model_cfg.get("timeout")
+                if timeout:
+                    chat_llm.timeout = float(timeout)
+
+                max_tool_rounds = int(chat_model_cfg.get("max_tool_rounds", 10))
+                chat_agent = ChatAgent(
+                    llm=chat_llm,
+                    store_url=f"http://localhost:{port}",
+                    max_tool_rounds=max_tool_rounds,
+                )
+                app.state.chat_agent = chat_agent
+                logger.info("Chat agent enabled (model=%s)", model)
+            else:
+                logger.warning("Chat enabled but no LLM provider/model configured")
+        except Exception:
+            logger.exception("Failed to initialize chat agent")
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

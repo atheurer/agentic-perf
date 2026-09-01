@@ -91,6 +91,21 @@ http://localhost:8090
 
 The dashboard shows live updates: agent activity, tool calls, token usage, and costs.
 
+#### Chat Assistant
+
+If chat is enabled (`chat.enabled: true` in config), a chat bar
+appears below the header. You can:
+
+- Ask questions: "What tickets are running?" "Show me PERF-XYZ"
+- Create tickets: "Run a boot time test on S32G with 50 samples"
+- Send interjections: "Tell PERF-XYZ the hypothesis is wrong"
+- Get help: "What board types are available?"
+
+On the ticket detail page, a ticket-scoped chat appears at the
+top of the left panel. Messages here automatically include the
+ticket context. When a ticket needs guidance, the chat proactively
+shows the reason and suggests actions.
+
 ### 3. Respond to Pauses
 
 If an agent pauses and asks for guidance, reply:
