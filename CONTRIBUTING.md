@@ -60,6 +60,11 @@ use the same scripts.
 See [AGENTS.md](AGENTS.md) for complete standards, architecture
 principles, and key file paths.
 
+## Reviewing Changes
+
+See [docs/reviewing.md](docs/reviewing.md) for project-specific guidance on
+reviewing orchestration, configuration, and agent workflow changes.
+
 ## Commit Messages
 
 Use conventional commits with thorough descriptions:
