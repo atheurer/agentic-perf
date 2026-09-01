@@ -84,7 +84,8 @@ Adding a new harness means adding a skill provider — no agent code changes.
 ## Prerequisites
 
 - Python 3.12+
-- An Anthropic API key (direct API or Google Cloud Vertex AI)
+- Credentials for the selected LLM provider (Anthropic, OpenAI-compatible,
+  or Gemini); Vertex AI additionally requires the vertex extra and ADC
 - SSH access to target hosts (for benchmark execution)
 
 ## Installation
@@ -130,7 +131,8 @@ Create `~/.agentic-perf/config.json`:
         "model": "claude-haiku-4-5",
         "backend": "vertex",
         "project_id": "your-gcp-project",
-        "region": "us-east5"
+        "region": "us-east5",
+        "max_tokens": 8000
     },
     "state_store": {
         "url": "http://localhost:8090",
@@ -266,7 +268,7 @@ agentic-perf/
   state_store/             # FastAPI REST API + ticket store + web dashboard
     static/                #   Single-page web dashboard
   providers/
-    llm/                   #   Claude (direct + Vertex) and mock providers
+    llm/                   #   Claude, OpenAI-compatible, Gemini, and mock providers
     resource/              #   QUADS, AWS EC2, PSAP Control Center, provider registry
     investigation/         #   Investigation Record storage (pluggable backends)
     secrets/               #   File-based local secrets

@@ -246,13 +246,16 @@ If configured, metrics are exported to your observability stack:
 ```json
 {
   "telemetry": {
-    "otlp_exporter": {
-      "endpoint": "http://jaeger-collector:4317",
-      "headers": {"Authorization": "Bearer token"}
-    }
+    "enabled": true,
+    "otlp_endpoint": "http://jaeger-collector:4317"
   }
 }
 ```
+
+Only enabled and otlp_endpoint are read from this section; headers and an
+otlp_exporter object are not supported. OTLP spans provide correlation and
+export, while token accounting comes from provider response usage and is
+recorded in llm_usage events even without an external collector.
 
 **Key traces to monitor:**
 - `agentic_perf.agent.duration` — Agent execution time by agent type
