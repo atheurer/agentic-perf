@@ -10,6 +10,25 @@ How to run an E2E test of the agentic-perf pipeline with Claude acting as both t
 4. **gcloud auth** active if using Vertex backend (`gcloud auth application-default login`)
 5. **Secrets deployed** at `~/.agentic-perf/secrets/` (crucible registry tokens — needed by the provisioning agent to install crucible on the controller)
 
+From a clean clone, install the CLI and the provider extras in an isolated
+environment:
+
+```bash
+git clone https://github.com/atheurer/agentic-perf.git
+cd agentic-perf
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -e '.[vertex,jumpstarter]'
+python3 cli.py --help
+```
+
+This repository has no installed console entry point, so all commands below
+use `python3 cli.py`. Use `.[openai]` or `.[gemini]` for those LLM providers;
+add `.[telemetry,telemetry-export]` for OTLP telemetry and `.[bitwarden]` for
+Bitwarden secrets. After starting the service, `python3 cli.py health` is a
+basic startup check. See the [CLI reference](cli-reference.md) and
+[ticket directives](ticket-directives.md) for command and field details.
+
 Crucible does NOT need to be pre-installed on the controller host. The provisioning agent installs it automatically during the `awaiting_provision` stage using the install contract in `~/.agentic-perf/private-skills/crucible.json`. If you skip provisioning (see "Skipping Early Stages" below), then crucible must already be on the controller.
 
 ### Config file (`~/.agentic-perf/config.json`)

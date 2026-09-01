@@ -10,6 +10,21 @@ production deployment experience. For basic container usage, see
 - Container image pushed to a registry (e.g., Quay.io)
 - LLM provider credentials (Vertex AI, OpenAI, etc.)
 - Jumpstarter client config (if using lab hardware)
+- Registry push credentials and a CAIB token if custom images are required
+
+Build and verify the image before creating the Deployment:
+
+```bash
+podman build -t 'quay.io/<org>/agentic-perf:<tag>' -f Containerfile .
+podman push 'quay.io/<org>/agentic-perf:<tag>'
+podman run --rm --entrypoint bash quay.io/<org>/agentic-perf:<tag> -lc \
+  'j --help >/dev/null && jmp --help >/dev/null && caib --help >/dev/null'
+```
+
+The Containerfile installs Jumpstarter and CAIB unconditionally (CAIB failure
+is warning-only during the build), the Vertex/Anthropic and telemetry Python
+extras, and the runtime tools listed in [container-deployment.md](container-deployment.md).
+OpenAI requires the optional `openai` extra in a derived image.
 
 ## Architecture
 
@@ -236,7 +251,7 @@ spec:
     spec:
       initContainers:
         - name: init-secrets
-          image: <registry>/agentic-perf:latest
+          image: <registry>/agentic-perf:<immutable-tag>
           command:
             - bash
             - -xc
@@ -254,7 +269,7 @@ spec:
               cp /ext-secrets/jumpstarter/perf-ci.yaml /opt/app-root/src/.config/jumpstarter/clients/perf-ci.yaml
               cp /ext-secrets/jumpstarter/config.yaml /opt/app-root/src/.config/jumpstarter/config.yaml
 
-              # Ensure secrets are readable by group 0 (OpenShift arbitrary UIDs)
+              # The main container runs with an arbitrary UID in group 0.
               chmod -R g+rX /data/agentic-perf/secrets
           volumeMounts:
             - name: data
@@ -274,7 +289,7 @@ spec:
               readOnly: true
       containers:
         - name: agentic-perf
-          image: <registry>/agentic-perf:latest
+          image: <registry>/agentic-perf:<immutable-tag>
           ports:
             - containerPort: 8090
           envFrom:
@@ -510,11 +525,15 @@ All persistent data lives on the PVC at
 | `secrets/domain-mcp/token` | Domain MCP auth token |
 | `secrets/horreum/api-key` | Horreum API key |
 | `users.json` | User accounts and token hashes |
+| `artifacts/<ticket>/<run>/` | Persistent benchmark artifacts |
+| `tickets/<ticket>/workspace/` | Workspace files and generated charts |
+| `skill-cache/`, `plugin-schema-cache/` | Cached skill/schema data |
+| `secrets/caib/` | CAIB token and registry auth (if enabled) |
 
-Benchmark artifacts are written to `/tmp/` and are
-**not persistent** — they are lost on pod restart.
-See [#461](https://github.com/atheurer/agentic-perf/issues/461)
-for planned artifact archival.
+Some third-party harnesses still use `/tmp` during execution; copy anything
+needed after the run into `AGENTIC_PERF_ARTIFACTS` or the ticket workspace.
+The PVC is mounted at `/data/agentic-perf`, so the default artifact location
+is persistent.
 
 ## Environment Variables
 
@@ -528,3 +547,17 @@ for planned artifact archival.
 | `ANTHROPIC_VERTEX_PROJECT_ID` | Vertex AI | GCP project ID |
 | `JMP_DRIVERS_UNSAFE` | Jumpstarter | Set to `true` for SNMP power control |
 | `OPENAI_API_KEY` | OpenAI | API key for OpenAI provider |
+
+For CAIB, mount `caib/token` and (when pushing) `caib/registry-auth.json`
+under `/data/agentic-perf/secrets/caib/`. Allow egress to the CAIB build
+service and the OCI registry; allow Jumpstarter exporters to pull the image.
+
+## CAIB custom image builds
+
+Set `image_build` in the ticket/configuration only when the flashed image must
+contain the requested change. The image-builder runs in `building_image`,
+before a hardware lease, and stores `image_build_result`; success advances to
+`awaiting_hardware`, while failure advances to `awaiting_customer_guidance`.
+See [CAIB image building](../skills/caib/image-building.md) for target
+resolution, package/bootc modes, manifests, token/registry setup, and
+recovery. Use `system_config` for post-flash runtime changes instead.

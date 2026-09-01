@@ -5,9 +5,28 @@ Directives are operational instructions in a ticket's
 the investigation. They tell agents what infrastructure to
 use, what image to flash, and how to execute the benchmark.
 
-Directives you provide are passed through to agents as-is.
-Omitted directives use defaults — the system infers what
-it can from the ticket description.
+Directives you provide are stored under `custom_fields.directives` and take
+precedence over triage's inferred values. Omitted directives use defaults or
+are inferred from the description. The CLI has no `--directive` option; use
+the API example below (or describe the requirement in the ticket text).
+
+### Field placement and precedence
+
+| Location | Purpose | Type/ownership |
+|---|---|---|
+| `custom_fields.directives` | User-controlled harness, image, hardware, and HITL settings | Object; user input wins over triage inference |
+| `custom_fields.resource_provider` | Pipeline resource-provider selection | String; `jumpstarter`, `quads`, `aws`, or `user_provided` |
+| `custom_fields.fleet_investigation` | Pipeline fleet state and enablement | Object; `enabled` is boolean, progress is agent-owned |
+| `custom_fields.image_build` | Pipeline custom-image build request and result | Object; user values merge with triage values |
+| `custom_fields.system_config` | Post-flash configuration operations | Array; deterministic provisioning input |
+| `custom_fields.anomaly_context` | Observed/baseline investigation data | Object; caller-provided |
+| `custom_fields.scoped_context` | Supplemental per-agent context | Object; keys are `shared`, `resource`, `provision`, `benchmark`, `review` |
+
+Pipeline fields must not be put inside `directives`. Triage writes derived
+`parsed_specs`, `hypothesis`, `benchmark_suite`, `required_hosts`,
+`directives`, and (when present) `scoped_context`. User directives override
+same-named inferred directives; `image_version` and `serial_capture` may
+also be promoted from top-level custom fields for compatibility.
 
 ## Submitting Directives
 
@@ -27,14 +46,10 @@ it can from the ticket description.
 }
 ```
 
-### Via CLI
-
-```bash
-agentic-perf submit "Boot time baseline on R-Car S4" \
-  --directive harness=boot-time \
-  --directive image_version=AutoSD-10 \
-  --directive board_selector=board-type=renesas-rcar-s4
-```
+There is no supported CLI syntax for structured directives. Submit this JSON
+to `POST /api/v1/tickets` (see the [E2E guide](e2e-testing.md) for the API
+workflow), or use `python3 cli.py submit` with the directive values in the
+natural-language description.
 
 ## Available Directives
 
@@ -87,22 +102,28 @@ correct directive values automatically.
 To target a specific board instance:
 
 ```json
-"board_selector": "device=nxp-s32g-vnp-rdb3-01"
+{
+  "custom_fields": {
+    "directives": {
+      "board_selector": "device=nxp-s32g-vnp-rdb3-01"
+    }
+  }
+}
 ```
 
 ### Resource Provider
 
 | Directive | Description | Examples |
 |---|---|---|
-| `resource_provider` | Which provider to use | `jumpstarter`, `quads`, `aws` |
+| `resource_provider` | Which provider to use; prefer top-level `custom_fields.resource_provider` | `jumpstarter`, `quads`, `aws`, `user_provided` |
 
 ### Harness Behavior
 
 | Directive | Description | Examples |
 |---|---|---|
-| `on_existing_install` | How to handle existing harness | `reinstall`, `skip` |
+| `on_existing_install` | How to handle existing harness | `reinstall`, `update`, `skip`, `ask_user` (default is provider/agent choice) |
 | `user_pre_run_approval` | Require approval before benchmark | `true`, `false` |
-| `host_cleanup` | Host cleanup policy | `skip` |
+| `host_cleanup` | Host cleanup policy | `required` (default), `skip` |
 | `firewall_policy` | Firewall handling | `flush` |
 | `skip_teardown` | Keep hosts after run | `true` |
 
@@ -124,6 +145,20 @@ and comparing results. The system automatically:
 
 Set in `custom_fields` (not `directives`) since it controls
 pipeline behavior, not harness configuration:
+
+```json
+{
+  "custom_fields": {
+    "fleet_investigation": {"enabled": true},
+    "directives": {
+      "harness": "boot-time",
+      "board_selector": "board-type=nxp-s32g-vnp-rdb3"
+    },
+    "samples": 10
+  }
+}
+```
+
 ### Custom Image Build
 
 | Field | Description | Values |
@@ -140,10 +175,11 @@ Set in `custom_fields` (not `directives`):
 ```json
 {
   "custom_fields": {
-    "fleet_investigation": {"enabled": true},
-    "board_selector": "board-type=nxp-s32g-vnp-rdb3",
-    "harness": "boot-time",
-    "samples": 10
+    "directives": {
+      "harness": "boot-time",
+      "board_selector": "board-type=nxp-s32g-vnp-rdb3"
+    },
+    "samples": 10,
     "image_build": {
       "target": "ebbr",
       "customizations": {
@@ -168,7 +204,7 @@ Progress is tracked in `custom_fields.fleet_investigation`:
   "fleet_investigation": {
     "enabled": true,
     "tested_hosts": [
-      {"host_id": "board-01", "status": "completed", "kpis": {...}},
+      {"host_id": "board-01", "status": "completed", "kpis": {"boot_ms": 1200}},
       {"host_id": "board-02", "status": "partial", "failure_reason": "..."}
     ],
     "fleet_exhausted": {"hard": true}
@@ -203,7 +239,8 @@ Example — delay a systemd service:
 
 ```json
 {
-  "system_config": [
+  "custom_fields": {
+    "system_config": [
     {
       "action": "write_file",
       "path": "/etc/systemd/system/podman-clean-transient.service.d/delay.conf",
@@ -213,7 +250,8 @@ Example — delay a systemd service:
       "action": "run_command",
       "command": "systemctl daemon-reload"
     }
-  ]
+    ]
+  }
 }
 ```
 
@@ -221,6 +259,38 @@ The provisioning agent applies these operations via SSH after
 the platform agent has flashed and verified the board, but
 before the benchmark starts. Results are recorded in
 `system_config_applied` and `system_config_errors` on the ticket.
+
+### Scoped context and convergence
+
+`scoped_context` is supplemental text, not a replacement for directives or
+parsed specifications. Valid keys are `shared`, `resource`, `provision`,
+`benchmark`, and `review`; each agent receives `shared` plus its own section.
+User-authored fenced blocks in the description (`agent:benchmark`, for
+example) are preserved verbatim and take precedence over supplemental
+context.
+
+```json
+{
+  "custom_fields": {
+    "scoped_context": {
+      "shared": "Use the lab's 25 GbE network.",
+      "resource": "Reserve one controller and one client.",
+      "benchmark": "Run exactly ten samples.",
+      "review": "Compare p99 latency to the supplied baseline."
+    },
+    "convergence_criteria": {
+      "metric": "throughput_gbps",
+      "direction": "higher_is_better",
+      "threshold": 0.05
+    }
+  }
+}
+```
+
+`convergence_criteria` is pipeline-owned evaluation input; it belongs at the
+top level of `custom_fields`, not in `directives`. Agent-generated progress
+and results are written back to custom fields and should not be supplied as
+initial directives.
 
 ### HITL Control
 
@@ -320,8 +390,10 @@ provides the anomaly details:
   "description": "Run 10 boot time samples on every available S32G board and compare results.",
   "custom_fields": {
     "fleet_investigation": {"enabled": true},
-    "harness": "boot-time",
-    "board_selector": "board-type=nxp-s32g-vnp-rdb3",
+    "directives": {
+      "harness": "boot-time",
+      "board_selector": "board-type=nxp-s32g-vnp-rdb3"
+    },
     "samples": 10
   }
 }
