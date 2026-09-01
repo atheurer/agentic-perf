@@ -436,6 +436,66 @@ provider's hard context limit.
 
 ---
 
+### `circuit_breaker` — Repeated-Failure Circuit Breaker
+
+Detects when a tool produces consecutive failures and injects a
+`[SYSTEM]` message nudging the agent to try a different approach.
+Without this, some models loop on the same failing tool call
+indefinitely, wasting all iterations (see issue #292).
+
+```json
+{
+    "circuit_breaker": {
+        "enabled": true,
+        "threshold": 3,
+        "max_trips_per_tool": 2,
+        "exempt_tools": []
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable the circuit breaker globally. |
+| `threshold` | int | `3` | Consecutive failures on the same tool before injecting a guidance message. |
+| `max_trips_per_tool` | int | `2` | Maximum number of guidance messages per tool per agent run. After this cap, failures are still counted and logged but no more messages are injected. |
+| `exempt_tools` | list | `[]` | Tool names that should never trigger the circuit breaker (e.g., polling tools that legitimately retry). |
+
+**Failure classification:** a tool result is counted as a failure
+when `is_error` is true, the content is empty/null, or the content
+is JSON with explicit error indicators (`exit_code != 0`,
+`success: false`, `status: "failed"/"error"/"no_files_found"`,
+non-null `error` field, or empty `results`/`matches`/`files`
+collections).
+
+**Per-ticket override:** individual tickets can override any
+circuit breaker field via `custom_fields.circuit_breaker`:
+
+```bash
+curl -X PATCH .../api/v1/tickets/PERF-123 \
+  -d '{"fields": {"circuit_breaker": {"threshold": 5, "exempt_tools": ["poll_run_status"]}}}'
+```
+
+**Behavior:** the circuit breaker is advisory — it injects
+guidance messages but does not block tool calls or force early
+termination. The injected message includes an excerpt of the
+last failing result (which often contains actionable information
+like directory listings) and directs the agent to try a
+fundamentally different approach.
+
+**Events:** each trip emits a `circuit_breaker` event to the
+ticket's JSONL log with the tool name, consecutive failure count,
+trip count, and threshold.
+
+**Design note:** the circuit breaker does not currently track
+argument similarity — it fires on any consecutive failures of the
+same tool, regardless of whether the arguments changed. Argument
+fingerprinting is planned as a future enhancement. The circuit
+breaker also does not persist state across agent restarts; each
+`run()` invocation starts with a fresh failure counter.
+
+---
+
 ### `introspection` — Introspection Agent
 
 The introspection agent is a continuous passive observer that runs
