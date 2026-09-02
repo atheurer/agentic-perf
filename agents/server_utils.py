@@ -83,7 +83,9 @@ def build_skill_provider(source_repo: str | None = None):
         except (OSError, json.JSONDecodeError):
             source_repo = None
     if not source_repo:
-        default_source = Path.home() / ".agentic-perf" / "skill-cache" / "crucible"
+        from paths import SKILL_CACHE_DIR
+
+        default_source = SKILL_CACHE_DIR / "crucible"
         if (default_source / "config" / "repos.json").is_file():
             source_repo = str(default_source)
     zathras_home = os.environ.get("ZATHRAS_HOME", "")
