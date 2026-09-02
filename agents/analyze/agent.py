@@ -307,8 +307,8 @@ class AnalyzeAgent(AgentBase):
                 f"**Harness:** {harness} — start by reading "
                 f"the investigation methodology skill: "
                 f"`list_skill_docs('{harness}')` then "
-                f"`read_skill('{harness}', "
-                f"'investigation-methodology.md')`"
+                f"`read_skills(docs=[{{'harness': '{harness}', "
+                f"'filename': 'investigation-methodology.md'}}])`"
             )
             parts.append("")
 

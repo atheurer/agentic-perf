@@ -41,14 +41,14 @@ tools listed below. Provider-specific tools are attached only when configured.
 
 | Server/role | Registered tools |
 |---|---|
-| Triage | `read_skill`, `list_benchmarks`, `get_benchmark_details`, `resolve_benchmark` |
+| Triage | `read_skills`, `list_benchmarks`, `get_benchmark_details`, `resolve_benchmark` |
 | Resource | `parse_host_config`, `list_resource_providers`, `check_available_resources`, `reserve_resources`, `get_reservation_status`, `validate_host`, `get_host_inventory`, `get_accumulated_metadata` |
 | Platform | `provision_platform`, `submit_platform_result` |
-| Provisioning | `check_platform_contract`, `check_host_prerequisites`, `install_packages`, `ensure_prerequisites`, `install_harness`, `verify_harness_install`, `check_existing_install`, `update_install`, `uninstall_harness`, `install_k3s`, `list_skill_docs`, `read_skill`, `read_skills`, `disable_firewall`, `open_firewall_port`, `tune_nic`, `configure_flow_steering`, `reset_flow_steering`, `tune_tcp`, `pin_irq`, `reset_irq_pinning`, `verify_host_tuning`, `tune_hosts`, `nm_set_mtu`, `nm_set_ip`, `nm_set_dhcp`, `nm_show_connection`, `nm_verify_interface`, `ensure_harness_installed`, `get_private_config` |
-| Benchmark | `read_skill`, `read_skills`, `list_harness_docs`, `read_harness_doc`, `get_execution_config`, `get_runfile_schema`, `get_benchmark_params`, `get_tool_params`, `get_example_runfile`, `setup_passwordless_ssh`, `execute_benchmark`, `get_run_logs`, `execute_boot_time_test` |
-| Analyze | `read_skill`, `list_skill_docs`, `get_ticket_results`, `search_tickets`, `submit_analysis_result` |
+| Provisioning | `check_platform_contract`, `check_host_prerequisites`, `install_packages`, `ensure_prerequisites`, `install_harness`, `verify_harness_install`, `check_existing_install`, `update_install`, `uninstall_harness`, `install_k3s`, `list_skill_docs`, `read_skills`, `disable_firewall`, `open_firewall_port`, `tune_nic`, `configure_flow_steering`, `reset_flow_steering`, `tune_tcp`, `pin_irq`, `reset_irq_pinning`, `verify_host_tuning`, `tune_hosts`, `nm_set_mtu`, `nm_set_ip`, `nm_set_dhcp`, `nm_show_connection`, `nm_verify_interface`, `ensure_harness_installed`, `get_private_config` |
+| Benchmark | `read_skills`, `list_harness_docs`, `read_harness_doc`, `get_execution_config`, `get_runfile_schema`, `get_benchmark_params`, `get_tool_params`, `get_example_runfile`, `setup_passwordless_ssh`, `execute_benchmark`, `get_run_logs`, `execute_boot_time_test` |
+| Analyze | `read_skills`, `list_skill_docs`, `get_ticket_results`, `search_tickets`, `submit_analysis_result` |
 | Evaluate | `submit_evaluation_result`, `list_benchmark_artifacts`, `read_benchmark_artifact` |
-| Review | `read_skill`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `cdm_api_requests`, `compare_results`, `get_review_config` |
+| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `cdm_api_requests`, `compare_results`, `get_review_config` |
 | Investigation | `query_investigation_records`, `get_investigation_record`, `create_investigation_record`, `append_build_history`, `link_jira_ticket`, `close_investigation_record` |
 | Gathering context | `submit_gathering_context_result` |
 | Synthesis | `submit_synthesis_result` |

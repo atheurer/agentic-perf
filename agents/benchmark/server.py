@@ -32,7 +32,7 @@ from agents.server_utils import (
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
-    read_skill_document,
+    read_skill_documents,
     tool_progress,
 )
 
@@ -214,28 +214,11 @@ async def _ensure_init():
 # ---------------------------------------------------------------------------
 
 
-def _read_skill_one(harness: str, filename: str) -> dict:
-    return read_skill_document(SKILLS_DIR, harness, filename)
-
-
-@mcp.tool()
-async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document containing critical lessons learned from prior benchmark runs (e.g. harness='crucible', filename='run-file-pitfalls.md'). These are listed in the 'Skills' section of the ticket context. Read ALL skill docs before constructing a run file — they contain pitfalls that will cause failures."""
-    await _ensure_init()
-    return json.dumps(_read_skill_one(harness, filename))
-
-
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read multiple skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}, {'harness': 'crucible', 'filename': 'uperf-run-file.md'}]). Use this instead of calling read_skill repeatedly — saves iterations when you need several docs at once."""
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}, {'harness': 'crucible', 'filename': 'uperf-run-file.md'}]). Read ALL skill docs before constructing a run file — they contain pitfalls that will cause failures."""
     await _ensure_init()
-    results = []
-    for doc in docs:
-        harness = doc.get("harness", "")
-        filename = doc.get("filename", "") or doc.get("name", "")
-        result = _read_skill_one(harness, filename)
-        results.append(result)
-    return json.dumps(results)
+    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
 
 @mcp.tool()

@@ -26,7 +26,7 @@ class TestHarnessToolScoping:
         agent = self._make_agent()
         agent.tools = self._make_tools(
             [
-                "read_skill",
+                "read_skills",
                 "set_ssh_context",
                 "check_host",
                 "execute_boot_time_test",
@@ -47,7 +47,7 @@ class TestHarnessToolScoping:
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
         assert names == {
-            "read_skill",
+            "read_skills",
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",
@@ -56,7 +56,7 @@ class TestHarnessToolScoping:
     def test_unlisted_harness_keeps_all_tools(self):
         agent = self._make_agent()
         all_names = [
-            "read_skill",
+            "read_skills",
             "execute_benchmark",
             "get_execution_config",
         ]
@@ -73,7 +73,7 @@ class TestHarnessToolScoping:
     def test_no_harness_directive_keeps_all_tools(self):
         agent = self._make_agent()
         all_names = [
-            "read_skill",
+            "read_skills",
             "execute_benchmark",
         ]
         agent.tools = self._make_tools(all_names)
@@ -84,7 +84,7 @@ class TestHarnessToolScoping:
 
     def test_empty_directives_keeps_all_tools(self):
         agent = self._make_agent()
-        all_names = ["read_skill", "execute_benchmark"]
+        all_names = ["read_skills", "execute_benchmark"]
         agent.tools = self._make_tools(all_names)
         ticket = {
             "custom_fields": {"directives": {}},

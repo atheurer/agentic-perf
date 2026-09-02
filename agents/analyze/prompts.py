@@ -43,7 +43,7 @@ skill file for the relevant harness:
 
 1. Call `list_skill_docs` with the harness category (e.g., 'boot-time')
 2. Look for an `investigation-methodology.md` file
-3. Call `read_skill` to load it
+3. Call `read_skills` to load it
 4. Follow the methodology's step-by-step investigation approach
 
 The methodology skill teaches you domain-specific knowledge:

@@ -27,7 +27,7 @@ from agents.server_utils import (
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
-    read_skill_document,
+    read_skill_documents,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,31 +64,10 @@ async def _ensure_init():
 
 
 @mcp.tool()
-async def read_skill(harness: str, filename: str) -> str:
-    """Read a skill document containing lessons learned from prior benchmark runs (e.g. harness='crucible', filename='result-parsing.md'). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
+async def read_skills(docs: list[dict]) -> str:
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'crucible', 'filename': 'result-parsing.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
-    res = read_skill_document(SKILLS_DIR, harness, filename)
-    if not res.get("found"):
-        available = []
-        target_harness = res.get("harness") or harness
-        harness_dir = SKILLS_DIR / target_harness
-        if harness_dir.is_dir():
-            available = [f.name for f in harness_dir.glob("*.md")]
-        target_filename = res.get("filename") or filename
-        return json.dumps(
-            {
-                "status": "not_found",
-                "path": str(SKILLS_DIR / target_harness / target_filename),
-                "available": available,
-            }
-        )
-    return json.dumps(
-        {
-            "status": "ok",
-            "filename": res["filename"],
-            "content": res["content"],
-        }
-    )
+    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
 
 @mcp.tool()

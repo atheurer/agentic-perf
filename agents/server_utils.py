@@ -619,3 +619,23 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
         "filename": filename,
         "content": skill_path.read_text(),
     }
+
+
+def read_skill_documents(skills_dir: Path, docs: list[dict]) -> list[dict]:
+    """Read multiple skill documents in one call.
+
+    Each entry in *docs* should have ``harness`` (or ``category`` as
+    alias) and ``filename`` (or ``name`` as alias).  Non-empty
+    ``harness`` takes precedence over ``category``; non-empty
+    ``filename`` takes precedence over ``name``.  An empty primary
+    value falls through to the alias.
+
+    Returns a list of ``read_skill_document`` results in the same order
+    as *docs*, including failure entries for documents not found.
+    """
+    results: list[dict] = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        filename = doc.get("filename") or doc.get("name", "")
+        results.append(read_skill_document(skills_dir, harness, filename))
+    return results

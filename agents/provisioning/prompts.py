@@ -131,7 +131,7 @@ Your tasks:
     different agent. The benchmark agent has no tools for this (no
     `pin_irq`, `tune_nic`, or `smp_affinity` access) — if you don't apply
     it here, it never happens, silently. Before proceeding:
-    a. Call `read_skill` (e.g. harness="general", filename="host-tuning.md") — it defines the
+    a. Call `read_skills(docs=[{"harness": "general", "filename": "host-tuning.md"}])` — it defines the
        required ordering (tune_nic → pin_irq) and irqbalance strategy.
     b. Apply the tuning with `tune_nic` (queue count, ring buffers,
        offloads), `tune_tcp` (congestion control, qdisc), and `pin_irq`

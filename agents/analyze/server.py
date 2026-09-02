@@ -18,7 +18,7 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import read_skill_document
+from agents.server_utils import read_skill_documents
 
 mcp = FastMCP("analyze-agent")
 
@@ -36,34 +36,9 @@ def _headers() -> dict[str, str]:
 
 
 @mcp.tool()
-async def read_skill(category: str, filename: str) -> str:
-    """Read an investigation methodology skill document (e.g. category='boot-time', filename='investigation-methodology.md').
-
-    Skill docs contain domain-specific knowledge for
-    investigating anomalies (e.g., boot-time phase analysis,
-    known patterns, measurement model).
-
-    Args:
-        category: Skill category (e.g., 'boot-time', 'jumpstarter').
-        filename: Filename within the skill directory.
-    """
-    res = read_skill_document(SKILLS_DIR, category, filename)
-    if not res.get("found"):
-        return json.dumps(
-            {
-                "found": False,
-                "message": res.get(
-                    "message", f"Skill not found: {category}/{filename}"
-                ),
-            },
-        )
-    return json.dumps(
-        {
-            "found": True,
-            "filename": res["filename"],
-            "content": res["content"],
-        },
-    )
+async def read_skills(docs: list[dict]) -> str:
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' (or 'category') and 'filename' (e.g. [{'harness': 'boot-time', 'filename': 'investigation-methodology.md'}]). Skill docs contain domain-specific knowledge for investigating anomalies."""
+    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
 
 @mcp.tool()
