@@ -78,7 +78,9 @@ def build_skill_provider(source_repo: str | None = None):
         try:
             from paths import CONFIG_PATH
 
-            config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
+            config = (
+                json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
+            )
             source_repo = config.get("crucible_source_repo")
         except (OSError, json.JSONDecodeError):
             source_repo = None

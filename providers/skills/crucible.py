@@ -89,9 +89,7 @@ class CrucibleSkillProvider(SkillProvider):
             self._source_repo / "subprojects" / "benchmarks" / name
             if self._source_repo
             else None,
-            self._source_repo / f"bench-{name}"
-            if self._source_repo
-            else None,
+            self._source_repo / f"bench-{name}" if self._source_repo else None,
         ]
         if self._source_repo:
             candidates.append(self._source_repo.parent / f"bench-{name}")
@@ -263,7 +261,9 @@ class CrucibleSkillProvider(SkillProvider):
             if re.search(rf"\b{re.escape(name.lower())}\b", search_text):
                 return name
 
-        if re.search(r"\b(perftest|rdma|infiniband|ib_(?:write|read|send|atomic))\b", search_text):
+        if re.search(
+            r"\b(perftest|rdma|infiniband|ib_(?:write|read|send|atomic))\b", search_text
+        ):
             return None
 
         scores: dict[str, int] = {}

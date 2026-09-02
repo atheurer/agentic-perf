@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 
 import pytest
 
@@ -175,7 +175,9 @@ async def test_source_catalog_discovers_benchmark_repositories(tmp_path):
         '{"benchmark": "perftest", "client": {}, "server": {}}'
     )
 
-    provider = CrucibleSkillProvider(tmp_path / "missing-controller", source_repo=source)
+    provider = CrucibleSkillProvider(
+        tmp_path / "missing-controller", source_repo=source
+    )
     benchmarks = await provider.list_benchmarks()
     perftest = next(b for b in benchmarks if b.name == "perftest")
     assert perftest.roles == ["client", "server"]
@@ -195,16 +197,24 @@ async def test_source_catalog_exact_match_and_no_generic_rdma_fallback(tmp_path)
         '"checkout": {"mode": "follow", "target": "main"}}], '
         '"unofficial": []}'
     )
-    provider = CrucibleSkillProvider(tmp_path / "missing-controller", source_repo=source)
+    provider = CrucibleSkillProvider(
+        tmp_path / "missing-controller", source_repo=source
+    )
 
-    assert await provider.resolve_benchmark(
-        {"description": "run perftest for RDMA throughput"}
-    ) == "perftest"
+    assert (
+        await provider.resolve_benchmark(
+            {"description": "run perftest for RDMA throughput"}
+        )
+        == "perftest"
+    )
 
     without_source = CrucibleSkillProvider(tmp_path / "missing-controller")
-    assert await without_source.resolve_benchmark(
-        {"description": "run ib_write_bw for RDMA throughput"}
-    ) is None
+    assert (
+        await without_source.resolve_benchmark(
+            {"description": "run ib_write_bw for RDMA throughput"}
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
