@@ -201,9 +201,12 @@ class ChatAgent:
                 auth_token,
             )
             parsed = json.loads(result)
-            response_text = (
-                f"Done. {parsed.get('id', '')} {parsed.get('status', '')}"
-            ).strip()
+            if "error" in parsed:
+                response_text = f"Action failed: {parsed['error']}"
+            else:
+                response_text = (
+                    f"Done. {parsed.get('id', '')} {parsed.get('status', '')}"
+                ).strip()
             # Remove only the last 2 messages (the confirmation
             # tool_use + tool_result pair) to avoid duplicate
             # tool_use IDs. Preserve earlier tool results so
@@ -367,10 +370,6 @@ class ChatAgent:
                         f"\n```\n\n"
                         f"Type **yes** to proceed or **no** "
                         f"to cancel."
-                    )
-                    session.add_tool_use(
-                        [{"id": tc.id, "name": tc.name, "input": tc.input}],
-                        response.raw_content,
                     )
                     tool_results.append(
                         {

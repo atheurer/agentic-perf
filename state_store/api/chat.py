@@ -85,10 +85,10 @@ def _get_principal(request: Request) -> Principal:
                     is_admin=user.is_admin,
                 )
 
-    return Principal(
-        kind="anonymous",
-        username="anonymous",
-        is_admin=False,
+    # Token was supplied but didn't match anything — reject it.
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid bearer token",
     )
 
 
@@ -102,7 +102,12 @@ def _get_user(request: Request) -> str:
     """
     principal = _get_principal(request)
     if principal.kind == "anonymous":
-        return "anonymous"
+        # Each anonymous request gets a unique key so sessions
+        # don't collide. The session is ephemeral — it will be
+        # evicted from the LRU cache and history is not returned.
+        import uuid
+
+        return f"anon-{uuid.uuid4().hex[:8]}"
     if principal.kind == "service":
         return "default"
     return principal.username
@@ -172,6 +177,11 @@ async def get_history(request: Request):
     """Get chat history for the current user."""
     agent = _get_chat_agent(request)
     user = _get_user(request)
+
+    principal = _get_principal(request)
+    if principal.kind == "anonymous":
+        usage = agent.get_usage(user)
+        return ChatHistoryResponse(messages=[], usage=usage)
 
     history = agent.get_history(user)
     usage = agent.get_usage(user)
