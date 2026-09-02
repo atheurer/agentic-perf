@@ -207,6 +207,19 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
+async def list_controller_userenvs(controller: str) -> str:
+    """List userenvs available from a running Crucible controller.
+
+    The controller's output is authoritative for selecting a Crucible
+    userenv. This intentionally runs only the fixed discovery command rather
+    than exposing arbitrary remote command execution.
+    """
+    ssh = _get_ssh()
+    result = await ssh.run(controller, "crucible userenvs list", timeout=30)
+    return _format_result(result)
+
+
+@mcp.tool()
 async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
     """Copy a remote directory to a local temp directory.
 

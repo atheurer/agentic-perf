@@ -64,6 +64,10 @@ def mock_infra_server(tmp_path: Path) -> Path:
             })
 
         @mcp.tool()
+        async def list_controller_userenvs(controller: str) -> str:
+            return json.dumps({"exit_code": 0, "stdout": "fedora44\\n"})
+
+        @mcp.tool()
         async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
             \"\"\"Copy a remote directory to a local temp directory.\"\"\"
             return json.dumps({"success": True, "local_path": "/tmp/remote-dir-mock"})
@@ -180,6 +184,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "check_hosts",
             "write_remote_file",
             "read_remote_file",
+            "list_controller_userenvs",
             "read_remote_dir",
             "get_ethtool_info",
             "get_sysctl_values",

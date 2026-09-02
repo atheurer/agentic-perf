@@ -12,8 +12,8 @@ Two things must align for a userenv to work:
 1. **Rickshaw must define it.** Each userenv has a
    `<name>.json` file in rickshaw's `userenvs/` directory
    that specifies the base container image, OS distro,
-   package manager, and core packages. Run `crucible userenvs`
-   on the controller to see available userenvs.
+   package manager, and core packages. Run `crucible userenvs list`
+   on the running controller to see available userenvs.
 
 2. **The benchmark must support it.** Each benchmark has a
    `workshop.json` that declares per-userenv requirements
@@ -47,9 +47,14 @@ by cross-referencing two sources on the controller:
 
 ### Step 1: Get available userenvs
 
-Run `crucible userenvs` on the controller. This shows all
+Run `crucible userenvs list` on the running controller. This shows all
 userenvs defined in rickshaw (official) and any external
 userenv repos. Note the "Pull Token" and "Notes" columns:
+
+This controller-side output is authoritative for the run. Never use a
+hard-coded or remembered userenv name, and do not infer availability from a
+local Rickshaw checkout or benchmark repository. If the command cannot be
+run, stop and request assistance rather than constructing a run file.
 
 - `Pull Token: yes` means a registry auth token is needed
 - `not CI tested` means crucible CI does not validate this
@@ -74,7 +79,7 @@ Rank your options by confidence:
    designed and tested with it.
 
 2. **Medium confidence** — the userenv is CI-tested (no
-   "not CI tested" note in `crucible userenvs` output) and
+   "not CI tested" note in `crucible userenvs list` output) and
    the benchmark has a `"default"` fallback entry. The
    container image is validated by CI and the benchmark's
    generic requirements should install correctly.

@@ -167,11 +167,14 @@ to construct a correct run file — getting the format right is critical.
   which IP the endpoints use to reach it (e.g., the controller is on a different
   subnet than the endpoints). Setting the wrong IP breaks the run.
 - `userenv` must be a real userenv name — `"default"` is NOT valid.
-  If the user explicitly requests a specific userenv in the ticket, use it.
-  Otherwise, before constructing the run file, read the userenv-guide skill
-  doc, then run `crucible userenvs` on the controller and read the benchmark's
+  If the user explicitly requests a specific userenv in the ticket, still
+  verify that it is reported by the running controller. Otherwise, before
+  constructing the run file, read the userenv-guide skill doc, then run
+  call `list_controller_userenvs(controller)` and read the benchmark's
   workshop.json at `/opt/crucible/subprojects/benchmarks/<name>/workshop.json`
-  to determine which userenv to use. Prefer userenvs with explicit benchmark
+  on the controller to determine which userenv to use. The controller's output is authoritative;
+  do not use a static default or infer availability from a local checkout.
+  Prefer userenvs with explicit benchmark
   support (high confidence), then CI-tested userenvs with a "default" fallback
   (medium confidence). Do NOT use non-CI-tested userenvs that only match
   "default" unless the user specifically requests that OS.
