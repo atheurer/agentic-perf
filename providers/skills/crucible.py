@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +30,13 @@ SKIP_RICKSHAW_KEYS = {"rickshaw-benchmark", "benchmark", "controller"}
 
 
 class CrucibleSkillProvider(SkillProvider):
-    def __init__(self, crucible_home: str | Path) -> None:
+    def __init__(
+        self,
+        crucible_home: str | Path,
+        source_repo: str | Path | None = None,
+    ) -> None:
         self._home = Path(crucible_home)
+        self._source_repo = Path(source_repo) if source_repo else None
         self._benchmarks_dir = self._home / "subprojects" / "benchmarks"
         self._tools_dir = self._home / "subprojects" / "tools"
         self._examples_dir = (
@@ -45,6 +51,81 @@ class CrucibleSkillProvider(SkillProvider):
             for d in sorted(self._benchmarks_dir.iterdir())
             if d.is_dir() or d.is_symlink()
         ]
+
+    def _source_repo_config(self) -> dict[str, Any] | None:
+        """Read Crucible's ecosystem index, independent of an installation."""
+        if self._source_repo is None:
+            return None
+        path = self._source_repo / "config" / "repos.json"
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _source_benchmark_entries(self) -> dict[str, dict[str, Any]]:
+        config = self._source_repo_config()
+        if not config:
+            return {}
+        entries: dict[str, dict[str, Any]] = {}
+        for group in ("official", "unofficial"):
+            for entry in config.get(group, []):
+                if isinstance(entry, dict) and entry.get("type") == "benchmark":
+                    name = entry.get("name")
+                    if isinstance(name, str) and name:
+                        entries[name] = entry
+        return entries
+
+    def _source_benchmark_path(
+        self, name: str, entry: dict[str, Any] | None = None
+    ) -> Path | None:
+        """Find a benchmark checkout when the source ecosystem is cached locally.
+
+        The core repo is the catalog source; benchmark repos may be checked out
+        beside it or activated as subproject symlinks.  No controller is needed
+        for this lookup.
+        """
+        candidates = [
+            self._source_repo / "subprojects" / "benchmarks" / name
+            if self._source_repo
+            else None,
+            self._source_repo / f"bench-{name}" if self._source_repo else None,
+        ]
+        if self._source_repo:
+            candidates.append(self._source_repo.parent / f"bench-{name}")
+        for candidate in candidates:
+            if candidate and candidate.exists():
+                return candidate
+        return None
+
+    def _benchmark_source(
+        self, name: str, entry: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        entry = entry or {}
+        checkout = entry.get("checkout") if isinstance(entry, dict) else {}
+        source: dict[str, Any] = {
+            "repository": entry.get("repository"),
+            "ref": (checkout or {}).get("target"),
+            "mode": (checkout or {}).get("mode"),
+            "catalog": "crucible/config/repos.json",
+            "metadata_files": ["multiplex.json", "rickshaw.json"],
+        }
+        repo_path = self._source_benchmark_path(name, entry)
+        if repo_path:
+            try:
+                revision = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if revision.returncode == 0:
+                    source["commit"] = revision.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return source
 
     def _discover_tools(self) -> list[str]:
         if not self._tools_dir.exists():
@@ -91,11 +172,23 @@ class CrucibleSkillProvider(SkillProvider):
 
     def _load_benchmark_meta(self, name: str) -> dict[str, Any]:
         meta: dict[str, Any] = {"name": name}
-        if not name or not self._benchmarks_dir.exists():
+        if not name or (
+            not self._benchmarks_dir.exists() and not self._source_repo_config()
+        ):
             return meta
-        bench_dir = (self._benchmarks_dir / name).resolve()
+        entry = self._source_benchmark_entries().get(name)
+        source_dir = self._source_benchmark_path(name, entry)
+        bench_dir = (source_dir or (self._benchmarks_dir / name)).resolve()
+        allowed_roots = [self._benchmarks_dir.resolve()]
+        if self._source_repo:
+            allowed_roots.extend(
+                [
+                    self._source_repo.resolve(),
+                    self._source_repo.parent.resolve(),
+                ]
+            )
         try:
-            if not bench_dir.is_relative_to(self._benchmarks_dir.resolve()):
+            if not any(bench_dir.is_relative_to(root) for root in allowed_roots):
                 return meta
         except (ValueError, AttributeError):
             return meta
@@ -121,7 +214,9 @@ class CrucibleSkillProvider(SkillProvider):
 
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         results = []
-        for name in self._discover_benchmarks():
+        source_entries = self._source_benchmark_entries()
+        names = set(self._discover_benchmarks()) | set(source_entries)
+        for name in sorted(names):
             meta = self._load_benchmark_meta(name)
             params = meta.get("multiplex", {})
 
@@ -139,6 +234,7 @@ class CrucibleSkillProvider(SkillProvider):
                     roles=roles,
                     min_hosts=min_hosts,
                     harness="crucible",
+                    source=self._benchmark_source(name, source_entries.get(name)),
                 )
             )
         return results
@@ -155,13 +251,27 @@ class CrucibleSkillProvider(SkillProvider):
         workload_type = str(requirements.get("workload_type", "")).lower()
         search_text = f"{description} {workload_type}"
 
+        source_entries = self._source_benchmark_entries()
+        available = set(self._discover_benchmarks()) | set(source_entries)
+
+        # An explicit benchmark/repository name must win over generic workload
+        # keywords.  In particular, RDMA requests must not silently become
+        # uperf requests merely because both are network throughput tests.
+        for name in sorted(available, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(name.lower())}\b", search_text):
+                return name
+
+        if re.search(
+            r"\b(perftest|rdma|infiniband|ib_(?:write|read|send|atomic))\b", search_text
+        ):
+            return None
+
         scores: dict[str, int] = {}
         for keyword, benchmarks in KEYWORD_MAP.items():
             if re.search(rf"\b{re.escape(keyword)}\b", search_text):
                 for bench in benchmarks:
                     scores[bench] = scores.get(bench, 0) + 1
 
-        available = set(self._discover_benchmarks())
         scored = {k: v for k, v in scores.items() if k in available}
 
         if not scored:
