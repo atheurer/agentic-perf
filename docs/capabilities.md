@@ -1,355 +1,73 @@
-# Agent Capabilities and Tool Inventory
-
-This document lists all tools, APIs, and data sources available to each agent. This is the authoritative source for what agents can and cannot do.
-
----
-
-## Overview
-
-Each agent has scoped MCP tools. The system enforces **least privilege**: agents can only use tools required for their specific role. This ensures focused reasoning and prevents accidental misuse of powerful capabilities.
-
----
-
-## Triage Agent
-
-**Role**: Parse user intent, select benchmark harness, form hypothesis
-
-### Read Tools
-- **list_benchmarks()** — List all available benchmark suites
-- **get_benchmark_details(name)** — Get suite configuration, parameters, endpoint types
-- **resolve_benchmark(description, workload_type?)** — Match natural-language request to benchmark
-- **read_skills(docs)** — Read one or more skill documents for harness selection guidance
-
-### External APIs (Read-Only)
-- Skill provider catalog (all installed harnesses)
-- Previous ticket search (lookup related prior tests)
-
-### Constraints
-- ❌ **Cannot SSH** to hosts
-- ❌ **Cannot execute** benchmarks
-- ❌ **Cannot reserve** hardware
-- ❌ **Cannot query** metrics from results
-
-### Output
-Structured **triage result** with:
-- Selected benchmark suite
-- Hypothesis to test
-- Recommended parameters
-- Resource profile (# of hosts, role assignments, required capabilities)
-
----
-
-## Resource Agent
-
-**Role**: Find, reserve, validate hardware
-
-### Read Tools
-- **parse_host_config(text)** — Extract host IPs, roles, SSH credentials from free-form text
-- **validate_host(host, user, key_path)** — SSH to host, verify connectivity and system info (OS, CPU, RAM)
-
-### Write Tools (Resource Providers)
-- **reserve_resources(provider, spec)** — Reserve hardware from:
-  - `provider="null"` — User-provided (stored in ticket)
-  - `provider="quads"` — QUADS bare-metal self-service
-  - `provider="aws"` — AWS EC2 on-demand
-  - `provider="psap"` — PSAP Control Center GPU clusters
-
-### External APIs
-- QUADS API (host search, assignment, SSH key management)
-- AWS EC2 API (instance launch, security groups, termination)
-- PSAP Control Center API (cluster reservation, kubeconfig endpoints)
-- SSH connections to candidate hosts (read-only validation)
-
-### Constraints
-- ❌ **Cannot install** software
-- ❌ **Cannot execute** benchmarks
-- ❌ **Cannot modify** system configuration
-- ❌ **Cannot query** metrics
-- ⚠️ **SSH is read-only** for validation; no `sudo` or configuration changes
-
-### Output
-Structured **resource result** with:
-- Reserved host list (IP address, hostname, role, SSH user, SSH key path)
-- Provider metadata (reservation ID, billing info, termination deadline)
-- Validation report (OS, CPU count, RAM, NIC model/count)
-
----
-
-## Provisioning Agent
-
-**Role**: Install benchmark harness, configure platform
-
-### Read Tools
-- **list_harnesses()** — List installed harnesses and their install modes
-- **get_harness_install_contract(harness, platform)** — Get install procedure: required packages, pre-conditions, post-conditions, secrets
-- **read_skills(docs)** — Read one or more skill documents for install guides and platform documentation
-
-### Write Tools
-- **ssh_execute(host, user, key_path, commands)** — Execute shell commands on host (SSH)
-- **transfer_file(host, user, key_path, local_path, remote_path)** — Copy files to host
-
-### External APIs
-- SSH to reserved hosts (full shell access, can run arbitrary commands with constraints)
-- Package managers (yum, apt, etc. via SSH)
-- Harness repositories (git clone, etc. via SSH)
-
-### Constraints
-- ❌ **Cannot query** metrics
-- ❌ **Cannot execute** benchmarks (only configure for them)
-- ❌ **Cannot reserve** additional resources
-- ⚠️ **SSH is scoped**: Commands restricted by command policy per agent
-  - Allowed: package install, git, harness CLI, configuration
-  - Denied: `rm -rf /`, `mkfs`, `dd to /dev/`, `chmod 777`, `shutdown`, etc.
-
-### Output
-Structured **provisioning result** with:
-- Installation status (success, warnings, errors)
-- Harness version and configuration
-- Test readiness report (all prerequisites met, ready for benchmark execution)
-
----
-
-## Benchmark Agent
-
-**Role**: Construct run configuration, execute, monitor
-
-### Read Tools
-- **get_harness_schema(harness)** — Get JSON schema for run configuration
-- **get_harness_defaults(harness)** — Get recommended default parameters
-- **read_skills(docs)** — Read one or more skill documents in a single call (run-file pitfalls, best practices)
-
-### Write Tools
-- **validate_runfile(harness, runfile)** — Validate run configuration against schema
-- **submit_benchmark(runfile)** — Execute benchmark, returns run ID
-
-### Read (Execution Monitoring)
-- **get_benchmark_status(run_id)** — Poll for execution progress (stage, elapsed time, errors)
-- **get_benchmark_intermediate_results(run_id)** — Get partial results as they become available
-
-### External APIs
-- Harness CLI (crucible, zathras, kube-burner, etc.) via SSH
-- SSH to provisioned hosts (monitor via log files, CLI queries)
-- Benchmark result storage (retrieve final results)
-
-### Constraints
-- ❌ **Cannot SSH directly** (uses provisioned harness via CLI)
-- ❌ **Cannot modify** run configuration mid-test
-- ❌ **Cannot query** historical metrics (only current run results)
-- ❌ **Cannot reserve** resources or install software
-- ⚠️ **Schema validation is mandatory**: No invalid run-files reach execution
-
-### Output
-Structured **benchmark result** with:
-- Benchmark status (success, partial, failed)
-- Raw metrics (throughput, latency, CPU usage, errors)
-- Run configuration (for audit trail)
-- Warnings/errors encountered
-
----
-
-## Review Agent
-
-**Role**: Analyze results, produce verdict, recommendations
-
-### Read Tools
-- **get_benchmark_results(run_id)** — Retrieve complete result data
-- **query_metrics(run_id, metric_name)** — Query specific metrics (throughput, latency, variance, etc.)
-- **compare_results(run_id1, run_id2, metric_list)** — Compare two benchmark runs
-- **read_skills(docs)** — Read one or more skill documents for analysis guidance and interpretation rules
-
-### External APIs
-- Metrics database (query, aggregation, statistical analysis)
-- Previous ticket results (search, retrieve, compare)
-
-### Constraints
-- ❌ **Cannot SSH** to hosts
-- ❌ **Cannot execute** benchmarks or make changes
-- ❌ **Cannot reserve** resources
-- ⚠️ **Read-only**: All operations are queries and analysis
-
-### Output
-Structured **review verdict** with:
-- Primary finding (hypothesis supported/refuted/inconclusive)
-- Confidence level (high/medium/low)
-- Statistical summary (mean, variance, outliers)
-- Comparisons to baseline (if applicable)
-- Recommendations (e.g., "repeat with X variation", "investigate Y factor")
-
----
-
-## Analyze Agent
-
-**Role**: Investigate anomalies, compare prior results, determine if findings are conclusive
-
-### Read Tools
-- **read_skills(docs)** — Read one or more skill documents for domain-specific investigation methodology
-- **list_skill_docs(category)** — List available skill documents for a category
-- **get_ticket_results(ticket_id)** — Retrieve benchmark results, KPIs, and evaluation findings from a prior ticket
-- **search_tickets(harness?, board_type?, status?, limit?)** — Search for prior tickets by harness, board type, or status
-
-### Write Tools
-- **submit_analysis_result(conclusive, finding, evidence?, root_cause?, ...)** — Submit analysis findings; conclusive=true advances to review, conclusive=false requests another benchmark iteration
-
-### Constraints
-- ❌ **Cannot SSH** to hosts
-- ❌ **Cannot execute** benchmarks
-- ❌ **Cannot reserve** resources
-- ⚠️ **Read-only** except for analysis result submission
-
-### Output
-Structured **analysis result** with:
-- Finding (what was observed)
-- Evidence (data supporting the finding)
-- Root cause (if identified)
-- Conclusiveness (whether more data is needed)
-- Benchmark parameters for next iteration (if inconclusive)
-
----
-
-## Retrospective Agent
-
-**Role**: Post-mortem analysis, skill improvement feedback
-
-### Read Tools
-- **get_transcript_analysis(ticket_id)** — Read transcript, detect patterns:
-  - Tool errors and retry sequences
-  - Convergence failures
-  - HITL escalations (pauses/user guidance)
-  - Self-correction language (agent catching own mistakes)
-  - Max-iteration hits (agent quit by safety limit)
-
-### Write Tools
-- **submit_retrospective(findings, classification)** — Submit classified findings for skill improvement
-
-### External APIs
-- Event log (read transcript of agent interactions)
-- Ticket metadata (custom fields, final status)
-
-### Constraints
-- ❌ All other tools
-- ⚠️ **Read-only except for retrospective submission**
-
-### Output
-Structured **retrospective** with:
-- Classified findings (tool defect, skill gap, schema mismatch, prompt gap, convergence failure)
-- Recommendations for improvement (new skill docs, prompt refinement, schema relaxation)
-
----
-
-## Cross-Agent Shared Data
-
-All agents can read from the shared **ticket** document:
-- `summary`, `description` — User's request
-- `custom_fields` — Arbitrary structured data
-- `status` — Current workflow state
-- Event log — Complete interaction history
-
-Agents **cannot modify** custom fields directly. Instead, they write results back using scoped write tools (`submit_*` structured output), which update the ticket atomically.
-
----
-
-## Guardrails and Safety
-
-### Host-Query Tool Guardrails
-The infra MCP server exposes purpose-built read-only tools instead of a generic
-SSH command executor. Each tool has a fixed, validated code path:
-
-- `get_ethtool_info` — NIC offload features or stats (ethtool)
-- `get_sysctl_values` — kernel parameters (validated key format)
-- `get_hardware_topology` — comprehensive hardware layout (NUMA, CCDs, SMT thread siblings, NIC locality)
-- `get_cache_topology` — CPU cache / CCD domains and per-CCD CPU lists
-- `list_interfaces` — UP interfaces with IP addresses
-- `verify_ssh_path` — SSH reachability between hosts
-- `read_remote_dir` — copy a remote directory locally for inspection
-
-This replaces the previous `execute_command` tool and its per-agent
-allowlist policy (`agents/infra/command_policy.py`). Every host
-interaction now has an explicit, narrow scope — no free-form shell.
-
-### Budget Enforcement
-- Per-ticket LLM token limit
-- System-wide cost limit (USD)
-- Budget warnings at 80%, enforced hard limit at 100%
-- Protects against infinite loops and accidental overspend
-
-### Convergence Safeguards
-- Max iterations per investigation loop (default: 10)
-- Consecutive-pass requirement (2 consecutive runs with same result = converged)
-- Min-iteration requirement (at least 3 runs before converging)
-- If max iterations hit, agent halts and escalates to user
-
----
-
-## Least Privilege in Practice
-
-### Example: Resource Agent Cannot SSH Install
-The **Resource** agent validates host connectivity with `validate_host()`, which is SSH read-only:
-- Can run `cat /etc/os-release` to check OS
-- Can run `nproc` to count CPUs
-- **Cannot** run `yum install` or modify anything
-
-If a host needs provisioning, **Provisioning** agent takes over with its `ssh_execute()` tool.
-
-### Example: Review Agent Cannot Query Live Metrics
-The **Review** agent can only query `historical` results from completed benchmarks. It cannot:
-- SSH to a host and run `top` to check live CPU
-- Access a metrics dashboard
-- Query in-flight performance data
-
-This keeps Review focused on analysis, not troubleshooting.
-
-### Example: Benchmark Agent Cannot Reserve Resources
-The **Benchmark** agent gets a ready-provisioned host and run-file. It cannot:
-- Call `reserve_resources()`
-- Change resource allocation mid-test
-- Decide to use different hardware
-
-This prevents scope creep and ensures deterministic execution.
-
----
-
-## Adding New Tools
-
-When adding a tool to an agent:
-
-1. **Add to MCP server** (`agents/{agent}/mcp_server.py`)
-   - Define the tool's purpose, input schema, output format
-2. **Implement the tool** in the same file or separate `tools.py` module
-3. **Update this documentation** with a new section in the agent's tools list
-4. **Add tests** verifying the tool works and respects constraints
-5. **Review for privilege creep**: Does this agent really need this tool? Are there weaker alternatives?
-
----
-
-## External System Guardrails
-
-### QUADS Integration
-- Agent can only reserve from available pool, cannot force allocation of unavailable hosts
-- SSH keys are automatically generated and scoped to reservation
-- Reservations auto-expire after deadline (default: 28 days)
-
-### AWS Integration
-- Agent can only launch pre-approved AMIs
-- Instance types restricted by harness requirements (e.g., minimum vCPU count)
-- Cost limits enforced at API call layer
-- Instances auto-terminate after deadline (default: 24 hours)
-
-### SSH Access
-- All SSH commands logged (event log includes command, host, user, result)
-- SSH keys stored securely (not in logs or tickets)
-- SSH connections use key-based auth only (no passwords)
-- Command allowlist prevents destructive operations
-
----
-
-## Data Access Restrictions
-
-### PII and Secrets
-- Agents are told NOT to ask for passwords, API keys, or personal information
-- If user submits credentials in ticket, agents should flag for redaction
-- Secrets stored in `~/.agentic-perf/secrets/` are injected as env vars at runtime, not passed through logs
-
-### Benchmark Results
-- Results are stored in `~/.agentic-perf/tickets/{id}/results/`
-- Results contain performance data (metrics, logs) but **not** raw system state (dmesg, memory dumps, etc.)
-- Users should not store sensitive data in benchmark configs
+# Capabilities and tool inventory
+
+Status: current implementation reference (audited against `origin/main`,
+commit `909f298`). The source of truth for registered MCP tools is each
+`agents/*/server.py` `@mcp.tool()` declaration plus the native workspace tools
+registered by `agents/base.py`.
+
+## Dispatchers and agents
+
+The deterministic orchestrator polls the state store, claims a ticket, and
+dispatches one handler for the current status. The status-to-handler mapping is
+in `orchestrator/dispatcher.py`; the complete lifecycle is in
+[status-lifecycle.md](status-lifecycle.md).
+
+| Handler | Status | LLM-driven | Purpose |
+|---|---|---:|---|
+| `triage` | `triage_pending` | yes | classify request and choose a path |
+| `resource_create` | `awaiting_hardware` | yes | discover, reserve, and validate resources |
+| `platform` | `preparing_platform` | no | deterministic platform/image preparation |
+| `image_builder` | `building_image` | no | deterministic custom image build |
+| `provisioning` | `awaiting_provision` | yes | install and configure harnesses |
+| `benchmark` | `executing_benchmark` | yes | construct, validate, and execute runs |
+| `review` | `awaiting_review` | yes | inspect results and recommend next action |
+| `resource_teardown` | `awaiting_teardown` | yes | release resources and clean hosts |
+| `retrospective` | `retrospective_pending` | yes | record post-run findings |
+| `gathering_context` | `gathering_context` | yes | collect prior records and change context |
+| `planning_investigation` | `planning_investigation` | yes | produce an investigation plan |
+| `evaluating_convergence` | `evaluating_convergence` | yes | assess results and route the next step |
+| `fleet_coordinator` | `coordinating_fleet` | no | record a host result and select the next host |
+| `synthesizing_results` | `synthesizing_results` | yes | write the final investigation record |
+| introspection | out-of-band | configurable | observe events and write guidance/summary |
+
+`new`, `awaiting_customer_guidance`, and `closed` are state-machine statuses,
+not dispatch targets. The coordinator also handles claims, lease renewal,
+stop requests, and terminal cleanup.
+
+## MCP tools by server
+
+These are the registered tools. Every agent also receives the native workspace
+tools listed below. Provider-specific tools are attached only when configured.
+
+| Server/role | Registered tools |
+|---|---|
+| Triage | `read_skills`, `list_benchmarks`, `get_benchmark_details`, `resolve_benchmark` |
+| Resource | `parse_host_config`, `list_resource_providers`, `check_available_resources`, `reserve_resources`, `get_reservation_status`, `validate_host`, `get_host_inventory`, `get_accumulated_metadata` |
+| Platform | `provision_platform`, `submit_platform_result` |
+| Provisioning | `check_platform_contract`, `check_host_prerequisites`, `install_packages`, `ensure_prerequisites`, `install_harness`, `verify_harness_install`, `check_existing_install`, `update_install`, `uninstall_harness`, `install_k3s`, `list_skill_docs`, `read_skills`, `disable_firewall`, `open_firewall_port`, `tune_nic`, `configure_flow_steering`, `reset_flow_steering`, `tune_tcp`, `pin_irq`, `reset_irq_pinning`, `verify_host_tuning`, `tune_hosts`, `nm_set_mtu`, `nm_set_ip`, `nm_set_dhcp`, `nm_show_connection`, `nm_verify_interface`, `ensure_harness_installed`, `get_private_config` |
+| Benchmark | `read_skills`, `list_harness_docs`, `read_harness_doc`, `get_execution_config`, `get_runfile_schema`, `get_benchmark_params`, `get_tool_params`, `get_example_runfile`, `setup_passwordless_ssh`, `execute_benchmark`, `get_run_logs`, `execute_boot_time_test` |
+| Analyze | `read_skills`, `list_skill_docs`, `get_ticket_results`, `search_tickets`, `submit_analysis_result` |
+| Evaluate | `submit_evaluation_result`, `list_benchmark_artifacts`, `read_benchmark_artifact` |
+| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `cdm_api_requests`, `compare_results`, `get_review_config` |
+| Investigation | `query_investigation_records`, `get_investigation_record`, `create_investigation_record`, `append_build_history`, `link_jira_ticket`, `close_investigation_record` |
+| Gathering context | `submit_gathering_context_result` |
+| Synthesis | `submit_synthesis_result` |
+| Retrospective | `get_transcript_analysis` |
+| Infrastructure | `set_ssh_context`, `check_host`, `write_remote_file`, `read_remote_file`, `read_remote_dir`, `get_ethtool_info`, `get_sysctl_values`, `get_hardware_topology`, `get_cache_topology`, `verify_ssh_path`, `list_interfaces`, `get_interface_inventory`, `deploy_secret`, `transfer_file`, `check_hosts`, `test_port_connectivity` |
+
+Agent-specific filtering is assembled when the dispatcher creates the agent
+MCP client. A tool in this table is not evidence that every agent can call it.
+For a live deployment, inspect the tool list in the agent startup event.
+
+## Native workspace tools
+
+All agents can use `jq_query`, `grep_file`, `read_file_slice`,
+`list_workspace_files`, and `generate_chart_from_workspace`. They are scoped
+to the current ticket workspace; see [workspaces-and-charts.md](workspaces-and-charts.md).
+
+## Explicit non-capabilities
+
+There are no current tools named `ssh_execute`, `get_harness_schema`,
+`submit_benchmark`, `get_benchmark_status`, `get_benchmark_results`, or
+`query_metrics`. SSH, run execution, result reading, and CDM requests are
+exposed under the names above and constrained by the agent server.

@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 
 import httpx
 
-DEFAULT_STORE_URL = "http://localhost:8090"
+from paths import DEFAULT_STATE_STORE_URL, resolve_state_store
+
+DEFAULT_STORE_URL = DEFAULT_STATE_STORE_URL
 
 
 def show_disclaimer():
@@ -37,6 +39,11 @@ def get_client(args) -> tuple[httpx.Client, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(base_url=url, timeout=10.0, headers=headers), url
+
+
+def get_default_store_url() -> str:
+    """Return the configured instance's state-store URL."""
+    return resolve_state_store()[0]
 
 
 def _check_403(r: httpx.Response) -> bool:
@@ -1252,10 +1259,10 @@ def main():
     )
     parser.add_argument(
         "--store-url",
-        default=os.environ.get("STATE_STORE_URL", DEFAULT_STORE_URL),
+        default=get_default_store_url(),
         help=(
-            "State store URL (default: STATE_STORE_URL environment variable "
-            f"or {DEFAULT_STORE_URL})"
+            "State store URL (default: STATE_STORE_URL environment variable, "
+            "state_store.url in config.json, or the configured local port)"
         ),
     )
     sub = parser.add_subparsers(dest="command")

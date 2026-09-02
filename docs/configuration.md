@@ -31,7 +31,8 @@ environment variable (defaults to `~/.agentic-perf`).
         "api": "chat_completions",
         "gemini_api_key": null,
         "timeout": 120,
-        "reasoning_effort": "medium"
+        "reasoning_effort": "medium",
+        "max_tokens": 8000
     },
     "agent_models": {
         "review": {
@@ -53,20 +54,34 @@ environment variable (defaults to `~/.agentic-perf`).
         "my-harness": "https://github.com/org/my-harness.git"
     },
     "agent_task_timeout": 0,
-    "stale_task_timeout": 900,
+    "stale_task_timeout": 3600,
+    "max_concurrent_agents": 8,
+    "global_max_iterations": 100,
+    "skip_teardown": false,
+    "instance_name": "my-agentic-perf",
+    "tool_rate_limit": {
+        "min_interval_sec": 0
+    },
+    "tool_spill_threshold": 4096,
     "llm_budget": {
-        "session_cost_usd": 50.00
+        "session_cost_usd": 50.00,
+        "default_ticket_budget": {
+            "max_tokens": 200000,
+            "max_cost_usd": 5.00,
+            "warn_pct": 80
+        }
+    },
+    "context_guard": {
+        "enabled": true,
+        "warn_pct": 60,
+        "pause_pct": 80
     },
     "introspection": {
         "enabled": false
     },
-    "compress_closed_after_days": 7,
-    "manual_purge_enabled": true,
     "telemetry": {
-        "otlp_exporter": {
-            "endpoint": "http://localhost:4317",
-            "headers": {"Authorization": "Bearer ..."}
-        }
+        "enabled": true,
+        "otlp_endpoint": "http://localhost:4317"
     }
 }
 ```
@@ -83,7 +98,7 @@ overridden by `agent_models`.
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `provider` | string | `"mock"` | `LLM_PROVIDER` | Provider name (see [Supported Providers](#supported-providers)) |
-| `model` | string | **(required)** | `LLM_MODEL` | Model identifier. No default — must be set when provider is not `mock`. |
+| `model` | string | `""` | `LLM_MODEL` | Model identifier. Set this for reproducible non-mock operation; an empty value causes the provider factory fallback to be used, and the orchestrator logs a warning. |
 | `backend` | string | — | `LLM_BACKEND` | `"vertex"` for Vertex AI, `"direct"` for direct API |
 | `project_id` | string | — | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID (Vertex AI backends) |
 | `region` | string | — | `CLOUD_ML_REGION` | Cloud region (Vertex AI backends) |
@@ -91,13 +106,14 @@ overridden by `agent_models`.
 | `api` | string | `"chat_completions"` | `OPENAI_API` | OpenAI API mode: `"chat_completions"` or `"responses"`. Applies only to the `openai` provider. |
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
-| `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). |
+| `max_tokens` | int | `8000` | `LLM_MAX_TOKENS` | Maximum output-token budget per completion. Reasoning tokens share this budget where supported. |
+| `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). Startup validation probes each model with its configured effort; an incompatible combination (e.g. `reasoning_effort` on a model without extended thinking) logs an error naming the affected agents. |
 
 #### Supported Providers
 
-| Provider value | LLM service | Default model |
+| Provider value | LLM service | Factory fallback when model is empty |
 |---|---|---|
-| `"claude"` or `"anthropic"` | Anthropic Claude (direct or Vertex AI) | `claude-sonnet-4-6` |
+| `"claude"` or `"anthropic"` | Anthropic Claude (direct or Vertex AI) | `claude-haiku-4-5` |
 | `"gemini"` or `"google"` | Google Gemini (direct or Vertex AI) | `gemini-2.5-flash` |
 | `"openai"` | OpenAI-compatible API (OpenAI, Azure, vLLM, Ollama, etc.) | `gpt-4o` |
 | `"mock"` | Canned responses for testing (no API key needed) | — |
@@ -107,14 +123,21 @@ overridden by `agent_models`.
 | Provider | How to authenticate |
 |---|---|
 | Claude (direct) | Set `ANTHROPIC_API_KEY` env var |
-| Claude (Vertex) | `gcloud auth application-default login` + set `project_id` and `region` |
+| Claude (Vertex) | Install the `vertex` extra, run `gcloud auth application-default login`, and set `project_id` and `region` |
 | Gemini (direct) | Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` env var, or `llm.gemini_api_key` in config |
-| Gemini (Vertex) | `gcloud auth application-default login` + set `project_id` and `region` |
+| Gemini (Vertex) | Install the `vertex` extra, run `gcloud auth application-default login`, and set `project_id` and `region` (or `GOOGLE_CLOUD_PROJECT`/`GOOGLE_CLOUD_LOCATION`) |
 | OpenAI | Set `OPENAI_API_KEY` env var |
 
 The OpenAI provider uses `max_completion_tokens` for GPT-5 and o-series
 models, which reject the legacy `max_tokens` parameter. Older
 OpenAI-compatible endpoints continue to receive `max_tokens`.
+
+Install provider SDKs only when needed: `pip install -e ".[openai]"` for
+OpenAI-compatible providers, `pip install -e ".[gemini]"` for Gemini, and
+`pip install -e ".[vertex]"` for Vertex support. The base installation includes
+the Anthropic SDK. Set `llm.api` or `OPENAI_API` to `responses` to select the
+OpenAI Responses API; the default is `chat_completions`. Responses uses
+`max_output_tokens` internally.
 
 ---
 
@@ -146,7 +169,10 @@ only when you want a specific agent to use a different model.
 
 Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
 and `max_tokens` keys. The `api` key is used when the override selects the
-`openai` provider.
+`openai` provider. A per-agent `reasoning_effort` is probed at startup
+alongside the model; if the model does not support it, the log names the
+affected agent(s) and suggests removing `reasoning_effort` or switching
+models.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`
@@ -286,7 +312,7 @@ for provisioning (30) matches the previous jumpstarter default.
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `url` | string | `"http://localhost:8090"` | `STATE_STORE_URL` | State store base URL |
-| `port` | int | `8090` | — | Port for the state store server |
+| `port` | int | `8090` | `STORE_PORT` | Port for the state store server |
 
 ---
 
@@ -485,7 +511,7 @@ stops automatically when the ticket reaches a terminal status. See
 |---|---|---|---|---|
 | `llm.timeout` | float | `120` | `LLM_TIMEOUT` | Per-request LLM API call timeout in seconds. `0` disables. |
 | `agent_task_timeout` | float | `0` (disabled) | `AGENT_TASK_TIMEOUT` | Maximum wall-clock seconds for an entire agent task. Catches agents stuck in tool loops or waiting on unresponsive services. |
-| `stale_task_timeout` | float | `900` | `STALE_TASK_TIMEOUT` | Cancel active tasks with no events for this many seconds. `0` disables. |
+| `stale_task_timeout` | float | `3600` | `STALE_TASK_TIMEOUT` | Cancel active tasks with no events for this many seconds. `0` disables. |
 
 ---
 
@@ -497,7 +523,29 @@ stops automatically when the ticket reaches a terminal status. See
 | `ssh_key` | string | — | `SSH_KEY` | Path to SSH private key for remote host access |
 | `ssh_key_vault_secret` | string | — | `SSH_KEY_VAULT_SECRET` | Vault secret name for SSH key fallback (see below) |
 | `crucible_home` | string | `"/opt/crucible"` | `CRUCIBLE_HOME` | Path to crucible installation |
+| `crucible_source_repo` | string | skill-cache checkout when present | `CRUCIBLE_SOURCE_REPO` | Core Crucible source checkout used for triage-time ecosystem discovery; independent of the execution controller |
+| `crucible_source_repo_url` | string | `https://github.com/perftool-incubator/crucible.git` | `CRUCIBLE_SOURCE_REPO_URL` | Source URL used to refresh the triage catalog when no explicit checkout is configured |
 | `zathras_home` | string | `""` | `ZATHRAS_HOME` | Path to zathras installation |
+| `max_concurrent_agents` | int | `8` | `MAX_CONCURRENT_AGENTS` | Maximum agents running at once; excess tickets wait for a later poll cycle. |
+| `global_max_iterations` | int | `100` | `GLOBAL_MAX_ITERATIONS` | Ticket-wide LLM iteration ceiling. |
+| `skip_teardown` | bool | `false` | — | Default for resource teardown; an explicit ticket directive takes precedence. |
+| `instance_name` | string | hostname | — | Instance identity used for ownership and resource tagging. |
+| `tool_rate_limit.min_interval_sec` | float | `0` | — | Minimum delay between tool calls. |
+| `tool_spill_threshold` | int | `4096` | — | Tool-result size in bytes above which results are spilled to workspace files. |
+
+### investigation_records — Investigation Record Backend
+
+Investigation tools use the file backend unless configured otherwise. The
+backend is selected by configuration; Horreum requires its endpoint and
+credentials. See the investigation provider section in Architecture for the
+supported shapes and behavior.
+
+    {
+        "investigation_records": {
+            "backend": "file",
+            "persist_dir": "~/.agentic-perf/investigation-records"
+        }
+    }
 
 ---
 
@@ -750,6 +798,16 @@ Built-in repositories: `crucible`, `crucible-examples`, `zathras`,
 `kube-burner`, `k8s-netperf`, `benchmark-runner`, `clusterbuster`,
 `vstorm`, `ioscale`, `forge`, `boot-time-analysis-scripts`.
 
+The Crucible provider uses the core `crucible` checkout as an ecosystem
+catalog. Its `config/repos.json` identifies the separate benchmark and tool
+repositories; detailed metadata is read from a cached checkout of the
+individual repository when available. Set `CRUCIBLE_SOURCE_REPO` to an
+explicit core checkout when the default skill-cache location is not suitable.
+This source checkout is used during triage and does not imply that the
+benchmark is installed on the eventual Crucible controller. Controller-side
+availability must be verified later with the installed Crucible state and,
+when supported, `crucible benchmark list` and `crucible tools list`.
+
 ---
 
 ### `telemetry` — OpenTelemetry Export
@@ -757,16 +815,19 @@ Built-in repositories: `crucible`, `crucible-examples`, `zathras`,
 ```json
 {
     "telemetry": {
-        "otlp_exporter": {
-            "endpoint": "http://localhost:4317",
-            "headers": {"Authorization": "Bearer ..."}
-        }
+        "enabled": true,
+        "otlp_endpoint": "http://localhost:4317"
     }
 }
 ```
 
-Exports LLM call telemetry, tool call spans, and agent lifecycle events
-to an OTLP-compatible collector (Jaeger, Grafana Loki, etc.).
+OpenTelemetry instrumentation is used for spans and optional OTLP export.
+The only currently read settings are enabled (default true) and
+otlp_endpoint (unset means no external export). otlp_exporter and headers are
+not supported configuration keys. Token accounting is performed directly from
+provider responses, so external OTLP export is not required for the dashboard
+or budget guardrails. Install the telemetry extra for instrumentation and the
+telemetry-export extra for the OTLP gRPC exporter.
 
 ---
 
@@ -871,10 +932,10 @@ no auth dependency).
 
 ### Data Retention
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `compress_closed_after_days` | int | `7` | Days after closing before event logs are compressed |
-| `manual_purge_enabled` | bool | — | Enable `agentic-perf purge` command for ticket deletion |
+There are currently no supported compress_closed_after_days or
+manual_purge_enabled configuration settings. Do not add them to config.json;
+event-log archival and purge behavior is controlled by the available CLI and
+operational procedures.
 
 ---
 
@@ -899,10 +960,13 @@ variable overrides, which take precedence over the file.
 | `OPENAI_API_KEY` | API key for OpenAI provider |
 | `OPENAI_BASE_URL` | `llm.base_url` |
 | `STATE_STORE_URL` | `state_store.url` |
+| `STORE_PORT` | `state_store.port` |
 | `POLL_INTERVAL` | `poll_interval` |
 | `SSH_KEY` | `ssh_key` |
 | `SSH_KEY_VAULT_SECRET` | `ssh_key_vault_secret` |
 | `CRUCIBLE_HOME` | `crucible_home` |
+| `CRUCIBLE_SOURCE_REPO` | `crucible_source_repo` |
+| `CRUCIBLE_SOURCE_REPO_URL` | `crucible_source_repo_url` |
 | `ZATHRAS_HOME` | `zathras_home` |
 | `HARNESS_REPOS` | `harness_repos` (JSON string) |
 | `AGENT_TASK_TIMEOUT` | `agent_task_timeout` |

@@ -21,7 +21,11 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_skill_provider, read_skill_documents
+from agents.server_utils import (
+    _configured_crucible_source,
+    build_skill_provider,
+    read_skill_documents,
+)
 
 mcp = FastMCP("triage-agent")
 
@@ -33,7 +37,7 @@ _skill_provider = None
 def _get_provider():
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = build_skill_provider()
+        _skill_provider = build_skill_provider(_configured_crucible_source())
     return _skill_provider
 
 
@@ -76,9 +80,11 @@ async def list_benchmarks() -> str:
         {
             "name": b.name,
             "description": b.description,
+            "supported_params": b.supported_params,
             "roles": b.roles,
             "min_hosts": b.min_hosts,
             "harness": b.harness,
+            "source": b.source,
         }
         for b in benchmarks
     ]
@@ -104,6 +110,7 @@ async def get_benchmark_details(name: str) -> str:
         "roles": b.roles,
         "min_hosts": b.min_hosts,
         "harness": b.harness,
+        "source": b.source,
     }
     # Arcaflow plugins: include the container image ref
     if b.harness == "arcaflow-plugins":

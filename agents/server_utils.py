@@ -7,6 +7,7 @@ This module centralizes that setup to avoid duplication.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -26,7 +27,34 @@ def setup_project_path() -> str:
     return root
 
 
-def build_skill_provider():
+def _configured_crucible_source() -> str | None:
+    """Return a configured source checkout or URL for triage discovery."""
+    source = os.environ.get("CRUCIBLE_SOURCE_REPO")
+    source_url = os.environ.get(
+        "CRUCIBLE_SOURCE_REPO_URL", "https://github.com/perftool-incubator/crucible.git"
+    )
+    try:
+        from paths import CONFIG_PATH
+
+        config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
+        source = source or config.get("crucible_source_repo")
+        source_url = config.get("crucible_source_repo_url", source_url)
+    except (OSError, json.JSONDecodeError):
+        pass
+    if source:
+        return source
+
+    from providers.skills.repo_cache import RepoCache
+
+    try:
+        path = RepoCache().ensure_repo("crucible", source_url)
+    except Exception:
+        logger.warning("Unable to refresh Crucible source repository", exc_info=True)
+        return None
+    return str(path) if (path / "config" / "repos.json").is_file() else None
+
+
+def build_skill_provider(source_repo: str | None = None):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
     Reads CRUCIBLE_HOME and ZATHRAS_HOME from env vars.
@@ -45,10 +73,27 @@ def build_skill_provider():
     from providers.skills.zathras import ZathrasSkillProvider
 
     crucible_home = os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
+    source_repo = source_repo or os.environ.get("CRUCIBLE_SOURCE_REPO")
+    if not source_repo:
+        try:
+            from paths import CONFIG_PATH
+
+            config = (
+                json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
+            )
+            source_repo = config.get("crucible_source_repo")
+        except (OSError, json.JSONDecodeError):
+            source_repo = None
+    if not source_repo:
+        from paths import SKILL_CACHE_DIR
+
+        default_source = SKILL_CACHE_DIR / "crucible"
+        if (default_source / "config" / "repos.json").is_file():
+            source_repo = str(default_source)
     zathras_home = os.environ.get("ZATHRAS_HOME", "")
 
     harnesses: dict[str, Any] = {
-        "crucible": CrucibleSkillProvider(crucible_home),
+        "crucible": CrucibleSkillProvider(crucible_home, source_repo=source_repo),
         "kube-burner": KubeBurnerSkillProvider(),
         "k8s-netperf": K8sNetperfSkillProvider(),
         "benchmark-runner": BenchmarkRunnerSkillProvider(),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -143,6 +144,77 @@ async def test_tool_params_and_metadata_discovery(tmp_path):
 
     meta = await provider.get_tool_metadata("sysstat")
     assert meta == {"description": "sysstat profiler"}
+
+
+@pytest.mark.asyncio
+async def test_source_catalog_discovers_benchmark_repositories(tmp_path):
+    """The core Crucible repo is an index; benchmark metadata lives elsewhere."""
+    source = tmp_path / "crucible"
+    (source / "config").mkdir(parents=True)
+    (source / "config" / "repos.json").write_text(
+        json.dumps(
+            {
+                "official": [
+                    {
+                        "name": "perftest",
+                        "type": "benchmark",
+                        "repository": "https://example.test/bench-perftest",
+                        "checkout": {"mode": "follow", "target": "main"},
+                    }
+                ],
+                "unofficial": [],
+            }
+        )
+    )
+    bench = tmp_path / "bench-perftest"
+    bench.mkdir()
+    (bench / "multiplex.json").write_text(
+        '{"presets": {"short": [{"arg": "duration", "vals": ["5"]}]}}'
+    )
+    (bench / "rickshaw.json").write_text(
+        '{"benchmark": "perftest", "client": {}, "server": {}}'
+    )
+
+    provider = CrucibleSkillProvider(
+        tmp_path / "missing-controller", source_repo=source
+    )
+    benchmarks = await provider.list_benchmarks()
+    perftest = next(b for b in benchmarks if b.name == "perftest")
+    assert perftest.roles == ["client", "server"]
+    assert perftest.min_hosts == 2
+    assert perftest.supported_params["presets"]["short"]
+    assert perftest.source["repository"] == "https://example.test/bench-perftest"
+    assert perftest.source["ref"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_source_catalog_exact_match_and_no_generic_rdma_fallback(tmp_path):
+    source = tmp_path / "crucible"
+    (source / "config").mkdir(parents=True)
+    (source / "config" / "repos.json").write_text(
+        '{"official": [{"name": "perftest", "type": "benchmark", '
+        '"repository": "https://example.test/bench-perftest", '
+        '"checkout": {"mode": "follow", "target": "main"}}], '
+        '"unofficial": []}'
+    )
+    provider = CrucibleSkillProvider(
+        tmp_path / "missing-controller", source_repo=source
+    )
+
+    assert (
+        await provider.resolve_benchmark(
+            {"description": "run perftest for RDMA throughput"}
+        )
+        == "perftest"
+    )
+
+    without_source = CrucibleSkillProvider(tmp_path / "missing-controller")
+    assert (
+        await without_source.resolve_benchmark(
+            {"description": "run ib_write_bw for RDMA throughput"}
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
