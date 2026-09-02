@@ -18,6 +18,7 @@ Each agent has scoped MCP tools. The system enforces **least privilege**: agents
 - **list_benchmarks()** — List all available benchmark suites
 - **get_benchmark_details(name)** — Get suite configuration, parameters, endpoint types
 - **resolve_benchmark(description, workload_type?)** — Match natural-language request to benchmark
+- **read_skills(docs)** — Read one or more skill documents for harness selection guidance
 
 ### External APIs (Read-Only)
 - Skill provider catalog (all installed harnesses)
@@ -81,6 +82,7 @@ Structured **resource result** with:
 ### Read Tools
 - **list_harnesses()** — List installed harnesses and their install modes
 - **get_harness_install_contract(harness, platform)** — Get install procedure: required packages, pre-conditions, post-conditions, secrets
+- **read_skills(docs)** — Read one or more skill documents for install guides and platform documentation
 
 ### Write Tools
 - **ssh_execute(host, user, key_path, commands)** — Execute shell commands on host (SSH)
@@ -172,6 +174,35 @@ Structured **review verdict** with:
 - Statistical summary (mean, variance, outliers)
 - Comparisons to baseline (if applicable)
 - Recommendations (e.g., "repeat with X variation", "investigate Y factor")
+
+---
+
+## Analyze Agent
+
+**Role**: Investigate anomalies, compare prior results, determine if findings are conclusive
+
+### Read Tools
+- **read_skills(docs)** — Read one or more skill documents for domain-specific investigation methodology
+- **list_skill_docs(category)** — List available skill documents for a category
+- **get_ticket_results(ticket_id)** — Retrieve benchmark results, KPIs, and evaluation findings from a prior ticket
+- **search_tickets(harness?, board_type?, status?, limit?)** — Search for prior tickets by harness, board type, or status
+
+### Write Tools
+- **submit_analysis_result(conclusive, finding, evidence?, root_cause?, ...)** — Submit analysis findings; conclusive=true advances to review, conclusive=false requests another benchmark iteration
+
+### Constraints
+- ❌ **Cannot SSH** to hosts
+- ❌ **Cannot execute** benchmarks
+- ❌ **Cannot reserve** resources
+- ⚠️ **Read-only** except for analysis result submission
+
+### Output
+Structured **analysis result** with:
+- Finding (what was observed)
+- Evidence (data supporting the finding)
+- Root cause (if identified)
+- Conclusiveness (whether more data is needed)
+- Benchmark parameters for next iteration (if inconclusive)
 
 ---
 
