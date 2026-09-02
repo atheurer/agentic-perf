@@ -523,6 +523,8 @@ stops automatically when the ticket reaches a terminal status. See
 | `ssh_key` | string | — | `SSH_KEY` | Path to SSH private key for remote host access |
 | `ssh_key_vault_secret` | string | — | `SSH_KEY_VAULT_SECRET` | Vault secret name for SSH key fallback (see below) |
 | `crucible_home` | string | `"/opt/crucible"` | `CRUCIBLE_HOME` | Path to crucible installation |
+| `crucible_source_repo` | string | skill-cache checkout when present | `CRUCIBLE_SOURCE_REPO` | Core Crucible source checkout used for triage-time ecosystem discovery; independent of the execution controller |
+| `crucible_source_repo_url` | string | `https://github.com/perftool-incubator/crucible.git` | `CRUCIBLE_SOURCE_REPO_URL` | Source URL used to refresh the triage catalog when no explicit checkout is configured |
 | `zathras_home` | string | `""` | `ZATHRAS_HOME` | Path to zathras installation |
 | `max_concurrent_agents` | int | `8` | `MAX_CONCURRENT_AGENTS` | Maximum agents running at once; excess tickets wait for a later poll cycle. |
 | `global_max_iterations` | int | `100` | `GLOBAL_MAX_ITERATIONS` | Ticket-wide LLM iteration ceiling. |
@@ -796,6 +798,16 @@ Built-in repositories: `crucible`, `crucible-examples`, `zathras`,
 `kube-burner`, `k8s-netperf`, `benchmark-runner`, `clusterbuster`,
 `vstorm`, `ioscale`, `forge`, `boot-time-analysis-scripts`.
 
+The Crucible provider uses the core `crucible` checkout as an ecosystem
+catalog. Its `config/repos.json` identifies the separate benchmark and tool
+repositories; detailed metadata is read from a cached checkout of the
+individual repository when available. Set `CRUCIBLE_SOURCE_REPO` to an
+explicit core checkout when the default skill-cache location is not suitable.
+This source checkout is used during triage and does not imply that the
+benchmark is installed on the eventual Crucible controller. Controller-side
+availability must be verified later with the installed Crucible state and,
+when supported, `crucible benchmark list` and `crucible tools list`.
+
 ---
 
 ### `telemetry` — OpenTelemetry Export
@@ -953,6 +965,8 @@ variable overrides, which take precedence over the file.
 | `SSH_KEY` | `ssh_key` |
 | `SSH_KEY_VAULT_SECRET` | `ssh_key_vault_secret` |
 | `CRUCIBLE_HOME` | `crucible_home` |
+| `CRUCIBLE_SOURCE_REPO` | `crucible_source_repo` |
+| `CRUCIBLE_SOURCE_REPO_URL` | `crucible_source_repo_url` |
 | `ZATHRAS_HOME` | `zathras_home` |
 | `HARNESS_REPOS` | `harness_repos` (JSON string) |
 | `AGENT_TASK_TIMEOUT` | `agent_task_timeout` |
