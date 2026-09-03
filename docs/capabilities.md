@@ -53,7 +53,7 @@ tools listed below. Provider-specific tools are attached only when configured.
 | Gathering context | `submit_gathering_context_result` |
 | Synthesis | `submit_synthesis_result` |
 | Retrospective | `get_transcript_analysis` |
-| Infrastructure | `set_ssh_context`, `check_host`, `write_remote_file`, `read_remote_file`, `read_remote_dir`, `get_ethtool_info`, `get_sysctl_values`, `get_hardware_topology`, `get_cache_topology`, `verify_ssh_path`, `list_interfaces`, `get_interface_inventory`, `deploy_secret`, `transfer_file`, `check_hosts`, `test_port_connectivity` |
+| Infrastructure | `set_ssh_context`, `check_host`, `write_remote_file`, `read_remote_file`, `read_remote_dir`, `get_ethtool_info`, `get_sysctl_values`, `get_hardware_topology`, `get_cache_topology`, `verify_ssh_path`, `list_interfaces`, `get_interface_inventory`, `list_controller_userenvs`, `run_crucible_command`, `deploy_secret`, `transfer_file`, `check_hosts`, `test_port_connectivity` |
 
 Agent-specific filtering is assembled when the dispatcher creates the agent
 MCP client. A tool in this table is not evidence that every agent can call it.
