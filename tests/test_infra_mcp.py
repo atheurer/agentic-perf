@@ -284,7 +284,7 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "set_ssh_context" in names
         assert "get_ethtool_info" in names
         assert "get_cache_topology" in names
-        assert len(names) == 17
+        assert len(names) == 18
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -335,7 +335,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 17
+    assert len(client._tool_routing) == 18
 
     await client.disconnect()
     assert len(client._servers) == 0

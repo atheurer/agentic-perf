@@ -339,17 +339,17 @@ async def get_execution_config(harness_name: str) -> str:
             }
         )
     result = {
-            "harness": harness_name,
-            "found": True,
-            "controller_required": execution.get("controller_required", False),
-            "run_command": execution.get("run_command", ""),
-            "endpoint_type": execution.get("endpoint_type", "remotehosts"),
-            "endpoint_user": execution.get("endpoint_user", "root"),
-            "default_osruntime": execution.get("default_osruntime", "podman"),
-            "pre_run": execution.get("pre_run", []),
-            "run_file_format": execution.get("run_file_format", "json"),
-            "results_dir_pattern": execution.get("results_dir_pattern", ""),
-        }
+        "harness": harness_name,
+        "found": True,
+        "controller_required": execution.get("controller_required", False),
+        "run_command": execution.get("run_command", ""),
+        "endpoint_type": execution.get("endpoint_type", "remotehosts"),
+        "endpoint_user": execution.get("endpoint_user", "root"),
+        "default_osruntime": execution.get("default_osruntime", "podman"),
+        "pre_run": execution.get("pre_run", []),
+        "run_file_format": execution.get("run_file_format", "json"),
+        "results_dir_pattern": execution.get("results_dir_pattern", ""),
+    }
     if harness_name == "crucible":
         # Userenv availability belongs to the running Crucible controller.
         # Never propagate a stale/static value from private metadata.
