@@ -321,21 +321,32 @@ async def get_execution_config(harness_name: str) -> str:
                 "message": f"No execution config found for harness '{harness_name}'",
             }
         )
-    return json.dumps(
-        {
-            "harness": harness_name,
-            "found": True,
-            "controller_required": execution.get("controller_required", False),
-            "run_command": execution.get("run_command", ""),
-            "endpoint_type": execution.get("endpoint_type", "remotehosts"),
-            "endpoint_user": execution.get("endpoint_user", "root"),
-            "default_userenv": execution.get("default_userenv", "discover"),
-            "default_osruntime": execution.get("default_osruntime", "podman"),
-            "pre_run": execution.get("pre_run", []),
-            "run_file_format": execution.get("run_file_format", "json"),
-            "results_dir_pattern": execution.get("results_dir_pattern", ""),
-        }
-    )
+    result = {
+        "harness": harness_name,
+        "found": True,
+        "controller_required": execution.get("controller_required", False),
+        "run_command": execution.get("run_command", ""),
+        "endpoint_type": execution.get("endpoint_type", "remotehosts"),
+        "endpoint_user": execution.get("endpoint_user", "root"),
+        "default_osruntime": execution.get("default_osruntime", "podman"),
+        "pre_run": execution.get("pre_run", []),
+        "run_file_format": execution.get("run_file_format", "json"),
+        "results_dir_pattern": execution.get("results_dir_pattern", ""),
+    }
+    if harness_name == "crucible":
+        # Userenv availability belongs to the running Crucible controller.
+        # Never propagate a stale/static value from private metadata.
+        result["userenv_discovery"] = execution.get(
+            "userenv_discovery",
+            {
+                "required": True,
+                "command": "crucible userenvs list",
+                "source": "running_controller",
+            },
+        )
+    elif "default_userenv" in execution:
+        result["default_userenv"] = execution["default_userenv"]
+    return json.dumps(result)
 
 
 @mcp.tool()

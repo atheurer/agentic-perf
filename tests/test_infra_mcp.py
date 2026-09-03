@@ -64,6 +64,10 @@ def mock_infra_server(tmp_path: Path) -> Path:
             })
 
         @mcp.tool()
+        async def list_controller_userenvs(controller: str) -> str:
+            return json.dumps({"exit_code": 0, "stdout": "fedora44\\n"})
+
+        @mcp.tool()
         async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
             \"\"\"Copy a remote directory to a local temp directory.\"\"\"
             return json.dumps({"success": True, "local_path": "/tmp/remote-dir-mock"})
@@ -180,6 +184,7 @@ async def test_infra_server_tools(mock_infra_server: Path):
             "check_hosts",
             "write_remote_file",
             "read_remote_file",
+            "list_controller_userenvs",
             "read_remote_dir",
             "get_ethtool_info",
             "get_sysctl_values",
@@ -279,7 +284,7 @@ async def test_multi_server_routing(mock_triage_server: Path, mock_infra_server:
         assert "set_ssh_context" in names
         assert "get_ethtool_info" in names
         assert "get_cache_topology" in names
-        assert len(names) == 17
+        assert len(names) == 18
 
         result = await client.call_tool("list_benchmarks", {})
         benchmarks = json.loads(result)
@@ -330,7 +335,7 @@ async def test_multi_server_disconnect_all(
     await client.connect(str(mock_triage_server), name="triage")
     await client.connect(str(mock_infra_server), name="infra")
     assert len(client._servers) == 2
-    assert len(client._tool_routing) == 17
+    assert len(client._tool_routing) == 18
 
     await client.disconnect()
     assert len(client._servers) == 0

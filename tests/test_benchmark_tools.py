@@ -20,7 +20,8 @@ def mock_provider() -> MockSkillProvider:
                     "run_command": "crucible run",
                     "endpoint_type": "remotehosts",
                     "endpoint_user": "root",
-                    "default_userenv": "alma8",
+                    # A stale value must be ignored for Crucible.
+                    "default_userenv": "fedora42",
                     "default_osruntime": "podman",
                     "pre_run": ["ssh_key_setup"],
                     "run_file_format": "json",
@@ -60,7 +61,8 @@ async def test_get_execution_config_crucible(handlers):
     assert result["harness"] == "crucible"
     assert result["run_command"] == "crucible run"
     assert result["run_file_format"] == "json"
-    assert result["default_userenv"] == "alma8"
+    assert result["userenv_discovery"]["required"] is True
+    assert result["userenv_discovery"]["command"] == "crucible userenvs list"
 
 
 @pytest.mark.asyncio
