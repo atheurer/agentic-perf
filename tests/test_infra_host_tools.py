@@ -74,6 +74,79 @@ class TestGetEthtoolInfo:
 
 
 # ---------------------------------------------------------------------------
+# run_crucible_command
+# ---------------------------------------------------------------------------
+
+
+class TestCrucibleCommandBroker:
+    @pytest.mark.asyncio
+    async def test_dispatches_allowlisted_read_command(self, patch_ssh):
+        patch_ssh._results["crucible benchmark list"] = SSHResult(
+            exit_code=0,
+            stdout="uperf\nfio\n",
+        )
+
+        result = await srv.run_crucible_command(
+            "controller.example", "benchmark_list", {}
+        )
+        data = json.loads(result)
+
+        assert data["exit_code"] == 0
+        assert data["command"] == "benchmark_list"
+        assert data["controller"] == "controller.example"
+        assert data["stdout"] == "uperf\nfio\n"
+        assert patch_ssh.calls[-1]["command"] == "crucible benchmark list"
+
+    @pytest.mark.asyncio
+    async def test_schema_enumerates_operations_and_empty_arguments(self):
+        tools = await srv.mcp.list_tools()
+        tool = next(t for t in tools if t.name == "run_crucible_command")
+        schema = tool.parameters
+
+        assert schema["properties"]["command"]["enum"] == [
+            "benchmark_list",
+            "tools_list",
+            "userenvs_list",
+        ]
+        assert schema["properties"]["arguments"]["anyOf"][0][
+            "additionalProperties"
+        ] is False
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_or_mutating_operation_without_ssh(self, patch_ssh):
+        for command in ("shell", "run", "benchmark_install"):
+            result = await srv.run_crucible_command("controller", command, {})
+            data = json.loads(result)
+            assert data["success"] is False
+
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_arguments_before_ssh(self, patch_ssh):
+        result = await srv.run_crucible_command(
+            "controller", "tools_list", {"extra": "--json"}
+        )
+        data = json.loads(result)
+
+        assert data["success"] is False
+        assert "does not accept arguments" in data["error"]
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    async def test_userenv_compatibility_wrapper_uses_broker(self, patch_ssh):
+        patch_ssh._results["crucible userenvs list"] = SSHResult(
+            exit_code=0, stdout="alma8\n"
+        )
+
+        result = await srv.list_controller_userenvs("controller")
+        data = json.loads(result)
+
+        assert data["stdout"] == "alma8\n"
+        assert data["command"] == "userenvs_list"
+        assert patch_ssh.calls[-1]["command"] == "crucible userenvs list"
+
+
+# ---------------------------------------------------------------------------
 # get_sysctl_values
 # ---------------------------------------------------------------------------
 

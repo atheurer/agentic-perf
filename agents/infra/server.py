@@ -20,13 +20,14 @@ import sys
 import tempfile
 from contextlib import AsyncExitStack
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict
 
 from agents.infra.topology import discover_cache_topology
 from agents.server_utils import (
@@ -79,6 +80,39 @@ def _format_result(result: SSHResult) -> str:
     if result.stderr:
         out["stderr"] = result.stderr
     return json.dumps(out, indent=2)
+
+
+# Keep this mapping deliberately explicit.  The values are complete commands,
+# rather than user-supplied command fragments; adding an operation requires
+# reviewing its read-only contract and adding a test.
+_CRUCIBLE_READ_COMMANDS = {
+    "benchmark_list": "crucible benchmark list",
+    "tools_list": "crucible tools list",
+    "userenvs_list": "crucible userenvs list",
+}
+CrucibleCommand = Literal["benchmark_list", "tools_list", "userenvs_list"]
+
+
+class CrucibleCommandArguments(BaseModel):
+    """Placeholder for operation-specific arguments; currently none exist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _crucible_command(command: str, arguments: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Resolve a broker operation to a fixed command, failing closed."""
+    if command not in _CRUCIBLE_READ_COMMANDS:
+        allowed = ", ".join(sorted(_CRUCIBLE_READ_COMMANDS))
+        return None, f"Unknown Crucible command {command!r}; allowed: {allowed}"
+    if arguments is not None:
+        supplied = (
+            arguments.model_dump()
+            if isinstance(arguments, CrucibleCommandArguments)
+            else arguments
+        )
+        if supplied:
+            return None, f"Command {command!r} does not accept arguments"
+    return _CRUCIBLE_READ_COMMANDS[command], None
 
 
 @mcp.tool()
@@ -214,9 +248,31 @@ async def list_controller_userenvs(controller: str) -> str:
     userenv. This intentionally runs only the fixed discovery command rather
     than exposing arbitrary remote command execution.
     """
+    return await run_crucible_command(controller, "userenvs_list", {})
+
+
+@mcp.tool()
+async def run_crucible_command(
+    controller: str,
+    command: CrucibleCommand,
+    arguments: CrucibleCommandArguments | None = None,
+) -> str:
+    """Run one allowlisted, read-only Crucible discovery operation.
+
+    This is a command broker, not a shell: ``command`` selects a fixed
+    implementation and ``arguments`` must currently be empty.  Benchmark
+    execution and all mutating operations remain separate tools requiring
+    their existing validation/approval paths.
+    """
+    resolved, error = _crucible_command(command, arguments)
+    if error:
+        return json.dumps({"success": False, "error": error})
+
     ssh = _get_ssh()
-    result = await ssh.run(controller, "crucible userenvs list", timeout=30)
-    return _format_result(result)
+    result = await ssh.run(controller, resolved, timeout=30)
+    response = json.loads(_format_result(result))
+    response.update({"controller": controller, "command": command})
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
