@@ -99,7 +99,9 @@ class CrucibleCommandArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _crucible_command(command: str, arguments: dict[str, Any] | None) -> tuple[str | None, str | None]:
+def _crucible_command(
+    command: str, arguments: dict[str, Any] | None
+) -> tuple[str | None, str | None]:
     """Resolve a broker operation to a fixed command, failing closed."""
     if command not in _CRUCIBLE_READ_COMMANDS:
         allowed = ", ".join(sorted(_CRUCIBLE_READ_COMMANDS))

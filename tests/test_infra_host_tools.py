@@ -108,9 +108,10 @@ class TestCrucibleCommandBroker:
             "tools_list",
             "userenvs_list",
         ]
-        assert schema["properties"]["arguments"]["anyOf"][0][
-            "additionalProperties"
-        ] is False
+        assert (
+            schema["properties"]["arguments"]["anyOf"][0]["additionalProperties"]
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_rejects_unknown_or_mutating_operation_without_ssh(self, patch_ssh):
