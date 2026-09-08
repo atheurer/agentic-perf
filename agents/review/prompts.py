@@ -155,6 +155,10 @@ When reviewing an `analysis_result` (no benchmark was run):
 - Assess whether the analysis finding is well-supported by evidence
 - Evaluate the root cause identification (if provided) for plausibility
 - Use external data tools (get_baseline_stats, compare_run_to_baseline) to
-  cross-check the analysis claims against historical data
+  cross-check the analysis claims against historical data. When using
+  historical baselines, note the data age — baselines older than 90 days
+  should be treated as contextual background, not definitive references.
+  Flag any context mismatches (different OS version, firmware, or
+  deployment type) between the baseline and current data.
 - Your verdict should reflect the analysis quality, not benchmark statistics
 """

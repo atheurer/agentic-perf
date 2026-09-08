@@ -64,6 +64,25 @@ record exists, skip the full investigation; if not, proceed.
   regression again than to skip an investigation of a new one.
 - Do NOT create new Investigation Records — that happens at the end of
   the investigation, not at the beginning.
+
+## Temporal confidence in dedup matches
+
+The age of an Investigation Record affects match confidence.
+Older records may describe root causes that no longer apply
+(firmware updated, kernel patched, config changed).
+
+- **< 30 days old**: Full dedup confidence — match normally
+- **30–90 days old**: Reduced confidence — report the match
+  but note the record's age and recommend re-investigation
+  if the platform or software context has changed since the
+  record was created
+- **> 90 days old**: Advisory only — mention the historical
+  finding as context but submit NO_MATCH so the ticket
+  proceeds to fresh investigation
+
+Use the record's `created_at` or `updated_at` timestamp to
+assess age. When reporting a match against an older record,
+include the record's age in the match_rationale.
 """
 
 

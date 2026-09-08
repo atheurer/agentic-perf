@@ -271,6 +271,10 @@ model is configured via `agent_models.chat`.
 - **Grounding dedup:** `gathering_context` routes to `retrospective_pending`
   (not directly to `closed`) if a matching Investigation Record is found,
   so the retrospective agent can analyze the dedup-skipped ticket.
+  Dedup matches are subject to temporal confidence decay: records
+  older than 90 days are advisory only and do not block fresh
+  investigation. See the investigation methodology skills for
+  full temporal decay tiers.
 - **Abort:** From `awaiting_customer_guidance`, the user can jump directly to
   `awaiting_teardown` to skip remaining work.
 - **Execution plan re-benchmark:** `awaiting_review` can transition back to

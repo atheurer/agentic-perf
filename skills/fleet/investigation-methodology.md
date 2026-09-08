@@ -102,3 +102,37 @@ triage → resource → platform → benchmark
 
 Each iteration resets the per-agent iteration budget via a
 `fleet_iteration_epoch` event marker.
+
+## Historical Data Confidence
+
+When comparing fleet results against historical baselines,
+assess confidence based on data age and collection context.
+Fleet comparisons are especially sensitive to context drift
+because hardware firmware versions, board revisions, and
+lab configurations change independently across devices.
+
+### Temporal decay
+
+- **< 7 days**: Full confidence
+- **7–30 days**: High confidence, note the age
+- **30–90 days**: Medium confidence, flag explicitly
+- **> 90 days**: Low confidence, contextual background only
+
+### Context validation for fleet comparisons
+
+Fleet comparisons require alignment on:
+
+- **Firmware version per board**: Individual boards may have
+  been updated at different times. A fleet baseline from
+  3 months ago may include boards with older firmware.
+- **Pool membership**: Boards may have been added to or
+  removed from pools. The set of boards in a historical
+  fleet run may not match the current pool.
+- **Lab infrastructure**: Network topology, DHCP servers,
+  and serial console configurations change. These affect
+  boot timing and provisioning reliability.
+
+When historical fleet data shows large per-board deviations
+from current results, check whether the specific board's
+firmware or configuration has changed before attributing
+the difference to a performance regression.

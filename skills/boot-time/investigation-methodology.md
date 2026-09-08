@@ -278,3 +278,56 @@ provides observability into time periods where no software
 clock exists. It is NOT implicated as a root cause of boot
 time variance. Do not confuse the counter itself with the
 phenomena it measures.
+
+## Historical Data Confidence
+
+When referencing historical data — prior ticket results,
+Domain MCP baselines, or investigation records — assess
+confidence based on data age and collection context.
+
+### Temporal decay
+
+- **< 7 days**: Full confidence — treat as current
+- **7–30 days**: High confidence — note the age but treat
+  as reliable
+- **30–90 days**: Medium confidence — flag explicitly in
+  analysis, note that firmware/software stack may have
+  changed
+- **> 90 days**: Low confidence — use as contextual
+  background only, never as a sole basis for conclusions
+
+### Context validation
+
+Before comparing datasets, verify alignment on:
+
+- **Hardware platform**: Same board type and firmware
+  version. A kernel regression on QC8775 firmware v2.1
+  may not manifest on v2.3.
+- **OS version and image type**: Nightly vs custom,
+  package vs ostree. Custom investigation images may
+  include debugging instrumentation that affects timing.
+- **Test configuration**: Same harness, sample count,
+  reboot method. SSH-based reboots produce different
+  timing profiles than serial-based.
+- **Deployment context**: Production CI vs experimental
+  investigation. Data from a one-off custom build may
+  not represent steady-state behavior.
+
+Flag mismatches explicitly — never silently compare
+datasets from different contexts. If contexts differ,
+state what differs and how it may affect the comparison.
+
+### Large historical deviations
+
+When analysis reveals large deviations between current
+results and historical data, consider:
+
+1. Was the historical data collected under comparable
+   conditions? (Check context alignment above)
+2. Has the hardware/software stack changed meaningfully
+   since the historical data was collected?
+3. Is the historical dataset from an experimental or
+   investigative run that may have had a singular purpose?
+
+Do not conclude "regression" or "improvement" based solely
+on deviation from stale or context-mismatched baselines.

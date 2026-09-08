@@ -69,4 +69,12 @@ conflict explicitly in your findings.
   agent can collect it efficiently.
 - **Show your evidence.** Reference specific run IDs, ticket IDs,
   metric values, and timestamps in your findings.
+- **Assess historical data freshness.** When referencing older
+  data (> 30 days), note its age and whether the hardware/software
+  context has changed since collection. Data older than 90 days
+  should be treated as contextual background, not as a reliable
+  baseline. Never conclude "regression" or "improvement" based
+  solely on deviation from stale or context-mismatched baselines.
+  Read the investigation methodology skill for detailed temporal
+  confidence guidance.
 """
