@@ -1622,7 +1622,8 @@ let artifactTimer = null;
 let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
-let renderedEvents = [];
+let maxRenderedSeq = 0;
+let renderedEventCount = 0;
 var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
@@ -2127,7 +2128,8 @@ async function renderDetail(ticketId) {
   try {
     const ticket = await api('/tickets/' + ticketId);
     lastSeq = 0;
-    renderedEvents = [];
+    maxRenderedSeq = 0;
+    renderedEventCount = 0;
     _lastResultHash = '';
     // Seed the trail from the ticket's authoritative
     // status_trail — the store appends on every transition.
@@ -3320,8 +3322,9 @@ function renderNewEvents(events) {
 
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
-    if (renderedEvents.indexOf(evt.seq) !== -1) continue;
-    renderedEvents.push(evt.seq);
+    if (evt.seq <= maxRenderedSeq) continue;
+    maxRenderedSeq = evt.seq;
+    renderedEventCount++;
     // Cap DOM nodes to prevent memory leak from accumulated
     // event elements. Remove oldest DOM children when over limit.
     // Tradeoff: oldest events become unviewable without a page
@@ -3338,7 +3341,7 @@ function renderNewEvents(events) {
   }
 
   var countEl = document.getElementById('event-count');
-  if (countEl) countEl.textContent = renderedEvents.length;
+  if (countEl) countEl.textContent = renderedEventCount;
 
   if (autoScroll) {
     container.scrollTop = container.scrollHeight;
@@ -3817,7 +3820,8 @@ function stopPolling() {
   }
   pollPaused = false;
   lastSeq = 0;
-  renderedEvents = [];
+  maxRenderedSeq = 0;
+  renderedEventCount = 0;
 
   // Destroy all chart instances to prevent memory leak
   for (var cid in _chartInstances) {
