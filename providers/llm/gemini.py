@@ -80,6 +80,10 @@ def _resolve_json_refs(obj: Any) -> Any:
 
 
 class GeminiLLMProvider(LLMProvider):
+    # Keep the direct-API behavior as the safe default for lightweight test
+    # doubles and instances created without running __init__.
+    _is_vertex: bool = False
+
     def __init__(
         self,
         api_key: str | None = None,
