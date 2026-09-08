@@ -168,11 +168,11 @@ only when you want a specific agent to use a different model.
 2. `llm.*` — global default
 
 Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
-and `max_tokens` keys. The `api` key is used when the override selects the
-`openai` provider. A per-agent `reasoning_effort` is probed at startup
-alongside the model; if the model does not support it, the log names the
-affected agent(s) and suggests removing `reasoning_effort` or switching
-models.
+and `max_tokens` keys. The `api` key is honored both at startup validation
+and at runtime when the override selects the `openai` provider. A per-agent
+`reasoning_effort` is probed at startup alongside the model; if the model
+does not support it, the log names the affected agent(s) and suggests
+removing `reasoning_effort` or switching models.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`
