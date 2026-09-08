@@ -2714,9 +2714,12 @@ function mountChart(containerId, chartData) {
         },
       });
 
-      canvas.addEventListener('mouseleave', function() {
-        updateSyncCrosshair(null);
-      });
+      if (!canvas._cdmMouseleaveBound) {
+        canvas.addEventListener('mouseleave', function() {
+          updateSyncCrosshair(null);
+        });
+        canvas._cdmMouseleaveBound = true;
+      }
 
       _chartInstances[canvasId] = chartInstance;
       renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
@@ -2813,10 +2816,14 @@ function mountChart(containerId, chartData) {
     },
   });
 
-  canvas.addEventListener('mouseleave', function() {
-    updateSyncCrosshair(null);
-  });
+  if (!canvas._cdmMouseleaveBound) {
+    canvas.addEventListener('mouseleave', function() {
+      updateSyncCrosshair(null);
+    });
+    canvas._cdmMouseleaveBound = true;
+  }
 
+  _chartInstances[cid] = chartInstance;
   renderMatrix(matrixEl, chartData, chartInstance, 0, chartData.unit);
   window._cdmSyncGroups[syncGroupId].push({
     chart: chartInstance,
