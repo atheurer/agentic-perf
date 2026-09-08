@@ -320,7 +320,10 @@ class ChatAgent:
                 "cannot create tickets, send interjections, "
                 "stop tickets, or manage users. If the user "
                 "asks for these actions, explain that they "
-                "need to log in with a bearer token first."
+                "need to log in with a bearer token first.\n"
+                "Each message is independent — anonymous "
+                "sessions do not retain conversation history "
+                "between messages."
             )
         else:
             available_tools = CHAT_TOOLS

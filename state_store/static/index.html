@@ -1623,6 +1623,7 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
+var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
@@ -2656,6 +2657,9 @@ function mountChart(containerId, chartData) {
         return cfg;
       });
 
+      var canvasId = canvas.id || canvas.getAttribute('data-chart-id') || ('chart-' + Math.random());
+      canvas.setAttribute('data-chart-id', canvasId);
+      if (_chartInstances[canvasId]) { _chartInstances[canvasId].destroy(); }
       var chartInstance = new Chart(canvas, {
         type: panel.type || chartData.type || 'line',
         data: { labels: chartData.labels || [], datasets: datasets },
@@ -2708,6 +2712,7 @@ function mountChart(containerId, chartData) {
         },
       });
 
+      _chartInstances[canvasId] = chartInstance;
       canvas.addEventListener('mouseleave', function() {
         updateSyncCrosshair(null);
       });
@@ -2751,6 +2756,8 @@ function mountChart(containerId, chartData) {
     return cfg;
   });
 
+  var cid = canvas.id || 'usage-chart';
+  if (_chartInstances[cid]) { _chartInstances[cid].destroy(); }
   var chartInstance = new Chart(canvas, {
     type: chartData.type || 'bar',
     data: { labels: chartData.labels || [], datasets: datasets },
@@ -2803,6 +2810,7 @@ function mountChart(containerId, chartData) {
     },
   });
 
+  _chartInstances[cid] = chartInstance;
   canvas.addEventListener('mouseleave', function() {
     updateSyncCrosshair(null);
   });
@@ -3790,6 +3798,14 @@ function stopPolling() {
   pollPaused = false;
   lastSeq = 0;
   renderedEvents = [];
+
+  // Destroy all chart instances to prevent memory leak
+  for (var cid in _chartInstances) {
+    if (_chartInstances[cid]) {
+      _chartInstances[cid].destroy();
+    }
+  }
+  _chartInstances = {};
 }
 
 // ── Main render ──

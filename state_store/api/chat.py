@@ -77,7 +77,6 @@ def _get_principal(request: Request) -> Principal:
         import hashlib
         from datetime import datetime, timezone
 
-        token_ttl_days = getattr(request.app.state, "token_ttl_days", 0)
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         for user in user_store.list_users():
             if user.token_hash == token_hash:
@@ -86,8 +85,10 @@ def _get_principal(request: Request) -> Principal:
                         status_code=403,
                         detail="User account is disabled",
                     )
+                token_ttl_days = getattr(request.app.state, "token_ttl_days", 0)
                 if token_ttl_days > 0:
-                    age = datetime.now(timezone.utc) - user.token_created
+                    issued = user.token_issued_at or user.created_at
+                    age = datetime.now(timezone.utc) - issued
                     if age.days >= token_ttl_days:
                         raise HTTPException(
                             status_code=401,

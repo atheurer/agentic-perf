@@ -97,6 +97,7 @@ def create_app() -> FastAPI:
     )
     app.state.multi_user = multi_user
     app.state.anonymous_read = anonymous_read
+    app.state.token_ttl_days = token_ttl_days
     if anonymous_read:
         logger.info("Anonymous read-only access enabled")
 
