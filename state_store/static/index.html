@@ -1445,8 +1445,8 @@ th.col-right { text-align: right; }
     <div class="chat-bar">
       <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
-      <span class="chat-cost" id="chat-cost"></span>
     </div>
+    <div class="chat-cost" id="chat-cost"></div>
   </div>
   <div id="app"></div>
 </div>
@@ -1623,7 +1623,6 @@ let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
 let renderedEvents = [];
-var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
@@ -2185,6 +2184,7 @@ async function renderDetail(ticketId) {
                 '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
               '</div>' +
+              '<div class="chat-cost" id="ticket-chat-cost"></div>' +
             '</div>' +
             renderDescription(ticket) +
             ownershipHtml +
@@ -2656,12 +2656,6 @@ function mountChart(containerId, chartData) {
         return cfg;
       });
 
-      // Destroy previous chart on this canvas to prevent leak
-      var canvasId = canvas.id || canvas.getAttribute('data-chart-id') || ('chart-' + Math.random());
-      canvas.setAttribute('data-chart-id', canvasId);
-      if (_chartInstances[canvasId]) {
-        _chartInstances[canvasId].destroy();
-      }
       var chartInstance = new Chart(canvas, {
         type: panel.type || chartData.type || 'line',
         data: { labels: chartData.labels || [], datasets: datasets },
@@ -2718,7 +2712,6 @@ function mountChart(containerId, chartData) {
         updateSyncCrosshair(null);
       });
 
-      _chartInstances[canvasId] = chartInstance;
       renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
       window._cdmSyncGroups[syncGroupId].push({
         chart: chartInstance,
@@ -2758,9 +2751,6 @@ function mountChart(containerId, chartData) {
     return cfg;
   });
 
-  // Destroy previous chart on this canvas
-  var cid = canvas.id || 'usage-chart';
-  if (_chartInstances[cid]) { _chartInstances[cid].destroy(); }
   var chartInstance = new Chart(canvas, {
     type: chartData.type || 'bar',
     data: { labels: chartData.labels || [], datasets: datasets },
@@ -3315,17 +3305,6 @@ function renderNewEvents(events) {
     var evt = events[i];
     if (renderedEvents.indexOf(evt.seq) !== -1) continue;
     renderedEvents.push(evt.seq);
-    // Cap DOM nodes to prevent memory leak from accumulated
-    // event elements. Remove oldest DOM children when over limit.
-    // Tradeoff: oldest events become unviewable without a page
-    // refresh. Scroll position may shift if the user is reading
-    // older events. A virtualized scroll approach would be ideal
-    // but requires a significant JS refactor.
-    if (container.children.length > 2000) {
-      while (container.children.length > 1500) {
-        container.removeChild(container.firstChild);
-      }
-    }
     var html = renderEvent(evt);
     if (html) container.insertAdjacentHTML('beforeend', html);
   }
@@ -3811,14 +3790,6 @@ function stopPolling() {
   pollPaused = false;
   lastSeq = 0;
   renderedEvents = [];
-
-  // Destroy all chart instances to prevent memory leak
-  for (var cid in _chartInstances) {
-    if (_chartInstances[cid]) {
-      _chartInstances[cid].destroy();
-    }
-  }
-  _chartInstances = {};
 }
 
 // ── Main render ──
@@ -3891,12 +3862,22 @@ function appendChatMessage(containerId, role, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-function updateChatCost(usage) {
-  var el = document.getElementById('chat-cost');
-  if (el && usage) {
-    var tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0);
-    el.textContent = tokens > 0 ? tokens.toLocaleString() + ' tokens' : '';
-  }
+function updateChatCost(usage, elId) {
+  var el = document.getElementById(elId || 'chat-cost');
+  if (!el || !usage) return;
+  var calls = usage.llm_calls || 0;
+  if (calls === 0) { el.innerHTML = ''; return; }
+  var total = usage.total_tokens || 0;
+  var model = usage.model || '';
+  var cachePctStr = fmtCachePct(usage);
+  var parts = [];
+  if (model) parts.push('<span style="color:var(--text-muted)">' + escHtml(model) + '</span>');
+  parts.push('<span style="color:var(--cyan)">' + total.toLocaleString() + '</span> tokens');
+  if (cachePctStr) parts.push('<span style="color:var(--text-muted)">(' + cachePctStr + ')</span>');
+  parts.push('<span style="color:var(--green)">' + calls + '</span> calls');
+  var cost = usage.estimated_cost_usd || 0;
+  if (cost > 0) parts.push('<span style="color:var(--yellow)">' + fmtCost(cost) + '</span>');
+  el.innerHTML = parts.join(' &middot; ');
 }
 
 async function sendChatMessage() {
@@ -3926,13 +3907,23 @@ async function sendChatMessage() {
       appendChatMessage('chat-messages', 'assistant', data.response || '');
       updateChatCost(data.usage || {});
     } else {
-      appendChatMessage('chat-messages', 'system', 'Error: ' + r.status);
+      var errMsg = 'Something went wrong (HTTP ' + r.status + '). ';
+      if (r.status === 504 || r.status === 408) {
+        errMsg = 'The request timed out. Try a simpler question, or break your request into smaller steps.';
+      } else if (r.status === 503) {
+        errMsg = 'Chat agent is not available. Check that chat is enabled in the configuration.';
+      } else if (r.status === 401) {
+        errMsg = 'Authentication required. Please log in to use the chat.';
+      } else if (r.status === 429) {
+        errMsg = 'Rate limit reached. Please wait a moment and try again.';
+      }
+      appendChatMessage('chat-messages', 'system', errMsg);
     }
   } catch(e) {
     var container = document.getElementById('chat-messages');
     var thinking = container.querySelector('.chat-msg.system:last-child');
     if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
-    appendChatMessage('chat-messages', 'system', 'Connection error');
+    appendChatMessage('chat-messages', 'system', 'Connection error. The server may be restarting — try again in a moment.');
   }
   btn.disabled = false;
   input.focus();
@@ -3960,8 +3951,12 @@ async function sendTicketChatMessage() {
     if (r.ok) {
       var data = await r.json();
       appendChatMessage('ticket-chat-messages', 'assistant', data.response || '');
+      updateChatCost(data.usage || {}, 'ticket-chat-cost');
     } else {
-      appendChatMessage('ticket-chat-messages', 'system', 'Error: ' + r.status);
+      var tErr = r.status === 504 || r.status === 408
+        ? 'Request timed out. Try a simpler question.'
+        : 'Something went wrong (HTTP ' + r.status + ')';
+      appendChatMessage('ticket-chat-messages', 'system', tErr);
     }
   } catch(e) {
     var container = document.getElementById('ticket-chat-messages');
