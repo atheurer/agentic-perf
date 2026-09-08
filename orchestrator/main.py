@@ -64,6 +64,7 @@ def _make_llm_factory(config: OrchestratorConfig):
             config,
             provider=agent_cfg.get("provider", ""),
             model=agent_cfg.get("model", ""),
+            api=agent_cfg.get("api", ""),
         )
         provider.default_timeout = config.llm_timeout
         effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
