@@ -101,7 +101,7 @@ def _fresh_config(fallback: OrchestratorConfig) -> OrchestratorConfig:
         try:
             text = CONFIG_PATH.read_text(encoding="utf-8")
             raw = json.loads(text)
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             if _last_good_config is not None:
                 logger.warning(
                     "Config reload failed (%s); using last good config",

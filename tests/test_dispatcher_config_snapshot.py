@@ -65,6 +65,27 @@ class TestFreshConfig:
 
         assert result is fallback
 
+    def test_invalid_utf8_uses_last_good(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_bytes(b"\x80\x81\x82")
+
+        last_good = _make_config({"llm": {"model": "last-good-model"}})
+        fallback = _make_config({})
+        with patch("paths.CONFIG_PATH", cfg_file):
+            result = self._call_fresh(fallback, last_good=last_good)
+
+        assert result is last_good
+
+    def test_invalid_utf8_no_last_good_uses_fallback(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_bytes(b"\x80\x81\x82")
+
+        fallback = _make_config({"llm": {"model": "fallback-model"}})
+        with patch("paths.CONFIG_PATH", cfg_file):
+            result = self._call_fresh(fallback, last_good=None)
+
+        assert result is fallback
+
     def test_missing_file_uses_last_good(self, tmp_path):
         cfg_file = tmp_path / "nonexistent.json"
 
