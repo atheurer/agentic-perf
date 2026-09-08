@@ -98,6 +98,33 @@ class TestGuidanceSummaryDeterministic:
         summary = agent._build_guidance_summary_deterministic(ticket, [])
         assert summary["reason"] == "handoff_blocked"
 
+    def test_rate_limit_reason(self):
+        agent = _make_agent()
+        ticket = _make_ticket(
+            comments=[
+                {
+                    "author": "system",
+                    "body": "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Resource exhausted.'}}",
+                },
+            ]
+        )
+        summary = agent._build_guidance_summary_deterministic(ticket, [])
+        assert summary["reason"] == "rate_limit"
+        assert any("rate limit" in a.lower() for a in summary["suggested_actions"])
+
+    def test_rate_limit_quota_reason(self):
+        agent = _make_agent()
+        ticket = _make_ticket(
+            comments=[
+                {
+                    "author": "system",
+                    "body": "LLM quota exceeded for project",
+                },
+            ]
+        )
+        summary = agent._build_guidance_summary_deterministic(ticket, [])
+        assert summary["reason"] == "rate_limit"
+
     def test_unknown_with_no_comments(self):
         agent = _make_agent()
         ticket = _make_ticket(comments=[])
