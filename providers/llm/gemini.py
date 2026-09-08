@@ -110,8 +110,10 @@ class GeminiLLMProvider(LLMProvider):
                 project=project_id,
                 location=region,
             )
+            self._is_vertex = True
         else:
             self._client = genai.Client(api_key=api_key)
+            self._is_vertex = False
 
         self._model = model
 
@@ -137,9 +139,23 @@ class GeminiLLMProvider(LLMProvider):
                 types.AutomaticFunctionCallingConfig(disable=True)
             )
         if self.reasoning_effort is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_level=self.reasoning_effort,
-            )
+            if self._is_vertex:
+                # Vertex AI uses thinkingBudget (token count)
+                # instead of thinking_level (named levels).
+                _EFFORT_TO_BUDGET = {
+                    "minimal": 1024,
+                    "low": 2048,
+                    "medium": 8192,
+                    "high": 24576,
+                }
+                budget = _EFFORT_TO_BUDGET.get(self.reasoning_effort, 8192)
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinkingBudget=budget
+                )
+            else:
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=self.reasoning_effort,
+                )
 
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:
