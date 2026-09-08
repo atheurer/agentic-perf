@@ -115,6 +115,16 @@ _LOCAL_TOOLS = [
                                 "type": "string",
                                 "description": "OS requirement (e.g. 'RHEL9')",
                             },
+                            "host": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": (
+                                    "Exact FQDN or IP of an existing host "
+                                    "the user named, copied VERBATIM "
+                                    "(case, domain suffixes). Omit for "
+                                    "hosts a provider will allocate."
+                                ),
+                            },
                         },
                         "required": ["roles"],
                     },
@@ -124,10 +134,15 @@ _LOCAL_TOOLS = [
                         "Always include a controller. A host can serve "
                         "multiple roles (e.g. controller + client). "
                         "Attach hardware specs the user requested to "
-                        "the relevant host entries. "
-                        "Example: [{roles: [controller], min_memory_gb: 16}, "
+                        "the relevant host entries. When the user names "
+                        "specific existing hosts, set 'host' to the "
+                        "exact FQDN or IP — never paraphrase, truncate, "
+                        "or resolve. "
+                        "Example: [{roles: [controller], host: "
+                        "'ctrl-01.lab.example.com'}, "
                         "{roles: [client], nic_speed: 25, os: 'RHEL9'}, "
-                        "{roles: [server], nic_speed: 25, os: 'RHEL9'}]"
+                        "{roles: [server], host: "
+                        "'node-42.lab.example.com'}]"
                     ),
                 },
                 "directives": {

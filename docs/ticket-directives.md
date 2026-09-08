@@ -28,6 +28,13 @@ Pipeline fields must not be put inside `directives`. Triage writes derived
 same-named inferred directives; `image_version` and `serial_capture` may
 also be promoted from top-level custom fields for compatibility.
 
+### Structured host identities
+
+Each `required_hosts` entry may carry an optional `host` field — the exact
+FQDN or IP of a user-provided existing machine. Handoff validation enforces
+that every `host` identity appears verbatim in `assigned_hardware_ips`.
+Entries without `host` are provider-allocated and unconstrained.
+
 ## Submitting Directives
 
 ### Via API
