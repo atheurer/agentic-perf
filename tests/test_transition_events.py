@@ -146,6 +146,36 @@ async def test_no_event_without_event_bus() -> None:
     assert result["status"] == "awaiting_hardware"
 
 
+async def test_terminal_events_preserved_beyond_limit(
+    event_bus: EventBus,
+    tmp_path: Path,
+) -> None:
+    """Terminal events are returned even when total events exceed the limit."""
+    tid = "PERF-TERM"
+    for i in range(250):
+        event_bus.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
+    event_bus.emit(tid, "test-agent", "agent_finished", {})
+
+    events = event_bus.get_events(tid, since=0, limit=200)
+    event_types = [e.get("event_type") for e in events]
+    assert "agent_finished" in event_types
+    assert event_types.count("tool_called") == 200
+
+
+async def test_terminal_events_not_duplicated_within_limit(
+    event_bus: EventBus,
+) -> None:
+    """When events fit within limit, terminal events are not duplicated."""
+    tid = "PERF-NODUP"
+    for i in range(10):
+        event_bus.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
+    event_bus.emit(tid, "test-agent", "agent_finished", {})
+
+    events = event_bus.get_events(tid, since=0, limit=200)
+    finished = [e for e in events if e.get("event_type") == "agent_finished"]
+    assert len(finished) == 1
+
+
 async def test_store_no_double_emit_on_consecutive_transitions(
     event_bus: EventBus,
     tmp_path: Path,

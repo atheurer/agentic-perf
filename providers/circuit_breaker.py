@@ -179,10 +179,20 @@ class CircuitBreakerState:
         return self._consecutive.get(tool_name, 0)
 
 
+_FALSY_STRINGS = frozenset(("false", "0", "no", "off", ""))
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Coerce a value to bool, treating string 'false'/'0'/'no'/'off' as False."""
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSY_STRINGS
+    return bool(value)
+
+
 def _coerce_config(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize and type-coerce circuit breaker settings."""
     merged = {k: raw.get(k, v) for k, v in _DEFAULTS.items()}
-    merged["enabled"] = bool(merged["enabled"])
+    merged["enabled"] = _coerce_bool(merged["enabled"])
     try:
         merged["threshold"] = int(merged["threshold"])
     except (TypeError, ValueError):

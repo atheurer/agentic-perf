@@ -366,6 +366,50 @@ class TestConfigMerging:
         )
         assert result["threshold"] == 7
 
+    def test_string_false_disables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "false"}},
+        )
+        assert result["enabled"] is False
+
+    def test_string_zero_disables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "0"}},
+        )
+        assert result["enabled"] is False
+
+    def test_string_no_disables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "no"}},
+        )
+        assert result["enabled"] is False
+
+    def test_string_off_disables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "off"}},
+        )
+        assert result["enabled"] is False
+
+    def test_string_true_enables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "true"}},
+        )
+        assert result["enabled"] is True
+
+    def test_string_one_enables(self):
+        result = circuit_breaker_from_config(
+            {"circuit_breaker": {"enabled": "1"}},
+        )
+        assert result["enabled"] is True
+
+    def test_custom_fields_string_false_disables(self):
+        config_cb = circuit_breaker_from_config({})
+        result = circuit_breaker_from_custom_fields(
+            {"circuit_breaker": {"enabled": "false"}},
+            config_cb,
+        )
+        assert result["enabled"] is False
+
 
 # ── Integration with agent loop ────────────────────────────────
 

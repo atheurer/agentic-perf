@@ -32,6 +32,15 @@ EVENT_TYPES = {
     "circuit_breaker",
 }
 
+TERMINAL_EVENTS = frozenset(
+    {
+        "agent_finished",
+        "agent_aborted",
+        "agent_error",
+        "agent_stopped",
+    }
+)
+
 
 class Event:
     __slots__ = ("seq", "timestamp", "ticket_id", "agent", "event_type", "data")
@@ -387,7 +396,13 @@ class EventBus:
         seen_seqs = {e["seq"] for e in in_memory}
         merged = in_memory + [e for e in from_file if e["seq"] not in seen_seqs]
         merged.sort(key=lambda e: e["seq"])
-        return merged[:limit]
+        if len(merged) <= limit:
+            return merged
+        head = merged[:limit]
+        tail_terminal = [
+            e for e in merged[limit:] if e.get("event_type") in TERMINAL_EVENTS
+        ]
+        return head + tail_terminal
 
     def _read_from_file(
         self,
