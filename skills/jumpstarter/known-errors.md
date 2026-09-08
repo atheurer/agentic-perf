@@ -32,6 +32,31 @@ process on the exporter host. Retrying or power cycling
 will not help. Report the failure and request a different
 board.
 
+## Boot Failure Diagnosis via Serial Capture
+
+When `serial_capture: true` is set in ticket directives,
+the platform agent captures serial output during the
+flash→boot→verify sequence. On provisioning failure,
+the last 2000 characters of serial output are included
+in the diagnostics.
+
+Common serial output patterns:
+
+- **`ApplyOverlay: ufdt apply overlay failed`** — DTB
+  overlay incompatibility. The kernel or DTB in the
+  image does not match the board's firmware expectations.
+  Requires a board-specific DTB overlay.
+- **`Kernel panic`** — Kernel crash during boot. Check
+  for driver incompatibilities or missing modules.
+- **No output at all** — Board did not reach firmware
+  stage. May indicate a flash failure or power issue.
+- **Output stops at U-Boot** — Kernel failed to load.
+  Check image format and partition layout.
+
+Serial logs are saved as artifacts at
+`platform-provision/serial-capture.log` and can be
+downloaded from the ticket's artifact list.
+
 ## Lease Cannot Be Satisfied
 
 **Error:** `the lease cannot be satisfied`
