@@ -79,6 +79,7 @@ async def provision_platform(
     if prov == "jumpstarter":
         return await _provision_jumpstarter(
             cf,
+            ticket_id=_ticket.get("id", ""),
             image_variant=image_variant,
             flash_timeout=flash_timeout_seconds,
             boot_wait=boot_wait_seconds,
@@ -89,6 +90,7 @@ async def provision_platform(
 
 async def _provision_jumpstarter(
     cf: dict[str, Any],
+    ticket_id: str = "",
     image_variant: str = "",
     flash_timeout: int = 600,
     boot_wait: int = 60,
@@ -166,7 +168,9 @@ async def _provision_jumpstarter(
     serial_enabled = directives.get("serial_capture", False)
     artifact_dir = ""
     if serial_enabled:
-        ticket_id = cf.get("ticket_id", "") or metadata.get("ticket_id", "")
+        ticket_id = (
+            ticket_id or cf.get("ticket_id", "") or metadata.get("ticket_id", "")
+        )
         if ticket_id:
             from paths import create_artifact_dir
 

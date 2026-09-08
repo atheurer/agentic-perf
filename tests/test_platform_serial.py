@@ -197,7 +197,6 @@ class TestPlatformServerSerialPassthrough:
     @pytest.fixture
     def cf_with_serial(self, tmp_path):
         return {
-            "ticket_id": "PERF-TEST123",
             "resource_provider": "jumpstarter",
             "resource_provider_metadata": {
                 "lease_id": "test-lease-123",
@@ -217,7 +216,7 @@ class TestPlatformServerSerialPassthrough:
     @pytest.mark.asyncio
     async def test_server_passes_serial_params(self, cf_with_serial, tmp_path):
         """Platform server passes serial_capture and artifact_dir."""
-        from agents.platform.server import _provision_jumpstarter
+        from agents.platform import server
 
         fake_result = FakeProvisionResult(success=True, ip="10.0.0.1")
 
@@ -231,8 +230,14 @@ class TestPlatformServerSerialPassthrough:
                 "paths.create_artifact_dir",
                 return_value=tmp_path,
             ),
+            patch.object(
+                server,
+                "_ticket",
+                {"id": "PERF-TEST123", "custom_fields": cf_with_serial},
+            ),
+            patch.object(server, "_ensure_init", new_callable=AsyncMock),
         ):
-            await _provision_jumpstarter(cf_with_serial)
+            await server.provision_platform()
 
             mock_provision.assert_called_once()
             kwargs = mock_provision.call_args
