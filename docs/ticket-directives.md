@@ -214,11 +214,17 @@ Progress is tracked in `custom_fields.fleet_investigation`:
 Or describe it naturally — the triage agent will detect custom
 build requirements and set the directives.
 
+### Diagnostics (Jumpstarter)
+
+| Directive | Description | Examples |
+|---|---|---|
+| `serial_capture` | Capture serial output during provisioning and benchmark. During provisioning, serial output is saved to `platform-provision/serial-capture.log` in the ticket's artifact directory. On provisioning failure, the last 2000 characters are included in diagnostics. During benchmarks, enables passive serial capture alongside SSH-based reboots. | `true`, `false` |
+
 ### Boot-Time Specific
 
 | Directive | Description | Examples |
 |---|---|---|
-| `jumpstarter_serial` | Enable serial capture during boot test | `true`, `false` |
+| `jumpstarter_serial` | Enable *active* serial capture during boot-time measurement (replaces SSH-based reboot with serial-based). Mutually exclusive with passive `serial_capture` during benchmark. | `true`, `false` |
 | `ssh_password` | Override default SSH password | `password` |
 | `system_config` | Post-flash system configuration operations | See below |
 

@@ -161,6 +161,17 @@ async def _provision_jumpstarter(
         provision_jumpstarter,
     )
 
+    # Resolve artifact directory for serial capture
+    directives = cf.get("directives", {})
+    serial_enabled = directives.get("serial_capture", False)
+    artifact_dir = ""
+    if serial_enabled:
+        ticket_id = cf.get("ticket_id", "") or metadata.get("ticket_id", "")
+        if ticket_id:
+            from paths import create_artifact_dir
+
+            artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
+
     result = await provision_jumpstarter(
         lease_name=lease_id,
         flash_url=flash_url,
@@ -168,6 +179,8 @@ async def _provision_jumpstarter(
         ssh_key_path=ssh_key_path,
         board_name=board_name,
         selector=selector,
+        serial_capture=serial_enabled,
+        artifact_dir=artifact_dir,
     )
 
     return json.dumps(
@@ -180,6 +193,7 @@ async def _provision_jumpstarter(
             "diagnostics": result.diagnostics,
             "flash_duration_s": result.flash_duration_s,
             "boot_duration_s": result.boot_duration_s,
+            "serial_log_path": result.serial_log_path,
         }
     )
 

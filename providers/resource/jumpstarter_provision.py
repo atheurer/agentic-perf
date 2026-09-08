@@ -43,6 +43,7 @@ class ProvisionResult:
     diagnostics: list[str] = field(default_factory=list)
     flash_duration_s: float = 0.0
     boot_duration_s: float = 0.0
+    serial_log_path: str = ""
 
 
 async def provision_jumpstarter(
@@ -53,6 +54,8 @@ async def provision_jumpstarter(
     board_name: str = "",
     client_config_path: str = "",
     selector: str = "",
+    serial_capture: bool = False,
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Run the deterministic flash + boot + verify sequence.
 
@@ -70,6 +73,10 @@ async def provision_jumpstarter(
         board_name: Exporter name for diagnostics.
         client_config_path: Path to Jumpstarter client
             config. Auto-detected if empty.
+        serial_capture: If True, capture serial output
+            during provisioning via jmp serial pipe.
+        artifact_dir: Directory for serial log. Falls
+            back to a temp file if empty.
 
     Returns:
         ProvisionResult with success/failure and diagnostics.
@@ -79,6 +86,51 @@ async def provision_jumpstarter(
         board_name=board_name,
         ssh_key_path=ssh_key_path,
     )
+
+    # ── Serial capture during provisioning ────────────
+    # Capture firmware, bootloader, and kernel messages
+    # during flash/boot/verify. Non-blocking: if serial
+    # fails to start, provisioning continues normally.
+    serial_proc = None
+    serial_log_fh = None
+    serial_log_path = ""
+
+    if serial_capture and lease_name:
+        if artifact_dir:
+            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
+        else:
+            import tempfile
+
+            serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
+        try:
+            serial_log_fh = open(serial_log_path, "w", encoding="utf-8")
+            serial_proc = await asyncio.create_subprocess_exec(
+                "jmp",
+                "shell",
+                f"--lease={lease_name}",
+                "--",
+                "j",
+                "serial",
+                "pipe",
+                stdout=serial_log_fh,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            logger.info(
+                "[platform] Serial capture started (lease=%s, pid=%s, log=%s)",
+                lease_name,
+                serial_proc.pid,
+                serial_log_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "[platform] Failed to start serial capture: %s",
+                e,
+            )
+            serial_proc = None
+            if serial_log_fh:
+                serial_log_fh.close()
+                serial_log_fh = None
 
     try:
         # Run the blocking Jumpstarter SDK calls in a
@@ -94,15 +146,47 @@ async def provision_jumpstarter(
             client_config_path,
             selector,
         )
-        return prov_result
+        result = prov_result
     except Exception as exc:
         diag.append(f"Provisioning exception: {exc}")
-        result.diagnostics = diag
-        logger.exception(
-            "[platform] Provisioning failed for %s",
-            board_name,
+    finally:
+        # ── Stop serial capture ──────────────────────
+        if serial_proc:
+            try:
+                serial_proc.terminate()
+                await asyncio.wait_for(serial_proc.wait(), timeout=5)
+            except Exception:
+                serial_proc.kill()
+        if serial_log_fh:
+            serial_log_fh.close()
+
+    # ── Process serial output ─────────────────────
+    if serial_proc and serial_log_path:
+        result.serial_log_path = serial_log_path
+        logger.info(
+            "[platform] Serial capture saved to %s",
+            serial_log_path,
         )
-        return result
+        if not result.success:
+            try:
+                log_text = Path(serial_log_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                if log_text.strip():
+                    tail = log_text[-2000:]
+                    result.diagnostics.append(
+                        f"Serial output (last 2000 chars):\n{tail}"
+                    )
+                else:
+                    result.diagnostics.append(
+                        "Serial: no output captured (board may not have booted)"
+                    )
+            except Exception:
+                pass
+
+    if diag:
+        result.diagnostics.extend(diag)
+    return result
 
 
 def _provision_sync(

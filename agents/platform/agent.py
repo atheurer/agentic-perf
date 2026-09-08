@@ -186,6 +186,8 @@ class PlatformAgent(AgentBase):
             fields["platform_flash_duration_s"] = result["flash_duration_s"]
         if result.get("boot_duration_s"):
             fields["platform_boot_duration_s"] = result["boot_duration_s"]
+        if result.get("serial_log_path"):
+            fields["platform_serial_log"] = result["serial_log_path"]
 
         await self._update_fields(ticket_id, fields)
 
