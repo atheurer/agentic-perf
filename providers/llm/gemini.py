@@ -187,9 +187,7 @@ class GeminiLLMProvider(LLMProvider):
             # the SDK may also raise ServerError or APIError
             # for rate limits depending on the backend.
             if getattr(exc, "code", None) == 429:
-                raise LLMRateLimitError(
-                    f"gemini/{self._model}"
-                ) from exc
+                raise LLMRateLimitError(f"gemini/{self._model}") from exc
             raise
         return self._parse_response(response, tool_call_names, model=self._model)
 
