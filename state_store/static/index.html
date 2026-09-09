@@ -3507,7 +3507,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml(data.details || '') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -3574,7 +3574,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        if (display.length > 200) display = display.substring(0, 200) + '...';
+        if (display.length > 500) display = display.substring(0, 500) + '...';
         dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + escHtml(display) + '</div>';
       });
       dataHtml += '</div>';
