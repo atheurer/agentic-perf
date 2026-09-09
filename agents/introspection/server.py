@@ -625,6 +625,29 @@ def _detect_anomalies_from_events(
                 # Only flag once per lookup→action sequence.
                 lookup_failed = False
 
+    # --- Empty LLM responses ---
+    # Flag when a model returns 0 output tokens. This is
+    # a model reliability issue (observed with Gemini) that
+    # wastes an iteration and may cause agent failure.
+    for evt in events:
+        if (
+            evt.get("event_type") == "agent_error"
+            and evt.get("data", {}).get("reason") == "empty_response"
+        ):
+            agent = evt.get("agent", "?")
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "type": "empty_llm_response",
+                    "message": (
+                        f"Agent '{agent}' received an empty "
+                        f"response (0 output tokens) from the "
+                        f"LLM. The model may be experiencing "
+                        f"reliability issues."
+                    ),
+                }
+            )
+
     return anomalies
 
 
