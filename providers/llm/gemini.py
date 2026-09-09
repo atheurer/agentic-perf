@@ -19,6 +19,7 @@ from typing import Any
 
 from .base import (
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolCall,
@@ -162,24 +163,32 @@ class GeminiLLMProvider(LLMProvider):
                 )
 
         effective_timeout = self._resolve_timeout(timeout)
-        if effective_timeout == 0:
-            response = await self._client.aio.models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-            return self._parse_response(response, tool_call_names, model=self._model)
         try:
-            response = await asyncio.wait_for(
-                self._client.aio.models.generate_content(
+            if effective_timeout == 0:
+                response = await self._client.aio.models.generate_content(
                     model=self._model,
                     contents=contents,
                     config=types.GenerateContentConfig(**config_kwargs),
-                ),
-                timeout=effective_timeout,
-            )
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._client.aio.models.generate_content(
+                        model=self._model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    ),
+                    timeout=effective_timeout,
+                )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"gemini/{self._model}") from None
+        except Exception as exc:
+            # Gemini SDK raises google.genai.errors.ClientError
+            # for 429 RESOURCE_EXHAUSTED. Catch broadly because
+            # the SDK may also raise ServerError or APIError
+            # for rate limits depending on the backend.
+            if getattr(exc, "code", None) == 429:
+                raise LLMRateLimitError(f"gemini/{self._model}") from exc
+            raise
         return self._parse_response(response, tool_call_names, model=self._model)
 
     @staticmethod
