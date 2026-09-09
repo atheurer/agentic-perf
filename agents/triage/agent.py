@@ -451,8 +451,20 @@ class TriageAgent(AgentBase):
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(triage_server, name="triage")
-        await mcp.connect(infra_server, name="infra")
+        await mcp.connect_ticket_server(
+            triage_server,
+            name="triage",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
+        await mcp.connect_ticket_server(
+            infra_server,
+            name="infra",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
@@ -610,6 +622,10 @@ class TriageAgent(AgentBase):
             "required_hosts": required_hosts,
             "directives": directives,
         }
+        if hasattr(self._skill_provider, "get_source_provenance"):
+            source_provenance = self._skill_provider.get_source_provenance("crucible")
+            if source_provenance:
+                fields["crucible_source"] = source_provenance
 
         scoped_context = result.get("scoped_context")
         if scoped_context and isinstance(scoped_context, dict):

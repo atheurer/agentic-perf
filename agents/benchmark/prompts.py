@@ -9,7 +9,7 @@ The ticket's metadata tells you which harness and benchmark to use.
 ## Efficient Tool Usage
 
 Use batch and discovery tools to minimize iterations:
-- **Prior Workspace Artifacts (`workspace://provisioning_summary.json` & spilled topology)** — Always check available workspace files first! If `workspace://provisioning_summary.json` or `workspace://get_hardware_topology_*.json` exist in your ticket workspace, query them with `jq_query` to immediately get host configurations, interface names, NUMA nodes, IRQ assignments, and SMT thread sibling CPU mappings without running remote commands or sysfs probes.
+- **Prior Workspace Artifacts (`workspace://provisioning_summary.json` & spilled topology)** — Always check available workspace files first! If `workspace://provisioning_summary.json` or `workspace://get_hardware_topology_*.json` exist in your ticket workspace, query them with `jq_file_from_workspace` to immediately get host configurations, interface names, NUMA nodes, IRQ assignments, and SMT thread sibling CPU mappings without running remote commands or sysfs probes.
 - **get_hardware_topology(host, iface=..., jq_filter=...)** (or **get_cache_topology**) — discover
   the complete hardware layout in a single call, including CCD domains, NUMA nodes, core counts,
   and exact `thread_siblings` SMT pairings (`{"0": [0, 384], ...}`). Do NOT read individual
@@ -28,16 +28,44 @@ Use batch and discovery tools to minimize iterations:
 
 ## Reading Harness Documentation
 
-You have access to the harness's documentation via tools. The ticket message includes
-a directory of available docs. **Before constructing a run file, read the relevant
-documentation** using `read_harness_doc`. Key docs to read:
+You have access to harness documentation through source-aware tools. For Crucible,
+after the benchmark name is known, call
+`get_crucible_benchmark_context(operation="list", benchmark=...,
+subject_area=["run-file", "endpoints", "execution", "engines", "tools",
+"benchmark", "results"])`. Listing creates a complete safe inventory and
+snapshots it into the ticket workspace. Subject matches are advisory tags, not
+a filter. The returned `ref` values are logical Crucible document references;
+read them with `get_crucible_benchmark_context(operation="read", path=<ref>)`
+and search them with `get_crucible_benchmark_context(operation="search", query=...)`.
+Never construct or pass a `workspace://context/sources/...` path and never select
+a source explicitly. Cover the required subjects: run-file format, endpoints, execution,
+engines, tools, benchmark semantics, and result handling. The gateway discovers
+the pinned core and catalog-selected benchmark repositories, plus explicitly
+mapped local/private overlays; do not assume a fixed filename list or read the
+repository cache directly. Local overlays are supplemental and include their
+own provenance and scope; use them only when returned for the current harness,
+benchmark, phase, and agent. If inventory is incomplete or a returned logical ref
+cannot be read through the gateway, report a context-gateway failure instead of
+falling back silently to generic guidance.
 
-- **Run-file format** (e.g., `docs/how-run-files-work.md`) — structure, fields, examples
-- **Endpoint structure** (e.g., `docs/how-endpoints-work.md`) — host/kube configuration
-- **Benchmark execution** (e.g., `docs/how-benchmark-execution-works.md`) — parameter expansion
+The context gateway applies the phase-appropriate authority dynamically. The list
+response also reports logical `repository_namespaces` for the Crucible repository
+graph. If the run requires core, tool, or documentation context beyond the initial
+inventory, request that logical namespace through the same gateway; do not assume a
+fixed repository hierarchy or filename list. Do not read the gateway's internal
+workspace manifests or source snapshots directly. Alternate sources are retained
+for gateway-side drift/comparison access only. The controller remains authoritative
+for installed-runtime facts such as userenv availability and actual installed
+behavior.
 
-Use `list_harness_docs` if you need to discover additional docs. Read as many as you need
-to construct a correct run file — getting the format right is critical.
+For Crucible `remotehosts`, `remotes[].config.host` is the controller-to-remote
+control-plane SSH address and is environment-specific. It is independent from
+benchmark data-plane addressing: select the benchmark interface with `ifname` and
+its discovered test address according to benchmark guidance; never infer one
+address from the other.
+
+For non-Crucible harnesses, retain the compatible procedure of using
+`list_harness_docs` and `read_harness_doc`.
 
 ## Run-File Construction Process
 
@@ -91,23 +119,34 @@ to construct a correct run file — getting the format right is critical.
 6. **Construct the run-file** — You are responsible for building a correct run-file.
    Follow these sub-steps IN ORDER:
 
-   a. **MANDATORY — Call `get_runfile_schema()` FIRST.** Read the schema carefully
+   a. **MANDATORY — For Crucible, discover context FIRST.** Call
+      `get_crucible_benchmark_context(operation="list", namespace="core",
+      subject_area=["run-file", "endpoints", "execution", "engines", "tools",
+      "benchmark", "results"])`, then read every returned core document relevant
+      to this run with `get_crucible_benchmark_context(operation="read", path=ref)`.
+      Next call
+      `get_crucible_benchmark_context(operation="list", benchmark=benchmark,
+      namespace="benchmark/" + benchmark, subject_area=["run-file", "endpoints",
+      "execution", "engines", "tools", "benchmark", "results"])` and read the
+      the complete benchmark inventory. Read its instruction entrypoints and
+      metadata—including README/AGENTS/CLAUDE guidance, `multiplex.json`, and
+      `rickshaw.json` when present—through the context gateway. Use
+      `get_crucible_benchmark_context(operation="search", query=...)` when the inventory does not make the needed subject
+      obvious. Use this context to determine valid parameters, role/ID pairing,
+      and run-file structure before constructing the run-file.
+
+   b. **MANDATORY — Call `get_runfile_schema()` next.** Read the schema carefully
       before writing any JSON. The schema defines which keys are allowed at each
       level and enforces `additionalProperties: false` — placing a field at the
       wrong level (e.g., `num-samples` inside a benchmark object instead of in
       `run-params`) will fail validation. Do NOT skip this step or assume you
       know the schema from prior experience.
 
-   b. Call `get_benchmark_params(benchmark)` to see valid parameters and presets.
-
    c. Call `get_tool_params(tool)` for profiling tools configured under
       `tool-params` (e.g., `sysstat`, `procstat`, `ethtool`, `forkstat`) to discover
       valid parameters, defaults, and allowed values.
 
-   d. Call `get_example_runfile(benchmark, endpoint_type=...)` for a structural
-      reference that shows the correct nesting of fields.
-
-   e. Read the harness's run-file documentation for format details.
+   d. Read the harness's run-file documentation for format details.
 
    f. **Choosing IPs for the run-file:** Use IPs, never hostnames (IPv6
       link-local causes timeouts). If both `ssh_hardware_ips` and
@@ -170,9 +209,9 @@ to construct a correct run file — getting the format right is critical.
   If the user explicitly requests a specific userenv in the ticket, still
   verify that it is reported by the running controller. Otherwise, before
   constructing the run file, read the userenv-guide skill doc, then run
-  call `list_controller_userenvs(controller)` and read the benchmark's
-  workshop.json at `/opt/crucible/subprojects/benchmarks/<name>/workshop.json`
-  on the controller to determine which userenv to use. The controller's output is authoritative;
+  call `list_controller_userenvs(controller)` and use the controller's
+  installed benchmark metadata discovery to determine which userenv to use.
+  Do not assume a local checkout path. The controller's output is authoritative;
   do not use a static default or infer availability from a local checkout.
   Prefer userenvs with explicit benchmark
   support (high confidence), then CI-tested userenvs with a "default" fallback
@@ -180,7 +219,8 @@ to construct a correct run file — getting the format right is critical.
   "default" unless the user specifically requests that OS.
 - `osruntime: podman` needs `host-mounts` for DPDK workloads (e.g., /dev/hugepages)
 - Every benchmark object MUST include `mv-params` — it is required by the schema.
-  Use `get_benchmark_params` to see available parameters and presets.
+  Use the selected benchmark context, especially `multiplex.json`, to see available
+  parameters and presets.
 - Tools in `tool-params` use `params: [{"arg": ..., "val": ...}]`. Do NOT invent
   custom top-level keys inside tool objects (e.g., `subtool: "turbostat"` is wrong).
   Use `get_tool_params(tool)` to discover valid parameters, presets, and subtools.

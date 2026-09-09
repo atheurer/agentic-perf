@@ -178,16 +178,20 @@ class BenchmarkAgent(AgentBase):
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             bench_server,
             name="benchmark",
-            env={
-                "TICKET_ID": ticket_id,
-                "STATE_STORE_URL": self.store_url,
-                "AGENT_NAME": self.agent_name,
-            },
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
-        await mcp.connect(infra_server, name="infra")
+        await mcp.connect_ticket_server(
+            infra_server,
+            name="infra",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         self._mcp = mcp
 
@@ -237,6 +241,9 @@ class BenchmarkAgent(AgentBase):
             "request_clarification",
         },
     }
+    _HARNESS_EXCLUDED_TOOLS: dict[str, set[str]] = {
+        "crucible": {"read_skills", "list_harness_docs", "read_harness_doc"},
+    }
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Filter tools based on harness type.
@@ -247,6 +254,10 @@ class BenchmarkAgent(AgentBase):
         harness = (
             ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
         )
+        excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
+        if excluded is not None:
+            self.tools = [t for t in self.tools if t.name not in excluded]
+            return
         allowed = self._HARNESS_TOOLS.get(harness)
         if allowed is not None:
             self.tools = [t for t in self.tools if t.name in allowed]
@@ -321,7 +332,7 @@ class BenchmarkAgent(AgentBase):
         harness = cf.get("directives", {}).get("harness", "crucible")
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
-        if skills_dir.is_dir():
+        if harness != "crucible" and skills_dir.is_dir():
             content += f"\n## {harness} Skills (read these first)\n"
             content += "These contain critical lessons from prior runs:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
@@ -335,7 +346,7 @@ class BenchmarkAgent(AgentBase):
         general_dir = (
             Path(__file__).resolve().parent.parent.parent / "skills" / "general"
         )
-        if general_dir.is_dir():
+        if harness != "crucible" and general_dir.is_dir():
             general_files = sorted(general_dir.glob("*.md"))
             if general_files:
                 content += "\n## General Skills\n"
@@ -343,7 +354,9 @@ class BenchmarkAgent(AgentBase):
                     content += f"- `{f.name}`\n"
                 content += "\nUse `read_skills(docs=[{'harness': 'general', 'filename': '...'}])` to read.\n"
 
-        if self._repo_cache:
+        # Crucible documentation is served by the source-aware gateway.  Keep
+        # the generic cache path for harnesses that have not adopted it yet.
+        if self._repo_cache and harness != "crucible":
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"

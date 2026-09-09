@@ -224,13 +224,27 @@ class ReviewAgent(AgentBase):
         eval_server = str(Path(__file__).parent.parent / "evaluate" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             review_server,
             name="review",
-            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
-        await mcp.connect(infra_server, name="infra")
-        await mcp.connect(eval_server, name="evaluate-tools")
+        await mcp.connect_ticket_server(
+            infra_server,
+            name="infra",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
+        await mcp.connect_ticket_server(
+            eval_server,
+            name="evaluate-tools",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Connect any configured external MCP servers
         # (e.g., historical baselines for comparison).
@@ -452,7 +466,9 @@ class ReviewAgent(AgentBase):
                     content += f"- `{f.name}`\n"
                 content += "\nUse `read_skills(docs=[{'harness': 'general', 'filename': '...'}])` to read.\n"
 
-        if self._repo_cache:
+        # Crucible documentation is served by the source-aware gateway; the
+        # legacy cache remains for other harnesses during migration.
+        if self._repo_cache and harness != "crucible":
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"

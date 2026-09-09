@@ -58,7 +58,7 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider()
+    _skill_provider = build_skill_provider(resolve_source=False)
     _secrets_provider = build_secrets_provider()
     _initialized = True
 

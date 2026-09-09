@@ -17,20 +17,34 @@ class RepoCache:
         repo_path = self._dir / name
         if repo_path.exists() and (repo_path / ".git").exists():
             logger.info(f"[repo-cache] Updating {name} from {url}")
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "pull", "--ff-only"],
                 cwd=repo_path,
                 capture_output=True,
                 timeout=60,
             )
+            if result.returncode != 0:
+                stderr = (
+                    result.stderr.decode(errors="replace")
+                    if isinstance(result.stderr, bytes)
+                    else str(result.stderr)
+                )
+                raise RuntimeError(f"failed to refresh {name}: {stderr}")
         else:
             repo_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"[repo-cache] Cloning {name} from {url}")
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "clone", "--depth", "1", url, str(repo_path)],
                 capture_output=True,
                 timeout=120,
             )
+            if result.returncode != 0:
+                stderr = (
+                    result.stderr.decode(errors="replace")
+                    if isinstance(result.stderr, bytes)
+                    else str(result.stderr)
+                )
+                raise RuntimeError(f"failed to clone {name}: {stderr}")
         return repo_path
 
     def get_path(self, name: str) -> Path | None:

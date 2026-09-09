@@ -27,34 +27,49 @@ def setup_project_path() -> str:
     return root
 
 
-def _configured_crucible_source() -> str | None:
-    """Return a configured source checkout or URL for triage discovery."""
+def resolve_crucible_source(repo_cache=None, local_fallback=None, source_url=None):
+    """Resolve an existing local Crucible checkout without network access."""
+    from providers.skills.crucible import CrucibleSourceResolver
+    from providers.skills.repo_cache import RepoCache
+
     source = os.environ.get("CRUCIBLE_SOURCE_REPO")
-    source_url = os.environ.get(
-        "CRUCIBLE_SOURCE_REPO_URL", "https://github.com/perftool-incubator/crucible.git"
-    )
+    # ``source_url`` remains accepted for configuration compatibility, but is
+    # intentionally never used to fetch a repository.
+    source_url = source_url or os.environ.get("CRUCIBLE_SOURCE_REPO_URL")
     try:
         from paths import CONFIG_PATH
 
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
         source = source or config.get("crucible_source_repo")
-        source_url = config.get("crucible_source_repo_url", source_url)
+        source_url = source_url or config.get(
+            "crucible_source_repo_url",
+            config.get("harness_repos", {}).get("crucible"),
+        )
     except (OSError, json.JSONDecodeError):
         pass
-    if source:
-        return source
-
-    from providers.skills.repo_cache import RepoCache
-
-    try:
-        path = RepoCache().ensure_repo("crucible", source_url)
-    except Exception:
-        logger.warning("Unable to refresh Crucible source repository", exc_info=True)
-        return None
-    return str(path) if (path / "config" / "repos.json").is_file() else None
+    source_url = source_url or "https://github.com/perftool-incubator/crucible.git"
+    resolver = CrucibleSourceResolver(
+        repo_cache or RepoCache(), source_url, local_fallback=local_fallback or source
+    )
+    return resolver.resolve()
 
 
-def build_skill_provider(source_repo: str | None = None):
+def _configured_crucible_source() -> str | None:
+    """Compatibility wrapper returning only the resolved source path."""
+    return_path = resolve_crucible_source().path
+    return str(return_path) if return_path else None
+
+
+def build_skill_provider(
+    source_repo: str | None = None,
+    *,
+    crucible_home: str | None = None,
+    repo_cache=None,
+    source_url: str | None = None,
+    zathras_home: str | None = None,
+    resolve_source: bool = True,
+    catalog_only: bool = False,
+):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
     Reads CRUCIBLE_HOME and ZATHRAS_HOME from env vars.
@@ -69,31 +84,31 @@ def build_skill_provider(source_repo: str | None = None):
     from providers.skills.kube_burner import KubeBurnerSkillProvider
     from providers.skills.multi import MultiHarnessSkillProvider
     from providers.skills.private import PrivateSkillProvider
+    from providers.skills.repo_cache import RepoCache
     from providers.skills.vstorm import VstormSkillProvider
     from providers.skills.zathras import ZathrasSkillProvider
 
-    crucible_home = os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
-    source_repo = source_repo or os.environ.get("CRUCIBLE_SOURCE_REPO")
-    if not source_repo:
-        try:
-            from paths import CONFIG_PATH
-
-            config = (
-                json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
-            )
-            source_repo = config.get("crucible_source_repo")
-        except (OSError, json.JSONDecodeError):
-            source_repo = None
-    if not source_repo:
-        from paths import SKILL_CACHE_DIR
-
-        default_source = SKILL_CACHE_DIR / "crucible"
-        if (default_source / "config" / "repos.json").is_file():
-            source_repo = str(default_source)
-    zathras_home = os.environ.get("ZATHRAS_HOME", "")
+    crucible_home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
+    repo_cache = repo_cache or RepoCache()
+    resolution = (
+        resolve_crucible_source(
+            repo_cache, local_fallback=source_repo, source_url=source_url
+        )
+        if resolve_source
+        else None
+    )
+    zathras_home = (
+        zathras_home if zathras_home is not None else os.environ.get("ZATHRAS_HOME", "")
+    )
 
     harnesses: dict[str, Any] = {
-        "crucible": CrucibleSkillProvider(crucible_home, source_repo=source_repo),
+        "crucible": CrucibleSkillProvider(
+            crucible_home,
+            source_repo=resolution.path if resolution else source_repo,
+            repo_cache=repo_cache,
+            source_provenance=resolution.provenance if resolution else {},
+            catalog_only=catalog_only,
+        ),
         "kube-burner": KubeBurnerSkillProvider(),
         "k8s-netperf": K8sNetperfSkillProvider(),
         "benchmark-runner": BenchmarkRunnerSkillProvider(),
@@ -114,6 +129,417 @@ def build_skill_provider(source_repo: str | None = None):
 
     return MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
+    )
+
+
+_CONTEXT_PRIVATE_KEYS = {
+    "source",
+    "sources",
+    "effective_source",
+    "source_reason",
+    "source_assumption",
+    "provenance",
+    "workspace_ref",
+    "workspace_refs",
+    "alternate_refs",
+}
+
+
+def _public_context_document(document: dict[str, Any]) -> dict[str, Any]:
+    """Remove source and workspace implementation details from a document."""
+    public = {
+        key: value
+        for key, value in document.items()
+        if key not in _CONTEXT_PRIVATE_KEYS
+    }
+    public.pop("source_path", None)
+    return public
+
+
+def _context_manifest(
+    documents: list[dict[str, Any]],
+    *,
+    phase: str,
+    audience: str,
+    benchmark: str,
+    namespace: str,
+    subject_area: str | list[str],
+) -> dict[str, Any]:
+    """Build the model-facing, source-neutral context inventory."""
+    inventory = []
+    for document in documents:
+        public = _public_context_document(document)
+        public.pop("content", None)
+        inventory.append(public)
+    inventory.sort(key=lambda item: item.get("ref", item.get("path", "")))
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "audience": audience,
+        "benchmark": benchmark,
+        "namespace": namespace,
+        "subject_area": subject_area,
+        "document_count": len(inventory),
+        "documents": inventory,
+    }
+
+
+def _public_context_result(
+    result: dict[str, Any],
+    *,
+    phase: str,
+    audience: str,
+    benchmark: str,
+    namespace: str,
+    subject_area: str | list[str],
+    manifest_documents: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return a context result without source-selection implementation data."""
+    public = dict(result)
+    public.pop("effective_source", None)
+    public.pop("source", None)
+    public.pop("sources_considered", None)
+    public.pop("provenance", None)
+    public.pop("selection", None)
+    public.pop("workspace", None)
+    if isinstance(public.get("documents"), list):
+        public["documents"] = [
+            _public_context_document(item)
+            for item in public["documents"]
+            if isinstance(item, dict)
+        ]
+    if isinstance(public.get("document"), dict):
+        public["document"] = _public_context_document(public["document"])
+    if isinstance(public.get("results"), list):
+        public["results"] = [
+            _public_context_document(item) if isinstance(item, dict) else item
+            for item in public["results"]
+        ]
+    documents = manifest_documents or result.get("documents", [])
+    if not documents and isinstance(result.get("context"), dict):
+        documents = [
+            {
+                "ref": f"benchmark/{benchmark}/{path}",
+                "path": f"benchmark/{benchmark}/{path}",
+                "namespace": f"benchmark/{benchmark}",
+            }
+            for path in result["context"]
+        ]
+    public["context_manifest"] = _context_manifest(
+        documents,
+        phase=phase,
+        audience=audience,
+        benchmark=benchmark,
+        namespace=namespace,
+        subject_area=subject_area,
+    )
+    return public
+
+
+def emit_private_tool_audit_event(
+    ticket_id: str,
+    *,
+    agent_name: str,
+    tool_name: str,
+    data: dict[str, Any],
+    event_type: str = "tool_audit",
+) -> None:
+    """Record private tool diagnostics outside the MCP response.
+
+    Local MCP tools can use this for structured diagnostics that must be
+    available to operators but must not become model context.  The payload is
+    redacted and written only to the ticket event log.
+    """
+    if not ticket_id:
+        return
+    import json as _json
+    from datetime import datetime, timezone
+
+    from paths import LOG_DIR
+
+    redactor = _get_progress_redactor()
+    payload = redactor.redact_string(ticket_id, _json.dumps(data, default=str))
+    try:
+        path = LOG_DIR / f"{ticket_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                _json.dumps(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "ticket_id": ticket_id,
+                        "agent": agent_name,
+                        "event_type": event_type,
+                        "data": {"tool": tool_name, "details": _json.loads(payload)},
+                    },
+                    default=str,
+                )
+                + "\n"
+            )
+    except (OSError, ValueError):
+        logger.debug(
+            "Failed to write context audit event for %s", ticket_id, exc_info=True
+        )
+
+
+def _emit_context_audit_event(
+    ticket_id: str,
+    *,
+    agent_name: str,
+    phase: str,
+    benchmark: str,
+    operation: str,
+    namespace: str,
+    result: dict[str, Any],
+) -> None:
+    """Record private Crucible context resolution details."""
+    data = {
+        "benchmark": benchmark,
+        "phase": phase,
+        "operation": operation,
+        "namespace": namespace,
+        "effective_source": result.get("effective_source"),
+        "source": result.get("source"),
+        "source_reason": result.get("source_reason"),
+        "source_assumption": result.get("source_assumption"),
+        "selection": result.get("selection"),
+        "sources_considered": result.get("sources_considered"),
+        "provenance": result.get("provenance"),
+        "workspace_policy": result.get("workspace_policy"),
+        "inventory": result.get("inventory"),
+    }
+    emit_private_tool_audit_event(
+        ticket_id,
+        agent_name=agent_name,
+        tool_name="get_crucible_benchmark_context",
+        event_type="context_resolution",
+        data={key: value for key, value in data.items() if value is not None},
+    )
+
+
+async def crucible_context_gateway(
+    skill_provider: Any,
+    *,
+    ticket_id: str = "",
+    agent_name: str,
+    phase: str,
+    benchmark: str = "",
+    operation: str = "list",
+    namespace: str = "all",
+    path: str = "",
+    subject_area: str | list[str] = "all",
+    include_alternates: bool = False,
+    query: str = "",
+) -> str:
+    """Expose and persist the phase-owned Crucible context gateway.
+
+    Identity is supplied by the server registration, not the LLM.  The
+    workspace manager stamps phase/audience and the gateway's source policy
+    supplies provenance.
+    """
+    provider = (
+        skill_provider.get_provider("crucible")
+        if hasattr(skill_provider, "get_provider")
+        else skill_provider
+    )
+    if provider is None or not hasattr(provider, "get_crucible_context"):
+        return json.dumps({"found": False, "reason": "crucible_gateway_unavailable"})
+    manager = None
+    if ticket_id:
+        from providers.workspace.manager import WorkspaceManager
+
+        manager = WorkspaceManager(
+            ticket_id=ticket_id, agent_name=agent_name, phase=phase
+        )
+        if operation == "read" and path:
+            cached = manager.read_document(path, include_alternates=include_alternates)
+            if cached.get("status") == "ok":
+                return json.dumps(
+                    _public_context_result(
+                        {
+                            "found": True,
+                            "operation": "read",
+                            "document": cached,
+                            "documents": [cached],
+                        },
+                        phase=phase,
+                        audience=manager.audience,
+                        benchmark=benchmark,
+                        namespace=namespace,
+                        subject_area=subject_area,
+                    )
+                )
+        if operation == "search" and manager.context_scope_indexed(namespace):
+            return json.dumps(
+                _public_context_result(
+                    manager.search_documents(
+                        query,
+                        namespace=namespace if namespace != "all" else "",
+                        include_alternates=include_alternates,
+                    ),
+                    phase=phase,
+                    audience=manager.audience,
+                    benchmark=benchmark,
+                    namespace=namespace,
+                    subject_area=subject_area,
+                    manifest_documents=manager.context_manifest(namespace).get(
+                        "documents", []
+                    ),
+                )
+            )
+    requested_operation = operation
+    provider_operation = "list" if operation == "search" else operation
+    result = await provider.get_crucible_context(
+        benchmark or None,
+        operation=provider_operation,
+        namespace=namespace,
+        path=path,
+        subject_area=subject_area,
+        include_alternates=include_alternates,
+        query=query,
+        phase=phase,
+        agent=agent_name,
+        include_content=True,
+    )
+    if ticket_id and result.get("found"):
+        assert manager is not None
+        indexed_documents: list[dict[str, Any]] = []
+        grouped_files: dict[tuple[str, str | None], dict[str, str]] = {}
+        for document in result.get("documents", []):
+            content = document.get("content")
+            if content is None:
+                read_result = await provider.get_crucible_context(
+                    benchmark or None,
+                    operation="read",
+                    namespace=document["namespace"],
+                    path=document.get("ref", document["path"]),
+                    subject_area="all",
+                    include_alternates=include_alternates,
+                    phase=phase,
+                    agent=agent_name,
+                )
+                read_document = read_result.get("document")
+                if isinstance(read_document, dict):
+                    content = read_document.get("content")
+            if content is None:
+                continue
+            document_source = document.get(
+                "source", result.get("effective_source", "github")
+            )
+            document_benchmark = document.get("benchmark")
+            doc_namespace = document.get("namespace", "")
+            if doc_namespace.startswith("benchmark/"):
+                _, document_benchmark = doc_namespace.split("/", 1)
+            group = (document_source, document_benchmark)
+            grouped_files.setdefault(group, {})[document["source_path"]] = content
+
+        refs: list[str] = []
+        saved_groups: dict[tuple[str, str | None], dict[str, Any]] = {}
+        for (source, document_benchmark), files in grouped_files.items():
+            provenance = next(
+                (
+                    item.get("provenance", {})
+                    for item in result.get("documents", [])
+                    if item.get("source", result.get("effective_source")) == source
+                    and (
+                        item.get("namespace") == f"benchmark/{document_benchmark}"
+                        if document_benchmark
+                        else not str(item.get("namespace", "")).startswith("benchmark/")
+                    )
+                ),
+                {},
+            )
+            saved = manager.save_source_snapshot(
+                source, provenance, files, benchmark=document_benchmark
+            )
+            saved_groups[(source, document_benchmark)] = saved
+            refs.extend(saved["files"].values())
+
+        for document in result.get("documents", []):
+            source = document.get("source", result.get("effective_source", "github"))
+            document_benchmark = document.get("benchmark")
+            if str(document.get("namespace", "")).startswith("benchmark/"):
+                _, document_benchmark = document["namespace"].split("/", 1)
+            saved = saved_groups.get((source, document_benchmark))
+            workspace_ref = (saved or {}).get("files", {}).get(document["source_path"])
+            if not workspace_ref:
+                continue
+            indexed = dict(document)
+            indexed["workspace_ref"] = workspace_ref
+            indexed_documents.append(indexed)
+            document["workspace_ref"] = workspace_ref
+
+        index_ref = manager.index_context_documents(indexed_documents)
+        previous = manager.read_effective_context() or {}
+        if previous.get("phase") == phase and previous.get(
+            "effective_source"
+        ) == result.get("effective_source"):
+            refs = list(dict.fromkeys(previous.get("workspace_refs", []) + refs))
+        result["workspace"] = {
+            "effective_context": manager.save_effective_context(
+                {
+                    "schema_version": 1,
+                    "policy": "phase_owned_source_with_local_supplements",
+                    "namespace": namespace,
+                    "subject_area": subject_area,
+                    "documents": [
+                        _public_context_document(document)
+                        for document in result.get("documents", [])
+                    ],
+                }
+            ),
+            "effective_source": result.get("effective_source"),
+            "document_index": index_ref,
+        }
+        if requested_operation == "read":
+            workspace_document = manager.read_document(
+                path, include_alternates=include_alternates
+            )
+            if workspace_document.get("status") == "ok":
+                metadata = next(
+                    (
+                        item
+                        for item in result.get("documents", [])
+                        if item.get("workspace_ref")
+                        == workspace_document.get("workspace_ref")
+                    ),
+                    {},
+                )
+                result["document"] = {
+                    **metadata,
+                    "content": workspace_document["content"],
+                }
+        elif requested_operation == "search":
+            result = {
+                **manager.search_documents(
+                    query,
+                    namespace=namespace if namespace != "all" else "",
+                    include_alternates=include_alternates,
+                ),
+                "workspace": result["workspace"],
+                "effective_source": result.get("effective_source"),
+            }
+        elif requested_operation == "list":
+            for document in result.get("documents", []):
+                document.pop("content", None)
+    _emit_context_audit_event(
+        ticket_id,
+        agent_name=agent_name,
+        phase=phase,
+        benchmark=benchmark,
+        operation=requested_operation,
+        namespace=namespace,
+        result=result,
+    )
+    return json.dumps(
+        _public_context_result(
+            result,
+            phase=phase,
+            audience=manager.audience if manager else agent_name,
+            benchmark=benchmark,
+            namespace=namespace,
+            subject_area=subject_area,
+        )
     )
 
 
@@ -276,7 +702,6 @@ def build_repo_cache():
     cache = RepoCache()
 
     default_repos = {
-        "crucible": "https://github.com/perftool-incubator/crucible.git",
         "crucible-examples": "https://github.com/perftool-incubator/crucible-examples.git",
         "zathras": "https://github.com/redhat-performance/zathras.git",
         "kube-burner": "https://github.com/kube-burner/kube-burner.git",
@@ -297,6 +722,9 @@ def build_repo_cache():
             pass
 
     for name, url in default_repos.items():
+        if name == "crucible":
+            # Crucible is never cloned or refreshed by agentic-perf.
+            continue
         try:
             cache.ensure_repo(name, url)
         except Exception:

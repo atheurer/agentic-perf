@@ -10,6 +10,7 @@ Run directly:  python agents/benchmark/server.py
 Connected via: AgentMCPClient (agents/mcp_client.py)
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -29,6 +30,8 @@ if _project_root not in sys.path:
 from fastmcp import FastMCP
 
 from agents.server_utils import (
+    _emit_context_audit_event,
+    _public_context_result,
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
@@ -41,6 +44,8 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("benchmark-agent")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
+
+_CRUCIBLE_ROOT = "/opt/crucible"
 
 
 def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -207,6 +212,371 @@ async def _ensure_init():
     except Exception:
         _repo_cache = None
     _initialized = True
+
+
+def _controller_host() -> str | None:
+    """Return the ticket's explicit Crucible controller host."""
+    fields = _ticket.get("custom_fields", {}) if _ticket else {}
+    context = fields.get("crucible_controller_context")
+    if isinstance(context, dict):
+        for key in ("host", "controller"):
+            if isinstance(context.get(key), str) and context[key].strip():
+                return context[key].strip()
+    assigned = fields.get("assigned_hardware_ips")
+    if isinstance(assigned, dict) and isinstance(assigned.get("controller"), str):
+        return assigned["controller"].strip() or None
+    return None
+
+
+async def _read_controller_file(host: str, path: str) -> str | None:
+    """Read one allowlisted controller context file through the ticket SSH."""
+    if _ssh is None:
+        return None
+    result = await _ssh.run(
+        host,
+        f"head -c 262144 {shlex.quote(path)}",
+        timeout=30,
+    )
+    if result.exit_code != 0:
+        return None
+    return result.stdout
+
+
+async def _find_controller_path(
+    host: str, candidates: list[str], *, directory: bool = False
+) -> str | None:
+    """Return the first existing path from a bounded controller candidate list."""
+    test_flag = "-d" if directory else "-f"
+    quoted = " ".join(shlex.quote(path) for path in candidates)
+    result = await _ssh.run(
+        host,
+        f"""for path in {quoted}; do if test {test_flag} "$path"; then printf '%s\\n' "$path"; break; fi; done""",
+        timeout=30,
+    )
+    if result.exit_code != 0:
+        return None
+    value = result.stdout.strip().splitlines()
+    return value[0].strip() if value else None
+
+
+async def _find_controller_repository(
+    host: str, entry: dict[str, Any], *, root: str = _CRUCIBLE_ROOT
+) -> str | None:
+    """Resolve a catalog entry against the installed controller tree.
+
+    Crucible installs a graph of repositories and does not guarantee one
+    directory naming convention.  The catalog gives us the repository name;
+    the bounded filesystem search handles the installation-specific layout.
+    """
+    name = str(entry.get("name", ""))
+    repository = str(entry.get("repository", ""))
+    repo_name = repository.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    repo_type = str(entry.get("type", "core"))
+    if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        return None
+    candidates = [
+        f"{root}/subprojects/{repo_type}s/{repo_name}",
+        f"{root}/subprojects/{repo_type}/{repo_name}",
+        f"{root}/subprojects/{repo_type}s/{name}",
+        f"{root}/subprojects/{repo_type}/{name}",
+        f"{root}/subprojects/benchmarks/bench-{name}",
+        f"{root}/subprojects/benchmarks/{name}",
+        f"{root}/repos/{repo_name}",
+        f"{root}/repos/{name}",
+        f"{root}/repos/{repo_type}-{name}",
+    ]
+    found = await _find_controller_path(host, candidates, directory=True)
+    if found:
+        return found
+    # The catalog determines the names we search for; this does not expose a
+    # general arbitrary-path reader to the agent.
+    names = [value for value in (repo_name, name, f"{repo_type}-{name}") if value]
+    quoted = " ".join(shlex.quote(value) for value in dict.fromkeys(names))
+    result = await _ssh.run(
+        host,
+        f"find {shlex.quote(root)}/subprojects {shlex.quote(root)}/repos "
+        f"-maxdepth 6 -type d \\\\( -name {quoted.replace(' ', ' -o -name ')} \\\\) "
+        "-print -quit 2>/dev/null",
+        timeout=30,
+    )
+    value = result.stdout.strip().splitlines() if result.exit_code == 0 else []
+    return value[0].strip() if value else None
+
+
+async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str, Any]:
+    """Snapshot Crucible context from the designated controller.
+
+    The context gateway owns this refresh so source selection is based on the
+    same controller that will execute the run.  Only documentation, catalog,
+    and benchmark metadata paths are read; no arbitrary controller command is
+    exposed through the gateway.
+    """
+    host = _controller_host()
+    if not host or _ssh is None:
+        return {"available": False, "reason": "controller_not_identified"}
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", benchmark or ""):
+        return {"available": False, "reason": "invalid_benchmark_name", "host": host}
+
+    catalog_path = await _find_controller_path(
+        host,
+        [
+            f"{_CRUCIBLE_ROOT}/config/repos.json",
+            f"{_CRUCIBLE_ROOT}/subprojects/core/config/repos.json",
+        ],
+    )
+    if not catalog_path:
+        return {"available": False, "reason": "crucible_not_installed", "host": host}
+
+    core_root = catalog_path.removesuffix("/config/repos.json")
+    core_docs_root = await _find_controller_path(
+        host,
+        [f"{core_root}/docs", f"{_CRUCIBLE_ROOT}/docs"],
+        directory=True,
+    )
+    listing = await _ssh.run(
+        host,
+        f"find {shlex.quote(core_docs_root or core_root)} -type f "
+        "\\( -name '*.md' -o -name '*.markdown' -o -name '*.rst' "
+        "-o -name '*.txt' -o -name '*.json' -o -name '*.yaml' "
+        "-o -name '*.yml' -o -name '*.toml' \\) -print",
+        timeout=30,
+    )
+    core_paths = [catalog_path]
+    if listing.exit_code == 0:
+        core_paths.extend(
+            line.strip()
+            for line in listing.stdout.splitlines()
+            if line.strip().startswith((core_docs_root or core_root) + "/")
+        )
+    core_results = await asyncio.gather(
+        *(_read_controller_file(host, path) for path in core_paths)
+    )
+    core_files: dict[str, str] = {}
+    for path, content in zip(core_paths, core_results):
+        if content is None:
+            continue
+        if path == catalog_path:
+            relative = "config/repos.json"
+        else:
+            relative = path.removeprefix(core_root + "/")
+        core_files[relative] = content
+
+    try:
+        catalog = json.loads(core_files["config/repos.json"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        catalog = {}
+    catalog_entries = {
+        entry.get("name"): entry
+        for group in ("official", "unofficial")
+        for entry in catalog.get(group, [])
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    }
+    benchmark_entry = catalog_entries.get(benchmark)
+    if not benchmark_entry or benchmark_entry.get("type") != "benchmark":
+        return {
+            "available": False,
+            "reason": "benchmark_not_in_controller_catalog",
+            "host": host,
+            "benchmark": benchmark,
+        }
+    benchmark_root = await _find_controller_repository(host, benchmark_entry)
+    if not benchmark_root:
+        return {
+            "available": False,
+            "reason": "controller_benchmark_checkout_unavailable",
+            "host": host,
+            "benchmark": benchmark,
+            "catalog_path": catalog_path,
+        }
+
+    from providers.skills.crucible import CrucibleSkillProvider
+
+    repository_roots: dict[str, str] = {f"benchmark/{benchmark}": benchmark_root}
+    for name, entry in catalog_entries.items():
+        if name == "crucible" or entry.get("type") not in {
+            "core",
+            "benchmark",
+            "tool",
+            "doc",
+        }:
+            continue
+        repo_root = await _find_controller_repository(host, entry)
+        if repo_root:
+            prefix = {
+                "core": "core",
+                "benchmark": "benchmark",
+                "tool": "tool",
+                "doc": "doc",
+            }[entry["type"]]
+            repository_roots[f"{prefix}/{name}"] = repo_root
+
+    async def read_repository(namespace: str, repository_root: str) -> dict[str, str]:
+        listing = await _ssh.run(
+            host,
+            f"find {shlex.quote(repository_root)} -type f "
+            "\\( -name '*.md' -o -name '*.markdown' -o -name '*.rst' "
+            "-o -name '*.txt' -o -name '*.json' -o -name '*.yaml' "
+            "-o -name '*.yml' -o -name '*.toml' \\) -print",
+            timeout=30,
+        )
+        paths: list[str] = []
+        if listing.exit_code == 0:
+            for value in listing.stdout.splitlines():
+                path = value.strip()
+                if not path.startswith(repository_root + "/"):
+                    continue
+                relative = Path(path.removeprefix(repository_root + "/"))
+                if CrucibleSkillProvider._safe_context_file(
+                    Path(repository_root),
+                    relative,
+                    benchmark_namespace=namespace.startswith("benchmark/"),
+                ):
+                    paths.append(path)
+        contents = await asyncio.gather(
+            *(_read_controller_file(host, path) for path in paths)
+        )
+        return {
+            f"repositories/{namespace}/{path.removeprefix(repository_root + '/')}": content
+            for path, content in zip(paths, contents)
+            if content is not None
+        }
+
+    repository_results = await asyncio.gather(
+        *(
+            read_repository(namespace, root)
+            for namespace, root in repository_roots.items()
+        )
+    )
+    repository_files = {
+        key: value for result in repository_results for key, value in result.items()
+    }
+    benchmark_files = {
+        key.removeprefix(f"repositories/benchmark/{benchmark}/"): value
+        for key, value in repository_files.items()
+        if key.startswith(f"repositories/benchmark/{benchmark}/")
+    }
+
+    if not core_files or not benchmark_files:
+        return {
+            "available": False,
+            "reason": "controller_context_incomplete",
+            "host": host,
+            "core_files": len(core_files),
+            "benchmark_files": len(benchmark_files),
+            "repositories": sorted(repository_roots),
+        }
+
+    provenance = {
+        "effective_source": "controller",
+        "source_reason": "controller_refresh_succeeded",
+        "controller": host,
+        "crucible_root": _CRUCIBLE_ROOT,
+        "catalog_path": catalog_path,
+        "core_docs_root": core_docs_root,
+        "benchmark_root": benchmark_root,
+        "repository_roots": repository_roots,
+    }
+    manager.save_source_snapshot(
+        "controller", provenance, {**core_files, **repository_files}
+    )
+    manager.save_source_snapshot(
+        "controller", provenance, benchmark_files, benchmark=benchmark
+    )
+    return {
+        "available": True,
+        "reason": "controller_refresh_succeeded",
+        "host": host,
+        "core_files": len(core_files),
+        "benchmark_files": len(benchmark_files),
+        "provenance": provenance,
+    }
+
+
+def _controller_snapshot_documents(
+    manager: Any,
+    *,
+    benchmark: str,
+    namespace: str,
+    subject_area: str | list[str],
+    provenance: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build the effective inventory from the remote controller snapshot."""
+    from providers.skills.crucible import CrucibleSkillProvider
+
+    documents: list[dict[str, Any]] = []
+    missing_namespaces: list[str] = []
+    snapshot = manager.load_source_snapshot("controller")
+    if snapshot and snapshot.get("files"):
+        owners: dict[str, dict[str, str]] = {}
+        for relative, content in snapshot.get("files", {}).items():
+            if relative.startswith("repositories/"):
+                parts = relative.split("/", 3)
+                if len(parts) < 4:
+                    continue
+                owner = f"{parts[1]}/{parts[2]}"
+                source_path = parts[3]
+            else:
+                owner, source_path = "core", relative
+            owners.setdefault(owner, {})[relative] = content
+        requested_owners = set(owners)
+        if namespace == "core":
+            requested_owners = {"core"}
+        elif namespace != "all":
+            requested_owners = {namespace}
+        elif benchmark:
+            requested_owners = {
+                owner
+                for owner in requested_owners
+                if owner == "core"
+                or owner == f"benchmark/{benchmark}"
+                or owner.startswith(("core/", "tool/", "doc/"))
+            }
+        for owner in sorted(requested_owners):
+            files = owners.get(owner, {})
+            if not files:
+                missing_namespaces.append(owner)
+                continue
+            for snapshot_path, content in sorted(files.items()):
+                source_path = (
+                    snapshot_path.split("/", 3)[3]
+                    if snapshot_path.startswith("repositories/")
+                    else snapshot_path
+                )
+                logical_ref = f"{owner}/{source_path}"
+                documents.append(
+                    {
+                        "namespace": owner,
+                        "path": logical_ref,
+                        "ref": logical_ref,
+                        "uri": f"crucible://{logical_ref}",
+                        "source_path": snapshot_path,
+                        "source": "controller",
+                        "authority": "effective",
+                        "provenance": provenance,
+                        "entrypoint": source_path
+                        in CrucibleSkillProvider._REPOSITORY_ENTRYPOINT_FILES,
+                        "subject_areas": CrucibleSkillProvider._subject_tags(
+                            source_path
+                        ),
+                        "subject_match": CrucibleSkillProvider._subject_matches(
+                            source_path, subject_area
+                        ),
+                        "content": content,
+                    }
+                )
+    else:
+        missing_namespaces.append("core")
+    documents.sort(key=lambda item: item["path"])
+    return documents, {
+        "complete": not missing_namespaces,
+        "discovered": len(documents),
+        "returned": len(documents),
+        "subject_matches": sum(bool(item.get("subject_match")) for item in documents),
+        "excluded": 0,
+        "exclusions": [],
+        "missing_namespaces": missing_namespaces,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +763,417 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
             "harness": harness_name,
             "params": params,
         }
+    )
+
+
+@mcp.tool()
+async def get_crucible_benchmark_context(
+    benchmark: str = "",
+    phase: str = "benchmark",
+    operation: str = "context",
+    namespace: str = "all",
+    path: str = "",
+    subject_area: str | list[str] = "all",
+    include_alternates: bool = False,
+    query: str = "",
+) -> str:
+    """Use the source-aware Crucible context gateway.
+
+    ``operation=list`` inventories safe documents in the requested logical
+    repository namespace and snapshots them into the ticket workspace. The
+    response also reports the catalog's available core, benchmark, tool, and
+    documentation namespaces. ``operation=read`` reads one returned ref from
+    that snapshot; ``operation=search`` searches it using ``query``. The legacy
+    default ``operation=context`` retains the benchmark-root response shape for
+    existing callers. Alternate sources require explicit ``include_alternates``
+    and are never effective by default.
+    """
+    await _ensure_init()
+    provider = (
+        _skill_provider.get_provider("crucible")
+        if hasattr(_skill_provider, "get_provider")
+        else _skill_provider
+    )
+    if provider is None or not hasattr(provider, "get_benchmark_context"):
+        return json.dumps(
+            {
+                "found": False,
+                "benchmark": benchmark,
+                "reason": "crucible_provider_unavailable",
+            }
+        )
+    if operation in {"list", "read", "search"} and hasattr(
+        provider, "get_crucible_context"
+    ):
+        requested_operation = operation
+        provider_operation = "list" if operation == "search" else operation
+        cf = _ticket.get("custom_fields", {}) if _ticket else {}
+        controller = cf.get("crucible_controller_context", {})
+        controller = dict(controller) if isinstance(controller, dict) else {}
+        ticket_id = os.environ.get("TICKET_ID", "")
+        manager = None
+        refresh = {"available": False, "reason": "workspace_unavailable"}
+        if ticket_id:
+            from providers.workspace.manager import WorkspaceManager
+
+            manager = WorkspaceManager(
+                ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+            )
+            if operation == "read" and path:
+                cached = manager.read_document(
+                    path, include_alternates=include_alternates
+                )
+                if cached.get("status") == "ok":
+                    return json.dumps(
+                        _public_context_result(
+                            {
+                                "found": True,
+                                "operation": "read",
+                                "document": cached,
+                                "documents": [cached],
+                            },
+                            phase=phase,
+                            audience=manager.audience,
+                            benchmark=benchmark,
+                            namespace=namespace,
+                            subject_area=subject_area,
+                            manifest_documents=manager.context_manifest(namespace).get(
+                                "documents", []
+                            ),
+                        )
+                    )
+            if operation == "search" and manager.context_scope_indexed(namespace):
+                return json.dumps(
+                    _public_context_result(
+                        manager.search_documents(
+                            query,
+                            namespace=namespace if namespace != "all" else "",
+                            include_alternates=include_alternates,
+                        ),
+                        phase=phase,
+                        audience=manager.audience,
+                        benchmark=benchmark,
+                        namespace=namespace,
+                        subject_area=subject_area,
+                        manifest_documents=manager.context_manifest(namespace).get(
+                            "documents", []
+                        ),
+                    )
+                )
+            refresh = await _refresh_controller_context(benchmark, manager)
+            existing = manager.load_source_snapshot("controller", benchmark)
+            if existing and not refresh.get("available"):
+                refresh = {
+                    "available": True,
+                    "reason": "controller_snapshot_already_present",
+                    "provenance": existing.get("provenance", {}),
+                }
+            controller.update(
+                {
+                    "identified": controller.get("identified") is True
+                    or bool(_controller_host()),
+                    "reachable": controller.get("reachable") is True
+                    or refresh.get("reason") != "controller_not_identified",
+                    "crucible_installed": controller.get("crucible_installed") is True
+                    or refresh.get("reason")
+                    not in {"controller_not_identified", "crucible_not_installed"},
+                    "snapshot_available": refresh.get("available", False),
+                }
+            )
+        policy = cf.get("crucible_update_policy")
+        if not policy:
+            policy = cf.get("directives", {}).get("update_harness")
+        from providers.skills.crucible import select_crucible_context
+
+        policy_selection = select_crucible_context(
+            phase=phase, controller=controller, update_policy=policy
+        )
+        result = await provider.get_crucible_context(
+            benchmark or None,
+            operation=provider_operation,
+            namespace=namespace,
+            path=path,
+            subject_area=subject_area,
+            include_alternates=include_alternates,
+            query=query,
+            phase=phase,
+            controller=controller,
+            update_policy=policy,
+            agent="benchmark-agent",
+            include_content=True,
+        )
+        if manager and result.get("found"):
+            if (
+                refresh.get("available")
+                and controller.get("snapshot_available")
+                and policy_selection["effective_source"] == "controller"
+            ):
+                result["effective_source"] = "controller"
+                result["source"] = "controller"
+                result["selection"] = policy_selection
+                controller_documents, controller_inventory = (
+                    _controller_snapshot_documents(
+                        manager,
+                        benchmark=benchmark,
+                        namespace=namespace,
+                        subject_area=subject_area,
+                        provenance=refresh["provenance"],
+                    )
+                )
+                local_documents = [
+                    item
+                    for item in result.get("documents", [])
+                    if item.get("source") == "local"
+                ]
+                result["documents"] = sorted(
+                    controller_documents + local_documents,
+                    key=lambda item: item["path"],
+                )
+                result["found"] = bool(result["documents"])
+                result["inventory"] = controller_inventory
+            indexed_documents: list[dict[str, Any]] = []
+            grouped_files: dict[tuple[str, str | None], dict[str, str]] = {}
+            for document in result.get("documents", []):
+                content = document.get("content")
+                if content is None:
+                    read_result = await provider.get_crucible_context(
+                        benchmark or None,
+                        operation="read",
+                        namespace=document["namespace"],
+                        path=document.get("ref", document["path"]),
+                        subject_area="all",
+                        include_alternates=include_alternates,
+                        phase=phase,
+                        controller=controller,
+                        update_policy=policy,
+                        agent="benchmark-agent",
+                    )
+                    read_document = read_result.get("document")
+                    if isinstance(read_document, dict):
+                        content = read_document.get("content")
+                if content is None:
+                    continue
+                doc_namespace = document["namespace"]
+                doc_benchmark = None
+                if doc_namespace.startswith("benchmark/"):
+                    _, doc_benchmark = doc_namespace.split("/", 1)
+                elif document.get("source") == "local" and document.get("benchmark"):
+                    doc_benchmark = document["benchmark"]
+                source = document.get(
+                    "source", result.get("effective_source", "github")
+                )
+                grouped_files.setdefault((source, doc_benchmark), {})[
+                    document["source_path"]
+                ] = content
+
+            refs: list[str] = []
+            saved_groups: dict[tuple[str, str | None], dict[str, Any]] = {}
+            for (source, doc_benchmark), files in grouped_files.items():
+                provenance = next(
+                    (
+                        item.get("provenance", {})
+                        for item in result.get("documents", [])
+                        if item.get("source", result.get("effective_source")) == source
+                    ),
+                    {},
+                )
+                snapshot = manager.save_source_snapshot(
+                    source, provenance, files, benchmark=doc_benchmark
+                )
+                saved_groups[(source, doc_benchmark)] = snapshot
+                refs.extend(snapshot["files"].values())
+
+            for document in result.get("documents", []):
+                doc_benchmark = None
+                if document["namespace"].startswith("benchmark/"):
+                    _, doc_benchmark = document["namespace"].split("/", 1)
+                elif document.get("source") == "local":
+                    doc_benchmark = document.get("benchmark")
+                source = document.get(
+                    "source", result.get("effective_source", "github")
+                )
+                snapshot = saved_groups.get((source, doc_benchmark), {})
+                workspace_ref = snapshot.get("files", {}).get(document["source_path"])
+                if not workspace_ref:
+                    continue
+                document["workspace_ref"] = workspace_ref
+                indexed_documents.append(dict(document))
+
+            index_ref = manager.index_context_documents(indexed_documents)
+            previous = manager.read_effective_context() or {}
+            if previous.get("phase") == phase and previous.get(
+                "effective_source"
+            ) == result.get("effective_source"):
+                refs = list(dict.fromkeys(previous.get("workspace_refs", []) + refs))
+            manifest = {
+                "schema_version": 1,
+                "policy": "phase_owned_source_with_local_supplements",
+                "namespace": namespace,
+                "subject_area": subject_area,
+                "documents": [
+                    {
+                        key: value
+                        for key, value in document.items()
+                        if key
+                        not in {
+                            "source",
+                            "provenance",
+                            "workspace_ref",
+                            "source_path",
+                            "content",
+                        }
+                    }
+                    for document in result.get("documents", [])
+                ],
+            }
+            result["workspace"] = {
+                "effective_context": manager.save_effective_context(manifest),
+                "effective_source": result.get("effective_source"),
+                "document_index": index_ref,
+            }
+            if requested_operation == "read":
+                workspace_document = manager.read_document(
+                    path, include_alternates=include_alternates
+                )
+                if workspace_document.get("status") == "ok":
+                    metadata = next(
+                        (
+                            item
+                            for item in result.get("documents", [])
+                            if item.get("workspace_ref")
+                            == workspace_document.get("workspace_ref")
+                        ),
+                        {},
+                    )
+                    result["document"] = {
+                        **metadata,
+                        "content": workspace_document["content"],
+                    }
+            elif requested_operation == "search":
+                result = {
+                    **manager.search_documents(
+                        query,
+                        namespace=namespace if namespace != "all" else "",
+                        include_alternates=include_alternates,
+                    ),
+                    "workspace": result["workspace"],
+                    "effective_source": result.get("effective_source"),
+                }
+            elif requested_operation == "list":
+                for document in result.get("documents", []):
+                    document.pop("content", None)
+        _emit_context_audit_event(
+            ticket_id,
+            agent_name="benchmark-agent",
+            phase=phase,
+            benchmark=benchmark,
+            operation=requested_operation,
+            namespace=namespace,
+            result=result,
+        )
+        return json.dumps(
+            _public_context_result(
+                result,
+                phase=phase,
+                audience="benchmark-agent",
+                benchmark=benchmark,
+                namespace=namespace,
+                subject_area=subject_area,
+            )
+        )
+    result = await provider.get_benchmark_context(benchmark)
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if result.get("found") and ticket_id:
+        from providers.skills.crucible import select_crucible_context
+        from providers.workspace.manager import WorkspaceManager
+
+        manager = WorkspaceManager(
+            ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+        )
+        refresh = await _refresh_controller_context(benchmark, manager)
+        github_provenance = {
+            key: result.get(key)
+            for key in (
+                "effective_source",
+                "source_reason",
+                "source_assumption",
+                "repository",
+                "ref",
+                "commit",
+            )
+        }
+        _ = manager.save_source_snapshot(
+            "github",
+            github_provenance,
+            result.get("context", {}),
+            benchmark=benchmark,
+        )
+        _, _ = manager.save_file(
+            "context/sources/github/harnesses/crucible/source.json",
+            json.dumps(github_provenance, indent=2) + "\n",
+        )
+        controller_snapshot = manager.load_source_snapshot("controller", benchmark)
+        controller_snapshot_available = controller_snapshot is not None
+        if controller_snapshot_available and not refresh.get("available"):
+            refresh = {
+                "available": True,
+                "reason": "controller_snapshot_already_present",
+                "provenance": controller_snapshot.get("provenance", {}),
+            }
+        cf = _ticket.get("custom_fields", {}) if _ticket else {}
+        controller = cf.get("crucible_controller_context", {})
+        controller = dict(controller) if isinstance(controller, dict) else {}
+        controller.update(
+            {
+                "identified": controller.get("identified") is True
+                or bool(_controller_host()),
+                "reachable": controller.get("reachable") is True
+                or refresh.get("reason") != "controller_not_identified",
+                "crucible_installed": controller.get("crucible_installed") is True
+                or refresh.get("reason")
+                not in {"controller_not_identified", "crucible_not_installed"},
+                "snapshot_available": controller_snapshot_available,
+            }
+        )
+        controller["snapshot_available"] = controller_snapshot_available
+        policy = cf.get("crucible_update_policy")
+        if not policy:
+            policy = cf.get("directives", {}).get("update_harness")
+        selection = select_crucible_context(
+            phase=phase, controller=controller, update_policy=policy
+        )
+        if selection["effective_source"] == "controller" and controller_snapshot:
+            result["context"] = controller_snapshot["files"]
+            result["files"] = list(controller_snapshot["files"])
+            result["effective_source"] = "controller"
+        manifest = {
+            "schema_version": 1,
+            "phase": "benchmark",
+            "policy": "phase_owned_source_with_local_supplements",
+            "documents": [],
+        }
+        result["workspace"] = {
+            "effective_context": manager.save_effective_context(manifest),
+            "effective_source": selection["effective_source"],
+        }
+    _emit_context_audit_event(
+        ticket_id,
+        agent_name="benchmark-agent",
+        phase=phase,
+        benchmark=benchmark,
+        operation="context",
+        namespace="all",
+        result=result,
+    )
+    return json.dumps(
+        _public_context_result(
+            result,
+            phase=phase,
+            audience="benchmark-agent",
+            benchmark=benchmark,
+            namespace="all",
+            subject_area="all",
+        )
     )
 
 

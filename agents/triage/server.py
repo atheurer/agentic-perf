@@ -21,11 +21,7 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import (
-    _configured_crucible_source,
-    build_skill_provider,
-    read_skill_documents,
-)
+from agents.server_utils import build_skill_provider, read_skill_documents
 
 mcp = FastMCP("triage-agent")
 
@@ -37,7 +33,10 @@ _skill_provider = None
 def _get_provider():
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = build_skill_provider(_configured_crucible_source())
+        _skill_provider = build_skill_provider(
+            resolve_source=False,
+            catalog_only=True,
+        )
     return _skill_provider
 
 

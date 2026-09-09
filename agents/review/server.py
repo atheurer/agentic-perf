@@ -27,6 +27,7 @@ from agents.server_utils import (
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
+    crucible_context_gateway,
     read_skill_documents,
 )
 
@@ -68,6 +69,33 @@ async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'crucible', 'filename': 'result-parsing.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
     return json.dumps(read_skill_documents(SKILLS_DIR, docs))
+
+
+@mcp.tool()
+async def get_crucible_benchmark_context(
+    benchmark: str = "",
+    operation: str = "list",
+    namespace: str = "all",
+    path: str = "",
+    subject_area: str | list[str] = "all",
+    include_alternates: bool = False,
+    query: str = "",
+) -> str:
+    """List, read, or search phase-effective Crucible context via its workspace snapshot."""
+    await _ensure_init()
+    return await crucible_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="review-agent",
+        phase="review",
+        benchmark=benchmark,
+        operation=operation,
+        namespace=namespace,
+        path=path,
+        subject_area=subject_area,
+        include_alternates=include_alternates,
+        query=query,
+    )
 
 
 @mcp.tool()
