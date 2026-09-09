@@ -503,12 +503,12 @@ async def _get_ticket(
         "status": ticket.get("status", ""),
         "status_trail": ticket.get("status_trail", []),
         "created_at": ticket.get("created_at", ""),
-        "harness": cf.get("harness") or directives.get("harness"),
+        "harness": directives.get("harness") or cf.get("harness"),
         "board_selector": (
-            cf.get("board_selector") or directives.get("board_selector")
+            directives.get("board_selector") or cf.get("board_selector")
         ),
         "samples": cf.get("samples"),
-        "image_version": (cf.get("image_version") or directives.get("image_version")),
+        "image_version": (directives.get("image_version") or cf.get("image_version")),
         "directives": directives,
         "guidance_summary": cf.get("guidance_summary"),
         "verdict": cf.get("verdict"),
