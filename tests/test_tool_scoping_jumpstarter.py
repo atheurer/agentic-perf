@@ -108,7 +108,10 @@ class TestBenchmarkToolScoping:
         # execute_benchmark is not in boot-time (uses its own tool).
         assert "execute_benchmark" not in allowed
 
-    def test_crucible_no_scoping(self):
+    def test_crucible_scoping_includes_validation_before_execution(self):
         from agents.benchmark.agent import BenchmarkAgent
 
-        assert "crucible" not in BenchmarkAgent._HARNESS_TOOLS
+        allowed = BenchmarkAgent._HARNESS_TOOLS.get("crucible")
+        assert allowed is not None
+        assert "validate_benchmark" in allowed
+        assert "execute_benchmark" in allowed

@@ -150,12 +150,19 @@ For non-Crucible harnesses, retain the compatible procedure of using
       management IPs are correct for benchmark traffic when the user specified
       different interfaces.
 
-7. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
+7. **Validate the run-file** — Before approval or execution, call
+   `validate_benchmark(controller, run_file, harness)`. For Crucible this performs
+   the controller-side `crucible validate` checks without deploying or running
+   anything. If it fails, correct the run-file and validate again; if the failure
+   cannot be resolved, request clarification. Never call `execute_benchmark`
+   with a run-file that has not returned `valid: true` from `validate_benchmark`.
+
+8. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
    Do NOT ask for approval when the user explicitly said not to.
    If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
 
-8. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
+9. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
    The controller validates the run-file during execution — if there are schema errors,
    they will appear in the execution output.
 

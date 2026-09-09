@@ -223,6 +223,23 @@ class BenchmarkAgent(AgentBase):
     # are hidden from the LLM to prevent exploration and
     # scope creep (upstream #201).
     _HARNESS_TOOLS: dict[str, set[str]] = {
+        "crucible": {
+            "read_skills",
+            "list_harness_docs",
+            "read_harness_doc",
+            "get_execution_config",
+            "get_runfile_schema",
+            "get_benchmark_params",
+            "get_tool_params",
+            "get_example_runfile",
+            "setup_passwordless_ssh",
+            "validate_benchmark",
+            "execute_benchmark",
+            "get_run_logs",
+            "submit_benchmark_result",
+            "present_runfile_for_approval",
+            "request_clarification",
+        },
         "boot-time": {
             "read_skills",
             "execute_boot_time_test",
