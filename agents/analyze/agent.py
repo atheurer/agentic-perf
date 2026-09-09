@@ -146,6 +146,8 @@ class AnalyzeAgent(AgentBase):
         self._prefetched_run_info = await self._prefetch_cited_runs(
             ticket,
         )
+        # Pre-fetch artifact paths for referenced tickets.
+        await self._resolve_referenced_artifacts(ticket)
 
         try:
             await super().run(ticket_id)
@@ -220,6 +222,36 @@ class AnalyzeAgent(AgentBase):
             except Exception as e:
                 logger.debug(f"[analyze] Failed to pre-fetch run {run_id}: {e}")
         return results
+
+    async def _resolve_referenced_artifacts(
+        self,
+        ticket: dict[str, Any],
+    ) -> None:
+        """Pre-fetch output_dirs for tickets referenced in the description."""
+        from agents.server_utils import extract_ticket_references
+
+        cf = ticket.get("custom_fields", {})
+        ref_text = ticket.get("description", "") + " " + cf.get("hypothesis", "")
+        ref_ids = [
+            rid for rid in extract_ticket_references(ref_text) if rid != ticket["id"]
+        ]
+        refs: dict[str, dict[str, str]] = {}
+        for rid in ref_ids:
+            try:
+                t = await self._get_ticket(rid)
+                rcf = t.get("custom_fields", {})
+                output_dir = rcf.get("output_dir", "")
+                if output_dir:
+                    refs[rid] = {
+                        "output_dir": output_dir,
+                        "run_id": rcf.get("run_id", ""),
+                    }
+            except Exception:
+                logger.debug(
+                    "[analyze] Could not fetch referenced ticket %s",
+                    rid,
+                )
+        self._referenced_artifacts = refs
 
     def _build_context(
         self,
@@ -318,5 +350,24 @@ class AnalyzeAgent(AgentBase):
             "investigation records. Then submit your findings "
             "via submit_analysis_result."
         )
+
+        # Cross-ticket artifact resolution
+        refs = getattr(self, "_referenced_artifacts", {})
+        if refs:
+            parts.append("## Referenced Ticket Artifacts")
+            parts.append("")
+            for rid, rinfo in refs.items():
+                rdir = rinfo.get("output_dir", "")
+                rrun = rinfo.get("run_id", "")
+                if rdir:
+                    parts.append(
+                        f"**{rid}:**\n"
+                        f"- output_dir: `{rdir}`\n"
+                        f"- run_id: `{rrun}`\n"
+                        f"Use `list_benchmark_artifacts` + "
+                        f"`read_benchmark_artifact` with "
+                        f"this output_dir."
+                    )
+                    parts.append("")
 
         return "\n".join(parts)

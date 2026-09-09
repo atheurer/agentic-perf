@@ -652,3 +652,20 @@ def get_board_selector(ticket: dict) -> str:
     cf = ticket.get("custom_fields", {})
     directives = cf.get("directives", {})
     return directives.get("board_selector", "") or cf.get("board_selector", "")
+
+
+def extract_ticket_references(text: str) -> list[str]:
+    """Extract PERF-XXXXXXXX ticket IDs from text.
+
+    Returns deduplicated list preserving first-seen order.
+    """
+    import re
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"PERF-[A-F0-9]{8}", text):
+        tid = match.group()
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids
