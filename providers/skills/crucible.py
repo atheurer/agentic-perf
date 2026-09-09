@@ -287,6 +287,7 @@ class CrucibleContextGateway:
         self._home = Path(crucible_home)
         self._catalog_only = catalog_only
         self._source_repo = Path(source_repo) if source_repo else None
+        self._custom_catalog_fetcher = catalog_fetcher is not None
         self._benchmarks_dir = self._home / "subprojects" / "benchmarks"
         self._tools_dir = self._home / "subprojects" / "tools"
         self._examples_dir = (
@@ -1251,6 +1252,17 @@ class CrucibleContextGateway:
 
     def _load_benchmark_meta(self, name: str) -> dict[str, Any]:
         meta: dict[str, Any] = {"name": name}
+        # A regular local provider with no installation must not fall back to
+        # the remote catalog.  Catalog-only providers explicitly opt into
+        # remote discovery for triage; runtime/local providers should report
+        # missing metadata instead of silently mixing sources.
+        if (
+            not self._catalog_only
+            and not self._custom_catalog_fetcher
+            and not self._home.exists()
+            and self._source_repo is None
+        ):
+            return meta
         catalog_entries = self._catalog_benchmark_entries()
         if not name or (
             not self._benchmarks_dir.exists()

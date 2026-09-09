@@ -110,7 +110,9 @@ def build_crucible_context_gateway(
     home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
     cache = repo_cache or RepoCache()
     if resolve_source:
-        logger.warning("resolve_source is ignored; Crucible repositories are not cloned")
+        logger.warning(
+            "resolve_source is ignored; Crucible repositories are not cloned"
+        )
     return CrucibleContextGateway(
         home,
         source_repo=source_repo,
@@ -333,12 +335,21 @@ def _controller_relative_path(path: str) -> str | None:
     if not value or value.startswith("/"):
         return None
     candidate = Path(value)
-    if any(part in {"", ".", ".."} or part.startswith(".git") for part in candidate.parts):
+    if any(
+        part in {"", ".", ".."} or part.startswith(".git") for part in candidate.parts
+    ):
         return None
     lowered = value.lower()
     if any(
         marker in lowered
-        for marker in ("/secrets/", "/.ssh/", "authorized_keys", ".pem", ".key", "token")
+        for marker in (
+            "/secrets/",
+            "/.ssh/",
+            "authorized_keys",
+            ".pem",
+            ".key",
+            "token",
+        )
     ):
         return None
     return candidate.as_posix()
@@ -472,11 +483,29 @@ async def controller_context_gateway(
     if operation == "read":
         cached = manager.read_document(path, include_alternates=include_alternates)
         if cached.get("status") == "ok":
-            result = {"found": True, "operation": operation, "document": cached, "documents": [cached]}
-            return json.dumps(_public_context_result(result, phase=phase, audience=manager.audience, benchmark=benchmark, namespace="controller", subject_area="all"))
+            result = {
+                "found": True,
+                "operation": operation,
+                "document": cached,
+                "documents": [cached],
+            }
+            return json.dumps(
+                _public_context_result(
+                    result,
+                    phase=phase,
+                    audience=manager.audience,
+                    benchmark=benchmark,
+                    namespace="controller",
+                    subject_area="all",
+                )
+            )
     if operation == "list":
         documents = manager.context_manifest("controller").get("documents", [])
-        result = {"found": bool(documents), "operation": operation, "documents": documents}
+        result = {
+            "found": bool(documents),
+            "operation": operation,
+            "documents": documents,
+        }
         return json.dumps(
             _public_context_result(
                 result,
@@ -490,21 +519,47 @@ async def controller_context_gateway(
         )
     relative = _controller_relative_path(path)
     if not controller_host or ssh is None:
-        return json.dumps({"found": False, "operation": operation, "reason": "controller_not_identified"})
+        return json.dumps(
+            {
+                "found": False,
+                "operation": operation,
+                "reason": "controller_not_identified",
+            }
+        )
     if operation in {"bootstrap", "read"}:
         remote_path = f"/opt/crucible/{relative}" if relative else ""
         if not remote_path:
-            return json.dumps({"found": False, "operation": operation, "reason": "invalid_controller_path", "path": path})
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "invalid_controller_path",
+                    "path": path,
+                }
+            )
         result = await ssh.run(
             controller_host,
             f"test -f {shlex.quote(remote_path)} && head -c 262144 {shlex.quote(remote_path)}",
             timeout=30,
         )
         if result.exit_code != 0:
-            return json.dumps({"found": False, "operation": operation, "reason": "controller_document_not_found", "path": relative})
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "controller_document_not_found",
+                    "path": relative,
+                }
+            )
         content = result.stdout
-        provenance = {"effective_source": "controller", "controller": controller_host, "path": relative}
-        saved = manager.save_source_snapshot("controller", provenance, {relative: content})
+        provenance = {
+            "effective_source": "controller",
+            "controller": controller_host,
+            "path": relative,
+        }
+        saved = manager.save_source_snapshot(
+            "controller", provenance, {relative: content}
+        )
         document = {
             "namespace": "controller",
             "path": relative,
@@ -519,13 +574,20 @@ async def controller_context_gateway(
             "workspace_ref": saved.get("files", {}).get(relative),
         }
         manager.index_context_documents([document])
-        manager.save_effective_context({
-            "schema_version": 1,
-            "policy": "controller_agent_directed",
-            "namespace": "controller",
-            "documents": [_public_context_document(document)],
-        })
-        result = {"found": True, "operation": operation, "document": document, "documents": [document]}
+        manager.save_effective_context(
+            {
+                "schema_version": 1,
+                "policy": "controller_agent_directed",
+                "namespace": "controller",
+                "documents": [_public_context_document(document)],
+            }
+        )
+        result = {
+            "found": True,
+            "operation": operation,
+            "document": document,
+            "documents": [document],
+        }
     elif operation == "search":
         result = await _search_controller_source(
             ssh=ssh,
@@ -533,9 +595,30 @@ async def controller_context_gateway(
             query=query,
         )
     else:
-        result = {"found": False, "operation": operation, "reason": "unsupported_operation"}
-    _emit_context_audit_event(ticket_id, agent_name=agent_name, phase=phase, benchmark=benchmark, operation=operation, namespace="controller", result=result)
-    return json.dumps(_public_context_result(result, phase=phase, audience=manager.audience, benchmark=benchmark, namespace="controller", subject_area="all"))
+        result = {
+            "found": False,
+            "operation": operation,
+            "reason": "unsupported_operation",
+        }
+    _emit_context_audit_event(
+        ticket_id,
+        agent_name=agent_name,
+        phase=phase,
+        benchmark=benchmark,
+        operation=operation,
+        namespace="controller",
+        result=result,
+    )
+    return json.dumps(
+        _public_context_result(
+            result,
+            phase=phase,
+            audience=manager.audience,
+            benchmark=benchmark,
+            namespace="controller",
+            subject_area="all",
+        )
+    )
 
 
 async def crucible_context_gateway(

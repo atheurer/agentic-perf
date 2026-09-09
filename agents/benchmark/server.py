@@ -827,8 +827,8 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "The Crucible run-file schema is controller-sourced context. "
-                    "Use get_crucible_benchmark_context(operation=\"list\" or "
-                    "\"read\") to retrieve it."
+                    'Use get_crucible_benchmark_context(operation="list" or '
+                    '"read") to retrieve it.'
                 ),
             }
         )
@@ -1162,14 +1162,12 @@ async def _legacy_get_crucible_benchmark_context(
             and controller.get("snapshot_available")
             and policy_selection["effective_source"] == "controller"
         ):
-            controller_documents, controller_inventory = (
-                _controller_snapshot_documents(
-                    manager,
-                    benchmark=benchmark,
-                    namespace=namespace,
-                    subject_area=subject_area,
-                    provenance=refresh["provenance"],
-                )
+            controller_documents, controller_inventory = _controller_snapshot_documents(
+                manager,
+                benchmark=benchmark,
+                namespace=namespace,
+                subject_area=subject_area,
+                provenance=refresh["provenance"],
             )
             result.update(
                 {

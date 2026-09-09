@@ -872,8 +872,7 @@ async def _verify_harness_install_one(
         f"{harness_name} verified"
         if verified
         else (
-            f"{harness_name} executable verified but controller context is "
-            "not ready"
+            f"{harness_name} executable verified but controller context is not ready"
             if harness_verified and context is not None and not context_ready
             else f"Verification failed: {result.stderr[:200]}"
         )

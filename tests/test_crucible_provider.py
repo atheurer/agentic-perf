@@ -1340,6 +1340,7 @@ def test_build_skill_provider_does_not_register_crucible(tmp_path, monkeypatch):
 
 def test_build_skill_provider_never_resolves_crucible_source(tmp_path, monkeypatch):
     from agents.server_utils import build_skill_provider
+
     provider = build_skill_provider(
         crucible_home=tmp_path / "controller",
         repo_cache=object(),
@@ -1757,8 +1758,13 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
     )
     assert read["document"]["ref"] == "subprojects/benchmarks/perftest/README.md"
     assert read["document"]["content"] == "perftest guidance"
-    manager = WorkspaceManager(ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark")
-    assert manager.read_document("subprojects/benchmarks/perftest/README.md")["status"] == "ok"
+    manager = WorkspaceManager(
+        ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+    )
+    assert (
+        manager.read_document("subprojects/benchmarks/perftest/README.md")["status"]
+        == "ok"
+    )
 
     search = json.loads(
         await controller_context_gateway(

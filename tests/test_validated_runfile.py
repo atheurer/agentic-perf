@@ -146,12 +146,16 @@ class TestComputeParamsFingerprint:
 
 
 @pytest.mark.asyncio
-async def test_invalid_runfile_rejected():
-    """validate_runfile returning errors should reject before SSH."""
+async def test_crucible_execution_does_not_use_local_validation_result():
+    """Crucible validation is performed by validate_benchmark on its controller."""
     provider = _make_provider(
         validation_result={"valid": False, "errors": ["missing field: benchmarks"]},
     )
     h, ssh = _make_handlers(provider)
+    mock_ssh = await _make_crucible_ssh()
+    ssh.run = mock_ssh.run
+    ssh.run_with_progress = mock_ssh.run_with_progress
+    ssh.copy_to = mock_ssh.copy_to
 
     result = await h["execute_benchmark"](
         controller="test-host",
@@ -159,9 +163,8 @@ async def test_invalid_runfile_rejected():
         harness="crucible",
     )
 
-    assert result["status"] == "rejected"
-    assert "schema validation" in result["message"]
-    assert "missing field" in result["message"]
+    assert result["status"] == "completed"
+    assert "result_summary" in result
 
 
 @pytest.mark.asyncio
