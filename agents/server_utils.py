@@ -639,3 +639,16 @@ def read_skill_documents(skills_dir: Path, docs: list[dict]) -> list[dict]:
         filename = doc.get("filename") or doc.get("name", "")
         results.append(read_skill_document(skills_dir, harness, filename))
     return results
+
+
+def get_board_selector(ticket: dict) -> str:
+    """Get board_selector from directives or top-level custom_fields.
+
+    Triage may place board_selector in either location depending
+    on the model. Check directives first (authoritative), then
+    fall back to top-level custom_fields for model-agnostic
+    behavior.
+    """
+    cf = ticket.get("custom_fields", {})
+    directives = cf.get("directives", {})
+    return directives.get("board_selector", "") or cf.get("board_selector", "")

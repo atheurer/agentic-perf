@@ -140,7 +140,9 @@ class ImageBuilderAgent:
         provider = _load_provider(provider_name)
 
         # Resolve target and build mode via provider interface
-        board_selector = directives.get("board_selector", "")
+        board_selector = directives.get("board_selector", "") or cf.get(
+            "board_selector", ""
+        )
         target = image_build.get("target", provider.resolve_target(board_selector))
         # Build mode: explicit from directives, or provider
         # default. Both package (build-dev) and bootc (build)

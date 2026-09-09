@@ -125,7 +125,9 @@ async def search_tickets(
         if harness and directives.get("harness") != harness:
             continue
         if board_type:
-            selector = directives.get("board_selector", "")
+            selector = directives.get("board_selector", "") or cf.get(
+                "board_selector", ""
+            )
             if board_type not in selector:
                 continue
         br = cf.get("benchmark_result", {})
