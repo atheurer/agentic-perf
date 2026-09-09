@@ -182,13 +182,14 @@ class GeminiLLMProvider(LLMProvider):
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"gemini/{self._model}") from None
         except Exception as exc:
-            # Gemini SDK raises ClientError for 429
-            # RESOURCE_EXHAUSTED. Surface as LLMRateLimitError
-            # so the agent retry logic handles it.
-            code = getattr(exc, "code", None)
-            msg = str(exc).lower()
-            if code == 429 or "resource_exhausted" in msg:
-                raise LLMRateLimitError(f"gemini/{self._model}") from exc
+            # Gemini SDK raises google.genai.errors.ClientError
+            # for 429 RESOURCE_EXHAUSTED. Catch broadly because
+            # the SDK may also raise ServerError or APIError
+            # for rate limits depending on the backend.
+            if getattr(exc, "code", None) == 429:
+                raise LLMRateLimitError(
+                    f"gemini/{self._model}"
+                ) from exc
             raise
         return self._parse_response(response, tool_call_names, model=self._model)
 
