@@ -1725,9 +1725,12 @@ class AgentBase(ABC):
 
         cf = ticket.get("custom_fields", {})
         ref_text = ticket.get("description", "") + " " + cf.get("hypothesis", "")
+        text_ids = set(extract_ticket_references(ref_text))
+        # Also include structured references stored by triage.
+        structured_ids = set(cf.get("reference_tickets", []))
         ref_ids = [
             rid
-            for rid in extract_ticket_references(ref_text)
+            for rid in sorted(text_ids | structured_ids)
             if rid != ticket.get("id", "")
         ]
         refs: dict[str, dict[str, str]] = {}
