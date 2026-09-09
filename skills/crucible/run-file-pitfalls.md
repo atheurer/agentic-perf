@@ -210,8 +210,10 @@ script. Any other top-level fields on the tool-params object
 are silently ignored by crucible, so the tool starts with no
 arguments and does nothing.
 
-Use `get_tool_params(tool)` to discover valid parameters, presets,
-and subtools for each tool.
+Bootstrap Crucible context, then read the tool's `multiplex.json` and metadata
+through `get_crucible_benchmark_context` to discover valid parameters, presets,
+and subtools. If the paths are not documented, search for the tool name first
+and read the selected files.
 
 ## mv-params is mandatory
 
@@ -220,8 +222,11 @@ an `mv-params` key — the schema requires it. This is where you
 define what the benchmark actually does (test type, message sizes,
 duration, etc.).
 
-Use `get_benchmark_params` to discover valid parameters and
-presets for each benchmark. At minimum:
+Read the benchmark's `multiplex.json` through
+`get_crucible_benchmark_context` to discover valid parameters and presets. If
+the path is not identified by the fetched context, search for the benchmark
+name and read the selected file.
+At minimum:
 
 ```json
 "benchmarks": [

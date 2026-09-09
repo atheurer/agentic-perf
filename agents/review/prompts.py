@@ -68,12 +68,15 @@ on where results are stored and how to access them. Different harnesses store re
 differently — some use APIs, others store files on disk. The review config tells you
 which approach to use.
 
-For Crucible, use `get_crucible_benchmark_context(operation="list", benchmark=...,
-subject_area=["results", "benchmark"])`, inspect the returned logical
-`repository_namespaces`, and request any additional core, tool, or documentation
-namespace through the same gateway before reading its documents. Read selected
-logical paths through the gateway; do not assume a fixed hierarchy or bypass it
-through a repository-cache path. For other harnesses,
+For Crucible, first use `get_crucible_benchmark_context(operation="bootstrap")`
+and read the returned `AGENTS.md`, following its documentation pointers
+iteratively. When it identifies the `subprojects/benchmarks/` layout, use the
+known benchmark name to read `subprojects/benchmarks/<benchmark>/AGENTS.md`,
+README/CLAUDE, and result-related metadata at controller-relative paths. If a
+needed document is not identified, use `operation="search"` to discover
+controller-relative candidate paths, then read selected paths separately. Do not
+ask the gateway to interpret repository metadata,
+assume a fixed hierarchy, or bypass it through a repository-cache path. For other harnesses,
 `list_harness_docs`/`read_harness_doc` remain compatible.
 
 ## Step 3: Retrieve Results

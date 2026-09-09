@@ -120,10 +120,8 @@ def handlers_without_schema(provider_without_schema):
 @pytest.mark.asyncio
 async def test_get_runfile_schema_found(handlers_with_schema):
     result = await handlers_with_schema["get_runfile_schema"]()
-    assert result["found"] is True
-    assert result["harness"] == "crucible"
-    assert result["schema"] == MOCK_SCHEMA
-    assert "benchmarks" in result["schema"]["properties"]
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -135,11 +133,8 @@ async def test_get_runfile_schema_not_found(handlers_without_schema):
 @pytest.mark.asyncio
 async def test_get_benchmark_params_found(handlers_with_schema):
     result = await handlers_with_schema["get_benchmark_params"](benchmark="uperf")
-    assert result["found"] is True
-    assert result["benchmark"] == "uperf"
-    assert result["harness"] == "crucible"
-    assert "presets" in result["params"]
-    assert "validations" in result["params"]
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -151,10 +146,8 @@ async def test_get_benchmark_params_not_found(handlers_with_schema):
 @pytest.mark.asyncio
 async def test_get_example_runfile_found(handlers_with_schema):
     result = await handlers_with_schema["get_example_runfile"](benchmark="uperf")
-    assert result["found"] is True
-    assert result["benchmark"] == "uperf"
-    assert "benchmarks" in result["run_file"]
-    assert result["run_file"]["benchmarks"][0]["name"] == "uperf"
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio

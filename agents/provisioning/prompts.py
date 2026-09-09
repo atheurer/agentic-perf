@@ -86,8 +86,11 @@ The controller remains authoritative for installed-runtime facts.
    - If not present in directives, fall back to the provisioning config's
      "on_existing_install".
    - Then act on the resolved value:
-     - "skip": proceed directly to submit_provisioning_result with
-       provisioning_complete=true. Do NOT ask the user.
+     - "skip": do not install, update, or remove anything. Call
+       verify_harness_install with the controller host as a read-only check,
+       then report its result (including Crucible controller context readiness)
+       in submit_provisioning_result. "skip" means preserve the existing
+       installation, not skip verification. Do NOT ask the user.
      - "update": run update_install with the controller host.
      - "reinstall": call uninstall_harness with the controller host FIRST,
        wait for completion, then call install_harness with the controller host.

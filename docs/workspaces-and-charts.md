@@ -28,17 +28,13 @@ New producers should use these ticket-workspace namespaces:
 Crucible source snapshots are kept separately under
 `context/sources/github/...` and `context/sources/controller/...`, with
 provenance alongside each snapshot. `context/effective-context.json` records
-the phase, policy, effective source, assumptions, and selected workspace
-references. Triage uses GitHub context. Post-provision benchmark construction
-uses controller context only when the ticket identifies a reachable installed
-controller, its snapshot is available, and no update is expected; otherwise it
-uses GitHub until controller refresh. The benchmark context gateway performs
-that refresh through the ticket's SSH context, reading only the Crucible
-catalog, safe documentation paths, and the selected benchmark's metadata into
-the workspace. Unknown update policy is recorded as a `no_update` assumption.
-Alternate sources remain available for drift comparison, but agents should
-follow the effective manifest rather than read all cached context. Existing
-files at the workspace root remain valid for compatibility.
+phase-owned policy and selected workspace references without exposing source
+selection to agents. The context gateway chooses the applicable source
+internally, refreshes controller context through the ticket's SSH context when
+appropriate, and caches only documents requested through the generic bootstrap,
+search, and read operations. Agents do not inspect source snapshots or
+repository catalogs directly. Existing files at the workspace root remain
+valid for compatibility.
 `list_workspace_files` includes `namespace` and `kind` so consumers can
 distinguish these files without parsing their names.
 
@@ -52,33 +48,33 @@ blocks an alternate source snapshot. Pass the explicit `include_alternates`
 comparison option only when performing source drift/comparison work. Files
 without a policy-manifest entry remain visible for backward compatibility.
 
-## Crucible context gateway
+## Context gateway
 
-Crucible-specific documentation is retrieved through the unified
-`get_crucible_benchmark_context` gateway. Use `operation=list` to discover
-source-backed documents and `operation=read` for a selected path. Stable
-namespaces are `core/...` for the pinned Crucible checkout and
-`benchmark/<name>/...` for the catalog-selected benchmark checkout. Explicitly
-mapped local overlays use `local/...` and are supplemental, with harness,
-benchmark, phase, agent, subject-area, and provenance metadata from
-`skills/context-manifest.json`. The gateway discovers files under an explicit
-safe-document policy, so renamed or newly added upstream documentation does not
-require prompt changes; it returns repository, ref, commit, and deterministic
-subject-area guidance for run-files, endpoints, execution, engines, tools,
-benchmark semantics, and results.
+Harness context is retrieved through generic context primitives. For Crucible,
+agents use `get_crucible_benchmark_context` as follows:
 
-Subject-area selection accepts a list such as `["run-file", "endpoints",
-"execution"]`; separate calls are also deterministic. Comma-separated strings
-are accepted for compatibility and normalized into the same selection.
+```json
+{"operation": "bootstrap"}
+{"operation": "search", "query": "perftest|multiplex.json"}
+{"operation": "read", "path": "subprojects/benchmarks/perftest/README.md"}
+```
 
-Read operations persist source material and the phase-owned effective-context
-manifest in the ticket workspace. Alternate snapshots are retained for
-comparison and are not part of an agent's default view. The legacy
-`list_harness_docs`, `read_harness_doc`, `read_skills`, and structured lookup
-tools remain registered for migration and for harnesses without a source-aware
-gateway. The Crucible benchmark agent uses the gateway for context and has the
-three legacy document tools scoped out; other harnesses retain their existing
-tool behavior.
+`bootstrap` returns the source's entrypoint document, normally `AGENTS.md`.
+`search` performs bounded discovery across both file/directory names and file
+contents, returning grouped candidate paths and snippets. `read` returns the
+exact caller-selected path. The caller decides which documents to search for
+and read; the gateway does not interpret repository metadata, invent a
+namespace, curate subject areas, or translate benchmark names.
+
+Source selection, phase/audience visibility, path safety, workspace caching,
+provenance, and audit records are server-managed. The agent-facing request
+does not select a source, namespace, subject area, benchmark, or alternate
+source. Read operations persist source material and phase-owned context in the
+ticket workspace without exposing source-selection internals to the agent.
+
+The legacy `list_harness_docs`, `read_harness_doc`, `read_skills`, and structured
+lookup tools remain available for migration and harnesses without a context
+gateway. They are not part of the Crucible context retrieval contract.
 
 Workspace files persist across agent handoffs and are included in the
 workspace manifest/context supplied to the next agent. They are removed only

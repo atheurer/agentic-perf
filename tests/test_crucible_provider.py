@@ -6,8 +6,9 @@ import os
 import pytest
 
 from providers.skills.crucible import (
-    CrucibleSkillProvider,
-    CrucibleSourceResolution,
+    CrucibleContextGateway as CrucibleSkillProvider,
+)
+from providers.skills.crucible import (
     CrucibleSourceResolver,
     select_crucible_context,
 )
@@ -337,7 +338,7 @@ async def test_benchmark_context_mcp_tool_delegates_to_crucible_provider(
     import agents.benchmark.server as server
     import paths
 
-    monkeypatch.setattr(server, "_skill_provider", provider)
+    monkeypatch.setattr(server, "_crucible_context", provider)
     monkeypatch.setattr(server, "_initialized", True)
     monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
     monkeypatch.setenv("TICKET_ID", "PERF-CONTEXT")
@@ -403,7 +404,7 @@ async def test_benchmark_context_uses_controller_snapshot_when_policy_allows(
         {"README.md": "controller guidance"},
         benchmark="fio",
     )
-    monkeypatch.setattr(server, "_skill_provider", provider)
+    monkeypatch.setattr(server, "_crucible_context", provider)
     monkeypatch.setattr(server, "_initialized", True)
     monkeypatch.setattr(
         server,
@@ -1040,7 +1041,7 @@ async def test_benchmark_gateway_prefers_controller_checkout_and_params(
 
     monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
     monkeypatch.setenv("TICKET_ID", "PERF-A3D7B59F")
-    monkeypatch.setattr(server, "_skill_provider", provider)
+    monkeypatch.setattr(server, "_crucible_context", provider)
     monkeypatch.setattr(server, "_initialized", True)
     monkeypatch.setattr(
         server,
@@ -1140,6 +1141,7 @@ async def test_controller_context_refresh_snapshots_remote_install(
 
     class FakeSSH:
         files = {
+            "/opt/crucible/AGENTS.md": "Crucible layout guidance",
             "/opt/crucible/subprojects/core/config/repos.json": (
                 '{"official": [{"name": "perftest", "type": "benchmark"}]}'
             ),
@@ -1151,6 +1153,8 @@ async def test_controller_context_refresh_snapshots_remote_install(
 
         async def run(self, host, command, **kwargs):
             if command.startswith("for path in"):
+                if "/opt/crucible/AGENTS.md" in command:
+                    return SSHResult("/opt/crucible/AGENTS.md\n", "", 0)
                 if "/opt/crucible/subprojects/core/config/repos.json" in command:
                     return SSHResult(
                         "/opt/crucible/subprojects/core/config/repos.json\n", "", 0
@@ -1205,6 +1209,12 @@ async def test_controller_context_refresh_snapshots_remote_install(
     manager = WorkspaceManager(
         ticket_id="PERF-REMOTE-CONTEXT", agent_name="benchmark-agent", phase="benchmark"
     )
+    bootstrap = await server._refresh_controller_bootstrap(manager)
+    assert bootstrap["available"] is True
+    assert bootstrap["document"]["ref"] == "core/AGENTS.md"
+    assert manager.read_document("core/AGENTS.md")["content"] == (
+        "Crucible layout guidance"
+    )
     result = await server._refresh_controller_context("perftest", manager)
 
     assert result["available"] is True
@@ -1242,12 +1252,12 @@ async def test_controller_context_refresh_snapshots_remote_install(
         '"repository": "https://example.test/bench-perftest"}]}'
     )
     (github / "bench-perftest" / "README.md").write_text("github benchmark guidance")
-    from providers.skills.crucible import CrucibleSkillProvider
+    from providers.skills.crucible import CrucibleContextGateway
 
     monkeypatch.setattr(
         server,
-        "_skill_provider",
-        CrucibleSkillProvider(tmp_path / "missing-controller", source_repo=github),
+        "_crucible_context",
+        CrucibleContextGateway(tmp_path / "missing-controller", source_repo=github),
     )
     monkeypatch.setattr(server, "_initialized", True)
     gateway_result = json.loads(
@@ -1319,56 +1329,23 @@ def test_crucible_source_resolver_uses_explicit_local_fallback(tmp_path):
     assert result.provenance["refresh_attempted"] is False
 
 
-def test_build_skill_provider_wires_resolved_crucible_source(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    (source / "config").mkdir(parents=True)
-    (source / "config" / "repos.json").write_text("{}")
-    resolution = CrucibleSourceResolution(
-        source,
-        {
-            "effective_source": "github",
-            "core_catalog_commit": "catalog-pin",
-        },
-    )
-
-    class Resolver:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def resolve(self):
-            return resolution
-
-    monkeypatch.setattr("providers.skills.crucible.CrucibleSourceResolver", Resolver)
+def test_build_skill_provider_does_not_register_crucible(tmp_path, monkeypatch):
     from agents.server_utils import build_skill_provider
 
     provider = build_skill_provider(
         crucible_home=tmp_path / "controller", repo_cache=object()
     )
-    crucible = provider.get_provider("crucible")
-
-    assert crucible._source_repo == source
-    assert crucible._source_provenance["core_catalog_commit"] == "catalog-pin"
+    assert provider.get_provider("crucible") is None
 
 
-def test_build_skill_provider_can_skip_crucible_source_resolution(
-    tmp_path, monkeypatch
-):
+def test_build_skill_provider_never_resolves_crucible_source(tmp_path, monkeypatch):
     from agents.server_utils import build_skill_provider
-    from providers.skills.crucible import CrucibleSourceResolver
-
-    def fail_if_resolved(*args, **kwargs):
-        raise AssertionError("source resolution is not allowed for provisioning")
-
-    monkeypatch.setattr(CrucibleSourceResolver, "resolve", fail_if_resolved)
     provider = build_skill_provider(
         crucible_home=tmp_path / "controller",
         repo_cache=object(),
         resolve_source=False,
     )
-    crucible = provider.get_provider("crucible")
-
-    assert crucible._source_repo is None
-    assert crucible._source_provenance == {}
+    assert provider.get_provider("crucible") is None
 
 
 @pytest.mark.asyncio
@@ -1696,3 +1673,96 @@ class TestEndpointUserEnforcement:
             [{"host": "10.0.0.1", "roles": ["client"]}],
         )
         assert template["endpoints"][0]["settings"]["user"] == "root"
+
+
+@pytest.mark.asyncio
+async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
+    import agents.benchmark.server as benchmark_server
+    import agents.review.server as review_server
+
+    for server in (benchmark_server, review_server):
+        tools = await server.mcp.list_tools()
+        tool = next(
+            item for item in tools if item.name == "get_crucible_benchmark_context"
+        )
+        assert set(tool.parameters["properties"]) == {"operation", "path", "query"}
+        assert tool.parameters["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_controller_context_gateway_follows_agent_supplied_paths(
+    tmp_path, monkeypatch
+):
+    import paths
+    from agents.server_utils import controller_context_gateway
+    from providers.ssh import SSHResult
+    from providers.workspace.manager import WorkspaceManager
+
+    class FakeSSH:
+        async def run(self, host, command, **kwargs):
+            if "grep -RInE" in command:
+                return SSHResult(
+                    "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md:12:device guidance\n"
+                    "NAME\tf\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
+                    "NAME\td\t/opt/crucible/subprojects/benchmarks/perftest\n",
+                    "",
+                    0,
+                )
+            if "AGENTS.md" in command:
+                return SSHResult(
+                    "Read subprojects/benchmarks/perftest/README.md next.", "", 0
+                )
+            if "perftest/README.md" in command:
+                return SSHResult("perftest guidance", "", 0)
+            return SSHResult("", "missing", 1)
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    ticket_id = "PERF-DIRECTED-CONTEXT"
+    bootstrap = json.loads(
+        await controller_context_gateway(
+            ssh=FakeSSH(),
+            controller_host="controller.example.test",
+            ticket_id=ticket_id,
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="bootstrap",
+        )
+    )
+    assert bootstrap["document"]["ref"] == "AGENTS.md"
+    assert "source" not in bootstrap["document"]
+
+    read = json.loads(
+        await controller_context_gateway(
+            ssh=FakeSSH(),
+            controller_host="controller.example.test",
+            ticket_id=ticket_id,
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="subprojects/benchmarks/perftest/README.md",
+        )
+    )
+    assert read["document"]["ref"] == "subprojects/benchmarks/perftest/README.md"
+    assert read["document"]["content"] == "perftest guidance"
+    manager = WorkspaceManager(ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark")
+    assert manager.read_document("subprojects/benchmarks/perftest/README.md")["status"] == "ok"
+
+    search = json.loads(
+        await controller_context_gateway(
+            ssh=FakeSSH(),
+            controller_host="controller.example.test",
+            ticket_id=ticket_id,
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="search",
+            query="device|rdma",
+        )
+    )
+    assert search["found"] is True
+    assert search["results"][0]["ref"] == "subprojects/benchmarks/perftest/README.md"
+    assert search["results"][0]["match_kinds"] == ["content", "name"]
+    assert search["results"][0]["matches"][0]["kind"] == "content"
+    assert search["total_files"] == 2
+    assert search["total_matches"] == 3
+    assert search["results"][1]["type"] == "directory"
+    assert "source" not in search["results"][0]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import sys
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -25,39 +26,6 @@ def setup_project_path() -> str:
     if root not in sys.path:
         sys.path.insert(0, root)
     return root
-
-
-def resolve_crucible_source(repo_cache=None, local_fallback=None, source_url=None):
-    """Resolve an existing local Crucible checkout without network access."""
-    from providers.skills.crucible import CrucibleSourceResolver
-    from providers.skills.repo_cache import RepoCache
-
-    source = os.environ.get("CRUCIBLE_SOURCE_REPO")
-    # ``source_url`` remains accepted for configuration compatibility, but is
-    # intentionally never used to fetch a repository.
-    source_url = source_url or os.environ.get("CRUCIBLE_SOURCE_REPO_URL")
-    try:
-        from paths import CONFIG_PATH
-
-        config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
-        source = source or config.get("crucible_source_repo")
-        source_url = source_url or config.get(
-            "crucible_source_repo_url",
-            config.get("harness_repos", {}).get("crucible"),
-        )
-    except (OSError, json.JSONDecodeError):
-        pass
-    source_url = source_url or "https://github.com/perftool-incubator/crucible.git"
-    resolver = CrucibleSourceResolver(
-        repo_cache or RepoCache(), source_url, local_fallback=local_fallback or source
-    )
-    return resolver.resolve()
-
-
-def _configured_crucible_source() -> str | None:
-    """Compatibility wrapper returning only the resolved source path."""
-    return_path = resolve_crucible_source().path
-    return str(return_path) if return_path else None
 
 
 def build_skill_provider(
@@ -77,38 +45,20 @@ def build_skill_provider(
     from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
     from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
     from providers.skills.clusterbuster import ClusterbusterSkillProvider
-    from providers.skills.crucible import CrucibleSkillProvider
     from providers.skills.forge import ForgeSkillProvider
     from providers.skills.ioscale import IoscaleSkillProvider
     from providers.skills.k8s_netperf import K8sNetperfSkillProvider
     from providers.skills.kube_burner import KubeBurnerSkillProvider
     from providers.skills.multi import MultiHarnessSkillProvider
     from providers.skills.private import PrivateSkillProvider
-    from providers.skills.repo_cache import RepoCache
     from providers.skills.vstorm import VstormSkillProvider
     from providers.skills.zathras import ZathrasSkillProvider
 
-    crucible_home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
-    repo_cache = repo_cache or RepoCache()
-    resolution = (
-        resolve_crucible_source(
-            repo_cache, local_fallback=source_repo, source_url=source_url
-        )
-        if resolve_source
-        else None
-    )
     zathras_home = (
         zathras_home if zathras_home is not None else os.environ.get("ZATHRAS_HOME", "")
     )
 
     harnesses: dict[str, Any] = {
-        "crucible": CrucibleSkillProvider(
-            crucible_home,
-            source_repo=resolution.path if resolution else source_repo,
-            repo_cache=repo_cache,
-            source_provenance=resolution.provenance if resolution else {},
-            catalog_only=catalog_only,
-        ),
         "kube-burner": KubeBurnerSkillProvider(),
         "k8s-netperf": K8sNetperfSkillProvider(),
         "benchmark-runner": BenchmarkRunnerSkillProvider(),
@@ -129,6 +79,37 @@ def build_skill_provider(
 
     return MultiHarnessSkillProvider(
         harnesses, PrivateSkillProvider(), default_harness="crucible"
+    )
+
+
+def build_crucible_context_gateway(
+    *,
+    crucible_home: str | None = None,
+    repo_cache=None,
+    source_repo: str | None = None,
+    source_url: str | None = None,
+    resolve_source: bool = False,
+    catalog_only: bool = False,
+):
+    """Build the internal Crucible context/catalog adapter.
+
+    Crucible is intentionally not registered in the general SkillProvider
+    aggregate.  Benchmark and review agents retrieve Crucible metadata through
+    the controller-backed context gateway; triage may use this adapter only for
+    its minimal catalog discovery.
+    """
+    from providers.skills.crucible import CrucibleContextGateway
+    from providers.skills.repo_cache import RepoCache
+
+    home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
+    cache = repo_cache or RepoCache()
+    if resolve_source:
+        logger.warning("resolve_source is ignored; Crucible repositories are not cloned")
+    return CrucibleContextGateway(
+        home,
+        source_repo=source_repo,
+        repo_cache=cache,
+        catalog_only=catalog_only,
     )
 
 
@@ -317,6 +298,240 @@ def _emit_context_audit_event(
     )
 
 
+def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
+    """Return the explicitly assigned Crucible controller from ticket data."""
+    fields = ticket.get("custom_fields", {}) if isinstance(ticket, dict) else {}
+    context = fields.get("crucible_controller_context")
+    if isinstance(context, dict):
+        for key in ("host", "controller"):
+            value = context.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    assigned = fields.get("assigned_hardware_ips")
+    if isinstance(assigned, dict):
+        value = assigned.get("controller")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _controller_relative_path(path: str) -> str | None:
+    """Normalize a path learned from controller documentation.
+
+    This intentionally does not classify or infer Crucible repositories.  It
+    only keeps reads below the installed controller root and excludes obvious
+    credential or VCS internals.
+    """
+    value = str(path or "").strip().removeprefix("crucible://")
+    value = value.removeprefix("/opt/crucible/")
+    if not value or value.startswith("/"):
+        return None
+    candidate = Path(value)
+    if any(part in {"", ".", ".."} or part.startswith(".git") for part in candidate.parts):
+        return None
+    lowered = value.lower()
+    if any(
+        marker in lowered
+        for marker in ("/secrets/", "/.ssh/", "authorized_keys", ".pem", ".key", "token")
+    ):
+        return None
+    return candidate.as_posix()
+
+
+async def _search_controller_source(
+    *,
+    ssh: Any,
+    controller_host: str,
+    query: str,
+    max_results: int = 100,
+    max_bytes: int = 65536,
+) -> dict[str, Any]:
+    """Find candidate documents in the installed controller tree.
+
+    This is discovery, not document resolution. The agent receives
+    controller-relative paths and short matching lines, then decides what to
+    read. The scan is bounded and excludes repository and credential internals.
+    """
+    if not query.strip():
+        return {"found": False, "operation": "search", "reason": "empty_query"}
+    max_results = max(1, min(int(max_results), 100))
+    max_bytes = max(1024, min(int(max_bytes), 131072))
+    find_pattern = shlex.quote(f".*({query}).*")
+    command = (
+        "{ "
+        "find /opt/crucible -regextype posix-extended "
+        "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
+        f"\\( -type f -o -type d \\) -regex {find_pattern} "
+        "-printf 'NAME\\t%y\\t%p\\n' 2>/dev/null; "
+        "grep -RInE --binary-files=without-match "
+        "--exclude-dir=.git --exclude-dir=.ssh --exclude-dir=secrets "
+        "--exclude='*.pem' --exclude='*.key' --exclude='authorized_keys' "
+        f"-- {shlex.quote(query)} /opt/crucible 2>/dev/null "
+        "| sed 's/^/CONTENT\\t/'; "
+        f"}} | head -n {max_results}"
+    )
+    result = await ssh.run(controller_host, command, timeout=30)
+    raw_output = result.stdout.encode("utf-8", errors="replace")
+    grouped: dict[str, dict[str, Any]] = {}
+    total_matches = 0
+    for line in raw_output[:max_bytes].decode("utf-8", errors="replace").splitlines():
+        fields = line.split("\t", 3)
+        if not fields:
+            continue
+        kind = fields[0]
+        if kind == "NAME":
+            if len(fields) != 3:
+                continue
+            file_type, value = fields[1:]
+            raw_path = value
+            line_number = ""
+            content = ""
+        elif kind == "CONTENT":
+            if len(fields) != 2:
+                continue
+            file_type = "f"
+            value = fields[1]
+            content_fields = value.split(":", 2)
+            if len(content_fields) != 3:
+                continue
+            raw_path, line_number, content = content_fields
+        else:
+            continue
+        if not raw_path.startswith("/opt/crucible/"):
+            continue
+        relative = _controller_relative_path(raw_path)
+        if not relative:
+            continue
+        total_matches += 1
+        entry = grouped.setdefault(
+            relative,
+            {
+                "ref": relative,
+                "uri": f"crucible://{relative}",
+                "type": "directory" if file_type == "d" else "file",
+                "match_kinds": [],
+                "matches": [],
+            },
+        )
+        match_kind = "name" if kind == "NAME" else "content"
+        if match_kind not in entry["match_kinds"]:
+            entry["match_kinds"].append(match_kind)
+        entry["matches"].append(
+            {
+                "kind": match_kind,
+                "line_number": int(line_number) if line_number.isdigit() else None,
+                "content": content[:1000] if content else None,
+            }
+        )
+    files = list(grouped.values())
+    for entry in files:
+        entry["match_count"] = len(entry["matches"])
+    return {
+        "found": bool(files),
+        "operation": "search",
+        "query": query,
+        "namespace": "controller",
+        "results": files,
+        "total_files": len(files),
+        "total_matches": total_matches,
+        "truncated": total_matches >= max_results or len(raw_output) > max_bytes,
+    }
+
+
+async def controller_context_gateway(
+    *,
+    ssh: Any,
+    controller_host: str | None,
+    ticket_id: str,
+    agent_name: str,
+    phase: str,
+    benchmark: str = "",
+    operation: str = "read",
+    path: str = "",
+    query: str = "",
+    include_alternates: bool = False,
+) -> str:
+    """Read controller context by following paths supplied by AGENTS.md.
+
+    The controller filesystem is the source of truth.  This function does not
+    parse repos.json, resolve benchmark repositories, or construct a document
+    inventory.  Agents bootstrap with AGENTS.md and then request the paths it
+    points to, just as a coding agent would.
+    """
+    from providers.workspace.manager import WorkspaceManager
+
+    manager = WorkspaceManager(ticket_id=ticket_id, agent_name=agent_name, phase=phase)
+    if operation == "bootstrap":
+        path = "AGENTS.md"
+    if operation == "read":
+        cached = manager.read_document(path, include_alternates=include_alternates)
+        if cached.get("status") == "ok":
+            result = {"found": True, "operation": operation, "document": cached, "documents": [cached]}
+            return json.dumps(_public_context_result(result, phase=phase, audience=manager.audience, benchmark=benchmark, namespace="controller", subject_area="all"))
+    if operation == "list":
+        documents = manager.context_manifest("controller").get("documents", [])
+        result = {"found": bool(documents), "operation": operation, "documents": documents}
+        return json.dumps(
+            _public_context_result(
+                result,
+                phase=phase,
+                audience=manager.audience,
+                benchmark=benchmark,
+                namespace="controller",
+                subject_area="all",
+                manifest_documents=documents,
+            )
+        )
+    relative = _controller_relative_path(path)
+    if not controller_host or ssh is None:
+        return json.dumps({"found": False, "operation": operation, "reason": "controller_not_identified"})
+    if operation in {"bootstrap", "read"}:
+        remote_path = f"/opt/crucible/{relative}" if relative else ""
+        if not remote_path:
+            return json.dumps({"found": False, "operation": operation, "reason": "invalid_controller_path", "path": path})
+        result = await ssh.run(
+            controller_host,
+            f"test -f {shlex.quote(remote_path)} && head -c 262144 {shlex.quote(remote_path)}",
+            timeout=30,
+        )
+        if result.exit_code != 0:
+            return json.dumps({"found": False, "operation": operation, "reason": "controller_document_not_found", "path": relative})
+        content = result.stdout
+        provenance = {"effective_source": "controller", "controller": controller_host, "path": relative}
+        saved = manager.save_source_snapshot("controller", provenance, {relative: content})
+        document = {
+            "namespace": "controller",
+            "path": relative,
+            "ref": relative,
+            "uri": f"crucible://{relative}",
+            "source_path": relative,
+            "source": "controller",
+            "authority": "effective",
+            "provenance": provenance,
+            "entrypoint": relative == "AGENTS.md",
+            "content": content,
+            "workspace_ref": saved.get("files", {}).get(relative),
+        }
+        manager.index_context_documents([document])
+        manager.save_effective_context({
+            "schema_version": 1,
+            "policy": "controller_agent_directed",
+            "namespace": "controller",
+            "documents": [_public_context_document(document)],
+        })
+        result = {"found": True, "operation": operation, "document": document, "documents": [document]}
+    elif operation == "search":
+        result = await _search_controller_source(
+            ssh=ssh,
+            controller_host=controller_host,
+            query=query,
+        )
+    else:
+        result = {"found": False, "operation": operation, "reason": "unsupported_operation"}
+    _emit_context_audit_event(ticket_id, agent_name=agent_name, phase=phase, benchmark=benchmark, operation=operation, namespace="controller", result=result)
+    return json.dumps(_public_context_result(result, phase=phase, audience=manager.audience, benchmark=benchmark, namespace="controller", subject_area="all"))
+
+
 async def crucible_context_gateway(
     skill_provider: Any,
     *,
@@ -351,6 +566,33 @@ async def crucible_context_gateway(
         manager = WorkspaceManager(
             ticket_id=ticket_id, agent_name=agent_name, phase=phase
         )
+        if operation == "bootstrap":
+            cached = manager.read_document(
+                "core/AGENTS.md", include_alternates=include_alternates
+            )
+            if cached.get("status") == "ok":
+                return json.dumps(
+                    _public_context_result(
+                        {
+                            "found": True,
+                            "operation": "bootstrap",
+                            "document": cached,
+                            "documents": [cached],
+                        },
+                        phase=phase,
+                        audience=manager.audience,
+                        benchmark=benchmark,
+                        namespace="core",
+                        subject_area="all",
+                    )
+                )
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": "bootstrap",
+                    "reason": "controller_bootstrap_not_available_in_workspace",
+                }
+            )
         if operation == "read" and path:
             cached = manager.read_document(path, include_alternates=include_alternates)
             if cached.get("status") == "ok":

@@ -57,12 +57,8 @@ def handlers(mock_provider):
 @pytest.mark.asyncio
 async def test_get_execution_config_crucible(handlers):
     result = await handlers["get_execution_config"](harness_name="crucible")
-    assert result["found"] is True
-    assert result["harness"] == "crucible"
-    assert result["run_command"] == "crucible run"
-    assert result["run_file_format"] == "json"
-    assert result["userenv_discovery"]["required"] is True
-    assert result["userenv_discovery"]["command"] == "crucible userenvs list"
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -300,11 +296,8 @@ async def test_get_tool_params_found():
     )
     h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
     res = await h["get_tool_params"](tool="sysstat", harness="crucible")
-    assert res["found"] is True
-    assert res["tool"] == "sysstat"
-    assert res["harness"] == "crucible"
-    assert res["params"]["presets"]["defaults"]["interval"] == "3"
-    assert res["metadata"]["description"] == "Wrapper for sar, mpstat, iostat, pidstat"
+    assert res["found"] is False
+    assert "controller-sourced context" in res["message"]
 
 
 @pytest.mark.asyncio
@@ -313,4 +306,4 @@ async def test_get_tool_params_not_found():
     h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
     res = await h["get_tool_params"](tool="nonexistent_tool", harness="crucible")
     assert res["found"] is False
-    assert "No parameter definitions or metadata" in res["message"]
+    assert "controller-sourced context" in res["message"]

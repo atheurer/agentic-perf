@@ -10,7 +10,6 @@ Run directly:  python agents/benchmark/server.py
 Connected via: AgentMCPClient (agents/mcp_client.py)
 """
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -31,10 +30,13 @@ from fastmcp import FastMCP
 
 from agents.server_utils import (
     _emit_context_audit_event,
+    _public_context_document,
     _public_context_result,
+    build_crucible_context_gateway,
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
+    controller_context_gateway,
     read_skill_documents,
     tool_progress,
 )
@@ -196,17 +198,19 @@ _initialized = False
 _boot_time_executed = False
 _ssh = None
 _skill_provider = None
+_crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
 
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
-    global _initialized, _ssh, _skill_provider, _repo_cache, _ticket
+    global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
     _skill_provider = build_skill_provider()
+    _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = build_repo_cache()
     except Exception:
@@ -291,7 +295,12 @@ async def _find_controller_repository(
     # The catalog determines the names we search for; this does not expose a
     # general arbitrary-path reader to the agent.
     names = [value for value in (repo_name, name, f"{repo_type}-{name}") if value]
-    quoted = " ".join(shlex.quote(value) for value in dict.fromkeys(names))
+    # Crucible stores clones below repos/ using the full remote URL as the
+    # directory name (for example
+    # ``https:github.com:perftool-incubator/bench-perftest``).  The basename
+    # therefore does not equal repo_name; match a bounded suffix as well.
+    patterns = list(dict.fromkeys(names + ([f"*{repo_name}"] if repo_name else [])))
+    quoted = " ".join(shlex.quote(value) for value in patterns)
     result = await _ssh.run(
         host,
         f"find {shlex.quote(root)}/subprojects {shlex.quote(root)}/repos "
@@ -303,7 +312,70 @@ async def _find_controller_repository(
     return value[0].strip() if value else None
 
 
-async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str, Any]:
+async def _refresh_controller_bootstrap(manager: Any) -> dict[str, Any]:
+    """Read the single controller document needed to bootstrap discovery."""
+    host = _controller_host()
+    if not host or _ssh is None:
+        return {"available": False, "reason": "controller_not_identified"}
+
+    bootstrap_path = await _find_controller_path(
+        host,
+        [
+            f"{_CRUCIBLE_ROOT}/AGENTS.md",
+            f"{_CRUCIBLE_ROOT}/subprojects/core/AGENTS.md",
+        ],
+    )
+    if not bootstrap_path:
+        return {
+            "available": False,
+            "reason": "controller_bootstrap_document_unavailable",
+            "host": host,
+        }
+    content = await _read_controller_file(host, bootstrap_path)
+    if content is None:
+        return {
+            "available": False,
+            "reason": "controller_bootstrap_document_unreadable",
+            "host": host,
+            "path": bootstrap_path,
+        }
+
+    provenance = {
+        "effective_source": "controller",
+        "source_reason": "controller_bootstrap_document",
+        "controller": host,
+        "crucible_root": _CRUCIBLE_ROOT,
+        "bootstrap_path": bootstrap_path,
+    }
+    saved = manager.save_source_snapshot(
+        "controller", provenance, {"AGENTS.md": content}
+    )
+    document = {
+        "namespace": "core",
+        "path": "core/AGENTS.md",
+        "ref": "core/AGENTS.md",
+        "uri": "crucible://core/AGENTS.md",
+        "source_path": "AGENTS.md",
+        "source": "controller",
+        "authority": "effective",
+        "provenance": provenance,
+        "entrypoint": True,
+        "content": content,
+        "workspace_ref": saved.get("files", {}).get("AGENTS.md"),
+    }
+    manager.index_context_documents([document])
+    return {
+        "available": True,
+        "reason": "controller_bootstrap_succeeded",
+        "host": host,
+        "provenance": provenance,
+        "document": document,
+    }
+
+
+async def _refresh_controller_context(
+    benchmark: str, manager: Any, *, namespace: str = "all"
+) -> dict[str, Any]:
     """Snapshot Crucible context from the designated controller.
 
     The context gateway owns this refresh so source selection is based on the
@@ -328,10 +400,13 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
     if not catalog_path:
         return {"available": False, "reason": "crucible_not_installed", "host": host}
 
-    core_root = catalog_path.removesuffix("/config/repos.json")
+    # The top-level catalog describes the repository graph; it is not
+    # necessarily the root of the active core repository.  Discover core docs
+    # and schemas independently from the catalog location.
+    core_root = f"{_CRUCIBLE_ROOT}/subprojects/core"
     core_docs_root = await _find_controller_path(
         host,
-        [f"{core_root}/docs", f"{_CRUCIBLE_ROOT}/docs"],
+        [f"{_CRUCIBLE_ROOT}/docs", f"{core_root}/docs"],
         directory=True,
     )
     listing = await _ssh.run(
@@ -342,24 +417,42 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
         "-o -name '*.yml' -o -name '*.toml' \\) -print",
         timeout=30,
     )
-    core_paths = [catalog_path]
+    core_paths: list[tuple[str, str]] = [(catalog_path, "config/repos.json")]
+    bootstrap_path = await _find_controller_path(
+        host,
+        [f"{_CRUCIBLE_ROOT}/AGENTS.md", f"{core_root}/AGENTS.md"],
+    )
+    if bootstrap_path:
+        core_paths.append((bootstrap_path, "AGENTS.md"))
+    # Run-file and tool schemas are controller runtime metadata, not static
+    # agentic-perf skills.  Snapshot the installed controller copies so the
+    # context gateway can serve them to benchmark and review agents.
+    for name in ("run-file.json", "tool-params.json", "remotehosts.json"):
+        schema_path = await _find_controller_path(
+            host,
+            [
+                f"{core_root}/rickshaw/schema/{name}",
+                f"{_CRUCIBLE_ROOT}/rickshaw/schema/{name}",
+            ],
+        )
+        if schema_path:
+            core_paths.append((schema_path, f"rickshaw/schema/{name}"))
+    docs_root = core_docs_root or core_root
     if listing.exit_code == 0:
         core_paths.extend(
-            line.strip()
+            (line.strip(), f"docs/{Path(line.strip()).relative_to(docs_root)}")
             for line in listing.stdout.splitlines()
-            if line.strip().startswith((core_docs_root or core_root) + "/")
+            if line.strip().startswith(docs_root + "/")
         )
-    core_results = await asyncio.gather(
-        *(_read_controller_file(host, path) for path in core_paths)
-    )
     core_files: dict[str, str] = {}
-    for path, content in zip(core_paths, core_results):
+    # Keep controller reads sequential. A Crucible controller commonly has a
+    # conservative SSH MaxStartups setting; a bulk gather here can cause the
+    # controller to reset handshakes and make an otherwise healthy context
+    # source appear empty.
+    for path, relative in core_paths:
+        content = await _read_controller_file(host, path)
         if content is None:
             continue
-        if path == catalog_path:
-            relative = "config/repos.json"
-        else:
-            relative = path.removeprefix(core_root + "/")
         core_files[relative] = content
 
     try:
@@ -372,44 +465,35 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
         for entry in catalog.get(group, [])
         if isinstance(entry, dict) and isinstance(entry.get("name"), str)
     }
+    needs_benchmark = namespace == "all" or namespace.startswith("benchmark/")
     benchmark_entry = catalog_entries.get(benchmark)
-    if not benchmark_entry or benchmark_entry.get("type") != "benchmark":
-        return {
-            "available": False,
-            "reason": "benchmark_not_in_controller_catalog",
-            "host": host,
-            "benchmark": benchmark,
-        }
-    benchmark_root = await _find_controller_repository(host, benchmark_entry)
-    if not benchmark_root:
-        return {
-            "available": False,
-            "reason": "controller_benchmark_checkout_unavailable",
-            "host": host,
-            "benchmark": benchmark,
-            "catalog_path": catalog_path,
-        }
+    benchmark_root = None
+    if needs_benchmark:
+        if not benchmark_entry or benchmark_entry.get("type") != "benchmark":
+            return {
+                "available": False,
+                "reason": "benchmark_not_in_controller_catalog",
+                "host": host,
+                "benchmark": benchmark,
+            }
+        benchmark_root = await _find_controller_repository(host, benchmark_entry)
+        if not benchmark_root:
+            return {
+                "available": False,
+                "reason": "controller_benchmark_checkout_unavailable",
+                "host": host,
+                "benchmark": benchmark,
+                "catalog_path": catalog_path,
+            }
 
-    from providers.skills.crucible import CrucibleSkillProvider
+    from providers.skills.crucible import CrucibleContextGateway
 
-    repository_roots: dict[str, str] = {f"benchmark/{benchmark}": benchmark_root}
-    for name, entry in catalog_entries.items():
-        if name == "crucible" or entry.get("type") not in {
-            "core",
-            "benchmark",
-            "tool",
-            "doc",
-        }:
-            continue
-        repo_root = await _find_controller_repository(host, entry)
-        if repo_root:
-            prefix = {
-                "core": "core",
-                "benchmark": "benchmark",
-                "tool": "tool",
-                "doc": "doc",
-            }[entry["type"]]
-            repository_roots[f"{prefix}/{name}"] = repo_root
+    # Discovery is intentionally lazy. The bootstrap AGENTS.md tells the
+    # caller how to ask for other namespaces; a request for one benchmark must
+    # not trigger SSH probes and file reads for every repo in repos.json.
+    repository_roots: dict[str, str] = {}
+    if benchmark_root:
+        repository_roots[f"benchmark/{benchmark}"] = benchmark_root
 
     async def read_repository(namespace: str, repository_root: str) -> dict[str, str]:
         listing = await _ssh.run(
@@ -427,27 +511,26 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
                 if not path.startswith(repository_root + "/"):
                     continue
                 relative = Path(path.removeprefix(repository_root + "/"))
-                if CrucibleSkillProvider._safe_context_file(
+                if CrucibleContextGateway._safe_context_file(
                     Path(repository_root),
                     relative,
                     benchmark_namespace=namespace.startswith("benchmark/"),
                 ):
                     paths.append(path)
-        contents = await asyncio.gather(
-            *(_read_controller_file(host, path) for path in paths)
-        )
-        return {
-            f"repositories/{namespace}/{path.removeprefix(repository_root + '/')}": content
-            for path, content in zip(paths, contents)
-            if content is not None
-        }
+        files: dict[str, str] = {}
+        for path in paths:
+            content = await _read_controller_file(host, path)
+            if content is not None:
+                files[
+                    f"repositories/{namespace}/{path.removeprefix(repository_root + '/')}"
+                ] = content
+        return files
 
-    repository_results = await asyncio.gather(
-        *(
-            read_repository(namespace, root)
-            for namespace, root in repository_roots.items()
+    repository_results = []
+    for repository_namespace, repository_root in repository_roots.items():
+        repository_results.append(
+            await read_repository(repository_namespace, repository_root)
         )
-    )
     repository_files = {
         key: value for result in repository_results for key, value in result.items()
     }
@@ -457,7 +540,7 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
         if key.startswith(f"repositories/benchmark/{benchmark}/")
     }
 
-    if not core_files or not benchmark_files:
+    if not core_files or (needs_benchmark and not benchmark_files):
         return {
             "available": False,
             "reason": "controller_context_incomplete",
@@ -480,9 +563,10 @@ async def _refresh_controller_context(benchmark: str, manager: Any) -> dict[str,
     manager.save_source_snapshot(
         "controller", provenance, {**core_files, **repository_files}
     )
-    manager.save_source_snapshot(
-        "controller", provenance, benchmark_files, benchmark=benchmark
-    )
+    if benchmark_files:
+        manager.save_source_snapshot(
+            "controller", provenance, benchmark_files, benchmark=benchmark
+        )
     return {
         "available": True,
         "reason": "controller_refresh_succeeded",
@@ -502,7 +586,7 @@ def _controller_snapshot_documents(
     provenance: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build the effective inventory from the remote controller snapshot."""
-    from providers.skills.crucible import CrucibleSkillProvider
+    from providers.skills.crucible import CrucibleContextGateway
 
     documents: list[dict[str, Any]] = []
     missing_namespaces: list[str] = []
@@ -555,11 +639,11 @@ def _controller_snapshot_documents(
                         "authority": "effective",
                         "provenance": provenance,
                         "entrypoint": source_path
-                        in CrucibleSkillProvider._REPOSITORY_ENTRYPOINT_FILES,
-                        "subject_areas": CrucibleSkillProvider._subject_tags(
+                        in CrucibleContextGateway._REPOSITORY_ENTRYPOINT_FILES,
+                        "subject_areas": CrucibleContextGateway._subject_tags(
                             source_path
                         ),
-                        "subject_match": CrucibleSkillProvider._subject_matches(
+                        "subject_match": CrucibleContextGateway._subject_matches(
                             source_path, subject_area
                         ),
                         "content": content,
@@ -630,6 +714,18 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 async def get_execution_config(harness_name: str) -> str:
     """Get the benchmark harness's execution configuration from private skills. Returns controller requirements, pre-run steps, run command, endpoint type, run file format, and defaults. The harness_name should be the harness that owns the benchmark (e.g., 'crucible' or 'zathras')."""
     await _ensure_init()
+    if harness_name == "crucible":
+        return json.dumps(
+            {
+                "harness": "crucible",
+                "found": False,
+                "message": (
+                    "Crucible execution guidance is controller-sourced context. "
+                    "Use get_crucible_benchmark_context; use action tools for "
+                    "runtime discovery, validation, and execution."
+                ),
+            }
+        )
     # Arcaflow plugins are self-contained containers — no private
     # execution config or harness installation is needed.
     if harness_name == "arcaflow-plugins":
@@ -724,6 +820,18 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
     """Get the JSON schema that defines the structure of a valid run-file. Use this to understand what top-level keys, benchmark objects, endpoint structures, and mv-params formats are allowed. The schema enforces additionalProperties: false, so only documented keys are permitted."""
     await _ensure_init()
     harness_name = harness or "crucible"
+    if harness_name == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "harness": "crucible",
+                "message": (
+                    "The Crucible run-file schema is controller-sourced context. "
+                    "Use get_crucible_benchmark_context(operation=\"list\" or "
+                    "\"read\") to retrieve it."
+                ),
+            }
+        )
     if hasattr(_skill_provider, "get_provider"):
         provider = _skill_provider.get_provider(harness_name)
         schema = await provider.get_runfile_schema() if provider else None
@@ -744,6 +852,19 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
     """Get the parameter definitions (multiplex.json) for a specific benchmark. Returns presets (named parameter sets like 'basic', 'default') and validations (regex patterns for allowed values per argument). Use this to understand what mv-params arguments are valid and what values they accept."""
     await _ensure_init()
     harness_name = harness or "crucible"
+    if harness_name == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "benchmark": benchmark,
+                "harness": "crucible",
+                "message": (
+                    "Crucible benchmark metadata is controller-sourced context. "
+                    "Use get_crucible_benchmark_context to read multiplex.json "
+                    "and related files."
+                ),
+            }
+        )
     if hasattr(_skill_provider, "get_provider"):
         provider = _skill_provider.get_provider(harness_name)
         params = await provider.get_benchmark_params(benchmark) if provider else None
@@ -766,8 +887,54 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
     )
 
 
-@mcp.tool()
-async def get_crucible_benchmark_context(
+@mcp.tool(name="get_crucible_benchmark_context")
+async def _get_crucible_benchmark_context_tool(
+    operation: str = "bootstrap",
+    path: str = "",
+    query: str = "",
+) -> str:
+    """Use generic context primitives for the designated Crucible controller.
+
+    ``bootstrap`` returns the controller's entrypoint document. ``read`` reads
+    the caller-selected controller-relative path. ``search`` searches controller
+    path names and file contents, returning grouped candidates; the caller then
+    selects files to read. Source selection, phase policy, and provenance are
+    server-managed.
+    """
+    await _ensure_init()
+    if operation not in {"bootstrap", "read", "search"}:
+        return json.dumps(
+            {
+                "found": False,
+                "operation": operation,
+                "reason": "unsupported_operation",
+                "guidance": "Use bootstrap, read, or search.",
+            }
+        )
+    controller_host = _controller_host()
+    if _ssh is None or not controller_host:
+        return json.dumps(
+            {
+                "found": False,
+                "operation": operation,
+                "reason": "controller_not_identified",
+            }
+        )
+    return await controller_context_gateway(
+        ssh=_ssh,
+        controller_host=controller_host,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="benchmark-agent",
+        phase="benchmark",
+        operation=operation,
+        path=path,
+        query=query,
+        benchmark="",
+        include_alternates=False,
+    )
+
+
+async def _legacy_get_crucible_benchmark_context(
     benchmark: str = "",
     phase: str = "benchmark",
     operation: str = "context",
@@ -777,23 +944,103 @@ async def get_crucible_benchmark_context(
     include_alternates: bool = False,
     query: str = "",
 ) -> str:
-    """Use the source-aware Crucible context gateway.
-
-    ``operation=list`` inventories safe documents in the requested logical
-    repository namespace and snapshots them into the ticket workspace. The
-    response also reports the catalog's available core, benchmark, tool, and
-    documentation namespaces. ``operation=read`` reads one returned ref from
-    that snapshot; ``operation=search`` searches it using ``query``. The legacy
-    default ``operation=context`` retains the benchmark-root response shape for
-    existing callers. Alternate sources require explicit ``include_alternates``
-    and are never effective by default.
-    """
+    """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
-    provider = (
-        _skill_provider.get_provider("crucible")
-        if hasattr(_skill_provider, "get_provider")
-        else _skill_provider
-    )
+    if (
+        operation in {"bootstrap", "list", "read", "search"}
+        and _ssh is not None
+        and _controller_host()
+    ):
+        return await controller_context_gateway(
+            ssh=_ssh,
+            controller_host=_controller_host(),
+            ticket_id=os.environ.get("TICKET_ID", ""),
+            agent_name="benchmark-agent",
+            phase=phase,
+            benchmark=benchmark,
+            operation=operation,
+            path=path,
+            query=query,
+            include_alternates=include_alternates,
+        )
+    if operation == "context" and _ssh is not None and _controller_host():
+        return json.dumps(
+            {
+                "found": False,
+                "operation": operation,
+                "reason": "unsupported_operation_use_bootstrap_read_or_search",
+                "guidance": (
+                    "Read controller AGENTS.md first, then request the documented "
+                    "controller-relative paths with operation=read."
+                ),
+            }
+        )
+    if operation == "bootstrap":
+        ticket_id = os.environ.get("TICKET_ID", "")
+        if not ticket_id:
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": "bootstrap",
+                    "reason": "ticket_required_for_controller_context",
+                }
+            )
+        from providers.workspace.manager import WorkspaceManager
+
+        manager = WorkspaceManager(
+            ticket_id=ticket_id, agent_name="benchmark-agent", phase=phase
+        )
+        bootstrap = await _refresh_controller_bootstrap(manager)
+        if not bootstrap.get("available"):
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": "bootstrap",
+                    **{
+                        key: value
+                        for key, value in bootstrap.items()
+                        if key != "document"
+                    },
+                }
+            )
+        document = bootstrap["document"]
+        result = {
+            "found": True,
+            "operation": "bootstrap",
+            "documents": [document],
+            "document": document,
+            "workspace": {
+                "effective_context": manager.save_effective_context(
+                    {
+                        "schema_version": 1,
+                        "policy": "controller_bootstrap",
+                        "namespace": "core",
+                        "subject_area": "all",
+                        "documents": [_public_context_document(document)],
+                    }
+                )
+            },
+        }
+        _emit_context_audit_event(
+            ticket_id,
+            agent_name="benchmark-agent",
+            phase=phase,
+            benchmark="",
+            operation="bootstrap",
+            namespace="core",
+            result=result,
+        )
+        return json.dumps(
+            _public_context_result(
+                result,
+                phase=phase,
+                audience="benchmark-agent",
+                benchmark="",
+                namespace="core",
+                subject_area="all",
+            )
+        )
+    provider = _crucible_context
     if provider is None or not hasattr(provider, "get_benchmark_context"):
         return json.dumps(
             {
@@ -860,7 +1107,9 @@ async def get_crucible_benchmark_context(
                         ),
                     )
                 )
-            refresh = await _refresh_controller_context(benchmark, manager)
+            refresh = await _refresh_controller_context(
+                benchmark, manager, namespace=namespace
+            )
             existing = manager.load_source_snapshot("controller", benchmark)
             if existing and not refresh.get("available"):
                 refresh = {
@@ -902,6 +1151,36 @@ async def get_crucible_benchmark_context(
             agent="benchmark-agent",
             include_content=True,
         )
+        # A controller snapshot is authoritative even when the agentic-perf
+        # host has no matching Crucible checkout.  Do not require the local
+        # provider to find a document before using the successfully refreshed
+        # controller source.
+        if (
+            manager
+            and not result.get("found")
+            and refresh.get("available")
+            and controller.get("snapshot_available")
+            and policy_selection["effective_source"] == "controller"
+        ):
+            controller_documents, controller_inventory = (
+                _controller_snapshot_documents(
+                    manager,
+                    benchmark=benchmark,
+                    namespace=namespace,
+                    subject_area=subject_area,
+                    provenance=refresh["provenance"],
+                )
+            )
+            result.update(
+                {
+                    "found": bool(controller_documents),
+                    "effective_source": "controller",
+                    "source": "controller",
+                    "selection": policy_selection,
+                    "documents": controller_documents,
+                    "inventory": controller_inventory,
+                }
+            )
         if manager and result.get("found"):
             if (
                 refresh.get("available")
@@ -1177,11 +1456,33 @@ async def get_crucible_benchmark_context(
     )
 
 
+async def get_crucible_benchmark_context(*args, **kwargs) -> str:
+    """Compatibility wrapper for direct in-process callers only.
+
+    This wrapper is intentionally not registered with MCP. Agents receive the
+    smaller generic schema from ``_get_crucible_benchmark_context_tool``.
+    """
+    return await _legacy_get_crucible_benchmark_context(*args, **kwargs)
+
+
 @mcp.tool()
 async def get_tool_params(tool: str, harness: str = "crucible") -> str:
     """Get parameter definitions (multiplex.json) and metadata for a performance profiling tool (e.g. 'sysstat', 'procstat', 'ethtool', 'forkstat'). Returns presets (default arguments) and validations (regex patterns for allowed argument values) along with tool description and CDM metric info. Use this to construct valid 'tool-params' entries in the run-file."""
     await _ensure_init()
     harness_name = harness or "crucible"
+    if harness_name == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "tool": tool,
+                "harness": "crucible",
+                "message": (
+                    "Crucible tool metadata is controller-sourced context. "
+                    "Use get_crucible_benchmark_context to read the tool "
+                    "metadata and parameter files."
+                ),
+            }
+        )
     if hasattr(_skill_provider, "get_provider"):
         provider = _skill_provider.get_provider(harness_name)
         params = await provider.get_tool_params(tool) if provider else None
@@ -1226,6 +1527,19 @@ async def get_example_runfile(
     await _ensure_init()
     harness_name = harness or "crucible"
     ep_type = endpoint_type or "remotehosts"
+    if harness_name == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "benchmark": benchmark,
+                "harness": "crucible",
+                "endpoint_type": ep_type,
+                "message": (
+                    "Crucible examples are controller-sourced context. Use "
+                    "get_crucible_benchmark_context to discover and read them."
+                ),
+            }
+        )
     if hasattr(_skill_provider, "get_provider"):
         provider = _skill_provider.get_provider(harness_name)
         example = (
@@ -1391,7 +1705,7 @@ async def execute_benchmark(
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
 
-    if _skill_provider:
+    if _skill_provider and harness_name != "crucible":
         validation = await _skill_provider.validate_runfile(run_file, harness_name)
         if not validation.get("valid", True):
             return json.dumps(

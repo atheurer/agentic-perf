@@ -21,13 +21,18 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_skill_provider, read_skill_documents
+from agents.server_utils import (
+    build_crucible_context_gateway,
+    build_skill_provider,
+    read_skill_documents,
+)
 
 mcp = FastMCP("triage-agent")
 
 SKILLS_DIR = Path(_project_root) / "skills"
 
 _skill_provider = None
+_crucible_catalog = None
 
 
 def _get_provider():
@@ -38,6 +43,16 @@ def _get_provider():
             catalog_only=True,
         )
     return _skill_provider
+
+
+def _get_crucible_catalog():
+    global _crucible_catalog
+    if _crucible_catalog is None:
+        _crucible_catalog = build_crucible_context_gateway(
+            resolve_source=False,
+            catalog_only=True,
+        )
+    return _crucible_catalog
 
 
 # Benchmarks provided by standalone tools on the benchmark
@@ -75,6 +90,8 @@ async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
     sp = _get_provider()
     benchmarks = await sp.list_benchmarks()
+    crucible = await _get_crucible_catalog().list_benchmarks()
+    benchmarks.extend(crucible)
     result = [
         {
             "name": b.name,
@@ -98,8 +115,10 @@ async def get_benchmark_details(name: str) -> str:
     for sb in _STANDALONE_BENCHMARKS:
         if sb["name"] == name:
             return json.dumps(sb, indent=2)
-    sp = _get_provider()
-    b = await sp.get_benchmark(name)
+    crucible = _get_crucible_catalog()
+    b = await crucible.get_benchmark(name)
+    if b is None:
+        b = await _get_provider().get_benchmark(name)
     if b is None:
         return json.dumps({"error": f"Benchmark '{name}' not found"})
     detail: dict[str, Any] = {
@@ -152,7 +171,9 @@ async def resolve_benchmark(
     if harness:
         reqs["harness"] = harness
 
-    result = await sp.resolve_benchmark(reqs)
+    result = await _get_crucible_catalog().resolve_benchmark(reqs)
+    if result is None:
+        result = await sp.resolve_benchmark(reqs)
     if result is None:
         return json.dumps({"matched_suite": None})
 

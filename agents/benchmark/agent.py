@@ -242,7 +242,16 @@ class BenchmarkAgent(AgentBase):
         },
     }
     _HARNESS_EXCLUDED_TOOLS: dict[str, set[str]] = {
-        "crucible": {"read_skills", "list_harness_docs", "read_harness_doc"},
+        "crucible": {
+            "read_skills",
+            "list_harness_docs",
+            "read_harness_doc",
+            "get_execution_config",
+            "get_runfile_schema",
+            "get_benchmark_params",
+            "get_tool_params",
+            "get_example_runfile",
+        },
     }
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:

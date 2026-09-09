@@ -70,7 +70,7 @@ class TestHarnessToolScoping:
         names = {t.name for t in agent.tools}
         assert names == set(all_names)
 
-    def test_crucible_hides_legacy_document_tools_only(self):
+    def test_crucible_hides_legacy_context_lookup_tools(self):
         agent = self._make_agent()
         all_names = [
             "read_skills",
@@ -78,6 +78,10 @@ class TestHarnessToolScoping:
             "read_harness_doc",
             "get_crucible_benchmark_context",
             "get_runfile_schema",
+            "get_benchmark_params",
+            "get_tool_params",
+            "get_example_runfile",
+            "get_execution_config",
             "execute_benchmark",
         ]
         agent.tools = self._make_tools(all_names)
@@ -86,7 +90,6 @@ class TestHarnessToolScoping:
         )
         assert {tool.name for tool in agent.tools} == {
             "get_crucible_benchmark_context",
-            "get_runfile_schema",
             "execute_benchmark",
         }
 

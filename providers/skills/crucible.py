@@ -13,7 +13,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .base import BenchmarkSuite, RunfileTemplate
 from .local_context import LocalContextSource
 
 KEYWORD_MAP = {
@@ -232,7 +232,15 @@ class CrucibleCatalogFetcher:
         return data if isinstance(data, dict) else None
 
 
-class CrucibleSkillProvider(SkillProvider):
+class CrucibleContextGateway:
+    """Source-aware Crucible catalog and context gateway.
+
+    This is deliberately not a ``SkillProvider``.  Crucible context is read
+    through the controller-aware gateway, while triage uses only its bounded
+    catalog methods.  Runtime operations remain MCP actions owned by the
+    relevant agent.
+    """
+
     def __init__(
         self,
         crucible_home: str | Path,
