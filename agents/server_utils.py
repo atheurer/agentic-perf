@@ -373,18 +373,39 @@ async def _search_controller_source(
         return {"found": False, "operation": "search", "reason": "empty_query"}
     max_results = max(1, min(int(max_results), 100))
     max_bytes = max(1024, min(int(max_bytes), 131072))
-    find_pattern = shlex.quote(f".*({query}).*")
+    # ``find`` and ``grep -r`` do not descend into symlinked directories.
+    # Crucible installations commonly expose ``subprojects`` (and sometimes
+    # individual repositories) through symlinks, so discovery must follow
+    # them.  Every candidate is realpath-checked before it is reported or
+    # searched, which preserves the controller-root containment guarantee.
     command = (
-        "{ "
-        "find /opt/crucible -regextype posix-extended "
+        "{ root=$(realpath -e -- /opt/crucible) && "
+        "find -L /opt/crucible "
         "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
-        f"\\( -type f -o -type d \\) -regex {find_pattern} "
-        "-printf 'NAME\\t%y\\t%p\\n' 2>/dev/null; "
-        "grep -rInE --binary-files=without-match "
-        "--exclude-dir=.git --exclude-dir=.ssh --exclude-dir=secrets "
-        "--exclude='*.pem' --exclude='*.key' --exclude='authorized_keys' "
-        f"-- {shlex.quote(query)} /opt/crucible 2>/dev/null "
+        "\\( -type f -o -type d \\) -exec sh -c "
+        "'root=$1; query=$2; shift 2; "
+        "for path do "
+        'candidate=$(realpath -e -- "$path") || continue; '
+        'case "$candidate" in "$root"|"$root"/*) ;; *) continue;; esac; '
+        "case \"$path\" in *'/.git/'*|*/.git|*/.ssh/*|*/.ssh|*/secrets/*|*/secrets|*.pem|*.key|*/authorized_keys) continue;; esac; "
+        'if printf "%s\\n" "$path" | grep -qE -- "$query"; then '
+        'if [ -d "$candidate" ]; then printf "NAME\\td\\t%s\\n" "$path"; '
+        'else printf "NAME\\tf\\t%s\\n" "$path"; fi; fi; '
+        'done\' sh "$root" '
+        f"{shlex.quote(query)} {{}} + 2>/dev/null; "
+        "root=$(realpath -e -- /opt/crucible) && "
+        "find -L /opt/crucible "
+        "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
+        "-type f -exec sh -c "
+        "'root=$1; query=$2; shift 2; "
+        "for path do "
+        'candidate=$(realpath -e -- "$path") || continue; '
+        'case "$candidate" in "$root"|"$root"/*) ;; *) continue;; esac; '
+        "case \"$path\" in *'/.git/'*|*/.git|*/.ssh/*|*/.ssh|*/secrets/*|*/secrets|*.pem|*.key|*/authorized_keys) continue;; esac; "
+        'grep -nHIE --binary-files=without-match -- "$query" "$path" 2>/dev/null '
         "| sed 's/^/CONTENT\\t/'; "
+        'done\' sh "$root" '
+        f"{shlex.quote(query)} {{}} + 2>/dev/null; "
         f"}} | head -n {max_results}"
     )
     result = await ssh.run(controller_host, command, timeout=30)
