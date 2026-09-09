@@ -418,6 +418,7 @@ async def resolve_images(
             # Fallback: derive from selector.
             selector = (
                 directives.get("board_selector")
+                or cf.get("board_selector", "")
                 or metadata.get("selector", "")
                 or metadata.get("jumpstarter_selector", "")
             )

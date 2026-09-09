@@ -25,7 +25,11 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_secrets_provider, build_ssh_from_ticket
+from agents.server_utils import (
+    build_secrets_provider,
+    build_ssh_from_ticket,
+    get_board_selector,
+)
 from paths import get_default_ssh_key
 
 logger = logging.getLogger(__name__)
@@ -153,7 +157,7 @@ async def check_available_resources(
     # Code-enforce the directive's board_selector for
     # Jumpstarter. The LLM may use a wrong selector key.
     if provider == "jumpstarter":
-        directive_selector = _get_board_selector(_ticket)
+        directive_selector = get_board_selector(_ticket)
         if directive_selector:
             req = requirements or {}
             llm_selector = req.get("jumpstarter_selector", "")
@@ -262,7 +266,7 @@ async def reserve_resources(
     # Jumpstarter. The LLM may substitute a different
     # (broader) selector; the directive is authoritative.
     if provider == "jumpstarter":
-        directive_selector = _get_board_selector(_ticket)
+        directive_selector = get_board_selector(_ticket)
         if directive_selector:
             llm_selector = selection.get("jumpstarter_selector", "")
             if llm_selector != directive_selector:

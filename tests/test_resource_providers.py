@@ -1731,20 +1731,20 @@ class TestValidateHostKeyPassthrough:
 
 
 class TestGetBoardSelector:
-    """Test _get_board_selector fallback logic."""
+    """Test get_board_selector fallback logic."""
 
     def test_from_directives(self):
-        from agents.resource.server import _get_board_selector
+        from agents.server_utils import get_board_selector
 
         ticket = {
             "custom_fields": {
                 "directives": {"board_selector": "board-type=qc8775"},
             }
         }
-        assert _get_board_selector(ticket) == "board-type=qc8775"
+        assert get_board_selector(ticket) == "board-type=qc8775"
 
     def test_from_top_level(self):
-        from agents.resource.server import _get_board_selector
+        from agents.server_utils import get_board_selector
 
         ticket = {
             "custom_fields": {
@@ -1752,10 +1752,10 @@ class TestGetBoardSelector:
                 "directives": {},
             }
         }
-        assert _get_board_selector(ticket) == "board-type=qc8775"
+        assert get_board_selector(ticket) == "board-type=qc8775"
 
     def test_directives_takes_precedence(self):
-        from agents.resource.server import _get_board_selector
+        from agents.server_utils import get_board_selector
 
         ticket = {
             "custom_fields": {
@@ -1763,20 +1763,20 @@ class TestGetBoardSelector:
                 "directives": {"board_selector": "board-type=qc8775"},
             }
         }
-        assert _get_board_selector(ticket) == "board-type=qc8775"
+        assert get_board_selector(ticket) == "board-type=qc8775"
 
     def test_empty_when_missing(self):
-        from agents.resource.server import _get_board_selector
+        from agents.server_utils import get_board_selector
 
         ticket = {"custom_fields": {}}
-        assert _get_board_selector(ticket) == ""
+        assert get_board_selector(ticket) == ""
 
     def test_no_directives_key(self):
-        from agents.resource.server import _get_board_selector
+        from agents.server_utils import get_board_selector
 
         ticket = {
             "custom_fields": {
                 "board_selector": "board-type=rcar-s4",
             }
         }
-        assert _get_board_selector(ticket) == "board-type=rcar-s4"
+        assert get_board_selector(ticket) == "board-type=rcar-s4"

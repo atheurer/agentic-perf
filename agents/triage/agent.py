@@ -598,6 +598,7 @@ class TriageAgent(AgentBase):
         _PROMOTABLE = (
             "image_version",
             "serial_capture",
+            "board_selector",
         )
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
