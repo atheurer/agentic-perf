@@ -1721,6 +1721,129 @@ async def execute_benchmark(
 
 
 @mcp.tool()
+async def validate_benchmark(
+    controller: str,
+    run_file: dict,
+    harness: str | None = None,
+) -> str:
+    """Validate a benchmark run-file on its controller without executing it.
+
+    For Crucible, the run-file is copied to the configured controller and
+    ``crucible validate`` performs the controller-side schema, endpoint,
+    benchmark-parameter, and tool-parameter validation.  This tool never
+    starts a benchmark, deploys endpoints, or starts supporting services.
+    """
+    await _ensure_init()
+
+    harness_name = harness or "crucible"
+    if harness_name != "crucible":
+        return json.dumps(
+            {
+                "status": "unsupported",
+                "valid": False,
+                "harness": harness_name,
+                "errors": [
+                    f"Controller-side validation is not supported for harness "
+                    f"'{harness_name}'"
+                ],
+            }
+        )
+
+    execution = {}
+    if _skill_provider:
+        execution = (await _skill_provider.get_all_private_config(harness_name)).get(
+            "execution", {}
+        )
+    validation_command = execution.get("validation_command", "crucible validate")
+    command_valid, command_reason = _validate_run_command(
+        validation_command, harness_name
+    )
+    if not command_valid:
+        return json.dumps(
+            {
+                "status": "failed",
+                "valid": False,
+                "harness": harness_name,
+                "errors": [f"Configured validation command rejected: {command_reason}"],
+            }
+        )
+
+    validation_uuid = uuid.uuid4().hex[:8]
+    remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
+    local_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as file:
+            json.dump(run_file, file, indent=2)
+            local_path = file.name
+
+        copied = await _ssh.copy_to(controller, local_path, remote_path)
+        if copied.exit_code != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "valid": False,
+                    "harness": harness_name,
+                    "controller": controller,
+                    "errors": [
+                        f"Failed to copy run-file to controller: "
+                        f"{copied.stderr or 'unknown error'}"
+                    ],
+                }
+            )
+
+        result = await _ssh.run(
+            controller,
+            f"{validation_command} {remote_path} 2>&1",
+            timeout=180,
+        )
+        output = (result.stdout or "").strip()
+        if result.exit_code == 0:
+            return json.dumps(
+                {
+                    "status": "valid",
+                    "valid": True,
+                    "harness": harness_name,
+                    "controller": controller,
+                    "validation_output": output,
+                    "errors": [],
+                }
+            )
+
+        details = output or (result.stderr or "Validation failed").strip()
+        return json.dumps(
+            {
+                "status": "invalid",
+                "valid": False,
+                "harness": harness_name,
+                "controller": controller,
+                "validation_output": output,
+                "errors": [details],
+                "exit_code": result.exit_code,
+            }
+        )
+    except Exception as exc:
+        logger.warning("[benchmark] Controller validation failed", exc_info=True)
+        return json.dumps(
+            {
+                "status": "failed",
+                "valid": False,
+                "harness": harness_name,
+                "controller": controller,
+                "errors": [f"Controller validation request failed: {exc}"],
+            }
+        )
+    finally:
+        if local_path:
+            Path(local_path).unlink(missing_ok=True)
+        try:
+            await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
+        except Exception:
+            logger.debug("Failed to remove temporary validation file", exc_info=True)
+
+
+@mcp.tool()
 async def get_run_logs(
     controller: str,
     run_id: str,
