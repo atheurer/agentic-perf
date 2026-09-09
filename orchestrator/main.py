@@ -402,9 +402,11 @@ def _apply_step_overrides(
         scoped.update(step_params["scoped_context"])
         override_fields["scoped_context"] = scoped
     elif agent_type in ("resource", "provision", "benchmark", "review"):
+        # Keys must match what agents pass to _get_scoped_context.
+        # See #573 for consolidating these into a shared source.
         agent_key = {
             "resource": "resource",
-            "provision": "provisioning",
+            "provision": "provision",
             "benchmark": "benchmark",
             "review": "review",
         }.get(agent_type)

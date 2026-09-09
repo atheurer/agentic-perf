@@ -736,22 +736,16 @@ class TriageAgent(AgentBase):
         if first_type == "resource" and first_params.get("required_hosts"):
             fields["required_hosts"] = first_params["required_hosts"]
 
-        # Clear the first step's scoped_context section so the
-        # agent relies on structured data instead of multi-iteration
-        # text.
-        agent_key_map = {
-            "resource": "resource",
-            "provision": "provision",
-            "benchmark": "benchmark",
-            "review": "review",
-        }
-        first_key = agent_key_map.get(first_type)
-        if (
-            first_key
-            and "scoped_context" in fields
-            and first_key in fields["scoped_context"]
-        ):
-            del fields["scoped_context"][first_key]
+        # Apply step 0's per-step scoped_context if provided,
+        # mirroring _apply_step_overrides for later steps.
+        # Do NOT clear ticket-level scoped_context for step 0 —
+        # it was written moments earlier by this same triage run
+        # and cannot be stale.  Clearing only applies to steps ≥ 1
+        # (multi-iteration text from prior runs).
+        if first_params.get("scoped_context"):
+            fields.setdefault("scoped_context", {}).update(
+                first_params["scoped_context"]
+            )
 
         # Fleet investigation: set up tracking state if
         # the triage agent detected a fleet request or the
