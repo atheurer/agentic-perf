@@ -1,17 +1,4 @@
 {
   "schema_version": 1,
-  "entries": [
-    {
-      "id": "crucible-uperf-run-file",
-      "path": "skills/crucible/uperf-run-file.md",
-      "harness": "crucible",
-      "benchmark": "uperf",
-      "phases": ["triage", "provisioning", "benchmark", "review"],
-      "subjects": ["run-file", "endpoints", "benchmark"],
-      "provenance": {
-        "owner": "agentic-perf",
-        "reason": "compatibility overlay for uperf-specific run-file semantics"
-      }
-    }
-  ]
+  "entries": []
 }

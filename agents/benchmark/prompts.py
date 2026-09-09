@@ -82,11 +82,11 @@ For non-Crucible harnesses, retain the compatible procedure of using
 4. **Execute pre-run steps** — For example, if "ssh_key_setup" is listed, call
    `setup_passwordless_ssh` with:
    - source: the controller's SSH-reachable IP (from ssh_hardware_ips.controller)
-   - targets: the endpoint private IPs (from assigned_hardware_ips.targets)
-   - target_ssh_hosts: the endpoint SSH-reachable IPs (from ssh_hardware_ips.targets)
-   This generates a key on the controller and injects it on each endpoint via
-   their SSH-reachable IPs, then verifies the controller can reach each endpoint
-   on the private IPs.
+   - targets: the endpoint identities from the resource assignment
+   - target_ssh_hosts: the endpoint addresses verified for controller-to-host SSH
+   This generates a key on the controller and injects it through the verified
+   access path. Do not substitute benchmark dataplane addresses for the SSH
+   addresses merely because they are IP addresses.
 
 5. **Validate network path (network benchmarks only)** — For network benchmarks
    (uperf, trafficgen, iperf, k8s-netperf, etc.), you MUST verify that the
@@ -137,10 +137,13 @@ For non-Crucible harnesses, retain the compatible procedure of using
 
    c. Read the harness's run-file documentation for format details.
 
-   f. **Choosing IPs for the run-file:** Use IPs, never hostnames (IPv6
-      link-local causes timeouts). If both `ssh_hardware_ips` and
-      `assigned_hardware_ips` are present, use `assigned_hardware_ips` for
-      run-file entries and benchmark parameters like `remotehost`.
+   f. **Choose Crucible remote hosts from verified SSH reachability:** For
+      `remotehosts`, each `remotes[].config.host` is the address the Crucible
+      controller uses for SSH, file transfer, and container orchestration.
+      Use the hostname or IP address that `verify_ssh_path` confirms from the
+      controller. Do not infer this address from the benchmark interface or
+      dataplane IP. The controller-to-remote access network and the benchmark
+      dataplane network may be different, especially in cloud environments.
 
    g. **Check directives for `test_interfaces`** — if the user requested specific
       NICs or a non-management network, you MUST discover the actual interface
@@ -193,7 +196,10 @@ For non-Crucible harnesses, retain the compatible procedure of using
    do not run additional commands.
 
 ### Common pitfalls:
-- Use IP addresses, never hostnames (IPv6 link-local causes timeouts)
+- For Crucible `remotehosts`, use the controller-verified SSH address in each
+  remote's `config.host`; it may be a hostname or an IP address. Do not use a
+  dataplane address unless it has independently been verified as the
+  controller's SSH access path.
 - `tags` must be an object `{"key": "val"}`, NOT an array
 - `ids` values must be strings: `"1"` not `1`
 - Do NOT set `controller-ip-address` unless you think crucible cannot resolve

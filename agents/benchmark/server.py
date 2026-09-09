@@ -670,7 +670,7 @@ def _controller_snapshot_documents(
 
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}, {'harness': 'crucible', 'filename': 'uperf-run-file.md'}]). Read ALL skill docs before constructing a run file — they contain pitfalls that will cause failures."""
+    """Read local skill documents for harnesses that still use the legacy fallback."""
     await _ensure_init()
     return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
