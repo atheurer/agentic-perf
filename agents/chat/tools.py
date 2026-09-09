@@ -495,16 +495,26 @@ async def _get_ticket(
     comments = ticket.get("comments", [])
     last_comments = comments[-5:] if comments else []
 
+    directives = cf.get("directives", {})
     result = {
         "id": ticket["id"],
         "summary": ticket.get("summary", ""),
+        "description": ticket.get("description", ""),
         "status": ticket.get("status", ""),
         "status_trail": ticket.get("status_trail", []),
         "created_at": ticket.get("created_at", ""),
+        "harness": directives.get("harness") or cf.get("harness"),
+        "board_selector": (
+            directives.get("board_selector") or cf.get("board_selector")
+        ),
+        "samples": cf.get("samples"),
+        "image_version": (directives.get("image_version") or cf.get("image_version")),
+        "directives": directives,
         "guidance_summary": cf.get("guidance_summary"),
         "verdict": cf.get("verdict"),
         "benchmark_status": cf.get("benchmark_status"),
         "image_build_result": cf.get("image_build_result"),
+        "hypothesis": cf.get("hypothesis"),
         "last_comments": [
             {
                 "author": c.get("author", ""),

@@ -2967,12 +2967,16 @@ async function pollEvents(ticketId) {
     // Proactive HITL: notify chat when ticket needs guidance
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
       var cf = ticket.custom_fields || {};
-      var gs = cf.guidance_summary;
+      var gs = cf.guidance_summary || (cf.introspection || {}).guidance_summary;
       if (gs && !document.getElementById('chat-guidance-' + ticketId)) {
         var guidanceMsg = '\ud83d\udd14 **' + ticketId + '** needs guidance\n\n';
         guidanceMsg += '**Agent:** ' + (gs.agent || '?') + '\n';
         guidanceMsg += '**Reason:** ' + (gs.reason || 'unknown') + '\n';
-        if (gs.details) guidanceMsg += '\n' + gs.details.substring(0, 300) + '\n';
+        if (gs.details) guidanceMsg += '\n' + gs.details + '\n';
+        if (gs.suggested_actions && gs.suggested_actions.length) {
+          guidanceMsg += '\n**Suggested actions:**\n';
+          gs.suggested_actions.forEach(function(a) { guidanceMsg += '- ' + a + '\n'; });
+        }
         if (gs.suggested_response) guidanceMsg += '\n**Suggestion:** ' + gs.suggested_response;
         var container = document.getElementById('ticket-chat-messages') || document.getElementById('chat-messages');
         if (container) {
@@ -3503,7 +3507,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml(data.details || '') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -3570,7 +3574,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        if (display.length > 200) display = display.substring(0, 200) + '...';
+        if (display.length > 500) display = display.substring(0, 500) + '...';
         dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + escHtml(display) + '</div>';
       });
       dataHtml += '</div>';
