@@ -747,20 +747,10 @@ class ResourceAgent(AgentBase):
         # Merge reservation metadata into provider_metadata.
         # The LLM may omit fields that the provider returned
         # — code-enforce them from the accumulated metadata.
-        for key in (
-            "public_ips",
-            "private_ips",
-            "ip_mapping",
-            "ami",
-            "cloud_login_user",
-            "lease_id",
-            "exporter_name",
-            "board_target",
-            "selector",
-            "duration_seconds",
-        ):
-            if key in reservation_metadata and key not in provider_metadata:
-                provider_metadata[key] = reservation_metadata[key]
+        # Provider-agnostic: merge all fields, not a whitelist.
+        for key, val in reservation_metadata.items():
+            if key not in provider_metadata:
+                provider_metadata[key] = val
         # Always set provider_metadata when we have a
         # reservation — downstream agents (platform,
         # provisioning) require it for lease operations.
