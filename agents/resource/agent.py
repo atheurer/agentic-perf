@@ -744,17 +744,30 @@ class ResourceAgent(AgentBase):
                 reservation_metadata = json.loads(raw) if raw else {}
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
+        # Merge reservation metadata into provider_metadata.
+        # The LLM may omit fields that the provider returned
+        # — code-enforce them from the accumulated metadata.
         for key in (
             "public_ips",
             "private_ips",
             "ip_mapping",
             "ami",
             "cloud_login_user",
+            "lease_id",
+            "exporter_name",
+            "board_target",
+            "selector",
+            "duration_seconds",
         ):
             if key in reservation_metadata and key not in provider_metadata:
                 provider_metadata[key] = reservation_metadata[key]
-        if provider_metadata:
-            fields["resource_provider_metadata"] = provider_metadata
+        # Always set provider_metadata when we have a
+        # reservation — downstream agents (platform,
+        # provisioning) require it for lease operations.
+        if provider_metadata or reservation_metadata:
+            fields["resource_provider_metadata"] = (
+                provider_metadata or reservation_metadata
+            )
 
         if reservation_metadata.get("ssh_user"):
             fields["ssh_user"] = reservation_metadata["ssh_user"]
