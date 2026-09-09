@@ -13,7 +13,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-from .base import BenchmarkSuite, RunfileTemplate
+from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 from .local_context import LocalContextSource
 
 KEYWORD_MAP = {
@@ -230,6 +230,37 @@ class CrucibleCatalogFetcher:
         except json.JSONDecodeError:
             return None
         return data if isinstance(data, dict) else None
+
+
+class CrucibleCatalogSkillProvider(SkillProvider):
+    """Catalog-only facade for triage capability discovery.
+
+    Crucible runtime context is served by ``CrucibleContextGateway`` rather
+    than local skill files. Triage still needs Crucible to participate in the
+    common capability interface, so this facade exposes only catalog-backed
+    benchmark identity and metadata. It never creates a checkout or generates
+    a run file.
+    """
+
+    def __init__(self, gateway: "CrucibleContextGateway") -> None:
+        self._gateway = gateway
+
+    async def list_benchmarks(self) -> list[BenchmarkSuite]:
+        return await self._gateway.list_benchmarks()
+
+    async def get_benchmark(self, name: str) -> BenchmarkSuite | None:
+        return await self._gateway.get_benchmark(name)
+
+    async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:
+        return await self._gateway.resolve_benchmark(requirements)
+
+    async def generate_runfile(
+        self, benchmark: str, params: dict[str, Any]
+    ) -> RunfileTemplate:
+        raise RuntimeError(
+            "Crucible catalog provider does not generate run files; "
+            "use controller-sourced context and the benchmark agent"
+        )
 
 
 class CrucibleContextGateway:

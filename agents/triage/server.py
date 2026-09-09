@@ -186,7 +186,20 @@ async def resolve_benchmark(
         "matched_suite": result,
         "harnesses": harnesses_list,
     }
-    if len(harnesses_list) == 1:
+    requested_harness = harness.strip() if harness else ""
+    if requested_harness:
+        if requested_harness in harnesses_list:
+            response["harness"] = requested_harness
+            response["note"] = (
+                f"Requested harness '{requested_harness}' provides this benchmark"
+            )
+        else:
+            response["harness_unavailable"] = requested_harness
+            response["note"] = (
+                f"Requested harness '{requested_harness}' does not provide "
+                f"benchmark '{result}'"
+            )
+    elif len(harnesses_list) == 1:
         response["harness"] = harnesses_list[0]
         response["note"] = (
             f"Only '{harnesses_list[0]}' provides this benchmark "

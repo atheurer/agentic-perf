@@ -45,6 +45,7 @@ def build_skill_provider(
     from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
     from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
     from providers.skills.clusterbuster import ClusterbusterSkillProvider
+    from providers.skills.crucible import CrucibleCatalogSkillProvider
     from providers.skills.forge import ForgeSkillProvider
     from providers.skills.ioscale import IoscaleSkillProvider
     from providers.skills.k8s_netperf import K8sNetperfSkillProvider
@@ -68,6 +69,11 @@ def build_skill_provider(
         "forge": ForgeSkillProvider(),
         "arcaflow-plugins": ArcaflowPluginSkillProvider(),
     }
+
+    if catalog_only:
+        harnesses["crucible"] = CrucibleCatalogSkillProvider(
+            build_crucible_context_gateway(catalog_only=True)
+        )
 
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)

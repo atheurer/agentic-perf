@@ -1348,6 +1348,19 @@ def test_build_skill_provider_never_resolves_crucible_source(tmp_path, monkeypat
     assert provider.get_provider("crucible") is None
 
 
+def test_build_skill_provider_catalog_only_registers_crucible_catalog(tmp_path):
+    from agents.server_utils import build_skill_provider
+
+    provider = build_skill_provider(
+        crucible_home=tmp_path / "controller",
+        repo_cache=object(),
+        catalog_only=True,
+    )
+    catalog = provider.get_provider("crucible")
+    assert catalog is not None
+    assert catalog.__class__.__name__ == "CrucibleCatalogSkillProvider"
+
+
 @pytest.mark.asyncio
 async def test_triage_catalog_uses_bounded_files_without_local_checkout(tmp_path):
     class Fetcher:
