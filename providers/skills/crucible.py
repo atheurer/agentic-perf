@@ -287,7 +287,6 @@ class CrucibleContextGateway:
         self._home = Path(crucible_home)
         self._catalog_only = catalog_only
         self._source_repo = Path(source_repo) if source_repo else None
-        self._custom_catalog_fetcher = catalog_fetcher is not None
         self._benchmarks_dir = self._home / "subprojects" / "benchmarks"
         self._tools_dir = self._home / "subprojects" / "tools"
         self._examples_dir = (
@@ -405,6 +404,12 @@ class CrucibleContextGateway:
 
     def _source_repo_entries(self) -> dict[str, dict[str, Any]]:
         config = self._source_repo_config()
+        return self._entries_from_config(config)
+
+    @staticmethod
+    def _entries_from_config(
+        config: dict[str, Any] | None,
+    ) -> dict[str, dict[str, Any]]:
         if not config:
             return {}
         entries: dict[str, dict[str, Any]] = {}
@@ -415,6 +420,9 @@ class CrucibleContextGateway:
                     if isinstance(name, str) and name:
                         entries[name] = entry
         return entries
+
+    def _controller_repo_entries(self) -> dict[str, dict[str, Any]]:
+        return self._entries_from_config(self._controller_repo_config())
 
     def _remote_repo_entries(self) -> dict[str, dict[str, Any]]:
         config = self._catalog_fetcher.read_json("config/repos.json")
@@ -430,9 +438,15 @@ class CrucibleContextGateway:
         return entries
 
     def _catalog_benchmark_entries(self) -> dict[str, dict[str, Any]]:
-        entries = self._source_repo_entries()
-        if not entries:
-            entries = self._remote_repo_entries()
+        if self._catalog_only:
+            # Triage has no authoritative controller yet, so it may use the
+            # bounded GitHub catalog.  This is the only mode that may fetch
+            # the remote catalog.
+            entries = self._source_repo_entries() or self._remote_repo_entries()
+        else:
+            # Runtime/context resolution must not silently switch authority
+            # to GitHub when the installed controller lacks metadata.
+            entries = self._source_repo_entries() or self._controller_repo_entries()
         return {
             name: entry
             for name, entry in entries.items()
@@ -1258,7 +1272,6 @@ class CrucibleContextGateway:
         # missing metadata instead of silently mixing sources.
         if (
             not self._catalog_only
-            and not self._custom_catalog_fetcher
             and not self._home.exists()
             and self._source_repo is None
         ):

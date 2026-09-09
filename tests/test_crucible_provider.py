@@ -1385,7 +1385,7 @@ async def test_triage_catalog_uses_bounded_files_without_local_checkout(tmp_path
             return None
 
     provider = CrucibleSkillProvider(
-        tmp_path / "does-not-exist", catalog_fetcher=Fetcher()
+        tmp_path / "does-not-exist", catalog_fetcher=Fetcher(), catalog_only=True
     )
 
     benchmark = await provider.get_benchmark("perftest")
@@ -1398,6 +1398,23 @@ async def test_triage_catalog_uses_bounded_files_without_local_checkout(tmp_path
     assert benchmark.min_hosts == 2
     assert benchmark.supported_params == {"params": {"ifname": {"role": "all"}}}
     assert resolved == "perftest"
+
+
+@pytest.mark.asyncio
+async def test_runtime_provider_does_not_fallback_to_remote_catalog(tmp_path):
+    crucible_home = tmp_path / "crucible"
+    crucible_home.mkdir()
+
+    class Fetcher:
+        def read_json(self, *args, **kwargs):
+            raise AssertionError("runtime context must not fetch the remote catalog")
+
+    provider = CrucibleSkillProvider(
+        crucible_home,
+        catalog_fetcher=Fetcher(),
+    )
+
+    assert await provider.get_benchmark("perftest") is None
 
 
 @pytest.mark.asyncio
