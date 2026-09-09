@@ -649,9 +649,13 @@ class ResourceAgent(AgentBase):
         endpoint_type = directives.get("endpoint_type", "remotehosts")
         if required_hosts:
             content += "\n## Resource Requirements\n"
+            has_identity = any(h.get("host") for h in required_hosts)
+            all_identity = has_identity and all(h.get("host") for h in required_hosts)
             for i, h in enumerate(required_hosts, 1):
                 roles_str = "+".join(h.get("roles", ["?"]))
                 specs = []
+                if h.get("host"):
+                    specs.append(f"host: {h['host']}")
                 if h.get("nic_speed"):
                     specs.append(f"NIC: {h['nic_speed']}Gbps")
                 if h.get("min_memory_gb"):
@@ -662,6 +666,18 @@ class ResourceAgent(AgentBase):
                     specs.append(f"OS: {h['os']}")
                 spec_str = f" ({', '.join(specs)})" if specs else ""
                 content += f"- Host {i}: **{roles_str}**{spec_str}\n"
+            if all_identity:
+                content += (
+                    "\n**All hosts are user-provided existing machines.** "
+                    "Validate each with validate_host and submit these "
+                    "exact identities — do not allocate from a provider.\n"
+                )
+            elif has_identity:
+                content += (
+                    "\n**Some hosts are user-provided existing machines** "
+                    "(those with a 'host' value above). Validate those "
+                    "with validate_host and submit their exact identities.\n"
+                )
             if endpoint_type == "kube":
                 content += "- **Endpoint type:** kube (workloads run as pods)\n"
                 content += "- **Total hosts to provision:** 1 (single host: controller + K8s cluster)\n"

@@ -32,7 +32,20 @@ Your job is to analyze a performance test request ticket and:
 
    Attach any hardware requirements the user specified to the relevant host entries.
    Available optional fields: nic_speed (int, Gbps), min_cores (int),
-   min_memory_gb (int), os (string). Only include specs the user actually requested.
+   min_memory_gb (int), os (string), host (string). Only include specs the
+   user actually requested.
+
+   **Existing hosts:** When the user names specific existing hosts (FQDNs or
+   IP addresses), set the `host` field on the corresponding required_hosts
+   entry to the EXACT string the user provided — character-for-character,
+   preserving case, domain suffixes, and hyphens. Never paraphrase,
+   truncate, resolve, or "correct" identities. Omit `host` for entries
+   where a provider will allocate the machine.
+
+   Example: uperf with user-provided controller and provider-allocated endpoints:
+   [{"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+    {"roles": ["client"], "nic_speed": 25, "os": "RHEL9"},
+    {"roles": ["server"], "host": "node-42.lab.example.com"}]
 
    Example: uperf on AWS with 25Gb NICs, 16GB controller, RHEL9:
    [{"roles": ["controller"], "min_memory_gb": 16},

@@ -14,6 +14,13 @@ Always call submit_resource_result with:
 - fresh_host: true for managed providers (hosts need full harness install)
 - lease_expiration: from the reservation result (null if not applicable)
 
+## Existing Hosts
+
+When required_hosts entries include a `host` field, that is a user-provided
+existing machine (FQDN or IP). Do NOT allocate it from a provider — validate
+it with validate_host and submit the EXACT string as-is (preserve case and
+domain suffixes). Entries without `host` should be allocated normally.
+
 ## Host Count
 
 The ticket's required_hosts field lists every host needed with its roles

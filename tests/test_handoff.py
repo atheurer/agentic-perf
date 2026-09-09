@@ -331,3 +331,124 @@ class TestEnrichedRequiredHosts:
         }
         ok, reason = check_handoff("awaiting_provision", ticket)
         assert ok, reason
+
+
+class TestHostIdentityEnforcement:
+    """When required_hosts carry 'host', identities must appear verbatim."""
+
+    def test_exact_identity_passes(self):
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+                    {"roles": ["server"], "host": "node-42.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab.example.com",
+                    "targets": ["node-42.lab.example.com"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
+    def test_missing_identity_fails(self):
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+                    {"roles": ["server"], "host": "node-42.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab.example.com",
+                    "targets": ["10.0.0.5"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert not ok
+        assert "node-42.lab.example.com" in reason
+
+    def test_case_mangled_identity_fails(self):
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "Ctrl-01.Lab.Example.COM"},
+                    {"roles": ["server"], "host": "node-42.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab.example.com",
+                    "targets": ["node-42.lab.example.com"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert not ok
+        assert "Ctrl-01.Lab.Example.COM" in reason
+
+    def test_truncated_identity_fails(self):
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab",
+                    "targets": [],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert not ok
+        assert "ctrl-01.lab.example.com" in reason
+
+    def test_managed_provider_unaffected(self):
+        """No host fields → identity check is skipped entirely."""
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "min_memory_gb": 16},
+                    {"roles": ["server"]},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": ["10.0.0.2"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
+    def test_mixed_named_and_allocated(self):
+        """Some entries have host, others don't — only named ones enforced."""
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+                    {"roles": ["client"]},
+                    {"roles": ["server"], "host": "node-42.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab.example.com",
+                    "targets": ["10.0.0.5", "node-42.lab.example.com"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
+    def test_identity_in_controller_passes(self):
+        """A named host assigned as controller is found."""
+        ticket = {
+            "custom_fields": {
+                "required_hosts": [
+                    {"roles": ["controller"], "host": "ctrl-01.lab.example.com"},
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "ctrl-01.lab.example.com",
+                    "targets": [],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
