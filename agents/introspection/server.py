@@ -639,7 +639,7 @@ def _detect_anomalies_from_events(
                 {
                     "severity": "medium",
                     "type": "empty_llm_response",
-                    "message": (
+                    "description": (
                         f"Agent '{agent}' received an empty "
                         f"response (0 output tokens) from the "
                         f"LLM. The model may be experiencing "
