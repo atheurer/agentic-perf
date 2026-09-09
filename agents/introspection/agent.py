@@ -951,7 +951,7 @@ class IntrospectionAgent:
             if author not in ("system", ""):
                 if not author.startswith("user"):
                     last_agent = author
-                    last_agent_message = c.get("body", "")[:500]
+                    last_agent_message = c.get("body", "")[:2000]
                     break
 
         # Fallback: if no agent comment found, check for
@@ -969,7 +969,7 @@ class IntrospectionAgent:
                     or "429" in body
                 ):
                     last_agent = "system"
-                    last_agent_message = body[:500]
+                    last_agent_message = body[:2000]
                     break
 
         # Classify the reason
