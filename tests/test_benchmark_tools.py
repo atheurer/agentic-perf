@@ -90,6 +90,66 @@ async def test_no_validate_run_file_tool(handlers):
     assert "validate_run_file" not in handlers
 
 
+@pytest.mark.asyncio
+async def test_validate_benchmark_validates_on_controller_without_execution(handlers):
+    ssh = MockSSHExecutor()
+    handlers = make_benchmark_handlers(
+        ssh=ssh,
+        skill_provider=MockSkillProvider(),
+    )
+    result = await handlers["validate_benchmark"](
+        controller="10.0.0.1",
+        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}]},
+        harness="crucible",
+    )
+
+    assert result["status"] == "valid"
+    assert result["valid"] is True
+    commands = [call.get("command", "") for call in ssh.calls]
+    assert any("crucible validate" in command for command in commands)
+    assert not any("crucible run" in command for command in commands)
+    assert not any("opensearch" in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_validate_benchmark_returns_structured_controller_errors():
+    from tests.conftest import SSHResult
+
+    ssh = MockSSHExecutor(
+        results={
+            "crucible validate": SSHResult(
+                exit_code=2, stderr="invalid endpoint schema"
+            ),
+        }
+    )
+    handlers = make_benchmark_handlers(
+        ssh=ssh,
+        skill_provider=MockSkillProvider(
+            private_config={
+                "crucible": {"execution": {"validation_command": "crucible validate"}}
+            }
+        ),
+    )
+    result = await handlers["validate_benchmark"](
+        controller="10.0.0.1", run_file={"bad": True}, harness="crucible"
+    )
+
+    assert result["status"] == "invalid"
+    assert result["valid"] is False
+    assert result["errors"] == ["invalid endpoint schema"]
+    assert result["exit_code"] == 2
+
+
+@pytest.mark.asyncio
+async def test_validate_benchmark_rejects_unsupported_harness(handlers):
+    result = await handlers["validate_benchmark"](
+        controller="10.0.0.1", run_file={}, harness="zathras"
+    )
+
+    assert result["status"] == "unsupported"
+    assert result["valid"] is False
+
+
 # ── result-summary.json verification tests ──────────────────
 
 
