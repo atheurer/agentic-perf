@@ -679,10 +679,11 @@ class AgentBase(ABC):
                                             "after": after,
                                         },
                                     )
-                                    # Retry with truncated
-                                    # context instead of
-                                    # wrapping up.
-                                    continue
+                                    # Truncation applied; fall
+                                    # through to process the
+                                    # current response normally.
+                                    # The reduced context takes
+                                    # effect on the next LLM call.
                             # Truncation already attempted
                             # or didn't help — wrap up.
                             self._wrapup_reason = "context"
