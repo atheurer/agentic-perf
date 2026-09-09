@@ -781,7 +781,7 @@ class AgentBase(ABC):
                     # tokens on valid prompts but succeed on
                     # the next attempt.
                     if (
-                        not response.text
+                        not (response.text or "").strip()
                         and not response.tool_calls
                         and not getattr(self, "_empty_response_retried", False)
                     ):
