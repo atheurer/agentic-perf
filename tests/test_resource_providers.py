@@ -1728,3 +1728,55 @@ class TestValidateHostKeyPassthrough:
             ssh_key_path="~/.ssh/id_rsa",
         )
         assert constructed_with.get("key_path") == "~/.ssh/id_rsa"
+
+
+class TestGetBoardSelector:
+    """Test _get_board_selector fallback logic."""
+
+    def test_from_directives(self):
+        from agents.resource.server import _get_board_selector
+
+        ticket = {
+            "custom_fields": {
+                "directives": {"board_selector": "board-type=qc8775"},
+            }
+        }
+        assert _get_board_selector(ticket) == "board-type=qc8775"
+
+    def test_from_top_level(self):
+        from agents.resource.server import _get_board_selector
+
+        ticket = {
+            "custom_fields": {
+                "board_selector": "board-type=qc8775",
+                "directives": {},
+            }
+        }
+        assert _get_board_selector(ticket) == "board-type=qc8775"
+
+    def test_directives_takes_precedence(self):
+        from agents.resource.server import _get_board_selector
+
+        ticket = {
+            "custom_fields": {
+                "board_selector": "board-type=s32g",
+                "directives": {"board_selector": "board-type=qc8775"},
+            }
+        }
+        assert _get_board_selector(ticket) == "board-type=qc8775"
+
+    def test_empty_when_missing(self):
+        from agents.resource.server import _get_board_selector
+
+        ticket = {"custom_fields": {}}
+        assert _get_board_selector(ticket) == ""
+
+    def test_no_directives_key(self):
+        from agents.resource.server import _get_board_selector
+
+        ticket = {
+            "custom_fields": {
+                "board_selector": "board-type=rcar-s4",
+            }
+        }
+        assert _get_board_selector(ticket) == "board-type=rcar-s4"
