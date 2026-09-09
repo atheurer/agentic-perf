@@ -266,14 +266,17 @@ class ChatAgent:
                     if gs:
                         ticket_info += (
                             f"\n- Guidance: {gs.get('reason', '?')}"
-                            f" - {gs.get('details', '')[:200]}"
+                            f" - {gs.get('details', '')}"
                         )
+                        actions = gs.get("suggested_actions", [])
+                        if actions:
+                            ticket_info += "\n  Actions: " + "; ".join(actions)
                     comments = t.get("comments", [])
                     if comments:
                         last = comments[-1]
                         ticket_info += (
                             f"\n- Last [{last.get('author', '')}]: "
-                            f"{last.get('body', '')[:200]}"
+                            f"{last.get('body', '')}"
                         )
             except Exception:
                 pass
