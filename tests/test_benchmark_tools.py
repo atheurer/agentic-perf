@@ -105,6 +105,7 @@ async def test_validate_benchmark_validates_on_controller_without_execution(hand
     assert any("crucible validate" in command for command in commands)
     assert not any("crucible run" in command for command in commands)
     assert not any("opensearch" in command for command in commands)
+    assert result["validation_id"].startswith("val-")
 
 
 @pytest.mark.asyncio
@@ -235,7 +236,13 @@ async def test_crucible_missing_result_summary_marks_failed():
 
     result = await h["execute_benchmark"](
         controller="test-host",
-        run_file={"benchmarks": []},
+        validation_id=(
+            await h["validate_benchmark"](
+                controller="test-host",
+                run_file={"benchmarks": []},
+                harness="crucible",
+            )
+        )["validation_id"],
         harness="crucible",
         run_command="crucible run",
     )
@@ -258,7 +265,13 @@ async def test_crucible_with_result_summary_marks_completed():
 
     result = await h["execute_benchmark"](
         controller="test-host",
-        run_file={"benchmarks": []},
+        validation_id=(
+            await h["validate_benchmark"](
+                controller="test-host",
+                run_file={"benchmarks": []},
+                harness="crucible",
+            )
+        )["validation_id"],
         harness="crucible",
         run_command="crucible run",
     )

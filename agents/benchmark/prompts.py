@@ -157,17 +157,19 @@ For non-Crucible harnesses, retain the compatible procedure of using
    `validate_benchmark(controller, run_file, harness)`. For Crucible this performs
    the controller-side `crucible validate` checks without deploying or running
    anything. If it fails, correct the run-file and validate again; if the failure
-   cannot be resolved, request clarification. Never call `execute_benchmark`
-   with a run-file that has not returned `valid: true` from `validate_benchmark`.
+   cannot be resolved, request clarification. Save the returned `validation_id`.
 
 8. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
    Do NOT ask for approval when the user explicitly said not to.
    If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
 
-9. **Execute** — Call `execute_benchmark(controller, run_file, harness, run_command)`.
-   The controller validates the run-file during execution — if there are schema errors,
-   they will appear in the execution output.
+9. **Execute** — For Crucible, call
+   `execute_benchmark(controller, validation_id, harness, run_command)`. Do not pass
+   the run-file: Crucible execution accepts only the exact run-file saved by the
+   successful validation identified by `validation_id`. If the run-file changes,
+   validate it again and use the new ID. Other harnesses may retain their existing
+   execution contract until they support validation IDs.
 
 9. **Verify and submit result** — Check the `execute_benchmark` response carefully:
    - If status is "completed" AND `result_summary` is present, submit with status "completed".

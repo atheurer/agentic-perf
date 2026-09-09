@@ -188,7 +188,7 @@ async def test_present_runfile_for_approval():
 
 @pytest.mark.asyncio
 async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_schema):
-    """execute_benchmark should pass the LLM's run-file directly to the controller."""
+    """execute_benchmark uses the exact runfile returned by validation."""
     llm_runfile = {
         "benchmarks": [{"name": "uperf", "ids": "1", "mv-params": {}}],
         "endpoints": [
@@ -207,12 +207,17 @@ async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_s
             },
         ],
     }
-    result = await handlers_with_schema["execute_benchmark"](
+    validation = await handlers_with_schema["validate_benchmark"](
         controller="10.0.0.1",
         run_file=llm_runfile,
         harness="crucible",
+    )
+    result = await handlers_with_schema["execute_benchmark"](
+        controller="10.0.0.1",
+        validation_id=validation["validation_id"],
+        harness="crucible",
         run_command="crucible run",
     )
-    # May fail at SCP (no real SSH in tests) but must not be "rejected"
-    # by any local validation — the controller is the single source of truth.
+    # May fail at SCP (no real SSH in tests), but must not be rejected for
+    # supplying an unvalidated or mismatched runfile.
     assert result["status"] != "rejected"

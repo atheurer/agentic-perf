@@ -68,13 +68,26 @@ def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
+    controller: str,
     params_fingerprint: str,
-) -> None:
-    """PATCH validated_run_file onto the ticket's custom_fields.
+) -> str | None:
+    """Persist a runfile validation record and return its opaque ID.
 
-    Silently no-ops when TICKET_ID is absent (test mode).
+    The record is retained in memory for test-mode calls and persisted onto
+    the ticket when running under an agentic-perf ticket.  Execution must use
+    this ID rather than supplying an independent runfile.
     """
     import httpx
+
+    validation_id = f"val-{uuid.uuid4().hex}"
+    record = {
+        "validation_id": validation_id,
+        "run_file": run_file,
+        "harness": harness,
+        "controller": controller,
+        "params_fingerprint": params_fingerprint,
+    }
+    _validation_records[validation_id] = record
 
     ticket_id = os.environ.get("TICKET_ID", "")
     state_store_url = os.environ.get(
@@ -82,13 +95,7 @@ async def _persist_validated_runfile(
         "http://localhost:8090",
     )
     if not ticket_id:
-        return
-
-    payload = {
-        "run_file": run_file,
-        "harness": harness,
-        "params_fingerprint": params_fingerprint,
-    }
+        return validation_id
 
     try:
         headers = {}
@@ -99,21 +106,33 @@ async def _persist_validated_runfile(
             timeout=10.0,
             headers=headers,
         ) as client:
-            await client.patch(
+            response = await client.patch(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={"fields": {"validated_run_file": payload}},
+                json={
+                    "fields": {
+                        "benchmark_validation": record,
+                        # Keep this compatibility field for ticket context and
+                        # audit consumers that already display the runfile.
+                        "validated_run_file": record,
+                    }
+                },
             )
+            response.raise_for_status()
         logger.info(
-            "[benchmark] Persisted validated_run_file for %s (%s)",
+            "[benchmark] Persisted benchmark validation %s for %s (%s)",
+            validation_id,
             ticket_id,
             harness,
         )
+        return validation_id
     except Exception:
         logger.debug(
-            "Failed to persist validated_run_file for %s",
+            "Failed to persist benchmark validation for %s",
             ticket_id,
             exc_info=True,
         )
+        _validation_records.pop(validation_id, None)
+        return None
 
 
 _HARNESS_ALLOWED_BINARIES: dict[str, frozenset[str]] = {
@@ -201,6 +220,7 @@ _skill_provider = None
 _crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
+_validation_records: dict[str, dict[str, Any]] = {}
 
 
 async def _ensure_init():
@@ -216,6 +236,33 @@ async def _ensure_init():
     except Exception:
         _repo_cache = None
     _initialized = True
+
+
+def _get_validated_runfile(
+    validation_id: str,
+    controller: str,
+    harness: str,
+    ticket: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve the exact runfile previously validated for this ticket."""
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        record = ticket.get("custom_fields", {}).get("benchmark_validation")
+    else:
+        record = _validation_records.get(validation_id)
+
+    if not isinstance(record, dict):
+        return None, "No validation record exists for this ticket"
+    if record.get("validation_id") != validation_id:
+        return None, "Validation ID does not match the ticket's latest validation"
+    if record.get("harness") != harness:
+        return None, "Validation was performed for a different harness"
+    if record.get("controller") != controller:
+        return None, "Validation was performed for a different controller"
+    run_file = record.get("run_file")
+    if not isinstance(run_file, dict):
+        return None, "Validation record does not contain a runfile"
+    return run_file, None
 
 
 def _controller_host() -> str | None:
@@ -1685,11 +1732,19 @@ async def setup_passwordless_ssh(
 @mcp.tool()
 async def execute_benchmark(
     controller: str,
-    run_file: dict,
+    validation_id: str | None = None,
     harness: str | None = None,
     run_command: str | None = None,
+    run_file: dict | None = None,
 ) -> str:
-    """Execute the benchmark on the controller host. For crucible, sends a JSON run-file via SCP and runs 'crucible run'. For zathras, constructs a burden command. This may take several minutes."""
+    """Execute a previously validated benchmark configuration.
+
+    Crucible execution is intentionally token-based: the caller must provide
+    the validation ID returned by ``validate_benchmark``.  The runfile is
+    loaded from that ticket-bound record, so a caller cannot substitute a
+    different runfile between validation and execution.  Other harnesses keep
+    the legacy runfile argument until they gain the same validation contract.
+    """
     await _ensure_init()
 
     from agents.server_utils import assert_ticket_active
@@ -1703,7 +1758,53 @@ async def execute_benchmark(
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
 
-    if _skill_provider and harness_name != "crucible":
+    if harness_name == "crucible":
+        if run_file is not None:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "message": (
+                        "Crucible execution does not accept a runfile. "
+                        "Call validate_benchmark and pass its validation_id."
+                    ),
+                }
+            )
+        if not validation_id:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "message": (
+                        "Crucible execution requires validation_id from a "
+                        "successful validate_benchmark call."
+                    ),
+                }
+            )
+        run_file, validation_error = _get_validated_runfile(
+            validation_id,
+            controller,
+            harness_name,
+            active_check,
+        )
+        if validation_error:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "validation_id": validation_id,
+                    "message": validation_error,
+                }
+            )
+    elif _skill_provider:
+        if run_file is None:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "message": "A runfile is required for this harness",
+                }
+            )
         validation = await _skill_provider.validate_runfile(run_file, harness_name)
         if not validation.get("valid", True):
             return json.dumps(
@@ -1716,6 +1817,15 @@ async def execute_benchmark(
                     ),
                 }
             )
+
+    if run_file is None:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "harness": harness_name,
+                "message": "A runfile is required for this harness",
+            }
+        )
 
     if run_command is not None:
         valid, reason = _validate_run_command(run_command, harness_name)
@@ -1731,10 +1841,6 @@ async def execute_benchmark(
                     ),
                 }
             )
-
-    ticket_cf = _ticket.get("custom_fields", {}) if _ticket else {}
-    fingerprint = _compute_params_fingerprint(ticket_cf)
-    await _persist_validated_runfile(run_file, harness_name, fingerprint)
 
     async def _benchmark_progress(output_line: str, elapsed: int) -> None:
         minutes = elapsed // 60
@@ -2893,12 +2999,35 @@ async def validate_benchmark(
         )
         output = (result.stdout or "").strip()
         if result.exit_code == 0:
+            params_fingerprint = _compute_params_fingerprint(
+                _ticket.get("custom_fields", {}) if _ticket else {}
+            )
+            validation_id = await _persist_validated_runfile(
+                run_file,
+                harness_name,
+                controller,
+                params_fingerprint,
+            )
+            if validation_id is None:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "valid": False,
+                        "harness": harness_name,
+                        "controller": controller,
+                        "errors": [
+                            "Validation succeeded but the validation record "
+                            "could not be persisted"
+                        ],
+                    }
+                )
             return json.dumps(
                 {
                     "status": "valid",
                     "valid": True,
                     "harness": harness_name,
                     "controller": controller,
+                    "validation_id": validation_id,
                     "validation_output": output,
                     "errors": [],
                 }
