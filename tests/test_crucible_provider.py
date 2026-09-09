@@ -1731,7 +1731,17 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
 
     class FakeSSH:
         async def run(self, host, command, **kwargs):
-            if "grep -RInE" in command:
+            if "realpath -e" in command:
+                if "perftest/README.md" in command:
+                    return SSHResult("perftest guidance", "", 0)
+                if "AGENTS.md" in command:
+                    return SSHResult(
+                        "Read subprojects/benchmarks/perftest/README.md next.",
+                        "",
+                        0,
+                    )
+                return SSHResult("", "missing", 1)
+            if "grep -rInE" in command:
                 return SSHResult(
                     "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md:12:device guidance\n"
                     "NAME\tf\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
@@ -1802,3 +1812,32 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
     assert search["total_matches"] == 3
     assert search["results"][1]["type"] == "directory"
     assert "source" not in search["results"][0]
+
+
+@pytest.mark.asyncio
+async def test_controller_context_gateway_rejects_symlink_escape(tmp_path, monkeypatch):
+    import paths
+    from agents.server_utils import controller_context_gateway
+    from providers.ssh import SSHResult
+
+    class EscapingSSH:
+        async def run(self, host, command, **kwargs):
+            if "realpath -e" in command:
+                return SSHResult("", "path escapes controller root", 2)
+            return SSHResult("", "unexpected command", 1)
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    result = json.loads(
+        await controller_context_gateway(
+            ssh=EscapingSSH(),
+            controller_host="controller.example.test",
+            ticket_id="PERF-SYMLINK-ESCAPE",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="subprojects/benchmarks/perftest/README.md",
+        )
+    )
+
+    assert result["found"] is False
+    assert result["reason"] == "controller_document_not_found"

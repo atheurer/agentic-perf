@@ -380,7 +380,7 @@ async def _search_controller_source(
         "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
         f"\\( -type f -o -type d \\) -regex {find_pattern} "
         "-printf 'NAME\\t%y\\t%p\\n' 2>/dev/null; "
-        "grep -RInE --binary-files=without-match "
+        "grep -rInE --binary-files=without-match "
         "--exclude-dir=.git --exclude-dir=.ssh --exclude-dir=secrets "
         "--exclude='*.pem' --exclude='*.key' --exclude='authorized_keys' "
         f"-- {shlex.quote(query)} /opt/crucible 2>/dev/null "
@@ -455,6 +455,32 @@ async def _search_controller_source(
     }
 
 
+async def _read_controller_document(
+    *,
+    ssh: Any,
+    controller_host: str,
+    relative: str,
+    max_bytes: int = 262144,
+) -> Any:
+    """Read a controller document only after resolving symlinks safely.
+
+    The lexical path checks above prevent traversal syntax, but do not stop a
+    path inside /opt/crucible from being a symlink to another tree.  Resolve
+    both the installation root and the requested target on the controller and
+    require the real target to remain below the real installation root.
+    """
+    remote_path = f"/opt/crucible/{relative}"
+    quoted_path = shlex.quote(remote_path)
+    command = (
+        "root=$(realpath -e -- /opt/crucible) && "
+        f"candidate=$(realpath -e -- {quoted_path}) && "
+        'case "$candidate" in "$root"/*) '
+        f'test -f "$candidate" && head -c {max_bytes} "$candidate";; '
+        "*) exit 2;; esac"
+    )
+    return await ssh.run(controller_host, command, timeout=30)
+
+
 async def controller_context_gateway(
     *,
     ssh: Any,
@@ -527,8 +553,7 @@ async def controller_context_gateway(
             }
         )
     if operation in {"bootstrap", "read"}:
-        remote_path = f"/opt/crucible/{relative}" if relative else ""
-        if not remote_path:
+        if not relative:
             return json.dumps(
                 {
                     "found": False,
@@ -537,10 +562,10 @@ async def controller_context_gateway(
                     "path": path,
                 }
             )
-        result = await ssh.run(
-            controller_host,
-            f"test -f {shlex.quote(remote_path)} && head -c 262144 {shlex.quote(remote_path)}",
-            timeout=30,
+        result = await _read_controller_document(
+            ssh=ssh,
+            controller_host=controller_host,
+            relative=relative,
         )
         if result.exit_code != 0:
             return json.dumps(
