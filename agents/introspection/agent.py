@@ -1096,7 +1096,28 @@ class IntrospectionAgent:
         )
 
         self._record_usage(ticket_id, response)
-        return response.text.strip() if response.text else None
+        text = response.text.strip() if response.text else None
+        if not text:
+            return None
+        # Discard incomplete suggestions — the LLM may
+        # have been cut short by token limits or produced
+        # a truncated response. Check for unclosed markdown
+        # or ending mid-word.
+        if text.endswith("`") and text.count("`") % 2 != 0:
+            logger.debug(
+                "[introspection] Discarding incomplete "
+                "suggestion (unclosed backtick): %s",
+                text[:50],
+            )
+            return None
+        if len(text) < 20:
+            logger.debug(
+                "[introspection] Discarding too-short suggestion (%d chars): %s",
+                len(text),
+                text,
+            )
+            return None
+        return text
 
     async def _get_ticket(
         self,
