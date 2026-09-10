@@ -3734,9 +3734,9 @@ def _generate_deployer_config(
     host: str,
     ssh_user: str = "root",
     ssh_key_path: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Generate an arcaflow deployer config for podman-over-SSH."""
-    config = {
+    config: dict[str, Any] = {
         "deployers": {
             "image": {
                 "deployer_name": "podman",
@@ -3753,12 +3753,7 @@ def _generate_deployer_config(
         config["deployers"]["image"]["podman"]["connection"] = {
             "host": connection,
         }
-    try:
-        import yaml
-
-        return yaml.dump(config, default_flow_style=False)
-    except ImportError:
-        return json.dumps(config, indent=2)
+    return config
 
 
 @mcp.tool()
@@ -3770,9 +3765,14 @@ async def execute_arcaflow_workflow(
 ) -> str:
     """Execute an Arcaflow workflow on the provisioned host.
 
-    Uses the Arcaflow MCP to load and validate the workflow,
-    then runs the arcaflow engine with a generated deployer
-    config that targets the provisioned host via podman-over-SSH.
+    Uses the Arcaflow MCP server to load, validate, and
+    export workflow inputs. Execution is managed by the MCP
+    when execution tools are available, or falls back to
+    direct engine invocation.
+
+    The deployer config (podman-over-SSH targeting the
+    provisioned host) is generated from ticket data and
+    passed to the MCP or engine.
 
     Args:
         workflow_source: Git repo URL or raw workflow file URL.
@@ -3787,7 +3787,6 @@ async def execute_arcaflow_workflow(
         JSON with run_id, status, output, and metrics.
     """
     import asyncio as _asyncio
-    import shutil
 
     await _ensure_init()
 
@@ -3812,32 +3811,40 @@ async def execute_arcaflow_workflow(
     # Resolve MCP source from URL
     source = _resolve_mcp_source(workflow_source)
 
-    # Generate deployer config
-    deployer_yaml = _generate_deployer_config(controller, ssh_user, ssh_key_path)
+    # Generate deployer config from ticket data
+    deployer = _generate_deployer_config(controller, ssh_user, ssh_key_path)
 
-    # Create working directory for this run
+    # Create artifact directory for this run
     ticket_id = os.environ.get("TICKET_ID", "unknown")
     from paths import create_artifact_dir
 
     output_dir = create_artifact_dir(ticket_id, run_uuid)
-    deployer_path = output_dir / "deployer-config.yaml"
-    deployer_path.write_text(deployer_yaml)
 
-    # Check if arcaflow engine is available
+    # Direct engine execution (Option B).
+    # When the Arcaflow MCP adds workflow_execute, the
+    # benchmark agent's LLM will call it directly as an
+    # external MCP tool — no server.py change needed.
+    # The Arcaflow MCP does not yet have workflow_execute.
+    # Run the engine directly with the workflow source and
+    # deployer config.
+    import shutil
+
     arcaflow_bin = shutil.which("arcaflow")
     if not arcaflow_bin:
-        # Try the arcaflow-mcp binary which may include
-        # engine capabilities, or use podman to run the
-        # engine container
         return json.dumps(
             {
                 "status": "failed",
                 "run_id": run_id,
                 "error": (
                     "arcaflow engine binary not found. "
-                    "Install arcaflow or configure the "
-                    "Arcaflow MCP for execution."
+                    "The Arcaflow MCP does not yet support "
+                    "workflow_execute. Install the arcaflow "
+                    "engine binary for direct execution."
                 ),
+                "mcp_tools_needed": [
+                    "workflow_execute",
+                    "workflow_execution_status",
+                ],
             }
         )
 
@@ -3862,11 +3869,10 @@ async def execute_arcaflow_workflow(
                 {
                     "status": "failed",
                     "run_id": run_id,
-                    "error": f"Git clone failed: {stderr.decode()[:500]}",
+                    "error": (f"Git clone failed: {stderr.decode()[:500]}"),
                 }
             )
     else:
-        # URL source - download the file
         try:
             import httpx
 
@@ -3875,7 +3881,8 @@ async def execute_arcaflow_workflow(
                 r.raise_for_status()
                 wf_file = workflow_dir / "workflow.yaml"
                 wf_file.write_text(r.text)
-                workflow_name = "workflow"
+                if not workflow_name:
+                    workflow_name = "workflow"
         except Exception as exc:
             return json.dumps(
                 {
@@ -3888,16 +3895,17 @@ async def execute_arcaflow_workflow(
     # Determine the workflow file path
     wf_path = ""
     if workflow_name:
-        candidate = workflow_dir / f"{workflow_name}.yaml"
-        if candidate.exists():
-            wf_path = str(candidate)
-        else:
-            candidate = workflow_dir / workflow_name
+        for candidate_name in [
+            f"{workflow_name}.yaml",
+            workflow_name,
+            f"{workflow_name}.yml",
+        ]:
+            candidate = workflow_dir / candidate_name
             if candidate.exists():
                 wf_path = str(candidate)
+                break
     if not wf_path:
-        # Find the first .yaml file
-        yamls = list(workflow_dir.glob("*.yaml"))
+        yamls = sorted(workflow_dir.glob("*.yaml"))
         yamls = [y for y in yamls if y.name != "config.yaml"]
         if yamls:
             wf_path = str(yamls[0])
@@ -3911,14 +3919,23 @@ async def execute_arcaflow_workflow(
             }
         )
 
+    # Write deployer config
+    deployer_path = output_dir / "deployer-config.yaml"
+    try:
+        import yaml
+
+        deployer_path.write_text(yaml.dump(deployer, default_flow_style=False))
+    except ImportError:
+        deployer_path.write_text(json.dumps(deployer, indent=2))
+
     # Write input overrides if provided
     input_path = ""
     if input_overrides:
         input_file = output_dir / "input.yaml"
         try:
-            import yaml
+            import yaml as _yaml
 
-            input_file.write_text(yaml.dump(input_overrides, default_flow_style=False))
+            input_file.write_text(_yaml.dump(input_overrides, default_flow_style=False))
         except ImportError:
             input_file.write_text(json.dumps(input_overrides, indent=2))
         input_path = str(input_file)
@@ -3958,7 +3975,7 @@ async def execute_arcaflow_workflow(
             {
                 "status": "failed",
                 "run_id": run_id,
-                "error": f"Workflow timed out after {timeout_seconds}s",
+                "error": (f"Workflow timed out after {timeout_seconds}s"),
                 "output_dir": str(output_dir),
             }
         )
@@ -3971,26 +3988,25 @@ async def execute_arcaflow_workflow(
     (output_dir / "stderr.log").write_text(stderr_text)
 
     # Parse structured output if available
-    output_data = {}
+    output_data: dict[str, Any] = {}
     try:
-        # Arcaflow outputs JSON to stdout
         output_data = json.loads(stdout_text)
     except json.JSONDecodeError:
         pass
 
-    result = {
-        "status": "completed" if proc.returncode == 0 else "failed",
-        "exit_code": proc.returncode,
-        "run_id": run_id,
-        "harness": "arcaflow",
-        "workflow_source": workflow_source,
-        "workflow_name": workflow_name or wf_path,
-        "output_dir": str(output_dir),
-        "output": output_data if output_data else stdout_text[:2000],
-        "error": stderr_text[:1000] if proc.returncode != 0 else "",
-    }
-
-    return json.dumps(result)
+    return json.dumps(
+        {
+            "status": ("completed" if proc.returncode == 0 else "failed"),
+            "exit_code": proc.returncode,
+            "run_id": run_id,
+            "harness": "arcaflow",
+            "workflow_source": workflow_source,
+            "workflow_name": workflow_name or wf_path,
+            "output_dir": str(output_dir),
+            "output": (output_data if output_data else stdout_text[:2000]),
+            "error": (stderr_text[:1000] if proc.returncode != 0 else ""),
+        }
+    )
 
 
 async def get_registered_tools():
