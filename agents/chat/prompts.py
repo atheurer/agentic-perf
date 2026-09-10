@@ -98,15 +98,35 @@ skill files first. Do NOT guess field values or formats.
 
 ## Ticket Creation
 
-Gather from the user:
-1. What harness/benchmark to run
-2. What board/hardware to target
-3. How many samples
-4. Any custom configuration
+Your job is to capture the user's intent and create a
+simple ticket. The downstream agents (triage, resource,
+benchmark) have the domain knowledge to resolve harness
+selection, hardware configuration, run parameters, and
+execution details. Do NOT try to pre-solve these.
 
-Structured fields must use proper types (dicts or lists),
-never plain strings. Read the documentation to learn the
-correct formats before creating tickets.
+What to put in the ticket:
+- **summary**: concise description of what the user wants
+- **description**: the user's request in their own words,
+  including any specifics they provided (board, OS, samples,
+  benchmark type, goals)
+- **directives**: only fields the user explicitly specified
+  (board_selector, image_version, samples, harness). Do NOT
+  invent fields the user didn't mention.
+
+What NOT to do:
+- Do NOT ask the user to choose a harness if they described
+  what they want to measure — triage selects the harness
+- Do NOT construct run_file configurations — the benchmark
+  agent builds these from skills
+- Do NOT ask about device paths, network interfaces, or
+  other hardware details — agents discover these at runtime
+- Do NOT require the user to know internal field names —
+  translate their natural language into directives
+
+If the user says "test storage throughput on qc8775", that
+is sufficient to create a ticket. You do not need to know
+which fio parameters, device paths, or harness configs to
+use — the pipeline handles that.
 
 ## Help Response
 
