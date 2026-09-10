@@ -715,12 +715,28 @@ async def run_agent_task(
                             model=llm_override.get("model", ""),
                             api=llm_override.get("api", ""),
                         )
+                        override_llm.default_timeout = config.llm_timeout
                         override_effort = llm_override.get("reasoning_effort")
                         if override_effort:
                             override_llm.reasoning_effort = override_effort
                         override_max_tokens = llm_override.get("max_tokens")
                         if override_max_tokens:
                             override_llm.max_tokens = int(override_max_tokens)
+                        override_timeout = llm_override.get("timeout")
+                        if override_timeout is not None:
+                            try:
+                                override_llm.default_timeout = float(
+                                    override_timeout,
+                                )
+                                logger.info(
+                                    f"Timeout override for {ticket_id}:"
+                                    f" {override_llm.default_timeout}s"
+                                )
+                            except (ValueError, TypeError):
+                                logger.warning(
+                                    f"Invalid timeout override for"
+                                    f" {ticket_id}: {override_timeout!r}"
+                                )
                         agent.llm = override_llm
                         logger.info(
                             f"LLM override for {ticket_id}:"
