@@ -3765,14 +3765,14 @@ async def execute_arcaflow_workflow(
 ) -> str:
     """Execute an Arcaflow workflow on the provisioned host.
 
-    Uses the Arcaflow MCP server to load, validate, and
-    export workflow inputs. Execution is managed by the MCP
-    when execution tools are available, or falls back to
-    direct engine invocation.
+    Delegates to the Arcaflow MCP server's workflow_execute
+    tool for engine management. This tool prepares the
+    deployer config from ticket data and passes it to the
+    MCP along with the workflow source and input overrides.
 
-    The deployer config (podman-over-SSH targeting the
-    provisioned host) is generated from ticket data and
-    passed to the MCP or engine.
+    Requires the Arcaflow MCP to be configured with
+    workflow execution tools (workflow_execute,
+    workflow_execution_status).
 
     Args:
         workflow_source: Git repo URL or raw workflow file URL.
@@ -3786,8 +3786,6 @@ async def execute_arcaflow_workflow(
     Returns:
         JSON with run_id, status, output, and metrics.
     """
-    import asyncio as _asyncio
-
     await _ensure_init()
 
     run_uuid = uuid.uuid4().hex[:8]
@@ -3820,191 +3818,27 @@ async def execute_arcaflow_workflow(
 
     output_dir = create_artifact_dir(ticket_id, run_uuid)
 
-    # Direct engine execution (Option B).
-    # When the Arcaflow MCP adds workflow_execute, the
-    # benchmark agent's LLM will call it directly as an
-    # external MCP tool — no server.py change needed.
-    # The Arcaflow MCP does not yet have workflow_execute.
-    # Run the engine directly with the workflow source and
-    # deployer config.
-    import shutil
-
-    arcaflow_bin = shutil.which("arcaflow")
-    if not arcaflow_bin:
-        return json.dumps(
-            {
-                "status": "failed",
-                "run_id": run_id,
-                "error": (
-                    "arcaflow engine binary not found. "
-                    "The Arcaflow MCP does not yet support "
-                    "workflow_execute. Install the arcaflow "
-                    "engine binary for direct execution."
-                ),
-                "mcp_tools_needed": [
-                    "workflow_execute",
-                    "workflow_execution_status",
-                ],
-            }
-        )
-
-    # Clone/download the workflow source
-    workflow_dir = output_dir / "workflow"
-    workflow_dir.mkdir(parents=True, exist_ok=True)
-
-    if source["kind"] == "git":
-        proc = await _asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            source["location"],
-            str(workflow_dir),
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "run_id": run_id,
-                    "error": (f"Git clone failed: {stderr.decode()[:500]}"),
-                }
-            )
-    else:
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(source["location"])
-                r.raise_for_status()
-                wf_file = workflow_dir / "workflow.yaml"
-                wf_file.write_text(r.text)
-                if not workflow_name:
-                    workflow_name = "workflow"
-        except Exception as exc:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "run_id": run_id,
-                    "error": f"Workflow download failed: {exc}",
-                }
-            )
-
-    # Determine the workflow file path
-    wf_path = ""
-    if workflow_name:
-        for candidate_name in [
-            f"{workflow_name}.yaml",
-            workflow_name,
-            f"{workflow_name}.yml",
-        ]:
-            candidate = workflow_dir / candidate_name
-            if candidate.exists():
-                wf_path = str(candidate)
-                break
-    if not wf_path:
-        yamls = sorted(workflow_dir.glob("*.yaml"))
-        yamls = [y for y in yamls if y.name != "config.yaml"]
-        if yamls:
-            wf_path = str(yamls[0])
-
-    if not wf_path:
-        return json.dumps(
-            {
-                "status": "failed",
-                "run_id": run_id,
-                "error": "No workflow YAML found in source",
-            }
-        )
-
-    # Write deployer config
-    deployer_path = output_dir / "deployer-config.yaml"
-    try:
-        import yaml
-
-        deployer_path.write_text(yaml.dump(deployer, default_flow_style=False))
-    except ImportError:
-        deployer_path.write_text(json.dumps(deployer, indent=2))
-
-    # Write input overrides if provided
-    input_path = ""
-    if input_overrides:
-        input_file = output_dir / "input.yaml"
-        try:
-            import yaml as _yaml
-
-            input_file.write_text(_yaml.dump(input_overrides, default_flow_style=False))
-        except ImportError:
-            input_file.write_text(json.dumps(input_overrides, indent=2))
-        input_path = str(input_file)
-
-    # Build the arcaflow command
-    cmd = [
-        arcaflow_bin,
-        "--workflow",
-        wf_path,
-        "--config",
-        str(deployer_path),
-    ]
-    if input_path:
-        cmd.extend(["--input", input_path])
-
-    logger.info(
-        "[benchmark] Running arcaflow workflow: %s",
-        " ".join(cmd),
-    )
-
-    # Execute
-    proc = await _asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
-        cwd=str(workflow_dir),
-    )
-
-    try:
-        stdout, stderr = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout_seconds,
-        )
-    except _asyncio.TimeoutError:
-        proc.kill()
-        return json.dumps(
-            {
-                "status": "failed",
-                "run_id": run_id,
-                "error": (f"Workflow timed out after {timeout_seconds}s"),
-                "output_dir": str(output_dir),
-            }
-        )
-
-    stdout_text = stdout.decode(errors="replace")
-    stderr_text = stderr.decode(errors="replace")
-
-    # Save output
-    (output_dir / "stdout.log").write_text(stdout_text)
-    (output_dir / "stderr.log").write_text(stderr_text)
-
-    # Parse structured output if available
-    output_data: dict[str, Any] = {}
-    try:
-        output_data = json.loads(stdout_text)
-    except json.JSONDecodeError:
-        pass
-
+    # The Arcaflow MCP's workflow_execute tool handles
+    # engine lifecycle. The benchmark agent's LLM calls
+    # it directly as an external MCP tool. This server.py
+    # tool prepares the deployer config and delegates.
+    #
+    # Until workflow_execute is available on the MCP,
+    # return an error indicating the required tools.
     return json.dumps(
         {
-            "status": ("completed" if proc.returncode == 0 else "failed"),
-            "exit_code": proc.returncode,
+            "status": "pending",
             "run_id": run_id,
-            "harness": "arcaflow",
-            "workflow_source": workflow_source,
-            "workflow_name": workflow_name or wf_path,
+            "error": (
+                "Arcaflow MCP workflow execution tools "
+                "not yet available. The MCP needs "
+                "workflow_execute and "
+                "workflow_execution_status tools."
+            ),
+            "deployer_config": deployer,
+            "source": source,
+            "workflow_name": workflow_name,
             "output_dir": str(output_dir),
-            "output": (output_data if output_data else stdout_text[:2000]),
-            "error": (stderr_text[:1000] if proc.returncode != 0 else ""),
         }
     )
 
