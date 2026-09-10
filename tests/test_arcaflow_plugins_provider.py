@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -479,3 +480,113 @@ class TestLookupAliasing:
         provider = ArcaflowPluginSkillProvider(discover_schemas=False)
         provider._catalog = {"arcaflow-stressng": {"image": "test"}}
         assert provider._lookup("unknown") is None
+
+
+class TestMCPDiscovery:
+    """Test MCP-backed plugin discovery."""
+
+    @pytest.mark.asyncio
+    async def test_mcp_discovery_populates_catalog(self, tmp_path):
+        """When MCP returns plugins, they populate the catalog."""
+        from unittest.mock import AsyncMock
+
+        mcp_response = json.dumps(
+            {
+                "plugins": [
+                    {
+                        "name": "arcaflow-plugin-fio",
+                        "image": "quay.io/arcalot/arcaflow-plugin-fio",
+                        "version": "0.9.0",
+                        "description": "Storage I/O benchmark using fio.",
+                        "keywords": ["storage", "fio", "io"],
+                        "architectures": ["amd64", "arm64"],
+                        "category": "storage",
+                        "default_step": "workload",
+                        "steps": ["workload"],
+                    },
+                    {
+                        "name": "arcaflow-plugin-stressng",
+                        "image": "quay.io/arcalot/arcaflow-plugin-stressng",
+                        "version": "0.9.1",
+                        "description": "CPU and memory stress testing.",
+                        "keywords": ["stress", "cpu", "memory"],
+                        "architectures": ["amd64"],
+                        "category": "stress",
+                    },
+                ],
+                "total": 2,
+            }
+        )
+
+        mock_mcp = AsyncMock()
+        mock_mcp.call_tool = AsyncMock(return_value=mcp_response)
+
+        provider = ArcaflowPluginSkillProvider(
+            schema_cache_dir=tmp_path / "schema-cache",
+            discover_schemas=False,
+            mcp_client=mock_mcp,
+        )
+        benchmarks = await provider.list_benchmarks()
+
+        assert len(benchmarks) == 2
+        fio = next(b for b in benchmarks if "fio" in b.name)
+        assert fio.harness == "arcaflow-plugins"
+        assert fio.architectures == ["amd64", "arm64"]
+        assert fio.description == "Storage I/O benchmark using fio."
+
+        stressng = next(b for b in benchmarks if "stressng" in b.name)
+        assert stressng.architectures == ["amd64"]
+
+    @pytest.mark.asyncio
+    async def test_mcp_failure_falls_back_to_quay(self, tmp_path):
+        """When MCP fails, falls back to Quay/local discovery."""
+        from unittest.mock import AsyncMock
+
+        mock_mcp = AsyncMock()
+        mock_mcp.call_tool = AsyncMock(side_effect=Exception("MCP unavailable"))
+
+        provider = ArcaflowPluginSkillProvider(
+            schema_cache_dir=tmp_path / "schema-cache",
+            discover_schemas=False,
+            mcp_client=mock_mcp,
+        )
+        # Force local metadata fallback
+        provider._build_from_local_metadata()
+        benchmarks = await provider.list_benchmarks()
+
+        # Should have plugins from local metadata
+        assert len(benchmarks) > 0
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_uses_existing_discovery(self, tmp_path):
+        """Without MCP client, uses Quay/local discovery as before."""
+        provider = ArcaflowPluginSkillProvider(
+            schema_cache_dir=tmp_path / "schema-cache",
+            discover_schemas=False,
+            mcp_client=None,
+        )
+        provider._build_from_local_metadata()
+        benchmarks = await provider.list_benchmarks()
+        assert len(benchmarks) > 0
+        # No architectures from local metadata
+        for b in benchmarks:
+            assert b.architectures == []
+
+    @pytest.mark.asyncio
+    async def test_architectures_in_benchmark_suite(self):
+        """BenchmarkSuite includes architectures field."""
+        from providers.skills.base import BenchmarkSuite
+
+        suite = BenchmarkSuite(
+            name="fio",
+            description="test",
+            harness="arcaflow-plugins",
+            architectures=["amd64", "arm64"],
+        )
+        assert suite.architectures == ["amd64", "arm64"]
+
+        suite_empty = BenchmarkSuite(
+            name="fio",
+            description="test",
+        )
+        assert suite_empty.architectures == []
