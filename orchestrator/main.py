@@ -725,14 +725,20 @@ async def run_agent_task(
                         override_timeout = llm_override.get("timeout")
                         if override_timeout is not None:
                             try:
-                                override_llm.default_timeout = float(
-                                    override_timeout,
-                                )
+                                t = float(override_timeout)
+                                import math
+
+                                if math.isnan(t) or math.isinf(t) or t < 0:
+                                    raise ValueError(
+                                        f"timeout must be finite and"
+                                        f" non-negative, got {t}"
+                                    )
+                                override_llm.default_timeout = t
                                 logger.info(
                                     f"Timeout override for {ticket_id}:"
                                     f" {override_llm.default_timeout}s"
                                 )
-                            except (ValueError, TypeError):
+                            except (ValueError, TypeError, OverflowError):
                                 logger.warning(
                                     f"Invalid timeout override for"
                                     f" {ticket_id}: {override_timeout!r}"
