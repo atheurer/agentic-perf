@@ -157,7 +157,8 @@ For non-Crucible harnesses, retain the compatible procedure of using
    `validate_benchmark(controller, run_file, harness)`. For Crucible this performs
    the controller-side `crucible validate` checks without deploying or running
    anything. If it fails, correct the run-file and validate again; if the failure
-   cannot be resolved, request clarification. Save the returned `validation_id`.
+   cannot be resolved, request clarification. The result must contain
+   `valid: true`; save the returned `validation_id`.
 
 8. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.

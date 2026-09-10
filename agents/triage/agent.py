@@ -115,6 +115,16 @@ _LOCAL_TOOLS = [
                                 "type": "string",
                                 "description": "OS requirement (e.g. 'RHEL9')",
                             },
+                            "host": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": (
+                                    "Exact FQDN or IP of an existing host "
+                                    "the user named, copied VERBATIM "
+                                    "(case, domain suffixes). Omit for "
+                                    "hosts a provider will allocate."
+                                ),
+                            },
                         },
                         "required": ["roles"],
                     },
@@ -124,10 +134,15 @@ _LOCAL_TOOLS = [
                         "Always include a controller. A host can serve "
                         "multiple roles (e.g. controller + client). "
                         "Attach hardware specs the user requested to "
-                        "the relevant host entries. "
-                        "Example: [{roles: [controller], min_memory_gb: 16}, "
+                        "the relevant host entries. When the user names "
+                        "specific existing hosts, set 'host' to the "
+                        "exact FQDN or IP — never paraphrase, truncate, "
+                        "or resolve. "
+                        "Example: [{roles: [controller], host: "
+                        "'ctrl-01.lab.example.com'}, "
                         "{roles: [client], nic_speed: 25, os: 'RHEL9'}, "
-                        "{roles: [server], nic_speed: 25, os: 'RHEL9'}]"
+                        "{roles: [server], host: "
+                        "'node-42.lab.example.com'}]"
                     ),
                 },
                 "directives": {
@@ -610,6 +625,7 @@ class TriageAgent(AgentBase):
         _PROMOTABLE = (
             "image_version",
             "serial_capture",
+            "board_selector",
         )
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
@@ -736,22 +752,16 @@ class TriageAgent(AgentBase):
         if first_type == "resource" and first_params.get("required_hosts"):
             fields["required_hosts"] = first_params["required_hosts"]
 
-        # Clear the first step's scoped_context section so the
-        # agent relies on structured data instead of multi-iteration
-        # text.
-        agent_key_map = {
-            "resource": "resource",
-            "provision": "provision",
-            "benchmark": "benchmark",
-            "review": "review",
-        }
-        first_key = agent_key_map.get(first_type)
-        if (
-            first_key
-            and "scoped_context" in fields
-            and first_key in fields["scoped_context"]
-        ):
-            del fields["scoped_context"][first_key]
+        # Apply step 0's per-step scoped_context if provided,
+        # mirroring _apply_step_overrides for later steps.
+        # Do NOT clear ticket-level scoped_context for step 0 —
+        # it was written moments earlier by this same triage run
+        # and cannot be stale.  Clearing only applies to steps ≥ 1
+        # (multi-iteration text from prior runs).
+        if first_params.get("scoped_context"):
+            fields.setdefault("scoped_context", {}).update(
+                first_params["scoped_context"]
+            )
 
         # Fleet investigation: set up tracking state if
         # the triage agent detected a fleet request or the

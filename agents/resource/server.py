@@ -25,7 +25,11 @@ if _project_root not in sys.path:
 
 from fastmcp import FastMCP
 
-from agents.server_utils import build_secrets_provider, build_ssh_from_ticket
+from agents.server_utils import (
+    build_secrets_provider,
+    build_ssh_from_ticket,
+    get_board_selector,
+)
 from paths import get_default_ssh_key
 
 logger = logging.getLogger(__name__)
@@ -153,8 +157,7 @@ async def check_available_resources(
     # Code-enforce the directive's board_selector for
     # Jumpstarter. The LLM may use a wrong selector key.
     if provider == "jumpstarter":
-        directives = _ticket.get("custom_fields", {}).get("directives", {})
-        directive_selector = directives.get("board_selector", "")
+        directive_selector = get_board_selector(_ticket)
         if directive_selector:
             req = requirements or {}
             llm_selector = req.get("jumpstarter_selector", "")
@@ -263,8 +266,7 @@ async def reserve_resources(
     # Jumpstarter. The LLM may substitute a different
     # (broader) selector; the directive is authoritative.
     if provider == "jumpstarter":
-        directives = _ticket.get("custom_fields", {}).get("directives", {})
-        directive_selector = directives.get("board_selector", "")
+        directive_selector = get_board_selector(_ticket)
         if directive_selector:
             llm_selector = selection.get("jumpstarter_selector", "")
             if llm_selector != directive_selector:
@@ -457,3 +459,16 @@ async def get_registered_tools():
 
 if __name__ == "__main__":
     mcp.run()
+
+
+def _get_board_selector(ticket: dict) -> str:
+    """Get board_selector from directives or top-level custom_fields.
+
+    Triage may place board_selector in either location depending
+    on the model. Check directives first (authoritative), then
+    fall back to top-level custom_fields for model-agnostic
+    behavior.
+    """
+    cf = ticket.get("custom_fields", {})
+    directives = cf.get("directives", {})
+    return directives.get("board_selector", "") or cf.get("board_selector", "")

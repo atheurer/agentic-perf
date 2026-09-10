@@ -136,6 +136,19 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
             f"unique target(s) found (controller={controller})",
         )
 
+    named_hosts = [h["host"] for h in required_hosts if h.get("host")]
+    if named_hosts:
+        all_assigned = {controller} if controller else set()
+        all_assigned.update(targets)
+        missing = [h for h in named_hosts if h not in all_assigned]
+        if missing:
+            return (
+                False,
+                f"User-provided host identities not found in "
+                f"assigned_hardware_ips: {missing}. The resource "
+                f"agent must submit these exact strings verbatim.",
+            )
+
     return True, ""
 
 

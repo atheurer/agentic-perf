@@ -1445,8 +1445,8 @@ th.col-right { text-align: right; }
     <div class="chat-bar">
       <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
-      <span class="chat-cost" id="chat-cost"></span>
     </div>
+    <div class="chat-cost" id="chat-cost"></div>
   </div>
   <div id="app"></div>
 </div>
@@ -1622,7 +1622,8 @@ let artifactTimer = null;
 let pollPaused = false;
 let lastSeq = 0;
 let autoScroll = true;
-let renderedEvents = [];
+let maxRenderedSeq = 0;
+let renderedEventCount = 0;
 var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
@@ -2127,7 +2128,8 @@ async function renderDetail(ticketId) {
   try {
     const ticket = await api('/tickets/' + ticketId);
     lastSeq = 0;
-    renderedEvents = [];
+    maxRenderedSeq = 0;
+    renderedEventCount = 0;
     _lastResultHash = '';
     // Seed the trail from the ticket's authoritative
     // status_trail — the store appends on every transition.
@@ -2185,6 +2187,7 @@ async function renderDetail(ticketId) {
                 '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
               '</div>' +
+              '<div class="chat-cost" id="ticket-chat-cost"></div>' +
             '</div>' +
             renderDescription(ticket) +
             ownershipHtml +
@@ -2656,12 +2659,9 @@ function mountChart(containerId, chartData) {
         return cfg;
       });
 
-      // Destroy previous chart on this canvas to prevent leak
       var canvasId = canvas.id || canvas.getAttribute('data-chart-id') || ('chart-' + Math.random());
       canvas.setAttribute('data-chart-id', canvasId);
-      if (_chartInstances[canvasId]) {
-        _chartInstances[canvasId].destroy();
-      }
+      if (_chartInstances[canvasId]) { _chartInstances[canvasId].destroy(); }
       var chartInstance = new Chart(canvas, {
         type: panel.type || chartData.type || 'line',
         data: { labels: chartData.labels || [], datasets: datasets },
@@ -2714,11 +2714,14 @@ function mountChart(containerId, chartData) {
         },
       });
 
-      canvas.addEventListener('mouseleave', function() {
-        updateSyncCrosshair(null);
-      });
-
+      if (!canvas._cdmMouseleaveBound) {
+        canvas.addEventListener('mouseleave', function() {
+          updateSyncCrosshair(null);
+        });
+        canvas._cdmMouseleaveBound = true;
+      }
       _chartInstances[canvasId] = chartInstance;
+
       renderMatrix(matrixEl, panel, chartInstance, pi, panel.unit);
       window._cdmSyncGroups[syncGroupId].push({
         chart: chartInstance,
@@ -2758,7 +2761,6 @@ function mountChart(containerId, chartData) {
     return cfg;
   });
 
-  // Destroy previous chart on this canvas
   var cid = canvas.id || 'usage-chart';
   if (_chartInstances[cid]) { _chartInstances[cid].destroy(); }
   var chartInstance = new Chart(canvas, {
@@ -2813,10 +2815,14 @@ function mountChart(containerId, chartData) {
     },
   });
 
-  canvas.addEventListener('mouseleave', function() {
-    updateSyncCrosshair(null);
-  });
+  if (!canvas._cdmMouseleaveBound) {
+    canvas.addEventListener('mouseleave', function() {
+      updateSyncCrosshair(null);
+    });
+    canvas._cdmMouseleaveBound = true;
+  }
 
+  _chartInstances[cid] = chartInstance;
   renderMatrix(matrixEl, chartData, chartInstance, 0, chartData.unit);
   window._cdmSyncGroups[syncGroupId].push({
     chart: chartInstance,
@@ -2961,12 +2967,16 @@ async function pollEvents(ticketId) {
     // Proactive HITL: notify chat when ticket needs guidance
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
       var cf = ticket.custom_fields || {};
-      var gs = cf.guidance_summary;
+      var gs = cf.guidance_summary || (cf.introspection || {}).guidance_summary;
       if (gs && !document.getElementById('chat-guidance-' + ticketId)) {
         var guidanceMsg = '\ud83d\udd14 **' + ticketId + '** needs guidance\n\n';
         guidanceMsg += '**Agent:** ' + (gs.agent || '?') + '\n';
         guidanceMsg += '**Reason:** ' + (gs.reason || 'unknown') + '\n';
-        if (gs.details) guidanceMsg += '\n' + gs.details.substring(0, 300) + '\n';
+        if (gs.details) guidanceMsg += '\n' + gs.details + '\n';
+        if (gs.suggested_actions && gs.suggested_actions.length) {
+          guidanceMsg += '\n**Suggested actions:**\n';
+          gs.suggested_actions.forEach(function(a) { guidanceMsg += '- ' + a + '\n'; });
+        }
         if (gs.suggested_response) guidanceMsg += '\n**Suggestion:** ' + gs.suggested_response;
         var container = document.getElementById('ticket-chat-messages') || document.getElementById('chat-messages');
         if (container) {
@@ -3313,8 +3323,9 @@ function renderNewEvents(events) {
 
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
-    if (renderedEvents.indexOf(evt.seq) !== -1) continue;
-    renderedEvents.push(evt.seq);
+    if (evt.seq <= maxRenderedSeq) continue;
+    maxRenderedSeq = evt.seq;
+    renderedEventCount++;
     // Cap DOM nodes to prevent memory leak from accumulated
     // event elements. Remove oldest DOM children when over limit.
     // Tradeoff: oldest events become unviewable without a page
@@ -3331,7 +3342,7 @@ function renderNewEvents(events) {
   }
 
   var countEl = document.getElementById('event-count');
-  if (countEl) countEl.textContent = renderedEvents.length;
+  if (countEl) countEl.textContent = renderedEventCount;
 
   if (autoScroll) {
     container.scrollTop = container.scrollHeight;
@@ -3496,7 +3507,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml((data.details || '').substring(0, 300)) + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml(data.details || '') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -3563,7 +3574,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        if (display.length > 200) display = display.substring(0, 200) + '...';
+        if (display.length > 500) display = display.substring(0, 500) + '...';
         dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + escHtml(display) + '</div>';
       });
       dataHtml += '</div>';
@@ -3810,7 +3821,8 @@ function stopPolling() {
   }
   pollPaused = false;
   lastSeq = 0;
-  renderedEvents = [];
+  maxRenderedSeq = 0;
+  renderedEventCount = 0;
 
   // Destroy all chart instances to prevent memory leak
   for (var cid in _chartInstances) {
@@ -3891,12 +3903,22 @@ function appendChatMessage(containerId, role, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-function updateChatCost(usage) {
-  var el = document.getElementById('chat-cost');
-  if (el && usage) {
-    var tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0);
-    el.textContent = tokens > 0 ? tokens.toLocaleString() + ' tokens' : '';
-  }
+function updateChatCost(usage, elId) {
+  var el = document.getElementById(elId || 'chat-cost');
+  if (!el || !usage) return;
+  var calls = usage.llm_calls || 0;
+  if (calls === 0) { el.innerHTML = ''; return; }
+  var total = usage.total_tokens || 0;
+  var model = usage.model || '';
+  var cachePctStr = fmtCachePct(usage);
+  var parts = [];
+  if (model) parts.push('<span style="color:var(--text-muted)">' + escHtml(model) + '</span>');
+  parts.push('<span style="color:var(--cyan)">' + total.toLocaleString() + '</span> tokens');
+  if (cachePctStr) parts.push('<span style="color:var(--text-muted)">(' + cachePctStr + ')</span>');
+  parts.push('<span style="color:var(--green)">' + calls + '</span> calls');
+  var cost = usage.estimated_cost_usd || 0;
+  if (cost > 0) parts.push('<span style="color:var(--yellow)">' + fmtCost(cost) + '</span>');
+  el.innerHTML = parts.join(' &middot; ');
 }
 
 async function sendChatMessage() {
@@ -3926,13 +3948,23 @@ async function sendChatMessage() {
       appendChatMessage('chat-messages', 'assistant', data.response || '');
       updateChatCost(data.usage || {});
     } else {
-      appendChatMessage('chat-messages', 'system', 'Error: ' + r.status);
+      var errMsg = 'Something went wrong (HTTP ' + r.status + '). ';
+      if (r.status === 504 || r.status === 408) {
+        errMsg = 'The request timed out. Try a simpler question, or break your request into smaller steps.';
+      } else if (r.status === 503) {
+        errMsg = 'Chat agent is not available. Check that chat is enabled in the configuration.';
+      } else if (r.status === 401) {
+        errMsg = 'Authentication required. Please log in to use the chat.';
+      } else if (r.status === 429) {
+        errMsg = 'Rate limit reached. Please wait a moment and try again.';
+      }
+      appendChatMessage('chat-messages', 'system', errMsg);
     }
   } catch(e) {
     var container = document.getElementById('chat-messages');
     var thinking = container.querySelector('.chat-msg.system:last-child');
     if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
-    appendChatMessage('chat-messages', 'system', 'Connection error');
+    appendChatMessage('chat-messages', 'system', 'Connection error. The server may be restarting — try again in a moment.');
   }
   btn.disabled = false;
   input.focus();
@@ -3960,8 +3992,12 @@ async function sendTicketChatMessage() {
     if (r.ok) {
       var data = await r.json();
       appendChatMessage('ticket-chat-messages', 'assistant', data.response || '');
+      updateChatCost(data.usage || {}, 'ticket-chat-cost');
     } else {
-      appendChatMessage('ticket-chat-messages', 'system', 'Error: ' + r.status);
+      var tErr = r.status === 504 || r.status === 408
+        ? 'Request timed out. Try a simpler question.'
+        : 'Something went wrong (HTTP ' + r.status + ')';
+      appendChatMessage('ticket-chat-messages', 'system', tErr);
     }
   } catch(e) {
     var container = document.getElementById('ticket-chat-messages');

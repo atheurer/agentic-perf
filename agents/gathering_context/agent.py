@@ -151,6 +151,11 @@ class GatheringContextAgent(AgentBase):
         if not records:
             return False
 
+        # TODO(#702): Apply temporal confidence decay.
+        # Records older than 90 days should be advisory
+        # only (skip match, surface as context). Records
+        # 30-90 days old should reduce match confidence.
+        # Currently all ages are treated as full matches.
         matched = records[0]
         matched_id = matched.investigation_id
         logger.info(

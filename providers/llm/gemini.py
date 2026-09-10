@@ -19,6 +19,7 @@ from typing import Any
 
 from .base import (
     LLMProvider,
+    LLMRateLimitError,
     LLMResponse,
     LLMTimeoutError,
     ToolCall,
@@ -80,6 +81,10 @@ def _resolve_json_refs(obj: Any) -> Any:
 
 
 class GeminiLLMProvider(LLMProvider):
+    # Keep the direct-API behavior as the safe default for lightweight test
+    # doubles and instances created without running __init__.
+    _is_vertex: bool = False
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -110,8 +115,10 @@ class GeminiLLMProvider(LLMProvider):
                 project=project_id,
                 location=region,
             )
+            self._is_vertex = True
         else:
             self._client = genai.Client(api_key=api_key)
+            self._is_vertex = False
 
         self._model = model
 
@@ -137,29 +144,51 @@ class GeminiLLMProvider(LLMProvider):
                 types.AutomaticFunctionCallingConfig(disable=True)
             )
         if self.reasoning_effort is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_level=self.reasoning_effort,
-            )
+            if self._is_vertex:
+                # Vertex AI uses thinkingBudget (token count)
+                # instead of thinking_level (named levels).
+                _EFFORT_TO_BUDGET = {
+                    "minimal": 1024,
+                    "low": 2048,
+                    "medium": 8192,
+                    "high": 24576,
+                }
+                budget = _EFFORT_TO_BUDGET.get(self.reasoning_effort, 8192)
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinkingBudget=budget
+                )
+            else:
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=self.reasoning_effort,
+                )
 
         effective_timeout = self._resolve_timeout(timeout)
-        if effective_timeout == 0:
-            response = await self._client.aio.models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-            return self._parse_response(response, tool_call_names, model=self._model)
         try:
-            response = await asyncio.wait_for(
-                self._client.aio.models.generate_content(
+            if effective_timeout == 0:
+                response = await self._client.aio.models.generate_content(
                     model=self._model,
                     contents=contents,
                     config=types.GenerateContentConfig(**config_kwargs),
-                ),
-                timeout=effective_timeout,
-            )
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._client.aio.models.generate_content(
+                        model=self._model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    ),
+                    timeout=effective_timeout,
+                )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(effective_timeout, f"gemini/{self._model}") from None
+        except Exception as exc:
+            # Gemini SDK raises google.genai.errors.ClientError
+            # for 429 RESOURCE_EXHAUSTED. Catch broadly because
+            # the SDK may also raise ServerError or APIError
+            # for rate limits depending on the backend.
+            if getattr(exc, "code", None) == 429:
+                raise LLMRateLimitError(f"gemini/{self._model}") from exc
+            raise
         return self._parse_response(response, tool_call_names, model=self._model)
 
     @staticmethod

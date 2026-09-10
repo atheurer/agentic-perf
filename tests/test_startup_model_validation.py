@@ -275,3 +275,110 @@ class TestValidateModels:
         assert "default" in msg
         assert "benchmark" in msg
         assert "review" in msg
+
+
+class TestLLMFactoryAPIOverride:
+    """_make_llm_factory passes per-agent api override to _make_llm_provider."""
+
+    def test_agent_with_api_override(self):
+        from orchestrator.main import _make_llm_factory
+
+        config = _make_config(
+            provider="openai",
+            model="gpt-4o",
+            agent_models={
+                "triage": {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "api": "responses",
+                },
+            },
+        )
+        config.llm_api = "chat_completions"
+
+        calls = []
+
+        def capture_provider(*args, **kwargs):
+            calls.append(kwargs)
+            p = MagicMock()
+            p.default_timeout = 30.0
+            p.reasoning_effort = None
+            p.max_tokens = 4096
+            return p
+
+        with patch(
+            "orchestrator.main._make_llm_provider",
+            side_effect=capture_provider,
+        ):
+            factory = _make_llm_factory(config)
+            factory("triage")
+
+        assert len(calls) == 1
+        assert calls[0]["api"] == "responses"
+
+    def test_agent_without_api_override_uses_global(self):
+        from orchestrator.main import _make_llm_factory
+
+        config = _make_config(
+            provider="openai",
+            model="gpt-4o",
+        )
+        config.llm_api = "chat_completions"
+
+        real_get = config.get_agent_llm_config
+
+        def openai_aware_get(agent_type):
+            base = real_get(agent_type)
+            if base.get("provider") == "openai" and "api" not in base:
+                base["api"] = config.llm_api
+            return base
+
+        config.get_agent_llm_config = openai_aware_get
+
+        calls = []
+
+        def capture_provider(*args, **kwargs):
+            calls.append(kwargs)
+            p = MagicMock()
+            p.default_timeout = 30.0
+            p.reasoning_effort = None
+            p.max_tokens = 4096
+            return p
+
+        with patch(
+            "orchestrator.main._make_llm_provider",
+            side_effect=capture_provider,
+        ):
+            factory = _make_llm_factory(config)
+            factory("triage")
+
+        assert len(calls) == 1
+        assert calls[0]["api"] == "chat_completions"
+
+    def test_non_openai_provider_unaffected(self):
+        from orchestrator.main import _make_llm_factory
+
+        config = _make_config(
+            provider="anthropic",
+            model="claude-haiku-4-5",
+        )
+
+        calls = []
+
+        def capture_provider(*args, **kwargs):
+            calls.append(kwargs)
+            p = MagicMock()
+            p.default_timeout = 30.0
+            p.reasoning_effort = None
+            p.max_tokens = 4096
+            return p
+
+        with patch(
+            "orchestrator.main._make_llm_provider",
+            side_effect=capture_provider,
+        ):
+            factory = _make_llm_factory(config)
+            factory("triage")
+
+        assert len(calls) == 1
+        assert calls[0]["api"] == ""

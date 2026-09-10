@@ -252,6 +252,10 @@ a guardrail. Existing examples to follow:
 - Field ownership enforcement (`assigned_hardware_ips` is written
   by the resource agent and platform agent only — provisioning
   reads it but never writes it)
+- Host identity enforcement (when `required_hosts` entries carry
+  `host`, handoff validation requires each identity to appear
+  verbatim in `assigned_hardware_ips` — protects against
+  resource-agent substitution or normalization)
 
 ### Security Model & Current Limitations
 

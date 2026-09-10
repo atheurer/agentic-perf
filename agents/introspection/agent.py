@@ -951,7 +951,25 @@ class IntrospectionAgent:
             if author not in ("system", ""):
                 if not author.startswith("user"):
                     last_agent = author
-                    last_agent_message = c.get("body", "")[:500]
+                    last_agent_message = c.get("body", "")[:2000]
+                    break
+
+        # Fallback: if no agent comment found, check for
+        # system error messages (e.g., unhandled exceptions)
+        if not last_agent_message:
+            for c in reversed(comments):
+                author = c.get("author", "")
+                body = c.get("body", "")
+                if author == "system" and (
+                    "exception" in body.lower()
+                    or "error" in body.lower()
+                    or "failed" in body.lower()
+                    or "exhausted" in body.lower()
+                    or "quota" in body.lower()
+                    or "429" in body
+                ):
+                    last_agent = "system"
+                    last_agent_message = body[:2000]
                     break
 
         # Classify the reason
@@ -971,6 +989,14 @@ class IntrospectionAgent:
             reason = "build_failure"
         elif "no" in lower_msg and ("board" in lower_msg or "available" in lower_msg):
             reason = "resource_exhaustion"
+        elif (
+            "429" in lower_msg
+            or "rate limit" in lower_msg
+            or "resource_exhausted" in lower_msg
+            or "resource exhausted" in lower_msg
+            or "quota" in lower_msg
+        ):
+            reason = "rate_limit"
         elif "failed" in lower_msg or "error" in lower_msg:
             reason = "error"
         elif last_agent_message:
@@ -983,6 +1009,12 @@ class IntrospectionAgent:
                 "Retry — the LLM call may succeed on a second attempt",
                 "Increase llm.timeout in config if this recurs",
                 "Abort if the ticket is no longer needed",
+            ]
+        elif reason == "rate_limit":
+            suggested_actions = [
+                "Retry — the LLM provider rate limit should clear shortly",
+                "Check Vertex AI / provider quotas if this recurs",
+                "Consider switching to a lower-cost model for this agent",
             ]
         elif reason == "error":
             suggested_actions = [

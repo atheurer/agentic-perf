@@ -28,6 +28,13 @@ Pipeline fields must not be put inside `directives`. Triage writes derived
 same-named inferred directives; `image_version` and `serial_capture` may
 also be promoted from top-level custom fields for compatibility.
 
+### Structured host identities
+
+Each `required_hosts` entry may carry an optional `host` field — the exact
+FQDN or IP of a user-provided existing machine. Handoff validation enforces
+that every `host` identity appears verbatim in `assigned_hardware_ips`.
+Entries without `host` are provider-allocated and unconstrained.
+
 ## Submitting Directives
 
 ### Via API
@@ -214,11 +221,17 @@ Progress is tracked in `custom_fields.fleet_investigation`:
 Or describe it naturally — the triage agent will detect custom
 build requirements and set the directives.
 
+### Diagnostics (Jumpstarter)
+
+| Directive | Description | Examples |
+|---|---|---|
+| `serial_capture` | Capture serial output during provisioning and benchmark. During provisioning, serial output is saved to `platform-provision/serial-capture.log` in the ticket's artifact directory. On provisioning failure, the last 2000 characters are included in diagnostics. During benchmarks, enables passive serial capture alongside SSH-based reboots. | `true`, `false` |
+
 ### Boot-Time Specific
 
 | Directive | Description | Examples |
 |---|---|---|
-| `jumpstarter_serial` | Enable serial capture during boot test | `true`, `false` |
+| `jumpstarter_serial` | Enable *active* serial capture during boot-time measurement (replaces SSH-based reboot with serial-based). Mutually exclusive with passive `serial_capture` during benchmark. | `true`, `false` |
 | `ssh_password` | Override default SSH password | `password` |
 | `system_config` | Post-flash system configuration operations | See below |
 

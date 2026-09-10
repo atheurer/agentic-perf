@@ -6,6 +6,26 @@ optional — sensible defaults are used when a field is absent.
 The config path can be changed by setting the `AGENTIC_PERF_HOME`
 environment variable (defaults to `~/.agentic-perf`).
 
+### Live config updates
+
+The orchestrator re-reads `config.json` at each agent dispatch.
+Changes to the following fields take effect on the next dispatch
+without a restart:
+
+- `llm.*` (provider, model, backend, region, timeout, max_tokens,
+  reasoning_effort)
+- `agent_models.*` (per-agent LLM overrides)
+- `agent_iterations.*` and `global_max_iterations`
+- `agent_task_timeout`
+
+All other fields (poll_interval, skills/repo-cache, secrets/vault,
+telemetry, budget, max_concurrent_agents, introspection) require a
+restart.
+
+If `config.json` is malformed or unreadable at dispatch time, the
+orchestrator logs a warning and continues with the last successfully
+loaded configuration.
+
 ## Minimal Example
 
 ```json
@@ -168,11 +188,11 @@ only when you want a specific agent to use a different model.
 2. `llm.*` — global default
 
 Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
-and `max_tokens` keys. The `api` key is used when the override selects the
-`openai` provider. A per-agent `reasoning_effort` is probed at startup
-alongside the model; if the model does not support it, the log names the
-affected agent(s) and suggests removing `reasoning_effort` or switching
-models.
+and `max_tokens` keys. The `api` key is honored both at startup validation
+and at runtime when the override selects the `openai` provider. A per-agent
+`reasoning_effort` is probed at startup alongside the model; if the model
+does not support it, the log names the affected agent(s) and suggests
+removing `reasoning_effort` or switching models.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`
@@ -459,6 +479,65 @@ iteration is granted regardless of which guardrail fires first.
 guard fires normally. This is the primary safety net for
 unlimited-iteration agents that would otherwise hit the
 provider's hard context limit.
+
+---
+
+### `chat` — Chat Assistant
+
+The chat assistant provides a conversational interface in the
+dashboard for searching tickets, creating tests, sending
+interjections, and getting help.
+
+```json
+{
+    "chat": {
+        "enabled": true
+    }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enable the chat assistant in the dashboard |
+
+The chat agent's model is configured via `agent_models.chat`,
+using the same options available to all agents:
+
+```json
+{
+    "agent_models": {
+        "chat": {
+            "model": "<model-name>",
+            "max_tokens": 4096,
+            "timeout": 60
+        }
+    }
+}
+```
+
+If `agent_models.chat` is not specified, the chat agent uses
+the global `llm.model` default.
+
+**Recommendations:**
+
+- Use a model with reliable tool-use and structured output.
+  The chat agent constructs JSON tool calls, reads
+  documentation, and must follow field format rules
+  precisely. Smaller/cheaper models may produce malformed
+  tool inputs or skip documentation lookups. A mid-tier
+  model with low reasoning effort is recommended over a
+  small model — the cost per chat message is minimal
+  regardless.
+- Set `max_tokens` to 4096 or lower. Chat responses should
+  be concise.
+- Set `timeout` to 60s. Chat should feel responsive.
+
+Chat sessions are per-user and ephemeral (in-memory).
+All chat tool calls use the authenticated user's bearer
+token, so actions are scoped to the user's permissions.
+High-impact actions (ticket creation, ticket stop, user
+creation, token rotation) require explicit user confirmation
+enforced in code.
 
 ---
 
