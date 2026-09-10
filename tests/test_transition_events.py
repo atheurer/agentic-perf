@@ -146,20 +146,65 @@ async def test_no_event_without_event_bus() -> None:
     assert result["status"] == "awaiting_hardware"
 
 
-async def test_terminal_events_preserved_beyond_limit(
+async def test_terminal_events_via_accessor(
     event_bus: EventBus,
     tmp_path: Path,
 ) -> None:
-    """Terminal events are returned even when total events exceed the limit."""
+    """get_terminal_events returns terminal events regardless of window."""
     tid = "PERF-TERM"
     for i in range(250):
         event_bus.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
     event_bus.emit(tid, "test-agent", "agent_finished", {})
 
+    terminal = event_bus.get_terminal_events(tid)
+    assert len(terminal) == 1
+    assert terminal[0]["event_type"] == "agent_finished"
+
     events = event_bus.get_events(tid, since=0, limit=200)
-    event_types = [e.get("event_type") for e in events]
-    assert "agent_finished" in event_types
-    assert event_types.count("tool_called") == 200
+    assert len(events) == 200
+    assert all(e["event_type"] == "tool_called" for e in events)
+
+
+async def test_contiguous_window_no_cursor_skip(
+    event_bus: EventBus,
+) -> None:
+    """get_events returns a contiguous window — no seq gaps from terminals."""
+    tid = "PERF-CURSOR"
+    for i in range(250):
+        event_bus.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
+    event_bus.emit(tid, "test-agent", "agent_finished", {})
+
+    all_seqs = []
+    cursor = 0
+    while True:
+        page = event_bus.get_events(tid, since=cursor, limit=100)
+        if not page:
+            break
+        for e in page:
+            all_seqs.append(e["seq"])
+        cursor = page[-1]["seq"]
+
+    assert len(all_seqs) == 251
+    assert all_seqs == list(range(1, 252))
+
+
+async def test_terminal_events_file_backed_restart(
+    tmp_path: Path,
+) -> None:
+    """After restart, get_terminal_events finds events from the JSONL file."""
+    log_dir = tmp_path / "logs"
+    tid = "PERF-RESTART"
+
+    bus1 = EventBus(log_dir=log_dir)
+    for i in range(250):
+        bus1.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
+    bus1.emit(tid, "test-agent", "agent_finished", {"result": "ok"})
+
+    bus2 = EventBus(log_dir=log_dir)
+    terminal = bus2.get_terminal_events(tid)
+    assert len(terminal) == 1
+    assert terminal[0]["event_type"] == "agent_finished"
+    assert terminal[0]["data"]["result"] == "ok"
 
 
 async def test_terminal_events_not_duplicated_within_limit(
@@ -174,6 +219,78 @@ async def test_terminal_events_not_duplicated_within_limit(
     events = event_bus.get_events(tid, since=0, limit=200)
     finished = [e for e in events if e.get("event_type") == "agent_finished"]
     assert len(finished) == 1
+
+    terminal = event_bus.get_terminal_events(tid)
+    assert len(terminal) == 1
+
+
+async def test_terminal_events_mixed_disk_and_memory(
+    tmp_path: Path,
+) -> None:
+    """Terminal events from both file (pre-restart) and memory merge correctly."""
+    log_dir = tmp_path / "logs"
+    tid = "PERF-MIXED"
+
+    bus1 = EventBus(log_dir=log_dir)
+    for i in range(100):
+        bus1.emit(tid, "test-agent", "tool_called", {"tool": f"t{i}"})
+    bus1.emit(tid, "test-agent", "agent_error", {"error": "retryable"})
+
+    bus2 = EventBus(log_dir=log_dir)
+    for i in range(50):
+        bus2.emit(tid, "test-agent", "tool_called", {"tool": f"r{i}"})
+    bus2.emit(tid, "test-agent", "agent_finished", {"result": "done"})
+
+    terminal = bus2.get_terminal_events(tid)
+    assert len(terminal) == 2
+    types = [e["event_type"] for e in terminal]
+    assert types == ["agent_error", "agent_finished"]
+    assert terminal[0]["seq"] < terminal[1]["seq"]
+
+
+async def test_terminal_cache_invalidated_on_new_events(
+    tmp_path: Path,
+) -> None:
+    """Cache refreshes when new terminal events are appended after first read."""
+    log_dir = tmp_path / "logs"
+    tid = "PERF-CACHE"
+
+    bus = EventBus(log_dir=log_dir)
+    bus.emit(tid, "test-agent", "tool_called", {"tool": "t0"})
+    bus.emit(tid, "test-agent", "agent_error", {"error": "fail1"})
+
+    terminal = bus.get_terminal_events(tid)
+    assert len(terminal) == 1
+    assert terminal[0]["event_type"] == "agent_error"
+
+    bus.emit(tid, "test-agent", "tool_called", {"tool": "t1"})
+    bus.emit(tid, "test-agent", "agent_finished", {"result": "ok"})
+
+    terminal = bus.get_terminal_events(tid)
+    assert len(terminal) == 2
+    assert terminal[1]["event_type"] == "agent_finished"
+
+
+async def test_terminal_cache_cross_process_invalidation(
+    tmp_path: Path,
+) -> None:
+    """Separate EventBus (simulating state store) sees new terminals."""
+    log_dir = tmp_path / "logs"
+    tid = "PERF-XPROC"
+
+    bus1 = EventBus(log_dir=log_dir)
+    bus1.emit(tid, "test-agent", "agent_error", {"error": "fail1"})
+
+    bus2 = EventBus(log_dir=log_dir)
+    terminal = bus2.get_terminal_events(tid)
+    assert len(terminal) == 1
+
+    bus1.emit(tid, "test-agent", "agent_finished", {"result": "done"})
+
+    terminal = bus2.get_terminal_events(tid)
+    assert len(terminal) == 2
+    types = [e["event_type"] for e in terminal]
+    assert types == ["agent_error", "agent_finished"]
 
 
 async def test_store_no_double_emit_on_consecutive_transitions(
