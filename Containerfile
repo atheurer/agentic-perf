@@ -21,7 +21,28 @@
 #     ~/.config/jumpstarter/clients/
 #   Set LLM credentials via environment variables
 
-# ── Build stage ──────────────────────────────────
+# ── Arcaflow MCP build stage ─────────────────────
+ARG ARCAFLOW_MCP_REPO=https://github.com/arcalot/arcaflow-mcp.git
+ARG ARCAFLOW_MCP_REF=initial-development
+
+FROM golang:1.24-alpine3.20 AS arcaflow-mcp-builder
+
+ARG ARCAFLOW_MCP_REPO
+ARG ARCAFLOW_MCP_REF
+
+RUN apk --no-cache add git
+
+WORKDIR /build
+RUN git clone --depth 1 --branch "${ARCAFLOW_MCP_REF}" \
+    "${ARCAFLOW_MCP_REPO}" repo
+
+WORKDIR /build/repo/server
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo \
+    -ldflags="-w -s" \
+    -o /arcaflow-mcp \
+    ./cmd/arcaflow-mcp
+
+# ── Python build stage ──────────────────────────────────
 FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
@@ -97,6 +118,9 @@ RUN CAIB_VERSION="v0.2.0" && \
     curl -sSL "https://raw.githubusercontent.com/centos-automotive-suite/automotive-dev-operator/${CAIB_VERSION}/hack/install-caib.sh" \
     | bash -s -- "${CAIB_VERSION}" || \
     echo 'WARNING: CAIB install failed (custom image builds will be unavailable)'
+
+# Arcaflow MCP server binary (built in arcaflow-mcp-builder stage)
+COPY --from=arcaflow-mcp-builder /arcaflow-mcp /usr/local/bin/arcaflow-mcp
 
 # Runtime configuration
 ENV AGENTIC_PERF_HOME=/data/agentic-perf
