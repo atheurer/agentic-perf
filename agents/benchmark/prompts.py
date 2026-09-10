@@ -253,4 +253,9 @@ cannot resolve, call request_clarification instead of submitting an
 incomplete or failed result. The user can provide direction, correct
 a misunderstanding, or tell you to proceed anyway. Never assume the
 user wants you to skip something — ask.
+
+After answering a clarification, always follow up with a tool call —
+either `present_runfile_for_approval` to re-present the current runfile,
+or `submit_benchmark_result` if the work is complete. Never end your
+turn with only prose after a clarification exchange.
 """

@@ -433,6 +433,8 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
+            self._hitl_just_resumed = False
+            self._post_hitl_nudge_used = False
             while (
                 self.max_iterations == 0
                 or iteration < self.max_iterations
@@ -842,6 +844,29 @@ class AgentBase(ABC):
                         t.name.startswith("submit_") for t in (self.tools or [])
                     )
                     if has_submit_tool:
+                        if self._hitl_just_resumed and not self._post_hitl_nudge_used:
+                            self._post_hitl_nudge_used = True
+                            self._hitl_just_resumed = False
+                            messages.append(
+                                {"role": "assistant", "content": response.raw_content}
+                            )
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] You answered in prose"
+                                        " but did not call a tool. If"
+                                        " you have addressed the user's"
+                                        " question, call your submit"
+                                        " tool with the results or"
+                                        " take the appropriate next"
+                                        " action. Do not end your"
+                                        " turn without a tool call."
+                                    ),
+                                }
+                            )
+                            continue
+                        self._hitl_just_resumed = False
                         summary = (
                             response.text[:500]
                             if response.text
@@ -875,9 +900,15 @@ class AgentBase(ABC):
                                 ),
                             }
                         )
+                        self._hitl_just_resumed = True
+                        self._post_hitl_nudge_used = False
                         continue
                     await self._handle_completion(ticket_id, response)
                     break
+
+                # LLM responded with tool calls — HITL nudge
+                # context is consumed regardless of tool type.
+                self._hitl_just_resumed = False
 
                 submit_call = next(
                     (tc for tc in response.tool_calls if tc.name.startswith("submit_")),
@@ -2003,6 +2034,8 @@ class AgentBase(ABC):
                     if handled is not None:
                         return handled
 
+                self._hitl_just_resumed = True
+                self._post_hitl_nudge_used = False
                 return reply
 
         logger.warning(f"[{self.agent_name}] HITL timeout on {ticket_id}")
@@ -2076,6 +2109,8 @@ class AgentBase(ABC):
                         if handled is not None:
                             return handled
                     self._hitl_timeout_count = 0
+                    self._hitl_just_resumed = True
+                    self._post_hitl_nudge_used = False
                     return reply
 
             # Second timeout — fall through to the permanent-pause path below
