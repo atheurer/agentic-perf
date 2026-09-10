@@ -86,8 +86,14 @@ on the agent home and do not spill secrets deliberately.
 
 `generate_chart_from_workspace` selects a registered adapter (currently generic
 JSON/metrics, CDM, and kube-burner adapters where their inputs match) and
-returns a `ChartSpec`. The dashboard consumes the spec rather than arbitrary
-HTML or JavaScript.
+stores a validated `ChartSpec`. Its optional `jq_filter` is applied to the
+source workspace JSON before adapter selection. Invalid, unavailable, timed
+out, multi-value, and null filters fail without creating a chart artifact.
+
+The tool returns compact control-plane metadata (`chart_ref`, label, dataset,
+and panel counts, plus a summary). The complete chart data remains only in the
+referenced artifact until review submission loads it for the dashboard. The
+dashboard consumes the spec rather than arbitrary HTML or JavaScript.
 
 ```json
 {
@@ -111,3 +117,7 @@ To add an adapter, implement `BaseChartAdapter.can_handle()` and
 `build_chart()`, register it in the chart registry, and add focused tests for
 input detection, units, labels, empty data, and malformed data. Do not claim a
 new adapter is available until it is registered.
+
+Generated charts must contain labels and at least one dataset with non-empty
+values aligned to those labels. Review submissions that provide `chart_ref`
+validate the referenced artifact before completing.

@@ -8,7 +8,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
 from .prompts import REVIEW_SYSTEM_PROMPT
@@ -207,6 +207,25 @@ class ReviewAgent(AgentBase):
             "the user explicitly says 'done' or 'submit the review'. Only "
             "then will submit_review_result be accepted. Call "
             "request_clarification now with your current findings."
+        )
+
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        chart_ref = submit_call.input.get("chart_ref")
+        if not chart_ref:
+            return None
+
+        from providers.workspace.manager import WorkspaceManager
+
+        manager = WorkspaceManager(ticket_id=ticket_id, agent_name=self.agent_name)
+        chart = manager.read_chart(str(chart_ref))
+        if chart.get("status") == "ok":
+            return None
+        return (
+            f"REJECTED: chart_ref '{chart_ref}' is not a usable chart: "
+            f"{chart.get('error', 'unknown chart error')}. Regenerate the chart "
+            "and submit its returned chart_ref."
         )
 
     async def run(self, ticket_id: str) -> None:
@@ -506,20 +525,17 @@ class ReviewAgent(AgentBase):
         }
         if result.get("chart_ref"):
             chart_ref = result["chart_ref"]
-            fields["chart_ref"] = chart_ref
-            try:
-                from providers.workspace.manager import WorkspaceManager
+            from providers.workspace.manager import WorkspaceManager
 
-                mgr = WorkspaceManager(ticket_id=ticket_id)
-                chart_path = mgr.resolve_path(chart_ref)
-                if chart_path.exists():
-                    fields["chart_data"] = json.loads(
-                        chart_path.read_text(encoding="utf-8")
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[{self.agent_name}] Failed to load chart from {chart_ref}: {e}"
+            mgr = WorkspaceManager(ticket_id=ticket_id, agent_name=self.agent_name)
+            chart = mgr.read_chart(chart_ref)
+            if chart.get("status") != "ok":
+                raise ValueError(
+                    f"chart_ref '{chart_ref}' became invalid after validation: "
+                    f"{chart.get('error', 'unknown chart error')}"
                 )
+            fields["chart_ref"] = chart_ref
+            fields["chart_data"] = chart["chart_data"]
         elif result.get("chart_data"):
             fields["chart_data"] = result["chart_data"]
         if result.get("results_url"):

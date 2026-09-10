@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+import subprocess
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from providers.llm.base import ToolCall
 from providers.workspace.charts import (
     CdmChartAdapter,
     ChartDataset,
@@ -14,6 +16,24 @@ from providers.workspace.charts import (
     KubeBurnerChartAdapter,
 )
 from providers.workspace.manager import WorkspaceManager
+
+
+def _cdm_metric(series_count: int, point_count: int = 100) -> dict:
+    return {
+        "usedBreakouts": ["engine-id"],
+        "remainingBreakouts": [],
+        "values": {
+            f"<{series + 1}>": [
+                {
+                    "begin": 1_000_000 + point * 3_000,
+                    "end": 1_003_000 + point * 3_000,
+                    "value": float(series * 1_000 + point),
+                }
+                for point in range(point_count)
+            ]
+            for series in range(series_count)
+        },
+    }
 
 
 class TestChartModels:
@@ -290,8 +310,122 @@ class TestWorkspaceManagerGenerateChart:
             unit="IOPS",
         )
         assert res["status"] == "ok"
-        assert res["chart_data"]["labels"] == ["4k", "64k"]
-        assert res["chart_data"]["datasets"][0]["values"] == [120000.0, 45000.0]
+        assert res["labels"] == 2
+        assert res["datasets"] == 1
+        assert "chart_data" not in res
+        chart = mgr.read_chart(res["chart_ref"])
+        assert chart["status"] == "ok"
+        assert chart["chart_data"]["labels"] == ["4k", "64k"]
+        assert chart["chart_data"]["datasets"][0]["values"] == [
+            120000.0,
+            45000.0,
+        ]
+
+    @pytest.mark.parametrize(
+        "jq_filter",
+        [".[", ".missing", ".[]"],
+    )
+    def test_filter_errors_do_not_create_chart(self, tmp_path, jq_filter):
+        mgr = WorkspaceManager(ticket_id="PERF-CHART-ERROR", workspace_dir=tmp_path)
+        mgr.save_file("source.json", json.dumps({"first": [1], "second": [2]}))
+
+        res = mgr.generate_chart(
+            file_ref="workspace://source.json",
+            jq_filter=jq_filter,
+            output_name="must_not_exist",
+        )
+
+        assert res["status"] == "error"
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
+
+    def test_missing_jq_does_not_create_chart(self, tmp_path, monkeypatch):
+        mgr = WorkspaceManager(ticket_id="PERF-CHART-NOJQ", workspace_dir=tmp_path)
+        mgr.save_file("source.json", json.dumps({"results": [{"value": 1}]}))
+        monkeypatch.setattr("providers.workspace.manager.shutil.which", lambda _: None)
+
+        res = mgr.generate_chart(
+            file_ref="workspace://source.json",
+            jq_filter=".results",
+            output_name="must_not_exist",
+        )
+
+        assert res["status"] == "error"
+        assert "jq executable is required" in res["error"]
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
+
+    def test_jq_timeout_does_not_create_chart(self, tmp_path):
+        mgr = WorkspaceManager(ticket_id="PERF-CHART-TIMEOUT", workspace_dir=tmp_path)
+        mgr.save_file("source.json", json.dumps({"results": [{"value": 1}]}))
+
+        with patch(
+            "providers.workspace.manager.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("jq", 5),
+        ):
+            res = mgr.generate_chart(
+                file_ref="workspace://source.json",
+                jq_filter=".results",
+                output_name="must_not_exist",
+            )
+
+        assert res["status"] == "error"
+        assert "timed out" in res["error"]
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
+
+    def test_empty_filtered_shape_does_not_create_chart(self, tmp_path):
+        mgr = WorkspaceManager(ticket_id="PERF-CHART-SHAPE", workspace_dir=tmp_path)
+        mgr.save_file(
+            "source.json", json.dumps({"uperf_s1": _cdm_metric(series_count=8)})
+        )
+
+        res = mgr.generate_chart(
+            file_ref="workspace://source.json",
+            harness="crucible",
+            jq_filter=".uperf_s1.values",
+            output_name="must_not_exist",
+        )
+
+        assert res["status"] == "error"
+        assert "at least one label" in res["error"]
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
+
+    def test_unmatched_metric_does_not_fall_back_to_all_data(self, tmp_path):
+        mgr = WorkspaceManager(ticket_id="PERF-CHART-METRIC", workspace_dir=tmp_path)
+        mgr.save_file(
+            "source.json", json.dumps({"uperf_s1": _cdm_metric(series_count=8)})
+        )
+
+        res = mgr.generate_chart(
+            file_ref="workspace://source.json",
+            metric="mpstat",
+            output_name="must_not_exist",
+        )
+
+        assert res["status"] == "error"
+        assert "did not match a CDM subquery" in res["error"]
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
+
+    def test_alternate_source_is_not_visible_to_chart_generation(self, tmp_path):
+        mgr = WorkspaceManager(
+            ticket_id="PERF-CHART-VISIBILITY",
+            workspace_dir=tmp_path,
+            agent_name="review-agent",
+        )
+        snapshot = mgr.save_source_snapshot(
+            "github",
+            {"repository": "example/bench"},
+            {"metrics.json": json.dumps([{"name": "one", "value": 1}])},
+        )
+
+        res = mgr.generate_chart(
+            file_ref=snapshot["files"]["metrics.json"],
+            x_field="name",
+            y_field="value",
+            output_name="must_not_exist",
+        )
+
+        assert res["status"] == "error"
+        assert "not visible" in res["error"]
+        assert not (tmp_path / "charts" / "must_not_exist.json").exists()
 
     def test_chart_spec_with_panels(self):
         from providers.workspace.charts.models import (
@@ -321,42 +455,74 @@ class TestWorkspaceManagerGenerateChart:
         assert d["panels"][1]["unit"] == "%"
 
 
+@pytest.mark.parametrize(
+    ("jq_filter", "dataset_count"),
+    [(".uperf_s1", 8), (".srv_cpu16", 1)],
+)
 @pytest.mark.asyncio
-async def test_agent_base_registers_and_executes_generate_chart(tmp_path):
-    from unittest.mock import patch
-
+async def test_agent_base_executes_filtered_chart_without_spilling(
+    tmp_path, jq_filter, dataset_count
+):
     from agents.review.agent import ReviewAgent
 
     llm = MagicMock()
-    agent = ReviewAgent(llm_provider=llm, state_store_url="http://localhost:8080")
+    agent = ReviewAgent(
+        llm_provider=llm,
+        state_store_url="http://localhost:8080",
+        tool_spill_threshold=1,
+    )
     agent._current_ticket_id = "PERF-T1"
+    agent._tool_min_interval = 0
 
     mgr = WorkspaceManager(ticket_id="PERF-T1", workspace_dir=tmp_path)
-    metric_file = tmp_path / "test_metric.json"
-    metric_file.write_text(
+    mgr.save_file(
+        "test_metric.json",
         json.dumps(
             {
-                "usedBreakouts": ["engine-id"],
-                "values": {
-                    "<1>": [{"begin": 1000, "value": 24.5}],
-                },
+                "uperf_s1": _cdm_metric(series_count=8),
+                "srv_cpu16": _cdm_metric(series_count=1),
             }
-        )
+        ),
     )
 
     assert "generate_chart_from_workspace" in agent._tool_handlers
 
-    with patch("providers.workspace.manager.WorkspaceManager", return_value=mgr):
-        raw_res = await agent._tool_handlers["generate_chart_from_workspace"](
-            file_ref="workspace://test_metric.json",
-            title="Test Chart",
-            harness="crucible",
-            output_name="test_chart",
+    generate_chart = MagicMock(wraps=mgr.generate_chart)
+    with (
+        patch("providers.workspace.manager.WorkspaceManager", return_value=mgr),
+        patch.object(mgr, "generate_chart", generate_chart),
+    ):
+        tool_res = await agent._execute_tool(
+            ToolCall(
+                id="chart-call",
+                name="generate_chart_from_workspace",
+                input={
+                    "file_ref": "workspace://test_metric.json",
+                    "title": "Test Chart",
+                    "chart_type": "line",
+                    "harness": "crucible",
+                    "output_name": f"test_chart_{dataset_count}",
+                    "max_points": 100,
+                    "jq_filter": jq_filter,
+                },
+            )
         )
-        res = json.loads(raw_res)
-        assert res["status"] == "ok"
-        assert res["chart_ref"] == "workspace://charts/test_chart.json"
-        assert (tmp_path / "charts" / "test_chart.json").exists()
+
+    assert not tool_res.is_error
+    res = json.loads(tool_res.content)
+    assert res["status"] == "ok"
+    assert res["chart_ref"] == (f"workspace://charts/test_chart_{dataset_count}.json")
+    assert res["labels"] == 100
+    assert res["datasets"] == dataset_count
+    assert "chart_data" not in res
+    assert generate_chart.call_args.kwargs["jq_filter"] == jq_filter
+
+    saved = json.loads(
+        (tmp_path / "charts" / f"test_chart_{dataset_count}.json").read_text()
+    )
+    assert len(saved["labels"]) == 100
+    assert len(saved["datasets"]) == dataset_count
+    assert all(len(dataset["values"]) == 100 for dataset in saved["datasets"])
 
 
 @pytest.mark.asyncio
@@ -413,3 +579,30 @@ async def test_review_agent_handles_chart_ref(tmp_path):
     assert called_fields["chart_ref"] == "workspace://charts/cpu_chart.json"
     assert called_fields["chart_data"]["title"] == "CPU Utilization"
     assert called_fields["chart_data"]["datasets"][0]["values"] == [10.0, 95.0]
+
+
+@pytest.mark.asyncio
+async def test_review_agent_rejects_invalid_chart_ref(tmp_path):
+    from agents.review.agent import ReviewAgent
+
+    mgr = WorkspaceManager(ticket_id="PERF-REVIEW2", workspace_dir=tmp_path)
+    mgr.save_file(
+        "charts/empty.json",
+        json.dumps({"title": "Empty", "type": "line", "labels": [], "datasets": []}),
+    )
+    agent = MagicMock(spec=ReviewAgent)
+    agent.agent_name = "review-agent"
+    submit_call = ToolCall(
+        id="submit-call",
+        name="submit_review_result",
+        input={"chart_ref": "workspace://charts/empty.json"},
+    )
+
+    with patch("providers.workspace.manager.WorkspaceManager", return_value=mgr):
+        rejection = await ReviewAgent._validate_submit_call(
+            agent, "PERF-REVIEW2", submit_call
+        )
+
+    assert rejection is not None
+    assert rejection.startswith("REJECTED:")
+    assert "at least one label" in rejection

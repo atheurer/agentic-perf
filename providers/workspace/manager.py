@@ -9,12 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from paths import get_ticket_workspace_dir
+from providers.workspace.charts.models import ChartValidationError, validate_chart_spec
 
 logger = logging.getLogger(__name__)
 
 
 class WorkspaceSecurityError(ValueError):
     """Raised when a workspace file reference attempts path traversal."""
+
+
+class ChartGenerationError(ValueError):
+    """Raised when chart source data cannot be transformed safely."""
 
 
 class WorkspaceManager:
@@ -983,6 +988,96 @@ class WorkspaceManager:
             "head_preview": lines[:3],
         }
 
+    @staticmethod
+    def _filter_chart_json(raw_text: str, jq_filter: str) -> Any:
+        jq_bin = shutil.which("jq")
+        if not jq_bin:
+            raise ChartGenerationError(
+                "jq executable is required when jq_filter is provided"
+            )
+        try:
+            proc = subprocess.run(
+                [jq_bin, "-c", jq_filter],
+                input=raw_text,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ChartGenerationError("jq filter timed out after 5s") from exc
+        except OSError as exc:
+            raise ChartGenerationError(f"failed to execute jq: {exc}") from exc
+
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or "unknown jq error"
+            raise ChartGenerationError(
+                f"jq filter failed with exit {proc.returncode}: {detail}"
+            )
+
+        outputs = [line for line in proc.stdout.splitlines() if line.strip()]
+        if len(outputs) != 1:
+            raise ChartGenerationError(
+                "jq_filter must produce exactly one JSON value; "
+                f"received {len(outputs)}"
+            )
+        try:
+            data = json.loads(outputs[0])
+        except json.JSONDecodeError as exc:
+            raise ChartGenerationError(
+                f"jq_filter produced invalid JSON: {exc}"
+            ) from exc
+        if data is None:
+            raise ChartGenerationError("jq_filter returned null")
+        return data
+
+    def _load_chart_source(
+        self,
+        path: Path,
+        file_ref: str,
+        jq_filter: str | None,
+    ) -> Any:
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+        suffix = path.suffix.lower()
+        if jq_filter:
+            if suffix == ".csv":
+                raise ChartGenerationError("jq_filter cannot be applied to CSV input")
+            return self._filter_chart_json(raw_text, jq_filter)
+        if suffix == ".csv":
+            return raw_text
+        if suffix == ".json":
+            try:
+                return json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise ChartGenerationError(
+                    f"failed to parse JSON chart source {file_ref}: {exc}"
+                ) from exc
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            return raw_text
+
+    def read_chart(self, file_ref: str) -> dict[str, Any]:
+        """Load and validate a generated chart artifact."""
+        try:
+            self._check_visible(file_ref, include_alternates=False)
+            path = self.resolve_path(file_ref)
+            if not path.is_file():
+                raise ChartGenerationError(f"chart file not found: {file_ref}")
+            chart_data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(chart_data, dict):
+                raise ChartGenerationError("chart artifact must contain a JSON object")
+
+            validate_chart_spec(chart_data)
+        except (
+            ChartGenerationError,
+            ChartValidationError,
+            WorkspaceSecurityError,
+            json.JSONDecodeError,
+            OSError,
+        ) as exc:
+            return {"status": "error", "error": str(exc), "chart_ref": file_ref}
+        return {"status": "ok", "chart_ref": file_ref, "chart_data": chart_data}
+
     def generate_chart(
         self,
         file_ref: str,
@@ -1002,63 +1097,47 @@ class WorkspaceManager:
     ) -> dict[str, Any]:
         """Generate a declarative Chart.js/Recharts specification from a workspace file and save it to workspace://charts/.
 
-        Returns a dictionary containing the chart spec, file_ref, and preview metadata.
+        Returns compact metadata that references the validated saved chart.
         """
-        path = self.resolve_path(file_ref)
-        if not path.exists():
+        try:
+            self._check_visible(file_ref, include_alternates=False)
+            path = self.resolve_path(file_ref)
+        except WorkspaceSecurityError as exc:
+            return {"status": "error", "error": str(exc)}
+        if not path.is_file():
             return {
                 "status": "error",
                 "error": f"File '{file_ref}' does not exist in workspace",
             }
 
-        raw_text = path.read_text(encoding="utf-8", errors="replace")
-        data: Any = None
-        if path.suffix.lower() == ".json":
-            try:
-                if jq_filter and shutil.which("jq"):
-                    proc = subprocess.run(
-                        ["jq", "-c", jq_filter],
-                        input=raw_text.encode("utf-8"),
-                        capture_output=True,
-                        timeout=5,
-                    )
-                    if proc.returncode == 0:
-                        data = json.loads(proc.stdout.decode("utf-8"))
-                    else:
-                        data = json.loads(raw_text)
-                else:
-                    data = json.loads(raw_text)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to parse JSON for chart generation from {file_ref}: {e}"
-                )
-                data = raw_text
-        elif path.suffix.lower() == ".csv":
-            data = raw_text
-        else:
-            try:
-                data = json.loads(raw_text)
-            except Exception:
-                data = raw_text
+        try:
+            data = self._load_chart_source(path, file_ref, jq_filter)
+        except (ChartGenerationError, OSError) as exc:
+            return {"status": "error", "error": str(exc)}
 
         from providers.workspace.charts import get_chart_registry
 
         registry = get_chart_registry()
-        spec = registry.generate_chart_spec(
-            data,
-            harness=harness,
-            title=title,
-            chart_type=chart_type,
-            x_field=x_field,
-            y_field=y_field,
-            group_by=group_by,
-            metric=metric,
-            metrics=metrics,
-            breakout=breakout,
-            unit=unit,
-            max_points=max_points,
-            source_file=file_ref,
-        )
+        try:
+            spec = registry.generate_chart_spec(
+                data,
+                harness=harness,
+                title=title,
+                chart_type=chart_type,
+                x_field=x_field,
+                y_field=y_field,
+                group_by=group_by,
+                metric=metric,
+                metrics=metrics,
+                breakout=breakout,
+                unit=unit,
+                max_points=max_points,
+                source_file=file_ref,
+            )
+
+            validate_chart_spec(spec)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
 
         if not output_name:
             safe_title = re.sub(r"[^a-zA-Z0-9_]+", "_", title.lower()).strip("_")
@@ -1074,6 +1153,8 @@ class WorkspaceManager:
         return {
             "status": "ok",
             "chart_ref": chart_ref,
-            "chart_data": spec_dict,
+            "labels": len(spec.labels),
+            "datasets": len(spec.datasets),
+            "panels": len(spec.panels),
             "summary": f"Generated {spec.type} chart '{spec.title}' with {len(spec.labels)} labels and {len(spec.datasets)} datasets.",
         }
