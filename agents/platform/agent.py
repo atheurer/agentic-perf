@@ -59,13 +59,12 @@ class PlatformAgent(AgentBase):
 
         platform_server = str(Path(__file__).with_name("server.py"))
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             platform_server,
             name="platform",
-            env={
-                "TICKET_ID": ticket_id,
-                "STATE_STORE_URL": self.store_url,
-            },
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
 
         self._mcp = mcp

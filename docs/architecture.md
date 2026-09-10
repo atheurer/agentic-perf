@@ -1223,7 +1223,6 @@ skills/
     cdm-query-guide.md     # How to query the CommonDataModel for results
     kube-endpoints.md       # Kubernetes endpoint configuration
     run-file-pitfalls.md    # Common run-file mistakes and solutions
-    uperf-run-file.md       # Uperf-specific run-file guide
     userenv-guide.md        # User environment selection
   zathras/
     local-config-guide.md   # Local execution configuration

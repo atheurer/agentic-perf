@@ -245,8 +245,20 @@ class GatheringContextAgent(AgentBase):
         ir_server = str(Path(__file__).parent.parent / "investigation" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(gc_server, name="gathering-context")
-        await mcp.connect(ir_server, name="investigation-records")
+        await mcp.connect_ticket_server(
+            gc_server,
+            name="gathering-context",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
+        await mcp.connect_ticket_server(
+            ir_server,
+            name="investigation-records",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Connect any configured external MCP servers
         # (e.g., domain knowledge, historical data).

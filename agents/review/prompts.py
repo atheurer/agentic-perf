@@ -68,8 +68,16 @@ on where results are stored and how to access them. Different harnesses store re
 differently — some use APIs, others store files on disk. The review config tells you
 which approach to use.
 
-If harness documentation is available (listed in the ticket context), use
-read_harness_doc to learn about result formats and interpretation.
+For Crucible, first use `get_crucible_benchmark_context(operation="bootstrap")`
+and read the returned `AGENTS.md`, following its documentation pointers
+iteratively. When it identifies the `subprojects/benchmarks/` layout, use the
+known benchmark name to read `subprojects/benchmarks/<benchmark>/AGENTS.md`,
+README/CLAUDE, and result-related metadata at controller-relative paths. If a
+needed document is not identified, use `operation="search"` to discover
+controller-relative candidate paths, then read selected paths separately. Do not
+ask the gateway to interpret repository metadata,
+assume a fixed hierarchy, or bypass it through a repository-cache path. For other harnesses,
+`list_harness_docs`/`read_harness_doc` remain compatible.
 
 ## Step 3: Retrieve Results
 
@@ -91,8 +99,9 @@ specific files — it auto-decompresses .xz files and defaults to 4000 bytes.
 Request more if needed.
 
 **Always read the harness skill file** (via `read_skills`) before deciding
-how to retrieve results. The skill file will tell you where results are
-stored for that harness.
+how to retrieve results. For Crucible, use the gateway for source documentation
+and use the controller/artifact tools for run evidence. The skill file remains
+available as a compatibility overlay and does not override phase-effective source.
 
 **DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results
 directory **exactly once** at the beginning of the review phase. Once located,
@@ -108,10 +117,10 @@ The review config will tell you when these are applicable.
 When tools return large outputs (> 4 KB by default, configurable via `custom_fields.tool_spill_threshold`), they are automatically saved into your ticket workspace as files (e.g. `workspace://cdm_api_requests_1.json`).
 
 - **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`) to receive the exact filtered slice immediately in the same turn without multi-step querying.
-- **JSON files**: Use `jq_query` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
-- **Text & Log files**: Use `read_file_slice` to paginate. The response provides `next_start_line` and `next_offset_bytes`. To read the next chunk without re-reading previous lines, simply pass `start_line=next_start_line` or `offset_bytes=next_offset_bytes`.
-- **Searching**: Use `grep_file` to jump directly to errors, drops, or specific pattern matches in large log files.
-- **Listing**: Use `list_workspace_files` to see all saved files in the ticket workspace.
+- **JSON files**: Use `jq_file_from_workspace` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
+- **Text & Log files**: Use `read_file_from_workspace` to paginate. The response provides `next_start_line` and `next_offset_bytes`. To read the next chunk without re-reading previous lines, simply pass `start_line=next_start_line` or `offset_bytes=next_offset_bytes`.
+- **Searching**: Use `grep_file_from_workspace` to jump directly to errors, drops, or specific pattern matches in large log files.
+- **Listing**: Use `list_files_from_workspace` to see all saved files in the ticket workspace.
 
 ## Step 4: Analysis
 

@@ -139,10 +139,23 @@ class AgentBase(ABC):
         def _get_manager():
             from providers.workspace.manager import WorkspaceManager
 
-            return WorkspaceManager(ticket_id=self._current_ticket_id)
+            return WorkspaceManager(
+                ticket_id=self._current_ticket_id,
+                agent_name=self.agent_name,
+            )
 
-        async def _jq_query(file_ref: str, filter: str, limit: int = 50) -> str:
-            res = _get_manager().jq_query(file_ref, filter, limit=limit)
+        async def _jq_query(
+            file_ref: str,
+            filter: str,
+            limit: int = 50,
+            include_alternates: bool = False,
+        ) -> str:
+            res = _get_manager().jq_query(
+                file_ref,
+                filter,
+                limit=limit,
+                include_alternates=include_alternates,
+            )
             return json.dumps(res, indent=2)
 
         async def _grep_file(
@@ -151,6 +164,7 @@ class AgentBase(ABC):
             max_lines: int = 50,
             context_lines: int = 0,
             case_insensitive: bool = True,
+            include_alternates: bool = False,
         ) -> str:
             res = _get_manager().grep_file(
                 file_ref,
@@ -158,6 +172,7 @@ class AgentBase(ABC):
                 max_lines=max_lines,
                 context_lines=context_lines,
                 case_insensitive=case_insensitive,
+                include_alternates=include_alternates,
             )
             return json.dumps(res, indent=2)
 
@@ -167,6 +182,7 @@ class AgentBase(ABC):
             max_bytes: int = 4096,
             start_line: int | None = None,
             max_lines: int | None = None,
+            include_alternates: bool = False,
         ) -> str:
             res = _get_manager().read_file_slice(
                 file_ref,
@@ -174,6 +190,7 @@ class AgentBase(ABC):
                 max_bytes=max_bytes,
                 start_line=start_line,
                 max_lines=max_lines,
+                include_alternates=include_alternates,
             )
             return json.dumps(res, indent=2)
 
@@ -181,15 +198,45 @@ class AgentBase(ABC):
             res = _get_manager().list_files()
             return json.dumps(res, indent=2)
 
+        async def _read_document(
+            ref: str,
+            include_alternates: bool = False,
+            max_bytes: int = 262144,
+        ) -> str:
+            res = _get_manager().read_document(
+                ref,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+            )
+            return json.dumps(res, indent=2)
+
+        async def _search_documents(
+            query: str,
+            namespace: str = "",
+            include_alternates: bool = False,
+            case_insensitive: bool = True,
+            max_results: int = 50,
+        ) -> str:
+            res = _get_manager().search_documents(
+                query,
+                namespace=namespace,
+                include_alternates=include_alternates,
+                case_insensitive=case_insensitive,
+                max_results=max_results,
+            )
+            return json.dumps(res, indent=2)
+
         async def _generate_chart_from_workspace(**kwargs: Any) -> str:
             res = _get_manager().generate_chart(**kwargs)
             return json.dumps(res, indent=2)
 
         ws_handlers = {
-            "jq_query": _jq_query,
-            "grep_file": _grep_file,
-            "read_file_slice": _read_file_slice,
-            "list_workspace_files": _list_workspace_files,
+            "jq_file_from_workspace": _jq_query,
+            "grep_file_from_workspace": _grep_file,
+            "read_file_from_workspace": _read_file_slice,
+            "list_files_from_workspace": _list_workspace_files,
+            "read_document_from_workspace": _read_document,
+            "search_documents_from_workspace": _search_documents,
             "generate_chart_from_workspace": _generate_chart_from_workspace,
         }
 
@@ -277,17 +324,28 @@ class AgentBase(ABC):
         workspace_prompt = (
             "\n\n## Scratchpad Workspace & Tool Querying\n"
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
-            "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_query` to query JSON fields, "
-            "`read_file_slice` to paginate text/logs, and `grep_file` to search.\n"
-            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` (or `jq_query`) directly in ANY JSON-returning "
+            "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
+            "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
             "to slice and return the exact data in a single turn without multi-step querying."
         )
         try:
             from providers.workspace.manager import WorkspaceManager
 
-            ws_mgr = WorkspaceManager(ticket_id=ticket_id)
-            ws_files = ws_mgr.list_files()
+            ws_mgr = WorkspaceManager(
+                ticket_id=ticket_id,
+                agent_name=self.agent_name,
+            )
+            ws_files = ws_mgr.list_effective_files()
+            effective_context = ws_mgr.read_effective_context()
+            if effective_context:
+                workspace_prompt += (
+                    "\n\n## Effective Context Policy\n"
+                    "Use the context gateway for phase-effective documentation. Do not read "
+                    "internal context manifests or source snapshots directly, and do not "
+                    "select a source explicitly."
+                )
             if ws_files:
                 file_lines = []
                 for f in ws_files:
@@ -298,7 +356,7 @@ class AgentBase(ABC):
                 workspace_prompt += (
                     "\n\n## Available Workspace Files from Prior Steps\n"
                     "The following files are already present in this ticket's workspace. "
-                    "Use `jq_query` (for JSON) or `read_file_slice` / `grep_file` (for text) to inspect them directly:\n"
+                    "Use `jq_file_from_workspace` (for JSON) or `read_file_from_workspace` / `grep_file_from_workspace` (for text) to inspect them directly:\n"
                     + "\n".join(file_lines)
                 )
         except Exception as e:
@@ -1197,10 +1255,12 @@ class AgentBase(ABC):
         # Exclude workspace inspection, skill/doc loading, user interaction, and submission tools
         exempt_tools = {
             # Workspace inspection
-            "jq_query",
-            "grep_file",
-            "read_file_slice",
-            "list_workspace_files",
+            "jq_file_from_workspace",
+            "grep_file_from_workspace",
+            "read_file_from_workspace",
+            "list_files_from_workspace",
+            "read_document_from_workspace",
+            "search_documents_from_workspace",
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
@@ -1223,7 +1283,10 @@ class AgentBase(ABC):
         try:
             from providers.workspace.manager import WorkspaceManager
 
-            manager = WorkspaceManager(ticket_id=self._current_ticket_id)
+            manager = WorkspaceManager(
+                ticket_id=self._current_ticket_id,
+                agent_name=self.agent_name,
+            )
             self._tool_call_seq += 1
 
             # Determine extension
@@ -1276,7 +1339,7 @@ class AgentBase(ABC):
                             "preview": preview,
                             "message": (
                                 f"Full output saved to '{file_ref}'. Filtered result ({len(filtered_json)} bytes) "
-                                f"exceeds threshold. Refine jq_query or read slices."
+                                f"exceeds threshold. Refine jq_file_from_workspace or read slices."
                             ),
                         }
                         return json.dumps(descriptor, indent=2)
@@ -1302,7 +1365,7 @@ class AgentBase(ABC):
                 "preview": preview,
                 "message": (
                     f"Tool output ({len(raw_bytes)} bytes) was saved to workspace as '{file_ref}'. "
-                    f"Use jq_query (for JSON) or grep_file / read_file_slice (for text) to inspect relevant parts."
+                    f"Use jq_file_from_workspace (for JSON) or grep_file_from_workspace / read_file_from_workspace (for text) to inspect relevant parts."
                 ),
             }
             logger.info(
@@ -1336,9 +1399,9 @@ class AgentBase(ABC):
 
         call_input = dict(tool_call.input) if tool_call.input else {}
         jq_filter = None
-        if tool_call.name != "jq_query":
+        if tool_call.name != "jq_file_from_workspace":
             jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
-                "jq_query", None
+                "jq_file_from_workspace", None
             )
             if jq_filter is not None:
                 jq_filter = str(jq_filter).strip() or None

@@ -121,7 +121,13 @@ class AnalyzeAgent(AgentBase):
         # Connect the analysis agent's own MCP server
         server_path = str(Path(__file__).with_name("server.py"))
         mcp = AgentMCPClient()
-        await mcp.connect(server_path, name="analyze")
+        await mcp.connect_ticket_server(
+            server_path,
+            name="analyze",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Connect external MCP servers (Domain MCP, etc.)
         from agents.mcp_client import connect_external_servers

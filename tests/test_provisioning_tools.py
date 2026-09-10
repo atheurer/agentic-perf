@@ -7,6 +7,7 @@ import pytest
 from agents.provisioning.server import (
     _parse_os_release,
     _summarize,
+    _verify_harness_install_one,
     validate_platform_contract,
 )
 from tests.conftest import (
@@ -184,6 +185,62 @@ async def test_check_existing_reads_from_config(mock_provider):
         == "/opt/crucible/bin/crucible help"
     )
     assert crucible_config["provisioning"]["install_target_path"] == "/opt/crucible"
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkeypatch):
+    """Crucible verification checks the executable and bootstrap document only."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["harness_verified"] is True
+    assert result["context_ready"] is True
+    assert result["context"] == {
+        "ready": True,
+        "bootstrap": "/opt/crucible/AGENTS.md",
+        "bytes": 1234,
+    }
+    assert all(
+        not any(token in call["command"] for token in ("install", "update", "rm "))
+        for call in mock_ssh.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_fails_readiness_when_context_missing(
+    mock_ssh, monkeypatch
+):
+    """A working executable is insufficient if the gateway bootstrap is absent."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(exit_code=1, stderr="not readable"),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["harness_verified"] is True
+    assert result["context_ready"] is False
+    assert result["verified"] is False
+    assert "context" in result["message"]
 
 
 @pytest.mark.asyncio

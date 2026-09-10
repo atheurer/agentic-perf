@@ -71,6 +71,34 @@ class AgentMCPClient:
             env=env,
         )
 
+    async def connect_ticket_server(
+        self,
+        server_script: str,
+        *,
+        name: str,
+        ticket_id: str,
+        state_store_url: str,
+        agent_name: str,
+    ) -> None:
+        """Connect an agent-owned MCP server with required ticket identity.
+
+        Generic and external MCP servers may use :meth:`connect`. Every local
+        server participating in ticket execution must use this method so its
+        workspace, state-store access, phase scoping, and audit attribution
+        cannot silently lose caller identity.
+        """
+        required = {
+            "TICKET_ID": ticket_id,
+            "STATE_STORE_URL": state_store_url,
+            "AGENT_NAME": agent_name,
+        }
+        missing = [key for key, value in required.items() if not str(value).strip()]
+        if missing:
+            raise ValueError(
+                "ticket-scoped MCP server requires non-empty " + ", ".join(missing)
+            )
+        await self.connect(server_script, name=name, env=required)
+
     async def connect_command(
         self,
         command: str,

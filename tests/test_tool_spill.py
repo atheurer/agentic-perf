@@ -39,10 +39,12 @@ def agent(tmp_path, monkeypatch):
 
 async def test_agent_has_native_workspace_tools(agent):
     tool_names = [t.name for t in agent.tools]
-    assert "jq_query" in tool_names
-    assert "grep_file" in tool_names
-    assert "read_file_slice" in tool_names
-    assert "list_workspace_files" in tool_names
+    assert "jq_file_from_workspace" in tool_names
+    assert "grep_file_from_workspace" in tool_names
+    assert "read_file_from_workspace" in tool_names
+    assert "list_files_from_workspace" in tool_names
+    assert "read_document_from_workspace" in tool_names
+    assert "search_documents_from_workspace" in tool_names
 
 
 async def test_tool_output_under_threshold_not_spilled(agent):
@@ -74,10 +76,10 @@ async def test_tool_output_over_threshold_spilled_and_queryable(agent):
     assert parsed_res["size_bytes"] == len(large_payload.encode("utf-8"))
     assert "preview" in parsed_res
 
-    # Query via agent's native jq_query tool handler
+    # Query via agent's native jq_file_from_workspace tool handler
     jq_call = ToolCall(
         id="call_jq",
-        name="jq_query",
+        name="jq_file_from_workspace",
         input={"file_ref": parsed_res["file_ref"], "filter": ".series[0:3]"},
     )
     jq_res = await agent._execute_tool(jq_call)
@@ -92,10 +94,12 @@ async def test_exempt_tools_not_spilled(agent, monkeypatch):
     agent._spill_threshold = 10
 
     exempt_tools = [
-        "jq_query",
-        "grep_file",
-        "read_file_slice",
-        "list_workspace_files",
+        "jq_file_from_workspace",
+        "grep_file_from_workspace",
+        "read_file_from_workspace",
+        "list_files_from_workspace",
+        "read_document_from_workspace",
+        "search_documents_from_workspace",
         "read_skills",
         "read_harness_doc",
         "get_review_config",

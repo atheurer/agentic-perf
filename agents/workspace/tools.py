@@ -4,7 +4,7 @@ from providers.llm.base import ToolDefinition
 
 WORKSPACE_TOOLS = [
     ToolDefinition(
-        name="jq_query",
+        name="jq_file_from_workspace",
         description="Execute a jq filter expression on a structured JSON workspace file to extract keys, arrays, or compute aggregated values. For large arrays, use slice ranges (e.g. '.values[0:50]', next chunk: '.values[50:100]') to paginate.",
         input_schema={
             "type": "object",
@@ -22,12 +22,17 @@ WORKSPACE_TOOLS = [
                     "description": "Maximum list items to return in result (default 50)",
                     "default": 50,
                 },
+                "include_alternates": {
+                    "type": "boolean",
+                    "description": "Explicit drift/comparison access to alternate source snapshots (default false)",
+                    "default": False,
+                },
             },
             "required": ["file_ref", "filter"],
         },
     ),
     ToolDefinition(
-        name="grep_file",
+        name="grep_file_from_workspace",
         description="Search for a string or regex pattern in a workspace text file.",
         input_schema={
             "type": "object",
@@ -55,12 +60,17 @@ WORKSPACE_TOOLS = [
                     "description": "Case-insensitive match (default True)",
                     "default": True,
                 },
+                "include_alternates": {
+                    "type": "boolean",
+                    "description": "Explicit drift/comparison access to alternate source snapshots (default false)",
+                    "default": False,
+                },
             },
             "required": ["file_ref", "pattern"],
         },
     ),
     ToolDefinition(
-        name="read_file_slice",
+        name="read_file_from_workspace",
         description="Read a slice or chunk of a workspace file by lines or bytes. Returns 'next_start_line' and 'next_offset_bytes' to easily fetch the next chunk without re-reading previous data.",
         input_schema={
             "type": "object",
@@ -87,16 +97,87 @@ WORKSPACE_TOOLS = [
                     "type": "integer",
                     "description": "Optional maximum number of lines to read",
                 },
+                "include_alternates": {
+                    "type": "boolean",
+                    "description": "Explicit drift/comparison access to alternate source snapshots (default false)",
+                    "default": False,
+                },
             },
             "required": ["file_ref"],
         },
     ),
     ToolDefinition(
-        name="list_workspace_files",
-        description="List all files stored in the ticket's scratchpad workspace directory.",
+        name="list_files_from_workspace",
+        description="List files visible to this agent's default audience in the ticket workspace. Alternate source snapshots require explicit comparison access.",
         input_schema={
             "type": "object",
             "properties": {},
+        },
+    ),
+    ToolDefinition(
+        name="read_document_from_workspace",
+        description=(
+            "Read an exact context document previously inventoried by a context "
+            "gateway into the ticket workspace. Pass a logical ref or URI returned "
+            "by the gateway; the current phase-effective source is used by default."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Logical document ref or URI returned by a context gateway",
+                },
+                "include_alternates": {
+                    "type": "boolean",
+                    "description": "Allow an explicitly indexed alternate source (default false)",
+                    "default": False,
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum document bytes to return (default 262144)",
+                    "default": 262144,
+                },
+            },
+            "required": ["ref"],
+        },
+    ),
+    ToolDefinition(
+        name="search_documents_from_workspace",
+        description=(
+            "Regex-search paths and contents in the context inventory already "
+            "materialized in the ticket workspace. Search is restricted to the "
+            "current phase-effective source unless alternates are explicitly enabled."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Regular expression to search for",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Optional logical namespace prefix, such as benchmark/perftest",
+                    "default": "",
+                },
+                "include_alternates": {
+                    "type": "boolean",
+                    "description": "Search explicitly indexed alternate sources (default false)",
+                    "default": False,
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Use case-insensitive matching (default true)",
+                    "default": True,
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum matching documents to return (default 50)",
+                    "default": 50,
+                },
+            },
+            "required": ["query"],
         },
     ),
     ToolDefinition(

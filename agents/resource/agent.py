@@ -192,14 +192,12 @@ class ResourceAgent(AgentBase):
         resource_server = str(Path(__file__).with_name("server.py"))
 
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             resource_server,
             name="resource",
-            env={
-                "TICKET_ID": ticket_id,
-                "STATE_STORE_URL": self.store_url,
-                "AGENT_NAME": self.agent_name,
-            },
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
         self._mcp = mcp
 

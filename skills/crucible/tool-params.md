@@ -5,9 +5,11 @@ They are configured in the `tool-params` array of the run file.
 
 ## Discovering Tool Parameters
 
-You can discover valid parameters, presets, and validations for tools using:
-1. **MCP Tool**: Call `get_tool_params(tool)` (e.g., `get_tool_params("sysstat")`).
-2. **Filesystem**: On the Crucible controller, tool parameter definitions are stored in `/opt/crucible/subprojects/tools/<tool>/multiplex.json` and metadata in `tool-metadata.json`.
+You can discover valid parameters, presets, and validations for tools using
+`get_crucible_benchmark_context`. Bootstrap the context, search for the tool
+name when its files are not identified by the documents you have read, then
+read the relevant tool `multiplex.json` and metadata documents from the
+designated controller.
 
 Like benchmarks, tool `multiplex.json` files define:
 - `presets.defaults`: Default argument values applied if not specified.

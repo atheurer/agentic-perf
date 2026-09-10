@@ -42,6 +42,12 @@ class MultiHarnessSkillProvider(SkillProvider):
     def get_provider(self, harness_name: str) -> SkillProvider | None:
         return self._harnesses.get(harness_name)
 
+    def get_source_provenance(self, harness: str = "crucible") -> dict[str, Any]:
+        """Return source resolution provenance for ticket recording."""
+        provider = self._harnesses.get(harness)
+        provenance = getattr(provider, "_source_provenance", {}) if provider else {}
+        return dict(provenance) if isinstance(provenance, dict) else {}
+
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         results = []
         private_suites = set(self._private.list_suites_with_private_config())
