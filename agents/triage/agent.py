@@ -210,6 +210,27 @@ _LOCAL_TOOLS = [
                                 "containers, or cloud-native."
                             ),
                         },
+                        "workflow_source": {
+                            "type": "string",
+                            "description": (
+                                "Git repo URL or raw workflow file URL "
+                                "for Arcaflow workflow execution. When "
+                                "set, the benchmark agent uses the "
+                                "Arcaflow MCP to load, configure, and "
+                                "run the workflow instead of direct "
+                                "plugin execution. Example: "
+                                "'https://gitlab.com/org/repo.git'"
+                            ),
+                        },
+                        "workflow_name": {
+                            "type": "string",
+                            "description": (
+                                "Name or path of the workflow within "
+                                "the workflow_source repo. Only needed "
+                                "when the source contains multiple "
+                                "workflows. Example: 'workflow-fio'"
+                            ),
+                        },
                     },
                     "additionalProperties": True,
                 },
@@ -626,6 +647,8 @@ class TriageAgent(AgentBase):
             "image_version",
             "serial_capture",
             "board_selector",
+            "workflow_source",
+            "workflow_name",
         )
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
