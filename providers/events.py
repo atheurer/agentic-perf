@@ -29,7 +29,17 @@ EVENT_TYPES = {
     "agent_stopped",
     "user_interjection",
     "escalation",
+    "circuit_breaker",
 }
+
+TERMINAL_EVENTS = frozenset(
+    {
+        "agent_finished",
+        "agent_aborted",
+        "agent_error",
+        "agent_stopped",
+    }
+)
 
 
 class Event:
@@ -138,6 +148,7 @@ class EventBus:
         self._last_event_time: dict[str, float] = {}
         self._usage_ledger = usage_ledger
         self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
+        self._terminal_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
@@ -387,6 +398,69 @@ class EventBus:
         merged = in_memory + [e for e in from_file if e["seq"] not in seen_seqs]
         merged.sort(key=lambda e: e["seq"])
         return merged[:limit]
+
+    def get_terminal_events(
+        self,
+        ticket_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return terminal events for a ticket regardless of window limits.
+
+        Merges in-memory and file-backed terminal events, deduplicates
+        by sequence number, and sorts by seq.  File-backed results are
+        cached per ticket since terminal events are immutable.
+        """
+        in_memory = [
+            e.to_dict()
+            for e in self._events.get(ticket_id, [])
+            if e.event_type in TERMINAL_EVENTS
+        ]
+        from_file = self._read_terminal_from_file(ticket_id)
+        if not from_file:
+            return in_memory
+        if not in_memory:
+            return from_file
+        seen_seqs = {e["seq"] for e in in_memory}
+        merged = in_memory + [e for e in from_file if e["seq"] not in seen_seqs]
+        merged.sort(key=lambda e: e["seq"])
+        return merged
+
+    def _read_terminal_from_file(
+        self,
+        ticket_id: str,
+    ) -> list[dict[str, Any]]:
+        path = self._log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return []
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            return []
+        cached = self._terminal_cache.get(ticket_id)
+        if cached is not None and cached[0] == file_size:
+            return [dict(e) for e in cached[1]]
+        results: list[dict[str, Any]] = []
+        try:
+            line_num = 0
+            with open(path, encoding="utf-8") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        evt = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    line_num += 1
+                    evt["seq"] = line_num
+                    if evt.get("event_type") in TERMINAL_EVENTS:
+                        results.append(evt)
+        except Exception:
+            logger.exception(
+                f"Failed to read terminal events from file for {ticket_id}",
+            )
+            return results
+        self._terminal_cache[ticket_id] = (file_size, results)
+        return [dict(e) for e in results]
 
     def _read_from_file(
         self,
