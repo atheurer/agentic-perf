@@ -1841,7 +1841,7 @@ class AgentBase(ABC):
         return r.json()
 
     async def _add_comment(self, ticket_id: str, body: str) -> dict[str, Any]:
-        self._emit(ticket_id, "comment", {"body": body[:200]})
+        self._emit(ticket_id, "comment", {"body": body})
         r = await self._client.post(
             f"{self.store_url}/api/v1/tickets/{ticket_id}/comments",
             json={"author": self.agent_name, "body": body},
