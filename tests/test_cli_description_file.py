@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
+_CLI_PATH = str(Path(__file__).resolve().parents[1] / "cli.py")
+
 
 class TestParserMutualExclusion:
     """Parser rejects -d and -f together (via real cli.py)."""
@@ -27,7 +29,7 @@ class TestParserMutualExclusion:
         result = subprocess.run(
             [
                 sys.executable,
-                "cli.py",
+                _CLI_PATH,
                 "submit",
                 "summary",
                 "-d",
@@ -37,37 +39,67 @@ class TestParserMutualExclusion:
             ],
             capture_output=True,
             text=True,
+            timeout=10,
         )
-        assert result.returncode != 0
+        assert result.returncode == 2
         assert "not allowed with argument" in result.stderr
 
-    def test_d_alone_accepted(self) -> None:
+    def test_d_alone_parsed(self, tmp_path: Path) -> None:
+        """Real parser accepts -d and passes it through."""
         result = subprocess.run(
             [
                 sys.executable,
-                "cli.py",
+                _CLI_PATH,
                 "submit",
-                "--help",
+                "my summary",
+                "-d",
+                "inline desc",
             ],
             capture_output=True,
             text=True,
+            timeout=10,
         )
-        assert result.returncode == 0
-        assert "--description-file" in result.stdout
-        assert "-f" in result.stdout
+        # Will fail connecting to state store, but parser succeeds
+        # (returncode != 2 means argparse didn't reject it)
+        assert result.returncode != 2
 
-    def test_f_flag_registered(self) -> None:
+    def test_f_alone_parsed(self, tmp_path: Path) -> None:
+        """Real parser accepts -f and passes it through."""
+        desc_file = tmp_path / "desc.txt"
+        desc_file.write_text("file content")
         result = subprocess.run(
             [
                 sys.executable,
-                "cli.py",
+                _CLI_PATH,
                 "submit",
-                "--help",
+                "my summary",
+                "-f",
+                str(desc_file),
             ],
             capture_output=True,
             text=True,
+            timeout=10,
         )
-        assert "--description-file" in result.stdout
+        assert result.returncode != 2
+
+    def test_f_long_form_parsed(self, tmp_path: Path) -> None:
+        """Real parser accepts --description-file long form."""
+        desc_file = tmp_path / "desc.txt"
+        desc_file.write_text("file content")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _CLI_PATH,
+                "submit",
+                "my summary",
+                "--description-file",
+                str(desc_file),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 2
 
 
 class TestResolveDescription:
@@ -119,6 +151,20 @@ class TestResolveDescription:
         )
         with pytest.raises(SystemExit):
             _resolve_description(args)
+
+    def test_unreadable_file_exits(self, tmp_path: Path) -> None:
+        from cli import _resolve_description
+
+        args = argparse.Namespace(
+            description=None,
+            description_file=str(tmp_path / "exists.txt"),
+            summary="test summary",
+        )
+        desc_file = tmp_path / "exists.txt"
+        desc_file.write_text("content")
+        with patch.object(Path, "read_text", side_effect=OSError("Permission denied")):
+            with pytest.raises(SystemExit):
+                _resolve_description(args)
 
     def test_inline_description_used(self) -> None:
         from cli import _resolve_description
