@@ -48,10 +48,12 @@ def _make_ticket(
 async def _run_override(
     config: OrchestratorConfig,
     ticket: dict,
-) -> MagicMock:
+) -> tuple[MagicMock, MagicMock]:
     """Run the llm_override path through the real run_agent_task().
 
-    Returns the agent mock so callers can inspect agent.llm.
+    Returns (agent_mock, override_provider_mock) so callers can
+    verify both the timeout value and that the override provider
+    was installed on the agent.
     """
     import httpx
 
@@ -98,7 +100,8 @@ async def _run_override(
             ticket_data=ticket,
         )
 
-    return mock_agent
+    mock_agent.run.assert_awaited_once_with("TEST-001")
+    return mock_agent, mock_provider
 
 
 class TestLLMOverrideTimeout:
@@ -108,35 +111,40 @@ class TestLLMOverrideTimeout:
         """Explicit timeout override is applied to the provider."""
         config = _make_config()
         ticket = _make_ticket(llm_override={"timeout": 300})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 300.0
 
     async def test_timeout_zero_disables(self) -> None:
         """timeout: 0 disables the timeout (0 means no timeout)."""
         config = _make_config()
         ticket = _make_ticket(llm_override={"timeout": 0})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 0.0
 
     async def test_no_timeout_inherits_global(self) -> None:
         """Without timeout in override, global llm_timeout applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"model": "custom"})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
     async def test_invalid_timeout_keeps_global(self) -> None:
         """Invalid timeout value is ignored, global applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"timeout": "not-a-number"})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
     async def test_timeout_as_string_coerced(self) -> None:
         """Numeric string timeout is coerced to float."""
         config = _make_config()
         ticket = _make_ticket(llm_override={"timeout": "300"})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 300.0
 
     async def test_timeout_with_other_overrides(self) -> None:
@@ -150,7 +158,8 @@ class TestLLMOverrideTimeout:
                 "timeout": 600,
             },
         )
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 600.0
         assert agent.llm.reasoning_effort == "high"
         assert agent.llm.max_tokens == 8192
@@ -159,26 +168,38 @@ class TestLLMOverrideTimeout:
         """Negative timeout is rejected, global applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"timeout": -5})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
     async def test_nan_timeout_rejected(self) -> None:
         """NaN timeout is rejected, global applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"timeout": float("nan")})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
     async def test_infinity_timeout_rejected(self) -> None:
         """Infinity timeout is rejected, global applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"timeout": float("inf")})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
     async def test_negative_infinity_timeout_rejected(self) -> None:
         """Negative infinity timeout is rejected, global applies."""
         config = _make_config({"llm": {"timeout": 120}})
         ticket = _make_ticket(llm_override={"timeout": float("-inf")})
-        agent = await _run_override(config, ticket)
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
+        assert agent.llm.default_timeout == 120
+
+    async def test_boolean_timeout_rejected(self) -> None:
+        """Boolean True/False are rejected as timeout values."""
+        config = _make_config({"llm": {"timeout": 120}})
+        ticket = _make_ticket(llm_override={"timeout": True})
+        agent, provider = await _run_override(config, ticket)
+        assert agent.llm is provider
         assert agent.llm.default_timeout == 120

@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -725,9 +726,9 @@ async def run_agent_task(
                         override_timeout = llm_override.get("timeout")
                         if override_timeout is not None:
                             try:
+                                if isinstance(override_timeout, bool):
+                                    raise TypeError("timeout must not be boolean")
                                 t = float(override_timeout)
-                                import math
-
                                 if math.isnan(t) or math.isinf(t) or t < 0:
                                     raise ValueError(
                                         f"timeout must be finite and"
