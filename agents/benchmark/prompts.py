@@ -14,9 +14,10 @@ Use batch and discovery tools to minimize iterations:
   the complete hardware layout in a single call, including CCD domains, NUMA nodes, core counts,
   and exact `thread_siblings` SMT pairings (`{"0": [0, 384], ...}`). Do NOT read individual
   `/sys/devices/system/cpu/cpu*/topology/` files or sysfs paths one by one.
-- **In-flight `jq_filter` parameter** — you can pass `jq_filter` in ANY JSON-returning tool call
+- **In-flight `jq_filter` parameter** — you can pass `jq_filter` in JSON-returning tool calls
   (e.g., `get_hardware_topology(host=..., jq_filter=".domains[0:2]")`)
   to receive the exact filtered slice immediately in the same turn without multi-step querying.
+  Tools that declare `jq_filter` consume it as their own input transformation.
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
   (not check_host per host)
 - **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**

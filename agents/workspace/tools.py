@@ -229,6 +229,10 @@ WORKSPACE_TOOLS = [
                     "items": {"type": "string"},
                     "description": "Optional list of multiple metric names (e.g. ['uperf::Gbps', 'mpstat::Busy-CPU']) to generate synchronized stacked chart panels.",
                 },
+                "breakout": {
+                    "type": "string",
+                    "description": "Optional CDM breakout field to visualize",
+                },
                 "unit": {
                     "type": "string",
                     "description": "Metric unit (e.g. 'Gbps', '%', 'IOPS', 'ms')",

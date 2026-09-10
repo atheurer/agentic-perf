@@ -182,6 +182,8 @@ async def test_in_flight_jq_filter_returns_data_in_same_turn(agent):
         {"ccd_id": 1, "cpus": [2, 3]},
     ]
     assert parsed["full_size_bytes"] > 20000
+    called_input = agent._tool_handlers["get_cache_topology"].call_args.kwargs
+    assert called_input == {"host": "10.0.0.1"}
 
 
 async def test_in_flight_jq_filter_invalid_query_returns_error_descriptor(agent):
@@ -200,3 +202,61 @@ async def test_in_flight_jq_filter_invalid_query_returns_error_descriptor(agent)
     assert parsed["status"] == "filter_error"
     assert parsed["file_ref"].startswith("workspace://get_items_")
     assert "error" in parsed
+
+
+async def test_mcp_chart_tool_receives_schema_declared_jq_filter(agent):
+    agent._tool_handlers.pop("generate_chart_from_workspace")
+    agent._mcp = AsyncMock()
+    agent._mcp.call_tool.return_value = json.dumps(
+        {
+            "status": "ok",
+            "chart_ref": "workspace://charts/example.json",
+            "labels": 100,
+            "datasets": 8,
+            "panels": 0,
+        }
+    )
+    call = ToolCall(
+        id="mcp-chart",
+        name="generate_chart_from_workspace",
+        input={
+            "file_ref": "workspace://source.json",
+            "jq_filter": ".uperf_s1",
+        },
+    )
+
+    result = await agent._execute_tool(call)
+
+    assert not result.is_error
+    assert json.loads(result.content)["chart_ref"] == (
+        "workspace://charts/example.json"
+    )
+    agent._mcp.call_tool.assert_awaited_once_with(
+        "generate_chart_from_workspace",
+        {
+            "file_ref": "workspace://source.json",
+            "jq_filter": ".uperf_s1",
+        },
+    )
+
+
+async def test_mcp_generic_tool_preserves_post_result_filtering(agent):
+    agent._mcp = AsyncMock()
+    agent._mcp.call_tool.return_value = json.dumps(
+        {"items": [{"id": 1}, {"id": 2}], "ignored": "large response"}
+    )
+    call = ToolCall(
+        id="mcp-generic",
+        name="remote_json_tool",
+        input={"kind": "sample", "jq_filter": ".items[0]"},
+    )
+
+    result = await agent._execute_tool(call)
+
+    assert not result.is_error
+    filtered = json.loads(result.content)
+    assert filtered["status"] == "filtered"
+    assert filtered["data"] == {"id": 1}
+    agent._mcp.call_tool.assert_awaited_once_with(
+        "remote_json_tool", {"kind": "sample"}
+    )

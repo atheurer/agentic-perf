@@ -326,9 +326,11 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
-            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON-returning "
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
-            "to slice and return the exact data in a single turn without multi-step querying."
+            "to slice and return the exact data in a single turn without multi-step querying. When a tool "
+            "declares `jq_filter` in its schema, such as `generate_chart_from_workspace`, the tool applies "
+            "the filter to its own input instead."
         )
         try:
             from providers.workspace.manager import WorkspaceManager
@@ -920,6 +922,10 @@ class AgentBase(ABC):
                         f"{submit_call.name} (iter {iteration})"
                     )
                     block_msg = self._should_block_submit(ticket_id)
+                    if not block_msg:
+                        block_msg = await self._validate_submit_call(
+                            ticket_id, submit_call
+                        )
                     if block_msg:
                         self._emit(
                             ticket_id,
@@ -1144,6 +1150,12 @@ class AgentBase(ABC):
         string to block, or None to allow the submit to proceed."""
         return None
 
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        """Override to validate submit payloads before completing an agent run."""
+        return None
+
     @staticmethod
     def _get_submit_result(response: LLMResponse) -> dict[str, Any] | None:
         for tc in response.tool_calls:
@@ -1292,6 +1304,9 @@ class AgentBase(ABC):
             "list_files_from_workspace",
             "read_document_from_workspace",
             "search_documents_from_workspace",
+            # Chart responses are compact control-plane metadata whose
+            # chart_ref must remain directly visible to the caller.
+            "generate_chart_from_workspace",
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
@@ -1425,25 +1440,37 @@ class AgentBase(ABC):
             await asyncio.sleep(self._tool_min_interval - elapsed)
         self._last_tool_call_time = time.monotonic()
 
+    def _tool_declares_parameter(self, tool_name: str, parameter: str) -> bool:
+        """Return whether the published input contract owns a parameter."""
+        for tool in self.tools:
+            if tool.name != tool_name:
+                continue
+            properties = tool.input_schema.get("properties", {})
+            if parameter in properties:
+                return True
+        return False
+
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         await self._throttle_tool_call()
 
         call_input = dict(tool_call.input) if tool_call.input else {}
         jq_filter = None
         if tool_call.name != "jq_file_from_workspace":
-            jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
-                "jq_file_from_workspace", None
-            )
-            if jq_filter is not None:
-                jq_filter = str(jq_filter).strip() or None
+            if self._tool_declares_parameter(tool_call.name, "jq_filter"):
+                if "jq_filter" in call_input:
+                    value = str(call_input["jq_filter"]).strip()
+                    call_input["jq_filter"] = value or None
+            else:
+                jq_filter = call_input.pop("jq_filter", None)
+                legacy_filter = call_input.pop("jq_file_from_workspace", None)
+                jq_filter = jq_filter or legacy_filter
+                if jq_filter is not None:
+                    jq_filter = str(jq_filter).strip() or None
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
             try:
-                try:
-                    result = await handler(**call_input)
-                except TypeError:
-                    result = await handler(**tool_call.input)
+                result = await handler(**call_input)
 
                 if isinstance(result, str):
                     content = result
@@ -1465,10 +1492,7 @@ class AgentBase(ABC):
 
         if self._mcp is not None:
             try:
-                try:
-                    content = await self._mcp.call_tool(tool_call.name, call_input)
-                except Exception:
-                    content = await self._mcp.call_tool(tool_call.name, tool_call.input)
+                content = await self._mcp.call_tool(tool_call.name, call_input)
 
                 content = self._spill_tool_output(
                     tool_call.name, content, jq_filter=jq_filter

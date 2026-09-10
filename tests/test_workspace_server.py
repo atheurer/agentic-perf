@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
 
 import paths
 from agents.workspace import server as ws_server
+from agents.workspace.tools import WORKSPACE_TOOLS
 from providers.workspace.manager import WorkspaceManager
 
 
@@ -16,6 +18,16 @@ def ws_env(tmp_path, monkeypatch):
     # Reset global manager in ws_server
     monkeypatch.setattr(ws_server, "_manager", manager)
     return manager
+
+
+def test_chart_tool_schema_matches_mcp_signature():
+    tool = next(
+        item for item in WORKSPACE_TOOLS if item.name == "generate_chart_from_workspace"
+    )
+
+    assert set(tool.input_schema["properties"]) == set(
+        inspect.signature(ws_server.generate_chart_from_workspace).parameters
+    )
 
 
 async def test_mcp_jq_file_from_workspace(ws_env):
@@ -67,6 +79,43 @@ async def test_mcp_list_files_from_workspace(ws_env):
     assert resp["count"] == 2
     files = {f["filename"] for f in resp["files"]}
     assert files == {"file1.json", "file2.txt"}
+
+
+async def test_mcp_generate_chart_applies_jq_filter_to_source(ws_env):
+    source = {
+        "selected": {
+            "usedBreakouts": ["engine-id"],
+            "remainingBreakouts": [],
+            "values": {
+                "<1>": [
+                    {"begin": 1000, "value": 10.0},
+                    {"begin": 2000, "value": 11.0},
+                ],
+                "<2>": [
+                    {"begin": 1000, "value": 20.0},
+                    {"begin": 2000, "value": 21.0},
+                ],
+            },
+        }
+    }
+    ws_env.save_file("metrics.json", json.dumps(source))
+
+    raw_resp = await ws_server.generate_chart_from_workspace(
+        file_ref="workspace://metrics.json",
+        chart_type="line",
+        harness="crucible",
+        output_name="filtered",
+        max_points=2,
+        jq_filter=".selected",
+    )
+
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    assert resp["chart_ref"] == "workspace://charts/filtered.json"
+    assert resp["labels"] == 2
+    assert resp["datasets"] == 2
+    chart = ws_env.read_chart(resp["chart_ref"])
+    assert chart["chart_data"]["datasets"][0]["values"] == [10.0, 11.0]
 
 
 async def test_mcp_read_and_search_indexed_documents(ws_env):
