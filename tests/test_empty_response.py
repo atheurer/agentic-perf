@@ -23,7 +23,7 @@ class TestEmptyResponseAnomaly:
         anomalies = _detect_anomalies_from_events(events)
         empty = [a for a in anomalies if a["type"] == "empty_llm_response"]
         assert len(empty) == 1
-        assert "triage-agent" in empty[0]["message"]
+        assert "triage-agent" in empty[0]["description"]
         assert empty[0]["severity"] == "medium"
 
     def test_no_false_positive(self):
