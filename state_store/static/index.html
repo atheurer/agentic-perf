@@ -618,6 +618,30 @@ details > .content { padding: 12px 16px; }
 
 .event-text.short { max-height: none; }
 
+.expandable-text {
+  position: relative;
+}
+.expandable-text .expand-full {
+  display: none;
+}
+.expandable-text.expanded .expand-truncated {
+  display: none;
+}
+.expandable-text.expanded .expand-full {
+  display: inline;
+}
+.expand-toggle {
+  color: var(--cyan);
+  font-size: 11px;
+  cursor: pointer;
+  margin-left: 4px;
+  text-decoration: underline;
+  user-select: none;
+}
+.expand-toggle:hover {
+  text-decoration: underline;
+}
+
 .transition-banner {
   background: linear-gradient(135deg, #1a2a1a, #1a3a2a);
   border: 1px solid #2a4a2a;
@@ -1930,6 +1954,29 @@ function truncate(s, n) {
   return s.slice(0, n) + '...';
 }
 
+var EXPAND_LIMIT = 300;
+
+function expandableText(text, limit) {
+  limit = limit || EXPAND_LIMIT;
+  if (!text || text.length <= limit) return escHtml(text || '');
+  return '<span class="expandable-text">' +
+    '<span class="expand-truncated">' + escHtml(text.substring(0, limit)) +
+      '<span class="expand-toggle">…</span>' +
+    '</span>' +
+    '<span class="expand-full">' + escHtml(text) +
+      '<span class="expand-toggle"> ▲</span>' +
+    '</span>' +
+  '</span>';
+}
+
+// Event delegation for expandable text toggles
+document.addEventListener('click', function(e) {
+  if (e.target.classList.contains('expand-toggle')) {
+    var parent = e.target.closest('.expandable-text');
+    if (parent) parent.classList.toggle('expanded');
+  }
+});
+
 function prettyJson(obj) {
   try {
     if (typeof obj === 'string') obj = JSON.parse(obj);
@@ -2452,7 +2499,7 @@ function renderHypothesisCard(ticket) {
       'DEDUP MATCH \u2014 ' + escHtml(String(dedupResult.matched_investigation_id)) + '</div>';
     html += '<div class="result-summary">' +
       'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
-      escHtml(String(dedupResult.match_rationale || '').substring(0, 200)) + '</div>';
+      expandableText(String(dedupResult.match_rationale || '')) + '</div>';
   }
   if (!verdict && synthResult) {
     var sCls = 'inconclusive';
@@ -3507,7 +3554,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + escHtml(data.details || '') + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + expandableText(data.details || '') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -3521,7 +3568,7 @@ function renderEvent(evt) {
       return '<div class="event tool-progress">' +
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-progress">PROGRESS</span>' +
-        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + escHtml(data.body || '') + '</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + expandableText(data.body || '') + '</span>' +
       '</div>';
 
     case 'comment':
@@ -3529,7 +3576,7 @@ function renderEvent(evt) {
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-comment">COMMENT</span>' +
         '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
-        '<div class="event-text short">' + escHtml(data.body || '') + '</div>' +
+        '<div class="event-text short">' + expandableText(data.body || '') + '</div>' +
       '</div>';
 
     default:
@@ -3574,8 +3621,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        if (display.length > 500) display = display.substring(0, 500) + '...';
-        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + escHtml(display) + '</div>';
+        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + expandableText(display) + '</div>';
       });
       dataHtml += '</div>';
     }
