@@ -13,12 +13,23 @@ import time
 from typing import Any
 
 from agents.base import AgentAbortedError, HITLDriftError
-from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
+from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
+from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
+from providers.skills.clusterbuster import ClusterbusterSkillProvider
+from providers.skills.crucible import CrucibleSkillProvider
+from providers.skills.forge import ForgeSkillProvider
+from providers.skills.ioscale import IoscaleSkillProvider
+from providers.skills.k8s_netperf import K8sNetperfSkillProvider
+from providers.skills.kube_burner import KubeBurnerSkillProvider
+from providers.skills.multi import MultiHarnessSkillProvider
+from providers.skills.private import PrivateSkillProvider
 from providers.skills.repo_cache import RepoCache
+from providers.skills.vstorm import VstormSkillProvider
+from providers.skills.zathras import ZathrasSkillProvider
 
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -1411,23 +1422,66 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
     repo_cache = RepoCache()
     for name, url in config.harness_repos.items():
-        # Crucible is never cloned or refreshed by agentic-perf. Its source
-        # must already exist locally or on the designated controller.
-        if name == "crucible":
-            continue
         try:
             repo_cache.ensure_repo(name, url)
         except Exception:
             logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
-    skills = build_skill_provider(
-        crucible_home=config.crucible_home,
-        repo_cache=repo_cache,
-        source_repo=config.raw.get("crucible_source_repo"),
-        source_url=config.harness_repos.get("crucible"),
-        zathras_home=config.zathras_home,
-        resolve_source=False,
-        catalog_only=True,
+    harnesses = {"crucible": CrucibleSkillProvider(config.crucible_home)}
+    if config.zathras_home:
+        harnesses["zathras"] = ZathrasSkillProvider(config.zathras_home)
+    else:
+        private = PrivateSkillProvider()
+        zathras_tests = private._load_config("zathras").get("tests")
+        if zathras_tests:
+            logger.info("No zathras_home set — using private-skills benchmark catalog")
+            harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
+    harnesses["kube-burner"] = KubeBurnerSkillProvider()
+    harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
+    harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
+    harnesses["clusterbuster"] = ClusterbusterSkillProvider()
+    harnesses["vstorm"] = VstormSkillProvider()
+    harnesses["ioscale"] = IoscaleSkillProvider()
+    harnesses["forge"] = ForgeSkillProvider()
+    # Create an MCP client for arcaflow plugin discovery
+    # when the Arcaflow MCP is configured.
+    arcaflow_mcp = None
+    for srv in config.raw.get("external_mcp_servers", []):
+        if srv.get("name") == "arcaflow" and srv.get("transport") == "stdio":
+            try:
+                from agents.mcp_client import AgentMCPClient
+
+                arcaflow_mcp = AgentMCPClient()
+                command = srv.get("command", [])
+                if command:
+                    import asyncio
+
+                    asyncio.get_event_loop().run_until_complete(
+                        arcaflow_mcp.connect_command(
+                            command=command[0],
+                            args=command[1:] if len(command) > 1 else [],
+                            name="arcaflow",
+                            env=srv.get("env"),
+                        )
+                    )
+                    logger.info(
+                        "[orchestrator] Arcaflow MCP connected for plugin discovery"
+                    )
+                else:
+                    arcaflow_mcp = None
+            except Exception:
+                logger.warning(
+                    "[orchestrator] Failed to connect Arcaflow MCP "
+                    "for plugin discovery — using Quay fallback",
+                    exc_info=True,
+                )
+                arcaflow_mcp = None
+            break
+    harnesses["arcaflow-plugins"] = ArcaflowPluginSkillProvider(
+        mcp_client=arcaflow_mcp,
+    )
+    skills = MultiHarnessSkillProvider(
+        harnesses, PrivateSkillProvider(), default_harness="crucible"
     )
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")

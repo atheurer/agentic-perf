@@ -501,9 +501,15 @@ async def connect_external_servers(
         else:
             continue
 
-        if not url or not transport:
+        if not transport:
             logger.warning(
-                f"[mcp] Skipping external server {name!r}: missing url or transport"
+                f"[mcp] Skipping external server {name!r}: missing transport"
+            )
+            continue
+        if transport != "stdio" and not url:
+            logger.warning(
+                f"[mcp] Skipping external server {name!r}: "
+                f"missing url for {transport} transport"
             )
             continue
 
@@ -524,7 +530,20 @@ async def connect_external_servers(
         try:
             trust = entry.get("trust", False)
 
-            if transport == "sse":
+            if transport == "stdio":
+                command = entry.get("command", [])
+                if not command:
+                    logger.warning(
+                        f"[mcp] Skipping stdio server {name!r}: missing command"
+                    )
+                    continue
+                await client.connect_command(
+                    command=command[0],
+                    args=command[1:] if len(command) > 1 else [],
+                    name=name,
+                    env=entry.get("env"),
+                )
+            elif transport == "sse":
                 await client.connect_sse(
                     url=url,
                     name=name,
