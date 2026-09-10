@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -64,9 +65,32 @@ def _check_429(r: httpx.Response) -> bool:
     return True
 
 
+def _resolve_description(args) -> str:
+    """Resolve ticket description from -d, -f, or summary fallback."""
+    desc_file = getattr(args, "description_file", None)
+    if desc_file:
+        if desc_file == "-":
+            content = sys.stdin.read()
+        else:
+            path = Path(desc_file)
+            if not path.exists():
+                print(f"Error: file not found: {desc_file}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError as e:
+                print(f"Error reading file: {e}", file=sys.stderr)
+                sys.exit(1)
+        if not content.strip():
+            print("Error: description file is empty", file=sys.stderr)
+            sys.exit(1)
+        return content.strip()
+    return args.description or args.summary
+
+
 def cmd_submit(args):
     client, url = get_client(args)
-    description = args.description or args.summary
+    description = _resolve_description(args)
     body: dict = {
         "summary": args.summary,
         "description": description,
@@ -1269,8 +1293,14 @@ def main():
 
     p_submit = sub.add_parser("submit", help="Create a new test ticket")
     p_submit.add_argument("summary", help="Test request summary")
-    p_submit.add_argument(
+    desc_group = p_submit.add_mutually_exclusive_group()
+    desc_group.add_argument(
         "-d", "--description", help="Detailed description (defaults to summary)"
+    )
+    desc_group.add_argument(
+        "-f",
+        "--description-file",
+        help="Read description from file (use - for stdin)",
     )
     p_submit.add_argument(
         "--owners",
