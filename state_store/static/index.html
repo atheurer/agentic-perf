@@ -2499,7 +2499,7 @@ function renderHypothesisCard(ticket) {
       'DEDUP MATCH \u2014 ' + escHtml(String(dedupResult.matched_investigation_id)) + '</div>';
     html += '<div class="result-summary">' +
       'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
-      expandableText(String(dedupResult.match_rationale || '')) + '</div>';
+      expandableText(String(dedupResult.match_rationale || ''), 200) + '</div>';
   }
   if (!verdict && synthResult) {
     var sCls = 'inconclusive';
