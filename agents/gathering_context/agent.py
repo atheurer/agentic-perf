@@ -134,11 +134,17 @@ class GatheringContextAgent(AgentBase):
             return False
 
         try:
+            # Fetch all matching open records without a
+            # limit. The query orders by created_at, but
+            # we select by min(updated_at). A record
+            # created long ago but recently updated would
+            # be missed by a small limit. Open records
+            # are a small set (typically < 100) so
+            # fetching all is safe.
             records = await provider.query(
                 state="open",
                 metric=dedup_metric,
                 platform=dedup_platform,
-                limit=10,
             )
         except Exception:
             logger.warning(
@@ -151,18 +157,76 @@ class GatheringContextAgent(AgentBase):
         if not records:
             return False
 
-        # TODO(#702): Apply temporal confidence decay.
-        # Records older than 90 days should be advisory
-        # only (skip match, surface as context). Records
-        # 30-90 days old should reduce match confidence.
-        # Currently all ages are treated as full matches.
-        matched = records[0]
+        # Temporal confidence decay (#702): older records
+        # get reduced confidence or advisory-only treatment.
+        # Use the most recently updated matching record.
+        from datetime import datetime, timezone
+
+        _FULL_CONFIDENCE_DAYS = 30
+        _ADVISORY_ONLY_DAYS = 90
+
+        now = datetime.now(timezone.utc)
+
+        def _record_age(r: Any) -> int:
+            ts = getattr(r, "updated_at", None) or getattr(r, "created_at", None)
+            if ts is None:
+                return 0  # No timestamp — treat as fresh
+            return (now - ts).days
+
+        # Pick the newest (lowest age) matching record
+        matched = min(records, key=_record_age)
         matched_id = matched.investigation_id
+        age_days = _record_age(matched)
+
+        if age_days >= _ADVISORY_ONLY_DAYS:
+            # Record is too old to block investigation.
+            # Surface as context but proceed with fresh
+            # investigation.
+            logger.info(
+                "[gathering-context] Deterministic dedup "
+                "match %s is %d days old (>%d) — "
+                "advisory only, proceeding to investigation",
+                matched_id,
+                age_days,
+                _ADVISORY_ONLY_DAYS,
+            )
+            await self._update_fields(
+                ticket_id,
+                {
+                    "dedup_advisory": {
+                        "matched_investigation_id": matched_id,
+                        "age_days": age_days,
+                        "rationale": (
+                            f"Record {matched_id} matches on "
+                            f"metric/platform but is {age_days} "
+                            f"days old. Proceeding with fresh "
+                            f"investigation — root cause may "
+                            f"no longer apply."
+                        ),
+                    },
+                },
+            )
+            return False
+
+        match_confidence = 1.0
+        age_note = ""
+        if age_days >= _FULL_CONFIDENCE_DAYS:
+            match_confidence = 0.7
+            age_note = (
+                f" Record is {age_days} days old — "
+                f"re-investigation recommended if "
+                f"platform/software context has changed."
+            )
+
         logger.info(
-            f"[gathering-context] Deterministic dedup "
-            f"match: {matched_id} "
-            f"(metric={dedup_metric}, "
-            f"platform={dedup_platform})"
+            "[gathering-context] Deterministic dedup "
+            "match: %s (metric=%s, platform=%s, "
+            "age=%dd, confidence=%.1f)",
+            matched_id,
+            dedup_metric,
+            dedup_platform,
+            age_days,
+            match_confidence,
         )
 
         # Record that the anomaly persists in this build
@@ -202,13 +266,14 @@ class GatheringContextAgent(AgentBase):
                 "dedup_result": {
                     "decision": "MATCH_FOUND",
                     "matched_investigation_id": matched_id,
-                    "match_confidence": 1.0,
+                    "match_confidence": match_confidence,
                     "match_rationale": (
                         "Deterministic match on "
                         f"metric='{dedup_metric}' "
-                        f"platform='{dedup_platform}'"
+                        f"platform='{dedup_platform}'.{age_note}"
                     ),
                     "match_method": "deterministic",
+                    "record_age_days": age_days,
                 },
             },
         )
@@ -218,9 +283,12 @@ class GatheringContextAgent(AgentBase):
             "(deterministic)\n\n"
             f"- **Matched Record:** {matched_id}\n"
             f"- **Metric:** {dedup_metric}\n"
-            f"- **Platform:** {dedup_platform}\n\n"
+            f"- **Platform:** {dedup_platform}\n"
+            f"- **Record Age:** {age_days} days\n"
+            f"- **Confidence:** {match_confidence}\n\n"
             "Skipping investigation — this anomaly "
             "matches an open Investigation Record."
+            f"{age_note}"
         )
         await self._add_comment(ticket_id, summary)
         await self._transition_ticket(
