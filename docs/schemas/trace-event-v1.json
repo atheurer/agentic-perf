@@ -1,0 +1,770 @@
+{
+  "$defs": {
+    "ActionDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
+        },
+        "target_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Type"
+        },
+        "type": {
+          "$ref": "#/$defs/ActionType"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "ActionDescriptor",
+      "type": "object"
+    },
+    "ActionType": {
+      "description": "Controlled domains that can produce a trace event.",
+      "enum": [
+        "dispatch",
+        "agent",
+        "handoff",
+        "llm",
+        "tool",
+        "mcp",
+        "operation",
+        "ssh",
+        "subprocess",
+        "api",
+        "filesystem",
+        "container",
+        "state"
+      ],
+      "title": "ActionType",
+      "type": "string"
+    },
+    "ErrorDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Message"
+        },
+        "retryable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retryable"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        }
+      },
+      "title": "ErrorDescriptor",
+      "type": "object"
+    },
+    "IdempotencyDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "fencing_token": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fencing Token"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "outcome": {
+          "$ref": "#/$defs/IdempotencyOutcome",
+          "default": "not_applicable"
+        },
+        "request_hash": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Hash"
+        }
+      },
+      "title": "IdempotencyDescriptor",
+      "type": "object"
+    },
+    "IdempotencyOutcome": {
+      "description": "Result of resolving an idempotency identity.",
+      "enum": [
+        "not_applicable",
+        "claimed",
+        "in_progress",
+        "reused",
+        "rejected",
+        "indeterminate"
+      ],
+      "title": "IdempotencyOutcome",
+      "type": "string"
+    },
+    "LifecycleDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "replay_of_action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replay Of Action Id"
+        },
+        "retry_kind": {
+          "$ref": "#/$defs/RetryKind",
+          "default": "none"
+        },
+        "state": {
+          "$ref": "#/$defs/LifecycleState"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "LifecycleDescriptor",
+      "type": "object"
+    },
+    "LifecycleState": {
+      "description": "Controlled event lifecycle vocabulary shared by every action type.",
+      "enum": [
+        "requested",
+        "claimed",
+        "started",
+        "paused",
+        "resumed",
+        "aborted",
+        "completed",
+        "failed",
+        "released",
+        "proposed",
+        "rejected",
+        "short_circuited",
+        "cancelled",
+        "connecting",
+        "connected",
+        "request_sent",
+        "request_received",
+        "duplicate_detected",
+        "response_sent",
+        "disconnected",
+        "reconnected",
+        "registered",
+        "lease_acquired",
+        "prepared",
+        "side_effect_started",
+        "reconciled",
+        "indeterminate",
+        "launched",
+        "timed_out",
+        "cleanup_started",
+        "cleanup_completed"
+      ],
+      "title": "LifecycleState",
+      "type": "string"
+    },
+    "MCPIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Request Id"
+        },
+        "protocol_request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Protocol Request Id"
+        },
+        "server": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server"
+        },
+        "server_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server Pid"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "transport": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transport"
+        }
+      },
+      "title": "MCPIdentity",
+      "type": "object"
+    },
+    "OperationOutcome": {
+      "description": "Terminal or current outcome for an action.",
+      "enum": [
+        "success",
+        "failure",
+        "cancelled",
+        "rejected",
+        "timed_out",
+        "indeterminate"
+      ],
+      "title": "OperationOutcome",
+      "type": "string"
+    },
+    "PayloadDescriptor": {
+      "additionalProperties": false,
+      "description": "Bounded payload metadata; it never contains the unbounded payload.",
+      "properties": {
+        "blob_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Blob Ref"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preview"
+        },
+        "redaction_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Redaction Applied"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        },
+        "truncated": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Truncated"
+        }
+      },
+      "title": "PayloadDescriptor",
+      "type": "object"
+    },
+    "ProducerIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "boot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Boot Id"
+        },
+        "component": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Component"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Instance Id"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pid"
+        },
+        "process_start_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Start Id"
+        }
+      },
+      "title": "ProducerIdentity",
+      "type": "object"
+    },
+    "RetryKind": {
+      "description": "Why an attempt exists, without conflating it with a replay.",
+      "enum": [
+        "none",
+        "validation",
+        "intentional_agent_retry",
+        "transport_before_send",
+        "ambiguous_after_send",
+        "transport_replay"
+      ],
+      "title": "RetryKind",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The complete immutable trace envelope for schema version 1.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ActionDescriptor"
+    },
+    "action_id": {
+      "title": "Action Id",
+      "type": "string"
+    },
+    "agent_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Agent Id"
+    },
+    "attributes": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attributes"
+    },
+    "duration_ms": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Duration Ms"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorDescriptor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "event_id": {
+      "format": "uuid",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "global_seq": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Global Seq"
+    },
+    "idempotency": {
+      "$ref": "#/$defs/IdempotencyDescriptor"
+    },
+    "input": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PayloadDescriptor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "invocation_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Invocation Id"
+    },
+    "iteration": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Iteration"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/LifecycleDescriptor"
+    },
+    "mcp": {
+      "$ref": "#/$defs/MCPIdentity"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OperationOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "output": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PayloadDescriptor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "parent_action_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Action Id"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerIdentity"
+    },
+    "recorded_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Recorded At"
+    },
+    "schema_version": {
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "ticket_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ticket Id"
+    },
+    "ticket_seq": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ticket Seq"
+    },
+    "tool_call_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool Call Id"
+    },
+    "trace_id": {
+      "title": "Trace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "action",
+    "lifecycle"
+  ],
+  "title": "TraceEventV1",
+  "type": "object"
+}
