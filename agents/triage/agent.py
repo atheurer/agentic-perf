@@ -653,6 +653,13 @@ class TriageAgent(AgentBase):
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
                 directives[key] = cf[key]
+        # Code-enforce harness for workflow tickets.
+        # When workflow_source is set, the benchmark agent
+        # must use MCP workflow tools, not direct plugin
+        # execution. The 'arcaflow' harness key routes to
+        # the workflow tool set.
+        if directives.get("workflow_source"):
+            directives["harness"] = "arcaflow"
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
