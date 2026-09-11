@@ -835,6 +835,36 @@ class AgentBase(ABC):
                             continue
 
                 if response.stop_reason == "end_turn" or not response.tool_calls:
+                    # Retry once on completely empty responses
+                    # (no text, no tool calls). Some models
+                    # (Gemini) occasionally return 0 output
+                    # tokens on valid prompts but succeed on
+                    # the next attempt.
+                    if (
+                        not (response.text or "").strip()
+                        and not response.tool_calls
+                        and not getattr(self, "_empty_response_retried", False)
+                    ):
+                        self._empty_response_retried = True
+                        logger.warning(
+                            "[%s] Empty response (0 output "
+                            "tokens) on %s at iter %d "
+                            "— retrying",
+                            self.agent_name,
+                            ticket_id,
+                            iteration,
+                        )
+                        self._emit(
+                            ticket_id,
+                            "agent_error",
+                            {
+                                "reason": "empty_response",
+                                "iteration": iteration,
+                                "action": "retry",
+                            },
+                        )
+                        continue
+
                     logger.info(
                         f"[{self.agent_name}] end_turn/no_tools at iter "
                         f"{iteration}, stop_reason={response.stop_reason}, "
