@@ -869,14 +869,26 @@ schema discovery.
     "external_mcp_servers": [
         {
             "name": "arcaflow",
-            "command": ["arcaflow-mcp", "--transport", "stdio"],
+            "command": ["arcaflow-mcp", "--enable-execution"],
             "transport": "stdio",
             "agents": {
                 "triage": {
                     "enabled_tools": ["plugin_list"]
                 },
                 "benchmark": {
-                    "enabled_tools": "all"
+                    "enabled_tools": [
+                        "plugin_list",
+                        "plugin_describe",
+                        "workflow_load",
+                        "workflow_list",
+                        "workflow_input_build",
+                        "workflow_input_validate",
+                        "workflow_input_export",
+                        "workflow_execute",
+                        "workflow_execution_status",
+                        "workflow_execution_cancel",
+                        "workflow_execution_output"
+                    ]
                 },
                 "review": {
                     "enabled_tools": [
