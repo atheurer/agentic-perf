@@ -1,5 +1,6 @@
 """Canonical tracing contracts and causal context helpers."""
 
+from .client import TraceClient, TraceDeliveryError
 from .context import (
     TraceContext,
     bind_trace_context,
@@ -31,6 +32,13 @@ from .payloads import (
     PayloadStorageError,
     canonicalize_payload,
 )
+from .spool import (
+    SpoolBackpressure,
+    SpoolCorruption,
+    SpoolError,
+    TraceSpool,
+    drain_abandoned_spools,
+)
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -58,4 +66,11 @@ __all__ = [
     "new_trace_context",
     "reset_trace_context",
     "canonicalize_payload",
+    "TraceClient",
+    "TraceDeliveryError",
+    "TraceSpool",
+    "SpoolError",
+    "SpoolBackpressure",
+    "SpoolCorruption",
+    "drain_abandoned_spools",
 ]

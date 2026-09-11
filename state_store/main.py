@@ -7,13 +7,15 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from orchestrator.config import _load_config_file
-from paths import TRACE_DB_PATH
+from paths import TRACE_DB_PATH, get_instance_name
 from providers.events import EventBus
 
 from .api.router import api_router, chat_router, health_router, webhook_router
@@ -75,6 +77,21 @@ def mount_routers(
 def create_app() -> FastAPI:
     app = FastAPI(title="Agentic Perf State Store", version="0.1.0")
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
+    app.state.trace_instance_id = get_instance_name()
+    app.state.trace_health = {
+        "ingested": 0,
+        "ingestion_failures": 0,
+        "schema_rejections": 0,
+        "quarantined_frames": 0,
+    }
+
+    @app.exception_handler(RequestValidationError)
+    async def count_trace_schema_rejections(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        if request.url.path.startswith("/api/v1/traces/events"):
+            app.state.trace_health["schema_rejections"] += 1
+        return await request_validation_exception_handler(request, exc)
 
     @app.on_event("shutdown")
     def close_trace_store() -> None:

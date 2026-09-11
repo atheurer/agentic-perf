@@ -135,6 +135,10 @@ class TraceStore:
 
     def insert_event(self, event: TraceEventV1) -> TraceEventV1:
         """Append an event, or return its original record for an exact replay."""
+        return self.insert_event_result(event)[0]
+
+    def insert_event_result(self, event: TraceEventV1) -> tuple[TraceEventV1, bool]:
+        """Atomically insert or return ``(event, duplicate)`` for a replay."""
         try:
             connection = self._open_connection()
             _, content_hash = self._content(event)
@@ -149,7 +153,7 @@ class TraceStore:
                     raise TraceEventConflictError(
                         f"event {event.event_id} already exists with different content"
                     )
-                return TraceEventV1.model_validate_json(existing["event_json"])
+                return TraceEventV1.model_validate_json(existing["event_json"]), True
             global_seq = connection.execute(
                 "SELECT COALESCE(MAX(global_seq), 0) + 1 FROM trace_events"
             ).fetchone()[0]
@@ -187,7 +191,7 @@ class TraceStore:
                 ),
             )
             connection.commit()
-            return stored
+            return stored, False
         except TraceEventConflictError:
             raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
