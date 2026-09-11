@@ -14,7 +14,7 @@ from typing import Any
 
 from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
-from paths import LOCK_FILE
+from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
@@ -1548,8 +1548,24 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     status_names = list(STATUS_AGENT_MAP)
     status_offset = 0
     was_at_capacity = False
+    last_trace_sweep = 0.0
+    trace_sweep_task: asyncio.Task | None = None
 
     while True:
+        if time.monotonic() - last_trace_sweep >= 60.0 and (
+            trace_sweep_task is None or trace_sweep_task.done()
+        ):
+            if trace_sweep_task is not None:
+                try:
+                    trace_sweep_task.result()
+                except Exception:
+                    logger.exception("Trace spool sweep failed")
+            # Network delivery may wait through an outage; never block ticket
+            # dispatch on orphan recovery.
+            trace_sweep_task = asyncio.create_task(
+                asyncio.to_thread(_sweep_trace_spools)
+            )
+            last_trace_sweep = time.monotonic()
         # Check system-wide budget before dispatching
         if system_budget is not None and events is not None:
             from providers.budget import (
@@ -1880,6 +1896,28 @@ def _auth_headers() -> dict[str, str]:
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
+
+
+def _sweep_trace_spools() -> None:
+    """Best-effort restart recovery for orphaned MCP producer spools."""
+    from providers.tracing import TraceClient, TraceDeliveryError
+
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if not token:
+        return
+    url, _ = resolve_state_store()
+    client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)
+    try:
+        count = client.sweep_abandoned()
+        if count:
+            logger.info("Drained %d abandoned trace spool event(s)", count)
+    except TraceDeliveryError:
+        logger.warning("Trace spool sweep deferred: state store unavailable")
+    finally:
+        try:
+            client.close()
+        except TraceDeliveryError:
+            pass
 
 
 def main():
