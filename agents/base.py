@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import httpx
 
@@ -1455,25 +1456,69 @@ class AgentBase(ABC):
             await asyncio.sleep(self._tool_min_interval - elapsed)
         self._last_tool_call_time = time.monotonic()
 
+    def _normalize_tool_input(
+        self, tool_call: ToolCall
+    ) -> tuple[dict[str, Any], str | None]:
+        """Separate in-flight jq filtering only when the selected schema omits it.
+
+        The advertised schema is the compatibility contract.  A handler failure
+        must not be used to decide whether a tool accepts ``jq_filter`` because
+        that would risk replaying a side-effecting call.
+        """
+        call_input = dict(tool_call.input) if tool_call.input else {}
+        if tool_call.name == "jq_file_from_workspace":
+            return call_input, None
+
+        tool_def = next(
+            (tool for tool in self.tools if tool.name == tool_call.name), None
+        )
+        properties = tool_def.input_schema.get("properties", {}) if tool_def else {}
+        if "jq_filter" in properties:
+            return call_input, None
+
+        jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
+            "jq_file_from_workspace", None
+        )
+        return call_input, str(
+            jq_filter
+        ).strip() or None if jq_filter is not None else None
+
+    @staticmethod
+    def _tool_error_content(
+        error: Exception | str,
+        retry_classification: Literal[
+            "validation",
+            "intentional_agent_retry",
+            "transport_before_send",
+            "ambiguous_after_send",
+        ],
+    ) -> str:
+        """Return retry context without scheduling an automatic retry."""
+        return json.dumps(
+            {
+                "error": str(error),
+                "retry_classification": retry_classification,
+            }
+        )
+
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         await self._throttle_tool_call()
 
-        call_input = dict(tool_call.input) if tool_call.input else {}
-        jq_filter = None
-        if tool_call.name != "jq_file_from_workspace":
-            jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
-                "jq_file_from_workspace", None
-            )
-            if jq_filter is not None:
-                jq_filter = str(jq_filter).strip() or None
+        call_input, jq_filter = self._normalize_tool_input(tool_call)
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
             try:
                 try:
-                    result = await handler(**call_input)
-                except TypeError:
-                    result = await handler(**tool_call.input)
+                    inspect.signature(handler).bind(**call_input)
+                except TypeError as e:
+                    return ToolResult(
+                        tool_use_id=tool_call.id,
+                        content=self._tool_error_content(e, "validation"),
+                        is_error=True,
+                    )
+
+                result = await handler(**call_input)
 
                 if isinstance(result, str):
                     content = result
@@ -1489,16 +1534,13 @@ class AgentBase(ABC):
                 logger.exception(f"[{self.agent_name}] Tool {tool_call.name} failed")
                 return ToolResult(
                     tool_use_id=tool_call.id,
-                    content=f"Tool error: {e}",
+                    content=self._tool_error_content(e, "ambiguous_after_send"),
                     is_error=True,
                 )
 
         if self._mcp is not None:
             try:
-                try:
-                    content = await self._mcp.call_tool(tool_call.name, call_input)
-                except Exception:
-                    content = await self._mcp.call_tool(tool_call.name, tool_call.input)
+                content = await self._mcp.call_tool(tool_call.name, call_input)
 
                 content = self._spill_tool_output(
                     tool_call.name, content, jq_filter=jq_filter
@@ -1507,12 +1549,15 @@ class AgentBase(ABC):
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise
             except Exception as e:
+                retry_classification = getattr(
+                    e, "retry_classification", "ambiguous_after_send"
+                )
                 logger.exception(
                     f"[{self.agent_name}] MCP tool {tool_call.name} failed"
                 )
                 return ToolResult(
                     tool_use_id=tool_call.id,
-                    content=f"Tool error: {e}",
+                    content=self._tool_error_content(e, retry_classification),
                     is_error=True,
                 )
 
