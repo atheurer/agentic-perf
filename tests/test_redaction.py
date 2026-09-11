@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from urllib.parse import quote as url_quote
 
@@ -127,6 +128,33 @@ class TestValueRedaction:
         text = f"value is {meta_val}"
         result = redactor.redact_string(TICKET, text)
         assert meta_val not in result
+
+    def test_concurrent_registration_has_a_deterministic_marker(self) -> None:
+        redactor = Redactor()
+        values = [("z-path", "samevalue"), ("a-path", "samevalue")]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda item: redactor.register(TICKET, *item), values))
+        assert redactor.redact_string(TICKET, "samevalue") == "[REDACTED:a-path]"
+
+    def test_concurrent_register_and_redact_never_exposes_registered_values(
+        self,
+    ) -> None:
+        redactor = Redactor()
+        values = [f"concurrent-secret-{number:02d}" for number in range(32)]
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(redactor.register, TICKET, f"path-{number:02d}", value)
+                for number, value in enumerate(values)
+            ]
+            redactions = [
+                executor.submit(redactor.redact_string, TICKET, value)
+                for value in values
+            ]
+            for future in futures:
+                future.result()
+            outputs = [future.result() for future in redactions]
+        outputs.extend(redactor.redact_string(TICKET, value) for value in values)
+        assert all(value not in output for value, output in zip(values, outputs[-32:]))
 
 
 # ── 3. Redaction — patterns ──────────────────────────────────

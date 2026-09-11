@@ -25,6 +25,12 @@ from .models import (
     RetryKind,
     TraceEventV1,
 )
+from .payloads import (
+    PayloadBlobStore,
+    PayloadBuilder,
+    PayloadStorageError,
+    canonicalize_payload,
+)
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -39,6 +45,9 @@ __all__ = [
     "MonotonicTimer",
     "OperationOutcome",
     "PayloadDescriptor",
+    "PayloadBlobStore",
+    "PayloadBuilder",
+    "PayloadStorageError",
     "ProducerIdentity",
     "RetryKind",
     "TraceContext",
@@ -48,4 +57,5 @@ __all__ = [
     "current_trace_context",
     "new_trace_context",
     "reset_trace_context",
+    "canonicalize_payload",
 ]
