@@ -144,7 +144,17 @@ RUN mkdir -p /opt/app-root/src/.ssh && \
     ssh-keygen -t ed25519 -f /opt/app-root/src/.ssh/id_ed25519 -N "" -q && \
     chmod 770 /opt/app-root/src/.ssh && \
     chmod 660 /opt/app-root/src/.ssh/* && \
-    chown -R 1001:0 /opt/app-root/src/.ssh
+    chown -R 1001:0 /opt/app-root/src/.ssh && \
+    # Also install the key at /root/.ssh so it's accessible
+    # when HOME=/root (OpenShift arbitrary UID runs as root).
+    # The ticket's ssh_key_path (~/.ssh/id_ed25519) resolves
+    # to /root/.ssh/id_ed25519.
+    mkdir -p /root/.ssh && \
+    cp /opt/app-root/src/.ssh/id_ed25519 /root/.ssh/id_ed25519 && \
+    cp /opt/app-root/src/.ssh/id_ed25519.pub /root/.ssh/id_ed25519.pub && \
+    chmod 700 /root/.ssh && \
+    chmod 600 /root/.ssh/id_ed25519 && \
+    chmod 644 /root/.ssh/id_ed25519.pub
 
 USER 1001
 
