@@ -3424,8 +3424,8 @@ async def execute_boot_time_test(
 
     while proc.returncode is None:
         try:
-            stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-                proc.communicate(),
+            await _asyncio.wait_for(
+                proc.wait(),
                 timeout=_STALL_CHECK_INTERVAL,
             )
             break  # Process finished
@@ -3439,7 +3439,7 @@ async def execute_boot_time_test(
                     benchmark_timeout,
                 )
                 proc.kill()
-                stdout_bytes, stderr_bytes = await proc.communicate()
+                await proc.wait()
                 break
 
             # Count artifact files for stall detection
@@ -3460,9 +3460,14 @@ async def execute_boot_time_test(
                     file_count,
                 )
                 proc.kill()
-                stdout_bytes, stderr_bytes = await proc.communicate()
+                await proc.wait()
                 stall_killed = True
                 break
+
+    # Collect output after process ends.
+    # communicate() is safe to call here since the process
+    # has already exited (wait() completed or kill() called).
+    stdout_bytes, stderr_bytes = await proc.communicate()
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
