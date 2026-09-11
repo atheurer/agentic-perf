@@ -41,6 +41,19 @@ def _process_insert(path: str) -> tuple[int, int]:
     return stored.global_seq, stored.ticket_seq
 
 
+def _cold_start_insert(
+    path: str, ready: object, start: object, results: object
+) -> None:
+    """Open only after peers are ready to force a cold-start initialization race."""
+    ready.put(None)
+    start.wait()
+    try:
+        global_seq, ticket_seq = _process_insert(path)
+        results.put((global_seq, ticket_seq, None))
+    except Exception as exc:  # pragma: no cover - returned to parent for assertion
+        results.put((None, None, repr(exc)))
+
+
 def test_concurrent_writers_have_gap_free_sequences(tmp_path: Path) -> None:
     path = tmp_path / "trace.db"
 
@@ -54,13 +67,30 @@ def test_concurrent_writers_have_gap_free_sequences(tmp_path: Path) -> None:
     assert sorted(item.ticket_seq for item in stored) == list(range(1, 25))
 
 
-def test_multiprocess_writers_have_gap_free_sequences(tmp_path: Path) -> None:
+def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:
     path = tmp_path / "trace.db"
     context = get_context("spawn")
-    with context.Pool(4) as pool:
-        stored = pool.map(_process_insert, [str(path)] * 16)
-    assert sorted(global_seq for global_seq, _ in stored) == list(range(1, 17))
-    assert sorted(ticket_seq for _, ticket_seq in stored) == list(range(1, 17))
+    ready = context.Queue()
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_cold_start_insert, args=(str(path), ready, start, results)
+        )
+        for _ in range(8)
+    ]
+    for process in processes:
+        process.start()
+    for _ in processes:
+        ready.get(timeout=10)
+    start.set()
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    stored = [results.get(timeout=5) for _ in processes]
+    assert [failure for _, _, failure in stored if failure] == []
+    assert sorted(global_seq for global_seq, _, _ in stored) == list(range(1, 9))
+    assert sorted(ticket_seq for _, ticket_seq, _ in stored) == list(range(1, 9))
 
 
 def test_restart_is_idempotent_and_continues_sequences(tmp_path: Path) -> None:

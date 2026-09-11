@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,8 +57,11 @@ class TraceStore:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-            self._connection.execute("PRAGMA journal_mode = WAL")
-            check = self._connection.execute("PRAGMA integrity_check").fetchone()[0]
+            deadline = time.monotonic() + busy_timeout_ms / 1000
+            self._startup_execute("PRAGMA journal_mode = WAL", deadline)
+            check = self._startup_execute(
+                "PRAGMA integrity_check", deadline
+            ).fetchone()[0]
             if check != "ok":
                 raise TraceStoreMigrationError(
                     f"trace database integrity check failed: {check}"
@@ -77,6 +81,24 @@ class TraceStore:
             raise TraceStoreMigrationError(
                 "could not initialize trace database"
             ) from exc
+
+    def _startup_execute(self, statement: str, deadline: float) -> sqlite3.Cursor:
+        """Run startup pragmas while other processes initialize the same DB.
+
+        SQLite serializes the WAL mode transition independently of the migration
+        transaction.  Retrying only lock/busy failures keeps simultaneous first
+        opens reliable while retaining a finite, explicit startup failure.
+        """
+        while True:
+            try:
+                return self._connection.execute(statement)
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.025, max(0, deadline - time.monotonic())))
 
     def close(self) -> None:
         """Close the connection; safe to call after a failed initialization."""
