@@ -360,8 +360,13 @@ class AgentMCPClient:
         if self.pre_call_hook is not None:
             try:
                 short_circuit = await self.pre_call_hook(name, arguments)
+            except MCPToolCallError:
+                raise
             except Exception as e:
-                raise MCPToolCallError(str(e), "transport_before_send") from e
+                # Hooks can dispatch themselves (for example, Jumpstarter's
+                # connection guard), so this boundary cannot prove no request
+                # was sent.  Preserve explicitly classified failures only.
+                raise MCPToolCallError(str(e), "ambiguous_after_send") from e
             if short_circuit is not None:
                 return short_circuit
 

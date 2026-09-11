@@ -1534,7 +1534,7 @@ class AgentBase(ABC):
                 logger.exception(f"[{self.agent_name}] Tool {tool_call.name} failed")
                 return ToolResult(
                     tool_use_id=tool_call.id,
-                    content=self._tool_error_content(e, "intentional_agent_retry"),
+                    content=self._tool_error_content(e, "ambiguous_after_send"),
                     is_error=True,
                 )
 

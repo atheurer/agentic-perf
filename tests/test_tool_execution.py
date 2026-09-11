@@ -46,9 +46,7 @@ async def test_native_type_error_after_entry_is_not_replayed(agent):
 
     assert calls == 1
     assert result.is_error
-    assert (
-        json.loads(result.content)["retry_classification"] == "intentional_agent_retry"
-    )
+    assert json.loads(result.content)["retry_classification"] == "ambiguous_after_send"
 
 
 async def test_mcp_failure_after_call_is_not_replayed(agent):
@@ -77,6 +75,38 @@ async def test_mcp_client_marks_session_failure_as_ambiguous_after_send():
 
     assert exc_info.value.retry_classification == "ambiguous_after_send"
     assert session.call_tool.await_count == 1
+
+
+async def test_mcp_hook_dispatch_failure_is_ambiguous_and_not_replayed():
+    dispatched = AsyncMock()
+
+    async def hook(name: str, arguments: dict[str, object]) -> None:
+        await dispatched(name, arguments)
+        raise RuntimeError("connection lost after hook dispatch")
+
+    client = AgentMCPClient()
+    client._tool_routing["mutate"] = "test-server"
+    client.pre_call_hook = hook
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("mutate", {"value": 1})
+
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    dispatched.assert_awaited_once_with("mutate", {"value": 1})
+
+
+async def test_mcp_hook_preserves_typed_failure_classification():
+    async def hook(name: str, arguments: dict[str, object]) -> None:
+        raise MCPToolCallError("invalid request", "validation")
+
+    client = AgentMCPClient()
+    client._tool_routing["mutate"] = "test-server"
+    client.pre_call_hook = hook
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("mutate", {})
+
+    assert exc_info.value.retry_classification == "validation"
 
 
 async def test_jq_filter_is_stripped_only_when_schema_omits_it(agent):
