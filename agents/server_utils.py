@@ -236,36 +236,30 @@ def emit_private_tool_audit_event(
     """Record private tool diagnostics outside the MCP response.
 
     Local MCP tools can use this for structured diagnostics that must be
-    available to operators but must not become model context.  The payload is
-    redacted and written only to the ticket event log.
+    available to operators but must not become model context. The payload is
+    redacted and written through the canonical trace store.
     """
     if not ticket_id:
         return
     import json as _json
-    from datetime import datetime, timezone
 
-    from paths import LOG_DIR
+    from paths import TRACE_DB_PATH
+    from providers.event_projection import legacy_to_trace
+    from state_store.trace_store import TraceStore, TraceStoreWriteError
 
     redactor = _get_progress_redactor()
     payload = redactor.redact_string(ticket_id, _json.dumps(data, default=str))
     try:
-        path = LOG_DIR / f"{ticket_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(
-                _json.dumps(
-                    {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "ticket_id": ticket_id,
-                        "agent": agent_name,
-                        "event_type": event_type,
-                        "data": {"tool": tool_name, "details": _json.loads(payload)},
-                    },
-                    default=str,
+        with TraceStore(TRACE_DB_PATH) as trace_store:
+            trace_store.insert_event(
+                legacy_to_trace(
+                    ticket_id,
+                    agent_name,
+                    event_type,
+                    {"tool": tool_name, "details": _json.loads(payload)},
                 )
-                + "\n"
             )
-    except (OSError, ValueError):
+    except (OSError, ValueError, TraceStoreWriteError):
         logger.debug(
             "Failed to write context audit event for %s", ticket_id, exc_info=True
         )
@@ -1211,8 +1205,7 @@ async def tool_progress(
 ) -> None:
     """Post a progress update to the ticket from within an MCP tool.
 
-    Creates both a comment (via the state store API) and an event
-    (appended directly to the JSONL event log) so the web UI can
+    Creates both a comment (via the state store API) and a canonical event so the web UI can
     display progress in real time.
 
     The event uses type "tool_progress" so the UI can distinguish
@@ -1272,33 +1265,24 @@ def _emit_tool_progress_event(
     author: str,
     message: str,
 ) -> None:
-    """Append a tool_progress event directly to the JSONL event log.
+    """Record a tool_progress event through the canonical trace store.
 
     Applies pattern-only redaction (no value registry — the MCP
     subprocess has no access to the orchestrator's secret registry).
     """
-    import json as _json
-    from datetime import datetime, timezone
-
-    from paths import LOG_DIR
+    from paths import TRACE_DB_PATH
+    from providers.event_projection import legacy_to_trace
+    from state_store.trace_store import TraceStore, TraceStoreWriteError
 
     redactor = _get_progress_redactor()
     message = redactor.redact_string(ticket_id, message)
 
-    log_dir = LOG_DIR
-    path = log_dir / f"{ticket_id}.jsonl"
-
     try:
-        event = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ticket_id": ticket_id,
-            "agent": author,
-            "event_type": "tool_progress",
-            "data": {"body": message},
-        }
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(_json.dumps(event, default=str) + "\n")
-    except OSError:
+        with TraceStore(TRACE_DB_PATH) as trace_store:
+            trace_store.insert_event(
+                legacy_to_trace(ticket_id, author, "tool_progress", {"body": message})
+            )
+    except (OSError, TraceStoreWriteError):
         logger.debug(
             "Failed to write tool_progress event for %s", ticket_id, exc_info=True
         )
