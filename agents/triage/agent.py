@@ -581,6 +581,20 @@ class TriageAgent(AgentBase):
                 "comparison.\n"
             )
 
+        # Surface existing directives so the LLM knows
+        # what the user already specified (e.g., workflow_source,
+        # board_selector set at ticket creation).
+        existing_directives = cf.get("directives", {})
+        if existing_directives:
+            content += "\n## User-Provided Directives\n\n"
+            content += (
+                "These directives were set at ticket creation. "
+                "Include them in your submit_triage_result "
+                "directives — do NOT ask the user to provide "
+                "information that is already here.\n\n"
+                f"```json\n{json.dumps(existing_directives, indent=2)}\n```\n"
+            )
+
         _TRIAGE_NOISE_AUTHORS = frozenset({"system", "orchestrator"})
         relevant_comments = [
             c
