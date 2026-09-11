@@ -355,6 +355,15 @@ class AgentMCPClient:
         if server_name is None:
             raise MCPToolCallError(f"No server provides tool {name!r}", "validation")
 
+        # A stale route without a connection is known to fail before either a
+        # provider hook or the session can dispatch a request.
+        conn = self._servers.get(server_name)
+        if conn is None:
+            raise MCPToolCallError(
+                f"No active connection for MCP server {server_name!r}",
+                "transport_before_send",
+            )
+
         # Pre-call hook: provider-specific guards
         # (e.g., Jumpstarter one-connect, timeout).
         if self.pre_call_hook is not None:
@@ -370,7 +379,6 @@ class AgentMCPClient:
             if short_circuit is not None:
                 return short_circuit
 
-        conn = self._servers[server_name]
         try:
             result = await conn.session.call_tool(name, arguments)
         except Exception as e:

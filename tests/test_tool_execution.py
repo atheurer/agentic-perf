@@ -77,6 +77,22 @@ async def test_mcp_client_marks_session_failure_as_ambiguous_after_send():
     assert session.call_tool.await_count == 1
 
 
+async def test_mcp_client_missing_connection_fails_before_dispatch():
+    session = MagicMock()
+    session.call_tool = AsyncMock()
+    hook = AsyncMock()
+    client = AgentMCPClient()
+    client._tool_routing["mutate"] = "missing-server"
+    client.pre_call_hook = hook
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("mutate", {})
+
+    assert exc_info.value.retry_classification == "transport_before_send"
+    hook.assert_not_awaited()
+    session.call_tool.assert_not_awaited()
+
+
 async def test_mcp_hook_dispatch_failure_is_ambiguous_and_not_replayed():
     dispatched = AsyncMock()
 
@@ -86,6 +102,9 @@ async def test_mcp_hook_dispatch_failure_is_ambiguous_and_not_replayed():
 
     client = AgentMCPClient()
     client._tool_routing["mutate"] = "test-server"
+    client._servers["test-server"] = _ServerConnection(
+        name="test-server", session=MagicMock()
+    )
     client.pre_call_hook = hook
 
     with pytest.raises(MCPToolCallError) as exc_info:
@@ -101,6 +120,9 @@ async def test_mcp_hook_preserves_typed_failure_classification():
 
     client = AgentMCPClient()
     client._tool_routing["mutate"] = "test-server"
+    client._servers["test-server"] = _ServerConnection(
+        name="test-server", session=MagicMock()
+    )
     client.pre_call_hook = hook
 
     with pytest.raises(MCPToolCallError) as exc_info:
