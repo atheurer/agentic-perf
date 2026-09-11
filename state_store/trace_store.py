@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from providers.tracing import TraceEventV1
+from providers.tracing import PayloadDescriptor, TraceEventV1
 
 from .trace_migrations import migrate
 
@@ -30,6 +30,10 @@ class TraceStoreWriteError(TraceStoreError):
 
 class TraceEventConflictError(TraceStoreError):
     """An event ID was reused with different immutable content."""
+
+
+class TracePayloadConflictError(TraceStoreWriteError):
+    """A payload digest was reused with incompatible safe metadata."""
 
 
 @dataclass(frozen=True)
@@ -191,6 +195,57 @@ class TraceStore:
             if connection is not None and connection.in_transaction:
                 connection.rollback()
             raise TraceStoreWriteError("could not write trace event") from exc
+
+    def put_payload_descriptor(self, descriptor: PayloadDescriptor) -> None:
+        """Persist safe payload metadata only; payload bytes are never stored in SQLite."""
+        if not descriptor.digest:
+            raise TraceStoreWriteError("payload descriptor requires a digest")
+        try:
+            connection = self._open_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            encoded = descriptor.model_dump_json()
+            existing = connection.execute(
+                "SELECT descriptor_json FROM trace_payloads WHERE digest = ?",
+                (descriptor.digest,),
+            ).fetchone()
+            if existing is not None:
+                connection.rollback()
+                if existing["descriptor_json"] != encoded:
+                    raise TracePayloadConflictError(
+                        f"payload {descriptor.digest} already has different metadata"
+                    )
+                return
+            connection.execute(
+                "INSERT INTO trace_payloads(digest, descriptor_json) VALUES (?, ?)",
+                (descriptor.digest, encoded),
+            )
+            connection.commit()
+        except TracePayloadConflictError:
+            raise
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            connection = getattr(self, "_connection", None)
+            if connection is not None and connection.in_transaction:
+                connection.rollback()
+            raise TraceStoreWriteError("could not write payload metadata") from exc
+
+    def get_payload_descriptor(self, digest: str) -> PayloadDescriptor | None:
+        """Return a safe descriptor; this API intentionally cannot retrieve blobs."""
+        try:
+            row = (
+                self._open_connection()
+                .execute(
+                    "SELECT descriptor_json FROM trace_payloads WHERE digest = ?",
+                    (digest,),
+                )
+                .fetchone()
+            )
+            return (
+                PayloadDescriptor.model_validate_json(row["descriptor_json"])
+                if row is not None
+                else None
+            )
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            raise TraceStoreWriteError("could not read payload metadata") from exc
 
     def create_operation(self, operation: OperationRecord) -> OperationRecord:
         """Persist an operation record; operation lifecycle policy lives elsewhere."""

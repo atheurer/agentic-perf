@@ -27,6 +27,7 @@ TRACE_SPOOL_DIR = AGENTIC_PERF_HOME / "trace-spool"
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")
 )
+TRACE_AUDIT_KEY_PATH = SECRETS_DIR / "trace-audit-key"
 ARTIFACT_DIR = Path(
     os.environ.get("AGENTIC_PERF_ARTIFACTS", AGENTIC_PERF_HOME / "artifacts")
 )
