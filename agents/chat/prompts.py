@@ -109,9 +109,13 @@ What to put in the ticket:
 - **description**: the user's request in their own words,
   including any specifics they provided (board, OS, samples,
   benchmark type, goals)
-- **directives**: only fields the user explicitly specified
-  (board_selector, image_version, samples, harness). Do NOT
-  invent fields the user didn't mention.
+- **directives**: only set directives the user explicitly
+  mentioned (e.g. harness, board_selector, image_version,
+  image_name, endpoint_type). Do NOT invent directives the
+  user didn't mention. See the ticket-directives docs for
+  the full list of supported fields.
+- **samples**: set as a top-level custom field
+  (`custom_fields.samples`), not inside directives.
 
 What NOT to do:
 - Do NOT ask the user to choose a harness if they described
