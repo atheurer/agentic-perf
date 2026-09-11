@@ -152,9 +152,10 @@ RUN mkdir -p /opt/app-root/src/.ssh && \
     mkdir -p /root/.ssh && \
     cp /opt/app-root/src/.ssh/id_ed25519 /root/.ssh/id_ed25519 && \
     cp /opt/app-root/src/.ssh/id_ed25519.pub /root/.ssh/id_ed25519.pub && \
-    chmod 700 /root/.ssh && \
-    chmod 600 /root/.ssh/id_ed25519 && \
-    chmod 644 /root/.ssh/id_ed25519.pub
+    chmod 770 /root/.ssh && \
+    chmod 660 /root/.ssh/id_ed25519 && \
+    chmod 660 /root/.ssh/id_ed25519.pub && \
+    chown -R 0:0 /root/.ssh
 
 USER 1001
 

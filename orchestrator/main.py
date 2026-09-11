@@ -1429,14 +1429,33 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                 if command:
                     import asyncio
 
-                    asyncio.get_event_loop().run_until_complete(
-                        arcaflow_mcp.connect_command(
-                            command=command[0],
-                            args=command[1:] if len(command) > 1 else [],
-                            name="arcaflow",
-                            env=srv.get("env"),
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop and loop.is_running():
+                        # Inside an async context — schedule
+                        # and wait (should not happen at startup)
+
+                        future = asyncio.run_coroutine_threadsafe(
+                            arcaflow_mcp.connect_command(
+                                command=command[0],
+                                args=(command[1:] if len(command) > 1 else []),
+                                name="arcaflow",
+                                env=srv.get("env"),
+                            ),
+                            loop,
                         )
-                    )
+                        future.result(timeout=30)
+                    else:
+                        asyncio.run(
+                            arcaflow_mcp.connect_command(
+                                command=command[0],
+                                args=(command[1:] if len(command) > 1 else []),
+                                name="arcaflow",
+                                env=srv.get("env"),
+                            )
+                        )
                     logger.info(
                         "[orchestrator] Arcaflow MCP connected for plugin discovery"
                     )
