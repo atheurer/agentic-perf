@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -156,9 +156,13 @@ class IdempotencyDescriptor(TraceModel):
 class PayloadDescriptor(TraceModel):
     """Bounded payload metadata; it never contains the unbounded payload."""
 
+    # Kept for the initial v1 schema; it is the original byte count.
     size_bytes: int | None = Field(default=None, ge=0)
+    original_size_bytes: int | None = Field(default=None, ge=0)
+    redacted_size_bytes: int | None = Field(default=None, ge=0)
     media_type: str | None = None
     digest: str | None = None
+    digest_kind: Literal["sha256", "hmac-sha256"] | None = None
     preview: str | None = None
     blob_ref: str | None = None
     truncated: bool | None = None

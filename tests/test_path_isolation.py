@@ -51,6 +51,7 @@ class TestPathIsolation:
             paths.TRACE_DB_PATH,
             paths.TRACE_PAYLOAD_DIR,
             paths.TRACE_SPOOL_DIR,
+            paths.TRACE_AUDIT_KEY_PATH,
         ):
             assert path.resolve().is_relative_to(_SANDBOX)
 

@@ -3,6 +3,9 @@
     "ActionDescriptor": {
       "additionalProperties": false,
       "properties": {
+        "type": {
+          "$ref": "#/$defs/ActionType"
+        },
         "phase": {
           "anyOf": [
             {
@@ -14,18 +17,6 @@
           ],
           "default": null,
           "title": "Phase"
-        },
-        "target": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Target"
         },
         "target_type": {
           "anyOf": [
@@ -39,8 +30,17 @@
           "default": null,
           "title": "Target Type"
         },
-        "type": {
-          "$ref": "#/$defs/ActionType"
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
         }
       },
       "required": [
@@ -72,6 +72,18 @@
     "ErrorDescriptor": {
       "additionalProperties": false,
       "properties": {
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        },
         "code": {
           "anyOf": [
             {
@@ -107,18 +119,6 @@
           ],
           "default": null,
           "title": "Retryable"
-        },
-        "type": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Type"
         }
       },
       "title": "ErrorDescriptor",
@@ -127,19 +127,6 @@
     "IdempotencyDescriptor": {
       "additionalProperties": false,
       "properties": {
-        "fencing_token": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Fencing Token"
-        },
         "key": {
           "anyOf": [
             {
@@ -152,10 +139,6 @@
           "default": null,
           "title": "Key"
         },
-        "outcome": {
-          "$ref": "#/$defs/IdempotencyOutcome",
-          "default": "not_applicable"
-        },
         "request_hash": {
           "anyOf": [
             {
@@ -167,6 +150,23 @@
           ],
           "default": null,
           "title": "Request Hash"
+        },
+        "outcome": {
+          "$ref": "#/$defs/IdempotencyOutcome",
+          "default": "not_applicable"
+        },
+        "fencing_token": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fencing Token"
         }
       },
       "title": "IdempotencyDescriptor",
@@ -188,11 +188,18 @@
     "LifecycleDescriptor": {
       "additionalProperties": false,
       "properties": {
+        "state": {
+          "$ref": "#/$defs/LifecycleState"
+        },
         "attempt": {
           "default": 1,
           "minimum": 1,
           "title": "Attempt",
           "type": "integer"
+        },
+        "retry_kind": {
+          "$ref": "#/$defs/RetryKind",
+          "default": "none"
         },
         "replay_of_action_id": {
           "anyOf": [
@@ -205,13 +212,6 @@
           ],
           "default": null,
           "title": "Replay Of Action Id"
-        },
-        "retry_kind": {
-          "$ref": "#/$defs/RetryKind",
-          "default": "none"
-        },
-        "state": {
-          "$ref": "#/$defs/LifecycleState"
         }
       },
       "required": [
@@ -265,30 +265,6 @@
     "MCPIdentity": {
       "additionalProperties": false,
       "properties": {
-        "correlation_request_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Correlation Request Id"
-        },
-        "protocol_request_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Protocol Request Id"
-        },
         "server": {
           "anyOf": [
             {
@@ -301,17 +277,17 @@
           "default": null,
           "title": "Server"
         },
-        "server_pid": {
+        "transport": {
           "anyOf": [
             {
-              "type": "integer"
+              "type": "string"
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "title": "Server Pid"
+          "title": "Transport"
         },
         "session_id": {
           "anyOf": [
@@ -325,7 +301,7 @@
           "default": null,
           "title": "Session Id"
         },
-        "transport": {
+        "protocol_request_id": {
           "anyOf": [
             {
               "type": "string"
@@ -335,7 +311,31 @@
             }
           ],
           "default": null,
-          "title": "Transport"
+          "title": "Protocol Request Id"
+        },
+        "correlation_request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Request Id"
+        },
+        "server_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server Pid"
         }
       },
       "title": "MCPIdentity",
@@ -358,66 +358,6 @@
       "additionalProperties": false,
       "description": "Bounded payload metadata; it never contains the unbounded payload.",
       "properties": {
-        "blob_ref": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Blob Ref"
-        },
-        "digest": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Digest"
-        },
-        "media_type": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Media Type"
-        },
-        "preview": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Preview"
-        },
-        "redaction_applied": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Redaction Applied"
-        },
         "size_bytes": {
           "anyOf": [
             {
@@ -431,6 +371,96 @@
           "default": null,
           "title": "Size Bytes"
         },
+        "original_size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Original Size Bytes"
+        },
+        "redacted_size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Redacted Size Bytes"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "digest_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "sha256",
+                "hmac-sha256"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest Kind"
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preview"
+        },
+        "blob_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Blob Ref"
+        },
         "truncated": {
           "anyOf": [
             {
@@ -442,6 +472,18 @@
           ],
           "default": null,
           "title": "Truncated"
+        },
+        "redaction_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Redaction Applied"
         }
       },
       "title": "PayloadDescriptor",
@@ -450,18 +492,6 @@
     "ProducerIdentity": {
       "additionalProperties": false,
       "properties": {
-        "boot_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Boot Id"
-        },
         "component": {
           "anyOf": [
             {
@@ -474,18 +504,6 @@
           "default": null,
           "title": "Component"
         },
-        "host": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Host"
-        },
         "instance_id": {
           "anyOf": [
             {
@@ -497,6 +515,18 @@
           ],
           "default": null,
           "title": "Instance Id"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
         },
         "pid": {
           "anyOf": [
@@ -521,6 +551,18 @@
           ],
           "default": null,
           "title": "Process Start Id"
+        },
+        "boot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Boot Id"
         }
       },
       "title": "ProducerIdentity",
@@ -543,16 +585,25 @@
   "additionalProperties": false,
   "description": "The complete immutable trace envelope for schema version 1.",
   "properties": {
-    "action": {
-      "$ref": "#/$defs/ActionDescriptor"
-    },
-    "action_id": {
-      "title": "Action Id",
+    "schema_version": {
+      "default": "v1",
+      "title": "Schema Version",
       "type": "string"
     },
-    "agent_id": {
+    "event_id": {
+      "format": "uuid",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "recorded_at": {
       "anyOf": [
         {
+          "format": "date-time",
           "type": "string"
         },
         {
@@ -560,20 +611,7 @@
         }
       ],
       "default": null,
-      "title": "Agent Id"
-    },
-    "attributes": {
-      "anyOf": [
-        {
-          "additionalProperties": true,
-          "type": "object"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Attributes"
+      "title": "Recorded At"
     },
     "duration_ms": {
       "anyOf": [
@@ -588,22 +626,6 @@
       "default": null,
       "title": "Duration Ms"
     },
-    "error": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ErrorDescriptor"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
-    },
-    "event_id": {
-      "format": "uuid",
-      "title": "Event Id",
-      "type": "string"
-    },
     "global_seq": {
       "anyOf": [
         {
@@ -617,19 +639,42 @@
       "default": null,
       "title": "Global Seq"
     },
-    "idempotency": {
-      "$ref": "#/$defs/IdempotencyDescriptor"
-    },
-    "input": {
+    "ticket_seq": {
       "anyOf": [
         {
-          "$ref": "#/$defs/PayloadDescriptor"
+          "minimum": 0,
+          "type": "integer"
         },
         {
           "type": "null"
         }
       ],
-      "default": null
+      "default": null,
+      "title": "Ticket Seq"
+    },
+    "ticket_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ticket Id"
+    },
+    "agent_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Agent Id"
     },
     "invocation_id": {
       "anyOf": [
@@ -657,21 +702,57 @@
       "default": null,
       "title": "Iteration"
     },
-    "lifecycle": {
-      "$ref": "#/$defs/LifecycleDescriptor"
+    "trace_id": {
+      "title": "Trace Id",
+      "type": "string"
+    },
+    "action_id": {
+      "title": "Action Id",
+      "type": "string"
+    },
+    "parent_action_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Action Id"
+    },
+    "tool_call_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool Call Id"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerIdentity"
     },
     "mcp": {
       "$ref": "#/$defs/MCPIdentity"
     },
-    "occurred_at": {
-      "format": "date-time",
-      "title": "Occurred At",
-      "type": "string"
+    "action": {
+      "$ref": "#/$defs/ActionDescriptor"
     },
-    "outcome": {
+    "lifecycle": {
+      "$ref": "#/$defs/LifecycleDescriptor"
+    },
+    "idempotency": {
+      "$ref": "#/$defs/IdempotencyDescriptor"
+    },
+    "input": {
       "anyOf": [
         {
-          "$ref": "#/$defs/OperationOutcome"
+          "$ref": "#/$defs/PayloadDescriptor"
         },
         {
           "type": "null"
@@ -690,79 +771,40 @@
       ],
       "default": null
     },
-    "parent_action_id": {
+    "outcome": {
       "anyOf": [
         {
-          "type": "string"
+          "$ref": "#/$defs/OperationOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorDescriptor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "attributes": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
         },
         {
           "type": "null"
         }
       ],
       "default": null,
-      "title": "Parent Action Id"
-    },
-    "producer": {
-      "$ref": "#/$defs/ProducerIdentity"
-    },
-    "recorded_at": {
-      "anyOf": [
-        {
-          "format": "date-time",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Recorded At"
-    },
-    "schema_version": {
-      "default": "v1",
-      "title": "Schema Version",
-      "type": "string"
-    },
-    "ticket_id": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Ticket Id"
-    },
-    "ticket_seq": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Ticket Seq"
-    },
-    "tool_call_id": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Tool Call Id"
-    },
-    "trace_id": {
-      "title": "Trace Id",
-      "type": "string"
+      "title": "Attributes"
     }
   },
   "required": [
