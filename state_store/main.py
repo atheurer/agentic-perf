@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from orchestrator.config import _load_config_file
+from paths import TRACE_DB_PATH
 from providers.events import EventBus
 
 from .api.router import api_router, chat_router, health_router, webhook_router
@@ -24,6 +25,7 @@ from .ratelimit import (
     make_rate_limit_dependency,
 )
 from .store import TicketStore
+from .trace_store import TraceStore
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -72,6 +74,11 @@ def mount_routers(
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Agentic Perf State Store", version="0.1.0")
+    app.state.trace_store = TraceStore(TRACE_DB_PATH)
+
+    @app.on_event("shutdown")
+    def close_trace_store() -> None:
+        app.state.trace_store.close()
 
     port = int(os.environ.get("STORE_PORT", "8090"))
     app.add_middleware(
