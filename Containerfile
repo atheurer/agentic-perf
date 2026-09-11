@@ -77,6 +77,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         jq \
         sshpass \
         iputils \
+        podman \
     && dnf clean all
 
 # Copy installed Python packages from builder
