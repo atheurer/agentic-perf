@@ -1,0 +1,51 @@
+"""Canonical tracing contracts and causal context helpers."""
+
+from .context import (
+    TraceContext,
+    bind_trace_context,
+    child_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
+from .models import (
+    SCHEMA_VERSION,
+    ActionDescriptor,
+    ActionType,
+    ErrorDescriptor,
+    IdempotencyDescriptor,
+    IdempotencyOutcome,
+    LifecycleDescriptor,
+    LifecycleState,
+    MCPIdentity,
+    MonotonicTimer,
+    OperationOutcome,
+    PayloadDescriptor,
+    ProducerIdentity,
+    RetryKind,
+    TraceEventV1,
+)
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "ActionDescriptor",
+    "ActionType",
+    "ErrorDescriptor",
+    "IdempotencyDescriptor",
+    "IdempotencyOutcome",
+    "LifecycleDescriptor",
+    "LifecycleState",
+    "MCPIdentity",
+    "MonotonicTimer",
+    "OperationOutcome",
+    "PayloadDescriptor",
+    "ProducerIdentity",
+    "RetryKind",
+    "TraceContext",
+    "TraceEventV1",
+    "bind_trace_context",
+    "child_context",
+    "current_trace_context",
+    "new_trace_context",
+    "reset_trace_context",
+]
