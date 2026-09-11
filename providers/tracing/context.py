@@ -30,7 +30,11 @@ class TraceContext(TraceModel):
     @field_validator("trace_id")
     @classmethod
     def validate_trace_id(cls, value: str) -> str:
-        if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        if (
+            len(value) != 32
+            or set(value) == {"0"}
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
             raise ValueError("trace_id must be 32 lowercase hexadecimal characters")
         return value
 
@@ -38,7 +42,9 @@ class TraceContext(TraceModel):
     @classmethod
     def validate_action_id(cls, value: str | None) -> str | None:
         if value is not None and (
-            len(value) != 16 or any(char not in "0123456789abcdef" for char in value)
+            len(value) != 16
+            or set(value) == {"0"}
+            or any(char not in "0123456789abcdef" for char in value)
         ):
             raise ValueError("action IDs must be 16 lowercase hexadecimal characters")
         return value
@@ -79,7 +85,9 @@ def child_context(
         "action_id": uuid.uuid4().hex[:16],
         **updates,
     }
-    return parent.model_copy(update=values)
+    # model_copy(update=...) trusts values in Pydantic v2.  Re-validating makes
+    # the helper a safe boundary for values supplied by future trace producers.
+    return TraceContext.model_validate(parent.model_dump() | values)
 
 
 def current_trace_context() -> TraceContext | None:

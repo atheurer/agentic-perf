@@ -69,6 +69,10 @@ class LifecycleState(str, Enum):
     TIMED_OUT = "timed_out"
     CLEANUP_STARTED = "cleanup_started"
     CLEANUP_COMPLETED = "cleanup_completed"
+    REQUEST_STARTED = "request_started"
+    RESPONSE_RECEIVED = "response_received"
+    RATE_LIMITED = "rate_limited"
+    RETRY_SCHEDULED = "retry_scheduled"
 
 
 class RetryKind(str, Enum):
@@ -230,7 +234,11 @@ class TraceEventV1(TraceModel):
     @field_validator("trace_id")
     @classmethod
     def validate_trace_id(cls, value: str) -> str:
-        if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        if (
+            len(value) != 32
+            or set(value) == {"0"}
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
             raise ValueError("trace_id must be 32 lowercase hexadecimal characters")
         return value
 
@@ -238,7 +246,9 @@ class TraceEventV1(TraceModel):
     @classmethod
     def validate_action_id(cls, value: str | None) -> str | None:
         if value is not None and (
-            len(value) != 16 or any(char not in "0123456789abcdef" for char in value)
+            len(value) != 16
+            or set(value) == {"0"}
+            or any(char not in "0123456789abcdef" for char in value)
         ):
             raise ValueError("action IDs must be 16 lowercase hexadecimal characters")
         return value

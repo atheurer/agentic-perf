@@ -119,6 +119,31 @@ def test_w3c_compatible_ids_are_created() -> None:
     assert int(event.action_id, 16) >= 0
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("trace_id", "0" * 32),
+        ("action_id", "0" * 16),
+    ],
+)
+def test_w3c_ids_reject_the_invalid_all_zero_value(field: str, value: str) -> None:
+    with pytest.raises(ValidationError, match="hexadecimal"):
+        _event(**{field: value})
+
+
+def test_minimum_llm_lifecycle_vocabulary_is_controlled() -> None:
+    values = {state.value for state in LifecycleState}
+
+    assert {
+        "request_started",
+        "response_received",
+        "timed_out",
+        "rate_limited",
+        "retry_scheduled",
+        "failed",
+    } <= values
+
+
 def test_timestamps_must_be_utc() -> None:
     event = _event(occurred_at=datetime.now(timezone.utc))
 

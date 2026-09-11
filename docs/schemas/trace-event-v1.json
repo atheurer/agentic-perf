@@ -253,7 +253,11 @@
         "launched",
         "timed_out",
         "cleanup_started",
-        "cleanup_completed"
+        "cleanup_completed",
+        "request_started",
+        "response_received",
+        "rate_limited",
+        "retry_scheduled"
       ],
       "title": "LifecycleState",
       "type": "string"

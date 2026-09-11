@@ -44,7 +44,18 @@ def test_context_is_immutable_and_w3c_compatible() -> None:
     with pytest.raises(ValidationError):
         TraceContext(trace_id="not-a-trace-id")
     with pytest.raises(ValidationError):
+        TraceContext(trace_id="0" * 32)
+    with pytest.raises(ValidationError):
+        TraceContext(action_id="0" * 16)
+    with pytest.raises(ValidationError):
         context.action_id = "0123456789abcdef"
 
     assert len(context.trace_id) == 32
     assert len(context.action_id) == 16
+
+
+def test_child_context_validates_caller_updates() -> None:
+    context = new_trace_context(ticket_id="PERF-123")
+
+    with pytest.raises(ValidationError):
+        child_context(context, action_id="not-a-span-id")
