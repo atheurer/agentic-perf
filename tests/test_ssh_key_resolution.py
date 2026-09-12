@@ -223,7 +223,7 @@ async def test_build_ssh_replaces_and_closes_owned_trace_client(
         async def __aexit__(self, *_: object) -> None:
             return None
 
-        async def get(self, _: str) -> Response:
+        async def get(self, _: str, **__: object) -> Response:
             return Response()
 
     class Recorder:

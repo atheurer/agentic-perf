@@ -181,7 +181,9 @@ class Dispatcher:
                 if ticket_id in self._trace_contexts
                 else {}
             )
-            with httpx.Client(timeout=10.0, headers=headers) as client:
+            from providers.execution import AuditedHTTPClient
+
+            with AuditedHTTPClient(timeout=10.0, headers=headers) as client:
                 client.request(
                     "DELETE",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
@@ -198,7 +200,9 @@ class Dispatcher:
                 if ticket_id in self._trace_contexts
                 else {}
             )
-            with httpx.Client(timeout=10.0, headers=headers) as client:
+            from providers.execution import AuditedHTTPClient
+
+            with AuditedHTTPClient(timeout=10.0, headers=headers) as client:
                 r = client.post(
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim/renew",
                     json={
