@@ -290,7 +290,8 @@ class AuditedSubprocessRunner:
                 process.stdin.close()
             except (BrokenPipeError, ConnectionError):
                 tracked.terminate()
-                await tracked.wait()
+                await tracked._process.wait()
+                await tracked._finish(LifecycleState.FAILED, stdin_error=True)
                 raise
         return tracked
 

@@ -174,3 +174,52 @@ async def test_signal_then_wait_has_one_terminal() -> None:
         "failed",
     ]
     assert events[-1].attributes["signal"] == "terminate"
+
+
+async def test_stdin_failure_finishes_the_started_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A write failure must not leave a durable STARTED action open."""
+
+    events = []
+
+    class BrokenStdin:
+        def write(self, _data: bytes) -> None:
+            raise BrokenPipeError
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        pid = 4242
+        returncode = -15
+        stdin = BrokenStdin()
+
+        def terminate(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def spawn(*_args, **_kwargs):
+        return Process()
+
+    async def emit(event):
+        events.append(event)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        with pytest.raises(BrokenPipeError):
+            await AuditedSubprocessRunner(emit).start(["demo"], stdin=b"input")
+    finally:
+        reset_trace_context(token)
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "started",
+        "failed",
+    ]
+    assert events[-1].attributes["stdin_error"] is True
