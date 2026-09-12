@@ -104,6 +104,7 @@ def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
     with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
         assert dispatcher.try_claim("PERF-1", "triage_pending")
     first = dispatcher._trace_contexts["PERF-1"]
+    dispatcher.release_claim = MagicMock()
     dispatcher.mark_done("PERF-1")
     with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
         assert dispatcher.try_claim("PERF-1", "triage_pending")
