@@ -269,16 +269,34 @@ class Dispatcher:
 
     def stop_agent(self, ticket_id: str, mode: str = "graceful") -> bool:
         self.stop_introspection(ticket_id)
+        context = self._trace_contexts.get(ticket_id)
         if mode == "graceful":
             agent = self._agents.get(ticket_id)
             if agent is not None and hasattr(agent, "request_stop"):
                 agent.request_stop()
+                if context is not None:
+                    self._trace.record(
+                        context,
+                        ActionType.AGENT,
+                        LifecycleState.PAUSED,
+                        phase="graceful_stop",
+                        attributes={"mode": "graceful"},
+                    )
                 logger.info(f"Graceful stop requested for {ticket_id}")
                 return True
         elif mode == "hard":
             task = self._tasks.get(ticket_id)
             if task is not None and not task.done():
                 task.cancel()
+                if context is not None:
+                    self._trace.record(
+                        context,
+                        ActionType.AGENT,
+                        LifecycleState.CANCELLED,
+                        phase="hard_stop",
+                        duration_ms=0,
+                        attributes={"mode": "hard"},
+                    )
                 logger.info(f"Hard stop (task.cancel) for {ticket_id}")
                 return True
         return False

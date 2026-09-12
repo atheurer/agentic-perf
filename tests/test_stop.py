@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from providers.tracing import LifecycleState, TraceRecorder, new_trace_context
 from state_store.main import create_app
 from state_store.models import (
     CreateTicketRequest,
@@ -337,6 +338,38 @@ class TestDispatcherStop:
         )
         result = dispatcher.stop_agent("PERF-nonexist", "graceful")
         assert result is False
+
+    def test_stop_modes_emit_trace_lifecycle(self):
+        """Dispatcher emits concrete stop outcomes, not just EventBus text."""
+        from orchestrator.dispatcher import Dispatcher
+
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event):
+                self.events.append(event)
+
+        dispatcher = Dispatcher(
+            state_store_url="http://localhost:8090",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+        )
+        sink = Sink()
+        dispatcher._trace = TraceRecorder(client=sink)
+        dispatcher._trace_contexts["PERF-test"] = new_trace_context(
+            ticket_id="PERF-test", agent_id="triage"
+        )
+        agent = MagicMock()
+        dispatcher._agents["PERF-test"] = agent
+        assert dispatcher.stop_agent("PERF-test", "graceful")
+        assert sink.events[-1].lifecycle.state == LifecycleState.PAUSED
+
+        task = MagicMock()
+        task.done.return_value = False
+        dispatcher._tasks["PERF-test"] = task
+        assert dispatcher.stop_agent("PERF-test", "hard")
+        assert sink.events[-1].lifecycle.state == LifecycleState.CANCELLED
 
     def test_mark_done_clears_agent(self):
         from orchestrator.dispatcher import Dispatcher
