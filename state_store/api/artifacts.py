@@ -134,8 +134,8 @@ def download_archive(ticket_id: str):
     except Exception:
         try:
             filesystem.unlink(export_name, missing_ok=True)
-        except Exception:
+        except Exception as cleanup_error:
             # Preserve the archive failure; its audit event remains the primary
             # diagnostic and cleanup has its own audited action when possible.
-            pass
+            raise RuntimeError("artifact export cleanup failed") from cleanup_error
         raise

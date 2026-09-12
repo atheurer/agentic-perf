@@ -490,6 +490,10 @@ class AuditedFilesystem:
     def archive(self, destination: str | Path, members: Iterable[str | Path]) -> Path:
         target, logical = self.root.resolve(destination)
         resolved = [self.root.resolve(member) for member in members]
+        attributes = {
+            "members": [reference for _, reference in resolved],
+            "atomic": True,
+        }
 
         def create_archive() -> Path:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -504,6 +508,7 @@ class AuditedFilesystem:
                 os.replace(temporary, target)
                 if not target.is_file() or not target.stat().st_size:
                     raise OSError("archive verification failed")
+                attributes.update(self._descriptor(target.read_bytes()))
                 return target
             except Exception as primary:
                 try:
@@ -523,8 +528,5 @@ class AuditedFilesystem:
             "archive",
             logical,
             create_archive,
-            attributes={
-                "members": [reference for _, reference in resolved],
-                "atomic": True,
-            },
+            attributes=attributes,
         )

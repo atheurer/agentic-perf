@@ -159,6 +159,8 @@ def test_archive_uses_only_logical_member_names(filesystem) -> None:
     fs.archive("results/bundle.tar.gz", ["logs/output.txt"])
     assert (root / "results/bundle.tar.gz").is_file()
     assert events[-1].attributes["members"] == ["workspace://logs/output.txt"]
+    assert events[-1].attributes["size_bytes"] > 0
+    assert len(events[-1].attributes["digest"]) == 64
     assert str(root) not in events[-1].model_dump_json()
 
 
