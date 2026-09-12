@@ -39,3 +39,13 @@ Operator diagnostics may retain physical paths only in local process logs.  Trac
 events, spool frames, payload blobs, exports, and state-store rows contain only
 logical `workspace://`, `artifact://`, or `ticket://` references and bounded
 digest/type/code metadata.
+
+## Reviewed AST exclusions
+
+The regression test parses every production module and requires exact
+`file:line:call` markers for each primitive outside the audited boundary. These
+are non-ticket/internal/fallback operations: trace payload/spool/fingerprint
+durability, operator authentication/identity, read-only cache/configuration,
+process locks, and ephemeral local staging. They are deliberately not routed
+through `AuditedFilesystem`, since doing so would recurse into the audit
+transport or expose an operator-only path to ticket owners.

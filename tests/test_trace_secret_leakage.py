@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import base64
+import tarfile
 from urllib.parse import quote
 
 import pytest
 
 from providers.redaction import Redactor
-from providers.tracing import PayloadBlobStore, PayloadBuilder
+from providers.tracing import (
+    ActionDescriptor,
+    ActionType,
+    LifecycleDescriptor,
+    LifecycleState,
+    OperationOutcome,
+    PayloadBlobStore,
+    PayloadBuilder,
+    TraceEventV1,
+    TraceSpool,
+)
 from state_store.trace_store import TracePayloadConflictError, TraceStore
 
 
@@ -118,6 +129,36 @@ def test_credentials_are_absent_from_descriptor_db_wal_blob_and_logs(
         surfaces.append(wal.read_text(errors="ignore"))
     surfaces.append(caplog.text)
     assert all(secret not in surface for surface in surfaces)
+
+
+def test_secret_is_absent_from_db_wal_spool_blob_and_export(tmp_path) -> None:
+    """Audit descriptors remain safe across every durable/re-exported surface."""
+    secret = "audit-storage-secret-12345"
+    builder = PayloadBuilder(
+        Redactor(),
+        blob_store=PayloadBlobStore(tmp_path / "blobs"),
+        audit_key_path=tmp_path / "secrets" / "audit-key",
+        inline_bytes=8,
+    )
+    descriptor = builder.build("PERF-1", {"password": secret})
+    event = TraceEventV1(
+        ticket_id="PERF-1",
+        action=ActionDescriptor(type=ActionType.FILESYSTEM, target="workspace://safe"),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.COMPLETED),
+        duration_ms=0,
+        outcome=OperationOutcome.SUCCESS,
+        output=descriptor,
+    )
+    spool = TraceSpool(tmp_path / "spool", name="filesystem")
+    spool.append(event)
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.put_payload_descriptor(descriptor)
+        export_source = tmp_path / "export.json"
+        export_source.write_text(event.model_dump_json())
+        with tarfile.open(tmp_path / "export.tar.gz", "w:gz") as archive:
+            archive.add(export_source, arcname="trace.json")
+        surfaces = _storage_surfaces(tmp_path, descriptor)
+        assert all(secret not in surface for surface in surfaces)
 
 
 def test_redaction_failure_returns_only_a_safe_descriptor(

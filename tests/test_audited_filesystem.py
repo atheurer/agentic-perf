@@ -178,6 +178,34 @@ def test_permission_failure_has_one_failed_terminal(filesystem, monkeypatch) -> 
     assert events[-1].error.message is None
 
 
+def test_temporary_cleanup_failure_has_a_failed_cleanup_lifecycle(
+    filesystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fs, events, _ = filesystem
+    import providers.execution.filesystem as module
+
+    original_replace = module.os.replace
+    monkeypatch.setattr(
+        module.os, "replace", lambda *_: (_ for _ in ()).throw(OSError("replace"))
+    )
+    monkeypatch.setattr(
+        module.os, "unlink", lambda *_: (_ for _ in ()).throw(OSError("cleanup"))
+    )
+    with pytest.raises(OSError):
+        fs.write("cleanup", b"data")
+    assert [event.attributes["operation"] for event in events] == [
+        "create",
+        "cleanup",
+        "create",
+    ]
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "failed",
+        "failed",
+    ]
+    monkeypatch.setattr(module.os, "replace", original_replace)
+
+
 def test_ticket_archive_records_each_move_and_survives_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
