@@ -22,6 +22,15 @@ from providers.llm.base import (
     ToolDefinition,
     ToolResult,
 )
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    OperationOutcome,
+    RetryKind,
+    TraceRecorder,
+    new_trace_context,
+    trace_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +141,8 @@ class AgentBase(ABC):
             else self._load_tool_spill_threshold()
         )
         self._register_workspace_tools()
+        self.trace_context = None
+        self._trace = TraceRecorder()
 
     def _register_workspace_tools(self) -> None:
         """Register native workspace tools on the agent."""
@@ -254,6 +265,14 @@ class AgentBase(ABC):
         self._stop_requested = True
 
     async def close(self) -> None:
+        if self.trace_context is not None:
+            self._trace.record(
+                self.trace_context,
+                ActionType.AGENT,
+                LifecycleState.COMPLETED,
+                phase="run",
+                duration_ms=0,
+            )
         await self._client.aclose()
 
     def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
@@ -295,6 +314,20 @@ class AgentBase(ABC):
 
     async def run(self, ticket_id: str) -> None:
         self._current_ticket_id = ticket_id
+        # Dispatcher normally supplies this context.  Direct agent use (tests,
+        # CLI tools) still gets an isolated invocation rather than losing causality.
+        if self.trace_context is None:
+            self.trace_context = new_trace_context(
+                ticket_id=ticket_id, agent_id=self.agent_name
+            )
+        self._trace.context = self.trace_context
+        self._client.headers.update(trace_headers(self.trace_context))
+        self._trace.record(
+            self.trace_context,
+            ActionType.AGENT,
+            LifecycleState.STARTED,
+            phase="run",
+        )
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
         self._dispatched_status = ticket.get("status", "")
@@ -458,6 +491,9 @@ class AgentBase(ABC):
                     )
 
                 iteration += 1
+                llm_context, llm_timer = self._trace.start(
+                    ActionType.LLM, phase="request", iteration=iteration
+                )
                 self._emit(
                     ticket_id,
                     "llm_request",
@@ -522,6 +558,16 @@ class AgentBase(ABC):
                         tools=(self.tools if self.tools else None),
                     )
                 except LLMTimeoutError as e:
+                    self._trace.record(
+                        llm_context,
+                        ActionType.LLM,
+                        LifecycleState.TIMED_OUT,
+                        phase="request",
+                        duration_ms=llm_timer.elapsed_ms(),
+                        outcome=OperationOutcome.TIMED_OUT,
+                        error=e,
+                        retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
+                    )
                     if tok is not None:
                         context.detach(tok)
                         tok = None
@@ -590,6 +636,16 @@ class AgentBase(ABC):
                     )
                     break
                 except LLMRateLimitError as e:
+                    self._trace.record(
+                        llm_context,
+                        ActionType.LLM,
+                        LifecycleState.FAILED,
+                        phase="request",
+                        duration_ms=llm_timer.elapsed_ms(),
+                        outcome=OperationOutcome.FAILURE,
+                        error=e,
+                        retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
+                    )
                     if tok is not None:
                         context.detach(tok)
                         tok = None
@@ -652,6 +708,29 @@ class AgentBase(ABC):
                     if tok is not None:
                         context.detach(tok)
                 self._llm_rate_limit_retries = 0
+                self._trace.record(
+                    llm_context,
+                    ActionType.LLM,
+                    LifecycleState.COMPLETED,
+                    phase="response",
+                    duration_ms=llm_timer.elapsed_ms(),
+                    outcome=OperationOutcome.SUCCESS,
+                )
+                for proposed in response.tool_calls:
+                    tool_context, _ = self._trace.start(
+                        ActionType.TOOL,
+                        phase="proposed",
+                        iteration=iteration,
+                        tool_call_id=proposed.id,
+                        parent=llm_context,
+                    )
+                    self._trace.record(
+                        tool_context,
+                        ActionType.TOOL,
+                        LifecycleState.PROPOSED,
+                        phase=proposed.name,
+                        attributes={"tool": proposed.name},
+                    )
                 self._emit(
                     ticket_id,
                     "llm_response",
@@ -950,6 +1029,21 @@ class AgentBase(ABC):
                                 "blocked": True,
                             },
                         )
+                        rejected_context, _ = self._trace.start(
+                            ActionType.TOOL,
+                            phase=submit_call.name,
+                            iteration=iteration,
+                            tool_call_id=submit_call.id,
+                            parent=llm_context,
+                        )
+                        self._trace.record(
+                            rejected_context,
+                            ActionType.TOOL,
+                            LifecycleState.REJECTED,
+                            phase=submit_call.name,
+                            duration_ms=0,
+                            outcome=OperationOutcome.REJECTED,
+                        )
                         messages.append(
                             {"role": "assistant", "content": response.raw_content}
                         )
@@ -995,6 +1089,22 @@ class AgentBase(ABC):
                     if non_clarify:
                         skipped = [tc for tc in calls_to_run if tc not in non_clarify]
                         for tc in skipped:
+                            skipped_context, _ = self._trace.start(
+                                ActionType.TOOL,
+                                phase=tc.name,
+                                iteration=iteration,
+                                tool_call_id=tc.id,
+                                parent=llm_context,
+                            )
+                            self._trace.record(
+                                skipped_context,
+                                ActionType.TOOL,
+                                LifecycleState.SHORT_CIRCUITED,
+                                phase=tc.name,
+                                duration_ms=0,
+                                outcome=OperationOutcome.SUCCESS,
+                                attributes={"reason": "other tools executed first"},
+                            )
                             self._emit(
                                 ticket_id,
                                 "tool_skipped",
@@ -1031,7 +1141,48 @@ class AgentBase(ABC):
                             "input": tc.input,
                         },
                     )
-                    result = await self._execute_tool(tc)
+                    tool_context, tool_timer = self._trace.start(
+                        ActionType.TOOL,
+                        phase=tc.name,
+                        iteration=iteration,
+                        tool_call_id=tc.id,
+                        parent=llm_context,
+                    )
+                    try:
+                        result = await self._execute_tool(tc)
+                    except asyncio.CancelledError:
+                        self._trace.record(
+                            tool_context,
+                            ActionType.TOOL,
+                            LifecycleState.CANCELLED,
+                            phase=tc.name,
+                            duration_ms=tool_timer.elapsed_ms(),
+                            outcome=OperationOutcome.CANCELLED,
+                        )
+                        raise
+                    except Exception as exc:
+                        self._trace.record(
+                            tool_context,
+                            ActionType.TOOL,
+                            LifecycleState.FAILED,
+                            phase=tc.name,
+                            duration_ms=tool_timer.elapsed_ms(),
+                            outcome=OperationOutcome.FAILURE,
+                            error=exc,
+                        )
+                        raise
+                    self._trace.record(
+                        tool_context,
+                        ActionType.TOOL,
+                        LifecycleState.FAILED
+                        if result.is_error
+                        else LifecycleState.COMPLETED,
+                        phase=tc.name,
+                        duration_ms=tool_timer.elapsed_ms(),
+                        outcome=OperationOutcome.FAILURE
+                        if result.is_error
+                        else OperationOutcome.SUCCESS,
+                    )
                     self._emit(
                         ticket_id,
                         "tool_result",

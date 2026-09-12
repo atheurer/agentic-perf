@@ -33,6 +33,13 @@ import httpx
 
 from providers.events import EventBus
 from providers.llm.base import LLMProvider
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    TraceRecorder,
+    new_trace_context,
+    trace_headers,
+)
 from state_store.models import TERMINAL_STATUSES as _MODEL_TERMINAL
 
 from .server import (
@@ -124,6 +131,8 @@ class IntrospectionAgent:
         self._guidance_produced = False
         self._llm_call_count = 0
         self._stop_requested = False
+        self.trace_context = None
+        self._trace = TraceRecorder()
         self._error_patterns = load_error_patterns()
         self._thresholds = load_thresholds()
         self._bypass_patterns = load_tool_bypass_patterns()
@@ -148,6 +157,17 @@ class IntrospectionAgent:
         detection, and calls the LLM for narrative interpretation
         at key moments.
         """
+        self.trace_context = self.trace_context or new_trace_context(
+            ticket_id=ticket_id, agent_id="introspection-agent"
+        )
+        self._trace.context = self.trace_context
+        self._client.headers.update(trace_headers(self.trace_context))
+        self._trace.record(
+            self.trace_context,
+            ActionType.AGENT,
+            LifecycleState.STARTED,
+            phase="observe",
+        )
         logger.info(
             f"[introspection] Starting observation of {ticket_id}"
             f" (llm={'yes' if self._llm else 'no'})"
@@ -340,6 +360,13 @@ class IntrospectionAgent:
                     "agent_finished",
                 )
             logger.info(f"[introspection] Stopped observing {ticket_id}")
+            self._trace.record(
+                self.trace_context,
+                ActionType.AGENT,
+                LifecycleState.COMPLETED,
+                phase="observe",
+                duration_ms=0,
+            )
 
     # --- LLM narrative ---
 

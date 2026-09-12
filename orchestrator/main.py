@@ -658,6 +658,11 @@ async def run_agent_task(
         if agent is None:
             return
 
+        if getattr(agent, "trace_context", None) is None:
+            agent.trace_context = dispatcher._trace_contexts.get(ticket_id)
+        if hasattr(agent, "_trace"):
+            agent._trace.client = dispatcher._trace.client
+
         dispatcher.set_agent(ticket_id, agent)
 
         if config and hasattr(agent, "DEFAULT_GLOBAL_MAX_ITERATIONS"):

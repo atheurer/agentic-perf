@@ -23,6 +23,13 @@ from providers.llm.base import LLMProvider
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
 from providers.skills.repo_cache import RepoCache
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    TraceClient,
+    TraceRecorder,
+    new_trace_context,
+)
 
 if TYPE_CHECKING:
     from state_store.identity import UserStore
@@ -95,6 +102,14 @@ class Dispatcher:
         self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
+        self._trace_contexts: dict[str, Any] = {}
+        trace_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        trace_client = (
+            TraceClient(self.store_url, trace_token, instance_id=self._instance_name)
+            if trace_token
+            else None
+        )
+        self._trace = TraceRecorder(client=trace_client)
 
     def is_active(self, ticket_id: str) -> bool:
         task = self._tasks.get(ticket_id)
@@ -122,7 +137,17 @@ class Dispatcher:
                         "duration_seconds": self.lease_seconds,
                     },
                 )
-                return r.status_code == 200
+                if r.status_code == 200:
+                    context = new_trace_context(ticket_id=ticket_id, agent_id=status)
+                    self._trace_contexts[ticket_id] = context
+                    self._trace.record(
+                        context,
+                        ActionType.DISPATCH,
+                        LifecycleState.CLAIMED,
+                        phase=status,
+                    )
+                    return True
+                return False
         except Exception:
             logger.exception(f"Failed to claim ticket {ticket_id}")
             return False
@@ -247,6 +272,15 @@ class Dispatcher:
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
         self.clear_quota_blocked(ticket_id)
+        context = self._trace_contexts.pop(ticket_id, None)
+        if context is not None:
+            self._trace.record(
+                context,
+                ActionType.DISPATCH,
+                LifecycleState.COMPLETED,
+                phase="cleanup",
+                duration_ms=0,
+            )
         if self.events is not None:
             self.events.unregister_ticket_owner(ticket_id)
         # Note: introspection is NOT stopped here. It runs
@@ -534,5 +568,14 @@ class Dispatcher:
             resolved = iter_factory(agent_type) if iter_factory is not None else None
             if resolved is not None:
                 agent.max_iterations = resolved
+
+        if agent is not None:
+            # A successful claim is the invocation boundary.  Assigning the
+            # immutable context here keeps every agent class on one envelope.
+            agent.trace_context = (
+                self._trace_contexts.get(ticket_data.get("id", ""))
+                if ticket_data
+                else None
+            )
 
         return agent

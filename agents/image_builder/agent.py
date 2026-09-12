@@ -21,6 +21,13 @@ from typing import Any
 
 from providers.events import EventBus
 from providers.image_build.base import BuildResult, BuildSpec
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    TraceRecorder,
+    new_trace_context,
+    trace_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +67,8 @@ class ImageBuilderAgent:
     ) -> None:
         self.store_url = state_store_url
         self._events = event_bus
+        self.trace_context = None
+        self._trace = TraceRecorder()
 
         import httpx
 
@@ -74,6 +83,14 @@ class ImageBuilderAgent:
 
     async def run(self, ticket_id: str) -> None:
         """Build a custom image from ticket directives."""
+        self.trace_context = self.trace_context or new_trace_context(
+            ticket_id=ticket_id, agent_id=self.agent_name
+        )
+        self._trace.context = self.trace_context
+        self._client.headers.update(trace_headers(self.trace_context))
+        self._trace.record(
+            self.trace_context, ActionType.AGENT, LifecycleState.STARTED, phase="run"
+        )
         try:
             ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
@@ -108,6 +125,13 @@ class ImageBuilderAgent:
             )
         finally:
             self._emit(ticket_id, "agent_finished", {})
+            self._trace.record(
+                self.trace_context,
+                ActionType.AGENT,
+                LifecycleState.COMPLETED,
+                phase="run",
+                duration_ms=0,
+            )
             await self._client.aclose()
 
     async def _build(self, ticket_id: str) -> None:
