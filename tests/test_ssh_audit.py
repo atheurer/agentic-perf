@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from providers.ssh import SSHExecutor
 from providers.tracing import LifecycleState, new_trace_context
 from state_store.trace_store import TraceStore
@@ -186,3 +188,49 @@ async def test_progress_cleanup_failure_closes_parent() -> None:
     assert [e for e in events if e.action.phase == "ssh_progress"][-1].attributes[
         "cleanup_failed"
     ]
+
+
+@pytest.mark.parametrize("method", ["copy_to", "copy_from"])
+@pytest.mark.parametrize(
+    ("exit_code", "terminal"),
+    [
+        (0, LifecycleState.COMPLETED),
+        (1, LifecycleState.FAILED),
+        (255, LifecycleState.FAILED),
+    ],
+)
+async def test_scp_transfer_audits_success_and_remote_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    exit_code: int,
+    terminal: LifecycleState,
+) -> None:
+    events: list[object] = []
+
+    class Process:
+        pid = 4242
+        returncode = exit_code
+
+        async def communicate(self):
+            return b"output", b"failure"
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SCP"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    result = await getattr(executor, method)("host", "source", "destination")
+    assert result.exit_code == exit_code
+    assert [event.lifecycle.state for event in events] == [
+        LifecycleState.REQUESTED,
+        LifecycleState.LAUNCHED,
+        terminal,
+    ]
+    assert events[-1].attributes["local_pid"] == 4242
+    assert "source" not in str(events)
+    assert "destination" not in str(events)

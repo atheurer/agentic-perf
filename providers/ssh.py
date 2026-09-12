@@ -213,7 +213,6 @@ class SSHExecutor:
         trace = _SSHTraceAction(self, "ssh", host)
         trace.record(
             LifecycleState.REQUESTED,
-            host,
             user=self.user,
             timeout=timeout,
             command_digest=self._digest(command),
@@ -292,7 +291,9 @@ class SSHExecutor:
             )
 
         trace.terminal(
-            LifecycleState.COMPLETED,
+            LifecycleState.COMPLETED
+            if result.exit_code == 0
+            else LifecycleState.FAILED,
             local_pid=proc.pid,
             exit_code=result.exit_code,
             duration_ms=(time.monotonic() - started) * 1000,
@@ -555,7 +556,6 @@ class SSHExecutor:
         trace = _SSHTraceAction(self, "scp_from", host)
         trace.record(
             LifecycleState.REQUESTED,
-            host,
             user=self.user,
             timeout=timeout,
             remote_path_digest=self._digest(remote_path),
@@ -629,7 +629,9 @@ class SSHExecutor:
             exit_code=proc.returncode or 0,
         )
         trace.terminal(
-            LifecycleState.COMPLETED,
+            LifecycleState.COMPLETED
+            if result.exit_code == 0
+            else LifecycleState.FAILED,
             local_pid=proc.pid,
             exit_code=result.exit_code,
             duration_ms=(time.monotonic() - started) * 1000,
@@ -650,7 +652,6 @@ class SSHExecutor:
         trace = _SSHTraceAction(self, "scp_to", host)
         trace.record(
             LifecycleState.REQUESTED,
-            host,
             user=self.user,
             timeout=timeout,
             remote_path_digest=self._digest(remote_path),
@@ -724,7 +725,9 @@ class SSHExecutor:
             exit_code=proc.returncode or 0,
         )
         trace.terminal(
-            LifecycleState.COMPLETED,
+            LifecycleState.COMPLETED
+            if result.exit_code == 0
+            else LifecycleState.FAILED,
             local_pid=proc.pid,
             exit_code=result.exit_code,
             duration_ms=(time.monotonic() - started) * 1000,
