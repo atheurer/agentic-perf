@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 from orchestrator.dispatcher import Dispatcher
@@ -63,7 +64,12 @@ async def test_introspection_is_a_sibling_child_of_dispatch() -> None:
     assert observer.trace_context.parent_action_id == dispatch.action_id
     assert primary.trace_context.parent_action_id == dispatch.action_id
     assert observer.trace_context.action_id != primary.trace_context.action_id
+    task = dispatcher._introspection_tasks["PERF-1"]
     dispatcher.stop_introspection("PERF-1")
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def test_run_agent_task_binds_and_resets_agent_context() -> None:
@@ -86,7 +92,7 @@ async def test_run_agent_task_binds_and_resets_agent_context() -> None:
     agent = Agent()
     dispatcher.create_agent = MagicMock(return_value=agent)
     dispatcher.release_claim = MagicMock()
-    await run_agent_task(dispatcher, "triage_pending", "PERF-1")
+    await run_agent_task(dispatcher, "test_status", "PERF-1")
     assert seen == [agent_context]
     assert current_trace_context() is None
 
