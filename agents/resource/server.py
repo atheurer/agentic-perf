@@ -434,11 +434,40 @@ async def get_host_inventory() -> str:
 
 @mcp.tool()
 async def get_accumulated_metadata() -> str:
-    """Return accumulated provider metadata from prior reserve_resources calls. Includes public_ips, private_ips, ip_mapping, ssh_user, and ssh_key_path."""
+    """Return accumulated provider metadata from prior reserve_resources calls.
+
+    Merges provider_metadata sub-dict with top-level
+    reservation fields. Providers may place metadata at
+    either level — this ensures all fields are available
+    regardless of provider convention.
+    """
+    # Start with any explicit provider_metadata sub-dict
     result = dict(_last_reservation.get("provider_metadata", {}))
-    for key in ("ssh_user", "ssh_key_path"):
-        if key in _last_reservation:
-            result[key] = _last_reservation[key]
+    # Promote all top-level reservation fields except
+    # transient/internal keys. Providers like Jumpstarter
+    # put lease_id, selector, etc. at the top level.
+    _SKIP_KEYS = frozenset(
+        {
+            "provider_metadata",
+            "error",
+            "available",
+            "status",
+            # Standard reservation fields that are not metadata
+            "provider",
+            "hosts",
+            "matching_devices",
+            "requested",
+            "count",
+            "message",
+            "ssh_user",
+            "ssh_key_path",
+            "reservation_id",
+            "fresh_host",
+        }
+    )
+    for key, val in _last_reservation.items():
+        if key not in _SKIP_KEYS and key not in result:
+            result[key] = val
     return json.dumps(result)
 
 
