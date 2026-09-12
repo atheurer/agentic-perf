@@ -295,6 +295,8 @@ class SSHExecutor:
             if result.exit_code == 0
             else LifecycleState.FAILED,
             local_pid=proc.pid,
+            remote_pid=None,
+            capture_status="not_requested",
             exit_code=result.exit_code,
             duration_ms=(time.monotonic() - started) * 1000,
             stdout_digest=self._digest(result.stdout),
@@ -465,13 +467,28 @@ class SSHExecutor:
                     except Exception as exc:
                         # Callback failures must be visible even though the
                         # remote command continues and retains its API result.
-                        child()._trace(
+                        callback_trace = _SSHTraceAction(
+                            SSHExecutor(
+                                user=self.user,
+                                key_path=self.key_path,
+                                connect_timeout=self.connect_timeout,
+                                strict_host_key=self.strict_host_key,
+                                trace_context=progress.context,
+                                trace_recorder=self.trace_recorder,
+                            ),
                             "ssh_progress_callback",
-                            LifecycleState.RESPONSE_RECEIVED,
                             host,
+                        )
+                        callback_trace.record(
+                            LifecycleState.REQUESTED,
                             remote_pid=pid,
                             error_type=type(exc).__name__,
                             error_digest=self._digest(str(exc)),
+                        )
+                        callback_trace.terminal(
+                            LifecycleState.FAILED,
+                            remote_pid=pid,
+                            error_type=type(exc).__name__,
                         )
 
             if finished:
@@ -535,7 +552,7 @@ class SSHExecutor:
             exit_code=exit_code,
         )
         progress.terminal(
-            LifecycleState.COMPLETED,
+            LifecycleState.COMPLETED if exit_code == 0 else LifecycleState.FAILED,
             remote_pid=pid,
             capture_status="captured",
             exit_code=exit_code,

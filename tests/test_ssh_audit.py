@@ -190,6 +190,56 @@ async def test_progress_cleanup_failure_closes_parent() -> None:
     ]
 
 
+async def test_progress_callback_failure_has_closed_child_lifecycle() -> None:
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    from providers.ssh import SSHResult
+
+    replies = iter(
+        [
+            SSHResult("/tmp/run\n", "", 0),
+            SSHResult("__PID:9\n", "", 0),
+            SSHResult("", "", 0),
+            SSHResult("progress\n", "", 0),
+            SSHResult("output", "", 0),
+            SSHResult("3", "", 0),
+            SSHResult("", "", 0),
+        ]
+    )
+
+    async def fake_run(*_: object, **__: object) -> SSHResult:
+        return next(replies)
+
+    async def broken_callback(*_: object) -> None:
+        raise RuntimeError("callback failure")
+
+    executor.run = fake_run
+    import asyncio
+
+    original = asyncio.sleep
+    asyncio.sleep = lambda _: original(0)
+    try:
+        result = await executor.run_with_progress(
+            "host", "command", broken_callback, poll_interval=1
+        )
+    finally:
+        asyncio.sleep = original
+    assert result.exit_code == 3
+    callback = [e for e in events if e.action.phase == "ssh_progress_callback"]
+    assert [e.lifecycle.state for e in callback] == [
+        LifecycleState.REQUESTED,
+        LifecycleState.FAILED,
+    ]
+    assert callback[0].action_id == callback[1].action_id
+    progress = [e for e in events if e.action.phase == "ssh_progress"]
+    assert progress[-1].lifecycle.state == LifecycleState.FAILED
+
+
 @pytest.mark.parametrize("method", ["copy_to", "copy_from"])
 @pytest.mark.parametrize(
     ("exit_code", "terminal"),
