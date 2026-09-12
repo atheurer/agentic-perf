@@ -105,14 +105,15 @@ async def provision_jumpstarter(
             serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
         try:
             serial_log_fh = open(serial_log_path, "w", encoding="utf-8")
-            serial_proc = await asyncio.create_subprocess_exec(
-                "jmp",
+            serial_proc = await AuditedSubprocessRunner().start(
+                ["jmp",
                 "shell",
                 f"--lease={lease_name}",
                 "--",
                 "j",
                 "serial",
                 "pipe",
+                ],
                 stdout=serial_log_fh,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -493,3 +494,4 @@ async def _run_provision_steps(
         ip,
     )
     return result
+from providers.execution import AuditedSubprocessRunner
