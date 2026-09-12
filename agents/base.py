@@ -278,6 +278,9 @@ class AgentBase(ABC):
                 outcome=(
                     OperationOutcome.CANCELLED
                     if self._trace_terminal_state == LifecycleState.CANCELLED
+                    else OperationOutcome.FAILURE
+                    if self._trace_terminal_state
+                    in {LifecycleState.ABORTED, LifecycleState.FAILED}
                     else OperationOutcome.SUCCESS
                 ),
             )
@@ -2120,6 +2123,7 @@ class AgentBase(ABC):
         Exempts awaiting_customer_guidance (budget-grace transitions there).
         """
         if self._aborted:
+            self._trace_terminal_state = LifecycleState.ABORTED
             raise AgentAbortedError("Agent already aborted")
         ticket = self._last_interject_ticket
         if ticket is None:
@@ -2130,6 +2134,7 @@ class AgentBase(ABC):
         if current_status == "awaiting_customer_guidance":
             return
         self._aborted = True
+        self._trace_terminal_state = LifecycleState.ABORTED
         self._emit(
             ticket.get("id", ""),
             "agent_aborted",

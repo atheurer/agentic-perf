@@ -45,6 +45,22 @@ async def test_renewal_loss_records_claim_failure() -> None:
     assert sink.events[-1].action.phase == "claim_renewal"
 
 
+async def test_introspection_is_a_sibling_child_of_dispatch() -> None:
+    dispatcher, _ = _dispatcher()
+    client = MagicMock()
+    client.__enter__.return_value.post.return_value.status_code = 200
+    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
+        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    primary = dispatcher.create_agent("triage_pending", {"id": "PERF-1"})
+    assert dispatcher.start_introspection("PERF-1")
+    observer = dispatcher._introspection_agents["PERF-1"]
+    dispatch = dispatcher._trace_contexts["PERF-1"]
+    assert observer.trace_context.parent_action_id == dispatch.action_id
+    assert primary.trace_context.parent_action_id == dispatch.action_id
+    assert observer.trace_context.action_id != primary.trace_context.action_id
+    dispatcher.stop_introspection("PERF-1")
+
+
 def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()
