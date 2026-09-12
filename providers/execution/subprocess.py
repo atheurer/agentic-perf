@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
+import os
+import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -20,6 +23,7 @@ from providers.tracing import (
     child_context,
     current_trace_context,
 )
+from providers.tracing.client import TraceClient, TraceDeliveryError
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,7 @@ class AuditedProcess:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._process, name)
 
-    async def _finish(self, state: LifecycleState) -> None:
+    async def _finish(self, state: LifecycleState, **descriptors: Any) -> None:
         if not self._terminal:
             self._terminal = True
             await self._runner._record(
@@ -67,6 +71,7 @@ class AuditedProcess:
                     context=self._context,
                     returncode=self.returncode,
                     duration_ms=(time.monotonic() - self._started) * 1000,
+                    **descriptors,
                 )
             )
 
@@ -84,12 +89,15 @@ class AuditedProcess:
         return result
 
     def terminate(self) -> None:
+        self._signal = "terminate"
         self._process.terminate()
 
     def kill(self) -> None:
+        self._signal = "kill"
         self._process.kill()
 
     def send_signal(self, signal: int) -> None:
+        self._signal = f"signal:{signal}"
         self._process.send_signal(signal)
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -113,9 +121,11 @@ class AuditedSubprocessRunner:
         self,
         emit: Callable[[TraceEventV1], Awaitable[Any]] | None = None,
         *,
+        recorder: TraceClient | None = None,
         output_limit: int = 65536,
     ) -> None:
         self._emit = emit
+        self._recorder = recorder
         self._output_limit = output_limit
 
     def _event(
@@ -170,9 +180,30 @@ class AuditedSubprocessRunner:
             },
         )
 
-    async def _record(self, event: TraceEventV1 | None) -> None:
+    async def _record(
+        self, event: TraceEventV1 | None, *, critical: bool = False
+    ) -> None:
         if event is not None and self._emit is not None:
             await self._emit(event)
+        elif event is not None:
+            if self._recorder is None:
+                url, token = (
+                    os.environ.get("STATE_STORE_URL"),
+                    os.environ.get("AGENTIC_PERF_API_TOKEN"),
+                )
+                if url and token:
+                    self._recorder = TraceClient(url, token)
+            if self._recorder is None and critical:
+                raise TraceDeliveryError(
+                    "mutating subprocess requires central trace readiness"
+                )
+            if self._recorder is not None:
+                method = (
+                    self._recorder.record_critical
+                    if critical
+                    else self._recorder.record
+                )
+                await asyncio.to_thread(method, event)
 
     async def start(
         self,
@@ -183,12 +214,16 @@ class AuditedSubprocessRunner:
         stdin: bytes | None = None,
         stdout: Any = asyncio.subprocess.PIPE,
         stderr: Any = asyncio.subprocess.PIPE,
+        mutating: bool = False,
     ) -> AuditedProcess:
         if not argv or any(not isinstance(part, str) for part in argv):
             raise ValueError("argv must be a non-empty string sequence")
         context = current_trace_context()
         child = child_context(context) if context is not None else None
-        await self._record(self._event(LifecycleState.REQUESTED, argv, context=child))
+        await self._record(
+            self._event(LifecycleState.REQUESTED, argv, context=child),
+            critical=mutating,
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -225,9 +260,14 @@ class AuditedSubprocessRunner:
             )
         )
         if stdin is not None and process.stdin is not None:
-            process.stdin.write(stdin)
-            await process.stdin.drain()
-            process.stdin.close()
+            try:
+                process.stdin.write(stdin)
+                await process.stdin.drain()
+                process.stdin.close()
+            except (BrokenPipeError, ConnectionError):
+                process.terminate()
+                await process.wait()
+                raise
         return AuditedProcess(self, process, argv, child)
 
     async def run(
@@ -238,9 +278,13 @@ class AuditedSubprocessRunner:
         env: dict[str, str] | None = None,
         stdin: bytes | None = None,
         timeout: float | None = None,
+        mutating: bool = False,
+        check: bool = False,
     ) -> ProcessResult:
         started = time.monotonic()
-        process = await self.start(argv, cwd=cwd, env=env, stdin=stdin)
+        process = await self.start(
+            argv, cwd=cwd, env=env, stdin=stdin, mutating=mutating
+        )
         timed_out = False
         task = asyncio.create_task(process._process.communicate())
         try:
@@ -250,14 +294,20 @@ class AuditedSubprocessRunner:
             await process._finish(
                 LifecycleState.COMPLETED
                 if process.returncode == 0
-                else LifecycleState.FAILED
+                else LifecycleState.FAILED,
+                stdout_size=len(stdout),
+                stderr_size=len(stderr),
+                stdout_digest=hashlib.sha256(stdout).hexdigest()[:16],
+                stderr_digest=hashlib.sha256(stderr).hexdigest()[:16],
+                stdout_truncated=len(stdout) > self._output_limit,
+                stderr_truncated=len(stderr) > self._output_limit,
             )
             outcome = "success" if process.returncode == 0 else "failure"
         except asyncio.TimeoutError:
             timed_out = True
             process.kill()
             stdout, stderr = await task
-            await process._finish(LifecycleState.TIMED_OUT)
+            await process._finish(LifecycleState.TIMED_OUT, timed_out=True)
             outcome = "timed_out"
         except asyncio.CancelledError:
             process.terminate()
@@ -274,8 +324,34 @@ class AuditedSubprocessRunner:
             (time.monotonic() - started) * 1000,
             timed_out,
         )
+        if check and result.returncode:
+            raise RuntimeError(f"command failed with exit {result.returncode}")
         return result
 
     def run_sync(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
         """Compatibility bridge for non-async provider discovery helpers."""
-        return asyncio.run(self.run(argv, **kwargs))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.run(argv, **kwargs))
+
+        # A few legacy discovery APIs are synchronous but are called by async
+        # provider methods.  Running their audited coroutine on a short-lived
+        # worker avoids nesting an event loop while retaining the caller's
+        # trace context for the subprocess events.
+        result: list[ProcessResult] = []
+        error: list[BaseException] = []
+        caller_context = contextvars.copy_context()
+
+        def execute() -> None:
+            try:
+                result.append(caller_context.run(asyncio.run, self.run(argv, **kwargs)))
+            except BaseException as exc:  # propagate the original provider error
+                error.append(exc)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        worker.join()
+        if error:
+            raise error[0]
+        return result[0]

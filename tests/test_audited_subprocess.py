@@ -9,6 +9,7 @@ import pytest
 
 from providers.execution.subprocess import AuditedSubprocessRunner
 from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
+from providers.tracing.client import TraceDeliveryError
 
 
 async def test_success_nonzero_timeout_and_bounded_output() -> None:
@@ -118,4 +119,55 @@ async def test_repeated_wait_emits_one_terminal_and_binary_output_is_bounded() -
         "requested",
         "started",
         "completed",
+    ]
+
+
+async def test_mutating_spawn_requires_critical_recorder() -> None:
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        with pytest.raises(TraceDeliveryError):
+            await AuditedSubprocessRunner().run(
+                [sys.executable, "-c", "pass"], mutating=True
+            )
+    finally:
+        reset_trace_context(token)
+
+
+async def test_spawn_error_is_audited_on_child_action() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        with pytest.raises(FileNotFoundError):
+            await AuditedSubprocessRunner(emit).run(["definitely-not-a-command"])
+    finally:
+        reset_trace_context(token)
+    assert [event.lifecycle.state.value for event in events] == ["requested", "failed"]
+    assert events[0].action_id == events[1].action_id
+    assert events[0].parent_action_id is not None
+
+
+async def test_signal_then_wait_has_one_terminal() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        process = await AuditedSubprocessRunner(emit).start(
+            [sys.executable, "-c", "import time;time.sleep(1)"]
+        )
+        process.terminate()
+        await process.wait()
+        await process.wait()
+    finally:
+        reset_trace_context(token)
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "started",
+        "failed",
     ]
