@@ -121,6 +121,9 @@ class AuditedProcess:
 class AuditedSubprocessRunner:
     """Runs argv-only local commands and emits start plus exactly one terminal event."""
 
+    _default_recorder: TraceClient | None = None
+    _default_recorder_lock = threading.Lock()
+
     def __init__(
         self,
         emit: Callable[[TraceEventV1], Awaitable[Any]] | None = None,
@@ -135,9 +138,10 @@ class AuditedSubprocessRunner:
     @classmethod
     def reset_default_recorder(cls) -> None:
         """Close ambient client state; primarily for orderly shutdown and tests."""
-        if cls._default_recorder is not None:
-            cls._default_recorder.close()
-            cls._default_recorder = None
+        with cls._default_recorder_lock:
+            recorder, cls._default_recorder = cls._default_recorder, None
+        if recorder is not None:
+            recorder.close()
 
     def _output_descriptors(self, stdout: bytes, stderr: bytes) -> dict[str, Any]:
         return {
@@ -213,9 +217,10 @@ class AuditedSubprocessRunner:
                     os.environ.get("AGENTIC_PERF_API_TOKEN"),
                 )
                 if url and token:
-                    if self._default_recorder is None:
-                        self._default_recorder = TraceClient(url, token)
-                    self._recorder = self._default_recorder
+                    with self._default_recorder_lock:
+                        if self._default_recorder is None:
+                            self._default_recorder = TraceClient(url, token)
+                        self._recorder = self._default_recorder
             if self._recorder is None and critical:
                 raise TraceDeliveryError(
                     "mutating subprocess requires central trace readiness"
@@ -238,13 +243,19 @@ class AuditedSubprocessRunner:
         stdout: Any = asyncio.subprocess.PIPE,
         stderr: Any = asyncio.subprocess.PIPE,
         mutating: bool = False,
+        system_context: bool = False,
     ) -> AuditedProcess:
         if not argv or any(not isinstance(part, str) for part in argv):
             raise ValueError("argv must be a non-empty string sequence")
         context = current_trace_context()
         child = child_context(context) if context is not None else None
+        requested = self._event(LifecycleState.REQUESTED, argv, context=child)
+        if mutating and requested is None and not system_context:
+            raise TraceDeliveryError(
+                "mutating subprocess requires a ticket trace context"
+            )
         await self._record(
-            self._event(LifecycleState.REQUESTED, argv, context=child),
+            requested,
             critical=mutating,
         )
         try:
@@ -304,11 +315,17 @@ class AuditedSubprocessRunner:
         stdin: bytes | None = None,
         timeout: float | None = None,
         mutating: bool = False,
+        system_context: bool = False,
         check: bool = False,
     ) -> ProcessResult:
         started = time.monotonic()
         process = await self.start(
-            argv, cwd=cwd, env=env, stdin=stdin, mutating=mutating
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            mutating=mutating,
+            system_context=system_context,
         )
         timed_out = False
         task = asyncio.create_task(process._process.communicate())
@@ -383,5 +400,3 @@ class AuditedSubprocessRunner:
         if error:
             raise error[0]
         return result[0]
-
-    _default_recorder: TraceClient | None = None

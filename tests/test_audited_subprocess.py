@@ -135,6 +135,19 @@ async def test_mutating_spawn_requires_critical_recorder() -> None:
         reset_trace_context(token)
 
 
+async def test_mutating_spawn_without_context_fails_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def must_not_spawn(*_args, **_kwargs):
+        raise AssertionError("mutating command must fail before spawn")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", must_not_spawn)
+    with pytest.raises(TraceDeliveryError, match="ticket trace context"):
+        await AuditedSubprocessRunner().run(
+            [sys.executable, "-c", "pass"], mutating=True
+        )
+
+
 async def test_spawn_error_is_audited_on_child_action() -> None:
     events = []
 
