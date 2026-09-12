@@ -1148,10 +1148,9 @@ async def build_ssh_from_ticket(
     """
     import httpx
 
-    from paths import TRACE_DB_PATH
     from providers.ssh import SSHExecutor
     from providers.tracing import new_trace_context
-    from state_store.trace_store import TraceStore
+    from providers.tracing.client import TraceClient
 
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
@@ -1195,6 +1194,7 @@ async def build_ssh_from_ticket(
             resolve_ssh_key(ssh_key, sp, vault_secret_name),
         )
 
+    trace_recorder = TraceClient(state_store_url, api_token) if api_token else None
     return SSHExecutor(
         user=ssh_user,
         key_path=resolved_key,
@@ -1203,7 +1203,7 @@ async def build_ssh_from_ticket(
             ticket_id=ticket_id,
             agent_id=os.environ.get("AGENT_NAME"),
         ),
-        trace_recorder=TraceStore(TRACE_DB_PATH),
+        trace_recorder=trace_recorder,
     ), ticket
 
 

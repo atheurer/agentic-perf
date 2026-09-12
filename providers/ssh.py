@@ -205,12 +205,15 @@ class SSHExecutor:
         key_path: str | None = None,
         allocate_pty: bool = False,
         stdin_data: bytes | None = None,
+        mutating: bool = False,
     ) -> SSHResult:
         args = self._ssh_args(host, key_path=key_path, allocate_pty=allocate_pty) + [
             command
         ]
         started = time.monotonic()
         trace = _SSHTraceAction(self, "ssh", host)
+        if mutating and (trace.context is None or self.trace_recorder is None):
+            raise RuntimeError("mutating SSH requires durable trace readiness")
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,
@@ -568,9 +571,12 @@ class SSHExecutor:
         local_path: str,
         timeout: int = 120,
         key_path: str | None = None,
+        mutating: bool = False,
     ) -> SSHResult:
         started = time.monotonic()
         trace = _SSHTraceAction(self, "scp_from", host)
+        if mutating and (trace.context is None or self.trace_recorder is None):
+            raise RuntimeError("mutating SCP requires durable trace readiness")
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,
@@ -664,9 +670,12 @@ class SSHExecutor:
         remote_path: str,
         timeout: int = 120,
         key_path: str | None = None,
+        mutating: bool = False,
     ) -> SSHResult:
         started = time.monotonic()
         trace = _SSHTraceAction(self, "scp_to", host)
+        if mutating and (trace.context is None or self.trace_recorder is None):
+            raise RuntimeError("mutating SCP requires durable trace readiness")
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,

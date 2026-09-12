@@ -284,3 +284,15 @@ async def test_scp_transfer_audits_success_and_remote_failures(
     assert events[-1].attributes["local_pid"] == 4242
     assert "source" not in str(events)
     assert "destination" not in str(events)
+
+
+async def test_mutating_ssh_fails_closed_without_durable_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def must_not_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must not spawn before critical audit readiness")
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", must_not_spawn)
+    executor = SSHExecutor(trace_context=new_trace_context(ticket_id="PERF-SSH"))
+    with pytest.raises(RuntimeError, match="durable trace readiness"):
+        await executor.run("host", "touch /mutating", mutating=True)
