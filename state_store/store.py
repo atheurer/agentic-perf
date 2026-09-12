@@ -337,6 +337,7 @@ class TicketStore:
                 ticket_id,
                 {"author": request.author, "comment_id": comment.id},
             )
+            self._trace_mutation(ticket_id, "add_comment")
             return comment.model_copy()
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
@@ -374,6 +375,7 @@ class TicketStore:
                             "held_by": existing["owner"],
                         },
                     )
+                    self._trace_mutation(ticket_id, "claim_ticket", rejected=True)
                     return None
 
             expires = now + timedelta(seconds=duration_seconds)
@@ -394,6 +396,7 @@ class TicketStore:
                     "result": "claimed",
                 },
             )
+            self._trace_mutation(ticket_id, "claim_ticket")
             return claim
 
     def release_claim(self, ticket_id: str, owner: str) -> bool:
@@ -438,6 +441,7 @@ class TicketStore:
                     ticket_id,
                     {"owner": owner, "result": "not_owner"},
                 )
+                self._trace_mutation(ticket_id, "renew_claim", rejected=True)
                 return None
 
             now = datetime.now(timezone.utc)
@@ -454,6 +458,7 @@ class TicketStore:
                     "result": "renewed",
                 },
             )
+            self._trace_mutation(ticket_id, "renew_claim")
             return existing
 
     def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
