@@ -145,6 +145,7 @@ class AgentBase(ABC):
         self._register_workspace_tools()
         self.trace_context = None
         self._trace = TraceRecorder()
+        self._trace_terminal_state = LifecycleState.COMPLETED
 
     def _register_workspace_tools(self) -> None:
         """Register native workspace tools on the agent."""
@@ -271,9 +272,14 @@ class AgentBase(ABC):
             self._trace.record(
                 self.trace_context,
                 ActionType.AGENT,
-                LifecycleState.COMPLETED,
+                self._trace_terminal_state,
                 phase="run",
                 duration_ms=0,
+                outcome=(
+                    OperationOutcome.CANCELLED
+                    if self._trace_terminal_state == LifecycleState.CANCELLED
+                    else OperationOutcome.SUCCESS
+                ),
             )
         await self._client.aclose()
 
@@ -1140,6 +1146,7 @@ class AgentBase(ABC):
                     try:
                         result = await self._execute_tool(tc)
                     except asyncio.CancelledError:
+                        self._trace_terminal_state = LifecycleState.CANCELLED
                         self._trace.record(
                             tool_context,
                             ActionType.TOOL,
