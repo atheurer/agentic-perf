@@ -3409,21 +3409,77 @@ async def execute_boot_time_test(
         cwd=str(output_dir),
         env=run_env,
     )
-    try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=benchmark_timeout,
-        )
-    except _asyncio.TimeoutError:
-        logger.warning(
-            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
-        )
-        proc.kill()
-        stdout_bytes, stderr_bytes = await proc.communicate()
+
+    # Stall detection: poll every 60s for new artifact files.
+    # If no new files appear for 5 minutes, the script is
+    # stuck (e.g., serial pipe dead after cold reboot) and
+    # we kill it early instead of waiting for the full
+    # benchmark_timeout.
+    _STALL_CHECK_INTERVAL = 60
+    _STALL_TIMEOUT = 300  # 5 min with no new files
+    _start_time = _asyncio.get_event_loop().time()
+    _last_file_count = 0
+    _last_progress_time = _start_time
+    stall_killed = False
+
+    while proc.returncode is None:
+        try:
+            await _asyncio.wait_for(
+                proc.wait(),
+                timeout=_STALL_CHECK_INTERVAL,
+            )
+            break  # Process finished
+        except _asyncio.TimeoutError:
+            now = _asyncio.get_event_loop().time()
+
+            # Check overall timeout
+            if now - _start_time > benchmark_timeout:
+                logger.warning(
+                    "[boot-time] Subprocess timed out after %ds, killing",
+                    benchmark_timeout,
+                )
+                proc.kill()
+                await proc.wait()
+                break
+
+            # Count artifact files for stall detection
+            try:
+                file_count = sum(1 for _ in output_dir.rglob("*") if _.is_file())
+            except Exception:
+                file_count = _last_file_count
+
+            if file_count > _last_file_count:
+                _last_file_count = file_count
+                _last_progress_time = now
+            elif now - _last_progress_time > _STALL_TIMEOUT:
+                logger.warning(
+                    "[boot-time] No new artifacts for "
+                    "%ds (stall detected at %d files), "
+                    "killing subprocess",
+                    int(now - _last_progress_time),
+                    file_count,
+                )
+                proc.kill()
+                await proc.wait()
+                stall_killed = True
+                break
+
+    # Collect output after process ends.
+    # communicate() is safe to call here since the process
+    # has already exited (wait() completed or kill() called).
+    stdout_bytes, stderr_bytes = await proc.communicate()
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
     stderr_str = stderr_bytes.decode(errors="replace")
+    if stall_killed:
+        stderr_str += (
+            "\n[agentic-perf] Benchmark killed: no new "
+            "artifact files for 5 minutes (stall detected). "
+            "This may indicate the board is unresponsive "
+            "after a cold reboot or the serial connection "
+            "is dead."
+        )
 
     # ── Stop passive serial capture ─────────────────────────
     if serial_proc is not None:
