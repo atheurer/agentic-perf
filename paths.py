@@ -127,10 +127,17 @@ def create_artifact_dir(
     if ticket_id:
         artifact_dir = ARTIFACT_DIR / ticket_id / run_id
         # Import locally to avoid making paths.py depend on tracing at import time.
-        from providers.execution import AuditedFilesystem, RootedPath
+        from providers.execution import (
+            AuditedFilesystem,
+            RootedPath,
+            durable_filesystem_emitter,
+        )
 
         AuditedFilesystem(
-            RootedPath(ARTIFACT_DIR, "artifact"), ticket_id=ticket_id
+            RootedPath(ARTIFACT_DIR, "artifact"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
         ).mkdir(f"{ticket_id}/{run_id}")
         return artifact_dir
     return Path(tempfile.mkdtemp(prefix=f"{run_id}-"))

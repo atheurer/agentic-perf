@@ -40,7 +40,12 @@ from agents.server_utils import (
     read_skill_documents,
     tool_progress,
 )
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import (
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3274,6 +3279,18 @@ async def execute_boot_time_test(
 
     _ticket_id = os.environ.get("TICKET_ID", "")
     output_dir = create_artifact_dir(_ticket_id, run_uuid)
+    artifact_filesystem = (
+        AuditedFilesystem(
+            RootedPath(
+                output_dir, "artifact", logical_prefix=f"{_ticket_id}/{run_uuid}"
+            ),
+            ticket_id=_ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        if _ticket_id
+        else None
+    )
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -3475,14 +3492,23 @@ async def execute_boot_time_test(
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            metadata_file.write_bytes(meta_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", meta_out)
+            else:
+                metadata_file.write_bytes(meta_out)
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            metadata_file.write_text("{}")
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", "{}")
+            else:
+                metadata_file.write_text("{}")
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        metadata_file.write_text("{}")
+        if artifact_filesystem:
+            artifact_filesystem.write("metadata.json", "{}")
+        else:
+            metadata_file.write_text("{}")
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -3534,7 +3560,10 @@ async def execute_boot_time_test(
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            merged_file.write_bytes(merge_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("merged-results.json", merge_out)
+            else:
+                merged_file.write_bytes(merge_out)
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(

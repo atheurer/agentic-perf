@@ -36,6 +36,24 @@ def test_create_is_audited_with_logical_digest_and_size(filesystem) -> None:
     assert str(root) not in complete.model_dump_json()
 
 
+def test_lifecycle_uses_one_child_action_and_never_records_error_text(
+    filesystem,
+) -> None:
+    fs, events, root = filesystem
+    secret = "secret-token-not-for-audit"
+    with pytest.raises(FileNotFoundError):
+        fs.rename("missing", secret)
+    assert [event.lifecycle.state.value for event in events] == ["requested", "failed"]
+    assert events[0].action_id == events[1].action_id
+    assert events[0].trace_id == events[1].trace_id
+    serialized = events[-1].model_dump_json()
+    assert secret not in serialized
+    assert str(root) not in serialized
+    assert events[-1].error is not None
+    assert events[-1].error.message is None
+    assert len(events[-1].attributes["error_digest"]) == 64
+
+
 def test_atomic_replace_rename_and_unlink(filesystem) -> None:
     fs, events, root = filesystem
     fs.write("one", "old")
@@ -66,6 +84,57 @@ def test_missing_target_and_audit_delivery_failure_are_not_success(filesystem) -
     with pytest.raises(FilesystemAuditError):
         blocked.write("never-created", "x")
     assert not (Path.cwd() / "never-created").exists()
+
+
+def test_critical_mutation_requires_recorder_before_touching_disk(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FilesystemAuditError):
+        AuditedFilesystem(
+            RootedPath(tmp_path, "ticket"), ticket_id="PERF-FILES", critical=True
+        )
+    assert not (tmp_path / "never-created").exists()
+
+
+def test_short_write_is_failed_and_never_completed(
+    filesystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fs, events, _ = filesystem
+
+    class ShortWriter:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def write(self, value):
+            self._handle.write(value[:1])
+            return 1
+
+    import providers.execution.filesystem as module
+
+    original = module.os.fdopen
+    monkeypatch.setattr(module.os, "fdopen", lambda *args: ShortWriter(original(*args)))
+    with pytest.raises(OSError, match="short filesystem write"):
+        fs.write("partial", b"abcdef")
+    assert [event.lifecycle.state.value for event in events] == ["requested", "failed"]
+
+
+def test_concurrent_same_target_is_atomic(filesystem) -> None:
+    import concurrent.futures
+
+    fs, _, root = filesystem
+    values = [f"value-{number}".encode() for number in range(12)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda value: fs.write("same", value), values))
+    assert (root / "same").read_bytes() in values
 
 
 def test_archive_uses_only_logical_member_names(filesystem) -> None:

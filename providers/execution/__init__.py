@@ -1,6 +1,11 @@
 """Audited local process execution."""
 
-from .filesystem import AuditedFilesystem, FilesystemAuditError, RootedPath
+from .filesystem import (
+    AuditedFilesystem,
+    FilesystemAuditError,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from .subprocess import AuditedSubprocessRunner, ProcessResult
 
 __all__ = [
@@ -9,4 +14,5 @@ __all__ = [
     "FilesystemAuditError",
     "ProcessResult",
     "RootedPath",
+    "durable_filesystem_emitter",
 ]

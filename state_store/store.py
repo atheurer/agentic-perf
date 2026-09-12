@@ -7,7 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
-from providers.execution import AuditedFilesystem, RootedPath
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -66,9 +70,11 @@ class TicketStore:
 
     def _filesystem(self, ticket_id: str) -> AuditedFilesystem:
         """Return the ticket-owned mutation boundary without exposing host paths."""
-        emit = None
-        if self._trace_store is not None:
-            emit = self._trace_store.insert_event_result
+        emit = (
+            self._trace_store.insert_event_result
+            if self._trace_store is not None
+            else durable_filesystem_emitter()
+        )
         return AuditedFilesystem(
             RootedPath(
                 self._persist_dir.parent,
@@ -78,6 +84,7 @@ class TicketStore:
             ),
             ticket_id=ticket_id,
             emit=emit,
+            critical=True,
         )
 
     def _trace_mutation(
@@ -537,8 +544,6 @@ class TicketStore:
                     f"Ticket {ticket_id} is {ticket.status.value}, not closed. "
                     "Only closed tickets can be archived."
                 )
-            del self._tickets[ticket_id]
-
         filesystem = self._filesystem(ticket_id)
         filesystem.mkdir("archive/tickets")
         archived = []
@@ -562,13 +567,22 @@ class TicketStore:
                 RootedPath(LOG_DIR.parent, "ticket"),
                 ticket_id=ticket_id,
                 emit=(
-                    self._trace_store.insert_event_result if self._trace_store else None
+                    self._trace_store.insert_event_result
+                    if self._trace_store
+                    else durable_filesystem_emitter()
                 ),
+                critical=True,
             )
             log_filesystem.rename(
                 f"logs/{ticket_id}.jsonl", f"archive/logs/{ticket_id}.jsonl"
             )
             archived.append(f"ticket://archive/logs/{ticket_id}.jsonl")
+
+        # Keep the closed ticket reachable if any durable move fails.  This is
+        # intentionally after both moves, so a primary archive failure is not
+        # hidden by an in-memory deletion.
+        with self._lock:
+            self._tickets.pop(ticket_id, None)
 
         logger.info(f"Archived ticket {ticket_id}: {archived}")
         return {"ticket_id": ticket_id, "archived_files": archived}

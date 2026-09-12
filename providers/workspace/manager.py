@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from paths import get_ticket_workspace_dir
-from providers.execution import AuditedFilesystem, RootedPath
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +56,16 @@ class WorkspaceManager:
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.workspace_dir = get_ticket_workspace_dir(self.ticket_id).resolve()
+        emitter = audit_emit or (
+            durable_filesystem_emitter() if self.ticket_id else None
+        )
         self._filesystem = AuditedFilesystem(
             RootedPath(self.workspace_dir, "workspace"),
             ticket_id=self.ticket_id or "workspace-scratch",
-            emit=audit_emit,
+            emit=emitter,
+            critical=bool(self.ticket_id),
+            # Only no-ticket scratch work is an allowed system context.
+            system_context=not self.ticket_id,
         )
         for namespace in self.NAMESPACES:
             self._filesystem.mkdir(namespace)
