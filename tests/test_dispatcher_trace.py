@@ -59,3 +59,15 @@ def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
     assert second.invocation_id != first.invocation_id
     assert second.parent_action_id == first.action_id
     assert sink.events[-1].attributes["prior_invocation_id"] == str(first.invocation_id)
+
+
+def test_constructed_agent_is_a_distinct_child_of_dispatch() -> None:
+    dispatcher, sink = _dispatcher()
+    client = MagicMock()
+    client.__enter__.return_value.post.return_value.status_code = 200
+    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
+        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    dispatch = dispatcher._trace_contexts["PERF-1"]
+    agent = dispatcher.create_agent("triage_pending", {"id": "PERF-1"})
+    assert agent.trace_context.parent_action_id == dispatch.action_id
+    assert agent.trace_context.action_id != dispatch.action_id
