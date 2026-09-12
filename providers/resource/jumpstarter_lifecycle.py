@@ -147,6 +147,11 @@ async def sweep_orphaned_leases(
                             ["jmp", "delete", "leases", lease_name],
                             timeout=15,
                             mutating=True,
+                            # The periodic orphan sweep is a daemon failsafe,
+                            # not an agent-owned ticket operation.  Mark this
+                            # narrow maintenance action explicitly rather than
+                            # weakening ticket-bound mutation checks globally.
+                            system_context=True,
                         )
                         if _dr.returncode == 0:
                             logger.info(
