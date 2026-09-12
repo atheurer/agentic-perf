@@ -56,7 +56,10 @@ class TraceStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._connection = sqlite3.connect(
-                self.db_path, timeout=busy_timeout_ms / 1000, isolation_level=None
+                self.db_path,
+                timeout=busy_timeout_ms / 1000,
+                isolation_level=None,
+                check_same_thread=False,
             )
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
@@ -199,6 +202,22 @@ class TraceStore:
             if connection is not None and connection.in_transaction:
                 connection.rollback()
             raise TraceStoreWriteError("could not write trace event") from exc
+
+    def list_events(self, ticket_id: str | None = None) -> list[TraceEventV1]:
+        """Return immutable events in their authoritative insertion order."""
+        try:
+            query = "SELECT event_json FROM trace_events"
+            values: tuple[str, ...] = ()
+            if ticket_id is not None:
+                query += " WHERE ticket_id = ?"
+                values = (ticket_id,)
+            query += " ORDER BY global_seq"
+            return [
+                TraceEventV1.model_validate_json(row["event_json"])
+                for row in self._open_connection().execute(query, values)
+            ]
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            raise TraceStoreWriteError("could not read trace events") from exc
 
     def put_payload_descriptor(self, descriptor: PayloadDescriptor) -> None:
         """Persist safe payload metadata only; payload bytes are never stored in SQLite."""

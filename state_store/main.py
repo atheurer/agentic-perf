@@ -95,6 +95,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     def close_trace_store() -> None:
+        # The adapters own separate connections and must close before the
+        # service's authoritative connection. ``getattr`` keeps early startup
+        # failures safe when router construction did not complete.
+        for name in ("event_bus", "audit_log"):
+            adapter = getattr(app.state, name, None)
+            if adapter is not None:
+                adapter.close()
         app.state.trace_store.close()
 
     port = int(os.environ.get("STORE_PORT", "8090"))
@@ -216,6 +223,9 @@ def create_app() -> FastAPI:
     from providers.redaction import Redactor
 
     audit_redactor = Redactor()
+    # Compatibility adapters use independent SQLite connections to the same
+    # database, so API worker threads never interleave transactions on one
+    # connection while the TraceStore remains the sole persistence authority.
     audit_log = AuditLog(redactor=audit_redactor)
     app.state.audit_log = audit_log
     app.state.event_bus = EventBus(redactor=audit_redactor)
