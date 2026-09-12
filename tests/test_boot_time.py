@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from providers.execution import AuditedSubprocessRunner
+from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
+
 
 @pytest.fixture(autouse=True)
 def _reset_boot_time_guard():
@@ -258,24 +261,34 @@ class TestBootTimeKPIExtraction:
                 )
             return proc
 
-        with (
-            patch.object(server, "_initialized", True),
-            patch.object(server, "_repo_cache", mock_cache),
-            patch.object(server, "_ticket", mock_ticket),
-            patch.object(server, "_ssh", MagicMock()),
-            patch(
-                "asyncio.create_subprocess_exec",
-                side_effect=mock_subprocess_exec,
-            ),
-            patch("tempfile.mkdtemp", return_value=str(tmp_path)),
-        ):
-            result = json.loads(
-                await server.execute_boot_time_test(
-                    sut_host="192.168.1.100",
-                    samples=3,
-                    description="test run",
+        async def emit(_event):
+            """Keep this unit test local while preserving a ticket trace."""
+
+        token = bind_trace_context(new_trace_context(ticket_id="PERF-BOOT"))
+        runner = AuditedSubprocessRunner(emit)
+
+        try:
+            with (
+                patch.object(server, "_initialized", True),
+                patch.object(server, "_repo_cache", mock_cache),
+                patch.object(server, "_ticket", mock_ticket),
+                patch.object(server, "_ssh", MagicMock()),
+                patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+                patch(
+                    "asyncio.create_subprocess_exec",
+                    side_effect=mock_subprocess_exec,
+                ),
+                patch("tempfile.mkdtemp", return_value=str(tmp_path)),
+            ):
+                result = json.loads(
+                    await server.execute_boot_time_test(
+                        sut_host="192.168.1.100",
+                        samples=3,
+                        description="test run",
+                    )
                 )
-            )
+        finally:
+            reset_trace_context(token)
 
         assert result["status"] == "completed"
         assert result["harness"] == "boot-time"

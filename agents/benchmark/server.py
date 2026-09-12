@@ -40,6 +40,7 @@ from agents.server_utils import (
     read_skill_documents,
     tool_progress,
 )
+from providers.execution import AuditedSubprocessRunner
 
 logger = logging.getLogger(__name__)
 
@@ -2704,21 +2705,20 @@ async def execute_benchmark(
                     }
                 )
 
-            proc = await _asyncio.create_subprocess_exec(
-                podman_path,
-                "run",
-                "-i",
-                "--rm",
-                "--network=host",
-                plugin_image,
-                *container_args,
-                stdin=_asyncio.subprocess.PIPE,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
+            proc = await AuditedSubprocessRunner().start(
+                [
+                    podman_path,
+                    "run",
+                    "-i",
+                    "--rm",
+                    "--network=host",
+                    plugin_image,
+                    *container_args,
+                ],
+                stdin=input_content.encode(),
+                mutating=True,
             )
-            stdout_bytes, stderr_bytes = await proc.communicate(
-                input=input_content.encode()
-            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
             stdout_str = stdout_bytes.decode(errors="replace")
             stderr_str = stderr_bytes.decode(errors="replace")
@@ -3238,14 +3238,15 @@ async def execute_boot_time_test(
         # Security: password on argv is visible in /proc/pid/cmdline.
         # The external scripts require --password= on the command line;
         # upstream fix: accept --password-file or SSHPASS env var.
-        install_proc = await _asyncio.create_subprocess_exec(
-            str(install_script),
-            sut_host,
-            f"--username={ssh_user}",
-            f"--password={ssh_password}",
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        install_proc = await AuditedSubprocessRunner().start(
+            [
+                str(install_script),
+                sut_host,
+                f"--username={ssh_user}",
+                f"--password={ssh_password}",
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         install_out, install_err = await install_proc.communicate()
         if install_proc.returncode != 0:
@@ -3365,16 +3366,19 @@ async def execute_boot_time_test(
                     "w",
                     encoding="utf-8",
                 )
-                serial_proc = await _asyncio.create_subprocess_exec(
-                    "jmp",
-                    "shell",
-                    f"--lease={_lease_id}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
+                serial_proc = await AuditedSubprocessRunner().start(
+                    [
+                        "jmp",
+                        "shell",
+                        f"--lease={_lease_id}",
+                        "--",
+                        "j",
+                        "serial",
+                        "pipe",
+                    ],
                     stdout=serial_log_fh,
                     stderr=_asyncio.subprocess.DEVNULL,
+                    mutating=True,
                 )
                 logger.info(
                     f"[boot-time] Passive serial capture "
@@ -3402,24 +3406,17 @@ async def execute_boot_time_test(
     # capture-boot timed out but jmp shell child lingered).
     benchmark_timeout = (samples * 90) + 900
 
-    proc = await _asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
+    proc = await AuditedSubprocessRunner().start(
+        cmd,
         cwd=str(output_dir),
         env=run_env,
+        mutating=True,
     )
     try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=benchmark_timeout,
-        )
+        stdout_bytes, stderr_bytes = await proc.communicate(timeout=benchmark_timeout)
     except _asyncio.TimeoutError:
-        logger.warning(
-            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
-        )
-        proc.kill()
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        logger.warning(f"[boot-time] Subprocess timed out after {benchmark_timeout}s")
+        stdout_bytes, stderr_bytes = b"", b""
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
@@ -3430,13 +3427,10 @@ async def execute_boot_time_test(
         try:
             serial_proc.terminate()
             try:
-                await _asyncio.wait_for(
-                    serial_proc.wait(),
-                    timeout=10,
-                )
+                await serial_proc.wait(timeout=10)
             except _asyncio.TimeoutError:
-                serial_proc.kill()
-                await serial_proc.wait()
+                # The tracked wait has already escalated to kill.
+                pass
             logger.info("[boot-time] Passive serial capture stopped")
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")
@@ -3471,12 +3465,13 @@ async def execute_boot_time_test(
     collect_metadata = scripts_dir / "collect-system-metadata.sh"
     if collect_metadata.exists():
         logger.info(f"[boot-time] Collecting system metadata from {sut_host}")
-        meta_proc = await _asyncio.create_subprocess_exec(
-            str(collect_metadata),
-            sut_host,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        meta_proc = await AuditedSubprocessRunner().start(
+            [
+                str(collect_metadata),
+                sut_host,
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
@@ -3532,11 +3527,10 @@ async def execute_boot_time_test(
                 break
         merge_cmd.extend(str(f) for f in boot_time_logs)
 
-        merge_proc = await _asyncio.create_subprocess_exec(
-            *merge_cmd,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        merge_proc = await AuditedSubprocessRunner().start(
+            merge_cmd,
             cwd=str(scripts_dir),
+            mutating=True,
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:

@@ -105,14 +105,16 @@ async def provision_jumpstarter(
             serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
         try:
             serial_log_fh = open(serial_log_path, "w", encoding="utf-8")
-            serial_proc = await asyncio.create_subprocess_exec(
-                "jmp",
-                "shell",
-                f"--lease={lease_name}",
-                "--",
-                "j",
-                "serial",
-                "pipe",
+            serial_proc = await AuditedSubprocessRunner().start(
+                [
+                    "jmp",
+                    "shell",
+                    f"--lease={lease_name}",
+                    "--",
+                    "j",
+                    "serial",
+                    "pipe",
+                ],
                 stdout=serial_log_fh,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -154,9 +156,10 @@ async def provision_jumpstarter(
         if serial_proc:
             try:
                 serial_proc.terminate()
-                await asyncio.wait_for(serial_proc.wait(), timeout=5)
+                await serial_proc.wait(timeout=5)
             except Exception:
-                serial_proc.kill()
+                # The tracked wait has already escalated to kill.
+                pass
         if serial_log_fh:
             serial_log_fh.close()
 
@@ -493,3 +496,6 @@ async def _run_provision_steps(
         ip,
     )
     return result
+
+
+from providers.execution import AuditedSubprocessRunner
