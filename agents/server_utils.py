@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx  # noqa: F401 - retained as a stable test patch seam
 
+from providers.execution import AuditedAsyncHTTPClient
+
 logger = logging.getLogger(__name__)
 
 
@@ -1097,8 +1099,6 @@ async def assert_ticket_active(
     drifted — the caller should return this to the LLM as a tool result
     instead of proceeding with the side-effecting operation.
     """
-    from providers.execution import AuditedAsyncHTTPClient
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL", "http://localhost:8090"
@@ -1148,7 +1148,6 @@ async def build_ssh_from_ticket(
     Returns (SSHExecutor, ticket_dict). If ticket_id is None, reads from
     TICKET_ID env var. If state_store_url is None, reads from STATE_STORE_URL.
     """
-    from providers.execution import AuditedAsyncHTTPClient
     from providers.ssh import SSHExecutor
     from providers.tracing import new_trace_context
     from providers.tracing.client import TraceClient
@@ -1235,8 +1234,6 @@ async def tool_progress(
     Reads TICKET_ID and STATE_STORE_URL from env if not provided.
     Silently no-ops if ticket_id is unavailable (e.g., in tests).
     """
-    from providers.execution import AuditedAsyncHTTPClient
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL",

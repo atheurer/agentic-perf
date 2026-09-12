@@ -48,6 +48,7 @@ _REQUEST_ID_HEADERS = frozenset(
     }
 )
 _READ_ONLY = frozenset({"GET", "HEAD", "OPTIONS"})
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
 _SECRET_PATH_LABELS = frozenset(
     {"callback", "callbacks", "hook", "hooks", "token", "tokens", "webhook", "webhooks"}
 )
@@ -383,9 +384,10 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
             raise ValueError(
                 "automatic redirects are disabled for audited HTTP; issue a separately audited request"
             )
-        # Override both per-call and client-constructor defaults.  A redirect
-        # is a new target and must be initiated explicitly so it is audited.
-        kwargs["follow_redirects"] = False
+        # Override a real httpx client's constructor default.  Test/provider
+        # doubles may expose narrow verb signatures, but cannot auto-follow.
+        if isinstance(self._client, _HTTPX_ASYNC_CLIENT):
+            kwargs["follow_redirects"] = False
         method, target = method.upper(), _safe_target(url)
         context = self._context(method)
         mutating = method not in _READ_ONLY
@@ -713,4 +715,5 @@ class _AsyncAdapter:
     async def request(self, *args: Any, **kwargs: Any) -> httpx.Response:
         # The sync facade owns the calling thread; keeping its httpx transport
         # on that thread avoids cross-thread connection-pool deadlocks.
+        kwargs["follow_redirects"] = False
         return self.client.request(*args, **kwargs)

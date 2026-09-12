@@ -438,36 +438,15 @@ class TestProcessStopRequests:
             },
         ):
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
+            audited = httpx.AsyncClient(
                 transport=transport,
                 base_url="http://testserver",
-            ) as _:
-                # _process_stop_requests creates its own client,
-                # so we need to monkeypatch httpx.AsyncClient
-                original_init = httpx.AsyncClient.__init__
-
-                def patched_init(self_client, **kwargs):
-                    kwargs.pop("timeout", None)
-                    kwargs.pop("headers", None)
-                    original_init(
-                        self_client,
-                        transport=transport,
-                        base_url="http://testserver",
-                        headers={
-                            "Authorization": (f"Bearer {app.state.api_token}"),
-                        },
-                        timeout=10.0,
-                    )
-
-                with patch.object(
-                    httpx.AsyncClient,
-                    "__init__",
-                    patched_init,
-                ):
-                    await _process_stop_requests(
-                        dispatcher,
-                        "http://testserver",
-                    )
+                headers={"Authorization": f"Bearer {app.state.api_token}"},
+            )
+            with patch(
+                "orchestrator.main.AuditedAsyncHTTPClient", return_value=audited
+            ):
+                await _process_stop_requests(dispatcher, "http://testserver")
 
         result = store.get_ticket(ticket.id)
         assert result.status.value == "closed"
@@ -517,30 +496,15 @@ class TestProcessStopRequests:
             },
         ):
             transport = httpx.ASGITransport(app=app)
-            original_init = httpx.AsyncClient.__init__
-
-            def patched_init(self_client, **kwargs):
-                kwargs.pop("timeout", None)
-                kwargs.pop("headers", None)
-                original_init(
-                    self_client,
-                    transport=transport,
-                    base_url="http://testserver",
-                    headers={
-                        "Authorization": (f"Bearer {app.state.api_token}"),
-                    },
-                    timeout=10.0,
-                )
-
-            with patch.object(
-                httpx.AsyncClient,
-                "__init__",
-                patched_init,
+            audited = httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                headers={"Authorization": f"Bearer {app.state.api_token}"},
+            )
+            with patch(
+                "orchestrator.main.AuditedAsyncHTTPClient", return_value=audited
             ):
-                await _process_stop_requests(
-                    dispatcher,
-                    "http://testserver",
-                )
+                await _process_stop_requests(dispatcher, "http://testserver")
 
         result = store.get_ticket(ticket.id)
         assert result.status.value == "awaiting_customer_guidance"

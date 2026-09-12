@@ -23,6 +23,10 @@ def _context():
     return bind_trace_context(new_trace_context(ticket_id="PERF-http", agent_id="test"))
 
 
+async def _discard_event(_event) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_audited_get_redacts_secrets_and_records_provider_request_id() -> None:
     events = []
@@ -404,3 +408,25 @@ def test_sync_client_records_bounded_request() -> None:
     finally:
         reset_trace_context(token)
     assert events[-1].attributes["target"] == "https://provider.example/read"
+
+
+def test_sync_client_disables_constructor_redirect_default() -> None:
+    seen = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://other.example/next"})
+
+    token = _context()
+    try:
+        client = AuditedHTTPClient(
+            client=httpx.Client(
+                transport=httpx.MockTransport(redirect), follow_redirects=True
+            ),
+            emit=_discard_event,
+        )
+        response = client.get("https://api.example/redirect")
+    finally:
+        reset_trace_context(token)
+    assert response.status_code == 302
+    assert seen == ["https://api.example/redirect"]

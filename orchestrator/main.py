@@ -1253,6 +1253,13 @@ async def _process_stop_requests(
                 if not stop_req:
                     continue
                 tid = ticket["id"]
+                # Stop requests are ticket-scoped mutations even when no
+                # agent task is active, so establish a fresh causal root.
+                getattr(client, "_client", client).headers.update(
+                    trace_headers(
+                        new_trace_context(ticket_id=tid, agent_id="orchestrator")
+                    )
+                )
                 mode = stop_req.get("mode", "graceful")
                 if mode == "hard":
                     # Hard stop: cancel the agent task (if any) AND
