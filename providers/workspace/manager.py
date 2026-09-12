@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from paths import get_ticket_workspace_dir
+from providers.execution import AuditedFilesystem, RootedPath
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class WorkspaceManager:
         workspace_dir: Path | str | None = None,
         agent_name: str | None = None,
         phase: str | None = None,
+        audit_emit: Any | None = None,
     ) -> None:
         self.ticket_id = ticket_id or ""
         self.agent_name = agent_name or "unknown"
@@ -50,8 +52,13 @@ class WorkspaceManager:
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.workspace_dir = get_ticket_workspace_dir(self.ticket_id).resolve()
+        self._filesystem = AuditedFilesystem(
+            RootedPath(self.workspace_dir, "workspace"),
+            ticket_id=self.ticket_id or "workspace-scratch",
+            emit=audit_emit,
+        )
         for namespace in self.NAMESPACES:
-            (self.workspace_dir / namespace).mkdir(parents=True, exist_ok=True)
+            self._filesystem.mkdir(namespace)
 
     @staticmethod
     def _audience_for_agent(agent_name: str) -> str:
@@ -92,8 +99,9 @@ class WorkspaceManager:
             "agent": self.agent_name,
             "kind": self.infer_kind(filename),
         }
-        self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        self._manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        self._filesystem.write(
+            "metadata/workspace-manifest.json", json.dumps(manifest, indent=2) + "\n"
+        )
 
     def _is_visible(self, file_ref: str, include_alternates: bool = False) -> bool:
         cleaned = file_ref.strip()
@@ -172,8 +180,6 @@ class WorkspaceManager:
         Returns (file_ref, resolved_path).
         """
         path = self.resolve_path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
         if not overwrite and path.exists():
             base_stem = path.stem
             suffix = path.suffix
@@ -182,12 +188,8 @@ class WorkspaceManager:
                 path = path.parent / f"{base_stem}_{counter}{suffix}"
                 counter += 1
 
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            path.write_text(content, encoding="utf-8")
-
         rel_name = str(path.relative_to(self.workspace_dir))
+        path = self._filesystem.write(rel_name, content)
         self._stamp(rel_name)
         return f"workspace://{rel_name}", path
 
