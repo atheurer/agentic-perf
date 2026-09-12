@@ -27,6 +27,7 @@ from providers.llm.base import (
     ToolDefinition,
 )
 from providers.llm.mock import MockLLMProvider
+from providers.tracing import LifecycleState, TraceRecorder
 
 
 class TestLLMTimeoutError:
@@ -241,6 +242,16 @@ class TestAgentTimeoutHandling:
             event_bus=events,
         )
 
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event):
+                self.events.append(event)
+
+        sink = Sink()
+        agent._trace = TraceRecorder(client=sink)
+
         # Mock the HTTP calls
         agent._get_ticket = AsyncMock(
             return_value={
@@ -275,6 +286,21 @@ class TestAgentTimeoutHandling:
             e for e in ticket_events if e.get("event_type") == "agent_error"
         ]
         assert len(error_events) == 3
+        llm_events = [e for e in sink.events if e.action.type.value == "llm"]
+        assert (
+            sum(e.lifecycle.state == LifecycleState.TIMED_OUT for e in llm_events) == 3
+        )
+        started = {
+            e.action_id
+            for e in llm_events
+            if e.lifecycle.state == LifecycleState.STARTED
+        }
+        terminal = {
+            e.action_id
+            for e in llm_events
+            if e.lifecycle.state == LifecycleState.TIMED_OUT
+        }
+        assert started <= terminal
         # First two are retries
         assert error_events[0]["data"]["retry"] == 1
         assert error_events[1]["data"]["retry"] == 2
