@@ -1691,6 +1691,200 @@ class TestParseHostConfigDefault:
         assert result["ssh_key_path"] == "/inline/key"
 
 
+class TestFQDNRegexNumericLabels:
+    """FQDN extraction must handle DNS labels containing digits (#719)."""
+
+    @pytest.mark.asyncio
+    async def test_numeric_label_not_truncated(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        text = (
+            "controller: dhcp-10-26-9-207.perf.eng.lab2.dc.example.com\n"
+            "targets: nfv-amd-4.perf.eng.lab2.dc.example.com "
+            "nfv-amd-5.perf.eng.lab2.dc.example.com"
+        )
+        result = await handlers["parse_host_config"](text=text)
+        assert result["controller"] == ("dhcp-10-26-9-207.perf.eng.lab2.dc.example.com")
+        assert result["targets"] == [
+            "nfv-amd-4.perf.eng.lab2.dc.example.com",
+            "nfv-amd-5.perf.eng.lab2.dc.example.com",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ip_only_input_unchanged(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller: 10.26.9.207\ntarget: 10.26.9.208",
+        )
+        assert result["controller"] == "10.26.9.207"
+        assert result["targets"] == ["10.26.9.208"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_ip_and_fqdn(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="10.1.2.3 host1.example.com",
+        )
+        assert result["controller"] == "10.1.2.3"
+        assert result["targets"] == ["host1.example.com"]
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_hosts(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host1.example.com host1.example.com",
+        )
+        all_hosts = [result["controller"]] + result["targets"]
+        assert all_hosts.count("host1.example.com") == 1
+
+    @pytest.mark.asyncio
+    async def test_simple_fqdn_still_matches(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller: host1.example.com",
+        )
+        assert result["controller"] == "host1.example.com"
+
+    @pytest.mark.asyncio
+    async def test_role_classification_unchanged(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        text = (
+            "controller: ctrl.perf.eng.lab2.dc.example.com\n"
+            "target: worker1.perf.eng.lab2.dc.example.com\n"
+            "target: worker2.perf.eng.lab2.dc.example.com"
+        )
+        result = await handlers["parse_host_config"](text=text)
+        assert result["controller"] == "ctrl.perf.eng.lab2.dc.example.com"
+        assert len(result["targets"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_bare_ip_not_matched_as_fqdn(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](text="10.26.9.207")
+        assert result["controller"] == "10.26.9.207"
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_hosts_rejected(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="999.1.2.3 not-a-host",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_duplicates_across_lines(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host1.example.com\nhost1.example.com",
+        )
+        all_hosts = [result["controller"]] + result["targets"]
+        assert all_hosts.count("host1.example.com") == 1
+
+
+class TestFreeFormExtraction:
+    """Two-stage scanner must extract hosts from free-form text (#719).
+
+    The scanner finds candidates by regex-searching the raw line, then
+    validates each candidate.  This handles forms that a tokenizer misses:
+    ``key=ip``, ``user@host``, ``host:port``, and trailing punctuation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_equals_delimited_ip(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller=10.1.2.3",
+        )
+        assert result["controller"] == "10.1.2.3"
+
+    @pytest.mark.asyncio
+    async def test_user_at_fqdn(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="root@host.example.com",
+        )
+        assert result["controller"] == "host.example.com"
+
+    @pytest.mark.asyncio
+    async def test_fqdn_with_port(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host.example.com:22",
+        )
+        assert result["controller"] == "host.example.com"
+
+    @pytest.mark.asyncio
+    async def test_ip_trailing_period(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="The controller is 10.1.2.3.",
+        )
+        assert result["controller"] == "10.1.2.3"
+
+    @pytest.mark.asyncio
+    async def test_invalid_ip_octets_rejected(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="999.1.2.3",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_ip_inside_fqdn_not_double_counted(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="10.1.2.3.example.com",
+        )
+        assert result["controller"] == "10.1.2.3.example.com"
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_controller_excluded_from_targets(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text=(
+                "controller: ctrl.example.com\n"
+                "target: ctrl.example.com worker.example.com"
+            ),
+        )
+        assert result["controller"] == "ctrl.example.com"
+        assert result["targets"] == ["worker.example.com"]
+
+
 class TestValidateHostKeyPassthrough:
     """validate_host must pass an explicitly-provided key through to ssh.run.
 
