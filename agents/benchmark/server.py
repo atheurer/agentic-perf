@@ -3713,6 +3713,7 @@ async def execute_boot_time_test(
     return json.dumps(response)
 
 
+
 async def get_registered_tools():
     """Introspect this server's registered @mcp.tool() functions."""
     from providers.llm.base import ToolDefinition

@@ -1411,15 +1411,64 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
     repo_cache = RepoCache()
     for name, url in config.harness_repos.items():
-        # Crucible is never cloned or refreshed by agentic-perf. Its source
-        # must already exist locally or on the designated controller.
-        if name == "crucible":
-            continue
         try:
             repo_cache.ensure_repo(name, url)
         except Exception:
             logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
+    # Create an MCP client for arcaflow plugin discovery
+    # when the Arcaflow MCP is configured.
+    arcaflow_mcp = None
+    for srv in config.raw.get("external_mcp_servers", []):
+        if srv.get("name") == "arcaflow" and srv.get("transport") == "stdio":
+            try:
+                from agents.mcp_client import AgentMCPClient
+
+                arcaflow_mcp = AgentMCPClient()
+                command = srv.get("command", [])
+                if command:
+                    import asyncio
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop and loop.is_running():
+                        # Inside an async context — schedule
+                        # and wait (should not happen at startup)
+
+                        future = asyncio.run_coroutine_threadsafe(
+                            arcaflow_mcp.connect_command(
+                                command=command[0],
+                                args=(command[1:] if len(command) > 1 else []),
+                                name="arcaflow",
+                                env=srv.get("env"),
+                            ),
+                            loop,
+                        )
+                        future.result(timeout=30)
+                    else:
+                        asyncio.run(
+                            arcaflow_mcp.connect_command(
+                                command=command[0],
+                                args=(command[1:] if len(command) > 1 else []),
+                                name="arcaflow",
+                                env=srv.get("env"),
+                            )
+                        )
+                    logger.info(
+                        "[orchestrator] Arcaflow MCP connected for plugin discovery"
+                    )
+                else:
+                    arcaflow_mcp = None
+            except Exception:
+                logger.warning(
+                    "[orchestrator] Failed to connect Arcaflow MCP "
+                    "for plugin discovery — using Quay fallback",
+                    exc_info=True,
+                )
+                arcaflow_mcp = None
+            break
     skills = build_skill_provider(
         crucible_home=config.crucible_home,
         repo_cache=repo_cache,
@@ -1428,6 +1477,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         zathras_home=config.zathras_home,
         resolve_source=False,
         catalog_only=True,
+        arcaflow_mcp_client=arcaflow_mcp,
     )
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")

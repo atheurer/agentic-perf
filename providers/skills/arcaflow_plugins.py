@@ -544,6 +544,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         cache_ttl: int = _CACHE_TTL_SECONDS,
         schema_cache_dir: Path | None = None,
         discover_schemas: bool = True,
+        mcp_client: Any | None = None,
     ) -> None:
         self._cache_ttl = cache_ttl
         self._catalog: dict[str, dict[str, Any]] = {}
@@ -554,6 +555,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         )
         self._discover_schemas = discover_schemas
         self._repo_orgs: dict[str, str] = {}
+        self._mcp_client = mcp_client
 
     def _is_cache_valid(self) -> bool:
         if not self._catalog:
@@ -561,9 +563,27 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         return (time.time() - self._catalog_timestamp) < self._cache_ttl
 
     async def _refresh_catalog(self) -> None:
-        """Discover plugins from Quay.io and merge with local metadata."""
+        """Discover plugins from MCP, Quay.io, or local metadata.
+
+        Prefers MCP when available (richer metadata, includes
+        architectures). Falls back to Quay.io scraping + local
+        schema discovery. Uses local metadata as last resort.
+        """
         if self._is_cache_valid():
             return
+
+        # Try MCP-backed discovery first
+        if self._mcp_client:
+            mcp_catalog = await self._discover_from_mcp()
+            if mcp_catalog:
+                self._catalog = mcp_catalog
+                self._catalog_timestamp = time.time()
+                self._rebuild_keyword_map()
+                logger.info(
+                    "[arcaflow-plugins] Loaded %d plugins from Arcaflow MCP",
+                    len(mcp_catalog),
+                )
+                return
 
         catalog: dict[str, dict[str, Any]] = {}
 
@@ -623,6 +643,53 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                 "[arcaflow-plugins] Quay.io unreachable, using local metadata only"
             )
             self._build_from_local_metadata()
+
+    async def _discover_from_mcp(self) -> dict[str, dict[str, Any]]:
+        """Discover plugins via the Arcaflow MCP server.
+
+        Returns a catalog dict keyed by benchmark name, or
+        empty dict if the MCP is unavailable or returns no
+        plugins.
+        """
+        try:
+            raw = await self._mcp_client.call_tool("plugin_list", {})
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            plugins = data.get("plugins", [])
+        except Exception:
+            logger.debug(
+                "[arcaflow-plugins] MCP plugin_list unavailable, falling back to Quay"
+            )
+            return {}
+
+        catalog: dict[str, dict[str, Any]] = {}
+        for plugin in plugins:
+            repo_name = plugin.get("name", "")
+            if not repo_name:
+                continue
+            benchmark_name = _plugin_name_to_benchmark(repo_name)
+            image = plugin.get("image", "")
+            version = plugin.get("version", "latest")
+
+            catalog[benchmark_name] = {
+                "image": image,
+                "version": version,
+                "description": plugin.get(
+                    "description",
+                    _description_from_repo_name(repo_name),
+                ),
+                "step": plugin.get("default_step", "workload"),
+                "steps": plugin.get("steps", ["workload"]),
+                "keywords": plugin.get(
+                    "keywords",
+                    _keywords_from_repo_name(repo_name),
+                ),
+                "params": {},
+                "example_input": {},
+                "schemas": {},
+                "architectures": plugin.get("architectures", []),
+                "category": plugin.get("category", ""),
+            }
+        return catalog
 
     async def _discover_from_quay(self) -> dict[str, str]:
         """Query Quay.io for arcaflow-plugin-* repos and latest versions.
@@ -751,6 +818,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                     roles=["client"],
                     min_hosts=1,
                     harness="arcaflow-plugins",
+                    architectures=info.get("architectures", []),
                 )
             )
         return results
@@ -768,6 +836,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             roles=["client"],
             min_hosts=1,
             harness="arcaflow-plugins",
+            architectures=info.get("architectures", []),
         )
 
     async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:

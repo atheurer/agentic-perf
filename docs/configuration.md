@@ -839,8 +839,9 @@ per-agent tool scoping.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Display name for logging and tool routing |
-| `url` | string | yes | MCP server endpoint URL |
-| `transport` | string | yes | `"sse"` or `"streamable_http"` |
+| `url` | string | for sse/http | MCP server endpoint URL (not needed for stdio) |
+| `command` | list | for stdio | Command and args to launch the MCP subprocess (e.g., `["arcaflow-mcp", "--transport", "stdio"]`) |
+| `transport` | string | yes | `"stdio"`, `"sse"`, or `"streamable_http"` |
 | `agents` | dict | yes | Maps agent type keys to their config. Only listed agents connect. |
 | `secret` | string | no | Path within `~/.agentic-perf/secrets/` to a file containing the auth token |
 | `trust` | bool | no | If `true`, disable SSL certificate verification (for self-signed certs) |
@@ -853,6 +854,57 @@ per-agent tool scoping.
 
 The auth token (if configured) is sent as `Authorization: Bearer <token>`
 in the HTTP headers.
+
+#### Example: Arcaflow MCP
+
+The Arcaflow MCP provides plugin discovery and workflow
+input construction for Arcaflow-based benchmarks. When
+configured, the arcaflow-plugins skill provider uses the
+MCP for plugin metadata (descriptions, schemas,
+architectures) instead of Quay.io scraping and local
+schema discovery.
+
+```json
+{
+    "external_mcp_servers": [
+        {
+            "name": "arcaflow",
+            "command": ["arcaflow-mcp", "--enable-execution"],
+            "transport": "stdio",
+            "agents": {
+                "triage": {
+                    "enabled_tools": ["plugin_list"]
+                },
+                "benchmark": {
+                    "enabled_tools": [
+                        "plugin_list",
+                        "plugin_describe",
+                        "workflow_load",
+                        "workflow_list",
+                        "workflow_input_build",
+                        "workflow_input_validate",
+                        "workflow_input_export",
+                        "workflow_execute",
+                        "workflow_execution_status",
+                        "workflow_execution_cancel",
+                        "workflow_execution_output"
+                    ]
+                },
+                "review": {
+                    "enabled_tools": [
+                        "workflow_results_load",
+                        "workflow_results_metrics_extract"
+                    ]
+                }
+            }
+        }
+    ]
+}
+```
+
+When the Arcaflow MCP is not configured, the arcaflow-plugins
+harness falls back to Quay.io API scraping and local schema
+discovery (requires podman on the orchestrator host).
 
 ---
 

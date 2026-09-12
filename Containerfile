@@ -21,7 +21,28 @@
 #     ~/.config/jumpstarter/clients/
 #   Set LLM credentials via environment variables
 
-# ── Build stage ──────────────────────────────────
+# ── Arcaflow MCP build stage ─────────────────────
+ARG ARCAFLOW_MCP_REPO=https://github.com/arcalot/arcaflow-mcp.git
+ARG ARCAFLOW_MCP_REF=initial-development
+
+FROM golang:1.24-alpine3.20 AS arcaflow-mcp-builder
+
+ARG ARCAFLOW_MCP_REPO
+ARG ARCAFLOW_MCP_REF
+
+RUN apk --no-cache add git
+
+WORKDIR /build
+RUN git clone --depth 1 --branch "${ARCAFLOW_MCP_REF}" \
+    "${ARCAFLOW_MCP_REPO}" repo
+
+WORKDIR /build/repo/server
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo \
+    -ldflags="-w -s" \
+    -o /arcaflow-mcp \
+    ./cmd/arcaflow-mcp
+
+# ── Python build stage ──────────────────────────────────
 FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
@@ -56,6 +77,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         jq \
         sshpass \
         iputils \
+        podman \
     && dnf clean all
 
 # Copy installed Python packages from builder
@@ -98,6 +120,9 @@ RUN CAIB_VERSION="v0.2.0" && \
     | bash -s -- "${CAIB_VERSION}" || \
     echo 'WARNING: CAIB install failed (custom image builds will be unavailable)'
 
+# Arcaflow MCP server binary (built in arcaflow-mcp-builder stage)
+COPY --from=arcaflow-mcp-builder /arcaflow-mcp /usr/local/bin/arcaflow-mcp
+
 # Runtime configuration
 ENV AGENTIC_PERF_HOME=/data/agentic-perf
 ENV PYTHONUNBUFFERED=1
@@ -120,7 +145,18 @@ RUN mkdir -p /opt/app-root/src/.ssh && \
     ssh-keygen -t ed25519 -f /opt/app-root/src/.ssh/id_ed25519 -N "" -q && \
     chmod 770 /opt/app-root/src/.ssh && \
     chmod 660 /opt/app-root/src/.ssh/* && \
-    chown -R 1001:0 /opt/app-root/src/.ssh
+    chown -R 1001:0 /opt/app-root/src/.ssh && \
+    # Also install the key at /root/.ssh so it's accessible
+    # when HOME=/root (OpenShift arbitrary UID runs as root).
+    # The ticket's ssh_key_path (~/.ssh/id_ed25519) resolves
+    # to /root/.ssh/id_ed25519.
+    mkdir -p /root/.ssh && \
+    cp /opt/app-root/src/.ssh/id_ed25519 /root/.ssh/id_ed25519 && \
+    cp /opt/app-root/src/.ssh/id_ed25519.pub /root/.ssh/id_ed25519.pub && \
+    chmod 770 /root/.ssh && \
+    chmod 660 /root/.ssh/id_ed25519 && \
+    chmod 660 /root/.ssh/id_ed25519.pub && \
+    chown -R 0:0 /root/.ssh
 
 USER 1001
 

@@ -78,6 +78,12 @@ Your job is to analyze a performance test request ticket and:
    - "use AWS" / "deploy on EC2" / "use cloud instances" → resource_provider: "aws"
    - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"
    - "run on kubernetes" / "use kube endpoints" / "run in pods" → endpoint_type: "kube"
+   - User provides a git URL or workflow file URL → workflow_source: "<url>"
+   - User names a specific workflow → workflow_name: "<name>"
+
+   When `workflow_source` is set, also set `harness: "arcaflow"`. The benchmark
+   agent will use the Arcaflow MCP to load and run the workflow. You do NOT need
+   to understand the workflow's contents — just pass the source URL through.
    - "run on bare metal" / "use remotehosts" → endpoint_type: "remotehosts"
    - "test the 25G NICs" / "use the Intel interfaces" / "not the management network"
      → test_interfaces: "<description of which NICs>" (the benchmark agent will

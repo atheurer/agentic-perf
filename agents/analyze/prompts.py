@@ -13,7 +13,10 @@ data sources — without provisioning hardware or running benchmarks.
    needs investigating.
 2. **Query available data sources** using MCP tools:
    - External performance data (Domain MCP): historical metrics,
-     baselines, run comparisons, distributions, anomaly search
+     baselines, run comparisons, distributions, anomaly search.
+     Read the `domain-mcp/data-sources.md` skill for dataset
+     types and metric naming conventions — querying with the
+     wrong dataset type returns no data.
    - Prior ticket results: benchmark results, KPIs, and findings
      from earlier investigations in this system
    - Investigation records: prior root cause findings for similar

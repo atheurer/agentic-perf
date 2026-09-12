@@ -193,9 +193,21 @@ class BenchmarkAgent(AgentBase):
             agent_name=self.agent_name,
         )
 
+        # Connect external MCP servers (Arcaflow MCP, etc.)
+        from agents.mcp_client import connect_external_servers
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "benchmark")
+
         self._mcp = mcp
 
         all_tools = await mcp.list_tools()
+        if ext_tools is not None:
+            all_tools = [
+                t
+                for t in all_tools
+                if mcp._tool_routing.get(t.name) not in connected_ext
+                or t.name in ext_tools
+            ]
         self.tools = all_tools + self.tools
 
         try:
@@ -254,6 +266,22 @@ class BenchmarkAgent(AgentBase):
             "get_runfile_schema",
             "get_benchmark_params",
             "execute_benchmark",
+            "execute_arcaflow_workflow",
+            "submit_benchmark_result",
+            "request_clarification",
+        },
+        "arcaflow": {
+            "read_skills",
+            "set_ssh_context",
+            "check_host",
+            "workflow_load",
+            "workflow_input_build",
+            "workflow_input_validate",
+            "workflow_input_export",
+            "workflow_execute",
+            "workflow_execution_status",
+            "workflow_execution_cancel",
+            "workflow_execution_output",
             "submit_benchmark_result",
             "request_clarification",
         },
