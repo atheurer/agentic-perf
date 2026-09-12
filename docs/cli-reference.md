@@ -13,13 +13,14 @@ also be set with `STATE_STORE_URL`.
 Create a new test ticket and start the pipeline.
 
 ```
-python3 cli.py submit SUMMARY [-d DESCRIPTION] [--owners USER1,USER2] [--stop-after STEP]
+python3 cli.py submit SUMMARY [-d DESCRIPTION | -f FILE] [--owners USER1,USER2] [--stop-after STEP]
 ```
 
 | Argument | Required | Description |
 |---|---|---|
 | `SUMMARY` | Yes | Natural-language test request (also used as the ticket summary) |
-| `-d`, `--description` | No | Detailed description. Defaults to the summary if omitted. |
+| `-d`, `--description` | No | Detailed description. Defaults to the summary if omitted. Mutually exclusive with `-f`. |
+| `-f`, `--description-file` | No | Read description from a file. Use `-` for stdin. Mutually exclusive with `-d`. |
 | `--owners` | No | Comma-separated owners (multi-user mode). |
 | `--stop-after STEP` | No | Stop after `triage`, `resource`, `provision`, `benchmark`, or `review` (debugging). |
 
@@ -46,6 +47,12 @@ python3 cli.py submit \
 python3 cli.py submit \
   "Run kube-burner node-density test" \
   -d "Use AWS EC2. Deploy K3s. 100 pods per node."
+
+# Description from a file (useful for multi-line configs)
+python3 cli.py submit "Latency sweep" -f benchmark-spec.md
+
+# Description from stdin (pipe from another command)
+cat benchmark-spec.md | python3 cli.py submit "Latency sweep" -f -
 ```
 
 ## list
