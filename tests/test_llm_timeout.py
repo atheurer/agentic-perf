@@ -301,11 +301,60 @@ class TestAgentTimeoutHandling:
             if e.lifecycle.state == LifecycleState.TIMED_OUT
         }
         assert started <= terminal
-        # First two are retries
         assert error_events[0]["data"]["retry"] == 1
         assert error_events[1]["data"]["retry"] == 2
-        # Third is final (retries exhausted)
         assert error_events[2]["data"]["retries_exhausted"] is True
+
+    @pytest.mark.asyncio
+    async def test_empty_response_attempt_is_closed_before_retry(self):
+        """The automatic empty-response retry does not leave an LLM action open."""
+        from agents.base import AgentBase
+
+        class Provider(LLMProvider):
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(
+                self, system_prompt, messages, tools=None, max_tokens=4096, timeout=None
+            ):
+                self.calls += 1
+                return LLMResponse(
+                    text="" if self.calls == 1 else "done", tool_calls=[]
+                )
+
+        class TestAgent(AgentBase):
+            def _system_prompt(self, ticket):
+                return "test"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        agent = TestAgent(
+            agent_name="test-agent",
+            llm_provider=Provider(),
+            state_store_url="http://store",
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={"id": "T", "status": "x", "custom_fields": {}}
+        )
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
+        await agent.run("T")
+        llm = [e for e in sink.events if e.action.type.value == "llm"]
+        started = {
+            e.action_id for e in llm if e.lifecycle.state == LifecycleState.STARTED
+        }
+        terminal = {
+            e.action_id for e in llm if e.lifecycle.state == LifecycleState.COMPLETED
+        }
+        assert started <= terminal
 
     @pytest.mark.asyncio
     async def test_agent_recovers_after_transient_timeout(self, tmp_path):
