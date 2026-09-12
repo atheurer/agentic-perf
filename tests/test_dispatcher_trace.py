@@ -5,7 +5,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from orchestrator.dispatcher import Dispatcher
-from providers.tracing import LifecycleState, TraceRecorder
+from providers.tracing import (
+    LifecycleState,
+    TraceRecorder,
+    current_trace_context,
+    new_trace_context,
+)
 
 
 class _Sink:
@@ -59,6 +64,31 @@ async def test_introspection_is_a_sibling_child_of_dispatch() -> None:
     assert primary.trace_context.parent_action_id == dispatch.action_id
     assert observer.trace_context.action_id != primary.trace_context.action_id
     dispatcher.stop_introspection("PERF-1")
+
+
+async def test_run_agent_task_binds_and_resets_agent_context() -> None:
+    """Adapter code sees the invocation while an agent runs, never afterward."""
+    from orchestrator.main import run_agent_task
+
+    dispatcher, _ = _dispatcher()
+    agent_context = new_trace_context(ticket_id="PERF-1", agent_id="triage")
+    seen = []
+
+    class Agent:
+        trace_context = agent_context
+
+        async def run(self, ticket_id):
+            seen.append(current_trace_context())
+
+        async def close(self):
+            pass
+
+    agent = Agent()
+    dispatcher.create_agent = MagicMock(return_value=agent)
+    dispatcher.release_claim = MagicMock()
+    await run_agent_task(dispatcher, "triage_pending", "PERF-1")
+    assert seen == [agent_context]
+    assert current_trace_context() is None
 
 
 def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
