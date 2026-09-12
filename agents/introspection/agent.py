@@ -29,9 +29,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import LLMProvider
 from providers.tracing import (
     ActionType,
@@ -141,7 +140,7 @@ class IntrospectionAgent:
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        self._client = AuditedAsyncHTTPClient(timeout=30.0, headers=headers)
 
     def request_stop(self) -> None:
         """Request graceful shutdown of the observation loop."""

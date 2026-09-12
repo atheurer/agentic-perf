@@ -17,6 +17,10 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx  # noqa: F401 - retained as a stable test patch seam
+
+from providers.execution import AuditedAsyncHTTPClient
+
 logger = logging.getLogger(__name__)
 
 
@@ -1095,8 +1099,6 @@ async def assert_ticket_active(
     drifted — the caller should return this to the LLM as a tool result
     instead of proceeding with the side-effecting operation.
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL", "http://localhost:8090"
@@ -1110,7 +1112,7 @@ async def assert_ticket_active(
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
             f"{state_store_url}/api/v1/tickets/{ticket_id}",
         )
@@ -1146,8 +1148,6 @@ async def build_ssh_from_ticket(
     Returns (SSHExecutor, ticket_dict). If ticket_id is None, reads from
     TICKET_ID env var. If state_store_url is None, reads from STATE_STORE_URL.
     """
-    import httpx
-
     from providers.ssh import SSHExecutor
     from providers.tracing import new_trace_context
     from providers.tracing.client import TraceClient
@@ -1165,7 +1165,7 @@ async def build_ssh_from_ticket(
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(f"{state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -1234,8 +1234,6 @@ async def tool_progress(
     Reads TICKET_ID and STATE_STORE_URL from env if not provided.
     Silently no-ops if ticket_id is unavailable (e.g., in tests).
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL",
@@ -1252,7 +1250,7 @@ async def tool_progress(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
             await client.post(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={"author": author, "body": message},

@@ -177,12 +177,11 @@ async def check_available_resources(
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     if ticket_id:
         try:
-            import httpx
-
+            from providers.execution import AuditedAsyncHTTPClient
             from state_store.auth import read_token_from_file
 
             token = read_token_from_file()
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 base_url=store_url,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10.0,

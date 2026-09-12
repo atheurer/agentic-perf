@@ -10,9 +10,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-import httpx
-
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import (
     LLMProvider,
     LLMRateLimitError,
@@ -29,8 +28,10 @@ from providers.tracing import (
     OperationOutcome,
     RetryKind,
     TraceRecorder,
+    bind_trace_context,
     child_context,
     new_trace_context,
+    reset_trace_context,
     trace_headers,
 )
 
@@ -124,7 +125,7 @@ class AgentBase(ABC):
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        self._client = AuditedAsyncHTTPClient(timeout=30.0, headers=headers)
         self._events = event_bus
         self._last_tool_call_time: float = 0.0
         self._tool_min_interval = self._load_tool_rate_limit()
@@ -342,6 +343,7 @@ class AgentBase(ABC):
             trace = TraceRecorder()
             self._trace = trace
         trace.context = trace_context
+        trace_token = bind_trace_context(trace_context)
         header_update = self._client.headers.update(trace_headers(trace_context))
         if inspect.isawaitable(header_update):
             await header_update
@@ -1311,6 +1313,7 @@ class AgentBase(ABC):
         finally:
             self.max_iterations = configured_max
             self._max_iterations_is_override = False
+            reset_trace_context(trace_token)
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")

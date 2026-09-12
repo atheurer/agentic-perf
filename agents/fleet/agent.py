@@ -27,6 +27,7 @@ from collections.abc import MutableMapping
 from typing import Any
 
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import LLMProvider
 from providers.tracing import (
     ActionType,
@@ -62,12 +63,10 @@ class FleetCoordinatorAgent:
         self._trace = TraceRecorder()
         # LLM provider accepted but unused — keeps dispatcher
         # interface consistent.
-        import httpx
-
         from state_store.auth import read_token_from_file
 
         token = read_token_from_file()
-        self._client = httpx.AsyncClient(
+        self._client = AuditedAsyncHTTPClient(
             base_url=state_store_url,
             headers={"Authorization": f"Bearer {token}"},
             timeout=30.0,

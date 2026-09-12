@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class QuadsClient:
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = AuditedAsyncHTTPClient(timeout=30.0)
         if api_scheme == "http":
             logger.warning(
                 "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
