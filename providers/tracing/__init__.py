@@ -33,6 +33,7 @@ from .payloads import (
     PayloadStorageError,
     canonicalize_payload,
 )
+from .runtime import TraceRecorder, trace_headers
 from .spool import (
     SpoolBackpressure,
     SpoolCorruption,
@@ -66,6 +67,8 @@ __all__ = [
     "current_trace_context",
     "new_trace_context",
     "reset_trace_context",
+    "TraceRecorder",
+    "trace_headers",
     "canonicalize_payload",
     "TraceClient",
     "TraceDeliveryError",
