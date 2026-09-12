@@ -101,6 +101,54 @@ class RootedPath:
         return target, f"{self.scheme}://{rendered}"
 
 
+class AuditedStream:
+    """A write handle whose filesystem action completes only on close."""
+
+    def __init__(self, filesystem, handle, path, target, context, started, attributes):
+        self._filesystem, self._handle, self._path = filesystem, handle, path
+        self._target, self._context, self._started = target, context, started
+        self._attributes, self._closed = attributes, False
+
+    def __getattr__(self, name: str):
+        return getattr(self._handle, name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._handle.close()
+            data = self._path.read_bytes()
+            self._filesystem._record(
+                self._filesystem._event(
+                    self._context,
+                    LifecycleState.COMPLETED,
+                    "stream_write",
+                    self._target,
+                    self._started,
+                    terminal=True,
+                    attributes=self._attributes | self._filesystem._descriptor(data),
+                )
+            )
+        except Exception as exc:
+            error, digest = self._filesystem._error(exc)
+            self._filesystem._record(
+                self._filesystem._event(
+                    self._context,
+                    LifecycleState.FAILED,
+                    "stream_write",
+                    self._target,
+                    self._started,
+                    terminal=True,
+                    attributes=self._attributes | {"error_digest": digest},
+                    error=error,
+                )
+            )
+            raise
+
+
 class AuditedFilesystem:
     """Mutate a rooted namespace without exposing physical details in traces.
 
@@ -296,6 +344,50 @@ class AuditedFilesystem:
             lambda: (path.mkdir(parents=True, exist_ok=True, mode=mode), path)[1],
             attributes={"mode": oct(mode)},
         )
+
+    def open_stream(self, relative: str | Path, *, mode: int = 0o600) -> AuditedStream:
+        """Open an audited output stream; callers must close it to finalize."""
+        path, logical = self.root.resolve(relative)
+        started = time.monotonic()
+        parent = current_trace_context()
+        context = (
+            child_context(parent)
+            if parent
+            else new_trace_context(ticket_id=self.ticket_id, agent_id="system")
+        )
+        attributes = {"mode": oct(mode), "atomic": False, "stream": True}
+        self._record(
+            self._event(
+                context,
+                LifecycleState.REQUESTED,
+                "stream_write",
+                logical,
+                started,
+                attributes=attributes,
+            )
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            handle = open(path, "wb")
+            os.chmod(path, mode)
+            return AuditedStream(
+                self, handle, path, logical, context, started, attributes
+            )
+        except Exception as exc:
+            error, digest = self._error(exc)
+            self._record(
+                self._event(
+                    context,
+                    LifecycleState.FAILED,
+                    "stream_write",
+                    logical,
+                    started,
+                    terminal=True,
+                    attributes=attributes | {"error_digest": digest},
+                    error=error,
+                )
+            )
+            raise
 
     def write(
         self,

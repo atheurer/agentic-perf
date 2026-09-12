@@ -3378,10 +3378,10 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = open(
-                    serial_log_path,
-                    "w",
-                    encoding="utf-8",
+                serial_log_fh = (
+                    artifact_filesystem.open_stream("serial-capture.log")
+                    if artifact_filesystem
+                    else open(serial_log_path, "wb")
                 )
                 serial_proc = await AuditedSubprocessRunner().start(
                     [
@@ -3464,7 +3464,10 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            serial_log_path.unlink(missing_ok=True)
+            if artifact_filesystem:
+                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+            else:
+                serial_log_path.unlink(missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh

@@ -137,6 +137,22 @@ def test_concurrent_same_target_is_atomic(filesystem) -> None:
     assert (root / "same").read_bytes() in values
 
 
+def test_stream_is_requested_before_open_and_finalized_on_close(filesystem) -> None:
+    fs, events, root = filesystem
+    stream = fs.open_stream("logs/serial.log")
+    stream.write(b"serial output")
+    stream.close()
+    assert (root / "logs/serial.log").read_bytes() == b"serial output"
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "completed",
+    ]
+    assert events[0].action_id == events[1].action_id
+    assert (
+        events[-1].attributes["digest"] == hashlib.sha256(b"serial output").hexdigest()
+    )
+
+
 def test_archive_uses_only_logical_member_names(filesystem) -> None:
     fs, events, root = filesystem
     fs.write("logs/output.txt", "output")
