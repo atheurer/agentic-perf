@@ -88,3 +88,10 @@ def test_retry_attempt_is_explicit_and_not_a_transport_replay() -> None:
     )
     assert sink.events[-1].lifecycle.retry_kind == RetryKind.INTENTIONAL_AGENT_RETRY
     assert sink.events[-1].lifecycle.replay_of_action_id is None
+
+
+def test_primary_and_introspection_use_distinct_invocation_branches() -> None:
+    primary = new_trace_context(ticket_id="PERF-1", agent_id="triage")
+    observer = new_trace_context(ticket_id="PERF-1", agent_id="introspection-agent")
+    assert primary.invocation_id != observer.invocation_id
+    assert primary.trace_id != observer.trace_id
