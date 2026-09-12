@@ -375,6 +375,7 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
+            self._context_truncated = False
             while (
                 self.max_iterations == 0
                 or iteration < self.max_iterations
@@ -649,61 +650,57 @@ class AgentBase(ABC):
                     )
                     if ctx_action == "pause":
                         if self._wrapup_reason is None:
-                            # Try truncation first before
-                            # giving up.
-                            if not getattr(
-                                self,
-                                "_context_truncated",
-                                False,
-                            ):
+                            truncated = False
+                            if not self._context_truncated:
                                 self._context_truncated = True
                                 before = len(messages)
-                                messages = self._truncate_context(
-                                    messages,
-                                )
-                                after = len(messages)
-                                if after < before:
-                                    logger.info(
-                                        "[%s] Context truncation: "
-                                        "%d → %d messages on %s",
+                                try:
+                                    messages = self._truncate_context(messages)
+                                except Exception:
+                                    logger.exception(
+                                        "[%s] Context truncation failed on %s",
                                         self.agent_name,
-                                        before,
-                                        after,
                                         ticket_id,
                                     )
-                                    self._emit(
-                                        ticket_id,
-                                        "context_truncated",
-                                        {
-                                            "before": before,
-                                            "after": after,
-                                        },
-                                    )
-                                    # Truncation applied; fall
-                                    # through to process the
-                                    # current response normally.
-                                    # The reduced context takes
-                                    # effect on the next LLM call.
-                            # Truncation already attempted
-                            # or didn't help — wrap up.
-                            self._wrapup_reason = "context"
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "[SYSTEM] Your context window "
-                                        "is nearly full. You MUST wrap "
-                                        "up immediately: submit your "
-                                        "best result now using your "
-                                        "submit_* tool, even if "
-                                        "incomplete. Raising the token "
-                                        "budget will NOT help — this "
-                                        "is a model input-size limit. "
-                                        "This is your final LLM call."
-                                    ),
-                                }
-                            )
-                            continue
+                                else:
+                                    after = len(messages)
+                                    if after < before:
+                                        truncated = True
+                                        logger.info(
+                                            "[%s] Context truncation: "
+                                            "%d → %d messages on %s",
+                                            self.agent_name,
+                                            before,
+                                            after,
+                                            ticket_id,
+                                        )
+                                        self._emit(
+                                            ticket_id,
+                                            "context_truncated",
+                                            {
+                                                "before": before,
+                                                "after": after,
+                                            },
+                                        )
+                            if not truncated:
+                                self._wrapup_reason = "context"
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "[SYSTEM] Your context window "
+                                            "is nearly full. You MUST wrap "
+                                            "up immediately: submit your "
+                                            "best result now using your "
+                                            "submit_* tool, even if "
+                                            "incomplete. Raising the token "
+                                            "budget will NOT help — this "
+                                            "is a model input-size limit. "
+                                            "This is your final LLM call."
+                                        ),
+                                    }
+                                )
+                                continue
                     elif ctx_action == "warn":
                         if not getattr(self, "_context_warned", False):
                             self._context_warned = True
