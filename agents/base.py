@@ -1714,12 +1714,12 @@ class AgentBase(ABC):
         self,
         ticket: dict[str, Any],
     ) -> None:
-        """Pre-fetch output_dirs for tickets referenced in the description.
+        """Pre-fetch artifact paths from textual and structured ticket references.
 
-        Extracts PERF-XXXXXXXX IDs from the ticket's description
-        and hypothesis, fetches each referenced ticket's output_dir
-        and run_id, and stores them in ``self._referenced_artifacts``
-        for use in ``_build_messages``.
+        Combines PERF-XXXXXXXX IDs from the description and hypothesis with
+        ``custom_fields.reference_tickets``, deduplicates them, and excludes
+        the current ticket. Fetches each reference's output_dir and run_id
+        for use in analyze and review ``_build_messages`` implementations.
         """
         from agents.server_utils import extract_ticket_references
 
