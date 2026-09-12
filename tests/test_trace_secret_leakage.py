@@ -161,8 +161,10 @@ def test_secret_is_absent_from_db_wal_spool_blob_and_export(tmp_path) -> None:
         for path in tmp_path.rglob("*"):
             if path.is_file() and "workspace" not in path.relative_to(tmp_path).parts:
                 surfaces.append(path.read_bytes().decode(errors="ignore"))
-        assert all(secret not in surface for surface in surfaces)
-        assert "secret-token.txt" not in "".join(surfaces)
+        persisted = "".join(surfaces)
+        assert secret not in persisted
+        assert "secret-token.txt" not in persisted
+        assert "private-key.pem" not in persisted
 
 
 def test_redaction_failure_returns_only_a_safe_descriptor(
