@@ -103,6 +103,7 @@ class Dispatcher:
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
         self._trace_contexts: dict[str, Any] = {}
+        self._previous_invocations: dict[str, Any] = {}
         trace_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         trace_client = (
             TraceClient(self.store_url, trace_token, instance_id=self._instance_name)
@@ -139,14 +140,32 @@ class Dispatcher:
                 )
                 if r.status_code == 200:
                     context = new_trace_context(ticket_id=ticket_id, agent_id=status)
+                    previous = self._previous_invocations.get(ticket_id)
+                    attributes = {}
+                    if previous is not None:
+                        # A resumed dispatch must not reuse the old invocation,
+                        # while its causal tree remains navigable.
+                        context = context.model_copy(
+                            update={"parent_action_id": previous.action_id}
+                        )
+                        attributes["prior_invocation_id"] = str(previous.invocation_id)
                     self._trace_contexts[ticket_id] = context
                     self._trace.record(
                         context,
                         ActionType.DISPATCH,
                         LifecycleState.CLAIMED,
                         phase=status,
+                        attributes=attributes or None,
                     )
                     return True
+                rejected = new_trace_context(ticket_id=ticket_id, agent_id=status)
+                self._trace.record(
+                    rejected,
+                    ActionType.DISPATCH,
+                    LifecycleState.REJECTED,
+                    phase=status,
+                    duration_ms=0,
+                )
                 return False
         except Exception:
             logger.exception(f"Failed to claim ticket {ticket_id}")
@@ -188,6 +207,15 @@ class Dispatcher:
                 await asyncio.sleep(interval)
                 if not self.renew_claim(ticket_id):
                     logger.warning(f"Claim renewal failed for {ticket_id}")
+                    context = self._trace_contexts.get(ticket_id)
+                    if context is not None:
+                        self._trace.record(
+                            context,
+                            ActionType.DISPATCH,
+                            LifecycleState.FAILED,
+                            phase="claim_renewal",
+                            duration_ms=0,
+                        )
                     break
         except asyncio.CancelledError:
             pass
@@ -274,6 +302,7 @@ class Dispatcher:
         self.clear_quota_blocked(ticket_id)
         context = self._trace_contexts.pop(ticket_id, None)
         if context is not None:
+            self._previous_invocations[ticket_id] = context
             self._trace.record(
                 context,
                 ActionType.DISPATCH,

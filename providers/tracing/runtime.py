@@ -6,6 +6,7 @@ the repetitive, task-local mechanics needed by dispatchers and agents.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .context import TraceContext, child_context, new_trace_context
@@ -20,6 +21,8 @@ from .models import (
     RetryKind,
     TraceEventV1,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def trace_headers(context: TraceContext) -> dict[str, str]:
@@ -132,5 +135,9 @@ class TraceRecorder:
             try:
                 self.client.record(event)
             except Exception:
-                pass
+                # Trace delivery is deliberately non-fatal for agent work, but
+                # losing the audit trail must remain visible to operators.
+                logger.exception(
+                    "failed to durably record trace event %s", event.event_id
+                )
         return event

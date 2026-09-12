@@ -25,9 +25,11 @@ from providers.llm.base import (
 from providers.tracing import (
     ActionType,
     LifecycleState,
+    MonotonicTimer,
     OperationOutcome,
     RetryKind,
     TraceRecorder,
+    child_context,
     new_trace_context,
     trace_headers,
 )
@@ -716,14 +718,12 @@ class AgentBase(ABC):
                     duration_ms=llm_timer.elapsed_ms(),
                     outcome=OperationOutcome.SUCCESS,
                 )
+                tool_contexts = {}
                 for proposed in response.tool_calls:
-                    tool_context, _ = self._trace.start(
-                        ActionType.TOOL,
-                        phase="proposed",
-                        iteration=iteration,
-                        tool_call_id=proposed.id,
-                        parent=llm_context,
+                    tool_context = child_context(
+                        llm_context, iteration=iteration, tool_call_id=proposed.id
                     )
+                    tool_contexts[proposed.id] = tool_context
                     self._trace.record(
                         tool_context,
                         ActionType.TOOL,
@@ -1029,13 +1029,7 @@ class AgentBase(ABC):
                                 "blocked": True,
                             },
                         )
-                        rejected_context, _ = self._trace.start(
-                            ActionType.TOOL,
-                            phase=submit_call.name,
-                            iteration=iteration,
-                            tool_call_id=submit_call.id,
-                            parent=llm_context,
-                        )
+                        rejected_context = tool_contexts[submit_call.id]
                         self._trace.record(
                             rejected_context,
                             ActionType.TOOL,
@@ -1089,13 +1083,7 @@ class AgentBase(ABC):
                     if non_clarify:
                         skipped = [tc for tc in calls_to_run if tc not in non_clarify]
                         for tc in skipped:
-                            skipped_context, _ = self._trace.start(
-                                ActionType.TOOL,
-                                phase=tc.name,
-                                iteration=iteration,
-                                tool_call_id=tc.id,
-                                parent=llm_context,
-                            )
+                            skipped_context = tool_contexts[tc.id]
                             self._trace.record(
                                 skipped_context,
                                 ActionType.TOOL,
@@ -1141,12 +1129,13 @@ class AgentBase(ABC):
                             "input": tc.input,
                         },
                     )
-                    tool_context, tool_timer = self._trace.start(
+                    tool_context = tool_contexts[tc.id]
+                    tool_timer = MonotonicTimer()
+                    self._trace.record(
+                        tool_context,
                         ActionType.TOOL,
+                        LifecycleState.STARTED,
                         phase=tc.name,
-                        iteration=iteration,
-                        tool_call_id=tc.id,
-                        parent=llm_context,
                     )
                     try:
                         result = await self._execute_tool(tc)

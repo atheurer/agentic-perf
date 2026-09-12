@@ -64,7 +64,12 @@ class TicketStore:
             self._audit.log(mutation, ticket_id, data)
 
     def _trace_mutation(
-        self, ticket_id: str, mutation: str, *, rejected: bool = False
+        self,
+        ticket_id: str,
+        mutation: str,
+        *,
+        rejected: bool = False,
+        attributes: dict | None = None,
     ) -> None:
         """Persist a state outcome under the request context when available."""
         context = current_trace_context()
@@ -90,6 +95,7 @@ class TicketStore:
                     outcome=OperationOutcome.REJECTED
                     if rejected
                     else OperationOutcome.SUCCESS,
+                    attributes=attributes,
                 )
             )
         except Exception:
@@ -203,7 +209,15 @@ class TicketStore:
                 allowed = VALID_TRANSITIONS.get(current, [])
 
             if new_status not in allowed:
-                self._trace_mutation(ticket_id, "transition_ticket", rejected=True)
+                self._trace_mutation(
+                    ticket_id,
+                    "transition_ticket",
+                    rejected=True,
+                    attributes={
+                        "old_state": current.value,
+                        "new_state": new_status.value,
+                    },
+                )
                 raise InvalidTransition(
                     f"Cannot transition from {current.value} to {new_status.value}. "
                     f"Allowed: {[s.value for s in allowed]}"
@@ -241,7 +255,11 @@ class TicketStore:
                     "comment": request.comment,
                 },
             )
-            self._trace_mutation(ticket_id, "transition_ticket")
+            self._trace_mutation(
+                ticket_id,
+                "transition_ticket",
+                attributes={"old_state": old_status, "new_state": new_status.value},
+            )
 
             # Emit transition event so the dashboard
             # Emit status_change for the dashboard breadcrumb
