@@ -2796,7 +2796,7 @@ async def execute_benchmark(
         local_path = f.name
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
-    scp_result = await _ssh.copy_to(controller, local_path, remote_path)
+    scp_result = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
     Path(local_path).unlink(missing_ok=True)
 
     if scp_result.exit_code != 0:
@@ -2977,7 +2977,7 @@ async def validate_benchmark(
             json.dump(run_file, file, indent=2)
             local_path = file.name
 
-        copied = await _ssh.copy_to(controller, local_path, remote_path)
+        copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
             return json.dumps(
                 {
