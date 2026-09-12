@@ -646,6 +646,15 @@ class TestOrchestratorConfig:
 class TestRunAgentTaskTimeout:
     """Test agent_task_timeout in run_agent_task."""
 
+    class _UnavailableAsyncClient:
+        """Fail HTTP setup immediately; timeout tests need no real store."""
+
+        async def __aenter__(self):
+            raise RuntimeError("state store unavailable")
+
+        async def __aexit__(self, *_args):
+            return None
+
     @pytest.mark.asyncio
     async def test_task_timeout_emits_error(self, tmp_path):
         """Agent task that exceeds timeout should emit error event."""
@@ -665,10 +674,16 @@ class TestRunAgentTaskTimeout:
         dispatcher.create_agent.return_value = slow_agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = events
+        dispatcher._trace_contexts = {}
+        dispatcher.clear_agent = MagicMock()
+        dispatcher.mark_done = MagicMock()
 
         # Use a status not in PLAN_AGENT_STATUS to avoid
         # _advance_plan trying to reach the state store.
-        await run_agent_task(dispatcher, "triaging", "SLOW-001", agent_task_timeout=0.1)
+        with patch("httpx.AsyncClient", return_value=self._UnavailableAsyncClient()):
+            await run_agent_task(
+                dispatcher, "triaging", "SLOW-001", agent_task_timeout=0.1
+            )
 
         # Should have emitted agent_error event
         ticket_events = events.get_events("SLOW-001", since=0, limit=100)
@@ -677,6 +692,44 @@ class TestRunAgentTaskTimeout:
         ]
         assert len(error_events) == 1
         assert error_events[0]["data"]["reason"] == "agent_task_timeout"
+        events.close()
+
+    @pytest.mark.asyncio
+    async def test_task_timeout_emits_error_before_guidance_transition(self, tmp_path):
+        """The timeout audit event is recorded before the state-store operation."""
+        from orchestrator.main import run_agent_task
+
+        events = EventBus(log_dir=str(tmp_path))
+
+        async def slow_run(tid):
+            await asyncio.sleep(10)
+
+        slow_agent = MagicMock()
+        slow_agent.run = slow_run
+        slow_agent.close = AsyncMock()
+        dispatcher = MagicMock()
+        dispatcher.create_agent.return_value = slow_agent
+        dispatcher.store_url = "http://localhost:9999"
+        dispatcher.events = events
+        dispatcher._trace_contexts = {}
+        dispatcher.clear_agent = MagicMock()
+        dispatcher.mark_done = MagicMock()
+
+        async def transition(*_args, **_kwargs):
+            ticket_events = events.get_events("SLOW-002", since=0, limit=100)
+            assert [e["event_type"] for e in ticket_events].count("agent_error") == 1
+
+        with (
+            patch("httpx.AsyncClient", return_value=self._UnavailableAsyncClient()),
+            patch("orchestrator.main._transition_to_guidance", new=transition),
+        ):
+            await run_agent_task(
+                dispatcher, "triaging", "SLOW-002", agent_task_timeout=0.1
+            )
+
+        ticket_events = events.get_events("SLOW-002", since=0, limit=100)
+        assert [e["event_type"] for e in ticket_events].count("agent_error") == 1
+        events.close()
 
     @pytest.mark.asyncio
     async def test_no_timeout_when_zero(self):

@@ -340,7 +340,9 @@ class Dispatcher:
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
         self.clear_quota_blocked(ticket_id)
-        context = self._trace_contexts.pop(ticket_id, None)
+        # Some focused integrations construct a dispatcher without running
+        # __init__. Cleanup remains valid when tracing was not configured.
+        context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
         if context is not None:
             self._previous_invocations[ticket_id] = context
             self._trace.record(

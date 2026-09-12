@@ -328,14 +328,25 @@ class AgentBase(ABC):
         self._trace_terminal_state = LifecycleState.COMPLETED
         # Dispatcher normally supplies this context.  Direct agent use (tests,
         # CLI tools) still gets an isolated invocation rather than losing causality.
-        if self.trace_context is None:
-            self.trace_context = new_trace_context(
+        trace_context = getattr(self, "trace_context", None)
+        if trace_context is None:
+            trace_context = new_trace_context(
                 ticket_id=ticket_id, agent_id=self.agent_name
             )
-        self._trace.context = self.trace_context
-        self._client.headers.update(trace_headers(self.trace_context))
-        self._trace.record(
-            self.trace_context,
+            self.trace_context = trace_context
+        trace = getattr(self, "_trace", None)
+        if trace is None:
+            # Keep direct/minimal AgentBase use observable as well.  Production
+            # instances initialize this in __init__, while focused adapters may
+            # only supply the methods required for their agent loop.
+            trace = TraceRecorder()
+            self._trace = trace
+        trace.context = trace_context
+        header_update = self._client.headers.update(trace_headers(trace_context))
+        if inspect.isawaitable(header_update):
+            await header_update
+        trace.record(
+            trace_context,
             ActionType.AGENT,
             LifecycleState.STARTED,
             phase="run",

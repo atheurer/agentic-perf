@@ -790,6 +790,20 @@ async def run_agent_task(
                     logger.error(
                         f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
                     )
+                    # The timeout is an observed orchestration outcome even if the
+                    # follow-up state transition cannot reach the state store.
+                    # Record it first so the audit trail does not depend on that
+                    # separate network operation succeeding.
+                    if dispatcher.events:
+                        dispatcher.events.emit(
+                            ticket_id,
+                            "orchestrator",
+                            "agent_error",
+                            {
+                                "reason": "agent_task_timeout",
+                                "timeout_seconds": agent_task_timeout,
+                            },
+                        )
                     await _transition_to_guidance(
                         dispatcher.store_url,
                         ticket_id,
