@@ -87,7 +87,7 @@ class TestSweepIntegration:
             result = MagicMock()
             if "get" in cmd:
                 result.returncode = 0
-                result.stdout = leases_json
+                result.stdout = leases_json.encode()
             else:
                 result.returncode = 0
             return result
@@ -98,9 +98,14 @@ class TestSweepIntegration:
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_resp
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=_mock_run)
 
         with (
-            patch("subprocess.run", side_effect=_mock_run),
+            patch(
+                "providers.resource.jumpstarter_lifecycle.AuditedSubprocessRunner",
+                return_value=runner,
+            ),
             patch("httpx.AsyncClient") as MockClient,
         ):
             MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -110,6 +115,10 @@ class TestSweepIntegration:
         delete_cmds = [c for c in sub_calls if "delete" in c]
         assert len(delete_cmds) == 1
         assert "perf-abcd1234" in delete_cmds[0]
+        delete_call = next(
+            call for call in runner.run.call_args_list if "delete" in call.args[0]
+        )
+        assert delete_call.kwargs["system_context"] is True
 
     @pytest.mark.asyncio
     async def test_sweep_skips_active_lease(self):
@@ -125,7 +134,7 @@ class TestSweepIntegration:
             sub_calls.append(cmd)
             result = MagicMock()
             result.returncode = 0
-            result.stdout = leases_json
+            result.stdout = leases_json.encode()
             return result
 
         mock_resp = MagicMock()
@@ -136,9 +145,14 @@ class TestSweepIntegration:
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_resp
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=_mock_run)
 
         with (
-            patch("subprocess.run", side_effect=_mock_run),
+            patch(
+                "providers.resource.jumpstarter_lifecycle.AuditedSubprocessRunner",
+                return_value=runner,
+            ),
             patch("httpx.AsyncClient") as MockClient,
         ):
             MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -162,7 +176,7 @@ class TestSweepIntegration:
             sub_calls.append(cmd)
             result = MagicMock()
             result.returncode = 0
-            result.stdout = leases_json
+            result.stdout = leases_json.encode()
             return result
 
         mock_resp = MagicMock()
@@ -170,9 +184,14 @@ class TestSweepIntegration:
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_resp
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=_mock_run)
 
         with (
-            patch("subprocess.run", side_effect=_mock_run),
+            patch(
+                "providers.resource.jumpstarter_lifecycle.AuditedSubprocessRunner",
+                return_value=runner,
+            ),
             patch("httpx.AsyncClient") as MockClient,
         ):
             MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -181,6 +200,10 @@ class TestSweepIntegration:
 
         delete_cmds = [c for c in sub_calls if "delete" in c]
         assert len(delete_cmds) == 1
+        delete_call = next(
+            call for call in runner.run.call_args_list if "delete" in call.args[0]
+        )
+        assert delete_call.kwargs["system_context"] is True
 
     @pytest.mark.asyncio
     async def test_sweep_ignores_non_ticket_leases(self):
@@ -201,10 +224,15 @@ class TestSweepIntegration:
             sub_calls.append(cmd)
             result = MagicMock()
             result.returncode = 0
-            result.stdout = leases_json
+            result.stdout = leases_json.encode()
             return result
 
-        with patch("subprocess.run", side_effect=_mock_run):
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=_mock_run)
+        with patch(
+            "providers.resource.jumpstarter_lifecycle.AuditedSubprocessRunner",
+            return_value=runner,
+        ):
             await _sweep_orphaned_leases("http://localhost:8090")
 
         delete_cmds = [c for c in sub_calls if "delete" in c]
@@ -223,10 +251,15 @@ class TestSweepIntegration:
             sub_calls.append(cmd)
             result = MagicMock()
             result.returncode = 0
-            result.stdout = _jmp_leases_json([])
+            result.stdout = _jmp_leases_json([]).encode()
             return result
 
-        with patch("subprocess.run", side_effect=_mock_run):
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=_mock_run)
+        with patch(
+            "providers.resource.jumpstarter_lifecycle.AuditedSubprocessRunner",
+            return_value=runner,
+        ):
             await _sweep_orphaned_leases("http://localhost:8090")
 
         delete_cmds = [c for c in sub_calls if "delete" in c]

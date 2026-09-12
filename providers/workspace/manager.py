@@ -715,10 +715,8 @@ class WorkspaceManager:
         jq_bin = shutil.which("jq")
         if jq_bin:
             try:
-                proc = subprocess.run(
+                proc = AuditedSubprocessRunner().run_sync(
                     [jq_bin, query, str(path)],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
                 if proc.returncode != 0:
@@ -726,7 +724,7 @@ class WorkspaceManager:
                         "status": "error",
                         "error": f"jq error (exit {proc.returncode}): {proc.stderr.strip()}",
                     }
-                raw_out = proc.stdout.strip()
+                raw_out = proc.stdout.decode(errors="replace").strip()
             except subprocess.TimeoutExpired:
                 return {
                     "status": "error",
@@ -1016,10 +1014,9 @@ class WorkspaceManager:
         if path.suffix.lower() == ".json":
             try:
                 if jq_filter and shutil.which("jq"):
-                    proc = subprocess.run(
+                    proc = AuditedSubprocessRunner().run_sync(
                         ["jq", "-c", jq_filter],
-                        input=raw_text.encode("utf-8"),
-                        capture_output=True,
+                        stdin=raw_text.encode("utf-8"),
                         timeout=5,
                     )
                     if proc.returncode == 0:
@@ -1077,3 +1074,6 @@ class WorkspaceManager:
             "chart_data": spec_dict,
             "summary": f"Generated {spec.type} chart '{spec.title}' with {len(spec.labels)} labels and {len(spec.datasets)} datasets.",
         }
+
+
+from providers.execution import AuditedSubprocessRunner

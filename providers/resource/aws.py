@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.server_utils import tool_progress
+from providers.execution import AuditedSubprocessRunner
 from providers.ssh import SSHExecutor
 from providers.tracing import (
     TraceClient,
@@ -777,15 +778,15 @@ class AWSResourceProvider(ResourceProvider):
             return pubkey_path.read_text().strip()
 
         # Derive public key from private key
-        proc = await asyncio.create_subprocess_exec(
-            "ssh-keygen",
-            "-y",
-            "-f",
-            self._ssh_key_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await AuditedSubprocessRunner().run(
+            [
+                "ssh-keygen",
+                "-y",
+                "-f",
+                self._ssh_key_path,
+            ],
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = proc.stdout, proc.stderr
         if proc.returncode != 0:
             raise RuntimeError(
                 f"Failed to derive public key: {stderr.decode().strip()}"
