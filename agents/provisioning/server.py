@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import re
+import shlex
 import sys
 import textwrap
 from contextlib import AsyncExitStack
@@ -58,7 +59,7 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider()
+    _skill_provider = build_skill_provider(resolve_source=False)
     _secrets_provider = build_secrets_provider()
     _initialized = True
 
@@ -535,6 +536,7 @@ async def _validate_and_deploy_contract(host: str, private_config: dict) -> dict
                 host,
                 item["local_path"],
                 item["remote_path"],
+                mutating=True,
             )
             if scp_result.exit_code != 0:
                 return {
@@ -819,23 +821,74 @@ async def _verify_harness_install_one(
     provisioning: dict,
     install_path: str = "",
 ) -> dict:
-    """Verify harness installation on a single host."""
+    """Verify harness installation and required controller context read-only.
+
+    Crucible's benchmark agent needs both a working controller installation and
+    the controller's bootstrap document.  The latter is deliberately checked
+    here without copying, updating, or otherwise modifying the installation so
+    that ``on_existing_install=skip`` still gives later agents an accurate
+    readiness result.
+    """
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )
     verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
 
     result = await _ssh.run(host, verify_cmd)
+    harness_verified = result.exit_code == 0
+    context: dict[str, Any] | None = None
+
+    # The context gateway bootstraps Crucible from the controller's installed
+    # tree.  Keep this harness-specific detail in the provisioning result, not
+    # in the generic agent prompt or a static local catalog.
+    if harness_name == "crucible":
+        bootstrap = provisioning.get("context_bootstrap", "AGENTS.md")
+        bootstrap_path = f"{path.rstrip('/')}/{bootstrap.lstrip('/')}"
+        quoted_path = shlex.quote(bootstrap_path)
+        context_probe = (
+            f"if [ -r {quoted_path} ]; then "
+            f"printf 'available=1\\nbytes='; wc -c < {quoted_path}; "
+            "else printf 'available=0\\n'; exit 1; fi"
+        )
+        context_result = await _ssh.run(host, context_probe, timeout=30)
+        context = {
+            "ready": context_result.exit_code == 0,
+            "bootstrap": bootstrap_path,
+            "bytes": 0,
+        }
+        if context_result.stdout:
+            match = re.search(r"bytes=(\d+)", context_result.stdout)
+            if match:
+                context["bytes"] = int(match.group(1))
+        if context_result.exit_code != 0:
+            context["error"] = (
+                context_result.stderr[:300]
+                if context_result.stderr
+                else "bootstrap document is not readable"
+            )
+
+    context_ready = context is None or context["ready"]
+    verified = harness_verified and context_ready
+    message = (
+        f"{harness_name} verified"
+        if verified
+        else (
+            f"{harness_name} executable verified but controller context is not ready"
+            if harness_verified and context is not None and not context_ready
+            else f"Verification failed: {result.stderr[:200]}"
+        )
+    )
     return {
         "host": host,
         "harness": harness_name,
-        "verified": result.exit_code == 0,
+        "verified": verified,
+        "harness_verified": harness_verified,
+        "context_ready": context_ready,
         "install_path": path,
         "output": result.stdout[:500] if result.stdout else "",
         "error": result.stderr[:500] if result.stderr else "",
-        "message": f"{harness_name} verified"
-        if result.exit_code == 0
-        else f"Verification failed: {result.stderr[:200]}",
+        "context": context,
+        "message": message,
     }
 
 
@@ -1023,14 +1076,20 @@ async def _ensure_harness_one(
         host, harness_name, provisioning, install_path
     )
     if existing.get("installed"):
-        return {
-            "host": host,
-            "harness": harness_name,
-            "status": "already_installed",
-            "install_path": existing.get("install_path", ""),
-            "version": existing.get("version", "unknown"),
-            "message": f"{harness_name} already installed on {host}",
-        }
+        verify_result = await _verify_harness_install_one(
+            host, harness_name, provisioning, install_path
+        )
+        if not verify_result.get("verified"):
+            verify_result["status"] = "installed_verify_failed"
+            return verify_result
+        verify_result.update(
+            {
+                "status": "already_installed",
+                "version": existing.get("version", "unknown"),
+                "message": f"{harness_name} already installed and verified on {host}",
+            }
+        )
+        return verify_result
 
     install_result = await _install_harness_one(
         host, harness_name, private_config, provisioning, constraints, branch

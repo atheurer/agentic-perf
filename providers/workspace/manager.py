@@ -20,17 +20,127 @@ class WorkspaceSecurityError(ValueError):
 class WorkspaceManager:
     """Manages per-ticket scratchpad workspace files and query operations."""
 
+    NAMESPACES = ("context", "runfiles", "results", "logs", "metadata", "scratch")
+    FILE_KINDS = frozenset(
+        {
+            "source_context",
+            "runfile",
+            "result_summary",
+            "raw_artifact",
+            "log",
+            "metadata",
+            "scratch",
+        }
+    )
+    CONTEXT_INDEX = "context/indexes/documents.json"
+
     def __init__(
         self,
         ticket_id: str | None = None,
         workspace_dir: Path | str | None = None,
+        agent_name: str | None = None,
+        phase: str | None = None,
     ) -> None:
         self.ticket_id = ticket_id or ""
+        self.agent_name = agent_name or "unknown"
+        self.phase = phase or self._phase_for_agent(self.agent_name)
+        self.audience = self._audience_for_agent(self.agent_name)
         if workspace_dir is not None:
             self.workspace_dir = Path(workspace_dir).resolve()
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.workspace_dir = get_ticket_workspace_dir(self.ticket_id).resolve()
+        for namespace in self.NAMESPACES:
+            (self.workspace_dir / namespace).mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _audience_for_agent(agent_name: str) -> str:
+        value = agent_name.lower().replace("-agent", "")
+        return value or "unknown"
+
+    @classmethod
+    def _phase_for_agent(cls, agent_name: str) -> str:
+        return cls._audience_for_agent(agent_name)
+
+    @property
+    def _manifest_path(self) -> Path:
+        return self.workspace_dir / "metadata" / "workspace-manifest.json"
+
+    def _load_manifest(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"schema_version": 1, "entries": {}}
+        return (
+            value if isinstance(value, dict) else {"schema_version": 1, "entries": {}}
+        )
+
+    def _stamp(
+        self,
+        filename: str,
+        *,
+        source: str = "local",
+        authority: str = "unclassified",
+    ) -> None:
+        manifest = self._load_manifest()
+        entries = manifest.setdefault("entries", {})
+        entries[filename] = {
+            "source": source,
+            "authority": authority,
+            "phase": self.phase,
+            "audience": self.audience,
+            "agent": self.agent_name,
+            "kind": self.infer_kind(filename),
+        }
+        self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        self._manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    def _is_visible(self, file_ref: str, include_alternates: bool = False) -> bool:
+        cleaned = file_ref.strip()
+        if cleaned.startswith("workspace://"):
+            cleaned = cleaned[len("workspace://") :]
+        if cleaned == "context/effective-context.json":
+            return True
+        entry = self._load_manifest().get("entries", {}).get(cleaned)
+        if not isinstance(entry, dict):
+            return True  # Legacy/unclassified files remain compatible.
+        effective = self.read_effective_context() or {}
+        if effective.get("phase") == self.phase and cleaned in {
+            str(ref).removeprefix("workspace://")
+            for ref in effective.get("workspace_refs", [])
+        }:
+            return True
+        if include_alternates:
+            return True
+        if entry.get("authority") == "alternate":
+            return False
+        audience = entry.get("audience")
+        return audience in (None, "unknown", self.audience, "shared")
+
+    def _check_visible(self, file_ref: str, include_alternates: bool) -> None:
+        if not self._is_visible(file_ref, include_alternates):
+            raise WorkspaceSecurityError(
+                f"Workspace file is not visible to audience '{self.audience}': {file_ref}"
+            )
+
+    @classmethod
+    def infer_kind(cls, filename: str) -> str:
+        """Infer a manifest kind from the backward-compatible namespace."""
+        parts = Path(filename).parts
+        if not parts:
+            return "scratch"
+        namespace = parts[0]
+        if namespace == "context":
+            return "source_context"
+        if namespace == "runfiles":
+            return "runfile"
+        if namespace == "results":
+            return "raw_artifact" if "raw" in parts[1:] else "result_summary"
+        if namespace == "logs":
+            return "log"
+        if namespace == "metadata":
+            return "metadata"
+        return "scratch"
 
     def resolve_path(self, file_ref: str) -> Path:
         """Resolve a workspace:// URI or relative filename to an absolute path.
@@ -78,9 +188,461 @@ class WorkspaceManager:
             path.write_text(content, encoding="utf-8")
 
         rel_name = str(path.relative_to(self.workspace_dir))
+        self._stamp(rel_name)
         return f"workspace://{rel_name}", path
 
-    def list_files(self) -> list[dict[str, Any]]:
+    def save_artifact_reference(
+        self,
+        filename: str,
+        artifact_ref: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[str, Path]:
+        """Store a small workspace reference to a large artifact-store object."""
+        payload: dict[str, Any] = {"artifact_ref": artifact_ref}
+        if metadata:
+            payload["metadata"] = metadata
+        raw_filename = filename.lstrip("/")
+        if not raw_filename.startswith("results/raw/"):
+            raw_filename = f"results/raw/{raw_filename}"
+        return self.save_file(
+            raw_filename,
+            json.dumps(payload, indent=2) + "\n",
+        )
+
+    def save_source_snapshot(
+        self,
+        source: str,
+        provenance: dict[str, Any],
+        files: dict[str, str],
+        benchmark: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an alternate source snapshot without selecting its authority."""
+        if source not in {"github", "controller", "local"}:
+            raise ValueError(f"unsupported context source: {source}")
+        root = f"context/sources/{source}"
+        if benchmark:
+            root += f"/benchmarks/{benchmark.replace('/', '_')}"
+        refs: dict[str, str] = {}
+        for filename, content in files.items():
+            ref, _ = self.save_file(f"{root}/{filename.lstrip('/')}", content)
+            refs[filename] = ref
+            self._stamp(
+                str(self.resolve_path(ref).relative_to(self.workspace_dir)),
+                source=source,
+                authority="alternate",
+            )
+        metadata_ref, _ = self.save_file(
+            f"{root}/source.json",
+            json.dumps(
+                {
+                    "source": source,
+                    "provenance": provenance,
+                    "phase": self.phase,
+                    "audience": self.audience,
+                    "agent": self.agent_name,
+                    "files": refs,
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        self._stamp(
+            str(self.resolve_path(metadata_ref).relative_to(self.workspace_dir)),
+            source=source,
+            authority="alternate",
+        )
+        return {"source": source, "files": refs, "metadata": metadata_ref}
+
+    def save_effective_context(self, manifest: dict[str, Any]) -> str:
+        """Record the phase-specific logical context as jq-queryable JSON.
+
+        Source selection and workspace snapshot paths are implementation
+        details.  They remain in the private context index and audit stamps,
+        but must not be copied into the model-facing effective manifest.
+        """
+        manifest = dict(manifest)
+        for key in (
+            "source",
+            "sources",
+            "effective_source",
+            "source_reason",
+            "source_assumption",
+            "provenance",
+            "workspace_ref",
+            "workspace_refs",
+            "alternate_refs",
+        ):
+            manifest.pop(key, None)
+        manifest.update(
+            {
+                "schema_version": manifest.get("schema_version", 1),
+                "phase": self.phase,
+                "audience": self.audience,
+                "agent": self.agent_name,
+            }
+        )
+        ref, _ = self.save_file(
+            "context/effective-context.json", json.dumps(manifest, indent=2) + "\n"
+        )
+        self._stamp(
+            "context/effective-context.json",
+            source="workspace",
+            authority="effective",
+        )
+        return ref
+
+    def load_source_snapshot(
+        self, source: str, benchmark: str | None = None
+    ) -> dict[str, Any] | None:
+        """Load one source snapshot without selecting its authority."""
+        root_name = f"context/sources/{source}"
+        if benchmark:
+            root_name += f"/benchmarks/{benchmark.replace('/', '_')}"
+        root = self.resolve_path(root_name)
+        metadata_path = root / "source.json"
+        if not metadata_path.is_file():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        files: dict[str, str] = {}
+        for path in root.rglob("*"):
+            if path.name == "source.json" or not path.is_file():
+                continue
+            try:
+                relative = str(path.relative_to(root))
+                if benchmark is None and relative.startswith("benchmarks/"):
+                    continue
+                files[relative] = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+        return {
+            "source": source,
+            "provenance": metadata.get("provenance", {}),
+            "files": files,
+            "metadata": metadata,
+        }
+
+    def read_effective_context(self) -> dict[str, Any] | None:
+        path = self.resolve_path("context/effective-context.json")
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _load_context_index(self) -> dict[str, Any]:
+        path = self.resolve_path(self.CONTEXT_INDEX)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"schema_version": 1, "documents": []}
+        if not isinstance(value, dict) or not isinstance(value.get("documents"), list):
+            return {"schema_version": 1, "documents": []}
+        return value
+
+    def index_context_documents(self, documents: list[dict[str, Any]]) -> str:
+        """Upsert logical context documents backed by workspace snapshots."""
+        index = self._load_context_index()
+        existing = {
+            (item.get("ref"), item.get("source")): item
+            for item in index.get("documents", [])
+            if isinstance(item, dict)
+        }
+        for document in documents:
+            ref = document.get("ref") or document.get("path")
+            workspace_ref = document.get("workspace_ref")
+            if not ref or not workspace_ref:
+                continue
+            item = {key: value for key, value in document.items() if key != "content"}
+            item["ref"] = ref
+            item["workspace_ref"] = workspace_ref
+            item["phase"] = self.phase
+            item["audience"] = self.audience
+            if item.get("authority") == "effective":
+                try:
+                    relative = str(
+                        self.resolve_path(workspace_ref).relative_to(self.workspace_dir)
+                    )
+                    self._stamp(relative, source="workspace", authority="effective")
+                except (OSError, ValueError, WorkspaceSecurityError):
+                    continue
+            existing[(ref, item.get("source"))] = item
+        payload = {
+            "schema_version": 1,
+            "phase": self.phase,
+            "audience": self.audience,
+            "documents": sorted(
+                existing.values(),
+                key=lambda item: (item.get("ref", ""), item.get("source", "")),
+            ),
+        }
+        ref, _ = self.save_file(
+            self.CONTEXT_INDEX, json.dumps(payload, indent=2) + "\n"
+        )
+        self._stamp(self.CONTEXT_INDEX, source="workspace", authority="effective")
+        return ref
+
+    @staticmethod
+    def _normalize_document_ref(ref: str) -> str:
+        value = ref.strip()
+        for prefix in ("context://crucible/", "crucible://"):
+            if value.startswith(prefix):
+                return value[len(prefix) :]
+        return value
+
+    def _context_document(
+        self, ref: str, *, include_alternates: bool = False
+    ) -> dict[str, Any] | None:
+        requested = self._normalize_document_ref(ref)
+        candidates = []
+        for item in self._load_context_index().get("documents", []):
+            if not isinstance(item, dict):
+                continue
+            aliases = {
+                self._normalize_document_ref(str(item.get(key, "")))
+                for key in ("ref", "path", "uri", "workspace_ref")
+            }
+            if requested not in aliases:
+                continue
+            workspace_ref = item.get("workspace_ref")
+            if not workspace_ref:
+                continue
+            try:
+                self._check_visible(workspace_ref, include_alternates)
+            except WorkspaceSecurityError:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        scoped_effective = [
+            item
+            for item in candidates
+            if item.get("phase") == self.phase
+            and item.get("audience") in {self.audience, "shared"}
+            and item.get("authority") == "effective"
+        ]
+        if scoped_effective:
+            return scoped_effective[0]
+        effective = [
+            item for item in candidates if item.get("authority") == "effective"
+        ]
+        if effective:
+            return effective[0]
+        scoped = [
+            item
+            for item in candidates
+            if item.get("phase") == self.phase
+            and item.get("audience") in {self.audience, "shared"}
+        ]
+        return (scoped or candidates)[0]
+
+    def context_manifest(self, namespace: str = "") -> dict[str, Any]:
+        """Return a source-neutral view of the current phase's context index."""
+        documents = []
+        for item in self._load_context_index().get("documents", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("phase") != self.phase or item.get("audience") not in {
+                self.audience,
+                "shared",
+            }:
+                continue
+            ref = item.get("ref") or item.get("path")
+            if not ref or (
+                namespace
+                and namespace != "all"
+                and not str(item.get("namespace", "")).startswith(namespace)
+            ):
+                continue
+            documents.append(
+                {
+                    "ref": ref,
+                    "namespace": item.get("namespace"),
+                    "uri": item.get("uri"),
+                    "entrypoint": item.get("entrypoint", False),
+                    "subject_areas": item.get("subject_areas", []),
+                }
+            )
+        documents.sort(key=lambda item: item["ref"])
+        return {
+            "schema_version": 1,
+            "phase": self.phase,
+            "audience": self.audience,
+            "namespace": namespace or "all",
+            "document_count": len(documents),
+            "documents": documents,
+        }
+
+    def context_scope_indexed(self, namespace: str = "") -> bool:
+        """Return whether the current workspace index covers a logical scope."""
+        documents = self._load_context_index().get("documents", [])
+        if not namespace or namespace == "all":
+            return bool(documents)
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            if item.get("phase") != self.phase or item.get("audience") not in {
+                self.audience,
+                "shared",
+            }:
+                continue
+            if (
+                namespace
+                and namespace != "all"
+                and not str(item.get("namespace", "")).startswith(namespace)
+            ):
+                continue
+            workspace_ref = item.get("workspace_ref")
+            if not workspace_ref:
+                continue
+            try:
+                self._check_visible(workspace_ref, include_alternates=False)
+            except WorkspaceSecurityError:
+                continue
+            return True
+        return False
+
+    def read_document(
+        self,
+        ref: str,
+        *,
+        include_alternates: bool = False,
+        max_bytes: int = 262144,
+    ) -> dict[str, Any]:
+        """Read an indexed logical document from the ticket workspace."""
+        item = self._context_document(ref, include_alternates=include_alternates)
+        if item is None:
+            try:
+                direct_path = self.resolve_path(ref)
+                direct_ref = (
+                    f"workspace://{direct_path.relative_to(self.workspace_dir)}"
+                )
+                self._check_visible(direct_ref, include_alternates)
+            except (OSError, ValueError, WorkspaceSecurityError):
+                return {"status": "error", "error": "document_not_found", "ref": ref}
+            if not direct_path.is_file():
+                return {"status": "error", "error": "document_not_found", "ref": ref}
+            manifest_entry = (
+                self._load_manifest()
+                .get("entries", {})
+                .get(str(direct_path.relative_to(self.workspace_dir)), {})
+            )
+            item = {
+                "ref": ref,
+                "workspace_ref": direct_ref,
+                "source": manifest_entry.get("source", "workspace"),
+                "authority": manifest_entry.get("authority", "effective"),
+                "provenance": manifest_entry,
+            }
+        workspace_ref = item["workspace_ref"]
+        path = self.resolve_path(workspace_ref)
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return {"status": "error", "error": str(exc), "ref": ref}
+        encoded = content.encode("utf-8")
+        truncated = len(encoded) > max_bytes
+        if truncated:
+            content = encoded[:max_bytes].decode("utf-8", errors="replace")
+        return {
+            "status": "ok",
+            "ref": item.get("ref"),
+            "uri": item.get("uri"),
+            "workspace_ref": workspace_ref,
+            "source": item.get("source"),
+            "authority": item.get("authority"),
+            "provenance": item.get("provenance", {}),
+            "content": content,
+            "size_bytes": len(encoded),
+            "truncated": truncated,
+        }
+
+    def search_documents(
+        self,
+        query: str,
+        *,
+        namespace: str = "",
+        include_alternates: bool = False,
+        case_insensitive: bool = True,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        """Search indexed document paths and contents in the workspace."""
+        flags = re.IGNORECASE if case_insensitive else 0
+        try:
+            pattern = re.compile(query, flags)
+        except re.error as exc:
+            return {"status": "error", "error": f"invalid_regex: {exc}"}
+        results: list[dict[str, Any]] = []
+        total_matches = 0
+        for item in self._load_context_index().get("documents", []):
+            if not isinstance(item, dict):
+                continue
+            if namespace and not str(item.get("namespace", "")).startswith(namespace):
+                continue
+            workspace_ref = item.get("workspace_ref")
+            if not workspace_ref:
+                continue
+            try:
+                self._check_visible(workspace_ref, include_alternates)
+                content = self.resolve_path(workspace_ref).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except (OSError, WorkspaceSecurityError):
+                continue
+            path_matched = bool(pattern.search(str(item.get("ref", ""))))
+            line_matches = [
+                {"line_number": number, "content": line.rstrip("\r\n")}
+                for number, line in enumerate(content.splitlines(), 1)
+                if pattern.search(line)
+            ]
+            if not path_matched and not line_matches:
+                continue
+            total_matches += 1
+            if len(results) >= max_results:
+                continue
+            results.append(
+                {
+                    "ref": item.get("ref"),
+                    "uri": item.get("uri"),
+                    "workspace_ref": workspace_ref,
+                    "source": item.get("source"),
+                    "authority": item.get("authority"),
+                    "provenance": item.get("provenance", {}),
+                    "path_match": path_matched,
+                    "matches": line_matches[:10],
+                    "match_count": len(line_matches),
+                }
+            )
+        return {
+            "status": "ok",
+            "query": query,
+            "namespace": namespace or "all",
+            "results": results,
+            "total_documents_matched": total_matches,
+            "truncated": total_matches > len(results),
+        }
+
+    def list_effective_files(self) -> list[dict[str, Any]]:
+        """List files while hiding non-effective source alternates from prompts."""
+        entries = self.list_files()
+        manifest = self.read_effective_context()
+        if not manifest:
+            return entries
+        selected = set(manifest.get("workspace_refs", []))
+        return [
+            entry
+            for entry in entries
+            if entry["namespace"] != "context"
+            or entry["file_ref"] in selected
+            or entry["file_ref"] == "workspace://context/effective-context.json"
+        ]
+
+    def list_files(self, include_alternates: bool = False) -> list[dict[str, Any]]:
         """List all files in the ticket workspace with metadata."""
         if not self.workspace_dir.exists():
             return []
@@ -89,6 +651,10 @@ class WorkspaceManager:
         for p in sorted(self.workspace_dir.rglob("*")):
             if p.is_file():
                 rel_path = str(p.relative_to(self.workspace_dir))
+                if rel_path == "metadata/workspace-manifest.json":
+                    continue
+                if not self._is_visible(f"workspace://{rel_path}", include_alternates):
+                    continue
                 size_bytes = p.stat().st_size
                 ext = p.suffix.lstrip(".").lower()
                 results.append(
@@ -97,6 +663,26 @@ class WorkspaceManager:
                         "file_ref": f"workspace://{rel_path}",
                         "size_bytes": size_bytes,
                         "format": ext or "text",
+                        "kind": self.infer_kind(rel_path),
+                        "namespace": Path(rel_path).parts[0]
+                        if Path(rel_path).parts
+                        else "scratch",
+                        "source": self._load_manifest()
+                        .get("entries", {})
+                        .get(rel_path, {})
+                        .get("source", "unknown"),
+                        "authority": self._load_manifest()
+                        .get("entries", {})
+                        .get(rel_path, {})
+                        .get("authority", "unclassified"),
+                        "phase": self._load_manifest()
+                        .get("entries", {})
+                        .get(rel_path, {})
+                        .get("phase"),
+                        "audience": self._load_manifest()
+                        .get("entries", {})
+                        .get(rel_path, {})
+                        .get("audience"),
                         "mtime": p.stat().st_mtime,
                     }
                 )
@@ -108,6 +694,7 @@ class WorkspaceManager:
         query: str,
         limit: int = 50,
         max_bytes: int = 16384,
+        include_alternates: bool = False,
     ) -> dict[str, Any]:
         """Execute a jq filter against a JSON file in the workspace.
 
@@ -117,6 +704,7 @@ class WorkspaceManager:
             limit: maximum items if result is a list
             max_bytes: maximum byte length of formatted result before truncating
         """
+        self._check_visible(file_ref, include_alternates)
         path = self.resolve_path(file_ref)
         if not path.is_file():
             return {
@@ -127,10 +715,8 @@ class WorkspaceManager:
         jq_bin = shutil.which("jq")
         if jq_bin:
             try:
-                proc = subprocess.run(
+                proc = AuditedSubprocessRunner().run_sync(
                     [jq_bin, query, str(path)],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
                 if proc.returncode != 0:
@@ -138,7 +724,7 @@ class WorkspaceManager:
                         "status": "error",
                         "error": f"jq error (exit {proc.returncode}): {proc.stderr.strip()}",
                     }
-                raw_out = proc.stdout.strip()
+                raw_out = proc.stdout.decode(errors="replace").strip()
             except subprocess.TimeoutExpired:
                 return {
                     "status": "error",
@@ -218,8 +804,10 @@ class WorkspaceManager:
         max_lines: int = 50,
         context_lines: int = 0,
         case_insensitive: bool = True,
+        include_alternates: bool = False,
     ) -> dict[str, Any]:
         """Search a workspace text file for regex or string matches."""
+        self._check_visible(file_ref, include_alternates)
         path = self.resolve_path(file_ref)
         if not path.is_file():
             return {
@@ -283,8 +871,10 @@ class WorkspaceManager:
         max_bytes: int = 4096,
         start_line: int = 1,
         max_lines: int | None = None,
+        include_alternates: bool = False,
     ) -> dict[str, Any]:
         """Read a slice of a workspace file by byte offset or line range."""
+        self._check_visible(file_ref, include_alternates)
         path = self.resolve_path(file_ref)
         if not path.is_file():
             return {
@@ -424,10 +1014,9 @@ class WorkspaceManager:
         if path.suffix.lower() == ".json":
             try:
                 if jq_filter and shutil.which("jq"):
-                    proc = subprocess.run(
+                    proc = AuditedSubprocessRunner().run_sync(
                         ["jq", "-c", jq_filter],
-                        input=raw_text.encode("utf-8"),
-                        capture_output=True,
+                        stdin=raw_text.encode("utf-8"),
                         timeout=5,
                     )
                     if proc.returncode == 0:
@@ -485,3 +1074,6 @@ class WorkspaceManager:
             "chart_data": spec_dict,
             "summary": f"Generated {spec.type} chart '{spec.title}' with {len(spec.labels)} labels and {len(spec.datasets)} datasets.",
         }
+
+
+from providers.execution import AuditedSubprocessRunner

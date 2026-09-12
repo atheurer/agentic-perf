@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from paths import LOG_DIR as DEFAULT_LOG_DIR
+from providers.events import EventBus
 
 
 def _read_events(
@@ -20,29 +21,12 @@ def _read_events(
     since: int = 0,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Read events from the JSONL file for a ticket."""
-    path = DEFAULT_LOG_DIR / f"{ticket_id}.jsonl"
-    if not path.exists():
-        return []
-    results: list[dict[str, Any]] = []
-    line_num = 0
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line_num += 1
-            if line_num <= since:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            evt["seq"] = line_num
-            results.append(evt)
-            if len(results) >= limit:
-                break
-    return results
+    """Read the legacy-compatible projection from the canonical trace store."""
+    bus = EventBus(log_dir=DEFAULT_LOG_DIR)
+    try:
+        return bus.get_events(ticket_id, since=since, limit=limit)
+    finally:
+        bus.close()
 
 
 def _truncate_event(evt: dict[str, Any]) -> dict[str, Any]:
@@ -624,6 +608,29 @@ def _detect_anomalies_from_events(
                 )
                 # Only flag once per lookup→action sequence.
                 lookup_failed = False
+
+    # --- Empty LLM responses ---
+    # Flag when a model returns 0 output tokens. This is
+    # a model reliability issue (observed with Gemini) that
+    # wastes an iteration and may cause agent failure.
+    for evt in events:
+        if (
+            evt.get("event_type") == "agent_error"
+            and evt.get("data", {}).get("reason") == "empty_response"
+        ):
+            agent = evt.get("agent", "?")
+            anomalies.append(
+                {
+                    "severity": "medium",
+                    "type": "empty_llm_response",
+                    "description": (
+                        f"Agent '{agent}' received an empty "
+                        f"response (0 output tokens) from the "
+                        f"LLM. The model may be experiencing "
+                        f"reliability issues."
+                    ),
+                }
+            )
 
     return anomalies
 

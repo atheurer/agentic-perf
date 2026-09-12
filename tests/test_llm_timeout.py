@@ -27,6 +27,7 @@ from providers.llm.base import (
     ToolDefinition,
 )
 from providers.llm.mock import MockLLMProvider
+from providers.tracing import LifecycleState, RetryKind, TraceRecorder
 
 
 class TestLLMTimeoutError:
@@ -241,6 +242,16 @@ class TestAgentTimeoutHandling:
             event_bus=events,
         )
 
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event):
+                self.events.append(event)
+
+        sink = Sink()
+        agent._trace = TraceRecorder(client=sink)
+
         # Mock the HTTP calls
         agent._get_ticket = AsyncMock(
             return_value={
@@ -275,11 +286,75 @@ class TestAgentTimeoutHandling:
             e for e in ticket_events if e.get("event_type") == "agent_error"
         ]
         assert len(error_events) == 3
-        # First two are retries
+        llm_events = [e for e in sink.events if e.action.type.value == "llm"]
+        assert (
+            sum(e.lifecycle.state == LifecycleState.TIMED_OUT for e in llm_events) == 3
+        )
+        started = {
+            e.action_id
+            for e in llm_events
+            if e.lifecycle.state == LifecycleState.STARTED
+        }
+        terminal = {
+            e.action_id
+            for e in llm_events
+            if e.lifecycle.state == LifecycleState.TIMED_OUT
+        }
+        assert started <= terminal
         assert error_events[0]["data"]["retry"] == 1
         assert error_events[1]["data"]["retry"] == 2
-        # Third is final (retries exhausted)
         assert error_events[2]["data"]["retries_exhausted"] is True
+
+    @pytest.mark.asyncio
+    async def test_empty_response_attempt_is_closed_before_retry(self):
+        """The automatic empty-response retry does not leave an LLM action open."""
+        from agents.base import AgentBase
+
+        class Provider(LLMProvider):
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(
+                self, system_prompt, messages, tools=None, max_tokens=4096, timeout=None
+            ):
+                self.calls += 1
+                return LLMResponse(
+                    text="" if self.calls == 1 else "done", tool_calls=[]
+                )
+
+        class TestAgent(AgentBase):
+            def _system_prompt(self, ticket):
+                return "test"
+
+            def _build_messages(self, ticket):
+                return [{"role": "user", "content": "test"}]
+
+            async def _handle_completion(self, ticket_id, response):
+                pass
+
+        agent = TestAgent(
+            agent_name="test-agent",
+            llm_provider=Provider(),
+            state_store_url="http://store",
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={"id": "T", "status": "x", "custom_fields": {}}
+        )
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
+        await agent.run("T")
+        llm = [e for e in sink.events if e.action.type.value == "llm"]
+        started = {
+            e.action_id for e in llm if e.lifecycle.state == LifecycleState.STARTED
+        }
+        terminal = {
+            e.action_id for e in llm if e.lifecycle.state == LifecycleState.COMPLETED
+        }
+        assert started <= terminal
 
     @pytest.mark.asyncio
     async def test_agent_recovers_after_transient_timeout(self, tmp_path):
@@ -571,6 +646,15 @@ class TestOrchestratorConfig:
 class TestRunAgentTaskTimeout:
     """Test agent_task_timeout in run_agent_task."""
 
+    class _UnavailableAsyncClient:
+        """Fail HTTP setup immediately; timeout tests need no real store."""
+
+        async def __aenter__(self):
+            raise RuntimeError("state store unavailable")
+
+        async def __aexit__(self, *_args):
+            return None
+
     @pytest.mark.asyncio
     async def test_task_timeout_emits_error(self, tmp_path):
         """Agent task that exceeds timeout should emit error event."""
@@ -590,10 +674,16 @@ class TestRunAgentTaskTimeout:
         dispatcher.create_agent.return_value = slow_agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = events
+        dispatcher._trace_contexts = {}
+        dispatcher.clear_agent = MagicMock()
+        dispatcher.mark_done = MagicMock()
 
         # Use a status not in PLAN_AGENT_STATUS to avoid
         # _advance_plan trying to reach the state store.
-        await run_agent_task(dispatcher, "triaging", "SLOW-001", agent_task_timeout=0.1)
+        with patch("httpx.AsyncClient", return_value=self._UnavailableAsyncClient()):
+            await run_agent_task(
+                dispatcher, "triaging", "SLOW-001", agent_task_timeout=0.1
+            )
 
         # Should have emitted agent_error event
         ticket_events = events.get_events("SLOW-001", since=0, limit=100)
@@ -602,6 +692,44 @@ class TestRunAgentTaskTimeout:
         ]
         assert len(error_events) == 1
         assert error_events[0]["data"]["reason"] == "agent_task_timeout"
+        events.close()
+
+    @pytest.mark.asyncio
+    async def test_task_timeout_emits_error_before_guidance_transition(self, tmp_path):
+        """The timeout audit event is recorded before the state-store operation."""
+        from orchestrator.main import run_agent_task
+
+        events = EventBus(log_dir=str(tmp_path))
+
+        async def slow_run(tid):
+            await asyncio.sleep(10)
+
+        slow_agent = MagicMock()
+        slow_agent.run = slow_run
+        slow_agent.close = AsyncMock()
+        dispatcher = MagicMock()
+        dispatcher.create_agent.return_value = slow_agent
+        dispatcher.store_url = "http://localhost:9999"
+        dispatcher.events = events
+        dispatcher._trace_contexts = {}
+        dispatcher.clear_agent = MagicMock()
+        dispatcher.mark_done = MagicMock()
+
+        async def transition(*_args, **_kwargs):
+            ticket_events = events.get_events("SLOW-002", since=0, limit=100)
+            assert [e["event_type"] for e in ticket_events].count("agent_error") == 1
+
+        with (
+            patch("httpx.AsyncClient", return_value=self._UnavailableAsyncClient()),
+            patch("orchestrator.main._transition_to_guidance", new=transition),
+        ):
+            await run_agent_task(
+                dispatcher, "triaging", "SLOW-002", agent_task_timeout=0.1
+            )
+
+        ticket_events = events.get_events("SLOW-002", since=0, limit=100)
+        assert [e["event_type"] for e in ticket_events].count("agent_error") == 1
+        events.close()
 
     @pytest.mark.asyncio
     async def test_no_timeout_when_zero(self):
@@ -696,6 +824,12 @@ class TestAgentRateLimitHandling:
         )
         agent._transition_ticket = AsyncMock()
         agent._add_comment = AsyncMock()
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await agent.run("TEST-RL-001")
@@ -766,12 +900,26 @@ class TestAgentRateLimitHandling:
         agent._transition_ticket = AsyncMock()
         agent._add_comment = AsyncMock()
 
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await agent.run("TEST-RL-002")
 
         # Recovered — should NOT have transitioned to guidance
         agent._transition_ticket.assert_not_called()
         assert call_count == 2
+        llm = [event for event in sink.events if event.action.type.value == "llm"]
+        retry = [
+            event
+            for event in llm
+            if event.lifecycle.retry_kind == RetryKind.INTENTIONAL_AGENT_RETRY
+        ]
+        assert retry and retry[0].lifecycle.state == LifecycleState.FAILED
+        assert len({event.action_id for event in llm}) == 2
 
     @pytest.mark.asyncio
     async def test_uses_retry_after_from_error(self, tmp_path):

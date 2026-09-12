@@ -63,12 +63,51 @@ class TestHarnessToolScoping:
         agent.tools = self._make_tools(all_names)
         ticket = {
             "custom_fields": {
-                "directives": {"harness": "crucible"},
+                "directives": {"harness": "zathras"},
             },
         }
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
         assert names == set(all_names)
+
+    def test_crucible_hides_legacy_context_lookup_tools(self):
+        agent = self._make_agent()
+        all_names = [
+            "read_skills",
+            "list_harness_docs",
+            "read_harness_doc",
+            "get_crucible_benchmark_context",
+            "get_runfile_schema",
+            "get_benchmark_params",
+            "get_tool_params",
+            "get_example_runfile",
+            "get_execution_config",
+            "execute_benchmark",
+        ]
+        agent.tools = self._make_tools(all_names)
+        agent._apply_tool_scoping(
+            {"custom_fields": {"directives": {"harness": "crucible"}}}
+        )
+        assert {tool.name for tool in agent.tools} == {
+            "get_crucible_benchmark_context",
+            "execute_benchmark",
+        }
+
+    def test_crucible_prompt_does_not_enumerate_local_skill_files(self):
+        agent = BenchmarkAgent.__new__(BenchmarkAgent)
+        agent._repo_cache = None
+        content = agent._build_messages(
+            {
+                "id": "PERF-TEST",
+                "summary": "run uperf",
+                "description": "run uperf",
+                "custom_fields": {
+                    "directives": {"harness": "crucible"},
+                },
+            }
+        )[0]["content"]
+        assert "uperf-run-file.md" not in content
+        assert "read_skills" not in content
 
     def test_no_harness_directive_keeps_all_tools(self):
         agent = self._make_agent()

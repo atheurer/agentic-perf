@@ -271,10 +271,18 @@ model is configured via `agent_models.chat`.
 - **Grounding dedup:** `gathering_context` routes to `retrospective_pending`
   (not directly to `closed`) if a matching Investigation Record is found,
   so the retrospective agent can analyze the dedup-skipped ticket.
-  Dedup matches are subject to temporal confidence decay: records
-  older than 90 days are advisory only and do not block fresh
-  investigation. See the investigation methodology skills for
-  full temporal decay tiers.
+  Dedup matches are subject to temporal confidence decay
+  (enforced in code, not just prompt guidance):
+  - **< 30 days**: full confidence (1.0), normal dedup match
+  - **30–90 days**: reduced confidence (0.7), match proceeds
+    but `dedup_result.match_rationale` notes the age and
+    recommends re-investigation if context has changed
+  - **≥ 90 days**: advisory only — no dedup match. The ticket
+    gets a `dedup_advisory` field with the historical finding
+    as context, but proceeds to fresh investigation.
+  When multiple records match, the most recently updated
+  record is used. See the investigation methodology skills
+  for additional prompt-level temporal guidance.
 - **Abort:** From `awaiting_customer_guidance`, the user can jump directly to
   `awaiting_teardown` to skip remaining work.
 - **Execution plan re-benchmark:** `awaiting_review` can transition back to
@@ -1223,7 +1231,6 @@ skills/
     cdm-query-guide.md     # How to query the CommonDataModel for results
     kube-endpoints.md       # Kubernetes endpoint configuration
     run-file-pitfalls.md    # Common run-file mistakes and solutions
-    uperf-run-file.md       # Uperf-specific run-file guide
     userenv-guide.md        # User environment selection
   zathras/
     local-config-guide.md   # Local execution configuration

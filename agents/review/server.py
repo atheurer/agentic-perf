@@ -24,10 +24,14 @@ if _project_root not in sys.path:
 from fastmcp import FastMCP
 
 from agents.server_utils import (
+    build_crucible_context_gateway,
     build_repo_cache,
     build_skill_provider,
     build_ssh_from_ticket,
+    controller_context_gateway,
+    crucible_context_gateway,
     read_skill_documents,
+    ticket_controller_host,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,17 +44,19 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 _initialized = False
 _ssh = None
 _skill_provider = None
+_crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
 
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
-    global _initialized, _ssh, _skill_provider, _repo_cache, _ticket
+    global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
     _skill_provider = build_skill_provider()
+    _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = build_repo_cache()
     except Exception:
@@ -68,6 +74,81 @@ async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'crucible', 'filename': 'result-parsing.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
     return json.dumps(read_skill_documents(SKILLS_DIR, docs))
+
+
+@mcp.tool(name="get_crucible_benchmark_context")
+async def _get_crucible_benchmark_context_tool(
+    operation: str = "bootstrap",
+    path: str = "",
+    query: str = "",
+) -> str:
+    """Use generic context primitives for the designated Crucible controller."""
+    await _ensure_init()
+    if operation not in {"bootstrap", "read", "search"}:
+        return json.dumps(
+            {
+                "found": False,
+                "operation": operation,
+                "reason": "unsupported_operation",
+                "guidance": "Use bootstrap, read, or search.",
+            }
+        )
+    return await controller_context_gateway(
+        ssh=_ssh,
+        controller_host=ticket_controller_host(_ticket),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="review-agent",
+        phase="review",
+        operation=operation,
+        path=path,
+        query=query,
+        benchmark="",
+        include_alternates=False,
+    )
+
+
+async def _legacy_get_crucible_benchmark_context(
+    benchmark: str = "",
+    operation: str = "list",
+    namespace: str = "all",
+    path: str = "",
+    subject_area: str | list[str] = "all",
+    include_alternates: bool = False,
+    query: str = "",
+) -> str:
+    """Compatibility implementation for pre-gateway internal callers."""
+    await _ensure_init()
+    if operation in {"bootstrap", "list", "read", "search"}:
+        return await controller_context_gateway(
+            ssh=_ssh,
+            controller_host=ticket_controller_host(_ticket),
+            ticket_id=os.environ.get("TICKET_ID", ""),
+            agent_name="review-agent",
+            phase="review",
+            benchmark=benchmark,
+            operation=operation,
+            path=path,
+            query=query,
+            include_alternates=include_alternates,
+        )
+    return await crucible_context_gateway(
+        _crucible_context,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="review-agent",
+        phase="review",
+        benchmark=benchmark,
+        operation=operation,
+        namespace=namespace,
+        path=path,
+        subject_area=subject_area,
+        include_alternates=include_alternates,
+        query=query,
+    )
+
+
+async def get_crucible_benchmark_context(*args, **kwargs) -> str:
+    """Compatibility wrapper for direct in-process callers only."""
+    return await _legacy_get_crucible_benchmark_context(*args, **kwargs)
 
 
 @mcp.tool()

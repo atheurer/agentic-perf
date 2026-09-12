@@ -183,7 +183,7 @@ class TestResourceAgentPromptFragments:
 class TestProvisioningAgentPromptFragments:
     """Test that the provisioning agent loads real fragments."""
 
-    def test_cloud_fragment_loaded_for_aws(self):
+    def test_cloud_address_guidance_is_not_loaded_locally(self):
         from agents.provisioning.agent import ProvisioningAgent
 
         ticket = {
@@ -250,7 +250,7 @@ class TestBenchmarkAgentPromptFragments:
         agent = BenchmarkAgent.__new__(BenchmarkAgent)
         agent._repo_cache = None
         prompt = agent._system_prompt(ticket)
-        assert "Cloud Provider IP" in prompt
+        assert "Cloud Provider IP" not in prompt
 
     def test_kube_fragment_loaded(self):
         from agents.benchmark.agent import BenchmarkAgent

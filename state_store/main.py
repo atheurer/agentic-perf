@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from orchestrator.config import _load_config_file
+from paths import TRACE_DB_PATH, get_instance_name
 from providers.events import EventBus
+from providers.tracing import TraceContext, bind_trace_context, reset_trace_context
 
 from .api.router import api_router, chat_router, health_router, webhook_router
 from .audit import AuditLog, set_actor
@@ -24,6 +28,7 @@ from .ratelimit import (
     make_rate_limit_dependency,
 )
 from .store import TicketStore
+from .trace_store import TraceStore
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -72,6 +77,57 @@ def mount_routers(
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Agentic Perf State Store", version="0.1.0")
+    app.state.trace_store = TraceStore(TRACE_DB_PATH)
+    app.state.trace_instance_id = get_instance_name()
+    app.state.trace_health = {
+        "ingested": 0,
+        "ingestion_failures": 0,
+        "schema_rejections": 0,
+        "quarantined_frames": 0,
+    }
+
+    @app.middleware("http")
+    async def restore_trace_context(request: Request, call_next):
+        """Restore trusted transport correlation; request bodies never set it."""
+        traceparent = request.headers.get("traceparent", "").split("-")
+        try:
+            context = TraceContext(
+                ticket_id=request.headers.get("X-Agentic-Perf-Ticket-Id") or None,
+                agent_id=request.headers.get("X-Agentic-Perf-Agent-Id") or None,
+                invocation_id=request.headers.get("X-Agentic-Perf-Invocation-Id")
+                or None,
+                trace_id=traceparent[1],
+                action_id=request.headers.get("X-Agentic-Perf-Action-Id")
+                or traceparent[2],
+                parent_action_id=request.headers.get("X-Agentic-Perf-Parent-Action-Id")
+                or None,
+            )
+        except (IndexError, ValueError):
+            return await call_next(request)
+        token = bind_trace_context(context)
+        try:
+            return await call_next(request)
+        finally:
+            reset_trace_context(token)
+
+    @app.exception_handler(RequestValidationError)
+    async def count_trace_schema_rejections(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        if request.url.path.startswith("/api/v1/traces/events"):
+            app.state.trace_health["schema_rejections"] += 1
+        return await request_validation_exception_handler(request, exc)
+
+    @app.on_event("shutdown")
+    def close_trace_store() -> None:
+        # The adapters own separate connections and must close before the
+        # service's authoritative connection. ``getattr`` keeps early startup
+        # failures safe when router construction did not complete.
+        for name in ("event_bus", "audit_log"):
+            adapter = getattr(app.state, name, None)
+            if adapter is not None:
+                adapter.close()
+        app.state.trace_store.close()
 
     port = int(os.environ.get("STORE_PORT", "8090"))
     app.add_middleware(
@@ -192,12 +248,16 @@ def create_app() -> FastAPI:
     from providers.redaction import Redactor
 
     audit_redactor = Redactor()
+    # Compatibility adapters use independent SQLite connections to the same
+    # database, so API worker threads never interleave transactions on one
+    # connection while the TraceStore remains the sole persistence authority.
     audit_log = AuditLog(redactor=audit_redactor)
     app.state.audit_log = audit_log
     app.state.event_bus = EventBus(redactor=audit_redactor)
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,
+        trace_store=app.state.trace_store,
     )
     mount_routers(app, auth, rate_limit_dep)
 

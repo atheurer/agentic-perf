@@ -13,23 +13,13 @@ import time
 from typing import Any
 
 from agents.base import AgentAbortedError, HITLDriftError
-from paths import LOCK_FILE
+from agents.server_utils import build_skill_provider
+from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
-from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
-from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
-from providers.skills.clusterbuster import ClusterbusterSkillProvider
-from providers.skills.crucible import CrucibleSkillProvider
-from providers.skills.forge import ForgeSkillProvider
-from providers.skills.ioscale import IoscaleSkillProvider
-from providers.skills.k8s_netperf import K8sNetperfSkillProvider
-from providers.skills.kube_burner import KubeBurnerSkillProvider
-from providers.skills.multi import MultiHarnessSkillProvider
-from providers.skills.private import PrivateSkillProvider
 from providers.skills.repo_cache import RepoCache
-from providers.skills.vstorm import VstormSkillProvider
-from providers.skills.zathras import ZathrasSkillProvider
+from providers.tracing import bind_trace_context, reset_trace_context
 
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -669,6 +659,11 @@ async def run_agent_task(
         if agent is None:
             return
 
+        if getattr(agent, "trace_context", None) is None:
+            agent.trace_context = dispatcher._trace_contexts.get(ticket_id)
+        if hasattr(agent, "_trace"):
+            agent._trace.client = dispatcher._trace.client
+
         dispatcher.set_agent(ticket_id, agent)
 
         if config and hasattr(agent, "DEFAULT_GLOBAL_MAX_ITERATIONS"):
@@ -779,36 +774,48 @@ async def run_agent_task(
                 image_config=_load_config_file().get("jumpstarter_images", {}),
             )
 
-        if agent_task_timeout > 0:
-            try:
-                await asyncio.wait_for(
-                    agent.run(ticket_id),
-                    timeout=agent_task_timeout,
-                )
-                success = True
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
-                )
-                if dispatcher.events:
-                    dispatcher.events.emit(
-                        ticket_id,
-                        "orchestrator",
-                        "agent_error",
-                        {
-                            "reason": "agent_task_timeout",
-                            "timeout_seconds": agent_task_timeout,
-                        },
+        context_token = (
+            bind_trace_context(agent.trace_context)
+            if getattr(agent, "trace_context", None) is not None
+            else None
+        )
+        try:
+            if agent_task_timeout > 0:
+                try:
+                    await asyncio.wait_for(
+                        agent.run(ticket_id), timeout=agent_task_timeout
                     )
-                await _transition_to_guidance(
-                    dispatcher.store_url,
-                    ticket_id,
-                    f"Agent task timed out after {agent_task_timeout}s",
-                    event_bus=dispatcher.events,
-                )
-        else:
-            await agent.run(ticket_id)
-            success = True
+                    success = True
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
+                    )
+                    # The timeout is an observed orchestration outcome even if the
+                    # follow-up state transition cannot reach the state store.
+                    # Record it first so the audit trail does not depend on that
+                    # separate network operation succeeding.
+                    if dispatcher.events:
+                        dispatcher.events.emit(
+                            ticket_id,
+                            "orchestrator",
+                            "agent_error",
+                            {
+                                "reason": "agent_task_timeout",
+                                "timeout_seconds": agent_task_timeout,
+                            },
+                        )
+                    await _transition_to_guidance(
+                        dispatcher.store_url,
+                        ticket_id,
+                        f"Agent task timed out after {agent_task_timeout}s",
+                        event_bus=dispatcher.events,
+                    )
+            else:
+                await agent.run(ticket_id)
+                success = True
+        finally:
+            if context_token is not None:
+                reset_trace_context(context_token)
 
         if config:
             try:
@@ -1422,30 +1429,23 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
     repo_cache = RepoCache()
     for name, url in config.harness_repos.items():
+        # Crucible is never cloned or refreshed by agentic-perf. Its source
+        # must already exist locally or on the designated controller.
+        if name == "crucible":
+            continue
         try:
             repo_cache.ensure_repo(name, url)
         except Exception:
             logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
-    harnesses = {"crucible": CrucibleSkillProvider(config.crucible_home)}
-    if config.zathras_home:
-        harnesses["zathras"] = ZathrasSkillProvider(config.zathras_home)
-    else:
-        private = PrivateSkillProvider()
-        zathras_tests = private._load_config("zathras").get("tests")
-        if zathras_tests:
-            logger.info("No zathras_home set — using private-skills benchmark catalog")
-            harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
-    harnesses["kube-burner"] = KubeBurnerSkillProvider()
-    harnesses["k8s-netperf"] = K8sNetperfSkillProvider()
-    harnesses["benchmark-runner"] = BenchmarkRunnerSkillProvider()
-    harnesses["clusterbuster"] = ClusterbusterSkillProvider()
-    harnesses["vstorm"] = VstormSkillProvider()
-    harnesses["ioscale"] = IoscaleSkillProvider()
-    harnesses["forge"] = ForgeSkillProvider()
-    harnesses["arcaflow-plugins"] = ArcaflowPluginSkillProvider()
-    skills = MultiHarnessSkillProvider(
-        harnesses, PrivateSkillProvider(), default_harness="crucible"
+    skills = build_skill_provider(
+        crucible_home=config.crucible_home,
+        repo_cache=repo_cache,
+        source_repo=config.raw.get("crucible_source_repo"),
+        source_url=config.harness_repos.get("crucible"),
+        zathras_home=config.zathras_home,
+        resolve_source=False,
+        catalog_only=True,
     )
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
@@ -1566,8 +1566,24 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     status_names = list(STATUS_AGENT_MAP)
     status_offset = 0
     was_at_capacity = False
+    last_trace_sweep = 0.0
+    trace_sweep_task: asyncio.Task | None = None
 
     while True:
+        if time.monotonic() - last_trace_sweep >= 60.0 and (
+            trace_sweep_task is None or trace_sweep_task.done()
+        ):
+            if trace_sweep_task is not None:
+                try:
+                    trace_sweep_task.result()
+                except Exception:
+                    logger.exception("Trace spool sweep failed")
+            # Network delivery may wait through an outage; never block ticket
+            # dispatch on orphan recovery.
+            trace_sweep_task = asyncio.create_task(
+                asyncio.to_thread(_sweep_trace_spools)
+            )
+            last_trace_sweep = time.monotonic()
         # Check system-wide budget before dispatching
         if system_budget is not None and events is not None:
             from providers.budget import (
@@ -1898,6 +1914,28 @@ def _auth_headers() -> dict[str, str]:
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
+
+
+def _sweep_trace_spools() -> None:
+    """Best-effort restart recovery for orphaned MCP producer spools."""
+    from providers.tracing import TraceClient, TraceDeliveryError
+
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if not token:
+        return
+    url, _ = resolve_state_store()
+    client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)
+    try:
+        count = client.sweep_abandoned()
+        if count:
+            logger.info("Drained %d abandoned trace spool event(s)", count)
+    except TraceDeliveryError:
+        logger.warning("Trace spool sweep deferred: state store unavailable")
+    finally:
+        try:
+            client.close()
+        except TraceDeliveryError:
+            pass
 
 
 def main():

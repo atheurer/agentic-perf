@@ -3,10 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from agents.server_utils import tool_progress
+from providers.execution import AuditedSubprocessRunner
+from providers.ssh import SSHExecutor
+from providers.tracing import (
+    TraceClient,
+    TraceContext,
+    current_trace_context,
+    new_trace_context,
+)
 
 from .base import ResourceProvider
 
@@ -35,6 +45,8 @@ class AWSResourceProvider(ResourceProvider):
         session_token: str | None = None,
         root_volume_gb: int = 50,
         instance_name: str | None = None,
+        trace_context: TraceContext | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self._region = region
         self._access_key_id = access_key_id
@@ -52,6 +64,39 @@ class AWSResourceProvider(ResourceProvider):
         self._default_root_volume_gb = root_volume_gb
         self._instance_name = instance_name
         self._ec2_client = None
+        self._trace_context = trace_context
+        self._trace_recorder = trace_recorder
+
+    @asynccontextmanager
+    async def _ssh_executor(self, user: str):
+        """Build ticket-scoped SSH with a recorder owned for this provider call."""
+        context = self._trace_context or current_trace_context()
+        if context is None and (ticket_id := os.environ.get("TICKET_ID")):
+            context = new_trace_context(
+                ticket_id=ticket_id,
+                agent_id=os.environ.get("AGENT_NAME"),
+            )
+
+        recorder = self._trace_recorder
+        owned_recorder = False
+        if recorder is None and context is not None and context.ticket_id:
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            if not token:
+                raise RuntimeError("AWS SSH requires durable trace authentication")
+            recorder = TraceClient(
+                os.environ.get("STATE_STORE_URL", "http://localhost:8090"), token
+            )
+            owned_recorder = True
+        try:
+            yield SSHExecutor(
+                user=user,
+                key_path=self._ssh_key_path,
+                trace_context=context,
+                trace_recorder=recorder,
+            )
+        finally:
+            if owned_recorder:
+                recorder.close()
 
     @classmethod
     async def from_secrets(
@@ -577,38 +622,24 @@ class AWSResourceProvider(ResourceProvider):
             f"Waiting for SSH connectivity on {len(hosts)} hosts...",
             "setup_ssh",
         )
-        for host in hosts:
-            for attempt in range(retries):
-                proc = await asyncio.create_subprocess_exec(
-                    "ssh",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-i",
-                    self._ssh_key_path,
-                    f"{self._ssh_user}@{host}",
-                    "echo SSH_OK",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and b"SSH_OK" in stdout:
-                    logger.info(f"[aws-provider] SSH ready on {host}")
-                    await tool_progress(
-                        f"SSH ready on {host}",
-                        "setup_ssh",
+        async with self._ssh_executor(self._ssh_user) as ssh:
+            for host in hosts:
+                for attempt in range(retries):
+                    result = await ssh.run(host, "echo SSH_OK", timeout=5)
+                    if result.exit_code == 0 and "SSH_OK" in result.stdout:
+                        logger.info(f"[aws-provider] SSH ready on {host}")
+                        await tool_progress(
+                            f"SSH ready on {host}",
+                            "setup_ssh",
+                        )
+                        break
+                    if attempt < retries - 1:
+                        await asyncio.sleep(interval)
+                else:
+                    logger.warning(
+                        f"[aws-provider] SSH not ready on {host} after "
+                        f"{retries * interval}s"
                     )
-                    break
-                if attempt < retries - 1:
-                    await asyncio.sleep(interval)
-            else:
-                logger.warning(
-                    f"[aws-provider] SSH not ready on {host} after "
-                    f"{retries * interval}s"
-                )
 
     async def get_reservation_status(
         self, reservation_id: str, provider_metadata: dict[str, Any] | None = None
@@ -747,15 +778,15 @@ class AWSResourceProvider(ResourceProvider):
             return pubkey_path.read_text().strip()
 
         # Derive public key from private key
-        proc = await asyncio.create_subprocess_exec(
-            "ssh-keygen",
-            "-y",
-            "-f",
-            self._ssh_key_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await AuditedSubprocessRunner().run(
+            [
+                "ssh-keygen",
+                "-y",
+                "-f",
+                self._ssh_key_path,
+            ],
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = proc.stdout, proc.stderr
         if proc.returncode != 0:
             raise RuntimeError(
                 f"Failed to derive public key: {stderr.decode().strip()}"
@@ -786,51 +817,24 @@ class AWSResourceProvider(ResourceProvider):
             "sudo mkdir -p /etc/containers",
             "echo '[engine]\ncgroup_manager = \"cgroupfs\"' | sudo tee /etc/containers/containers.conf > /dev/null",
         ]
-        for cmd in bootstrap_cmds:
-            proc = await asyncio.create_subprocess_exec(
-                "ssh",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-i",
-                self._ssh_key_path,
-                f"{self._ssh_user}@{host}",
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"Bootstrap cmd failed (exit {proc.returncode}): {cmd} — "
-                    f"{stderr.decode().strip()}"
-                )
+        async with self._ssh_executor(self._ssh_user) as bootstrap_ssh:
+            for cmd in bootstrap_cmds:
+                result = await bootstrap_ssh.run(host, cmd, timeout=10, mutating=True)
+                if result.exit_code != 0:
+                    raise RuntimeError(
+                        f"Bootstrap cmd failed (exit {result.exit_code}): {cmd} — "
+                        f"{result.stderr.strip()}"
+                    )
 
-        # Give sshd time to restart fully
-        await asyncio.sleep(5)
+            # Give sshd time to restart fully.
+            await asyncio.sleep(5)
 
-        # Verify root SSH works
-        proc = await asyncio.create_subprocess_exec(
-            "ssh",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-i",
-            self._ssh_key_path,
-            f"root@{host}",
-            "echo ROOT_OK",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0 or b"ROOT_OK" not in stdout:
-            raise RuntimeError("Root SSH verification failed after bootstrap")
+        # Use a separate child action so root verification records its own
+        # credential target while retaining the same ticket ancestor.
+        async with self._ssh_executor("root") as root_ssh:
+            result = await root_ssh.run(host, "echo ROOT_OK", timeout=10)
+            if result.exit_code != 0 or "ROOT_OK" not in result.stdout:
+                raise RuntimeError("Root SSH verification failed after bootstrap")
         logger.info(f"[aws-provider] Root SSH enabled on {host}")
         await tool_progress(f"Root SSH verified on {host}", "setup_ssh")
 

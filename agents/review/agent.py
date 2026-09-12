@@ -215,6 +215,10 @@ class ReviewAgent(AgentBase):
         # Block auto-submit only when the ticket
         # explicitly requests interactive review.
         ticket = await self._get_ticket(ticket_id)
+
+        # Pre-fetch artifact paths for referenced tickets
+        # so _build_messages can include them in context.
+        await self._resolve_referenced_artifacts(ticket)
         directives = ticket.get("custom_fields", {}).get("directives", {})
         if directives.get("review_mode") == "interactive":
             self._user_approved_submit = False
@@ -224,13 +228,27 @@ class ReviewAgent(AgentBase):
         eval_server = str(Path(__file__).parent.parent / "evaluate" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             review_server,
             name="review",
-            env={"TICKET_ID": ticket_id, "STATE_STORE_URL": self.store_url},
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
-        await mcp.connect(infra_server, name="infra")
-        await mcp.connect(eval_server, name="evaluate-tools")
+        await mcp.connect_ticket_server(
+            infra_server,
+            name="infra",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
+        await mcp.connect_ticket_server(
+            eval_server,
+            name="evaluate-tools",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Connect any configured external MCP servers
         # (e.g., historical baselines for comparison).
@@ -452,7 +470,9 @@ class ReviewAgent(AgentBase):
                     content += f"- `{f.name}`\n"
                 content += "\nUse `read_skills(docs=[{'harness': 'general', 'filename': '...'}])` to read.\n"
 
-        if self._repo_cache:
+        # Crucible documentation is served by the source-aware gateway; the
+        # legacy cache remains for other harnesses during migration.
+        if self._repo_cache and harness != "crucible":
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"
@@ -465,6 +485,23 @@ class ReviewAgent(AgentBase):
             content += "\n## Previous Comments\n"
             for comment in user_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
+
+        # Cross-ticket artifact resolution: include
+        # pre-fetched output_dirs for referenced tickets.
+        refs = getattr(self, "_referenced_artifacts", {})
+        if refs:
+            content += "\n## Referenced Ticket Artifacts\n"
+            for rid, rinfo in refs.items():
+                rdir = rinfo.get("output_dir", "")
+                rrun = rinfo.get("run_id", "")
+                if rdir:
+                    content += (
+                        f"\n**{rid}:**\n"
+                        f"- output_dir: `{rdir}`\n"
+                        f"- run_id: `{rrun}`\n"
+                        f"Use `read_benchmark_artifact` "
+                        f"with this output_dir.\n"
+                    )
 
         return [{"role": "user", "content": content}]
 

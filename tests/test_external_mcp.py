@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -162,3 +163,54 @@ def test_connect_delegates_to_connect_command():
 
     source = inspect.getsource(AgentMCPClient.connect)
     assert "connect_command" in source
+
+
+@pytest.mark.asyncio
+async def test_ticket_server_connection_injects_required_context():
+    client = AgentMCPClient()
+    client.connect = AsyncMock()
+
+    await client.connect_ticket_server(
+        "/project/agents/triage/server.py",
+        name="triage",
+        ticket_id="PERF-12345678",
+        state_store_url="http://state-store:8090",
+        agent_name="triage-agent",
+    )
+
+    client.connect.assert_awaited_once_with(
+        "/project/agents/triage/server.py",
+        name="triage",
+        env={
+            "TICKET_ID": "PERF-12345678",
+            "STATE_STORE_URL": "http://state-store:8090",
+            "AGENT_NAME": "triage-agent",
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ticket_id", "state_store_url", "agent_name", "missing"),
+    [
+        ("", "http://state-store:8090", "triage-agent", "TICKET_ID"),
+        ("PERF-12345678", "", "triage-agent", "STATE_STORE_URL"),
+        ("PERF-12345678", "http://state-store:8090", "", "AGENT_NAME"),
+    ],
+)
+async def test_ticket_server_connection_rejects_missing_context(
+    ticket_id, state_store_url, agent_name, missing
+):
+    client = AgentMCPClient()
+    client.connect = AsyncMock()
+
+    with pytest.raises(ValueError, match=missing):
+        await client.connect_ticket_server(
+            "/project/agents/triage/server.py",
+            name="triage",
+            ticket_id=ticket_id,
+            state_store_url=state_store_url,
+            agent_name=agent_name,
+        )
+
+    client.connect.assert_not_awaited()

@@ -585,3 +585,220 @@ class TestDeterministicDedup:
             "platform": "nxp-s32g-vnp-rdb3",
         }
         assert key_a["platform"] != key_b["platform"]
+
+
+class TestDedupTemporalDecay:
+    """Test temporal confidence decay in deterministic dedup."""
+
+    def _make_agent(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        agent = MagicMock()
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        # Bind the real method
+        from agents.gathering_context.agent import (
+            GatheringContextAgent,
+        )
+
+        agent._deterministic_dedup = GatheringContextAgent._deterministic_dedup.__get__(
+            agent,
+        )
+        return agent
+
+    def _make_record(self, age_days):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+
+        record = MagicMock()
+        record.investigation_id = f"RCA-AGE{age_days}"
+        ts = datetime.now(timezone.utc) - timedelta(days=age_days)
+        record.created_at = ts
+        record.updated_at = ts
+        return record
+
+    def _make_ticket(self):
+        return {
+            "custom_fields": {
+                "dedup_key": {
+                    "metric": "CoV - BOOT2 - Kernel Duration",
+                    "platform": "qc8775",
+                },
+                "anomaly_context": {"source": "horreum"},
+                "run_metadata": {"build": "nightly-2026-09-08"},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_recent_record_full_match(self):
+        """Records < 30 days old get full confidence match."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=5)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST1", self._make_ticket())
+
+        assert result is True
+        # Check confidence was 1.0
+        update_call = agent._update_fields.call_args_list[0]
+        dedup_result = update_call[0][1]["dedup_result"]
+        assert dedup_result["match_confidence"] == 1.0
+        assert dedup_result["record_age_days"] == 5
+
+    @pytest.mark.asyncio
+    async def test_aging_record_reduced_confidence(self):
+        """Records 30-90 days old get reduced confidence."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=60)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST2", self._make_ticket())
+
+        assert result is True
+        update_call = agent._update_fields.call_args_list[0]
+        dedup_result = update_call[0][1]["dedup_result"]
+        assert dedup_result["match_confidence"] == 0.7
+        assert dedup_result["record_age_days"] == 60
+        assert "re-investigation" in dedup_result["match_rationale"]
+
+    @pytest.mark.asyncio
+    async def test_stale_record_advisory_only(self):
+        """Records > 90 days old are advisory — no match."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=120)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST3", self._make_ticket())
+
+        # Should NOT match — returns False
+        assert result is False
+        # Should save advisory context
+        update_call = agent._update_fields.call_args_list[0]
+        advisory = update_call[0][1]["dedup_advisory"]
+        assert advisory["age_days"] == 120
+        assert "RCA-AGE120" in advisory["matched_investigation_id"]
+        # Should NOT transition
+        agent._transition_ticket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_boundary_30_days(self):
+        """Exactly 30 days gets reduced confidence."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=30)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST4", self._make_ticket())
+
+        assert result is True
+        update_call = agent._update_fields.call_args_list[0]
+        dedup_result = update_call[0][1]["dedup_result"]
+        assert dedup_result["match_confidence"] == 0.7
+
+    @pytest.mark.asyncio
+    async def test_boundary_90_days(self):
+        """Exactly 90 days is advisory only."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=90)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST5", self._make_ticket())
+
+        assert result is False
+        agent._transition_ticket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_picks_newest_record(self):
+        """When multiple records match, picks the most recent."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        old_record = self._make_record(age_days=120)  # advisory
+        new_record = self._make_record(age_days=10)  # full match
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[old_record, new_record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST6", self._make_ticket())
+
+        # Should match the newer record, not the stale one
+        assert result is True
+        update_call = agent._update_fields.call_args_list[0]
+        dedup_result = update_call[0][1]["dedup_result"]
+        assert dedup_result["match_confidence"] == 1.0
+        assert "RCA-AGE10" in dedup_result["matched_investigation_id"]
+
+    @pytest.mark.asyncio
+    async def test_record_without_timestamp_treated_as_fresh(self):
+        """Records missing timestamps are treated as fresh."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        agent = self._make_agent()
+        record = MagicMock()
+        record.investigation_id = "RCA-NODATE"
+        record.created_at = None
+        record.updated_at = None
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST7", self._make_ticket())
+
+        # No timestamp → age 0 → full confidence
+        assert result is True
+        update_call = agent._update_fields.call_args_list[0]
+        dedup_result = update_call[0][1]["dedup_result"]
+        assert dedup_result["match_confidence"] == 1.0

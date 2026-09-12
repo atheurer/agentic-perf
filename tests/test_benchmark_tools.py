@@ -57,12 +57,8 @@ def handlers(mock_provider):
 @pytest.mark.asyncio
 async def test_get_execution_config_crucible(handlers):
     result = await handlers["get_execution_config"](harness_name="crucible")
-    assert result["found"] is True
-    assert result["harness"] == "crucible"
-    assert result["run_command"] == "crucible run"
-    assert result["run_file_format"] == "json"
-    assert result["userenv_discovery"]["required"] is True
-    assert result["userenv_discovery"]["command"] == "crucible userenvs list"
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -109,6 +105,7 @@ async def test_validate_benchmark_validates_on_controller_without_execution(hand
     assert any("crucible validate" in command for command in commands)
     assert not any("crucible run" in command for command in commands)
     assert not any("opensearch" in command for command in commands)
+    assert result["validation_id"].startswith("val-")
 
 
 @pytest.mark.asyncio
@@ -195,7 +192,7 @@ async def _make_crucible_ssh(
             stdout=f"run directory: {RUN_DIR}\n" + (run_stdout or ""),
         )
 
-    async def _copy_to(host, local_path, remote_path, timeout=60):
+    async def _copy_to(host, local_path, remote_path, timeout=60, mutating=False):
         return _FakeSSHResult(exit_code=0)
 
     class _Mock:
@@ -239,7 +236,13 @@ async def test_crucible_missing_result_summary_marks_failed():
 
     result = await h["execute_benchmark"](
         controller="test-host",
-        run_file={"benchmarks": []},
+        validation_id=(
+            await h["validate_benchmark"](
+                controller="test-host",
+                run_file={"benchmarks": []},
+                harness="crucible",
+            )
+        )["validation_id"],
         harness="crucible",
         run_command="crucible run",
     )
@@ -262,7 +265,13 @@ async def test_crucible_with_result_summary_marks_completed():
 
     result = await h["execute_benchmark"](
         controller="test-host",
-        run_file={"benchmarks": []},
+        validation_id=(
+            await h["validate_benchmark"](
+                controller="test-host",
+                run_file={"benchmarks": []},
+                harness="crucible",
+            )
+        )["validation_id"],
         harness="crucible",
         run_command="crucible run",
     )
@@ -360,11 +369,8 @@ async def test_get_tool_params_found():
     )
     h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
     res = await h["get_tool_params"](tool="sysstat", harness="crucible")
-    assert res["found"] is True
-    assert res["tool"] == "sysstat"
-    assert res["harness"] == "crucible"
-    assert res["params"]["presets"]["defaults"]["interval"] == "3"
-    assert res["metadata"]["description"] == "Wrapper for sar, mpstat, iostat, pidstat"
+    assert res["found"] is False
+    assert "controller-sourced context" in res["message"]
 
 
 @pytest.mark.asyncio
@@ -373,4 +379,4 @@ async def test_get_tool_params_not_found():
     h = make_benchmark_handlers(ssh=MockSSHExecutor(), skill_provider=provider)
     res = await h["get_tool_params"](tool="nonexistent_tool", harness="crucible")
     assert res["found"] is False
-    assert "No parameter definitions or metadata" in res["message"]
+    assert "controller-sourced context" in res["message"]

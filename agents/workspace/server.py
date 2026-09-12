@@ -1,7 +1,8 @@
 """FastMCP server for ticket workspace scratchpad tools.
 
-Exposes generic data inspection primitives (jq_query, grep_file, read_file_slice,
-list_workspace_files) over stdio. The ticket workspace directory is resolved
+Exposes generic data inspection primitives (jq_file_from_workspace,
+grep_file_from_workspace, read_file_from_workspace,
+list_files_from_workspace) over stdio. The ticket workspace directory is resolved
 using TICKET_ID from the environment.
 
 Run directly:  python agents/workspace/server.py
@@ -36,15 +37,20 @@ def _get_manager() -> WorkspaceManager:
     if _manager is None:
         ticket_id = os.environ.get("TICKET_ID", "")
         ws_dir_env = os.environ.get("WORKSPACE_DIR")
-        _manager = WorkspaceManager(ticket_id=ticket_id, workspace_dir=ws_dir_env)
+        _manager = WorkspaceManager(
+            ticket_id=ticket_id,
+            workspace_dir=ws_dir_env,
+            agent_name=os.environ.get("AGENT_NAME", "workspace-agent"),
+        )
     return _manager
 
 
 @mcp.tool()
-async def jq_query(
+async def jq_file_from_workspace(
     file_ref: str,
     filter: str,
     limit: int = 50,
+    include_alternates: bool = False,
 ) -> str:
     """Execute a jq filter expression on a structured JSON workspace file.
 
@@ -54,17 +60,20 @@ async def jq_query(
         limit: max list items to return in result (default 50)
     """
     manager = _get_manager()
-    res = manager.jq_query(file_ref, filter, limit=limit)
+    res = manager.jq_query(
+        file_ref, filter, limit=limit, include_alternates=include_alternates
+    )
     return json.dumps(res, indent=2)
 
 
 @mcp.tool()
-async def grep_file(
+async def grep_file_from_workspace(
     file_ref: str,
     pattern: str,
     max_lines: int = 50,
     context_lines: int = 0,
     case_insensitive: bool = True,
+    include_alternates: bool = False,
 ) -> str:
     """Search for string or regex pattern in a workspace text file.
 
@@ -82,17 +91,19 @@ async def grep_file(
         max_lines=max_lines,
         context_lines=context_lines,
         case_insensitive=case_insensitive,
+        include_alternates=include_alternates,
     )
     return json.dumps(res, indent=2)
 
 
 @mcp.tool()
-async def read_file_slice(
+async def read_file_from_workspace(
     file_ref: str,
     offset_bytes: int = 0,
     max_bytes: int = 4096,
     start_line: int = 1,
     max_lines: int = 50,
+    include_alternates: bool = False,
 ) -> str:
     """Read a slice/chunk of a workspace file by lines or bytes.
 
@@ -110,16 +121,63 @@ async def read_file_slice(
         max_bytes=max_bytes,
         start_line=start_line,
         max_lines=max_lines,
+        include_alternates=include_alternates,
     )
     return json.dumps(res, indent=2)
 
 
 @mcp.tool()
-async def list_workspace_files() -> str:
+async def list_files_from_workspace() -> str:
     """List all files in the current ticket's scratchpad workspace."""
     manager = _get_manager()
-    files = manager.list_files()
+    files = manager.list_files(include_alternates=False)
     return json.dumps({"status": "ok", "files": files, "count": len(files)}, indent=2)
+
+
+@mcp.tool()
+async def read_document_from_workspace(
+    ref: str,
+    include_alternates: bool = False,
+    max_bytes: int = 262144,
+) -> str:
+    """Read an exact context document previously inventoried into the workspace.
+
+    Pass a logical ref or URI returned by the context gateway. The effective
+    phase source is used by default; alternate sources require explicit opt-in.
+    """
+    manager = _get_manager()
+    return json.dumps(
+        manager.read_document(
+            ref, include_alternates=include_alternates, max_bytes=max_bytes
+        ),
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def search_documents_from_workspace(
+    query: str,
+    namespace: str = "",
+    include_alternates: bool = False,
+    case_insensitive: bool = True,
+    max_results: int = 50,
+) -> str:
+    """Search workspace-backed context document paths and contents.
+
+    Searches the current phase-effective snapshot by default. Set namespace to
+    a logical prefix such as ``benchmark/perftest`` or ``core`` to narrow it.
+    """
+    manager = _get_manager()
+    return json.dumps(
+        manager.search_documents(
+            query,
+            namespace=namespace,
+            include_alternates=include_alternates,
+            case_insensitive=case_insensitive,
+            max_results=max_results,
+        ),
+        indent=2,
+    )
 
 
 @mcp.tool()
