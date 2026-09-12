@@ -53,9 +53,10 @@ class WorkspaceManager:
         self.audience = self._audience_for_agent(self.agent_name)
         if workspace_dir is not None:
             self.workspace_dir = Path(workspace_dir).resolve()
-            self.workspace_dir.mkdir(parents=True, exist_ok=True)
         else:
-            self.workspace_dir = get_ticket_workspace_dir(self.ticket_id).resolve()
+            self.workspace_dir = get_ticket_workspace_dir(
+                self.ticket_id, create=False
+            ).resolve()
         emitter = audit_emit or (
             durable_filesystem_emitter() if self.ticket_id else None
         )

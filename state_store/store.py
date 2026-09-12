@@ -80,7 +80,6 @@ class TicketStore:
                 self._persist_dir.parent,
                 "ticket",
                 physical_prefix=self._persist_dir.name,
-                logical_prefix="active",
             ),
             ticket_id=ticket_id,
             emit=emit,
@@ -548,14 +547,6 @@ class TicketStore:
         filesystem.mkdir("archive/tickets")
         archived = []
 
-        ticket_path = self._persist_dir / f"{ticket_id}.json"
-        if ticket_path.exists():
-            filesystem.rename(
-                f"{self._persist_dir.name}/{ticket_id}.json",
-                f"archive/tickets/{ticket_id}.json",
-            )
-            archived.append(f"ticket://archive/tickets/{ticket_id}.json")
-
         from paths import LOG_DIR
 
         log_path = LOG_DIR / f"{ticket_id}.jsonl"
@@ -577,6 +568,16 @@ class TicketStore:
                 f"logs/{ticket_id}.jsonl", f"archive/logs/{ticket_id}.jsonl"
             )
             archived.append(f"ticket://archive/logs/{ticket_id}.jsonl")
+
+        # Move the durable ticket record last.  If an earlier companion move
+        # fails, restart still loads the ticket and can safely retry archive.
+        ticket_path = self._persist_dir / f"{ticket_id}.json"
+        if ticket_path.exists():
+            filesystem.rename(
+                f"{self._persist_dir.name}/{ticket_id}.json",
+                f"archive/tickets/{ticket_id}.json",
+            )
+            archived.insert(0, f"ticket://archive/tickets/{ticket_id}.json")
 
         # Keep the closed ticket reachable if any durable move fails.  This is
         # intentionally after both moves, so a primary archive failure is not

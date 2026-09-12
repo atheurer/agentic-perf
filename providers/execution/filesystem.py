@@ -89,7 +89,9 @@ class RootedPath:
             (
                 f"redacted-{hashlib.sha256(part.encode()).hexdigest()[:16]}"
                 if re.search(
-                    r"(?:secret|token|password|credential|private.?key)", part, re.I
+                    r"(?:secret|token|password|credential|private.?key|id_rsa|id_ed25519|\.pem$|\.key$|\.env$)",
+                    part,
+                    re.I,
                 )
                 else part
             )
@@ -132,6 +134,17 @@ class AuditedFilesystem:
             "digest": hashlib.sha256(data).hexdigest(),
             "digest_kind": "sha256",
         }
+
+    @staticmethod
+    def _sensitive_name(relative: str | Path) -> bool:
+        return any(
+            re.search(
+                r"(?:secret|token|password|credential|private.?key|id_rsa|id_ed25519|\.pem$|\.key$|\.env$)",
+                part,
+                re.I,
+            )
+            for part in Path(str(relative)).parts
+        )
 
     @staticmethod
     def _error(exc: BaseException) -> tuple[ErrorDescriptor, str]:
@@ -296,7 +309,12 @@ class AuditedFilesystem:
         path, logical = self.root.resolve(relative)
         data = content if isinstance(content, bytes) else content.encode(encoding)
         operation = "replace" if path.exists() else "create"
-        attributes = self._descriptor(data) | {
+        descriptor = (
+            {"size_bytes": len(data), "sensitive": True}
+            if self._sensitive_name(relative)
+            else self._descriptor(data)
+        )
+        attributes = descriptor | {
             "mode": oct(mode),
             "atomic": atomic,
             "write_kind": operation,
