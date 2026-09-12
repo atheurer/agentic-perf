@@ -48,12 +48,12 @@ def ticket(store):
 
 
 def _read_entries(audit_path):
-    if not audit_path.exists():
-        return []
-    entries = []
-    for line in audit_path.read_text().strip().splitlines():
-        entries.append(json.loads(line))
-    return entries
+    """Read the public compatibility projection, never its old backing file."""
+    log = AuditLog(path=audit_path)
+    try:
+        return log.read(limit=10_000)
+    finally:
+        log.close()
 
 
 class TestTransitionAudit:

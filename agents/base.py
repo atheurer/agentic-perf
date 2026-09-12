@@ -264,38 +264,27 @@ class AgentBase(ABC):
         the per-agent budget each fleet iteration so agents
         don't exhaust their budget across the full fleet.
         """
-        import json
+        from providers.events import EventBus
 
-        log_dir = self._events._log_dir if self._events else None
-        if not log_dir:
-            from paths import LOG_DIR
-
-            log_dir = LOG_DIR
-        path = log_dir / f"{ticket_id}.jsonl"
-        if not path.exists():
-            return 0, 0
+        events = self._events or EventBus()
         agent_iters = 0
         global_iters = 0
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                        if evt.get("event_type") == "fleet_iteration_epoch":
-                            # Reset counts — new fleet iteration
-                            agent_iters = 0
-                            global_iters = 0
-                        elif evt.get("event_type") == "llm_request":
-                            global_iters += 1
-                            if evt.get("agent") == self.agent_name:
-                                agent_iters += 1
-                    except Exception:
-                        continue
+            for evt in events.get_events(ticket_id, since=0, limit=100_000):
+                if evt.get("event_type") == "fleet_iteration_epoch":
+                    agent_iters = 0
+                    global_iters = 0
+                elif evt.get("event_type") == "llm_request":
+                    global_iters += 1
+                    if evt.get("agent") == self.agent_name:
+                        agent_iters += 1
         except Exception as e:
-            logger.warning(f"Failed to read previous iteration counts from {path}: {e}")
+            logger.warning(
+                "Failed to read previous iteration counts for %s: %s", ticket_id, e
+            )
+        finally:
+            if self._events is None:
+                events.close()
         return agent_iters, global_iters
 
     def _emit(

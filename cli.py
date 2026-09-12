@@ -187,23 +187,13 @@ EVENT_ICONS = {
 
 
 def _read_events(ticket_id, last_seq):
-    from paths import LOG_DIR
+    from providers.events import EventBus
 
-    log_path = LOG_DIR / f"{ticket_id}.jsonl"
-    if not log_path.exists():
-        return [], last_seq
-    events = []
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if evt.get("seq", 0) > last_seq:
-                events.append(evt)
+    bus = EventBus()
+    try:
+        events = bus.get_events(ticket_id, since=last_seq, limit=100_000)
+    finally:
+        bus.close()
     new_seq = events[-1]["seq"] if events else last_seq
     return events, new_seq
 
@@ -851,22 +841,13 @@ def cmd_cleanup(args):
 
 
 def _read_all_events(ticket_id):
-    from paths import LOG_DIR
+    from providers.events import EventBus
 
-    log_path = LOG_DIR / f"{ticket_id}.jsonl"
-    if not log_path.exists():
-        return []
-    events = []
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
+    bus = EventBus()
+    try:
+        return bus.get_events(ticket_id, since=0, limit=100_000)
+    finally:
+        bus.close()
 
 
 def _ts_short(ts):
@@ -1034,7 +1015,7 @@ def cmd_transcript(args):
     events = _read_all_events(args.ticket_id)
     if not events:
         print(f"No event log found for {args.ticket_id}")
-        print(f"  (looking in ~/.agentic-perf/logs/{args.ticket_id}.jsonl)")
+        print(f"  (reading the trace-backed event projection for {args.ticket_id})")
         return
 
     if args.json:
