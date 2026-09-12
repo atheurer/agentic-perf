@@ -142,11 +142,11 @@ async def _provision_jumpstarter(
             flash_url = flash_command.replace("j storage flash ", "").strip()
 
     ssh_public_key = flash_info.get("ssh_public_key", "")
-    ssh_key_path = flash_info.get("ssh_key_path", "")
+    ssh_key_path = flash_info.get("ssh_key_path", "") or cf.get("ssh_key_path", "")
 
     # Derive public key from private key path if not
     # explicitly provided — the resource agent sets
-    # ssh_key_path but not ssh_public_key.
+    # ssh_key_path at the ticket level, not in flash_info.
     if not ssh_public_key and ssh_key_path:
         pub_path = (
             Path(ssh_key_path)
