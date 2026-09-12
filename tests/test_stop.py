@@ -6,6 +6,7 @@ abort drift guard, dispatcher stop_agent.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -800,15 +801,19 @@ class TestAdvancePlanAbortGuard:
             },
         }
         mock_client = MagicMock()
-        mock_client.get.return_value = mock_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-
-        with patch("httpx.Client", return_value=mock_client):
-            _advance_plan(
-                "http://localhost:8090",
-                "PERF-TEST",
-                "executing_benchmark",
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.patch = AsyncMock()
+        mock_client.post = AsyncMock()
+        wrapper = MagicMock()
+        wrapper.__aenter__ = AsyncMock(return_value=mock_client)
+        wrapper.__aexit__ = AsyncMock(return_value=None)
+        with patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=wrapper):
+            asyncio.run(
+                _advance_plan(
+                    "http://localhost:8090",
+                    "PERF-TEST",
+                    "executing_benchmark",
+                )
             )
 
         mock_client.patch.assert_not_called()

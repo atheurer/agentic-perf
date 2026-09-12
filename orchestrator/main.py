@@ -4,7 +4,6 @@ import asyncio
 import atexit
 import fcntl
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -342,12 +341,6 @@ def _missing_host_tuning(cf: dict) -> str:
     return ""
 
 
-async def _await_if_needed(value):
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
 async def _apply_step_overrides(
     store_url: str,
     client: object,
@@ -419,11 +412,9 @@ async def _apply_step_overrides(
             override_fields["scoped_context"] = scoped
 
     if override_fields:
-        await _await_if_needed(
-            client.patch(
-                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={"fields": override_fields},
-            )
+        await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": override_fields},
         )
 
 
