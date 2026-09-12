@@ -230,6 +230,39 @@ class TestAWSResourceProvider:
         )
 
     @pytest.mark.asyncio
+    async def test_aws_ssh_helper_preserves_injected_trace_dependencies(self):
+        """Readiness and bootstrap SSH must not construct a bare executor."""
+        from providers.tracing import new_trace_context
+
+        recorder = MagicMock()
+        context = new_trace_context(ticket_id="PERF-AWS", agent_id="resource")
+        provider = self._make_provider()
+        provider._trace_context = context
+        provider._trace_recorder = recorder
+
+        async with provider._ssh_executor("ec2-user") as executor:
+            assert executor.user == "ec2-user"
+            assert executor.trace_context is context
+            assert executor.trace_recorder is recorder
+
+    @pytest.mark.asyncio
+    async def test_aws_ssh_helper_closes_owned_durable_recorder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A ticket-scoped provider call owns and closes its TraceClient."""
+        from providers.tracing import new_trace_context
+
+        recorder = MagicMock()
+        monkeypatch.setattr("providers.resource.aws.TraceClient", lambda *_: recorder)
+        provider = self._make_provider()
+        provider._trace_context = new_trace_context(ticket_id="PERF-AWS")
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+
+        async with provider._ssh_executor("root") as executor:
+            assert executor.trace_recorder is recorder
+        recorder.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_check_available_default(self):
         provider = self._make_provider()
         result = await provider.check_available({})

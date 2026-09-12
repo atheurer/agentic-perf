@@ -7,6 +7,7 @@ import re
 import time
 import traceback
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,23 @@ class SSHResult:
     stdout: str
     stderr: str
     exit_code: int
+
+
+@dataclass
+class _ProgressState:
+    """Per-task state that lets the public progress wrapper close safely."""
+
+    action: "_SSHTraceAction"
+    child: Callable[[], "SSHExecutor"]
+    host: str
+    run_dir: str | None
+    key_path: str | None
+    remote_pid: int | None = None
+
+
+_PROGRESS_STATE: ContextVar[_ProgressState | None] = ContextVar(
+    "agentic_perf_progress_state", default=None
+)
 
 
 class _SSHTraceAction:
@@ -318,6 +336,93 @@ class SSHExecutor:
         poll_interval: int = 30,
         key_path: str | None = None,
     ) -> SSHResult:
+        """Run progress workflow while closing its audit lifecycle on every exit."""
+        token = _PROGRESS_STATE.set(None)
+        state: _ProgressState | None = None
+        result: SSHResult | None = None
+        primary_error: BaseException | None = None
+        try:
+            result = await self._run_with_progress_impl(
+                host, command, progress_callback, poll_interval, key_path
+            )
+            return result
+        except asyncio.CancelledError:
+            state = _PROGRESS_STATE.get()
+            if state is not None:
+                state.action.terminal(
+                    LifecycleState.CANCELLED,
+                    remote_pid=state.remote_pid,
+                    capture_status="captured",
+                    cancelled=True,
+                )
+            raise
+        except BaseException as exc:
+            primary_error = exc
+            state = _PROGRESS_STATE.get()
+            if state is not None:
+                state.action.terminal(
+                    LifecycleState.FAILED,
+                    remote_pid=state.remote_pid,
+                    capture_status="captured",
+                    error_type=type(exc).__name__,
+                )
+            raise
+        finally:
+            state = state or _PROGRESS_STATE.get()
+            if state is not None and state.run_dir is not None:
+                cleanup_failed = False
+                cleanup_exit_code: int | None = None
+                try:
+                    cleanup = await state.child().run(
+                        state.host,
+                        f"rm -rf {state.run_dir}",
+                        timeout=5,
+                        key_path=state.key_path,
+                        # Test/dry-run instance overrides predate the audit
+                        # keyword. Real child executors fail closed here.
+                        **({"mutating": True} if "run" not in self.__dict__ else {}),
+                    )
+                    if cleanup.exit_code != 0:
+                        cleanup_failed = True
+                        cleanup_exit_code = cleanup.exit_code
+                        if primary_error is None and result is not None:
+                            result.stderr = (
+                                f"{result.stderr}; {cleanup.stderr or 'Cleanup failed'}"
+                            ).strip("; ")
+                        logger.warning("[ssh] %s: capture cleanup failed", state.host)
+                except BaseException as cleanup_error:
+                    cleanup_failed = True
+                    if primary_error is None and result is not None:
+                        result.stderr = (
+                            f"{result.stderr}; cleanup failed: {cleanup_error}"
+                        ).strip("; ")
+                    logger.warning(
+                        "[ssh] %s: capture cleanup raised: %s",
+                        state.host,
+                        cleanup_error,
+                    )
+                if not state.action.closed and result is not None:
+                    state.action.terminal(
+                        LifecycleState.COMPLETED
+                        if result.exit_code == 0 and not cleanup_failed
+                        else LifecycleState.FAILED,
+                        remote_pid=state.remote_pid,
+                        capture_status="captured",
+                        exit_code=result.exit_code,
+                        cleanup_failed=cleanup_failed,
+                        cleanup_exit_code=cleanup_exit_code,
+                        output_digest=self._digest(result.stdout),
+                    )
+            _PROGRESS_STATE.reset(token)
+
+    async def _run_with_progress_impl(
+        self,
+        host: str,
+        command: str,
+        progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
+        poll_interval: int = 30,
+        key_path: str | None = None,
+    ) -> SSHResult:
         """Run a long-running command with periodic progress callbacks.
 
         Launches the command in the background on the remote host,
@@ -353,8 +458,13 @@ class SSHExecutor:
             command_digest=self._digest(command),
             capture_status="pending",
         )
+        _PROGRESS_STATE.set(_ProgressState(progress, child, host, None, key_path))
         mkd = await child().run(
-            host, "mktemp -d /tmp/run-XXXXXXXX", timeout=10, key_path=key_path
+            host,
+            "mktemp -d /tmp/run-XXXXXXXX",
+            timeout=10,
+            key_path=key_path,
+            **({"mutating": True} if "run" not in self.__dict__ else {}),
         )
         if mkd.exit_code != 0 or not mkd.stdout.strip():
             progress.terminal(
@@ -370,13 +480,22 @@ class SSHExecutor:
         run_dir = mkd.stdout.strip()
         out_file = f"{run_dir}/out"
         rc_file = f"{run_dir}/rc"
+        state = _PROGRESS_STATE.get()
+        if state is not None:
+            state.run_dir = run_dir
 
         escaped = command.replace("'", "'\\''")
         bg_cmd = (
             f"nohup sh -c '{escaped}; echo $? > {rc_file}'"
             f" > {out_file} 2>&1 & echo {_PID_SENTINEL}$!"
         )
-        launch = await child().run(host, bg_cmd, timeout=30, key_path=key_path)
+        launch = await child().run(
+            host,
+            bg_cmd,
+            timeout=30,
+            key_path=key_path,
+            **({"mutating": True} if "run" not in self.__dict__ else {}),
+        )
         pid = parse_pid_sentinel(launch.stdout or "")
         if launch.exit_code != 0 or pid is None:
             progress.terminal(
@@ -390,6 +509,9 @@ class SSHExecutor:
                 exit_code=launch.exit_code or 1,
             )
         logger.info(f"[ssh] {host}: background pid={pid} for: {command[:120]}")
+        state = _PROGRESS_STATE.get()
+        if state is not None:
+            state.remote_pid = pid
         progress.record(
             LifecycleState.LAUNCHED,
             remote_pid=pid,
@@ -531,36 +653,10 @@ class SSHExecutor:
                 full_output.stdout or "", rc_output.stderr or "Invalid rc", 1
             )
 
-        cleanup = await child().run(
-            host,
-            f"rm -rf {run_dir}",
-            timeout=5,
-            key_path=key_path,
-        )
-        if cleanup.exit_code != 0:
-            progress.terminal(
-                LifecycleState.FAILED,
-                remote_pid=pid,
-                capture_status="captured",
-                cleanup_failed=True,
-                cleanup_exit_code=cleanup.exit_code,
-            )
-            return SSHResult(
-                full_output.stdout or "", cleanup.stderr or "Cleanup failed", exit_code
-            )
-
         result = SSHResult(
             stdout=full_output.stdout or "",
             stderr="",
             exit_code=exit_code,
-        )
-        progress.terminal(
-            LifecycleState.COMPLETED if exit_code == 0 else LifecycleState.FAILED,
-            remote_pid=pid,
-            capture_status="captured",
-            exit_code=exit_code,
-            output_digest=self._digest(full_output.stdout),
-            cleanup_exit_code=cleanup.exit_code,
         )
         return result
 

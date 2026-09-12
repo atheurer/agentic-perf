@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
-from providers.ssh import SSHExecutor
+from providers.ssh import SSHExecutor, SSHResult
 from providers.tracing import LifecycleState, new_trace_context
 from state_store.trace_store import TraceStore
 
@@ -187,6 +188,31 @@ async def test_progress_cleanup_failure_closes_parent() -> None:
     assert result.stderr == "rm failed"
     assert [e for e in events if e.action.phase == "ssh_progress"][-1].attributes[
         "cleanup_failed"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_progress_mktemp_cancellation_closes_parent() -> None:
+    """Cancellation before the capture directory exists still closes progress."""
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+
+    async def cancelled(*_: object, **__: object) -> SSHResult:
+        raise asyncio.CancelledError
+
+    executor.run = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        await executor.run_with_progress("host", "command")
+
+    progress = [event for event in events if event.action.phase == "ssh_progress"]
+    assert [event.lifecycle.state for event in progress] == [
+        LifecycleState.REQUESTED,
+        LifecycleState.CANCELLED,
     ]
 
 
