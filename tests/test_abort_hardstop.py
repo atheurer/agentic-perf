@@ -8,6 +8,7 @@ budget-grace non-regression, and server-side assert_ticket_active.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,7 @@ from agents.base import (
 )
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.tracing import LifecycleState, TraceRecorder
 
 # ── Shared helpers ───────────────────────────────────────────
 
@@ -134,6 +136,49 @@ class TestExecuteToolReraise:
 
         with pytest.raises(AgentAbortedError):
             await agent._execute_tool(tc)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_tool_closes_tool_and_agent_trace(self, tmp_path):
+        class ToolLLM(LLMProvider):
+            async def complete(
+                self, system_prompt, messages, tools=None, max_tokens=4096
+            ):
+                return LLMResponse(
+                    text=None,
+                    tool_calls=[ToolCall(id="cancel-1", name="cancel", input={})],
+                    stop_reason="tool_use",
+                )
+
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event):
+                self.events.append(event)
+
+        async def cancel():
+            raise asyncio.CancelledError()
+
+        agent = _StubAgent(
+            agent_name="test-agent",
+            llm_provider=ToolLLM(),
+            state_store_url="http://store",
+            tool_handlers={"cancel": cancel},
+        )
+        agent._tool_min_interval = 0
+        agent._get_ticket = AsyncMock(
+            return_value={"id": "T", "status": "run", "custom_fields": {}}
+        )
+        sink = Sink()
+        agent._trace = TraceRecorder(client=sink)
+        with pytest.raises(asyncio.CancelledError):
+            await agent.run("T")
+        await agent.close()
+        cancelled = [
+            e for e in sink.events if e.lifecycle.state == LifecycleState.CANCELLED
+        ]
+        assert any(e.action.type.value == "tool" for e in cancelled)
+        assert any(e.action.type.value == "agent" for e in cancelled)
 
     @pytest.mark.asyncio
     async def test_reraises_mcp_drift(self, tmp_path):
