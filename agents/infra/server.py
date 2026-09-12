@@ -795,31 +795,7 @@ async def transfer_file(
     if direction == "push":
         result = await ssh.copy_to(host, local_path, remote_path)
     elif direction == "pull":
-        args = [
-            "scp",
-            "-r",
-            "-o",
-            f"ConnectTimeout={ssh.connect_timeout}",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-        ]
-        if ssh.key_path:
-            args.extend(["-i", ssh.key_path])
-        args.extend([f"{ssh.user}@{host}:{remote_path}", local_path])
-
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        result = SSHResult(
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-            exit_code=proc.returncode or 0,
-        )
+        result = await ssh.copy_from(host, remote_path, local_path)
     else:
         return json.dumps(
             {"success": False, "error": f"Unknown direction: {direction}"}

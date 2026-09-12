@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.server_utils import tool_progress
+from providers.ssh import SSHExecutor
 
 from .base import ResourceProvider
 
@@ -577,25 +578,11 @@ class AWSResourceProvider(ResourceProvider):
             f"Waiting for SSH connectivity on {len(hosts)} hosts...",
             "setup_ssh",
         )
+        ssh = SSHExecutor(user=self._ssh_user, key_path=self._ssh_key_path)
         for host in hosts:
             for attempt in range(retries):
-                proc = await asyncio.create_subprocess_exec(
-                    "ssh",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-i",
-                    self._ssh_key_path,
-                    f"{self._ssh_user}@{host}",
-                    "echo SSH_OK",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and b"SSH_OK" in stdout:
+                result = await ssh.run(host, "echo SSH_OK", timeout=5)
+                if result.exit_code == 0 and "SSH_OK" in result.stdout:
                     logger.info(f"[aws-provider] SSH ready on {host}")
                     await tool_progress(
                         f"SSH ready on {host}",
@@ -764,6 +751,8 @@ class AWSResourceProvider(ResourceProvider):
 
     async def _enable_root_ssh(self, host: str, pubkey: str) -> None:
         """Enable root SSH login and install our key."""
+        bootstrap_ssh = SSHExecutor(user=self._ssh_user, key_path=self._ssh_key_path)
+        root_ssh = SSHExecutor(user="root", key_path=self._ssh_key_path)
         bootstrap_cmds = [
             # RHEL10 uses sshd_config.d/ drop-ins that override the main config.
             # Remove any PermitRootLogin overrides from drop-ins first.
@@ -787,49 +776,19 @@ class AWSResourceProvider(ResourceProvider):
             "echo '[engine]\ncgroup_manager = \"cgroupfs\"' | sudo tee /etc/containers/containers.conf > /dev/null",
         ]
         for cmd in bootstrap_cmds:
-            proc = await asyncio.create_subprocess_exec(
-                "ssh",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-i",
-                self._ssh_key_path,
-                f"{self._ssh_user}@{host}",
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
+            result = await bootstrap_ssh.run(host, cmd, timeout=10)
+            if result.exit_code != 0:
                 raise RuntimeError(
-                    f"Bootstrap cmd failed (exit {proc.returncode}): {cmd} — "
-                    f"{stderr.decode().strip()}"
+                    f"Bootstrap cmd failed (exit {result.exit_code}): {cmd} — "
+                    f"{result.stderr.strip()}"
                 )
 
         # Give sshd time to restart fully
         await asyncio.sleep(5)
 
         # Verify root SSH works
-        proc = await asyncio.create_subprocess_exec(
-            "ssh",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-i",
-            self._ssh_key_path,
-            f"root@{host}",
-            "echo ROOT_OK",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0 or b"ROOT_OK" not in stdout:
+        result = await root_ssh.run(host, "echo ROOT_OK", timeout=10)
+        if result.exit_code != 0 or "ROOT_OK" not in result.stdout:
             raise RuntimeError("Root SSH verification failed after bootstrap")
         logger.info(f"[aws-provider] Root SSH enabled on {host}")
         await tool_progress(f"Root SSH verified on {host}", "setup_ssh")

@@ -1148,7 +1148,10 @@ async def build_ssh_from_ticket(
     """
     import httpx
 
+    from paths import TRACE_DB_PATH
     from providers.ssh import SSHExecutor
+    from providers.tracing import new_trace_context
+    from state_store.trace_store import TraceStore
 
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
@@ -1193,7 +1196,14 @@ async def build_ssh_from_ticket(
         )
 
     return SSHExecutor(
-        user=ssh_user, key_path=resolved_key, strict_host_key=strict
+        user=ssh_user,
+        key_path=resolved_key,
+        strict_host_key=strict,
+        trace_context=new_trace_context(
+            ticket_id=ticket_id,
+            agent_id=os.environ.get("AGENT_NAME"),
+        ),
+        trace_recorder=TraceStore(TRACE_DB_PATH),
     ), ticket
 
 
