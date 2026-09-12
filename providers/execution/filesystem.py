@@ -112,6 +112,12 @@ class AuditedStream:
     def __getattr__(self, name: str):
         return getattr(self._handle, name)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -119,8 +125,13 @@ class AuditedStream:
         try:
             self._handle.flush()
             os.fsync(self._handle.fileno())
-            self._handle.close()
             data = self._path.read_bytes()
+            descriptor = (
+                {"size_bytes": len(data), "sensitive": True}
+                if self._filesystem._sensitive_name(self._path.name)
+                else self._filesystem._descriptor(data)
+            )
+            self._handle.close()
             self._filesystem._record(
                 self._filesystem._event(
                     self._context,
@@ -129,10 +140,14 @@ class AuditedStream:
                     self._target,
                     self._started,
                     terminal=True,
-                    attributes=self._attributes | self._filesystem._descriptor(data),
+                    attributes=self._attributes | descriptor,
                 )
             )
         except Exception as exc:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
             error, digest = self._filesystem._error(exc)
             self._filesystem._record(
                 self._filesystem._event(

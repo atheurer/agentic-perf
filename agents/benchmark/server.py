@@ -3452,10 +3452,7 @@ async def execute_boot_time_test(
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")
     if serial_log_fh is not None:
-        try:
-            serial_log_fh.close()
-        except Exception:
-            pass
+        serial_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
