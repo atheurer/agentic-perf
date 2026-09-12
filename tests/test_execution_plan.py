@@ -19,6 +19,7 @@ def _async_client() -> MagicMock:
     client.post = AsyncMock()
     return client
 
+
 # --- State machine ---
 
 
