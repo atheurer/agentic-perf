@@ -324,6 +324,68 @@ async def test_mutating_ssh_fails_closed_without_durable_recorder(
         await executor.run("host", "touch /mutating", mutating=True)
 
 
+async def test_unclassified_ticket_ssh_without_recorder_blocks_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket commands default to mutating until a call site marks read-only."""
+
+    async def must_not_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must not spawn before audit readiness")
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", must_not_spawn)
+    executor = SSHExecutor(trace_context=new_trace_context(ticket_id="PERF-SSH"))
+    with pytest.raises(RuntimeError, match="ticket-scoped SSH"):
+        await executor.run("host", "mkdir -p /remote/path")
+
+    with pytest.raises(RuntimeError, match="ticket-scoped SSH"):
+        await executor.run("host", "echo read-only", mutating=False)
+
+
+async def test_explicit_no_ticket_read_only_ssh_remains_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """System/no-ticket probes may explicitly remain outside ticket auditing."""
+
+    class Process:
+        pid = 22
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"ok", b""
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    assert (await SSHExecutor().run("host", "echo ok", mutating=False)).stdout == "ok"
+
+
+async def test_explicit_ticket_read_only_records_resolved_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class Process:
+        pid = 23
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"ok", b""
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    await executor.run("host", "echo ok", mutating=False)
+    assert events[0].attributes["resolved_mutating"] is False
+
+
 @pytest.mark.parametrize("exit_code", [0, 1, 255])
 async def test_ssh_run_audits_success_and_remote_failures(
     monkeypatch: pytest.MonkeyPatch, exit_code: int

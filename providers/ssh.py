@@ -174,6 +174,17 @@ class SSHExecutor:
         recorder(event)
 
     @staticmethod
+    def _resolved_mutation(trace: _SSHTraceAction, mutating: bool | None) -> bool:
+        """Resolve safe defaults and require durable audit for ticket work."""
+        ticket_scoped = bool(trace.context is not None and trace.context.ticket_id)
+        resolved = ticket_scoped if mutating is None else mutating
+        if ticket_scoped and trace.executor.trace_recorder is None:
+            raise RuntimeError("ticket-scoped SSH requires durable trace readiness")
+        if resolved and (not ticket_scoped or trace.executor.trace_recorder is None):
+            raise RuntimeError("mutating SSH requires durable trace readiness")
+        return resolved
+
+    @staticmethod
     def _digest(value: str | bytes | None) -> str | None:
         if value is None:
             return None
@@ -223,15 +234,14 @@ class SSHExecutor:
         key_path: str | None = None,
         allocate_pty: bool = False,
         stdin_data: bytes | None = None,
-        mutating: bool = False,
+        mutating: bool | None = None,
     ) -> SSHResult:
         args = self._ssh_args(host, key_path=key_path, allocate_pty=allocate_pty) + [
             command
         ]
         started = time.monotonic()
         trace = _SSHTraceAction(self, "ssh", host)
-        if mutating and (trace.context is None or self.trace_recorder is None):
-            raise RuntimeError("mutating SSH requires durable trace readiness")
+        resolved_mutating = self._resolved_mutation(trace, mutating)
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,
@@ -245,6 +255,7 @@ class SSHExecutor:
             if stdin_data is not None
             else None,
             key_identity=self._digest(key_path or self.key_path),
+            resolved_mutating=resolved_mutating,
         )
         logger.info(f"[ssh] {self.user}@{host}: {command[:120]}")
 
@@ -335,6 +346,7 @@ class SSHExecutor:
         progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
         poll_interval: int = 30,
         key_path: str | None = None,
+        mutating: bool | None = None,
     ) -> SSHResult:
         """Run progress workflow while closing its audit lifecycle on every exit."""
         token = _PROGRESS_STATE.set(None)
@@ -343,7 +355,7 @@ class SSHExecutor:
         primary_error: BaseException | None = None
         try:
             result = await self._run_with_progress_impl(
-                host, command, progress_callback, poll_interval, key_path
+                host, command, progress_callback, poll_interval, key_path, mutating
             )
             return result
         except asyncio.CancelledError:
@@ -378,6 +390,7 @@ class SSHExecutor:
                         f"rm -rf {state.run_dir}",
                         timeout=5,
                         key_path=state.key_path,
+                        mutating=True,
                         # Test/dry-run instance overrides predate the audit
                         # keyword. Real child executors fail closed here.
                         **({"mutating": True} if "run" not in self.__dict__ else {}),
@@ -422,6 +435,7 @@ class SSHExecutor:
         progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
         poll_interval: int = 30,
         key_path: str | None = None,
+        mutating: bool | None = None,
     ) -> SSHResult:
         """Run a long-running command with periodic progress callbacks.
 
@@ -433,6 +447,7 @@ class SSHExecutor:
         Returns the same SSHResult as run() with the full output.
         """
         progress = _SSHTraceAction(self, "ssh_progress", host)
+        resolved_mutating = self._resolved_mutation(progress, mutating)
 
         def child() -> SSHExecutor:
             # Preserve instance-level test/dry-run overrides of ``run``. Real
@@ -457,6 +472,7 @@ class SSHExecutor:
             LifecycleState.REQUESTED,
             command_digest=self._digest(command),
             capture_status="pending",
+            resolved_mutating=resolved_mutating,
         )
         _PROGRESS_STATE.set(_ProgressState(progress, child, host, None, key_path))
         mkd = await child().run(
@@ -464,7 +480,7 @@ class SSHExecutor:
             "mktemp -d /tmp/run-XXXXXXXX",
             timeout=10,
             key_path=key_path,
-            **({"mutating": True} if "run" not in self.__dict__ else {}),
+            mutating=True,
         )
         if mkd.exit_code != 0 or not mkd.stdout.strip():
             progress.terminal(
@@ -494,7 +510,7 @@ class SSHExecutor:
             bg_cmd,
             timeout=30,
             key_path=key_path,
-            **({"mutating": True} if "run" not in self.__dict__ else {}),
+            mutating=True,
         )
         pid = parse_pid_sentinel(launch.stdout or "")
         if launch.exit_code != 0 or pid is None:
@@ -540,6 +556,7 @@ class SSHExecutor:
                 f"test -f {rc_file}",
                 timeout=5,
                 key_path=key_path,
+                mutating=False,
             )
 
             # SSH connection failure (exit 255) or timeout (exit -1)
@@ -582,6 +599,7 @@ class SSHExecutor:
                     f"tail -5 {out_file} 2>/dev/null",
                     timeout=10,
                     key_path=key_path,
+                    mutating=False,
                 )
                 lines = [ln for ln in (tail.stdout or "").splitlines() if ln.strip()]
                 last_line = lines[-1] if lines else ""
@@ -627,6 +645,7 @@ class SSHExecutor:
             f"cat {out_file}",
             timeout=60,
             key_path=key_path,
+            mutating=False,
         )
         if full_output.exit_code != 0:
             progress.terminal(
@@ -642,6 +661,7 @@ class SSHExecutor:
             f"cat {rc_file}",
             timeout=5,
             key_path=key_path,
+            mutating=False,
         )
         try:
             exit_code = int(rc_output.stdout.strip())
@@ -670,12 +690,11 @@ class SSHExecutor:
         local_path: str,
         timeout: int = 120,
         key_path: str | None = None,
-        mutating: bool = False,
+        mutating: bool | None = None,
     ) -> SSHResult:
         started = time.monotonic()
         trace = _SSHTraceAction(self, "scp_from", host)
-        if mutating and (trace.context is None or self.trace_recorder is None):
-            raise RuntimeError("mutating SCP requires durable trace readiness")
+        resolved_mutating = self._resolved_mutation(trace, mutating)
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,
@@ -683,6 +702,7 @@ class SSHExecutor:
             remote_path_digest=self._digest(remote_path),
             local_path_digest=self._digest(local_path),
             key_identity=self._digest(key_path or self.key_path),
+            resolved_mutating=resolved_mutating,
         )
         args = [
             "scp",
@@ -769,12 +789,11 @@ class SSHExecutor:
         remote_path: str,
         timeout: int = 120,
         key_path: str | None = None,
-        mutating: bool = False,
+        mutating: bool | None = None,
     ) -> SSHResult:
         started = time.monotonic()
         trace = _SSHTraceAction(self, "scp_to", host)
-        if mutating and (trace.context is None or self.trace_recorder is None):
-            raise RuntimeError("mutating SCP requires durable trace readiness")
+        resolved_mutating = self._resolved_mutation(trace, mutating)
         trace.record(
             LifecycleState.REQUESTED,
             user=self.user,
@@ -782,6 +801,7 @@ class SSHExecutor:
             remote_path_digest=self._digest(remote_path),
             local_path_digest=self._digest(local_path),
             key_identity=self._digest(key_path or self.key_path),
+            resolved_mutating=resolved_mutating,
         )
         args = [
             "scp",
