@@ -78,12 +78,29 @@ class AuditedProcess:
                 )
             )
 
-    async def wait(self) -> int:
+    async def _stop(self, task: asyncio.Task[Any]) -> None:
+        """Bound shutdown so a TERM-ignoring child cannot defeat a timeout."""
+        self.terminate()
         try:
-            result = await self._process.wait()
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._runner.shutdown_timeout
+            )
+        except asyncio.TimeoutError:
+            self.kill()
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._runner.shutdown_timeout
+            )
+
+    async def wait(self, *, timeout: float | None = None) -> int:
+        task = asyncio.create_task(self._process.wait())
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self._stop(task)
+            await self._finish(LifecycleState.TIMED_OUT, timed_out=True)
+            raise
         except asyncio.CancelledError:
-            self.terminate()
-            await self._process.wait()
+            await self._stop(task)
             await self._finish(LifecycleState.CANCELLED)
             raise
         await self._finish(
@@ -103,13 +120,28 @@ class AuditedProcess:
         self._signal = f"signal:{signal}"
         self._process.send_signal(signal)
 
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+    async def communicate(
+        self, input: bytes | None = None, *, timeout: float | None = None
+    ) -> tuple[bytes, bytes]:
+        task = asyncio.create_task(self._process.communicate(input))
         try:
-            result = await self._process.communicate(input)
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self._stop(task)
+            stdout, stderr = task.result()
+            await self._finish(
+                LifecycleState.TIMED_OUT,
+                timed_out=True,
+                **self._runner._output_descriptors(stdout, stderr),
+            )
+            raise
         except asyncio.CancelledError:
-            self.terminate()
-            await self._process.communicate()
-            await self._finish(LifecycleState.CANCELLED)
+            await self._stop(task)
+            stdout, stderr = task.result()
+            await self._finish(
+                LifecycleState.CANCELLED,
+                **self._runner._output_descriptors(stdout, stderr),
+            )
             raise
         await self._finish(
             LifecycleState.COMPLETED if self.returncode == 0 else LifecycleState.FAILED,
@@ -130,10 +162,12 @@ class AuditedSubprocessRunner:
         *,
         recorder: TraceClient | None = None,
         output_limit: int = 65536,
+        shutdown_timeout: float = 5.0,
     ) -> None:
         self._emit = emit
         self._recorder = recorder
         self._output_limit = output_limit
+        self.shutdown_timeout = shutdown_timeout
 
     @classmethod
     def reset_default_recorder(cls) -> None:

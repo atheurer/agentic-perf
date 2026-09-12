@@ -3413,16 +3413,10 @@ async def execute_boot_time_test(
         mutating=True,
     )
     try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=benchmark_timeout,
-        )
+        stdout_bytes, stderr_bytes = await proc.communicate(timeout=benchmark_timeout)
     except _asyncio.TimeoutError:
-        logger.warning(
-            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
-        )
-        proc.kill()
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        logger.warning(f"[boot-time] Subprocess timed out after {benchmark_timeout}s")
+        stdout_bytes, stderr_bytes = b"", b""
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
@@ -3433,13 +3427,10 @@ async def execute_boot_time_test(
         try:
             serial_proc.terminate()
             try:
-                await _asyncio.wait_for(
-                    serial_proc.wait(),
-                    timeout=10,
-                )
+                await serial_proc.wait(timeout=10)
             except _asyncio.TimeoutError:
-                serial_proc.kill()
-                await serial_proc.wait()
+                # The tracked wait has already escalated to kill.
+                pass
             logger.info("[boot-time] Passive serial capture stopped")
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")

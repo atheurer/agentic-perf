@@ -78,6 +78,34 @@ async def test_timeout_and_cancellation_emit_one_correct_terminal() -> None:
         reset_trace_context(token)
 
 
+async def test_tracked_communicate_timeout_escalates_and_is_timed_out() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        process = await AuditedSubprocessRunner(emit, shutdown_timeout=0.1).start(
+            [
+                sys.executable,
+                "-c",
+                "import signal,time;signal.signal(signal.SIGTERM, lambda *_: None);time.sleep(5)",
+            ]
+        )
+        await asyncio.sleep(0.05)  # let the child install its SIGTERM handler
+        with pytest.raises(asyncio.TimeoutError):
+            await process.communicate(timeout=0.01)
+    finally:
+        reset_trace_context(token)
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "started",
+        "timed_out",
+    ]
+    assert events[-1].attributes["signal"] == "kill"
+
+
 async def test_secret_argv_env_and_stdin_are_not_in_events() -> None:
     events = []
 

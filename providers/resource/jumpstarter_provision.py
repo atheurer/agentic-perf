@@ -156,9 +156,10 @@ async def provision_jumpstarter(
         if serial_proc:
             try:
                 serial_proc.terminate()
-                await asyncio.wait_for(serial_proc.wait(), timeout=5)
+                await serial_proc.wait(timeout=5)
             except Exception:
-                serial_proc.kill()
+                # The tracked wait has already escalated to kill.
+                pass
         if serial_log_fh:
             serial_log_fh.close()
 
