@@ -27,7 +27,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
+from providers.execution import AuditedAsyncHTTPClient
 
 from .base import InvestigationRecordProvider
 from .models import (
@@ -77,7 +77,7 @@ class HorreumRecordProvider(InvestigationRecordProvider):
             )
         self._url = url.rstrip("/")
         self._token = token
-        self._client = httpx.AsyncClient(
+        self._client = AuditedAsyncHTTPClient(
             base_url=self._url,
             timeout=30.0,
             headers=self._auth_headers(),

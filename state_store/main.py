@@ -89,6 +89,8 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def restore_trace_context(request: Request, call_next):
         """Restore trusted transport correlation; request bodies never set it."""
+        if request.headers.get("X-Agentic-Perf-Causal-Context") != "v1":
+            return await call_next(request)
         traceparent = request.headers.get("traceparent", "").split("-")
         try:
             context = TraceContext(

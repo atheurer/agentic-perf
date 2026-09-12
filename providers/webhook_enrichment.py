@@ -18,9 +18,15 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
+from providers.execution import AuditedAsyncHTTPClient
+from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
 
 logger = logging.getLogger(__name__)
+
+
+async def _webhook_trace(event: Any) -> None:
+    """Keep webhook audit events observable before its state-store client exists."""
+    logger.info("webhook outbound HTTP audit: %s", event.model_dump_json())
 
 
 def _ap_home() -> Path:
@@ -114,14 +120,24 @@ async def enrich_webhook_ticket(
             merged["board_selector"] = f"board-type={target}"
             fields["directives"] = merged
 
-    async with httpx.AsyncClient(
-        timeout=10.0,
-        headers=headers,
-    ) as client:
-        await client.patch(
-            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": fields},
-        )
+    # Enrichment runs outside an agent invocation, so establish the ticket root
+    # here.  The HTTP client makes the PATCH its child action and forwards it to
+    # the state store, preserving this causal join.
+    token = bind_trace_context(
+        new_trace_context(ticket_id=ticket_id, agent_id="webhook")
+    )
+    try:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0,
+            headers=headers,
+            emit=_webhook_trace,
+        ) as client:
+            await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": fields},
+            )
+    finally:
+        reset_trace_context(token)
 
     logger.info(
         f"[enrich] {ticket_id}: wrote run_metadata"
@@ -177,10 +193,11 @@ async def _call_get_run_info(
                 headers["Authorization"] = f"Bearer {token}"
 
     try:
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=30.0,
             headers=headers,
             verify=not mcp_server.get("trust", False),
+            emit=_webhook_trace,
         ) as client:
             # Initialize MCP session
             init_resp = await client.post(

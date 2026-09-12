@@ -16,6 +16,7 @@ from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
@@ -676,9 +677,7 @@ async def run_agent_task(
         # their default max_iterations re-reading skills and
         # host state on each investigation loop-back.
         try:
-            import httpx
-
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=_auth_headers()
             ) as client:
                 r = await client.get(
@@ -733,7 +732,7 @@ async def run_agent_task(
         # agent into thinking the investigation is incomplete.
         if status == "synthesizing_results":
             try:
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
                     r = await client.get(
@@ -819,9 +818,7 @@ async def run_agent_task(
 
         if config:
             try:
-                import httpx
-
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
                     # Preserve max_iterations_override when the
@@ -846,9 +843,7 @@ async def run_agent_task(
     except asyncio.CancelledError:
         logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
         try:
-            import httpx
-
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=_auth_headers()
             ) as client:
                 # Check if ticket was already force-closed before
@@ -932,9 +927,7 @@ async def run_agent_task(
         # itself; we force-close here if stop_after_step == "triage".
         if success and status == "triage_pending":
             try:
-                import httpx
-
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as _stop_client:
                     r = await _stop_client.get(
@@ -985,10 +978,11 @@ async def _transition_to_guidance(
     Used by orchestrator-level error handlers (stale watchdog,
     task timeout) that operate outside an agent context.
     """
-    import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={
@@ -1028,10 +1022,8 @@ async def _check_stale_tasks(
     """
     from datetime import datetime
 
-    import httpx
-
     now = time.time()
-    async with httpx.AsyncClient(timeout=5.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=5.0, headers=_auth_headers()) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
             last_event_time = event_bus.last_event_time(tid)
             if last_event_time is None:
@@ -1100,9 +1092,7 @@ async def _block_absent_suite(
     ticket_id: str,
     event_bus: EventBus | None = None,
 ) -> None:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         suite = ""
         try:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
@@ -1155,9 +1145,8 @@ async def _redirect_to_investigation(
     on the investigation path. If triage routed to the ad-hoc
     path, the orchestrator corrects it here.
     """
-    import httpx
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -1209,11 +1198,9 @@ async def _block_handoff_failed(
     current_status: str = "",
     event_bus: EventBus | None = None,
 ) -> None:
-    import httpx
-
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
@@ -1251,9 +1238,9 @@ async def _process_stop_requests(
     dispatched_tickets: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
             if dispatched_tickets is not None:
                 tickets = dispatched_tickets
             else:
@@ -1357,10 +1344,9 @@ async def _add_comment(
     body: str,
 ) -> None:
     """Post a comment on a ticket (fire-and-forget)."""
-    import httpx
 
     try:
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=_auth_headers(),
         ) as client:
