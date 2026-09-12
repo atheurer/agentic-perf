@@ -56,6 +56,20 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 _CRUCIBLE_ROOT = "/opt/crucible"
 
 
+def _write_ticket_staging_file(
+    ticket_id: str, content: str
+) -> tuple[AuditedFilesystem, str, str]:
+    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
+    filesystem = AuditedFilesystem(
+        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+        ticket_id=ticket_id,
+        emit=durable_filesystem_emitter(),
+        critical=True,
+    )
+    name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
+    return filesystem, name, str(filesystem.write(name, content))
+
+
 def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
     """SHA-256 fingerprint of the current execution plan step's mv_params."""
     plan = cf.get("execution_plan")
@@ -2796,13 +2810,24 @@ async def execute_benchmark(
     # Default: crucible (and any unknown harness that uses JSON run-files)
     remote_path = f"/tmp/run-file-{run_uuid}.json"
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(run_file, f, indent=2)
-        local_path = f.name
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
+    else:
+        staging = None
+        staging_name = ""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(run_file, f, indent=2)
+            local_path = f.name
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     scp_result = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
-    Path(local_path).unlink(missing_ok=True)
+    if staging:
+        staging.unlink(staging_name, missing_ok=True)
+    else:
+        Path(local_path).unlink(missing_ok=True)
 
     if scp_result.exit_code != 0:
         return json.dumps(
@@ -2976,11 +3001,19 @@ async def validate_benchmark(
     remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
     local_path = ""
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as file:
-            json.dump(run_file, file, indent=2)
-            local_path = file.name
+        ticket_id = os.environ.get("TICKET_ID", "")
+        staging = None
+        staging_name = ""
+        if ticket_id:
+            staging, staging_name, local_path = _write_ticket_staging_file(
+                ticket_id, json.dumps(run_file, indent=2)
+            )
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as file:
+                json.dump(run_file, file, indent=2)
+                local_path = file.name
 
         copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
@@ -3063,7 +3096,10 @@ async def validate_benchmark(
         )
     finally:
         if local_path:
-            Path(local_path).unlink(missing_ok=True)
+            if staging:
+                staging.unlink(staging_name, missing_ok=True)
+            else:
+                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:

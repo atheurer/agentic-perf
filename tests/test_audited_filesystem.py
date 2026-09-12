@@ -162,6 +162,22 @@ def test_archive_uses_only_logical_member_names(filesystem) -> None:
     assert str(root) not in events[-1].model_dump_json()
 
 
+def test_permission_failure_has_one_failed_terminal(filesystem, monkeypatch) -> None:
+    fs, events, _ = filesystem
+    import providers.execution.filesystem as module
+
+    monkeypatch.setattr(
+        module.os,
+        "fdopen",
+        lambda *_: (_ for _ in ()).throw(PermissionError(13, "denied")),
+    )
+    with pytest.raises(PermissionError):
+        fs.write("denied", b"x")
+    assert [event.lifecycle.state.value for event in events] == ["requested", "failed"]
+    assert events[-1].outcome.value == "failure"
+    assert events[-1].error.message is None
+
+
 def test_ticket_archive_records_each_move_and_survives_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
