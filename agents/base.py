@@ -322,6 +322,7 @@ class AgentBase(ABC):
 
     async def run(self, ticket_id: str) -> None:
         self._current_ticket_id = ticket_id
+        self._trace_terminal_state = LifecycleState.COMPLETED
         # Dispatcher normally supplies this context.  Direct agent use (tests,
         # CLI tools) still gets an isolated invocation rather than losing causality.
         if self.trace_context is None:
@@ -565,6 +566,17 @@ class AgentBase(ABC):
                         messages=messages,
                         tools=(self.tools if self.tools else None),
                     )
+                except asyncio.CancelledError:
+                    self._trace_terminal_state = LifecycleState.CANCELLED
+                    self._trace.record(
+                        llm_context,
+                        ActionType.LLM,
+                        LifecycleState.CANCELLED,
+                        phase="request",
+                        duration_ms=llm_timer.elapsed_ms(),
+                        outcome=OperationOutcome.CANCELLED,
+                    )
+                    raise
                 except LLMTimeoutError as e:
                     self._trace.record(
                         llm_context,

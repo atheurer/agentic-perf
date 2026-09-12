@@ -28,7 +28,9 @@ from providers.tracing import (
     LifecycleState,
     TraceClient,
     TraceRecorder,
+    child_context,
     new_trace_context,
+    trace_headers,
 )
 
 if TYPE_CHECKING:
@@ -174,7 +176,12 @@ class Dispatcher:
     def release_claim(self, ticket_id: str) -> None:
         """Release our claim on a ticket."""
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
+            headers = self._auth_headers() | (
+                trace_headers(self._trace_contexts[ticket_id])
+                if ticket_id in self._trace_contexts
+                else {}
+            )
+            with httpx.Client(timeout=10.0, headers=headers) as client:
                 client.request(
                     "DELETE",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
@@ -186,7 +193,12 @@ class Dispatcher:
     def renew_claim(self, ticket_id: str) -> bool:
         """Renew our claim on a ticket. Returns True on success."""
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
+            headers = self._auth_headers() | (
+                trace_headers(self._trace_contexts[ticket_id])
+                if ticket_id in self._trace_contexts
+                else {}
+            )
+            with httpx.Client(timeout=10.0, headers=headers) as client:
                 r = client.post(
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim/renew",
                     json={
@@ -195,8 +207,18 @@ class Dispatcher:
                     },
                 )
                 return r.status_code == 200
-        except Exception:
+        except Exception as exc:
             logger.exception(f"Failed to renew claim on {ticket_id}")
+            context = self._trace_contexts.get(ticket_id)
+            if context is not None:
+                self._trace.record(
+                    context,
+                    ActionType.DISPATCH,
+                    LifecycleState.FAILED,
+                    phase="claim_renewal",
+                    duration_ms=0,
+                    error=exc,
+                )
             return False
 
     async def _renewal_loop(self, ticket_id: str) -> None:
@@ -360,6 +382,12 @@ class Dispatcher:
             event_bus=self.events,
             llm_provider=llm,
         )
+        dispatch_context = self._trace_contexts.get(ticket_id)
+        if dispatch_context is not None:
+            agent.trace_context = child_context(
+                dispatch_context, agent_id="introspection-agent"
+            )
+            agent._trace.client = self._trace.client
         self._introspection_agents[ticket_id] = agent
 
         task = asyncio.create_task(
@@ -619,10 +647,14 @@ class Dispatcher:
         if agent is not None:
             # A successful claim is the invocation boundary.  Assigning the
             # immutable context here keeps every agent class on one envelope.
-            agent.trace_context = (
+            dispatch_context = (
                 self._trace_contexts.get(ticket_data.get("id", ""))
                 if ticket_data
                 else None
             )
+            if dispatch_context is not None:
+                agent.trace_context = child_context(
+                    dispatch_context, agent_id=getattr(agent, "agent_name", agent_type)
+                )
 
         return agent

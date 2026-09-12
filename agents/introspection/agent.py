@@ -36,6 +36,7 @@ from providers.llm.base import LLMProvider
 from providers.tracing import (
     ActionType,
     LifecycleState,
+    OperationOutcome,
     TraceRecorder,
     new_trace_context,
     trace_headers,
@@ -189,6 +190,8 @@ class IntrospectionAgent:
             )
 
         reached_terminal = False
+        terminal_state = LifecycleState.COMPLETED
+        terminal_outcome = OperationOutcome.SUCCESS
         try:
             while not self._stop_requested:
                 try:
@@ -319,6 +322,10 @@ class IntrospectionAgent:
                 await asyncio.sleep(_POLL_INTERVAL)
 
         except asyncio.CancelledError:
+            terminal_state, terminal_outcome = (
+                LifecycleState.CANCELLED,
+                OperationOutcome.CANCELLED,
+            )
             logger.info(f"[introspection] Observation of {ticket_id} cancelled")
             # Check if ticket reached terminal while we were
             # cancelled (e.g., stop_agent during close).
@@ -330,6 +337,10 @@ class IntrospectionAgent:
                 except Exception:
                     pass
         except Exception:
+            terminal_state, terminal_outcome = (
+                LifecycleState.FAILED,
+                OperationOutcome.FAILURE,
+            )
             logger.exception(f"[introspection] Error observing {ticket_id}")
         finally:
             # Final flush and LLM summary on terminal status.
@@ -363,9 +374,10 @@ class IntrospectionAgent:
             self._trace.record(
                 self.trace_context,
                 ActionType.AGENT,
-                LifecycleState.COMPLETED,
+                terminal_state,
                 phase="observe",
                 duration_ms=0,
+                outcome=terminal_outcome,
             )
 
     # --- LLM narrative ---
@@ -469,6 +481,9 @@ class IntrospectionAgent:
         """Make an LLM call for narrative interpretation."""
         assert self._llm is not None
         self._llm_call_count += 1
+        llm_context, timer = self._trace.start(
+            ActionType.LLM, phase="narrative", iteration=self._llm_call_count
+        )
 
         system_prompt = _load_observer_prompt()
 
@@ -507,9 +522,35 @@ class IntrospectionAgent:
                 messages=[{"role": "user", "content": user_msg}],
                 tools=None,
             )
+            self._trace.record(
+                llm_context,
+                ActionType.LLM,
+                LifecycleState.COMPLETED,
+                phase="narrative",
+                duration_ms=timer.elapsed_ms(),
+                outcome=OperationOutcome.SUCCESS,
+            )
             self._record_usage(ticket_id, response)
             return response.text
+        except asyncio.CancelledError:
+            self._trace.record(
+                llm_context,
+                ActionType.LLM,
+                LifecycleState.CANCELLED,
+                phase="narrative",
+                duration_ms=timer.elapsed_ms(),
+                outcome=OperationOutcome.CANCELLED,
+            )
+            raise
         except Exception:
+            self._trace.record(
+                llm_context,
+                ActionType.LLM,
+                LifecycleState.FAILED,
+                phase="narrative",
+                duration_ms=timer.elapsed_ms(),
+                outcome=OperationOutcome.FAILURE,
+            )
             logger.debug(
                 "[introspection] LLM narrative call failed",
                 exc_info=True,
@@ -573,6 +614,9 @@ class IntrospectionAgent:
     ) -> dict[str, Any]:
         """Produce the final summary using the LLM."""
         assert self._llm is not None
+        trace_context, trace_timer = self._trace.start(
+            ActionType.LLM, phase="final_summary", iteration=self._llm_call_count + 1
+        )
 
         system_prompt = _load_observer_prompt()
 
@@ -623,6 +667,14 @@ class IntrospectionAgent:
                 messages=[{"role": "user", "content": user_msg}],
                 tools=None,
             )
+            self._trace.record(
+                trace_context,
+                ActionType.LLM,
+                LifecycleState.COMPLETED,
+                phase="final_summary",
+                duration_ms=trace_timer.elapsed_ms(),
+                outcome=OperationOutcome.SUCCESS,
+            )
             self._record_usage(ticket_id, response)
             # Parse the LLM's JSON response.
             parsed = self._parse_summary_response(response.text)
@@ -632,6 +684,14 @@ class IntrospectionAgent:
             parsed["anomalies"] = anomalies
             return parsed
         except Exception:
+            self._trace.record(
+                trace_context,
+                ActionType.LLM,
+                LifecycleState.FAILED,
+                phase="final_summary",
+                duration_ms=trace_timer.elapsed_ms(),
+                outcome=OperationOutcome.FAILURE,
+            )
             logger.warning(
                 "[introspection] LLM final summary failed,"
                 " falling back to deterministic",
@@ -1101,6 +1161,9 @@ class IntrospectionAgent:
         """Use LLM to generate a suggested response."""
         if not self._llm:
             return None
+        trace_context, trace_timer = self._trace.start(
+            ActionType.LLM, phase="guidance", iteration=self._llm_call_count + 1
+        )
 
         prompt = (
             f"A performance testing ticket ({ticket_id}) has "
@@ -1121,9 +1184,37 @@ class IntrospectionAgent:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
-
-        self._record_usage(ticket_id, response)
-        return response.text.strip() if response.text else None
+        try:
+            self._record_usage(ticket_id, response)
+            self._trace.record(
+                trace_context,
+                ActionType.LLM,
+                LifecycleState.COMPLETED,
+                phase="guidance",
+                duration_ms=trace_timer.elapsed_ms(),
+                outcome=OperationOutcome.SUCCESS,
+            )
+            return response.text.strip() if response.text else None
+        except asyncio.CancelledError:
+            self._trace.record(
+                trace_context,
+                ActionType.LLM,
+                LifecycleState.CANCELLED,
+                phase="guidance",
+                duration_ms=trace_timer.elapsed_ms(),
+                outcome=OperationOutcome.CANCELLED,
+            )
+            raise
+        except Exception:
+            self._trace.record(
+                trace_context,
+                ActionType.LLM,
+                LifecycleState.FAILED,
+                phase="guidance",
+                duration_ms=trace_timer.elapsed_ms(),
+                outcome=OperationOutcome.FAILURE,
+            )
+            raise
 
     async def _get_ticket(
         self,
