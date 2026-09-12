@@ -218,7 +218,7 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
         local_path = f.name
 
     try:
-        scp_result = await ssh.copy_to(host, local_path, remote_path)
+        scp_result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     finally:
         Path(local_path).unlink(missing_ok=True)
 
@@ -768,7 +768,7 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
                 }
             )
 
-        result = await ssh.copy_to(host, str(local_path), remote_path)
+        result = await ssh.copy_to(host, str(local_path), remote_path, mutating=True)
         return json.dumps(
             {
                 "success": result.exit_code == 0,
@@ -793,7 +793,7 @@ async def transfer_file(
     ssh = _get_ssh()
 
     if direction == "push":
-        result = await ssh.copy_to(host, local_path, remote_path)
+        result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     elif direction == "pull":
         result = await ssh.copy_from(host, remote_path, local_path)
     else:
