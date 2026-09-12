@@ -1182,19 +1182,25 @@ async def build_ssh_from_ticket(
     # checking to avoid stale key errors.
     strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
 
+    # This stack owns resources held by the process-global MCP SSH executor.
+    # Rebuilding the executor (for a new ticket or server reinitialization)
+    # closes its predecessor's key material and TraceClient transport first.
+    global _ssh_key_stack
+    if _ssh_key_stack is not None:
+        await _ssh_key_stack.aclose()
+    _ssh_key_stack = AsyncExitStack()
+
     vault_secret_name = _resolve_vault_secret_name(fields)
     resolved_key = ssh_key
     if vault_secret_name:
-        global _ssh_key_stack
-        if _ssh_key_stack is not None:
-            await _ssh_key_stack.aclose()
-        _ssh_key_stack = AsyncExitStack()
         sp = build_secrets_provider()
         resolved_key = await _ssh_key_stack.enter_async_context(
             resolve_ssh_key(ssh_key, sp, vault_secret_name),
         )
 
     trace_recorder = TraceClient(state_store_url, api_token) if api_token else None
+    if trace_recorder is not None:
+        _ssh_key_stack.callback(trace_recorder.close)
     return SSHExecutor(
         user=ssh_user,
         key_path=resolved_key,
