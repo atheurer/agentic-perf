@@ -26,6 +26,7 @@ from .models import (
     RetryKind,
     TraceEventV1,
 )
+from .operations import AmbiguousOperation, OperationCancelled, operation
 from .payloads import (
     PayloadBlobStore,
     PayloadBuilder,
@@ -73,4 +74,7 @@ __all__ = [
     "SpoolBackpressure",
     "SpoolCorruption",
     "drain_abandoned_spools",
+    "operation",
+    "AmbiguousOperation",
+    "OperationCancelled",
 ]

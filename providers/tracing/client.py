@@ -124,3 +124,65 @@ class TraceClient:
             self.record_critical(event)
 
         return drain_abandoned_spools(self.spool.directory, deliver)
+
+    def operation_register(self, operation_key: str, request_hash: str) -> dict:
+        """Register immutable operation input through authenticated service API."""
+        return self._operation_post(
+            "/operations/register",
+            {"operation_key": operation_key, "request_hash": request_hash},
+        )
+
+    def operation_acquire(
+        self, operation_key: str, request_hash: str, ttl_seconds: float
+    ) -> dict:
+        return self._operation_post(
+            "/operations/acquire",
+            {
+                "operation_key": operation_key,
+                "request_hash": request_hash,
+                "ttl_seconds": ttl_seconds,
+            },
+        )
+
+    def operation_transition(
+        self,
+        operation_key: str,
+        action: str,
+        fencing_token: int,
+        *,
+        descriptor: dict | None = None,
+        external_ids: dict | None = None,
+        ttl_seconds: float | None = None,
+        reconciliation_outcome: str | None = None,
+    ) -> dict:
+        """Submit a server-authorized fenced operation mutation."""
+        payload: dict = {"fencing_token": fencing_token}
+        if descriptor is not None:
+            payload["descriptor"] = descriptor
+        if external_ids is not None:
+            payload["external_ids"] = external_ids
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = ttl_seconds
+        if reconciliation_outcome is not None:
+            payload["reconciliation_outcome"] = reconciliation_outcome
+        return self._operation_post(
+            f"/operations/{operation_key}/{action}",
+            payload,
+        )
+
+    def _operation_post(self, suffix: str, payload: dict) -> dict:
+        if self._closed:
+            raise TraceDeliveryError("trace client is closed")
+        try:
+            response = self._client.post(
+                self.url.removesuffix("/events") + suffix,
+                headers=self._headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or "operation" not in body:
+                raise ValueError("invalid operation acknowledgement")
+            return body
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            raise TraceDeliveryError("operation request was not accepted") from exc
