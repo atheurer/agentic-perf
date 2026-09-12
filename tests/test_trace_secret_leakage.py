@@ -20,6 +20,7 @@ from providers.tracing import (
     TraceEventV1,
     TraceSpool,
 )
+from providers.execution import AuditedFilesystem, RootedPath
 from state_store.trace_store import TracePayloadConflictError, TraceStore
 
 
@@ -141,24 +142,33 @@ def test_secret_is_absent_from_db_wal_spool_blob_and_export(tmp_path) -> None:
         inline_bytes=8,
     )
     descriptor = builder.build("PERF-1", {"password": secret})
-    event = TraceEventV1(
+    events = []
+    filesystem = AuditedFilesystem(
+        RootedPath(tmp_path / "workspace", "workspace"),
         ticket_id="PERF-1",
-        action=ActionDescriptor(type=ActionType.FILESYSTEM, target="workspace://safe"),
-        lifecycle=LifecycleDescriptor(state=LifecycleState.COMPLETED),
-        duration_ms=0,
-        outcome=OperationOutcome.SUCCESS,
-        output=descriptor,
+        emit=events.append,
+        critical=True,
     )
+    filesystem.write("secrets/secret-token.txt", secret)
+    with filesystem.open_stream("keys/private-key.pem") as stream:
+        stream.write(secret.encode())
+    assert events
     spool = TraceSpool(tmp_path / "spool", name="filesystem")
-    spool.append(event)
     with TraceStore(tmp_path / "trace.db") as store:
         store.put_payload_descriptor(descriptor)
+        for event in events:
+            store.insert_event(event)
+            spool.append(event)
         export_source = tmp_path / "export.json"
-        export_source.write_text(event.model_dump_json())
+        export_source.write_text("\n".join(event.model_dump_json() for event in events))
         with tarfile.open(tmp_path / "export.tar.gz", "w:gz") as archive:
             archive.add(export_source, arcname="trace.json")
-        surfaces = _storage_surfaces(tmp_path, descriptor)
+        surfaces = [descriptor.model_dump_json()]
+        for path in tmp_path.rglob("*"):
+            if path.is_file() and "workspace" not in path.relative_to(tmp_path).parts:
+                surfaces.append(path.read_bytes().decode(errors="ignore"))
         assert all(secret not in surface for surface in surfaces)
+        assert "secret-token.txt" not in "".join(surfaces)
 
 
 def test_redaction_failure_returns_only_a_safe_descriptor(
