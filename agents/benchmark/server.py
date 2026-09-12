@@ -2823,11 +2823,15 @@ async def execute_benchmark(
             local_path = f.name
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
-    scp_result = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
-    if staging:
-        staging.unlink(staging_name, missing_ok=True)
-    else:
-        Path(local_path).unlink(missing_ok=True)
+    try:
+        scp_result = await _ssh.copy_to(
+            controller, local_path, remote_path, mutating=True
+        )
+    finally:
+        if staging:
+            staging.unlink(staging_name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
 
     if scp_result.exit_code != 0:
         return json.dumps(
