@@ -322,3 +322,345 @@ async def test_mutating_ssh_fails_closed_without_durable_recorder(
     executor = SSHExecutor(trace_context=new_trace_context(ticket_id="PERF-SSH"))
     with pytest.raises(RuntimeError, match="durable trace readiness"):
         await executor.run("host", "touch /mutating", mutating=True)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 255])
+async def test_ssh_run_audits_success_and_remote_failures(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    """SSH records request, spawn, and exactly one terminal for all RCs."""
+    events: list[object] = []
+
+    class Process:
+        pid = 17
+        returncode = exit_code
+
+        async def communicate(self, input=None):
+            return b"visible-output", b"visible-error"
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    result = await executor.run("host", "command")
+    assert result.exit_code == exit_code
+    assert [event.lifecycle.state for event in events] == [
+        LifecycleState.REQUESTED,
+        LifecycleState.LAUNCHED,
+        LifecycleState.COMPLETED if exit_code == 0 else LifecycleState.FAILED,
+    ]
+    assert events[-1].attributes["local_pid"] == 17
+
+
+async def test_ssh_run_timeout_cancellation_and_launch_failure_are_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout, task cancellation, and spawn errors each close the action."""
+
+    class Process:
+        pid = 18
+        returncode = None
+
+        async def communicate(self, input=None):
+            await asyncio.Event().wait()
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            return None
+
+    for mode, expected in (
+        ("timeout", LifecycleState.TIMED_OUT),
+        ("cancel", LifecycleState.CANCELLED),
+        ("launch", LifecycleState.FAILED),
+    ):
+        events: list[object] = []
+
+        async def spawn(*_args: object, **_kwargs: object) -> Process:
+            if mode == "launch":
+                raise OSError("spawn failed")
+            return Process()
+
+        monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+        executor = SSHExecutor(
+            trace_context=new_trace_context(ticket_id="PERF-SSH"),
+            trace_recorder=type(
+                "Recorder",
+                (),
+                {"record_critical": lambda _, event: events.append(event)},
+            )(),
+        )
+        if mode == "timeout":
+            assert (await executor.run("host", "command", timeout=0.01)).exit_code == -1
+        elif mode == "cancel":
+            task = asyncio.create_task(executor.run("host", "command"))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OSError, match="spawn failed"):
+                await executor.run("host", "command")
+        assert events[-1].lifecycle.state == expected
+
+
+@pytest.mark.parametrize("method", ["copy_to", "copy_from"])
+@pytest.mark.parametrize("mode", ["timeout", "cancel", "launch"])
+async def test_scp_timeout_cancellation_and_launch_failure_are_audited(
+    monkeypatch: pytest.MonkeyPatch, method: str, mode: str
+) -> None:
+    events: list[object] = []
+
+    class Process:
+        pid = 19
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.Event().wait()
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            return None
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        if mode == "launch":
+            raise OSError("spawn failed")
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SCP"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    call = getattr(executor, method)
+    if mode == "timeout":
+        assert (
+            await call("host", "source", "destination", timeout=0.01)
+        ).exit_code == -1
+        expected = LifecycleState.TIMED_OUT
+    elif mode == "cancel":
+        task = asyncio.create_task(call("host", "source", "destination"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        expected = LifecycleState.CANCELLED
+    else:
+        with pytest.raises(OSError, match="spawn failed"):
+            await call("host", "source", "destination")
+        expected = LifecycleState.FAILED
+    assert events[-1].lifecycle.state == expected
+
+
+async def test_progress_callback_success_retains_progress_ancestor() -> None:
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    replies = iter(
+        [
+            SSHResult("/tmp/run\n", "", 0),
+            SSHResult("__PID:9\n", "", 0),
+            SSHResult("", "", 0),
+            SSHResult("progress\n", "", 0),
+            SSHResult("output", "", 0),
+            SSHResult("0", "", 0),
+            SSHResult("", "", 0),
+        ]
+    )
+    observed: list[str] = []
+
+    async def fake_run(*_: object, **__: object) -> SSHResult:
+        return next(replies)
+
+    async def callback(line: str, _: int) -> None:
+        observed.append(line)
+
+    executor.run = fake_run
+    original_sleep = asyncio.sleep
+    asyncio.sleep = lambda _: original_sleep(0)
+    try:
+        assert (
+            await executor.run_with_progress("host", "command", callback, 1)
+        ).exit_code == 0
+    finally:
+        asyncio.sleep = original_sleep
+    progress = [event for event in events if event.action.phase == "ssh_progress"]
+    callback_events = [
+        event for event in events if event.action.phase == "ssh_progress_callback"
+    ]
+    assert observed == ["progress"]
+    assert progress[-1].lifecycle.state == LifecycleState.COMPLETED
+    assert [event.lifecycle.state for event in callback_events] == [
+        LifecycleState.REQUESTED,
+        LifecycleState.COMPLETED,
+    ]
+    assert callback_events[0].parent_action_id == progress[0].action_id
+
+
+@pytest.mark.parametrize("failure", ["output", "rc"])
+async def test_progress_collection_failures_still_attempt_cleanup(failure: str) -> None:
+    """Output and malformed-RC failures both remove the capture directory."""
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type("Recorder", (), {"record_critical": lambda *_: None})(),
+    )
+    replies = [
+        SSHResult("/tmp/run\n", "", 0),
+        SSHResult("__PID:9\n", "", 0),
+        SSHResult("", "", 0),
+    ]
+    if failure == "output":
+        replies.extend([SSHResult("", "cannot read", 255), SSHResult("", "", 0)])
+    else:
+        replies.extend(
+            [
+                SSHResult("output", "", 0),
+                SSHResult("not-an-int", "", 0),
+                SSHResult("", "", 0),
+            ]
+        )
+    commands: list[str] = []
+
+    async def fake_run(_host: str, command: str, **_: object) -> SSHResult:
+        commands.append(command)
+        return replies.pop(0)
+
+    executor.run = fake_run
+    original_sleep = asyncio.sleep
+    asyncio.sleep = lambda _: original_sleep(0)
+    try:
+        result = await executor.run_with_progress("host", "command", poll_interval=1)
+    finally:
+        asyncio.sleep = original_sleep
+    assert result.exit_code != 0
+    assert "rm -rf /tmp/run" in commands
+
+
+async def test_progress_post_launch_cancellation_attempts_cleanup() -> None:
+    """Cancellation after PID capture has a cancelled parent and cleanup action."""
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, event: events.append(event)}
+        )(),
+    )
+    replies = iter([SSHResult("/tmp/run\n", "", 0), SSHResult("__PID:9\n", "", 0)])
+    commands: list[str] = []
+
+    async def fake_run(_host: str, command: str, **_: object) -> SSHResult:
+        commands.append(command)
+        if command.startswith("rm -rf"):
+            return SSHResult("", "", 0)
+        return next(replies)
+
+    async def cancelled(_: float) -> None:
+        raise asyncio.CancelledError
+
+    executor.run = fake_run
+    original_sleep = asyncio.sleep
+    asyncio.sleep = cancelled
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await executor.run_with_progress("host", "command", poll_interval=1)
+    finally:
+        asyncio.sleep = original_sleep
+    assert "rm -rf /tmp/run" in commands
+    progress = [event for event in events if event.action.phase == "ssh_progress"]
+    assert progress[-1].lifecycle.state == LifecycleState.CANCELLED
+
+
+def test_audit_events_never_persist_command_stdin_or_stream_secrets(
+    tmp_path: Path,
+) -> None:
+    """The durable fixture proves all three sensitive values stay out of traces."""
+    secret = "audit-secret-must-not-persist"
+
+    class Process:
+        pid = 20
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return f"output {secret}".encode(), f"error {secret}".encode()
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    async def exercise() -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            executor = SSHExecutor(
+                trace_context=new_trace_context(ticket_id="PERF-SECRET"),
+                trace_recorder=store,
+            )
+            original = asyncio.create_subprocess_exec
+            asyncio.create_subprocess_exec = spawn
+            try:
+                await executor.run("host", f"echo {secret}", stdin_data=secret.encode())
+            finally:
+                asyncio.create_subprocess_exec = original
+
+    asyncio.run(exercise())
+    assert secret.encode() not in (tmp_path / "trace.db").read_bytes()
+
+
+def test_requested_and_launched_actions_have_one_terminal() -> None:
+    """The action lifecycle invariant holds for a concrete SSH operation."""
+    events: list[object] = []
+
+    class Process:
+        pid = 21
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"", b""
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    async def exercise() -> None:
+        executor = SSHExecutor(
+            trace_context=new_trace_context(ticket_id="PERF-INVARIANT"),
+            trace_recorder=type(
+                "Recorder",
+                (),
+                {"record_critical": lambda _, event: events.append(event)},
+            )(),
+        )
+        original = asyncio.create_subprocess_exec
+        asyncio.create_subprocess_exec = spawn
+        try:
+            await executor.run("host", "command")
+        finally:
+            asyncio.create_subprocess_exec = original
+
+    asyncio.run(exercise())
+    terminal = {
+        LifecycleState.COMPLETED,
+        LifecycleState.FAILED,
+        LifecycleState.TIMED_OUT,
+        LifecycleState.CANCELLED,
+    }
+    actions: dict[str, list[object]] = {}
+    for event in events:
+        actions.setdefault(event.action_id, []).append(event)
+    for lifecycle in actions.values():
+        if any(
+            event.lifecycle.state in {LifecycleState.REQUESTED, LifecycleState.LAUNCHED}
+            for event in lifecycle
+        ):
+            assert sum(event.lifecycle.state in terminal for event in lifecycle) == 1

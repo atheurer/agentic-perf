@@ -587,33 +587,36 @@ class SSHExecutor:
                 last_line = lines[-1] if lines else ""
                 if last_line and last_line != last_reported:
                     last_reported = last_line
+                    callback_trace = _SSHTraceAction(
+                        SSHExecutor(
+                            user=self.user,
+                            key_path=self.key_path,
+                            connect_timeout=self.connect_timeout,
+                            strict_host_key=self.strict_host_key,
+                            trace_context=progress.context,
+                            trace_recorder=self.trace_recorder,
+                        ),
+                        "ssh_progress_callback",
+                        host,
+                    )
+                    callback_trace.record(
+                        LifecycleState.REQUESTED,
+                        remote_pid=pid,
+                    )
                     try:
                         await progress_callback(last_line, elapsed)
                     except Exception as exc:
                         # Callback failures must be visible even though the
                         # remote command continues and retains its API result.
-                        callback_trace = _SSHTraceAction(
-                            SSHExecutor(
-                                user=self.user,
-                                key_path=self.key_path,
-                                connect_timeout=self.connect_timeout,
-                                strict_host_key=self.strict_host_key,
-                                trace_context=progress.context,
-                                trace_recorder=self.trace_recorder,
-                            ),
-                            "ssh_progress_callback",
-                            host,
-                        )
-                        callback_trace.record(
-                            LifecycleState.REQUESTED,
-                            remote_pid=pid,
-                            error_type=type(exc).__name__,
-                            error_digest=self._digest(str(exc)),
-                        )
                         callback_trace.terminal(
                             LifecycleState.FAILED,
                             remote_pid=pid,
                             error_type=type(exc).__name__,
+                        )
+                    else:
+                        callback_trace.terminal(
+                            LifecycleState.COMPLETED,
+                            remote_pid=pid,
                         )
 
             if finished:
