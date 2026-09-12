@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -88,8 +88,24 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def restore_trace_context(request: Request, call_next):
-        """Restore trusted transport correlation; request bodies never set it."""
+        """Restore correlation only from an authenticated internal caller.
+
+        Middleware runs before route dependencies, so authenticate here before
+        binding anything.  A user token (or a forged marker) may authorize the
+        route but can never choose its causal parent.
+        """
         if request.headers.get("X-Agentic-Perf-Causal-Context") != "v1":
+            return await call_next(request)
+        auth = getattr(request.app.state, "auth_dependency", None)
+        if auth is None:
+            return await call_next(request)
+        try:
+            principal = await auth(request)
+        except HTTPException:
+            # The route dependency returns the normal authentication response;
+            # importantly, no untrusted context is bound on that path.
+            return await call_next(request)
+        if principal.kind != "service":
             return await call_next(request)
         traceparent = request.headers.get("traceparent", "").split("-")
         try:

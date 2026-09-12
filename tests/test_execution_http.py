@@ -10,7 +10,13 @@ from providers.execution import (
     AuditedAsyncHTTPClient,
     AuditedHTTPClient,
 )
-from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
+from providers.tracing import (
+    TraceSpool,
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
+from state_store.trace_store import TraceStore
 
 
 def _context():
@@ -82,9 +88,23 @@ async def test_mutating_retry_keeps_idempotency_key() -> None:
         event.lifecycle.attempt
         for event in events
         if event.lifecycle.state.value == "requested"
-    ] == [1, 2]
-    terminal = [event for event in events if event.outcome is not None]
-    assert len({event.action_id for event in terminal}) == len(terminal)
+    ] == [1, 1, 2]
+    operation_id = events[0].action_id
+    operation = [event for event in events if event.action_id == operation_id]
+    assert [event.lifecycle.state.value for event in operation] == [
+        "requested",
+        "retry_scheduled",
+        "completed",
+    ]
+    attempts = [event for event in events if event.action_id != operation_id]
+    assert [event.lifecycle.state.value for event in attempts] == [
+        "requested",
+        "failed",
+        "requested",
+        "completed",
+    ]
+    assert all(event.parent_action_id == operation[0].action_id for event in attempts)
+    assert len([event for event in operation if event.outcome is not None]) == 1
 
 
 @pytest.mark.asyncio
@@ -112,11 +132,151 @@ async def test_ambiguous_mutating_timeout_is_not_replayed() -> None:
     finally:
         reset_trace_context(token)
 
-    assert (
-        len([event for event in events if event.lifecycle.state.value == "requested"])
-        == 1
-    )
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "requested",
+        "timed_out",
+        "indeterminate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pre_send_connect_error_retries_without_idempotency_support() -> None:
+    events = []
+    calls = 0
+
+    async def emit(event):
+        events.append(event)
+
+    async def fail_then_succeed(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("dns unavailable")
+        return httpx.Response(201)
+
+    token = _context()
+    try:
+        client = AuditedAsyncHTTPClient(
+            client=type("Client", (), {"request": fail_then_succeed})(),
+            emit=emit,
+            retries=1,
+        )
+        assert (await client.post("https://provider.example/jobs")).status_code == 201
+    finally:
+        reset_trace_context(token)
+    assert calls == 2
+    assert [event.lifecycle.state.value for event in events] == [
+        "requested",
+        "requested",
+        "failed",
+        "requested",
+        "completed",
+        "completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_pre_send_connect_error_is_definite_failure() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    async def fail(*_args, **_kwargs):
+        raise httpx.ConnectTimeout("connect timeout")
+
+    token = _context()
+    try:
+        client = AuditedAsyncHTTPClient(
+            client=type("Client", (), {"request": fail})(), emit=emit, retries=1
+        )
+        with pytest.raises(httpx.ConnectTimeout):
+            await client.post("https://provider.example/jobs")
+    finally:
+        reset_trace_context(token)
     assert events[-1].lifecycle.state.value == "timed_out"
+    assert events[-1].outcome.value == "timed_out"
+
+
+@pytest.mark.asyncio
+async def test_target_paths_and_automatic_redirects_are_safe() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    seen = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://other.example/next"})
+
+    token = _context()
+    try:
+        client = AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(redirect), follow_redirects=True
+            ),
+            emit=emit,
+        )
+        with pytest.raises(ValueError, match="automatic redirects"):
+            await client.post("https://api.example/jobs", follow_redirects=True)
+        response = await client.get(
+            "https://api.example/webhooks/super-secret-token-1234567890"
+        )
+    finally:
+        reset_trace_context(token)
+    assert "super-secret-token-1234567890" not in events[-1].attributes["target"]
+    assert response.status_code == 302
+    assert seen == ["https://api.example/webhooks/super-secret-token-1234567890"]
+
+
+@pytest.mark.asyncio
+async def test_audited_http_secrets_never_reach_db_wal_spool_or_export(
+    tmp_path,
+) -> None:
+    """Scan every persisted/auditable representation, including a live WAL."""
+    events = []
+    secrets = {
+        "auth-cookie-791",
+        "request-body-791",
+        "query-secret-791",
+        "webhook-secret-791-0123456789",
+        "userinfo-secret-791",
+    }
+
+    async def emit(event):
+        events.append(event)
+
+    token = _context()
+    try:
+        async with AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(201))
+            ),
+            emit=emit,
+        ) as client:
+            await client.post(
+                "https://user:userinfo-secret-791@api.example/webhooks/"
+                "webhook-secret-791-0123456789?token=query-secret-791",
+                headers={"Cookie": "session=auth-cookie-791"},
+                json={"password": "request-body-791"},
+            )
+    finally:
+        reset_trace_context(token)
+
+    spool = TraceSpool(tmp_path / "spool", name="audit")
+    with TraceStore(tmp_path / "trace.db") as store:
+        for event in events:
+            store.insert_event(event)
+            spool.append(event)
+        surfaces = [event.model_dump_json() for event in events]  # export fixture
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                surfaces.append(path.read_bytes().decode(errors="ignore"))
+        assert all(secret not in surface for secret in secrets for surface in surfaces)
+    spool.close()
 
 
 @pytest.mark.asyncio
@@ -220,6 +380,8 @@ async def test_cancel_records_one_terminal_event() -> None:
         reset_trace_context(token)
     assert [event.lifecycle.state.value for event in events] == [
         "requested",
+        "requested",
+        "cancelled",
         "cancelled",
     ]
 

@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -20,7 +21,13 @@ from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
-from providers.tracing import bind_trace_context, reset_trace_context
+from providers.tracing import (
+    bind_trace_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+    trace_headers,
+)
 
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -335,7 +342,13 @@ def _missing_host_tuning(cf: dict) -> str:
     return ""
 
 
-def _apply_step_overrides(
+async def _await_if_needed(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _apply_step_overrides(
     store_url: str,
     client: object,
     ticket_id: str,
@@ -406,13 +419,15 @@ def _apply_step_overrides(
             override_fields["scoped_context"] = scoped
 
     if override_fields:
-        client.patch(
-            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": override_fields},
+        await _await_if_needed(
+            client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": override_fields},
+            )
         )
 
 
-def _advance_plan(
+async def _advance_plan(
     store_url: str,
     ticket_id: str,
     completed_status: str,
@@ -425,11 +440,12 @@ def _advance_plan(
     Only advances if the completed agent matches the current step's
     agent_type.
     """
-    import httpx
-
-    client = httpx.Client(timeout=10.0, headers=_auth_headers())
-    try:
-        r = client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+    context = current_trace_context() or new_trace_context(
+        ticket_id=ticket_id, agent_id="orchestrator"
+    )
+    headers = _auth_headers() | trace_headers(context)
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
             return
         ticket = r.json()
@@ -481,7 +497,7 @@ def _advance_plan(
                     f"tuning ({missing}) but configuration_applied is empty "
                     f"— blocking advance to benchmark"
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={
                         "status": "awaiting_customer_guidance",
@@ -516,11 +532,11 @@ def _advance_plan(
         # (the ticket may be in any status at this point).
         stop_after = cf.get("stop_after_step")
         if stop_after and step.get("agent_type") == stop_after:
-            client.patch(
+            await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={"fields": {"execution_plan": plan}},
             )
-            client.post(
+            await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={
                     "author": "orchestrator",
@@ -530,7 +546,7 @@ def _advance_plan(
                     ),
                 },
             )
-            client.post(
+            await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/force-close",
             )
             return
@@ -581,15 +597,8 @@ def _advance_plan(
                 # Apply step overrides BEFORE saving the plan
                 # so that mutations (e.g. analysis-informed
                 # benchmark params) are persisted.
-                _apply_step_overrides(
-                    store_url,
-                    client,
-                    ticket_id,
-                    next_step,
-                    cf,
-                )
-
-                client.patch(
+                await _apply_step_overrides(store_url, client, ticket_id, next_step, cf)
+                await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
                         "fields": {
@@ -603,7 +612,7 @@ def _advance_plan(
                     "label",
                     next_step["agent_type"],
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
                         "author": "orchestrator",
@@ -618,13 +627,13 @@ def _advance_plan(
                 comment = (
                     f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={"status": next_status, "comment": comment},
                 )
                 return
 
-        client.patch(
+        await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={
                 "fields": {
@@ -633,8 +642,6 @@ def _advance_plan(
                 },
             },
         )
-    finally:
-        client.close()
 
 
 async def run_agent_task(
@@ -912,7 +919,7 @@ async def run_agent_task(
 
         if success and status in PLAN_AGENT_STATUS.values():
             try:
-                _advance_plan(
+                await _advance_plan(
                     dispatcher.store_url,
                     ticket_id,
                     status,

@@ -48,6 +48,9 @@ _REQUEST_ID_HEADERS = frozenset(
     }
 )
 _READ_ONLY = frozenset({"GET", "HEAD", "OPTIONS"})
+_SECRET_PATH_LABELS = frozenset(
+    {"callback", "callbacks", "hook", "hooks", "token", "tokens", "webhook", "webhooks"}
+)
 
 
 class AmbiguousHTTPReplayError(httpx.RequestError):
@@ -55,12 +58,29 @@ class AmbiguousHTTPReplayError(httpx.RequestError):
 
 
 def _safe_target(url: str | httpx.URL) -> str:
-    """Keep only scheme, authority, and path; signed queries are credentials."""
+    """Keep a useful target without retaining signed or secret path material."""
     parsed = urlsplit(str(url))
     host = parsed.hostname or ""
     if parsed.port:
         host = f"{host}:{parsed.port}"
-    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    segments = parsed.path.split("/")
+    sanitized: list[str] = []
+    redact_next = False
+    for segment in segments:
+        lower = segment.lower()
+        high_entropy = (
+            len(segment) >= 24
+            and any(char.isdigit() for char in segment)
+            and sum(char.isalnum() or char in "-_=." for char in segment)
+            == len(segment)
+        )
+        if redact_next or high_entropy:
+            digest = hashlib.sha256(segment.encode()).hexdigest()[:16]
+            sanitized.append(f"[redacted:{digest}]")
+        else:
+            sanitized.append(segment)
+        redact_next = lower in _SECRET_PATH_LABELS
+    return urlunsplit((parsed.scheme, host, "/".join(sanitized), "", ""))
 
 
 def _safe_headers(headers: Any) -> dict[str, str]:
@@ -207,20 +227,23 @@ class _AuditedHTTPBase:
                 if state == LifecycleState.COMPLETED
                 else OperationOutcome.FAILURE
             )
+        request_headers = None
+        if response is not None:
+            try:
+                request_headers = response.request.headers
+            except RuntimeError:
+                # Lightweight provider test doubles may not attach a request.
+                pass
         attrs: dict[str, Any] = {
             "method": method,
             "target": target,
-            "safe_headers": _safe_headers(
-                getattr(response, "request", None).headers
-                if response is not None and response.request is not None
-                else None
-            ),
+            "safe_headers": _safe_headers(request_headers),
         }
         if response is not None:
             attrs["status_code"] = response.status_code
             attrs["provider_request_id"] = next(
                 (
-                    response.headers[h]
+                    str(response.headers[h])[:256]
                     for h in _REQUEST_ID_HEADERS
                     if h in response.headers
                 ),
@@ -356,6 +379,13 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
         self, method: str, url: str | httpx.URL, **kwargs: Any
     ) -> httpx.Response:
         send_method = kwargs.pop("_audit_send_method", None)
+        if kwargs.pop("follow_redirects", False):
+            raise ValueError(
+                "automatic redirects are disabled for audited HTTP; issue a separately audited request"
+            )
+        # Override both per-call and client-constructor defaults.  A redirect
+        # is a new target and must be initiated explicitly so it is audited.
+        kwargs["follow_redirects"] = False
         method, target = method.upper(), _safe_target(url)
         context = self._context(method)
         mutating = method not in _READ_ONLY
@@ -364,6 +394,21 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
         payload = _request_payload(kwargs)
         if mutating and context is None:
             raise TraceDeliveryError("mutating HTTP requires a ticket trace context")
+        # An operation owns the complete request, while each wire attempt is a
+        # child action.  This makes joins deterministic even after retries.
+        operation_started = time.monotonic()
+        await self._record(
+            self._event(
+                context,
+                LifecycleState.REQUESTED,
+                method=method,
+                target=target,
+                attempt=1,
+                idempotency_key=key,
+                input=payload,
+            ),
+            critical=mutating,
+        )
         for attempt in range(1, self.retries + 2):
             request_context = child_context(context) if context is not None else None
             kwargs["headers"] = self._headers(
@@ -401,6 +446,19 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
                     ),
                     critical=mutating,
                 )
+                await self._record(
+                    self._event(
+                        context,
+                        LifecycleState.CANCELLED,
+                        method=method,
+                        target=target,
+                        attempt=1,
+                        idempotency_key=key,
+                        input=payload,
+                        duration_ms=(time.monotonic() - operation_started) * 1000,
+                    ),
+                    critical=mutating,
+                )
                 raise
             except httpx.TimeoutException as exc:
                 state = LifecycleState.TIMED_OUT
@@ -418,19 +476,41 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
                     ),
                     critical=mutating,
                 )
-                if (
-                    attempt <= self.retries
-                    and can_replay
-                    and self._retryable_before_send(exc)
-                ):
+                if attempt <= self.retries and self._retryable_before_send(exc):
                     continue
-                if mutating and (
-                    not can_replay or not self._retryable_before_send(exc)
-                ):
+                if mutating and not self._retryable_before_send(exc):
+                    await self._record(
+                        self._event(
+                            context,
+                            LifecycleState.INDETERMINATE,
+                            method=method,
+                            target=target,
+                            attempt=1,
+                            idempotency_key=key,
+                            input=payload,
+                            duration_ms=(time.monotonic() - operation_started) * 1000,
+                            error=exc,
+                        ),
+                        critical=True,
+                    )
                     raise AmbiguousHTTPReplayError(
                         "mutating request timed out after send; refusing replay",
                         request=getattr(exc, "request", None),
                     ) from exc
+                await self._record(
+                    self._event(
+                        context,
+                        state,
+                        method=method,
+                        target=target,
+                        attempt=1,
+                        idempotency_key=key,
+                        input=payload,
+                        duration_ms=(time.monotonic() - operation_started) * 1000,
+                        error=exc,
+                    ),
+                    critical=mutating,
+                )
                 raise
             except httpx.HTTPError as exc:
                 await self._record(
@@ -447,19 +527,41 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
                     ),
                     critical=mutating,
                 )
-                if (
-                    attempt <= self.retries
-                    and can_replay
-                    and self._retryable_before_send(exc)
-                ):
+                if attempt <= self.retries and self._retryable_before_send(exc):
                     continue
-                if mutating and (
-                    not can_replay or not self._retryable_before_send(exc)
-                ):
+                if mutating and not self._retryable_before_send(exc):
+                    await self._record(
+                        self._event(
+                            context,
+                            LifecycleState.INDETERMINATE,
+                            method=method,
+                            target=target,
+                            attempt=1,
+                            idempotency_key=key,
+                            input=payload,
+                            duration_ms=(time.monotonic() - operation_started) * 1000,
+                            error=exc,
+                        ),
+                        critical=True,
+                    )
                     raise AmbiguousHTTPReplayError(
                         "mutating request failed after send; refusing replay",
                         request=getattr(exc, "request", None),
                     ) from exc
+                await self._record(
+                    self._event(
+                        context,
+                        LifecycleState.FAILED,
+                        method=method,
+                        target=target,
+                        attempt=1,
+                        idempotency_key=key,
+                        input=payload,
+                        duration_ms=(time.monotonic() - operation_started) * 1000,
+                        error=exc,
+                    ),
+                    critical=mutating,
+                )
                 raise
             headers = getattr(response, "headers", {})
             content_type = (
@@ -506,6 +608,21 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
                     critical=mutating,
                 )
                 continue
+            await self._record(
+                self._event(
+                    context,
+                    state,
+                    method=method,
+                    target=target,
+                    attempt=1,
+                    idempotency_key=key,
+                    input=payload,
+                    output=output,
+                    duration_ms=(time.monotonic() - operation_started) * 1000,
+                    response=response,
+                ),
+                critical=mutating,
+            )
             return response
         raise AssertionError("unreachable")
 

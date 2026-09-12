@@ -30,12 +30,19 @@ async def test_state_store_restores_only_internal_causal_context(
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     )
-    accepted = await client.post("/_test_context", headers=trace_headers(trace_context))
+    accepted = await client.post(
+        "/_test_context",
+        headers={
+            **trace_headers(trace_context),
+            "Authorization": f"Bearer {app.state.api_token}",
+        },
+    )
     rejected = await client.post(
         "/_test_context",
         headers={
             "traceparent": f"00-{trace_context.trace_id}-{trace_context.action_id}-01",
             "X-Agentic-Perf-Ticket-Id": "forged",
+            "X-Agentic-Perf-Causal-Context": "v1",
         },
     )
     await client.aclose()
