@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from orchestrator.config import _load_config_file
 from paths import TRACE_DB_PATH, get_instance_name
 from providers.events import EventBus
+from providers.tracing import TraceContext, bind_trace_context, reset_trace_context
 
 from .api.router import api_router, chat_router, health_router, webhook_router
 from .audit import AuditLog, set_actor
@@ -84,6 +85,30 @@ def create_app() -> FastAPI:
         "schema_rejections": 0,
         "quarantined_frames": 0,
     }
+
+    @app.middleware("http")
+    async def restore_trace_context(request: Request, call_next):
+        """Restore trusted transport correlation; request bodies never set it."""
+        traceparent = request.headers.get("traceparent", "").split("-")
+        try:
+            context = TraceContext(
+                ticket_id=request.headers.get("X-Agentic-Perf-Ticket-Id") or None,
+                agent_id=request.headers.get("X-Agentic-Perf-Agent-Id") or None,
+                invocation_id=request.headers.get("X-Agentic-Perf-Invocation-Id")
+                or None,
+                trace_id=traceparent[1],
+                action_id=request.headers.get("X-Agentic-Perf-Action-Id")
+                or traceparent[2],
+                parent_action_id=request.headers.get("X-Agentic-Perf-Parent-Action-Id")
+                or None,
+            )
+        except (IndexError, ValueError):
+            return await call_next(request)
+        token = bind_trace_context(context)
+        try:
+            return await call_next(request)
+        finally:
+            reset_trace_context(token)
 
     @app.exception_handler(RequestValidationError)
     async def count_trace_schema_rejections(
@@ -232,6 +257,7 @@ def create_app() -> FastAPI:
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,
+        trace_store=app.state.trace_store,
     )
     mount_routers(app, auth, rate_limit_dep)
 

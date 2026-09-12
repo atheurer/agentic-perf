@@ -21,11 +21,21 @@ provider-agnostic ``check_available_resources`` interface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import MutableMapping
 from typing import Any
 
 from providers.events import EventBus
 from providers.llm.base import LLMProvider
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    OperationOutcome,
+    TraceRecorder,
+    new_trace_context,
+    trace_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,8 @@ class FleetCoordinatorAgent:
     ) -> None:
         self.store_url = state_store_url
         self._events = event_bus
+        self.trace_context = None
+        self._trace = TraceRecorder()
         # LLM provider accepted but unused — keeps dispatcher
         # interface consistent.
         import httpx
@@ -63,6 +75,16 @@ class FleetCoordinatorAgent:
 
     async def run(self, ticket_id: str) -> None:
         """Coordinate one fleet iteration step."""
+        self.trace_context = self.trace_context or new_trace_context(
+            ticket_id=ticket_id, agent_id=self.agent_name
+        )
+        self._trace.context = self.trace_context
+        if isinstance(self._client.headers, MutableMapping):
+            self._client.headers.update(trace_headers(self.trace_context))
+        self._trace.record(
+            self.trace_context, ActionType.AGENT, LifecycleState.STARTED, phase="run"
+        )
+        terminal, outcome = LifecycleState.COMPLETED, OperationOutcome.SUCCESS
         try:
             ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
@@ -79,7 +101,11 @@ class FleetCoordinatorAgent:
                 },
             )
             await self._coordinate(ticket_id)
+        except asyncio.CancelledError:
+            terminal, outcome = LifecycleState.CANCELLED, OperationOutcome.CANCELLED
+            raise
         except Exception as e:
+            terminal, outcome = LifecycleState.FAILED, OperationOutcome.FAILURE
             logger.error(
                 f"[fleet-coordinator] {ticket_id}: {e}",
                 exc_info=True,
@@ -96,6 +122,14 @@ class FleetCoordinatorAgent:
             )
         finally:
             self._emit(ticket_id, "agent_finished", {})
+            self._trace.record(
+                self.trace_context,
+                ActionType.AGENT,
+                terminal,
+                phase="run",
+                duration_ms=0,
+                outcome=outcome,
+            )
             await self._client.aclose()
 
     async def _coordinate(self, ticket_id: str) -> None:

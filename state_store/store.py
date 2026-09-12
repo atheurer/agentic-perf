@@ -7,6 +7,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
+from providers.tracing import (
+    ActionDescriptor,
+    ActionType,
+    LifecycleDescriptor,
+    LifecycleState,
+    OperationOutcome,
+    TraceEventV1,
+    child_context,
+    current_trace_context,
+)
 
 from .audit import AuditLog
 from .directives import parse_verbatim_directives
@@ -37,6 +47,7 @@ class TicketStore:
         persist_dir: str | Path | None = None,
         audit_log: AuditLog | None = None,
         event_bus: object | None = None,
+        trace_store: object | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
         self._lock = threading.Lock()
@@ -45,11 +56,50 @@ class TicketStore:
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._audit = audit_log
         self._event_bus = event_bus
+        self._trace_store = trace_store
         self._load_from_disk()
 
     def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
         if self._audit is not None:
             self._audit.log(mutation, ticket_id, data)
+
+    def _trace_mutation(
+        self,
+        ticket_id: str,
+        mutation: str,
+        *,
+        rejected: bool = False,
+        attributes: dict | None = None,
+    ) -> None:
+        """Persist a state outcome under the request context when available."""
+        context = current_trace_context()
+        if self._trace_store is None or context is None:
+            return
+        child = child_context(context)
+        try:
+            self._trace_store.insert_event_result(
+                TraceEventV1(
+                    ticket_id=ticket_id,
+                    agent_id=context.agent_id,
+                    invocation_id=context.invocation_id,
+                    trace_id=child.trace_id,
+                    action_id=child.action_id,
+                    parent_action_id=child.parent_action_id,
+                    action=ActionDescriptor(type=ActionType.STATE, target=mutation),
+                    lifecycle=LifecycleDescriptor(
+                        state=LifecycleState.REJECTED
+                        if rejected
+                        else LifecycleState.COMPLETED
+                    ),
+                    duration_ms=0,
+                    outcome=OperationOutcome.REJECTED
+                    if rejected
+                    else OperationOutcome.SUCCESS,
+                    attributes=attributes,
+                )
+            )
+        except Exception:
+            logger.exception("failed to persist state mutation trace")
 
     def create_ticket(
         self,
@@ -81,6 +131,7 @@ class TicketStore:
                 ticket.id,
                 {"summary": ticket.summary[:200]},
             )
+            self._trace_mutation(ticket.id, "create_ticket")
             return ticket.model_copy()
 
     def get_ticket(self, ticket_id: str) -> Ticket:
@@ -158,6 +209,15 @@ class TicketStore:
                 allowed = VALID_TRANSITIONS.get(current, [])
 
             if new_status not in allowed:
+                self._trace_mutation(
+                    ticket_id,
+                    "transition_ticket",
+                    rejected=True,
+                    attributes={
+                        "old_state": current.value,
+                        "new_state": new_status.value,
+                    },
+                )
                 raise InvalidTransition(
                     f"Cannot transition from {current.value} to {new_status.value}. "
                     f"Allowed: {[s.value for s in allowed]}"
@@ -194,6 +254,11 @@ class TicketStore:
                     "new_status": new_status.value,
                     "comment": request.comment,
                 },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "transition_ticket",
+                attributes={"old_state": old_status, "new_state": new_status.value},
             )
 
             # Emit transition event so the dashboard
@@ -235,6 +300,7 @@ class TicketStore:
                 ticket_id,
                 {"field_names": sorted(fields.keys())},
             )
+            self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
 
     def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
@@ -271,6 +337,7 @@ class TicketStore:
                 ticket_id,
                 {"author": request.author, "comment_id": comment.id},
             )
+            self._trace_mutation(ticket_id, "add_comment")
             return comment.model_copy()
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
@@ -308,6 +375,7 @@ class TicketStore:
                             "held_by": existing["owner"],
                         },
                     )
+                    self._trace_mutation(ticket_id, "claim_ticket", rejected=True)
                     return None
 
             expires = now + timedelta(seconds=duration_seconds)
@@ -328,6 +396,7 @@ class TicketStore:
                     "result": "claimed",
                 },
             )
+            self._trace_mutation(ticket_id, "claim_ticket")
             return claim
 
     def release_claim(self, ticket_id: str, owner: str) -> bool:
@@ -372,6 +441,7 @@ class TicketStore:
                     ticket_id,
                     {"owner": owner, "result": "not_owner"},
                 )
+                self._trace_mutation(ticket_id, "renew_claim", rejected=True)
                 return None
 
             now = datetime.now(timezone.utc)
@@ -388,6 +458,7 @@ class TicketStore:
                     "result": "renewed",
                 },
             )
+            self._trace_mutation(ticket_id, "renew_claim")
             return existing
 
     def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
