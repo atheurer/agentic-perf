@@ -1,11 +1,11 @@
 # Filesystem audit inventory
 
-The checked inventory command is:
-
-```bash
-rg -n 'write_text\(|write_bytes\(|\.unlink\(|NamedTemporaryFile|mkstemp|os\.replace|\.rename\(' \
-  agents providers state_store paths.py --glob '*.py'
-```
+`tests/test_filesystem_inventory.py` parses every Python module under `agents`,
+`orchestrator`, `providers`, and `state_store`, plus `paths.py`. It recognizes
+path mutation methods, write-mode `open`/`fdopen`/`tarfile.open`, OS and shutil
+mutators, and temporary-file constructors. Its fixed `file:line:call` manifest
+must exactly equal the discovered set, so additions, removals, and moved calls
+require review.
 
 Ticket-owned paths must use `AuditedFilesystem`: ticket persistence/archive
 (`state_store/store.py`), workspaces (`providers/workspace/manager.py`), artifact
@@ -15,37 +15,35 @@ directory creation (`paths.py`), artifact export archives
 recorder use the process-managed, fsyncing trace spool and fail closed if it is
 unavailable.
 
-The remaining direct filesystem calls are intentionally excluded:
+The manifest entries fall into these reviewed classes:
 
-* `providers/tracing/{spool,payloads,fingerprints}.py`: trace transport internals
-  cannot recursively emit trace filesystem events; their own checksummed atomic
-  protocol is the durable recorder.
-* `state_store/auth.py`, `state_store/identity.py`, and
-  `providers/resource/jumpstarter.py`: instance/operator credentials or provider
-  configuration, never ticket-owned content.  They must not appear in owner
-  traces.
-* `providers/image_build/caib.py`: a build-tool manifest temporary, with no
-  ticket identifier or artifact ownership contract.
-* `providers/investigation/file.py`: global investigation records, which have
-  their own provider lifecycle and are not ticket workspace/artifact state.
-* `agents/{infra,benchmark}/server.py` temporary SCP runfiles: process-local
-  transport staging files, removed immediately after transfer; the remote copy is
-  already covered by the audited SSH/SCP boundary.  They contain no persisted
-  owner artifact and therefore cannot be represented as a stable logical ref.
-* `orchestrator/main.py` lock file and `providers/image_build` cleanup: process
-  coordination/build internals, not ticket state.
+* `providers/execution/filesystem.py` contains the reviewed low-level mutation
+  primitives. Calls through `filesystem`, `staging`, `artifact_filesystem`,
+  `log_filesystem`, or `self._filesystem` are audited facade calls.
+* Ticket-aware branches in `agents/benchmark/server.py`,
+  `agents/infra/server.py`, `providers/resource/jumpstarter_provision.py`,
+  `providers/workspace/manager.py`, `state_store/store.py`,
+  `state_store/api/artifacts.py`, and `paths.py` use that facade. Direct calls in
+  those modules are explicit no-ticket compatibility fallbacks.
+* `providers/tracing/{spool,payloads,fingerprints}.py`, `providers/events.py`,
+  `providers/quota.py`, `state_store/audit.py`, and `state_store/trace_store.py`
+  are audit transport or process-log internals; recursively auditing them would
+  make the durable recorder depend on itself.
+* `state_store/auth.py`, `state_store/identity.py`,
+  `providers/secrets/bitwarden.py`, and `providers/resource/jumpstarter.py`
+  manage operator identity, credentials, or provider configuration. They are
+  deliberately excluded from ticket-owner traces.
+* `providers/image_build/caib.py`, `providers/skills/arcaflow_plugins.py`,
+  `providers/skills/repo_cache.py`, and `providers/investigation/file.py` own
+  build caches or global provider records without a ticket ownership contract.
+* `orchestrator/main.py` lock mutations and remaining agent scratch-directory
+  constructors are process coordination/bootstrap operations without a ticket.
 
 Operator diagnostics may retain physical paths only in local process logs.  Trace
 events, spool frames, payload blobs, exports, and state-store rows contain only
 logical `workspace://`, `artifact://`, or `ticket://` references and bounded
 digest/type/code metadata.
 
-## Reviewed AST exclusions
-
-The regression test parses every production module and requires exact
-`file:line:call` markers for each primitive outside the audited boundary. These
-are non-ticket/internal/fallback operations: trace payload/spool/fingerprint
-durability, operator authentication/identity, read-only cache/configuration,
-process locks, and ephemeral local staging. They are deliberately not routed
-through `AuditedFilesystem`, since doing so would recurse into the audit
-transport or expose an operator-only path to ticket owners.
+The literal manifest lives beside the scanner so failures print exact missing
+and added entries. Reviewers must classify every delta against the classes above
+before updating it; broad module or directory wildcards are not accepted.

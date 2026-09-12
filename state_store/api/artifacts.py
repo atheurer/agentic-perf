@@ -131,11 +131,11 @@ def download_archive(ticket_id: str):
             media_type="application/gzip",
             background=BackgroundTask(filesystem.unlink, export_name, missing_ok=True),
         )
-    except Exception:
+    except Exception as primary:
         try:
             filesystem.unlink(export_name, missing_ok=True)
         except Exception as cleanup_error:
-            # Preserve the archive failure; its audit event remains the primary
-            # diagnostic and cleanup has its own audited action when possible.
-            raise RuntimeError("artifact export cleanup failed") from cleanup_error
+            primary.add_note(
+                f"artifact export cleanup failed: {type(cleanup_error).__name__}"
+            )
         raise

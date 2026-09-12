@@ -8,19 +8,13 @@ from urllib.parse import quote
 
 import pytest
 
+from providers.execution import AuditedFilesystem, RootedPath
 from providers.redaction import Redactor
 from providers.tracing import (
-    ActionDescriptor,
-    ActionType,
-    LifecycleDescriptor,
-    LifecycleState,
-    OperationOutcome,
     PayloadBlobStore,
     PayloadBuilder,
-    TraceEventV1,
     TraceSpool,
 )
-from providers.execution import AuditedFilesystem, RootedPath
 from state_store.trace_store import TracePayloadConflictError, TraceStore
 
 
