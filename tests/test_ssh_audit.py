@@ -110,3 +110,79 @@ async def test_progress_poll_loss_closes_parent_failure() -> None:
     assert result.exit_code == 1
     progress = [event for event in events if event.action.phase == "ssh_progress"]
     assert progress[-1].lifecycle.state == LifecycleState.FAILED
+
+
+async def test_progress_output_collection_failure_closes_parent() -> None:
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, e: events.append(e)}
+        )(),
+    )
+    from providers.ssh import SSHResult
+
+    replies = iter(
+        [
+            SSHResult("/tmp/run\n", "", 0),
+            SSHResult("__PID:9\n", "", 0),
+            SSHResult("", "", 0),
+            SSHResult("", "read failed", 255),
+        ]
+    )
+
+    async def fake_run(*_: object, **__: object):
+        return next(replies)
+
+    executor.run = fake_run
+    import asyncio
+
+    original = asyncio.sleep
+    asyncio.sleep = lambda _: original(0)
+    try:
+        result = await executor.run_with_progress("host", "command", poll_interval=1)
+    finally:
+        asyncio.sleep = original
+    assert result.exit_code == 255
+    assert [e for e in events if e.action.phase == "ssh_progress"][-1].attributes[
+        "output_collection_failed"
+    ]
+
+
+async def test_progress_cleanup_failure_closes_parent() -> None:
+    events: list[object] = []
+    executor = SSHExecutor(
+        trace_context=new_trace_context(ticket_id="PERF-SSH"),
+        trace_recorder=type(
+            "Recorder", (), {"record_critical": lambda _, e: events.append(e)}
+        )(),
+    )
+    from providers.ssh import SSHResult
+
+    replies = iter(
+        [
+            SSHResult("/tmp/run\n", "", 0),
+            SSHResult("__PID:9\n", "", 0),
+            SSHResult("", "", 0),
+            SSHResult("out", "", 0),
+            SSHResult("0", "", 0),
+            SSHResult("", "rm failed", 1),
+        ]
+    )
+
+    async def fake_run(*_: object, **__: object):
+        return next(replies)
+
+    executor.run = fake_run
+    import asyncio
+
+    original = asyncio.sleep
+    asyncio.sleep = lambda _: original(0)
+    try:
+        result = await executor.run_with_progress("host", "command", poll_interval=1)
+    finally:
+        asyncio.sleep = original
+    assert result.stderr == "rm failed"
+    assert [e for e in events if e.action.phase == "ssh_progress"][-1].attributes[
+        "cleanup_failed"
+    ]
