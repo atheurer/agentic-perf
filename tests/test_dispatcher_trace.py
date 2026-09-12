@@ -43,3 +43,19 @@ async def test_renewal_loss_records_claim_failure() -> None:
     await dispatcher._renewal_loop("PERF-1")
     assert sink.events[-1].lifecycle.state == LifecycleState.FAILED
     assert sink.events[-1].action.phase == "claim_renewal"
+
+
+def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
+    dispatcher, sink = _dispatcher()
+    client = MagicMock()
+    client.__enter__.return_value.post.return_value.status_code = 200
+    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
+        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    first = dispatcher._trace_contexts["PERF-1"]
+    dispatcher.mark_done("PERF-1")
+    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
+        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    second = dispatcher._trace_contexts["PERF-1"]
+    assert second.invocation_id != first.invocation_id
+    assert second.parent_action_id == first.action_id
+    assert sink.events[-1].attributes["prior_invocation_id"] == str(first.invocation_id)
