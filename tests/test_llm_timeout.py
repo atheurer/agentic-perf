@@ -27,7 +27,7 @@ from providers.llm.base import (
     ToolDefinition,
 )
 from providers.llm.mock import MockLLMProvider
-from providers.tracing import LifecycleState, TraceRecorder
+from providers.tracing import LifecycleState, RetryKind, TraceRecorder
 
 
 class TestLLMTimeoutError:
@@ -722,6 +722,12 @@ class TestAgentRateLimitHandling:
         )
         agent._transition_ticket = AsyncMock()
         agent._add_comment = AsyncMock()
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await agent.run("TEST-RL-001")
@@ -792,12 +798,26 @@ class TestAgentRateLimitHandling:
         agent._transition_ticket = AsyncMock()
         agent._add_comment = AsyncMock()
 
+        sink = type(
+            "Sink",
+            (),
+            {"events": [], "record": lambda self, event: self.events.append(event)},
+        )()
+        agent._trace = TraceRecorder(client=sink)
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await agent.run("TEST-RL-002")
 
         # Recovered — should NOT have transitioned to guidance
         agent._transition_ticket.assert_not_called()
         assert call_count == 2
+        llm = [event for event in sink.events if event.action.type.value == "llm"]
+        retry = [
+            event
+            for event in llm
+            if event.lifecycle.retry_kind == RetryKind.INTENTIONAL_AGENT_RETRY
+        ]
+        assert retry and retry[0].lifecycle.state == LifecycleState.FAILED
+        assert len({event.action_id for event in llm}) == 2
 
     @pytest.mark.asyncio
     async def test_uses_retry_after_from_error(self, tmp_path):
