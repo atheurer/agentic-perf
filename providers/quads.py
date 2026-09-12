@@ -308,6 +308,7 @@ class QuadsClient:
                     "-C",
                     "host-key-do-not-remove",
                 ],
+                mutating=True,
             )
             await proc.wait()
 
@@ -320,7 +321,9 @@ class QuadsClient:
         pubkey = pubkey_path.read_text().strip()
 
         for host in hosts:
-            await AuditedSubprocessRunner().run(["ssh-keygen", "-R", host])
+            await AuditedSubprocessRunner().run(
+                ["ssh-keygen", "-R", host], mutating=True
+            )
 
         results: dict[str, str] = {}
         for host in hosts:
@@ -359,6 +362,7 @@ class QuadsClient:
                         f"root@{host}",
                         f"sed -i '/{self.PROVISIONING_KEY_COMMENT}/d' /root/.ssh/authorized_keys",
                     ],
+                    mutating=True,
                 )
                 stderr = ssh_result.stderr
                 results[host] = (
@@ -405,6 +409,7 @@ class QuadsClient:
                 ),
             ],
             stdin=self.default_root_password.encode() + b"\n",
+            mutating=True,
         )
         stdout, stderr = proc.stdout, proc.stderr
         output = stdout.decode().strip()

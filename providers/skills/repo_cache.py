@@ -21,6 +21,7 @@ class RepoCache:
                 ["git", "pull", "--ff-only"],
                 cwd=repo_path,
                 timeout=60,
+                mutating=True,
             )
             if result.returncode != 0:
                 stderr = (
@@ -35,6 +36,7 @@ class RepoCache:
             result = AuditedSubprocessRunner().run_sync(
                 ["git", "clone", "--depth", "1", url, str(repo_path)],
                 timeout=120,
+                mutating=True,
             )
             if result.returncode != 0:
                 stderr = (

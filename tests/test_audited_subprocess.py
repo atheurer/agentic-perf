@@ -59,6 +59,8 @@ async def test_timeout_and_cancellation_emit_one_correct_terminal() -> None:
             "started",
             "timed_out",
         ]
+        assert events[-1].attributes["stdout_size"] == 0
+        assert events[-1].attributes["stderr_truncated"] is False
         events.clear()
         task = asyncio.create_task(
             runner.run([sys.executable, "-c", "import time;time.sleep(1)"])
@@ -171,3 +173,4 @@ async def test_signal_then_wait_has_one_terminal() -> None:
         "started",
         "failed",
     ]
+    assert events[-1].attributes["signal"] == "terminate"

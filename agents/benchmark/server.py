@@ -2716,6 +2716,7 @@ async def execute_benchmark(
                     *container_args,
                 ],
                 stdin=input_content.encode(),
+                mutating=True,
             )
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
@@ -3245,6 +3246,7 @@ async def execute_boot_time_test(
                 f"--password={ssh_password}",
             ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         install_out, install_err = await install_proc.communicate()
         if install_proc.returncode != 0:
@@ -3376,6 +3378,7 @@ async def execute_boot_time_test(
                     ],
                     stdout=serial_log_fh,
                     stderr=_asyncio.subprocess.DEVNULL,
+                    mutating=True,
                 )
                 logger.info(
                     f"[boot-time] Passive serial capture "
@@ -3407,6 +3410,7 @@ async def execute_boot_time_test(
         cmd,
         cwd=str(output_dir),
         env=run_env,
+        mutating=True,
     )
     try:
         stdout_bytes, stderr_bytes = await _asyncio.wait_for(
@@ -3476,6 +3480,7 @@ async def execute_boot_time_test(
                 sut_host,
             ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
@@ -3534,6 +3539,7 @@ async def execute_boot_time_test(
         merge_proc = await AuditedSubprocessRunner().start(
             merge_cmd,
             cwd=str(scripts_dir),
+            mutating=True,
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:

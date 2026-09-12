@@ -55,6 +55,7 @@ class AuditedProcess:
             context,
         )
         self._terminal = False
+        self._signal: str | None = None
         self._started = time.monotonic()
 
     def __getattr__(self, name: str) -> Any:
@@ -63,6 +64,8 @@ class AuditedProcess:
     async def _finish(self, state: LifecycleState, **descriptors: Any) -> None:
         if not self._terminal:
             self._terminal = True
+            if self._signal is not None:
+                descriptors["signal"] = self._signal
             await self._runner._record(
                 self._runner._event(
                     state,
@@ -109,7 +112,8 @@ class AuditedProcess:
             await self._finish(LifecycleState.CANCELLED)
             raise
         await self._finish(
-            LifecycleState.COMPLETED if self.returncode == 0 else LifecycleState.FAILED
+            LifecycleState.COMPLETED if self.returncode == 0 else LifecycleState.FAILED,
+            **self._runner._output_descriptors(*result),
         )
         return result
 
@@ -127,6 +131,23 @@ class AuditedSubprocessRunner:
         self._emit = emit
         self._recorder = recorder
         self._output_limit = output_limit
+
+    @classmethod
+    def reset_default_recorder(cls) -> None:
+        """Close ambient client state; primarily for orderly shutdown and tests."""
+        if cls._default_recorder is not None:
+            cls._default_recorder.close()
+            cls._default_recorder = None
+
+    def _output_descriptors(self, stdout: bytes, stderr: bytes) -> dict[str, Any]:
+        return {
+            "stdout_size": len(stdout),
+            "stderr_size": len(stderr),
+            "stdout_digest": hashlib.sha256(stdout).hexdigest()[:16],
+            "stderr_digest": hashlib.sha256(stderr).hexdigest()[:16],
+            "stdout_truncated": len(stdout) > self._output_limit,
+            "stderr_truncated": len(stderr) > self._output_limit,
+        }
 
     def _event(
         self,
@@ -192,7 +213,9 @@ class AuditedSubprocessRunner:
                     os.environ.get("AGENTIC_PERF_API_TOKEN"),
                 )
                 if url and token:
-                    self._recorder = TraceClient(url, token)
+                    if self._default_recorder is None:
+                        self._default_recorder = TraceClient(url, token)
+                    self._recorder = self._default_recorder
             if self._recorder is None and critical:
                 raise TraceDeliveryError(
                     "mutating subprocess requires central trace readiness"
@@ -259,16 +282,17 @@ class AuditedSubprocessRunner:
                 stdin_size=len(stdin or b""),
             )
         )
+        tracked = AuditedProcess(self, process, argv, child)
         if stdin is not None and process.stdin is not None:
             try:
                 process.stdin.write(stdin)
                 await process.stdin.drain()
                 process.stdin.close()
             except (BrokenPipeError, ConnectionError):
-                process.terminate()
-                await process.wait()
+                tracked.terminate()
+                await tracked.wait()
                 raise
-        return AuditedProcess(self, process, argv, child)
+        return tracked
 
     async def run(
         self,
@@ -295,24 +319,27 @@ class AuditedSubprocessRunner:
                 LifecycleState.COMPLETED
                 if process.returncode == 0
                 else LifecycleState.FAILED,
-                stdout_size=len(stdout),
-                stderr_size=len(stderr),
-                stdout_digest=hashlib.sha256(stdout).hexdigest()[:16],
-                stderr_digest=hashlib.sha256(stderr).hexdigest()[:16],
-                stdout_truncated=len(stdout) > self._output_limit,
-                stderr_truncated=len(stderr) > self._output_limit,
+                **self._output_descriptors(stdout, stderr),
             )
             outcome = "success" if process.returncode == 0 else "failure"
         except asyncio.TimeoutError:
             timed_out = True
             process.kill()
             stdout, stderr = await task
-            await process._finish(LifecycleState.TIMED_OUT, timed_out=True)
+            await process._finish(
+                LifecycleState.TIMED_OUT,
+                timed_out=True,
+                **self._output_descriptors(stdout, stderr),
+            )
             outcome = "timed_out"
         except asyncio.CancelledError:
             process.terminate()
             await asyncio.shield(task)
-            await process._finish(LifecycleState.CANCELLED)
+            stdout, stderr = task.result()
+            await process._finish(
+                LifecycleState.CANCELLED,
+                **self._output_descriptors(stdout, stderr),
+            )
             raise
         result = ProcessResult(
             tuple(argv),
@@ -355,3 +382,5 @@ class AuditedSubprocessRunner:
         if error:
             raise error[0]
         return result[0]
+
+    _default_recorder: TraceClient | None = None

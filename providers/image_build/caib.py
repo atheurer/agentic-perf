@@ -287,6 +287,7 @@ class CAIBProvider(ImageBuildProvider):
             process_result = await AuditedSubprocessRunner().run(
                 cmd,
                 timeout=spec.timeout_minutes * 60 + 120,
+                mutating=True,
             )
             stdout, stderr = process_result.stdout, process_result.stderr
 

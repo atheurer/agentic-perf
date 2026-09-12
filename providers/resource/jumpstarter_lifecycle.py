@@ -54,6 +54,7 @@ async def release_lease_for_ticket(
         _r = await AuditedSubprocessRunner().run(
             ["jmp", "delete", "leases", lease_id],
             timeout=15,
+            mutating=True,
         )
         if _r.returncode == 0:
             logger.info(
@@ -145,6 +146,7 @@ async def sweep_orphaned_leases(
                         _dr = await AuditedSubprocessRunner().run(
                             ["jmp", "delete", "leases", lease_name],
                             timeout=15,
+                            mutating=True,
                         )
                         if _dr.returncode == 0:
                             logger.info(
