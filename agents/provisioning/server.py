@@ -536,6 +536,7 @@ async def _validate_and_deploy_contract(host: str, private_config: dict) -> dict
                 host,
                 item["local_path"],
                 item["remote_path"],
+                mutating=True,
             )
             if scp_result.exit_code != 0:
                 return {

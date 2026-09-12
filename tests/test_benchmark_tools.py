@@ -192,7 +192,7 @@ async def _make_crucible_ssh(
             stdout=f"run directory: {RUN_DIR}\n" + (run_stdout or ""),
         )
 
-    async def _copy_to(host, local_path, remote_path, timeout=60):
+    async def _copy_to(host, local_path, remote_path, timeout=60, mutating=False):
         return _FakeSSHResult(exit_code=0)
 
     class _Mock:
