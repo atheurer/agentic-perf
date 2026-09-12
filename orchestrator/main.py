@@ -19,6 +19,7 @@ from providers.events import EventBus
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
+from providers.tracing import bind_trace_context, reset_trace_context
 
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -773,36 +774,34 @@ async def run_agent_task(
                 image_config=_load_config_file().get("jumpstarter_images", {}),
             )
 
-        if agent_task_timeout > 0:
-            try:
-                await asyncio.wait_for(
-                    agent.run(ticket_id),
-                    timeout=agent_task_timeout,
-                )
-                success = True
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
-                )
-                if dispatcher.events:
-                    dispatcher.events.emit(
-                        ticket_id,
-                        "orchestrator",
-                        "agent_error",
-                        {
-                            "reason": "agent_task_timeout",
-                            "timeout_seconds": agent_task_timeout,
-                        },
+        context_token = (
+            bind_trace_context(agent.trace_context)
+            if getattr(agent, "trace_context", None) is not None
+            else None
+        )
+        try:
+            if agent_task_timeout > 0:
+                try:
+                    await asyncio.wait_for(
+                        agent.run(ticket_id), timeout=agent_task_timeout
                     )
-                await _transition_to_guidance(
-                    dispatcher.store_url,
-                    ticket_id,
-                    f"Agent task timed out after {agent_task_timeout}s",
-                    event_bus=dispatcher.events,
-                )
-        else:
-            await agent.run(ticket_id)
-            success = True
+                    success = True
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
+                    )
+                    await _transition_to_guidance(
+                        dispatcher.store_url,
+                        ticket_id,
+                        f"Agent task timed out after {agent_task_timeout}s",
+                        event_bus=dispatcher.events,
+                    )
+            else:
+                await agent.run(ticket_id)
+                success = True
+        finally:
+            if context_token is not None:
+                reset_trace_context(context_token)
 
         if config:
             try:
