@@ -114,30 +114,27 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
         != request.headers.get("X-Agentic-Perf-Invocation-Id", "")
         or not identity["action"]
         or grant["action"] != identity["action"]
-        or any(grant[key] != value for key, value in identity.items() if grant[key])
+        or any(grant[key] != value for key, value in identity.items())
     ):
         raise HTTPException(
             status_code=403,
             detail="validation creation requires a bound, unexpired capability",
         )
-    creator = body.record.creator
-    creator_bindings = {
-        "action": creator.get("action_id", ""),
-        "session": creator.get("session_id", "") or creator.get("mcp_session_id", ""),
-        "epoch": creator.get("epoch", "") or creator.get("session_epoch", ""),
-        "request": creator.get("request_id", ""),
-    }
-    if any(
-        creator_bindings[key] and creator_bindings[key] != grant[key]
-        for key in creator_bindings
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="validation creator identity does not match capability",
-        )
     # Consume only after every capability binding has been checked.  A rejected
     # cross-ticket/action request must not burn the caller's valid capability.
     grants.pop(capability, None)
+    creator = {
+        "agent_id": grant["agent"],
+        "invocation_id": grant["invocation"],
+        "action_id": grant["action"],
+        "request_id": grant["request"],
+    }
+    if grant["session"]:
+        creator["session_id"] = grant["session"]
+    if grant["epoch"]:
+        creator["session_epoch"] = grant["epoch"]
+    record = body.record.model_dump(mode="json")
+    record["creator"] = creator
     canonical_runfile_digest = hashlib.sha256(
         json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -153,7 +150,7 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
     require_write_access(request.state.principal, ticket, request.app.state.multi_user)
     try:
         updated, conflict = store.create_validation(
-            ticket_id, body.record.model_dump(mode="json"), body.expected_version
+            ticket_id, record, body.expected_version
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

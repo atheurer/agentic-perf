@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from providers.tracing import PayloadDescriptor
 
@@ -244,6 +244,10 @@ class InvalidationReason(str, Enum):
 
 class ValidationRecordV1(BaseModel):
     """Controller-attested validation evidence; ordinary users cannot create it."""
+
+    # Provenance is server-authoritative: the API constructs creator from the
+    # bound capability and request identity rather than accepting client data.
+    model_config = ConfigDict(extra="forbid")
 
     validation_id: str = Field(pattern=r"^val-[a-f0-9]{32}$")
     run_file: dict[str, Any]

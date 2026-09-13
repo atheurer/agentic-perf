@@ -15,7 +15,11 @@ from agents.benchmark.server import (
     _runfile_fingerprint,
 )
 from state_store.api.router import api_router
-from state_store.api.validations import create_validation, get_validation
+from state_store.api.validations import (
+    create_validation,
+    get_validation,
+    issue_capability,
+)
 from state_store.auth import Principal, make_auth_dependency
 from state_store.main import _set_audit_actor
 from state_store.models import CreateTicketRequest, CreateValidationRequest
@@ -209,7 +213,10 @@ def test_user_cannot_forge_controller_validation_post(tmp_path):
     store = TicketStore(persist_dir=tmp_path)
     ticket_id = _ticket(store)
     record = _record("val-" + "a" * 32)
-    body = CreateValidationRequest(record=record, expected_version=0)
+    body_record = dict(record)
+    body_record.pop("creator")
+    body_record.pop("server_pid")
+    body = CreateValidationRequest(record=body_record, expected_version=0)
     request = SimpleNamespace(
         state=SimpleNamespace(principal=Principal("user", "writer", False)),
         headers={},
@@ -307,6 +314,36 @@ def test_validation_get_requires_ticket_access_for_multi_user(tmp_path):
         )
 
 
+def test_validation_route_constructs_server_authoritative_creator(tmp_path):
+    app = _app(tmp_path)
+    ticket_id = _ticket(app.state.store)
+    headers = {
+        "X-Agentic-Perf-Benchmark-Validator": "validator",
+        "X-Agentic-Perf-Agent-Id": "benchmark",
+        "X-Agentic-Perf-Invocation-Id": "invocation",
+        "X-Agentic-Perf-Action-Id": "action-1",
+        "X-Agentic-Perf-Request-Id": "request-1",
+    }
+    request = SimpleNamespace(
+        state=SimpleNamespace(principal=Principal("service", "deployment", True)),
+        headers=headers,
+        app=app,
+    )
+    capability = issue_capability(ticket_id, request)["capability"]
+    record = _record("val-" + "c" * 32)
+    record.pop("creator")
+    record.pop("server_pid")
+    body = CreateValidationRequest(record=record, expected_version=0)
+    request.headers = headers | {"X-Agentic-Perf-Validation-Capability": capability}
+    result = create_validation(ticket_id, body, request)
+    assert result["record"]["creator"] == {
+        "agent_id": "benchmark",
+        "invocation_id": "invocation",
+        "action_id": "action-1",
+        "request_id": "request-1",
+    }
+
+
 def _app(tmp_path) -> FastAPI:
     class _Trace:
         def insert_event_result(self, event):
@@ -393,9 +430,12 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             agent: str = "benchmark",
             action: str = "action-1",
         ):
+            client_record = dict(record)
+            client_record.pop("creator", None)
+            client_record.pop("server_pid", None)
             return await client.post(
                 f"/api/v1/tickets/{ticket_id}/validations",
-                json={"record": record, "expected_version": 0},
+                json={"record": client_record, "expected_version": 0},
                 headers=headers(invocation, action, agent)
                 | {
                     "X-Agentic-Perf-Validation-Capability": cap,
@@ -414,6 +454,18 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
                 headers=auth,
             )
         ).json()["record"]["validation_id"] == first["validation_id"]
+        persisted = (
+            await client.get(
+                f"/api/v1/tickets/{ticket_one}/validations/{first['validation_id']}",
+                headers=auth,
+            )
+        ).json()["record"]
+        assert persisted["creator"] == {
+            "agent_id": "benchmark",
+            "invocation_id": "invocation",
+            "action_id": "action-1",
+            "request_id": "request-1",
+        }
         # Concurrent distinct records append without losing either exact ID.
         third = _record("val-" + "3" * 32, value=3)
         fourth = _record("val-" + "4" * 32, value=4)

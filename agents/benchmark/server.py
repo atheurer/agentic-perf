@@ -146,7 +146,7 @@ def _validation_creator() -> dict[str, Any]:
 def _validation_identity_headers(creator: dict[str, Any]) -> dict[str, str]:
     """Propagate the trace identity required to spend a validation capability."""
     headers = {
-        "X-Agentic-Perf-Agent-Id": str(creator.get("agent_id", "benchmark")),
+        "X-Agentic-Perf-Agent-Id": str(creator.get("agent_id") or "benchmark"),
         "X-Agentic-Perf-Invocation-Id": str(creator.get("invocation_id", "")),
         "X-Agentic-Perf-Action-Id": str(creator.get("action_id", "")),
         "X-Agentic-Perf-Request-Id": str(creator.get("request_id", "")),
