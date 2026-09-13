@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from paths import get_instance_name
 from providers.tracing import TraceEventV1
+from providers.tracing.payloads import PayloadBlobStore, PayloadStorageError
 from providers.tracing.query import (
     TraceQuery,
     diagnostics,
@@ -330,6 +331,33 @@ def action_trace(
         include_payloads=include_payloads,
         limit=limit,
     )
+
+
+@query_router.get("/{ticket_id}/payloads/{digest}")
+def payload_content(ticket_id: str, digest: str, request: Request) -> Response:
+    """Return a referenced redacted blob only to detailed trace principals."""
+    if not _authorize_query(request, ticket_id):
+        raise HTTPException(
+            status_code=403, detail="payload access requires operator authentication"
+        )
+    ref = digest if digest.startswith("sha256:") else f"sha256:{digest}"
+    events = request.app.state.trace_store.list_events(ticket_id=ticket_id)
+    refs = {
+        descriptor.blob_ref
+        for event in events
+        for descriptor in (event.input, event.output)
+        if descriptor
+    }
+    if ref not in refs:
+        raise HTTPException(status_code=404, detail="payload not found")
+    try:
+        content = PayloadBlobStore(ticket_id=ticket_id).get(ref, max_bytes=1_048_576)
+    except PayloadStorageError as exc:
+        raise HTTPException(status_code=404, detail="payload unavailable") from exc
+    audit_log = getattr(request.app.state, "audit_log", None)
+    if audit_log is not None:
+        audit_log.log("trace_payload_read", ticket_id, {"digest": ref})
+    return Response(content, media_type="application/octet-stream")
 
 
 async def _service_principal(request: Request) -> Principal:
