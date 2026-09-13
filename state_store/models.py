@@ -203,6 +203,13 @@ class CreateTicketRequest(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     owners: list[str] | None = None
 
+    @model_validator(mode="after")
+    def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        protected = _VALIDATION_RESERVED_FIELDS.intersection(self.custom_fields)
+        if protected:
+            raise ValueError("benchmark validation fields are reserved")
+        return self
+
 
 class TransitionRequest(BaseModel):
     status: TicketStatus
@@ -213,11 +220,24 @@ class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
 
 
+_VALIDATION_RESERVED_FIELDS = frozenset(
+    {
+        "benchmark_validation",
+        "benchmark_validations",
+        "benchmark_validation_records",
+        "benchmark_validation_manifest",
+        "validated_run_file",
+    }
+)
+
+
 class InvalidationReason(str, Enum):
     RELEVANT_PARAMETERS_CHANGED = "relevant_parameters_changed"
     CONTROLLER_CHANGED = "controller_changed"
     VALIDATOR_REVOKED = "validator_revoked"
     OPERATOR_INVALIDATED = "operator_invalidated"
+    RUN_FILE_CHANGED = "run_file_changed"
+    TICKET_REPLANNED = "ticket_replanned"
 
 
 class ValidationRecordV1(BaseModel):

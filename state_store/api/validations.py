@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -52,13 +53,13 @@ def get_validation(ticket_id: str, validation_id: str, request: Request):
 
 @router.post("")
 def create_validation(ticket_id: str, body: CreateValidationRequest, request: Request):
-    if (
-        request.state.principal.kind != "service"
-        or request.headers.get("X-Agentic-Perf-Internal-Validation") != "v1"
+    capability = request.headers.get("X-Agentic-Perf-Benchmark-Validator", "")
+    if request.state.principal.kind != "service" or not secrets.compare_digest(
+        capability, request.app.state.benchmark_validator_token
     ):
         raise HTTPException(
             status_code=403,
-            detail="validation creation is restricted to the internal controller validator",
+            detail="validation creation requires the benchmark validator capability",
         )
     canonical_runfile_digest = hashlib.sha256(
         json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()

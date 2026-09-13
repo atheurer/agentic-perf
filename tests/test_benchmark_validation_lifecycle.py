@@ -178,6 +178,20 @@ def test_generic_field_updates_cannot_replace_validation_manifest(tmp_path):
     store.create_validation(ticket_id, _record("val-one"), 0)
     with pytest.raises(ValueError, match="immutable"):
         store.update_fields(ticket_id, {"benchmark_validations": {}})
+    with pytest.raises(ValueError, match="immutable"):
+        store.update_fields(ticket_id, {"benchmark_validation_manifest": {}})
+
+
+def test_ticket_creation_cannot_preseed_validation_manifest(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    with pytest.raises(ValueError, match="reserved"):
+        store.create_ticket(
+            CreateTicketRequest(
+                summary="forged",
+                description="forged",
+                custom_fields={"benchmark_validations": {}},
+            )
+        )
 
 
 def test_user_cannot_forge_controller_validation_post(tmp_path):

@@ -28,6 +28,7 @@ from providers.tracing import (
 from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
 from .models import (
+    _VALIDATION_RESERVED_FIELDS,
     VALID_TRANSITIONS,
     AddCommentRequest,
     Comment,
@@ -136,6 +137,9 @@ class TicketStore:
         with self._lock:
             self._global_seq += 1
             custom_fields = dict(request.custom_fields)
+            protected = _VALIDATION_RESERVED_FIELDS.intersection(custom_fields)
+            if protected:
+                raise ValueError("benchmark validation fields are reserved")
             verbatim = parse_verbatim_directives(request.description)
             if verbatim:
                 custom_fields["verbatim_directives"] = verbatim
@@ -317,11 +321,7 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
-            protected = {
-                "benchmark_validation",
-                "benchmark_validations",
-                "validated_run_file",
-            }.intersection(fields)
+            protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
             if protected:
                 raise ValueError(
                     "benchmark validation fields are immutable; use the validations API"

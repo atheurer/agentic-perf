@@ -21,7 +21,11 @@ from providers.tracing import TraceContext, bind_trace_context, reset_trace_cont
 
 from .api.router import api_router, chat_router, health_router, webhook_router
 from .audit import AuditLog, set_actor
-from .auth import load_or_generate_token, make_auth_dependency
+from .auth import (
+    load_or_generate_token,
+    load_or_generate_validator_token,
+    make_auth_dependency,
+)
 from .ratelimit import (
     AuthFailureLimiter,
     RateLimiter,
@@ -85,6 +89,7 @@ def create_app() -> FastAPI:
         "schema_rejections": 0,
         "quarantined_frames": 0,
     }
+    app.state.benchmark_validator_token = load_or_generate_validator_token()
 
     @app.middleware("http")
     async def restore_trace_context(request: Request, call_next):

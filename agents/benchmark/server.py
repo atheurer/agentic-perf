@@ -221,7 +221,11 @@ async def _persist_validated_runfile(
                         "record": record,
                         "expected_version": manifest.get("version", 0),
                     },
-                    headers={"X-Agentic-Perf-Internal-Validation": "v1"},
+                    headers={
+                        "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
+                            "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
+                        )
+                    },
                 )
                 if response.status_code != 409:
                     response.raise_for_status()
