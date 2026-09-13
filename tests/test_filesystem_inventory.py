@@ -61,8 +61,15 @@ def _call_name(node: ast.expr) -> str:
     return ""
 
 
-def _mode(node: ast.Call) -> str | None:
-    value: ast.expr | None = node.args[1] if len(node.args) > 1 else None
+def _mode(node: ast.Call, call: str) -> str | None:
+    # Path.open(name, mode) has its mode as the first positional argument,
+    # while built-in open/tarfile.open and os.fdopen place mode second.
+    positional_mode = (
+        0 if call.endswith(".open") and call not in {"tarfile.open", "open"} else 1
+    )
+    value: ast.expr | None = (
+        node.args[positional_mode] if len(node.args) > positional_mode else None
+    )
     for keyword in node.keywords:
         if keyword.arg == "mode":
             value = keyword.value
@@ -80,13 +87,13 @@ def _is_mutation(node: ast.Call, call: str) -> bool:
     if call.rsplit(".", 1)[-1] in MUTATING_ATTRIBUTES:
         return True
     if call == "tarfile.open":
-        mode = _mode(node) or "r"
+        mode = _mode(node, call) or "r"
         return any(flag in mode for flag in "wax+")
     if call == "os.fdopen":
-        mode = _mode(node) or "r"
+        mode = _mode(node, call) or "r"
         return any(flag in mode for flag in "wax+")
     if call == "open" or call.endswith(".open"):
-        mode = _mode(node) or "r"
+        mode = _mode(node, call) or "r"
         return any(flag in mode for flag in "wax+")
     return False
 
@@ -130,8 +137,8 @@ agents/infra/server.py|232|tempfile.NamedTemporaryFile
 agents/infra/server.py|240|staging.unlink
 agents/infra/server.py|242|unlink
 agents/infra/server.py|307|tempfile.mkdtemp
-orchestrator/main.py|1857|LOCK_FILE.parent.mkdir
-orchestrator/main.py|1889|LOCK_FILE.unlink
+orchestrator/main.py|1885|LOCK_FILE.parent.mkdir
+orchestrator/main.py|1917|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir
@@ -193,6 +200,7 @@ providers/tracing/spool.py|59|self.directory.mkdir
 providers/tracing/spool.py|62|os.chmod
 providers/tracing/spool.py|89|self.lock_path.unlink
 providers/tracing/spool.py|103|os.chmod
+providers/tracing/spool.py|121|self.path.open
 providers/tracing/spool.py|138|tempfile.mkstemp
 providers/tracing/spool.py|141|os.fdopen
 providers/tracing/spool.py|145|os.replace
@@ -222,15 +230,18 @@ state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
-state_store/store.py|72|self._persist_dir.mkdir
+state_store/store.py|86|self._persist_dir.mkdir
+state_store/store.py|117|self._lease_path.unlink
+state_store/store.py|126|temporary.open
+state_store/store.py|130|os.replace
 state_store/process_lock.py|56|path.parent.mkdir
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
-state_store/store.py|884|filesystem.mkdir
-state_store/store.py|891|filesystem.mkdir
-state_store/store.py|904|log_filesystem.rename
-state_store/store.py|913|filesystem.rename
+state_store/store.py|1066|filesystem.mkdir
+state_store/store.py|1073|filesystem.mkdir
+state_store/store.py|1086|log_filesystem.rename
+state_store/store.py|1095|filesystem.rename
 state_store/trace_store.py|77|self.db_path.parent.mkdir
 """
 
@@ -260,4 +271,12 @@ def test_full_production_mutation_inventory_has_reviewed_exclusions() -> None:
     assert not missing and not added, (
         "filesystem mutation inventory changed; review each delta and update the "
         f"fixed manifest. missing={missing!r}, added={added!r}"
+    )
+
+
+def test_leader_lease_temporary_write_is_inventoried() -> None:
+    """Path.open write modes must remain visible to the mutation scanner."""
+    assert any(
+        mutation.path == "state_store/store.py" and mutation.call == "temporary.open"
+        for mutation in _inventory()
     )

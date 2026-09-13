@@ -14,6 +14,7 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 def health(request: Request):
     store = request.app.state.store
+    lease = store.get_orchestrator_lease()
     all_tickets = store.list_tickets()
     counts = {}
     for status in TicketStatus:
@@ -46,6 +47,9 @@ def health(request: Request):
             "oldest_unacked_age_seconds": oldest,
             "quarantined_frames": quarantined,
         },
+        # Public health reports only liveness.  Holder identity and fencing
+        # metadata belong behind the authenticated control endpoint.
+        "orchestrator_lease": {"active": lease is not None},
     }
 
 

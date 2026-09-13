@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -224,6 +225,40 @@ class TransitionRequest(BaseModel):
 
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
+
+
+class OrchestratorLease(BaseModel):
+    """The state-store-owned fencing lease for an active orchestrator."""
+
+    session_id: UUID
+    instance_name: str = Field(min_length=1, max_length=255)
+    host: str = Field(min_length=1, max_length=255)
+    pid: int = Field(gt=0)
+    process_start_id: str = Field(min_length=1, max_length=255)
+    epoch: int = Field(gt=0)
+    acquired_at: datetime
+    renewed_at: datetime
+    expires_at: datetime
+
+
+class AcquireOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    instance_name: str = Field(min_length=1, max_length=255)
+    host: str = Field(min_length=1, max_length=255)
+    pid: int = Field(gt=0)
+    process_start_id: str = Field(min_length=1, max_length=255)
+    ttl_seconds: float = Field(gt=0, le=3600)
+
+
+class RenewOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    epoch: int = Field(gt=0)
+    ttl_seconds: float = Field(gt=0, le=3600)
+
+
+class ReleaseOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    epoch: int = Field(gt=0)
 
 
 _VALIDATION_RESERVED_FIELDS = frozenset(

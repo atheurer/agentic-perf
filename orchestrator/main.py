@@ -1363,6 +1363,20 @@ async def _add_comment(
         logger.exception("Failed to add comment on %s", ticket_id)
 
 
+async def _renew_leader_lease(lease: Any, interval: float) -> None:
+    """Keep the control-plane lease fenced while the poll loop is active."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await lease.renew()
+            except Exception as exc:
+                logger.critical("Orchestrator leader lease renewal failed: %s", exc)
+                raise RuntimeError("orchestrator leader lease lost") from exc
+    finally:
+        await lease.release()
+
+
 def _check_dispatch_quota(
     ticket: dict[str, Any],
     user_store: Any,
@@ -1408,6 +1422,18 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     _last_good_digest = hashlib.sha256(
         json.dumps(config.raw, sort_keys=True).encode()
     ).hexdigest()[:12]
+
+    from .leader_lease import LeaderLeaseClient
+
+    leader_lease = LeaderLeaseClient(
+        config.state_store_url,
+        instance_name=config.instance_name,
+        ttl_seconds=config.leader_lease_ttl_seconds,
+    )
+    await leader_lease.acquire()
+    lease_renew_task = asyncio.create_task(
+        _renew_leader_lease(leader_lease, config.leader_lease_renew_interval)
+    )
 
     await _validate_models(config)
 
@@ -1565,6 +1591,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     trace_sweep_task: asyncio.Task | None = None
 
     while True:
+        if lease_renew_task.done():
+            lease_renew_task.result()
         if time.monotonic() - last_trace_sweep >= 60.0 and (
             trace_sweep_task is None or trace_sweep_task.done()
         ):
