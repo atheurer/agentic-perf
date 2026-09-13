@@ -109,7 +109,7 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
             if parent is None:
                 break
             current = parent
-    seqs = sorted(item.global_seq for item in values if item.global_seq is not None)
+    seqs = sorted(item.ticket_seq for item in values if item.ticket_seq is not None)
     gaps = [
         number
         for left, right in zip(seqs, seqs[1:])
@@ -119,6 +119,7 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
         "missing_parents": missing,
         "cycles": sorted(set(cycles)),
         "sequence_gaps": gaps,
+        "unmatched_lifecycle_pairs": _unmatched_pairs(values),
         "indeterminate_operations": sorted(
             event.action_id
             for event in values
@@ -127,6 +128,21 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
             and event.outcome.value == "indeterminate"
         ),
     }
+
+
+def _unmatched_pairs(values: list[TraceEventV1]) -> list[str]:
+    starts = {
+        event.action_id
+        for event in values
+        if event.lifecycle.state.value in {"started", "requested", "claimed"}
+    }
+    terminals = {
+        event.action_id
+        for event in values
+        if event.lifecycle.state.value
+        in {"completed", "failed", "cancelled", "aborted", "rejected", "indeterminate"}
+    }
+    return sorted(starts - terminals)
 
 
 def _matches(event: TraceEventV1, query: TraceQuery) -> bool:

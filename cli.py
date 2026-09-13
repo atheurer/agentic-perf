@@ -1047,6 +1047,7 @@ def cmd_trace(args):
             "invocation_id": args.invocation,
             "action_type": args.action_type,
             "outcome": args.outcome,
+            "lifecycle_state": args.lifecycle_state,
             "causal": args.causal or args.tree,
             "include_payloads": args.include_payloads,
             "limit": args.limit,
@@ -1056,6 +1057,7 @@ def cmd_trace(args):
     endpoint = "/api/v1/traces/export" if args.export else "/api/v1/traces/query"
     if args.export:
         params["format"] = args.format
+        params["manifest"] = "true"
     response = client.get(endpoint, params=params)
     response.raise_for_status()
     if args.export:
@@ -1416,6 +1418,7 @@ def main():
     p_trace.add_argument("--invocation")
     p_trace.add_argument("--type", dest="action_type")
     p_trace.add_argument("--outcome")
+    p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument(
         "--causal", action="store_true", help="Include ancestors and descendants"

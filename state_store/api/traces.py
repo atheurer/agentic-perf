@@ -172,7 +172,9 @@ def export(
     trace_id: str | None = None,
     invocation_id: str | None = None,
     action_id: str | None = None,
+    parent_action_id: str | None = None,
     action_type: str | None = None,
+    lifecycle_state: str | None = None,
     outcome: str | None = None,
     producer_component: str | None = None,
     retry_kind: str | None = None,
@@ -183,6 +185,7 @@ def export(
     limit: int = Query(default=10000, ge=1, le=10000),
     cursor: int = Query(default=0, ge=0),
     include_payloads: bool = False,
+    manifest: bool = False,
 ) -> Response:
     detailed = _authorize_query(request, ticket_id)
     audit_log = getattr(request.app.state, "audit_log", None)
@@ -197,7 +200,9 @@ def export(
             trace_id=trace_id,
             invocation_id=invocation_id,
             action_id=action_id,
+            parent_action_id=parent_action_id,
             action_type=action_type,
+            lifecycle_state=lifecycle_state,
             outcome=outcome,
             producer_component=producer_component,
             retry_kind=retry_kind,
@@ -220,6 +225,13 @@ def export(
             for event in selected
         ]
     content = export_events(selected, format)
+    if manifest and format == "jsonl":
+        content += (
+            json.dumps(
+                {"_manifest": export_manifest(selected, content)}, separators=(",", ":")
+            )
+            + "\n"
+        )
     response = Response(content, media_type=media)
     response.headers["X-Trace-Manifest"] = json.dumps(
         export_manifest(selected, content), separators=(",", ":")
