@@ -46,8 +46,8 @@ def test_approval_is_persisted_and_resolved_once(tmp_path):
             ttl_seconds=60,
         )
     )
-    store.claim_ticket(ticket.id, "benchmark")
-    claim_id = ticket.custom_fields["claim"]["claim_id"]
+    claim = store.claim_ticket(ticket.id, "benchmark", session_id=session_id, epoch=1)
+    claim_id = claim["claim_id"]
     approval_body = _approval_request(session_id=str(session_id), claim_id=claim_id)
     ticket.custom_fields["validated_run_file"] = {
         "validation_id": approval_body.validation_id,
@@ -122,9 +122,9 @@ def test_approval_resolution_rejects_intent_mismatch(tmp_path):
             ttl_seconds=60,
         )
     )
-    store.claim_ticket(ticket.id, "benchmark")
+    claim = store.claim_ticket(ticket.id, "benchmark", session_id=session_id, epoch=1)
     approval_body = _approval_request(
-        session_id=str(session_id), claim_id=ticket.custom_fields["claim"]["claim_id"]
+        session_id=str(session_id), claim_id=claim["claim_id"]
     )
     ticket.custom_fields["validated_run_file"] = {
         "validation_id": approval_body.validation_id,
@@ -162,10 +162,8 @@ def test_approval_creation_is_idempotent_and_expiry_is_durable(tmp_path):
             ttl_seconds=60,
         )
     )
-    store.claim_ticket(ticket.id, "benchmark")
-    body = _approval_request(
-        session_id=str(session_id), claim_id=ticket.custom_fields["claim"]["claim_id"]
-    )
+    claim = store.claim_ticket(ticket.id, "benchmark", session_id=session_id, epoch=1)
+    body = _approval_request(session_id=str(session_id), claim_id=claim["claim_id"])
     ticket.custom_fields["validated_run_file"] = {
         "validation_id": body.validation_id,
         "state": "executable",
@@ -203,5 +201,68 @@ def test_approval_creation_rejects_missing_fence(tmp_path):
         "execution_intent_digest": body.execution_intent_digest,
     }
     store._persist_ticket(ticket)
-    with pytest.raises(ValueError, match="active matching session"):
+    with pytest.raises(ValueError, match="no active leader lease"):
         store.create_approval_request(ticket.id, body, created_by="benchmark")
+
+
+def test_approval_creation_rejects_expired_malformed_and_prior_claims(tmp_path):
+    now = [datetime.now(timezone.utc)]
+    store = TicketStore(persist_dir=tmp_path, clock=lambda: now[0])
+    ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+    old_session = uuid4()
+    store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=old_session,
+            instance_name="test",
+            host="localhost",
+            pid=1,
+            process_start_id="test",
+            ttl_seconds=1,
+        )
+    )
+    claim = store.claim_ticket(ticket.id, "benchmark", session_id=old_session, epoch=1)
+    body = _approval_request(session_id=str(old_session), claim_id=claim["claim_id"])
+    ticket.custom_fields["validated_run_file"] = {
+        "validation_id": body.validation_id,
+        "state": "executable",
+        "runfile_fingerprint": body.presented_run_file_digest,
+        "execution_intent_digest": body.execution_intent_digest,
+    }
+    store._persist_ticket(ticket)
+
+    ticket.custom_fields["claim"]["expires"] = (
+        now[0] - timedelta(seconds=1)
+    ).isoformat()
+    store._persist_ticket(ticket)
+    with pytest.raises(ValueError, match="claim_expired"):
+        store.create_approval_request(ticket.id, body, created_by="benchmark")
+
+    ticket.custom_fields["claim"] = {"claim_id": claim["claim_id"], "expires": "bad"}
+    store._persist_ticket(ticket)
+    with pytest.raises(ValueError, match="claim_malformed"):
+        store.create_approval_request(ticket.id, body, created_by="benchmark")
+
+    now[0] += timedelta(seconds=2)
+    new_session = uuid4()
+    store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=new_session,
+            instance_name="test-new",
+            host="localhost",
+            pid=2,
+            process_start_id="test-new",
+            ttl_seconds=60,
+        )
+    )
+    ticket.custom_fields["claim"] = {
+        "claim_id": claim["claim_id"],
+        "session_id": str(old_session),
+        "epoch": 1,
+        "expires": (now[0] + timedelta(seconds=30)).isoformat(),
+    }
+    store._persist_ticket(ticket)
+    stale = body.model_copy(
+        update={"session_id": str(new_session), "session_epoch": "2"}
+    )
+    with pytest.raises(ValueError, match="claim_owned_by_other_session"):
+        store.create_approval_request(ticket.id, stale, created_by="benchmark")

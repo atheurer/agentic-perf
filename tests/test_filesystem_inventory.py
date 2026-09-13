@@ -238,10 +238,10 @@ state_store/process_lock.py|56|path.parent.mkdir
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
-state_store/store.py|1795|filesystem.mkdir
-state_store/store.py|1802|filesystem.mkdir
-state_store/store.py|1815|log_filesystem.rename
-state_store/store.py|1824|filesystem.rename
+state_store/store.py|1825|filesystem.mkdir
+state_store/store.py|1832|filesystem.mkdir
+state_store/store.py|1845|log_filesystem.rename
+state_store/store.py|1854|filesystem.rename
 state_store/trace_store.py|77|self.db_path.parent.mkdir
 """
 

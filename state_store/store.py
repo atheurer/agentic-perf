@@ -994,29 +994,59 @@ class TicketStore:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             lease = self._read_orchestrator_lease()
             claim = ticket.custom_fields.get("claim")
-            if (
-                lease is None
-                or lease.expires_at <= self._lease_now()
-                or not isinstance(claim, dict)
-                or not request.session_id
-                or not request.session_epoch
-                or not request.claim_id
-                or request.session_id != str(lease.session_id)
-                or request.session_epoch != str(lease.epoch)
-                or request.claim_id != claim.get("claim_id")
-                or request.ticket_attempt != claim.get("claim_id")
-            ):
+            rejection_reason = None
+            if lease is None or lease.expires_at <= self._lease_now():
+                rejection_reason = "no active leader lease"
+            elif not isinstance(claim, dict):
+                rejection_reason = "claim_missing"
+            else:
+                try:
+                    claim_expires = datetime.fromisoformat(claim["expires"])
+                    if claim_expires.tzinfo is None:
+                        claim_expires = claim_expires.replace(tzinfo=timezone.utc)
+                    if claim_expires <= self._lease_now():
+                        rejection_reason = "claim_expired"
+                    elif (
+                        not isinstance(claim.get("session_id"), str)
+                        or not claim["session_id"]
+                        or not isinstance(claim.get("epoch"), int)
+                        or isinstance(claim["epoch"], bool)
+                        or claim["epoch"] <= 0
+                        or not isinstance(claim.get("claim_id"), str)
+                        or not claim["claim_id"]
+                    ):
+                        rejection_reason = "claim_malformed"
+                    elif (
+                        not request.session_id
+                        or not request.session_epoch
+                        or not request.claim_id
+                        or request.session_id != str(lease.session_id)
+                        or request.session_epoch != str(lease.epoch)
+                        or claim["session_id"] != str(lease.session_id)
+                        or claim["epoch"] != lease.epoch
+                        or request.claim_id != claim["claim_id"]
+                        or request.ticket_attempt != claim["claim_id"]
+                    ):
+                        rejection_reason = "claim_owned_by_other_session"
+                except (KeyError, TypeError, ValueError):
+                    rejection_reason = "claim_malformed"
+            if rejection_reason is not None:
                 self._audit_log(
                     "approval_requested_rejected",
                     ticket_id,
                     {
-                        "reason": "inactive or mismatched approval fence",
+                        "reason": rejection_reason,
                         "validation_id": request.validation_id,
+                        "claim_id": request.claim_id,
                     },
                 )
-                raise ValueError(
-                    "approval requires the active matching session, epoch, claim, and attempt"
+                self._trace_mutation(
+                    ticket_id,
+                    "approval_requested",
+                    rejected=True,
+                    attributes={"reason": rejection_reason},
                 )
+                raise ValueError(f"approval rejected: {rejection_reason}")
             fields = ticket.custom_fields
             manifest = fields.get("benchmark_validations", {})
             records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
