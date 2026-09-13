@@ -81,6 +81,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
     )
     monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
     monkeypatch.setenv("STATE_STORE_URL", base_url)
+    monkeypatch.setenv("AGENTIC_PERF_HOME", str(tmp_path))
     recorder = TraceClient(base_url, "service", spool_dir=tmp_path / "client-spool")
     trace = TraceContext(
         ticket_id="PERF-786",
@@ -122,15 +123,16 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         replay = await asyncio.wait_for(
             second.call_tool("execute_benchmark", {}, trace), 15
         )
-        assert replay == result
+        assert "cached response unavailable" in replay
         assert counter.read_text() == "1"
         assert first_pid and second_pid and first_pid != second_pid
         await asyncio.to_thread(recorder.flush)
         with TraceStore(tmp_path / "trace.db") as store:
             operation = store.get_operation("mcp-786")
             assert operation and operation.state == "terminal"
-            assert operation.result_descriptor == {"operation_result": "stored"}
-            assert store.get_operation_result("mcp-786") is not None
+            descriptor = operation.result_descriptor["operation_result"]
+            assert descriptor["blob_ref"]
+            assert descriptor["original_size_bytes"] > 4096
             events = store.list_events("PERF-786")
         assert any(
             e.producer.component == "mcp_client"

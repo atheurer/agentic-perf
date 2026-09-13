@@ -154,7 +154,6 @@ class TraceClient:
         external_ids: dict | None = None,
         ttl_seconds: float | None = None,
         reconciliation_outcome: str | None = None,
-        result: dict | None = None,
     ) -> dict:
         """Submit a server-authorized fenced operation mutation."""
         payload: dict = {"fencing_token": fencing_token}
@@ -166,8 +165,6 @@ class TraceClient:
             payload["ttl_seconds"] = ttl_seconds
         if reconciliation_outcome is not None:
             payload["reconciliation_outcome"] = reconciliation_outcome
-        if result is not None:
-            payload["result"] = result
         return self._operation_post(
             f"/operations/{operation_key}/{action}",
             payload,

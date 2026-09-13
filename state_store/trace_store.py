@@ -392,21 +392,6 @@ class TraceStore:
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             raise TraceStoreWriteError("could not read operation") from exc
 
-    def get_operation_result(self, operation_key: str) -> dict[str, Any] | None:
-        """Return an authenticated operation's exact terminal result."""
-        try:
-            row = (
-                self._open_connection()
-                .execute(
-                    "SELECT result_json FROM operation_results WHERE operation_key=?",
-                    (operation_key,),
-                )
-                .fetchone()
-            )
-            return json.loads(row["result_json"]) if row is not None else None
-        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-            raise TraceStoreWriteError("could not read operation result") from exc
-
     @staticmethod
     def _lease_time(value: datetime | None = None) -> str:
         """Use one UTC policy for every lease comparison and persisted expiry."""
@@ -666,7 +651,6 @@ class TraceStore:
         descriptor: dict[str, Any] | None = None,
         external_ids: dict[str, Any] | None = None,
         terminal_outcome: str | None = None,
-        result: dict[str, Any] | None = None,
         allow_expired_reconciliation: bool = False,
     ) -> OperationRecord:
         """Perform a fenced legal transition and append immutable history atomically."""
@@ -729,19 +713,6 @@ class TraceStore:
                 terminal_outcome if terminal else None,
             )
             self._update_operation_tx(connection, updated)
-            if result is not None:
-                if not terminal:
-                    raise OperationTransitionError(
-                        "operation result requires terminal state"
-                    )
-                connection.execute(
-                    "INSERT INTO operation_results(operation_key,result_json) VALUES (?, ?) "
-                    "ON CONFLICT(operation_key) DO UPDATE SET result_json=excluded.result_json",
-                    (
-                        operation_key,
-                        json.dumps(result, sort_keys=True, separators=(",", ":")),
-                    ),
-                )
             self._audit(
                 connection,
                 updated,
@@ -885,8 +856,6 @@ class TraceStore:
         owner: str,
         fencing_token: int,
         descriptor: dict[str, Any],
-        *,
-        result: dict[str, Any] | None = None,
     ) -> OperationRecord:
         return self.transition_operation(
             operation_key,
@@ -895,7 +864,6 @@ class TraceStore:
             "terminal",
             descriptor=descriptor,
             terminal_outcome="success",
-            result=result,
         )
 
     def fail(
@@ -904,8 +872,6 @@ class TraceStore:
         owner: str,
         fencing_token: int,
         descriptor: dict[str, Any],
-        *,
-        result: dict[str, Any] | None = None,
     ) -> OperationRecord:
         return self.transition_operation(
             operation_key,
@@ -914,7 +880,6 @@ class TraceStore:
             "terminal",
             descriptor=descriptor,
             terminal_outcome="failure",
-            result=result,
         )
 
     def reject(

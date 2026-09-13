@@ -9,6 +9,8 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -18,6 +20,7 @@ from mcp import McpError
 from mcp.types import ErrorData
 from pydantic import TypeAdapter
 
+from providers.redaction import Redactor
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -35,6 +38,11 @@ from providers.tracing import (
     reset_trace_context,
 )
 from providers.tracing.client import TraceClient
+from providers.tracing.payloads import (
+    PayloadBlobStore,
+    PayloadBuilder,
+    PayloadStorageError,
+)
 
 META_KEY = "agentic-perf"
 _MAX_REPLAY_CACHE = 1024
@@ -42,6 +50,7 @@ _MAX_REPLAY_CACHE = 1024
 # refuses to dispatch a protected handler unless #787 has already accepted its
 # immutable idempotency identity.
 _PROTECTED_TOOLS = frozenset({"execute_benchmark"})
+_MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 
 
 def _meta_values(message: Any) -> dict[str, Any]:
@@ -108,6 +117,11 @@ class MCPAuditMiddleware(Middleware):
         # Correlation IDs remain stable across a transport reconnect.  Retain
         # them across SDK session IDs so a replay cannot become a second launch.
         self._seen: OrderedDict[str, str] = OrderedDict()
+
+    async def close(self) -> None:
+        """Flush and close the server-owned trace transport at process shutdown."""
+        if self._client is not None:
+            await asyncio.to_thread(self._client.close)
 
     def _emit(
         self,
@@ -201,16 +215,23 @@ class MCPAuditMiddleware(Middleware):
             content=json.dumps(payload, sort_keys=True), is_error=is_error
         )
 
-    @staticmethod
-    def _result_descriptor(result: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    def _result_descriptor(self, trace: TraceContext, result: Any) -> dict[str, Any]:
         """Serialize the actual FastMCP result, bounded for operation storage."""
         if not isinstance(result, ToolResult):
-            return {"mcp_result": json.dumps(result, default=str)[:4096]}, None
+            return {"mcp_result": json.dumps(result, default=str)[:4096]}
         payload = result.model_dump(mode="json")
         encoded = json.dumps(payload, sort_keys=True)
         if len(encoded) > 4096:
-            return {"operation_result": "stored"}, {"tool_result": payload}
-        return {"tool_result": payload}, None
+            if len(encoded.encode()) > _MAX_OPERATION_RESULT_BYTES:
+                raise PayloadStorageError(
+                    "protected result exceeds operation result quota"
+                )
+            root = Path(os.environ.get("AGENTIC_PERF_HOME", ".")) / "trace-payloads"
+            descriptor = PayloadBuilder(
+                Redactor(), blob_store=PayloadBlobStore(root)
+            ).build(trace.ticket_id or "unknown", payload)
+            return {"operation_result": descriptor.model_dump(mode="json")}
+        return {"tool_result": payload}
 
     def _protect_operation(
         self, trace: TraceContext, tool_name: str
@@ -243,9 +264,7 @@ class MCPAuditMiddleware(Middleware):
         status = acquired.get("status")
         if status == "terminal":
             descriptor = acquired.get("operation", {}).get("result_descriptor", {})
-            payload = descriptor.get("tool_result") or acquired.get("result", {}).get(
-                "tool_result"
-            )
+            payload = descriptor.get("tool_result")
             if isinstance(payload, dict):
                 from fastmcp.tools.base import ContentBlock
 
@@ -258,7 +277,11 @@ class MCPAuditMiddleware(Middleware):
                     is_error=bool(payload.get("is_error")),
                 )
             return None, self._protected_result(
-                {"status": "indeterminate", "reason": "cached response unavailable"},
+                {
+                    "status": "indeterminate",
+                    "reason": "cached response unavailable",
+                    "operation": descriptor,
+                },
                 is_error=True,
             )
         if status != "acquired":
@@ -411,13 +434,12 @@ class MCPAuditMiddleware(Middleware):
         finally:
             reset_trace_context(token)
         if lease is not None:
-            descriptor, operation_result = self._result_descriptor(result)
+            descriptor = self._result_descriptor(trace, result)
             self._client.operation_transition(
                 trace.idempotency_key or "",
                 "fail" if getattr(result, "is_error", False) else "complete",
                 int(lease["fencing_generation"]),
                 descriptor=descriptor,
-                result=operation_result,
             )
         terminal_state = (
             LifecycleState.FAILED
@@ -441,7 +463,16 @@ class MCPAuditMiddleware(Middleware):
 
 def create_ticket_mcp(server_name: str) -> FastMCP:
     """Create the required audited FastMCP instance for a local ticket server."""
-    return FastMCP(server_name, middleware=[MCPAuditMiddleware(server_name)])
+    middleware = MCPAuditMiddleware(server_name)
+
+    @asynccontextmanager
+    async def lifespan(_: FastMCP):
+        try:
+            yield {}
+        finally:
+            await middleware.close()
+
+    return FastMCP(server_name, middleware=[middleware], lifespan=lifespan)
 
 
 def assert_fastmcp_audit_compatibility() -> None:

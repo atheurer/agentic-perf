@@ -32,7 +32,6 @@ class LeaseRequest(RegisterRequest):
 class FencedRequest(BaseModel):
     fencing_token: int = Field(ge=1)
     descriptor: dict[str, Any] | None = None
-    result: dict[str, Any] | None = None
     external_ids: dict[str, Any] | None = None
     ttl_seconds: float | None = Field(default=None, gt=0, le=86_400)
     reconciliation_outcome: str = "indeterminate"
@@ -79,14 +78,7 @@ async def acquire(
         record, status = request.app.state.trace_store.acquire_operation_result(
             body.operation_key, body.request_hash, principal.username, body.ttl_seconds
         )
-        response: dict[str, Any] = {"operation": record.__dict__, "status": status}
-        if status == "terminal":
-            result = request.app.state.trace_store.get_operation_result(
-                body.operation_key
-            )
-            if result is not None:
-                response["result"] = result
-        return response
+        return {"operation": record.__dict__, "status": status}
     except (
         OperationConflictError,
         OperationLeaseError,
@@ -126,7 +118,6 @@ async def transition(
                 principal.username,
                 body.fencing_token,
                 body.descriptor or {},
-                result=body.result,
             )
         elif action == "fail":
             record = store.fail(
@@ -134,7 +125,6 @@ async def transition(
                 principal.username,
                 body.fencing_token,
                 body.descriptor or {},
-                result=body.result,
             )
         elif action == "reject":
             record = store.reject(
