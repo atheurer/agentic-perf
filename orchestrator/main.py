@@ -1482,9 +1482,13 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     else:
         secrets = local_secrets
 
-    from providers.redaction import Redactor
+    from providers.redaction import get_shared_redactor
 
-    redactor = Redactor()
+    # Secret providers, progress reporting, and MCP payload capture must share
+    # the live registry so values registered during a ticket cannot leak via a
+    # later large-result replay.
+    # (The registry is the process-wide equivalent of the old Redactor().)
+    redactor = get_shared_redactor()
 
     usage_ledger = None
     if config.raw.get("auth", {}).get("multi_user", False):

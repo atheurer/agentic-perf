@@ -26,10 +26,10 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict
 
 from agents.infra.topology import discover_cache_topology
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _resolve_vault_secret_name,
     resolve_ssh_key,
@@ -46,7 +46,7 @@ from providers.ssh import _PID_SENTINEL, SSHExecutor, SSHResult, parse_pid_senti
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("infra")
+mcp = create_ticket_mcp("infra")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 

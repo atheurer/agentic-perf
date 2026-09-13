@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from providers.redaction import get_shared_redactor
+
 from .context import TraceContext, child_context, new_trace_context
 from .models import (
     ActionDescriptor,
@@ -129,7 +131,11 @@ class TraceRecorder:
             duration_ms=duration_ms if terminal else None,
             outcome=outcome,
             error=ErrorDescriptor(
-                type=type(error).__name__, message=str(error), retryable=False
+                type=type(error).__name__,
+                message=get_shared_redactor().redact_string(
+                    context.ticket_id or "unknown", str(error)
+                )[:4096],
+                retryable=False,
             )
             if error
             else None,
