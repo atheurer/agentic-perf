@@ -17,7 +17,9 @@ def _make_multi_user_app(tmp_path):
     from state_store.main import mount_routers
 
     app = (
-        create_app.__wrapped__() if hasattr(create_app, "__wrapped__") else create_app()
+        create_app.__wrapped__(initialize_immediately=True)
+        if hasattr(create_app, "__wrapped__")
+        else create_app(initialize_immediately=True)
     )
 
     token = app.state.api_token
@@ -452,9 +454,9 @@ class TestLegacyMode:
     @pytest.fixture()
     def legacy_client(self):
         app = (
-            create_app.__wrapped__()
+            create_app.__wrapped__(initialize_immediately=True)
             if hasattr(create_app, "__wrapped__")
-            else create_app()
+            else create_app(initialize_immediately=True)
         )
         token = app.state.api_token
         c = TestClient(app)

@@ -33,7 +33,7 @@ def event_bus(tmp_path):
 
 @pytest.fixture
 def app(store, event_bus):
-    application = create_app()
+    application = create_app(initialize_immediately=True)
     application.state.store = store
     application.state.event_bus = event_bus
     return application
@@ -299,7 +299,7 @@ class TestTranscriptEndpoint:
     ):
         from fastapi.testclient import TestClient
 
-        application = create_app()
+        application = create_app(initialize_immediately=True)
         application.state.store = store
         ticket = store.create_ticket(
             CreateTicketRequest(summary="no-bus", description="no-bus"),
@@ -316,7 +316,7 @@ class TestTranscriptEndpoint:
     def test_transcript_no_event_bus_nonexistent_returns_404(self, store):
         from fastapi.testclient import TestClient
 
-        application = create_app()
+        application = create_app(initialize_immediately=True)
         application.state.store = store
         c = TestClient(application)
         c.headers["Authorization"] = f"Bearer {application.state.api_token}"

@@ -209,7 +209,7 @@ providers/tracing/spool.py|235|self.path.touch
 providers/tracing/spool.py|236|self.ack_path.unlink
 providers/workspace/manager.py|72|self._filesystem.mkdir
 state_store/api/artifacts.py|136|filesystem.unlink
-state_store/audit.py|41|self._path.parent.mkdir
+state_store/audit.py|42|self._path.parent.mkdir
 state_store/auth.py|64|SECRETS_DIR.mkdir
 state_store/auth.py|66|TOKEN_FILE.write_text
 state_store/auth.py|67|TOKEN_FILE.chmod
@@ -219,6 +219,10 @@ state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
+state_store/process_lock.py|56|path.parent.mkdir
+state_store/process_lock.py|72|os.replace
+state_store/process_lock.py|80|temporary.unlink
+state_store/process_lock.py|107|self.root.mkdir
 state_store/store.py|61|self._persist_dir.mkdir
 state_store/store.py|547|filesystem.mkdir
 state_store/store.py|554|filesystem.mkdir

@@ -35,6 +35,7 @@ class AuditLog:
         path: Path | None = None,
         redactor: Any | None = None,
         trace_store: TraceStore | None = None,
+        process_identity: dict[str, Any] | None = None,
     ) -> None:
         self._path = path or AUDIT_LOG
         self._redactor = redactor
@@ -43,6 +44,7 @@ class AuditLog:
         self._trace_lock = threading.Lock()
         self._trace_store = trace_store or TraceStore(self._path.parent / "trace.db")
         self._owns_trace_store = trace_store is None
+        self._process_identity = dict(process_identity or {})
         self._seq = self._recover_seq()
 
     def _recover_seq(self) -> int:
@@ -73,6 +75,8 @@ class AuditLog:
         with self._lock:
             if self._redactor:
                 data = self._redactor.redact(ticket_id, data)
+            if self._process_identity:
+                data = {**data, "state_store": self._process_identity}
             try:
                 with self._trace_lock:
                     stored = self._trace_store.insert_event(

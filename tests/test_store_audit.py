@@ -269,7 +269,7 @@ class TestAuditReload:
 class TestAuditEndpoint:
     @pytest.fixture
     def app_with_audit(self, tmp_path):
-        application = create_app()
+        application = create_app(initialize_immediately=True)
         audit = AuditLog(path=tmp_path / "audit.jsonl")
         store = TicketStore(
             persist_dir=tmp_path / "tickets",
