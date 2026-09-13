@@ -32,6 +32,21 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _terminate_process(process: subprocess.Popen[str], timeout: float = 5) -> str:
+    """Stop a test subprocess and collect diagnostics without blocking forever."""
+    if process.poll() is None:
+        process.terminate()
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        process.kill()
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            output = expired.output or ""
+    return output or ""
+
+
 @pytest.mark.skipif(
     sys.version_info >= (3, 14),
     reason="FastMCP stdio hangs on local Python 3.14; covered in CI 3.12/3.13",
@@ -74,7 +89,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
     base_url = f"http://127.0.0.1:{port}"
     for _ in range(100):
         if server.poll() is not None:
-            output = server.stdout.read() if server.stdout else ""
+            output = _terminate_process(server)
             pytest.fail(f"temporary state-store exited during startup: {output}")
         try:
             import httpx
@@ -88,9 +103,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
             pass
         await asyncio.sleep(0.03)
     else:
-        output = server.stdout.read() if server.stdout else ""
-        server.terminate()
-        server.wait(timeout=5)
+        output = _terminate_process(server)
         pytest.fail(f"temporary state-store did not start: {output}")
     counter = tmp_path / "handler-count"
     sentinel = "cross-process-secret-sentinel-786"
@@ -212,12 +225,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         await asyncio.wait_for(first.disconnect(), 10)
         await asyncio.wait_for(second.disconnect(), 10)
         await asyncio.to_thread(recorder.close)
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=5)
+        _terminate_process(server, timeout=10)
 
 
 def _request(
