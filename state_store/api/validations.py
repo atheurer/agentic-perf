@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -17,6 +18,38 @@ router = APIRouter(prefix="/tickets/{ticket_id}/validations", tags=["validations
 
 def _store(request: Request):
     return request.app.state.store
+
+
+@router.post("/capability")
+def issue_capability(ticket_id: str, request: Request):
+    """Issue a one-time, short-lived capability bound to this MCP invocation."""
+    seed = request.headers.get("X-Agentic-Perf-Benchmark-Validator", "")
+    if request.state.principal.kind != "service" or not secrets.compare_digest(
+        seed, request.app.state.benchmark_validator_token
+    ):
+        raise HTTPException(
+            status_code=403, detail="benchmark validator capability required"
+        )
+    agent = request.headers.get("X-Agentic-Perf-Agent-Id", "")
+    invocation = request.headers.get("X-Agentic-Perf-Invocation-Id", "")
+    if agent != "benchmark" or not invocation:
+        raise HTTPException(
+            status_code=403, detail="benchmark invocation identity required"
+        )
+    nonce = secrets.token_urlsafe(24)
+    request.app.state.benchmark_validation_capabilities[nonce] = {
+        "ticket_id": ticket_id,
+        "agent": agent,
+        "invocation": invocation,
+        "action": request.headers.get("X-Agentic-Perf-Action-Id", ""),
+        "expires_at": time.monotonic() + 60,
+    }
+    _store(request)._audit_log(
+        "issue_validation_capability",
+        ticket_id,
+        {"agent": agent, "invocation": invocation},
+    )
+    return {"capability": nonce, "expires_in_seconds": 60}
 
 
 @router.get("/{validation_id}")
@@ -53,13 +86,24 @@ def get_validation(ticket_id: str, validation_id: str, request: Request):
 
 @router.post("")
 def create_validation(ticket_id: str, body: CreateValidationRequest, request: Request):
-    capability = request.headers.get("X-Agentic-Perf-Benchmark-Validator", "")
-    if request.state.principal.kind != "service" or not secrets.compare_digest(
-        capability, request.app.state.benchmark_validator_token
+    if request.state.principal.kind != "service":
+        raise HTTPException(
+            status_code=403,
+            detail="validation creation requires a bound, unexpired capability",
+        )
+    capability = request.headers.get("X-Agentic-Perf-Validation-Capability", "")
+    grant = request.app.state.benchmark_validation_capabilities.pop(capability, None)
+    if (
+        not grant
+        or grant["expires_at"] < time.monotonic()
+        or grant["ticket_id"] != ticket_id
+        or grant["agent"] != request.headers.get("X-Agentic-Perf-Agent-Id", "")
+        or grant["invocation"]
+        != request.headers.get("X-Agentic-Perf-Invocation-Id", "")
     ):
         raise HTTPException(
             status_code=403,
-            detail="validation creation requires the benchmark validator capability",
+            detail="validation creation requires a bound, unexpired capability",
         )
     canonical_runfile_digest = hashlib.sha256(
         json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()

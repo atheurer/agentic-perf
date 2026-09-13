@@ -209,6 +209,16 @@ async def _persist_validated_runfile(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}",
             )
             ticket_response.raise_for_status()
+            capability_response = await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/validations/capability",
+                headers={
+                    "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
+                        "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
+                    )
+                },
+            )
+            capability_response.raise_for_status()
+            capability = capability_response.json()["capability"]
             for _ in range(3):
                 manifest = (
                     ticket_response.json()
@@ -222,9 +232,7 @@ async def _persist_validated_runfile(
                         "expected_version": manifest.get("version", 0),
                     },
                     headers={
-                        "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
-                            "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
-                        )
+                        "X-Agentic-Perf-Validation-Capability": capability,
                     },
                 )
                 if response.status_code != 409:
@@ -1951,15 +1959,48 @@ async def execute_benchmark(
                 if "mismatched" in validation_error
                 else "unknown"
             )
-            return json.dumps(
-                {
-                    "status": "rejected",
-                    "harness": harness_name,
-                    "validation_id": validation_id,
-                    "reason_code": reason_code,
-                    "message": validation_error,
-                }
+            rejection = {
+                "status": "rejected",
+                "harness": harness_name,
+                "validation_id": validation_id,
+                "reason_code": reason_code,
+                "message": validation_error,
+            }
+            records = (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
             )
+            supersession = next(
+                (
+                    item
+                    for item in records.values()
+                    if isinstance(item, dict)
+                    and item.get("supersedes_validation_id") == validation_id
+                ),
+                None,
+            )
+            if supersession:
+                replacement_id = supersession.get("replacement_validation_id")
+                replacement = records.get(replacement_id, {})
+                rejection.update(
+                    {
+                        "invalidated_at": supersession.get("created_at"),
+                        "invalidated_by": supersession.get("writer"),
+                        "invalidation_reason": supersession.get("reason"),
+                        "replacement_validation_id": replacement_id,
+                        "replacement": {
+                            key: replacement.get(key)
+                            for key in (
+                                "validation_id",
+                                "harness",
+                                "controller",
+                                "runfile_fingerprint",
+                            )
+                        },
+                    }
+                )
+            return json.dumps(rejection)
         record = active_check.get("custom_fields", {}).get(
             "benchmark_validations", {}
         ).get("records", {}).get(validation_id) or _validation_records.get(

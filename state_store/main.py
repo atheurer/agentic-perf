@@ -90,6 +90,7 @@ def create_app() -> FastAPI:
         "quarantined_frames": 0,
     }
     app.state.benchmark_validator_token = load_or_generate_validator_token()
+    app.state.benchmark_validation_capabilities = {}
 
     @app.middleware("http")
     async def restore_trace_context(request: Request, call_next):

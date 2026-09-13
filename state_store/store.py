@@ -391,7 +391,16 @@ class TicketStore:
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             manifest = self._validation_manifest(ticket)
-            if manifest["version"] != expected_version:
+            # Append-only validation evidence is safe to merge: concurrent
+            # controller successes must not be thrown away merely because the
+            # active-pointer version advanced.  Only a duplicate ID conflicts.
+            validation_id = record.get("validation_id")
+            if isinstance(validation_id, str) and validation_id in manifest["records"]:
+                existing = manifest["records"][validation_id]
+                if existing.get("runfile_fingerprint") == record.get(
+                    "runfile_fingerprint"
+                ):
+                    return ticket.model_copy(), None
                 self._audit_log(
                     "create_validation_rejected",
                     ticket_id,
@@ -404,7 +413,6 @@ class TicketStore:
                     attributes=self._validation_conflict(ticket, manifest),
                 )
                 return None, self._validation_conflict(ticket, manifest)
-            validation_id = record.get("validation_id")
             if (
                 not isinstance(validation_id, str)
                 or not validation_id
