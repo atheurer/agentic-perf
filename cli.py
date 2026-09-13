@@ -1047,8 +1047,14 @@ def cmd_trace(args):
             "invocation_id": args.invocation,
             "action_type": args.action_type,
             "outcome": args.outcome,
+            "parent_action_id": args.parent_action_id,
+            "producer_component": args.producer_component,
+            "since": args.since,
+            "until": args.until,
+            "retry_kind": args.retry_kind,
+            "idempotency_outcome": args.idempotency_outcome,
             "lifecycle_state": args.lifecycle_state,
-            "causal": args.causal or args.tree,
+            "causal": args.causal or args.tree or bool(args.ticket_id),
             "include_payloads": args.include_payloads,
             "limit": args.limit,
         }.items()
@@ -1074,7 +1080,12 @@ def cmd_trace(args):
         for event in payload.get("events", []):
             print(json.dumps(event, separators=(",", ":")))
     else:
-        print(f"{payload['count']} trace event(s)")
+        for event in payload.get("events", []):
+            action = event.get("action", {})
+            producer = event.get("producer", {})
+            print(
+                f"{event.get('global_seq', '?'):>6} {action.get('type', '?'):12} {event.get('lifecycle', {}).get('state', '?'):16} action={event.get('action_id', '?')} parent={event.get('parent_action_id') or '-'} duration={event.get('duration_ms') or 0}ms process={producer.get('process_start_id') or '-'} session={event.get('mcp', {}).get('session_id') or '-'}"
+            )
 
 
 def cmd_health(args):
@@ -1423,6 +1434,12 @@ def main():
     p_trace.add_argument("--invocation")
     p_trace.add_argument("--type", dest="action_type")
     p_trace.add_argument("--outcome")
+    p_trace.add_argument("--parent", dest="parent_action_id")
+    p_trace.add_argument("--producer", dest="producer_component")
+    p_trace.add_argument("--since")
+    p_trace.add_argument("--until")
+    p_trace.add_argument("--retry-kind")
+    p_trace.add_argument("--idempotency-outcome")
     p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument(
         "--causal", action="store_true", help="Include ancestors and descendants"
