@@ -200,7 +200,7 @@ class TestAuthFailureLimiter:
 class TestRateLimitIntegration:
     @pytest.fixture()
     def app_and_token(self):
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         return app, app.state.api_token
 
     def test_health_not_rate_limited(self, app_and_token):
@@ -219,7 +219,7 @@ class TestRateLimitIntegration:
 
         clock = FakeClock()
         user_store = UserStore(persist_path=tmp_path / "users.json")
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         token = app.state.api_token
 
         app.state.multi_user = True
@@ -263,7 +263,7 @@ class TestRateLimitIntegration:
 
         clock = FakeClock()
         user_store = UserStore(persist_path=tmp_path / "users.json")
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         token = app.state.api_token
 
         app.state.multi_user = True
@@ -296,7 +296,7 @@ class TestRateLimitIntegration:
     def test_disabled_limiter_never_429s(self):
         """When rate_limit is None, no 429s are returned."""
         rate_limit_dep = make_rate_limit_dependency(None)
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         token = app.state.api_token
 
         from state_store.main import mount_routers
@@ -322,7 +322,7 @@ class TestRateLimitIntegration:
             failures_per_min=3,
             clock=clock,
         )
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         token = app.state.api_token
 
         auth = make_auth_dependency(
@@ -357,7 +357,7 @@ class TestRateLimitIntegration:
 
     def test_events_limit_bound(self):
         """GET /tickets/{id}/events rejects limit > 1000."""
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         token = app.state.api_token
         client = TestClient(app)
         client.headers["Authorization"] = f"Bearer {token}"
@@ -380,7 +380,7 @@ class TestRateLimitIntegration:
 
     def test_tickets_since_requires_auth(self):
         """GET /tickets/since/{seq} is behind auth."""
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         client = TestClient(app)
 
         r = client.get("/api/v1/tickets/since/0")
@@ -401,7 +401,7 @@ class TestRateLimitIntegration:
             events_mod._summary_cache = {}
             events_mod._summary_cache_ts = 0.0
 
-            app = create_app()
+            app = create_app(initialize_immediately=True)
             token = app.state.api_token
             client = TestClient(app)
             client.headers["Authorization"] = f"Bearer {token}"

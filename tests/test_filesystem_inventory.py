@@ -132,10 +132,10 @@ agents/infra/server.py|242|unlink
 agents/infra/server.py|307|tempfile.mkdtemp
 orchestrator/main.py|1853|LOCK_FILE.parent.mkdir
 orchestrator/main.py|1885|LOCK_FILE.unlink
-paths.py|136|mkdir
-paths.py|143|tempfile.mkdtemp
-paths.py|161|ws_dir.mkdir
-paths.py|165|temp_dir.mkdir
+paths.py|145|mkdir
+paths.py|152|tempfile.mkdtemp
+paths.py|170|ws_dir.mkdir
+paths.py|174|temp_dir.mkdir
 providers/events.py|149|self._log_dir.mkdir
 providers/execution/filesystem.py|359|path.mkdir
 providers/execution/filesystem.py|385|path.parent.mkdir
@@ -209,7 +209,7 @@ providers/tracing/spool.py|235|self.path.touch
 providers/tracing/spool.py|236|self.ack_path.unlink
 providers/workspace/manager.py|72|self._filesystem.mkdir
 state_store/api/artifacts.py|136|filesystem.unlink
-state_store/audit.py|41|self._path.parent.mkdir
+state_store/audit.py|42|self._path.parent.mkdir
 state_store/auth.py|64|SECRETS_DIR.mkdir
 state_store/auth.py|66|TOKEN_FILE.write_text
 state_store/auth.py|67|TOKEN_FILE.chmod
@@ -219,6 +219,10 @@ state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
+state_store/process_lock.py|56|path.parent.mkdir
+state_store/process_lock.py|72|os.replace
+state_store/process_lock.py|80|temporary.unlink
+state_store/process_lock.py|107|self.root.mkdir
 state_store/store.py|61|self._persist_dir.mkdir
 state_store/store.py|547|filesystem.mkdir
 state_store/store.py|554|filesystem.mkdir
