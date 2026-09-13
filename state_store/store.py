@@ -35,9 +35,13 @@ from .models import (
     VALID_TRANSITIONS,
     AcquireOrchestratorLeaseRequest,
     AddCommentRequest,
+    ApprovalRequest,
     Comment,
+    ConsumeApprovalRequest,
+    CreateApprovalRequest,
     CreateTicketRequest,
     OrchestratorLease,
+    ResolveApprovalRequest,
     Ticket,
     TicketStatus,
     TransitionRequest,
@@ -154,6 +158,7 @@ class TicketStore:
             lease = self._read_orchestrator_lease()
             if lease is not None and lease.expires_at <= self._lease_now():
                 self._write_orchestrator_lease(None)
+                self._expire_all_pending_approvals_unlocked()
                 self._audit_log(
                     "orchestrator_lease_expire", "-", {"epoch": lease.epoch}
                 )
@@ -189,6 +194,10 @@ class TicketStore:
                     current, (current.expires_at - now).total_seconds()
                 )
             epoch = (current.epoch + 1) if current is not None else 1
+            if current is not None:
+                self._cancel_pending_approvals_unlocked_all(
+                    reason="orchestrator lease takeover"
+                )
             lease = OrchestratorLease(
                 session_id=request.session_id,
                 instance_name=request.instance_name,
@@ -211,6 +220,60 @@ class TicketStore:
                 },
             )
             return lease.model_copy()
+
+    def _expire_pending_approvals_unlocked(self, ticket: Ticket) -> None:
+        raw = ticket.custom_fields.get("approval_requests", {})
+        if not isinstance(raw, dict):
+            return
+        now = self._lease_now()
+        changed = False
+        for approval_id, value in list(raw.items()):
+            if not isinstance(value, dict):
+                continue
+            current = ApprovalRequest.model_validate(value)
+            if (
+                current.status == "pending"
+                and current.expires_at is not None
+                and current.expires_at <= now
+            ):
+                raw[approval_id] = current.model_copy(
+                    update={
+                        "status": "expired",
+                        "resolved_at": now,
+                        "resolved_by": "system",
+                        "resolution_reason": "approval request expired",
+                        "record_version": current.record_version + 1,
+                    }
+                ).model_dump(mode="json")
+                self._audit_log(
+                    "approval_expired",
+                    ticket.id,
+                    {
+                        "approval_request_id": approval_id,
+                        "validation_id": current.validation_id,
+                        "execution_intent_digest": current.execution_intent_digest,
+                        "reason": "approval request expired",
+                        "actor": "system",
+                    },
+                )
+                self._trace_mutation(
+                    ticket.id,
+                    "approval_expired",
+                    attributes={"approval_request_id": approval_id},
+                )
+                changed = True
+        if changed:
+            ticket.updated_at = now
+            self._persist_ticket(ticket)
+
+    def _expire_all_pending_approvals_unlocked(self) -> None:
+        for ticket in self._tickets.values():
+            self._expire_pending_approvals_unlocked(ticket)
+
+    def _cancel_pending_approvals_unlocked_all(self, *, reason: str) -> None:
+        for ticket in self._tickets.values():
+            self._cancel_pending_approvals_unlocked(ticket, reason=reason)
+            self._persist_ticket(ticket)
 
     def renew_orchestrator_lease(
         self, session_id: uuid.UUID, epoch: int, ttl_seconds: float
@@ -498,6 +561,10 @@ class TicketStore:
                     ticket.previous_status = current
             else:
                 ticket.previous_status = None
+                self._cancel_pending_approvals_unlocked(
+                    ticket,
+                    reason="ticket resumed without resolving approval",
+                )
 
             old_status = current.value
             ticket.status = new_status
@@ -580,6 +647,11 @@ class TicketStore:
                 raise ValueError(
                     "imported fixture control and provenance fields are immutable; "
                     "use import-state or the reviewed resume operation"
+                )
+            if {"execution_plan", "abort_requested"}.intersection(fields):
+                self._cancel_pending_approvals_unlocked(
+                    ticket,
+                    reason="execution intent changed or ticket aborted",
                 )
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
@@ -835,6 +907,20 @@ class TicketStore:
             }
             if manifest.get("active_validation_id") == validation_id:
                 manifest["active_validation_id"] = replacement_validation_id
+            raw_approvals = ticket.custom_fields.get("approval_requests", {})
+            if isinstance(raw_approvals, dict):
+                for approval_id, value in list(raw_approvals.items()):
+                    if (
+                        isinstance(value, dict)
+                        and value.get("status") == "pending"
+                        and value.get("validation_id") == validation_id
+                    ):
+                        self._cancel_pending_approvals_unlocked(
+                            ticket,
+                            reason="validation superseded or invalidated",
+                            validation_id=validation_id,
+                        )
+                        break
             manifest["version"] += 1
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
@@ -893,6 +979,414 @@ class TicketStore:
             )
             self._trace_mutation(ticket_id, "add_comment")
             return comment.model_copy()
+
+    def create_approval_request(
+        self,
+        ticket_id: str,
+        request: CreateApprovalRequest,
+        *,
+        created_by: str,
+    ) -> ApprovalRequest:
+        """Persist one immutable benchmark approval before pausing the ticket."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            lease = self._read_orchestrator_lease()
+            claim = ticket.custom_fields.get("claim")
+            rejection_reason = None
+            if lease is None or lease.expires_at <= self._lease_now():
+                rejection_reason = "no active leader lease"
+            elif not isinstance(claim, dict):
+                rejection_reason = "claim_missing"
+            else:
+                try:
+                    claim_expires = datetime.fromisoformat(claim["expires"])
+                    if claim_expires.tzinfo is None:
+                        claim_expires = claim_expires.replace(tzinfo=timezone.utc)
+                    if claim_expires <= self._lease_now():
+                        rejection_reason = "claim_expired"
+                    elif (
+                        not isinstance(claim.get("session_id"), str)
+                        or not claim["session_id"]
+                        or not isinstance(claim.get("epoch"), int)
+                        or isinstance(claim["epoch"], bool)
+                        or claim["epoch"] <= 0
+                        or not isinstance(claim.get("claim_id"), str)
+                        or not claim["claim_id"]
+                    ):
+                        rejection_reason = "claim_malformed"
+                    elif (
+                        not request.session_id
+                        or not request.session_epoch
+                        or not request.claim_id
+                        or request.session_id != str(lease.session_id)
+                        or request.session_epoch != str(lease.epoch)
+                        or claim["session_id"] != str(lease.session_id)
+                        or claim["epoch"] != lease.epoch
+                        or request.claim_id != claim["claim_id"]
+                        or request.ticket_attempt != claim["claim_id"]
+                    ):
+                        rejection_reason = "claim_owned_by_other_session"
+                except (KeyError, TypeError, ValueError):
+                    rejection_reason = "claim_malformed"
+            if rejection_reason is not None:
+                self._audit_log(
+                    "approval_requested_rejected",
+                    ticket_id,
+                    {
+                        "reason": rejection_reason,
+                        "validation_id": request.validation_id,
+                        "claim_id": request.claim_id,
+                    },
+                )
+                self._trace_mutation(
+                    ticket_id,
+                    "approval_requested",
+                    rejected=True,
+                    attributes={"reason": rejection_reason},
+                )
+                raise ValueError(f"approval rejected: {rejection_reason}")
+            fields = ticket.custom_fields
+            manifest = fields.get("benchmark_validations", {})
+            records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+            validation = records.get(request.validation_id)
+            if not isinstance(validation, dict):
+                legacy = fields.get("validated_run_file", {})
+                validation = legacy if isinstance(legacy, dict) else None
+            if (
+                not isinstance(validation, dict)
+                or validation.get("validation_id") != request.validation_id
+                or validation.get("state", "executable") != "executable"
+                or validation.get("runfile_fingerprint")
+                != request.presented_run_file_digest
+                or validation.get("execution_intent_digest")
+                != request.execution_intent_digest
+            ):
+                raise ValueError(
+                    "approval does not match an executable validation record"
+                )
+            raw = ticket.custom_fields.setdefault("approval_requests", {})
+            if not isinstance(raw, dict):
+                raise ValueError("approval request state is malformed")
+            self._expire_pending_approvals_unlocked(ticket)
+            for value in raw.values():
+                if not isinstance(value, dict):
+                    continue
+                existing = ApprovalRequest.model_validate(value)
+                if (
+                    existing.status == "pending"
+                    and existing.validation_id == request.validation_id
+                    and existing.presented_run_file_digest
+                    == request.presented_run_file_digest
+                    and existing.execution_intent_digest
+                    == request.execution_intent_digest
+                    and existing.waiter_owner == request.waiter_owner
+                    and existing.invocation_id == request.invocation_id
+                    and existing.tool_call_id == request.tool_call_id
+                    and existing.session_id == request.session_id
+                    and existing.session_epoch == request.session_epoch
+                    and existing.claim_id == request.claim_id
+                    and existing.ticket_attempt == request.ticket_attempt
+                ):
+                    return existing
+            approval_id = f"apr-{uuid.uuid4().hex}"
+            expires_at = request.expires_at or (self._lease_now() + timedelta(hours=1))
+            if expires_at <= self._lease_now():
+                raise ValueError("approval request expiry must be in the future")
+            claim = ticket.custom_fields.get("claim")
+            if request.claim_id and (
+                not isinstance(claim, dict) or request.claim_id != claim.get("claim_id")
+            ):
+                self._audit_log(
+                    "approval_requested_rejected",
+                    ticket_id,
+                    {
+                        "reason": "claim identity mismatch",
+                        "validation_id": request.validation_id,
+                    },
+                )
+                raise ValueError(
+                    "approval claim identity does not match active ticket claim"
+                )
+            lease = self._read_orchestrator_lease()
+            if lease is not None and lease.expires_at > self._lease_now():
+                if (
+                    request.claim_id or request.waiter_owner or request.invocation_id
+                ) and (not request.session_id or not request.session_epoch):
+                    raise ValueError("approval requires active session and epoch")
+                if request.session_id and request.session_id != str(lease.session_id):
+                    raise ValueError("approval session does not match active lease")
+                if request.session_epoch and request.session_epoch != str(lease.epoch):
+                    raise ValueError("approval epoch does not match active lease")
+                bound_session_id = str(lease.session_id)
+                bound_session_epoch = str(lease.epoch)
+            else:
+                bound_session_id = request.session_id
+                bound_session_epoch = request.session_epoch
+            approval = ApprovalRequest(
+                approval_request_id=approval_id,
+                ticket_id=ticket_id,
+                created_by=created_by,
+                **request.model_dump(
+                    exclude={
+                        "expires_at",
+                        "claim_id",
+                        "waiter_owner",
+                        "ticket_attempt",
+                        "session_id",
+                        "session_epoch",
+                    }
+                ),
+                session_id=bound_session_id,
+                session_epoch=bound_session_epoch,
+                expires_at=expires_at,
+                waiter_owner=request.waiter_owner,
+                claim_id=claim.get("claim_id") if isinstance(claim, dict) else None,
+                ticket_attempt=(
+                    request.ticket_attempt
+                    or (claim.get("claim_id") if isinstance(claim, dict) else None)
+                ),
+            )
+            raw[approval_id] = approval.model_dump(mode="json")
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            self._audit_log(
+                "approval_requested",
+                ticket_id,
+                {
+                    "approval_request_id": approval_id,
+                    "validation_id": request.validation_id,
+                },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "approval_requested",
+                attributes={"approval_request_id": approval_id},
+            )
+            return approval
+
+    def _cancel_pending_approvals_unlocked(
+        self, ticket: Ticket, *, reason: str, validation_id: str | None = None
+    ) -> None:
+        raw = ticket.custom_fields.get("approval_requests", {})
+        if not isinstance(raw, dict):
+            return
+        now = datetime.now(timezone.utc)
+        for approval_id, value in list(raw.items()):
+            if not isinstance(value, dict) or value.get("status") != "pending":
+                continue
+            current = ApprovalRequest.model_validate(value)
+            if validation_id is not None and current.validation_id != validation_id:
+                continue
+            raw[approval_id] = current.model_copy(
+                update={
+                    "status": "cancelled",
+                    "resolved_at": now,
+                    "resolved_by": "system",
+                    "resolution_reason": reason,
+                    "record_version": current.record_version + 1,
+                }
+            ).model_dump(mode="json")
+            # Keep cancellation causal and durable; approval data remains
+            # queryable without relying on comment ordering.
+            self._audit_log(
+                "approval_cancelled",
+                ticket.id,
+                {
+                    "approval_request_id": approval_id,
+                    "validation_id": current.validation_id,
+                    "execution_intent_digest": current.execution_intent_digest,
+                    "reason": reason,
+                    "actor": "system",
+                },
+            )
+            self._trace_mutation(
+                ticket.id,
+                "approval_cancelled",
+                attributes={"approval_request_id": approval_id, "reason": reason},
+            )
+
+    def consume_approval_request(
+        self,
+        ticket_id: str,
+        approval_request_id: str,
+        request: ConsumeApprovalRequest,
+        *,
+        consumed_by: str,
+    ) -> ApprovalRequest:
+        """Atomically spend an approved request exactly once."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            raw = ticket.custom_fields.get("approval_requests", {})
+            value = raw.get(approval_request_id) if isinstance(raw, dict) else None
+            if not isinstance(value, dict):
+                raise TicketNotFound("approval request not found")
+            current = ApprovalRequest.model_validate(value)
+            self._expire_pending_approvals_unlocked(ticket)
+            value = raw.get(approval_request_id) if isinstance(raw, dict) else None
+            if isinstance(value, dict):
+                current = ApprovalRequest.model_validate(value)
+            if current.status != "approved":
+                raise ValueError("approval request is not approved")
+            if current.consumed_at is not None:
+                raise ValueError("approval request was already consumed")
+            for key in (
+                "validation_id",
+                "presented_run_file_digest",
+                "execution_intent_digest",
+            ):
+                if getattr(current, key) != getattr(request, key):
+                    raise ValueError(f"approval request {key} does not match")
+            if current.session_id is not None:
+                lease = self._read_orchestrator_lease()
+                if (
+                    lease is None
+                    or lease.expires_at <= self._lease_now()
+                    or request.session_id != current.session_id
+                    or request.session_epoch != current.session_epoch
+                    or str(lease.session_id) != current.session_id
+                    or str(lease.epoch) != current.session_epoch
+                ):
+                    raise ValueError("approval requires the active fenced session")
+            if (
+                current.ticket_attempt is not None
+                and request.ticket_attempt != current.ticket_attempt
+            ):
+                raise ValueError("approval ticket attempt does not match")
+            claim = ticket.custom_fields.get("claim")
+            if current.session_id is None or current.claim_id is None:
+                raise ValueError(
+                    "approval is not bound to an active fenced ticket attempt"
+                )
+            if current.claim_id is not None:
+                if (
+                    not isinstance(claim, dict)
+                    or claim.get("claim_id") != current.claim_id
+                    or request.claim_id != current.claim_id
+                    or datetime.fromisoformat(claim["expires"]) <= self._lease_now()
+                ):
+                    raise ValueError("approval requires the active ticket claim")
+            consumed = current.model_copy(
+                update={
+                    "consumed_at": datetime.now(timezone.utc),
+                    "record_version": current.record_version + 1,
+                }
+            )
+            raw[approval_request_id] = consumed.model_dump(mode="json")
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            self._audit_log(
+                "approval_consumed",
+                ticket_id,
+                {
+                    "approval_request_id": approval_request_id,
+                    "consumed_by": consumed_by,
+                },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "approval_consumed",
+                attributes={"approval_request_id": approval_request_id},
+            )
+            return consumed
+
+    def list_approval_requests(self, ticket_id: str) -> list[ApprovalRequest]:
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            self._expire_pending_approvals_unlocked(ticket)
+            raw = ticket.custom_fields.get("approval_requests", {})
+            if not isinstance(raw, dict):
+                return []
+            return [
+                ApprovalRequest.model_validate(value)
+                for value in raw.values()
+                if isinstance(value, dict)
+            ]
+
+    def resolve_approval_request(
+        self,
+        ticket_id: str,
+        approval_request_id: str,
+        request: ResolveApprovalRequest,
+        *,
+        resolved_by: str,
+    ) -> ApprovalRequest:
+        """Resolve exactly once, checking the immutable intent with CAS semantics."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            raw = ticket.custom_fields.get("approval_requests", {})
+            current_raw = (
+                raw.get(approval_request_id) if isinstance(raw, dict) else None
+            )
+            if not isinstance(current_raw, dict):
+                raise TicketNotFound("approval request not found")
+            current = ApprovalRequest.model_validate(current_raw)
+            self._expire_pending_approvals_unlocked(ticket)
+            current_raw = (
+                raw.get(approval_request_id) if isinstance(raw, dict) else None
+            )
+            if isinstance(current_raw, dict):
+                current = ApprovalRequest.model_validate(current_raw)
+            if current.status != "pending":
+                raise ValueError(f"approval request is already {current.status}")
+            if request.comment_id:
+                for item in raw.values():
+                    if (
+                        isinstance(item, dict)
+                        and item.get("resolution_comment_id") == request.comment_id
+                    ):
+                        raise ValueError("resolution comment was already consumed")
+            for key, expected in (
+                ("validation_id", request.validation_id),
+                ("presented_run_file_digest", request.presented_run_file_digest),
+                ("execution_intent_digest", request.execution_intent_digest),
+            ):
+                if expected is not None and expected != getattr(current, key):
+                    raise ValueError(f"approval request {key} does not match")
+            resolution_comment_id = request.comment_id
+            if request.comment and resolution_comment_id is None:
+                comment = Comment(
+                    id=uuid.uuid4().hex[:8], author=resolved_by, body=request.comment
+                )
+                ticket.comments.append(comment)
+                resolution_comment_id = comment.id
+            resolved = current.model_copy(
+                update={
+                    "status": request.decision,
+                    "resolved_at": datetime.now(timezone.utc),
+                    "resolved_by": resolved_by,
+                    "resolution_comment_id": resolution_comment_id,
+                    "resolution_reason": request.reason,
+                    "record_version": current.record_version + 1,
+                }
+            )
+            raw[approval_request_id] = resolved.model_dump(mode="json")
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            self._audit_log(
+                "approval_resolved",
+                ticket_id,
+                {
+                    "approval_request_id": approval_request_id,
+                    "status": request.decision,
+                },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "approval_resolved",
+                attributes={
+                    "approval_request_id": approval_request_id,
+                    "status": request.decision,
+                },
+            )
+            return resolved
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
         with self._lock:
@@ -986,6 +1480,9 @@ class TicketStore:
 
             expires = now + timedelta(seconds=duration_seconds)
             claim = {
+                "claim_id": existing.get("claim_id", f"claim-{uuid.uuid4().hex}")
+                if isinstance(existing, dict)
+                else f"claim-{uuid.uuid4().hex}",
                 "owner": owner,
                 "expires": expires.isoformat(),
                 "status": ticket.status.value,

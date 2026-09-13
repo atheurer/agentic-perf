@@ -1960,6 +1960,7 @@ async def setup_passwordless_ssh(
 async def execute_benchmark(
     controller: str,
     validation_id: str | None = None,
+    approval_request_id: str | None = None,
     harness: str | None = None,
     run_command: str | None = None,
     run_file: dict | None = None,
@@ -1981,6 +1982,16 @@ async def execute_benchmark(
     )
     if active_check.get("status") == "rejected":
         return json.dumps(active_check)
+    if (
+        active_check.get("id") or os.environ.get("TICKET_ID")
+    ) and not approval_request_id:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "approval_required",
+                "message": "ticket-scoped benchmark execution requires approval_request_id",
+            }
+        )
 
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
@@ -2126,6 +2137,70 @@ async def execute_benchmark(
                         f"Only known harness binaries are allowed."
                     ),
                 }
+            )
+
+    if approval_request_id:
+        # #798 owns the approval capability boundary.  #788 may add richer
+        # operation claims later; this optional token is deliberately checked
+        # immediately before any benchmark-side effect.
+        ticket_id = active_check.get("id") or os.environ.get("TICKET_ID", "")
+        record = (
+            (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+                .get(validation_id, {})
+            )
+            if validation_id
+            else {}
+        )
+        if not ticket_id or not validation_id or not isinstance(record, dict):
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_binding_missing"}
+            )
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                consumed = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/approvals/{approval_request_id}/consume",
+                    json={
+                        "validation_id": validation_id,
+                        "presented_run_file_digest": record.get("runfile_fingerprint"),
+                        "execution_intent_digest": record.get(
+                            "execution_intent_digest"
+                        ),
+                        "session_id": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
+                        ),
+                        "session_epoch": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_EPOCH"
+                        ),
+                        "ticket_attempt": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                        "claim_id": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                    },
+                )
+            if consumed.status_code >= 300:
+                return json.dumps(
+                    {"status": "rejected", "reason_code": "approval_not_approved"}
+                )
+        except Exception:
+            logger.exception("[benchmark] approval capability consumption failed")
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_check_failed"}
             )
 
     async def _benchmark_progress(output_line: str, elapsed: int) -> None:

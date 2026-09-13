@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from . import (
+    approvals,
     artifacts,
     audit,
     chat,
@@ -27,6 +28,7 @@ from . import (
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(audit.router)
 api_router.include_router(artifacts.router)
+api_router.include_router(approvals.router)
 api_router.include_router(tickets.router)
 api_router.include_router(transitions.router)
 api_router.include_router(comments.router)
