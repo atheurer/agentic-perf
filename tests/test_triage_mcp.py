@@ -235,9 +235,7 @@ async def test_base_agent_mcp_dispatch():
     result = await agent._execute_tool(mcp_call)
     assert result.content == '{"mcp": "result"}'
     assert not result.is_error
-    mock_mcp.call_tool.assert_called_once_with(
-        "mcp_tool", {"y": 2}, trace_context=None
-    )
+    mock_mcp.call_tool.assert_called_once_with("mcp_tool", {"y": 2}, trace_context=None)
 
     agent._mcp = None
     unknown_call = ToolCall(id="3", name="unknown", input={})
