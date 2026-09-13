@@ -25,10 +25,21 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+    principal = _get_principal(request)
+    require_write_access(principal, ticket, _is_multi_user(request))
+    if body.reviewed_resume and principal.kind != "service" and not principal.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Imported fixture resume requires an authorized reviewer",
+        )
 
     try:
-        result = store.transition_ticket(ticket_id, body)
+        result = store.transition_ticket(
+            ticket_id,
+            body,
+            triggered_by=principal.username,
+            reviewer_authorized=(principal.kind == "service" or principal.is_admin),
+        )
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except InvalidTransition as e:

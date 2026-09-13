@@ -11,7 +11,7 @@ from ..models import (
     TicketStatus,
     UpdateFieldsRequest,
 )
-from ..store import TicketNotFound
+from ..store import TicketDispatchBlocked, TicketNotFound
 from .action_hints import after_create
 
 logger = logging.getLogger(__name__)
@@ -214,6 +214,8 @@ def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     try:
         result = store.claim_ticket(ticket_id, body.owner, body.duration_seconds)
+    except TicketDispatchBlocked as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     if result is None:

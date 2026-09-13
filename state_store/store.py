@@ -37,6 +37,7 @@ from .models import (
     Ticket,
     TicketStatus,
     TransitionRequest,
+    imported_fixture_reserved_field,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,12 @@ class InvalidTransition(Exception):
 
 
 class TicketNotFound(Exception):
+    pass
+
+
+class TicketDispatchBlocked(Exception):
+    """A ticket is intentionally prevented from entering agent execution."""
+
     pass
 
 
@@ -183,6 +190,7 @@ class TicketStore:
         ticket_id: str,
         request: TransitionRequest,
         triggered_by: str = "system",
+        reviewer_authorized: bool = False,
     ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
@@ -214,6 +222,37 @@ class TicketStore:
                             and isinstance(steps[idx], dict)
                         ):
                             steps[idx]["status"] = "aborted"
+                elif ticket.custom_fields.get("imported_fixture"):
+                    if not request.reviewed_resume:
+                        self._trace_mutation(
+                            ticket_id,
+                            "transition_ticket",
+                            rejected=True,
+                            attributes={"reason": "imported_fixture_requires_review"},
+                        )
+                        raise InvalidTransition(
+                            "Imported fixture requires reviewed_resume=true before "
+                            "it can become executable"
+                        )
+                    if not reviewer_authorized:
+                        self._trace_mutation(
+                            ticket_id,
+                            "transition_ticket",
+                            rejected=True,
+                            attributes={"reason": "reviewer_authorization_required"},
+                        )
+                        raise InvalidTransition(
+                            "Imported fixture resume requires an authorized "
+                            "service or administrator reviewer"
+                        )
+                    # Imported fixtures intentionally have no previous status.
+                    # A reviewed operator must explicitly re-enter the normal
+                    # pipeline at triage rather than accidentally resuming a
+                    # copied in-progress operation.
+                    allowed = [
+                        TicketStatus.TRIAGE_PENDING,
+                        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+                    ]
                 elif ticket.previous_status is None:
                     raise InvalidTransition(
                         "Cannot resume from AWAITING_CUSTOMER_GUIDANCE: no previous status"
@@ -252,6 +291,12 @@ class TicketStore:
                     f"Cannot transition from {current.value} to {new_status.value}. "
                     f"Allowed: {[s.value for s in allowed]}"
                 )
+
+            if request.reviewed_resume and ticket.custom_fields.get("imported_fixture"):
+                ticket.custom_fields["imported_fixture_reviewed"] = {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "reviewed_by": triggered_by,
+                }
 
             if new_status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                 if current != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
@@ -327,6 +372,11 @@ class TicketStore:
                 raise ValueError(
                     "benchmark validation fields are immutable; use the validations API"
                 )
+            if self._contains_imported_fixture_reserved_field(fields):
+                raise ValueError(
+                    "imported fixture control and provenance fields are immutable; "
+                    "use import-state or the reviewed resume operation"
+                )
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
@@ -337,6 +387,22 @@ class TicketStore:
             )
             self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
+
+    @staticmethod
+    def _contains_imported_fixture_reserved_field(value: object) -> bool:
+        """Find protected fixture metadata at any nested update path."""
+        if isinstance(value, dict):
+            return any(
+                imported_fixture_reserved_field(key)
+                or TicketStore._contains_imported_fixture_reserved_field(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(
+                TicketStore._contains_imported_fixture_reserved_field(item)
+                for item in value
+            )
+        return False
 
     @staticmethod
     def _validation_manifest(ticket: Ticket) -> dict:
@@ -635,6 +701,25 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            if ticket.custom_fields.get(
+                "imported_fixture"
+            ) and not ticket.custom_fields.get("imported_fixture_reviewed"):
+                self._audit_log(
+                    "claim_ticket",
+                    ticket_id,
+                    {"owner": owner, "result": "rejected_imported_fixture"},
+                )
+                self._trace_mutation(
+                    ticket_id,
+                    "claim_ticket",
+                    rejected=True,
+                    attributes={"reason": "imported_fixture_requires_review"},
+                )
+                raise TicketDispatchBlocked(
+                    "Imported fixture is non-dispatchable until an explicit "
+                    "reviewed resume operation is recorded"
+                )
 
             now = datetime.now(timezone.utc)
             existing = ticket.custom_fields.get("claim")
