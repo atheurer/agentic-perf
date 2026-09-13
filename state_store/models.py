@@ -373,3 +373,7 @@ class AbortRequest(BaseModel):
 class ClaimRequest(BaseModel):
     owner: str
     duration_seconds: int = 300
+    session_id: UUID | None = None
+    epoch: int | None = Field(default=None, gt=0)
+    claim_id: str | None = Field(default=None, min_length=1, max_length=128)
+    instance_name: str | None = Field(default=None, max_length=255)
