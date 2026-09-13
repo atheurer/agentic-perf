@@ -93,10 +93,13 @@ class TestStoreIsolation:
         assert app.state.trace_store._connection is None
 
     def test_module_level_app_uses_sandbox(self):
+        from fastapi.testclient import TestClient
+
         from state_store import main
 
-        store = main.app.state.store
-        assert Path(store._persist_dir).resolve().is_relative_to(_SANDBOX)
+        with TestClient(main.app):
+            store = main.app.state.store
+            assert Path(store._persist_dir).resolve().is_relative_to(_SANDBOX)
 
 
 class TestSandboxConfiguration:

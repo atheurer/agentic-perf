@@ -52,12 +52,47 @@ except Exception:
 STORE_PORT="${STORE_PORT:-$(_read_port)}"
 
 _is_store_running() {
-    if [ -f "$STORE_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$STORE_PID_FILE")
-        kill -0 "$pid" 2>/dev/null && return 0
+    [ -f "$AP_HOME/state-store.lock" ] || return 1
+    python3 -c "
+import fcntl, sys
+fd = open('$AP_HOME/state-store.lock')
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(0)  # held lock is authoritative, unlike a PID file
+fcntl.flock(fd, fcntl.LOCK_UN)
+sys.exit(1)
+" 2>/dev/null
+}
+
+_store_endpoint_status() {
+    local token="${AGENTIC_PERF_API_TOKEN:-}"
+    [ -f "$AP_HOME/secrets/api-token" ] && token=$(tr -d '\n' < "$AP_HOME/secrets/api-token")
+    local response
+    response=$(curl -sS --max-time 1 -H "Authorization: Bearer $token" \
+        "http://localhost:$STORE_PORT/api/v1/diagnostics" 2>/dev/null) || return 1
+    python3 -c "
+import json, sys
+try:
+    remote = json.loads(sys.argv[1]).get('store_id')
+    local_id = open('$AP_HOME/state-store.id').read().strip()
+    print('this-store' if remote and remote == local_id else 'different-store')
+except Exception:
+    print('another-service')
+" "$response"
+}
+
+_store_pid_detail() {
+    [ -f "$STORE_PID_FILE" ] || return 0
+    local pid
+    pid=$(cat "$STORE_PID_FILE" 2>/dev/null)
+    if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "stale PID file ($STORE_PID_FILE)"
+    elif [ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" != "$REPO_DIR" ]; then
+        echo "PID $pid running from different worktree ($(readlink -f "/proc/$pid/cwd" 2>/dev/null))"
+    else
+        echo "PID $pid running from this worktree"
     fi
-    return 1
 }
 
 _is_orch_running() {
@@ -86,10 +121,16 @@ cmd_start() {
         exit 1
     fi
 
-    # Start state store
+    # The persistence-root lock is authoritative.  PID files only aid diagnosis.
     if _is_store_running; then
-        echo "State store already running (PID $(cat "$STORE_PID_FILE"))."
+        endpoint=$(_store_endpoint_status || true)
+        echo "State store process lock held (${endpoint:-endpoint unavailable}; $(_store_pid_detail))."
     else
+        endpoint=$(_store_endpoint_status || true)
+        if [ -n "$endpoint" ]; then
+            echo "ERROR: port $STORE_PORT is occupied by $endpoint; refusing to start."
+            exit 1
+        fi
         echo "Starting state store on port $STORE_PORT..."
         STORE_PORT="$STORE_PORT" nohup python3 -m uvicorn state_store.main:app \
             --host 0.0.0.0 --port "$STORE_PORT" \
@@ -182,10 +223,16 @@ cmd_stop() {
 cmd_status() {
     echo "=== agentic-perf services ==="
     if _is_store_running; then
-        echo "State store:  RUNNING (PID $(cat "$STORE_PID_FILE"))"
+        endpoint=$(_store_endpoint_status || true)
+        echo "State store:  LOCK HELD (${endpoint:-endpoint unavailable}; $(_store_pid_detail))"
         echo "  Dashboard:  http://localhost:$STORE_PORT/"
     else
-        echo "State store:  STOPPED"
+        endpoint=$(_store_endpoint_status || true)
+        if [ -n "$endpoint" ]; then
+            echo "State store:  ENDPOINT OCCUPIED BY $endpoint"
+        else
+            echo "State store:  STOPPED ($(_store_pid_detail))"
+        fi
     fi
 
     if _is_orch_running; then

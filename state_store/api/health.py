@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
 from paths import TRACE_SPOOL_DIR
 
@@ -47,3 +47,13 @@ def health(request: Request):
             "quarantined_frames": quarantined,
         },
     }
+
+
+async def _require_authenticated(request: Request):
+    return await request.app.state.auth_dependency(request)
+
+
+@router.get("/diagnostics", dependencies=[Depends(_require_authenticated)])
+def diagnostics(request: Request):
+    """Authenticated operator diagnostics; do not add these fields to health."""
+    return dict(request.app.state.store_diagnostics)

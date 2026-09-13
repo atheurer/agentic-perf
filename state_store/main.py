@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,13 +16,19 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from orchestrator.config import _load_config_file
-from paths import TRACE_DB_PATH, get_instance_name
+from paths import (
+    AGENTIC_PERF_HOME,
+    TRACE_DB_PATH,
+    get_instance_name,
+    persistence_root_fingerprint,
+)
 from providers.events import EventBus
 from providers.tracing import TraceContext, bind_trace_context, reset_trace_context
 
 from .api.router import api_router, chat_router, health_router, webhook_router
 from .audit import AuditLog, set_actor
 from .auth import load_or_generate_token, make_auth_dependency
+from .process_lock import PersistenceRootLock
 from .ratelimit import (
     AuthFailureLimiter,
     RateLimiter,
@@ -75,8 +82,8 @@ def mount_routers(
     app.include_router(chat_router)
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Agentic Perf State Store", version="0.1.0")
+def _initialize_runtime(app: FastAPI, port: int) -> None:
+    """Construct writable runtime components only after the root lock is held."""
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
     app.state.trace_instance_id = get_instance_name()
     app.state.trace_health = {
@@ -85,78 +92,6 @@ def create_app() -> FastAPI:
         "schema_rejections": 0,
         "quarantined_frames": 0,
     }
-
-    @app.middleware("http")
-    async def restore_trace_context(request: Request, call_next):
-        """Restore correlation only from an authenticated internal caller.
-
-        Middleware runs before route dependencies, so authenticate here before
-        binding anything.  A user token (or a forged marker) may authorize the
-        route but can never choose its causal parent.
-        """
-        if request.headers.get("X-Agentic-Perf-Causal-Context") != "v1":
-            return await call_next(request)
-        auth = getattr(request.app.state, "auth_dependency", None)
-        if auth is None:
-            return await call_next(request)
-        try:
-            principal = await auth(request)
-        except HTTPException:
-            # The route dependency returns the normal authentication response;
-            # importantly, no untrusted context is bound on that path.
-            return await call_next(request)
-        if principal.kind != "service":
-            return await call_next(request)
-        traceparent = request.headers.get("traceparent", "").split("-")
-        try:
-            context = TraceContext(
-                ticket_id=request.headers.get("X-Agentic-Perf-Ticket-Id") or None,
-                agent_id=request.headers.get("X-Agentic-Perf-Agent-Id") or None,
-                invocation_id=request.headers.get("X-Agentic-Perf-Invocation-Id")
-                or None,
-                trace_id=traceparent[1],
-                action_id=request.headers.get("X-Agentic-Perf-Action-Id")
-                or traceparent[2],
-                parent_action_id=request.headers.get("X-Agentic-Perf-Parent-Action-Id")
-                or None,
-            )
-        except (IndexError, ValueError):
-            return await call_next(request)
-        token = bind_trace_context(context)
-        try:
-            return await call_next(request)
-        finally:
-            reset_trace_context(token)
-
-    @app.exception_handler(RequestValidationError)
-    async def count_trace_schema_rejections(
-        request: Request, exc: RequestValidationError
-    ) -> Response:
-        if request.url.path.startswith("/api/v1/traces/events"):
-            app.state.trace_health["schema_rejections"] += 1
-        return await request_validation_exception_handler(request, exc)
-
-    @app.on_event("shutdown")
-    def close_trace_store() -> None:
-        # The adapters own separate connections and must close before the
-        # service's authoritative connection. ``getattr`` keeps early startup
-        # failures safe when router construction did not complete.
-        for name in ("event_bus", "audit_log"):
-            adapter = getattr(app.state, name, None)
-            if adapter is not None:
-                adapter.close()
-        app.state.trace_store.close()
-
-    port = int(os.environ.get("STORE_PORT", "8090"))
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            f"http://localhost:{port}",
-            f"http://127.0.0.1:{port}",
-        ],
-        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
-    )
 
     token = load_or_generate_token()
     app.state.api_token = token
@@ -269,7 +204,11 @@ def create_app() -> FastAPI:
     # Compatibility adapters use independent SQLite connections to the same
     # database, so API worker threads never interleave transactions on one
     # connection while the TraceStore remains the sole persistence authority.
-    audit_log = AuditLog(redactor=audit_redactor)
+    audit_log = AuditLog(
+        redactor=audit_redactor,
+        trace_store=app.state.trace_store,
+        process_identity=getattr(app.state, "store_diagnostics", {}),
+    )
     app.state.audit_log = audit_log
     app.state.event_bus = EventBus(redactor=audit_redactor)
     app.state.store = TicketStore(
@@ -279,20 +218,17 @@ def create_app() -> FastAPI:
     )
     mount_routers(app, auth, rate_limit_dep)
 
-    # ── Chat agent (optional) ────────────────────────────
     chat_cfg = cfg.get("chat", {})
     if chat_cfg.get("enabled", False):
         try:
             from agents.chat.agent import ChatAgent
+            from providers.llm.factory import create_llm_provider
 
             llm_cfg = cfg.get("llm", {})
             chat_model_cfg = cfg.get("agent_models", {}).get("chat", {})
             provider = llm_cfg.get("provider", "")
             model = chat_model_cfg.get("model", llm_cfg.get("model", ""))
-
             if provider and model:
-                from providers.llm.factory import create_llm_provider
-
                 chat_llm = create_llm_provider(
                     provider=provider,
                     model=model,
@@ -301,26 +237,151 @@ def create_app() -> FastAPI:
                     project_id=llm_cfg.get("project_id", ""),
                     region=llm_cfg.get("region", ""),
                 )
-                max_tokens = chat_model_cfg.get("max_tokens")
-                if max_tokens:
+                if max_tokens := chat_model_cfg.get("max_tokens"):
                     chat_llm.max_tokens = int(max_tokens)
-                timeout = chat_model_cfg.get("timeout")
-                if timeout:
+                if timeout := chat_model_cfg.get("timeout"):
                     chat_llm.timeout = float(timeout)
-
-                max_tool_rounds = int(chat_model_cfg.get("max_tool_rounds", 10))
-                chat_agent = ChatAgent(
+                app.state.chat_agent = ChatAgent(
                     llm=chat_llm,
                     store_url=f"http://localhost:{port}",
-                    max_tool_rounds=max_tool_rounds,
+                    max_tool_rounds=int(chat_model_cfg.get("max_tool_rounds", 10)),
                 )
-                app.state.chat_agent = chat_agent
                 logger.info("Chat agent enabled (model=%s)", model)
             else:
                 logger.warning("Chat enabled but no LLM provider/model configured")
         except Exception:
             logger.exception("Failed to initialize chat agent")
 
+
+def create_app(*, initialize_immediately: bool = True) -> FastAPI:
+    port = int(os.environ.get("STORE_PORT", "8090"))
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if not getattr(app.state, "runtime_initialized", False):
+            lock = PersistenceRootLock(AGENTIC_PERF_HOME, port)
+            lock.acquire()
+            app.state.process_lock = lock
+            app.state.store_diagnostics = {
+                "store_id": lock.store_id,
+                "process_session_id": lock.session_id,
+                "persistence_root_fingerprint": persistence_root_fingerprint(),
+                "instance_name": get_instance_name(),
+                "process": lock.metadata,
+            }
+            try:
+                _initialize_runtime(app, port)
+                app.state.runtime_initialized = True
+                logger.info(
+                    "State store started: store_id=%s session_id=%s root=%s",
+                    lock.store_id,
+                    lock.session_id,
+                    app.state.store_diagnostics["persistence_root_fingerprint"],
+                )
+            except Exception:
+                lock.release()
+                raise
+        try:
+            yield
+        finally:
+            if getattr(app.state, "runtime_initialized", False):
+                for name in ("event_bus", "audit_log"):
+                    adapter = getattr(app.state, name, None)
+                    if adapter is not None:
+                        adapter.close()
+                app.state.trace_store.close()
+                app.state.runtime_initialized = False
+            lock = getattr(app.state, "process_lock", None)
+            if lock is not None:
+                lock.release()
+
+    app = FastAPI(title="Agentic Perf State Store", version="0.1.0", lifespan=lifespan)
+    app.state.trace_health = {
+        "ingested": 0,
+        "ingestion_failures": 0,
+        "schema_rejections": 0,
+        "quarantined_frames": 0,
+    }
+
+    @app.middleware("http")
+    async def restore_trace_context(request: Request, call_next):
+        """Restore correlation only from an authenticated internal caller.
+
+        Middleware runs before route dependencies, so authenticate here before
+        binding anything.  A user token (or a forged marker) may authorize the
+        route but can never choose its causal parent.
+        """
+        if request.headers.get("X-Agentic-Perf-Causal-Context") != "v1":
+            return await call_next(request)
+        auth = getattr(request.app.state, "auth_dependency", None)
+        if auth is None:
+            return await call_next(request)
+        try:
+            principal = await auth(request)
+        except HTTPException:
+            # The route dependency returns the normal authentication response;
+            # importantly, no untrusted context is bound on that path.
+            return await call_next(request)
+        if principal.kind != "service":
+            return await call_next(request)
+        traceparent = request.headers.get("traceparent", "").split("-")
+        try:
+            context = TraceContext(
+                ticket_id=request.headers.get("X-Agentic-Perf-Ticket-Id") or None,
+                agent_id=request.headers.get("X-Agentic-Perf-Agent-Id") or None,
+                invocation_id=request.headers.get("X-Agentic-Perf-Invocation-Id")
+                or None,
+                trace_id=traceparent[1],
+                action_id=request.headers.get("X-Agentic-Perf-Action-Id")
+                or traceparent[2],
+                parent_action_id=request.headers.get("X-Agentic-Perf-Parent-Action-Id")
+                or None,
+            )
+        except (IndexError, ValueError):
+            return await call_next(request)
+        token = bind_trace_context(context)
+        try:
+            return await call_next(request)
+        finally:
+            reset_trace_context(token)
+
+    @app.exception_handler(RequestValidationError)
+    async def count_trace_schema_rejections(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        if request.url.path.startswith("/api/v1/traces/events"):
+            app.state.trace_health["schema_rejections"] += 1
+        return await request_validation_exception_handler(request, exc)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+        ],
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    if initialize_immediately:
+        # Compatibility for in-process callers and existing unit-test helpers.
+        # The production ASGI application below initializes only in lifespan.
+        _initialize_runtime(app, port)
+        app.state.runtime_initialized = True
+
+    def close_compatibility_runtime() -> None:
+        """Keep direct in-process app users able to release test resources."""
+        if getattr(app.state, "process_lock", None) is not None:
+            return
+        if getattr(app.state, "runtime_initialized", False):
+            for name in ("event_bus", "audit_log"):
+                adapter = getattr(app.state, name, None)
+                if adapter is not None:
+                    adapter.close()
+            app.state.trace_store.close()
+            app.state.runtime_initialized = False
+
+    app.router.on_shutdown.append(close_compatibility_runtime)
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -328,7 +389,7 @@ def create_app() -> FastAPI:
         def serve_dashboard():
             index_path = STATIC_DIR / "index.html"
             html = index_path.read_text()
-            inject_token = "" if multi_user else token
+            inject_token = "" if app.state.multi_user else app.state.api_token
             token_script = f'<script>window.API_TOKEN="{inject_token}";</script>'
             html = html.replace("</head>", f"{token_script}</head>", 1)
             return HTMLResponse(
@@ -339,7 +400,7 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+app = create_app(initialize_immediately=False)
 
 if __name__ == "__main__":
     uvicorn.run(
