@@ -56,6 +56,7 @@ async def provision_jumpstarter(
     selector: str = "",
     serial_capture: bool = False,
     artifact_dir: str = "",
+    ticket_id: str = "",
 ) -> ProvisionResult:
     """Run the deterministic flash + boot + verify sequence.
 
@@ -94,17 +95,36 @@ async def provision_jumpstarter(
     serial_proc = None
     serial_log_fh = None
     serial_log_path = ""
+    serial_filesystem = None
 
     if serial_capture and lease_name:
         if artifact_dir:
-            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            if ticket_id:
+                from providers.execution import (
+                    AuditedFilesystem,
+                    RootedPath,
+                    durable_filesystem_emitter,
+                )
+
+                serial_filesystem = AuditedFilesystem(
+                    RootedPath(
+                        artifact_dir, "artifact", logical_prefix="platform-provision"
+                    ),
+                    ticket_id=ticket_id,
+                    emit=durable_filesystem_emitter(),
+                    critical=True,
+                )
             serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
         else:
             import tempfile
 
             serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
         try:
-            serial_log_fh = open(serial_log_path, "w", encoding="utf-8")
+            serial_log_fh = (
+                serial_filesystem.open_stream("serial-capture.log")
+                if serial_filesystem
+                else open(serial_log_path, "wb")
+            )
             serial_proc = await AuditedSubprocessRunner().start(
                 [
                     "jmp",
