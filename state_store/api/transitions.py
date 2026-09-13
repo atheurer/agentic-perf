@@ -28,7 +28,11 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     try:
-        result = store.transition_ticket(ticket_id, body)
+        result = store.transition_ticket(
+            ticket_id,
+            body,
+            triggered_by=_get_principal(request).username,
+        )
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except InvalidTransition as e:

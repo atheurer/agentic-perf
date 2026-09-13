@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
+from state_store.store import InvalidTransition, TicketDispatchBlocked, TicketStore
+
 _SPEC = importlib.util.spec_from_file_location(
     "dev_instance_identity",
     Path(__file__).parents[1] / "scripts/dev_instance_identity.py",
@@ -89,3 +92,62 @@ def test_import_is_dry_run_by_default_and_sanitizes_fixture(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="destination ticket collision"):
         identity.import_state(str(source), str(destination), ["PERF-1"], False)
+
+
+@pytest.mark.parametrize(
+    "ticket_id", ["../PERF-1", "nested/PERF-1", "\\PERF-1", ".", ".."]
+)
+def test_import_rejects_path_traversal_ticket_ids(
+    tmp_path: Path, ticket_id: str
+) -> None:
+    source, _ = _instance(tmp_path, "source", 18105)
+    destination, _ = _instance(tmp_path, "destination", 18106)
+
+    with pytest.raises(ValueError, match="invalid ticket ID"):
+        identity.import_state(str(source), str(destination), [ticket_id], False)
+
+
+def test_import_rejects_record_id_mismatch(tmp_path: Path) -> None:
+    source, _ = _instance(tmp_path, "source", 18107)
+    destination, _ = _instance(tmp_path, "destination", 18108)
+    tickets = source / "tickets"
+    tickets.mkdir()
+    (tickets / "PERF-1.json").write_text(json.dumps({"id": "PERF-2"}))
+
+    with pytest.raises(ValueError, match="source ticket ID mismatch"):
+        identity.import_state(str(source), str(destination), ["PERF-1"], False)
+
+
+def test_imported_fixture_requires_review_before_dispatch_or_resume(
+    tmp_path: Path,
+) -> None:
+    store = TicketStore(persist_dir=tmp_path / "store")
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="fixture",
+            description="fixture",
+            custom_fields={"imported_fixture": True},
+        )
+    )
+    stored = store._tickets[ticket.id]
+    stored.status = TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+    stored.previous_status = None
+    store._persist_ticket(stored)
+
+    with pytest.raises(InvalidTransition, match="reviewed_resume"):
+        store.transition_ticket(
+            ticket.id,
+            TransitionRequest(status="triage_pending"),
+        )
+    with pytest.raises(TicketDispatchBlocked, match="non-dispatchable"):
+        store.claim_ticket(ticket.id, "test-owner")
+
+    resumed = store.transition_ticket(
+        ticket.id,
+        TransitionRequest(status="triage_pending", reviewed_resume=True),
+        triggered_by="reviewer",
+    )
+    assert (
+        resumed.custom_fields["imported_fixture_reviewed"]["reviewed_by"] == "reviewer"
+    )
+    assert store.claim_ticket(ticket.id, "test-owner")["owner"] == "test-owner"

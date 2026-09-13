@@ -50,6 +50,12 @@ class TicketNotFound(Exception):
     pass
 
 
+class TicketDispatchBlocked(Exception):
+    """A ticket is intentionally prevented from entering agent execution."""
+
+    pass
+
+
 class TicketStore:
     def __init__(
         self,
@@ -214,6 +220,26 @@ class TicketStore:
                             and isinstance(steps[idx], dict)
                         ):
                             steps[idx]["status"] = "aborted"
+                elif ticket.custom_fields.get("imported_fixture"):
+                    if not request.reviewed_resume:
+                        self._trace_mutation(
+                            ticket_id,
+                            "transition_ticket",
+                            rejected=True,
+                            attributes={"reason": "imported_fixture_requires_review"},
+                        )
+                        raise InvalidTransition(
+                            "Imported fixture requires reviewed_resume=true before "
+                            "it can become executable"
+                        )
+                    # Imported fixtures intentionally have no previous status.
+                    # A reviewed operator must explicitly re-enter the normal
+                    # pipeline at triage rather than accidentally resuming a
+                    # copied in-progress operation.
+                    allowed = [
+                        TicketStatus.TRIAGE_PENDING,
+                        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+                    ]
                 elif ticket.previous_status is None:
                     raise InvalidTransition(
                         "Cannot resume from AWAITING_CUSTOMER_GUIDANCE: no previous status"
@@ -252,6 +278,12 @@ class TicketStore:
                     f"Cannot transition from {current.value} to {new_status.value}. "
                     f"Allowed: {[s.value for s in allowed]}"
                 )
+
+            if request.reviewed_resume and ticket.custom_fields.get("imported_fixture"):
+                ticket.custom_fields["imported_fixture_reviewed"] = {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "reviewed_by": triggered_by,
+                }
 
             if new_status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                 if current != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
@@ -635,6 +667,25 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            if ticket.custom_fields.get(
+                "imported_fixture"
+            ) and not ticket.custom_fields.get("imported_fixture_reviewed"):
+                self._audit_log(
+                    "claim_ticket",
+                    ticket_id,
+                    {"owner": owner, "result": "rejected_imported_fixture"},
+                )
+                self._trace_mutation(
+                    ticket_id,
+                    "claim_ticket",
+                    rejected=True,
+                    attributes={"reason": "imported_fixture_requires_review"},
+                )
+                raise TicketDispatchBlocked(
+                    "Imported fixture is non-dispatchable until an explicit "
+                    "reviewed resume operation is recorded"
+                )
 
             now = datetime.now(timezone.utc)
             existing = ticket.custom_fields.get("claim")

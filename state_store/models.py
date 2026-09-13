@@ -216,6 +216,10 @@ class CreateTicketRequest(BaseModel):
 class TransitionRequest(BaseModel):
     status: TicketStatus
     comment: str | None = None
+    # Imported fixtures remain blocked even if their status is edited.  A
+    # reviewed resume is an explicit, auditable opt-in rather than an
+    # incidental transition from awaiting_customer_guidance.
+    reviewed_resume: bool = False
 
 
 class UpdateFieldsRequest(BaseModel):

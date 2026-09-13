@@ -50,6 +50,19 @@ EXCLUDED_FIELDS = {
 }
 
 
+def _validate_ticket_id(ticket_id: str) -> None:
+    if (
+        not ticket_id
+        or ticket_id in {".", ".."}
+        or "/" in ticket_id
+        or "\\" in ticket_id
+        or Path(ticket_id).name != ticket_id
+    ):
+        raise ValueError(
+            f"invalid ticket ID {ticket_id!r}; IDs must be a single path component"
+        )
+
+
 def _canonical(path: str | Path) -> str:
     return str(Path(path).expanduser().resolve())
 
@@ -226,6 +239,7 @@ def import_state(
         raise ValueError("source and destination must be different managed instances")
     outputs: list[tuple[Path, dict]] = []
     for ticket_id in ids:
+        _validate_ticket_id(ticket_id)
         src = source / "tickets" / f"{ticket_id}.json"
         dst = destination / "tickets" / f"{ticket_id}.json"
         if dst.exists():
@@ -235,8 +249,14 @@ def import_state(
         record = _sanitize(json.loads(src.read_text()))
         if not isinstance(record, dict):
             raise ValueError(f"ticket fixture is not an object: {src}")
+        if record.get("id") != ticket_id:
+            raise ValueError(
+                f"source ticket ID mismatch: selected {ticket_id!r}, "
+                f"record contains {record.get('id')!r}"
+            )
         original_status = record.get("status")
         record["status"] = "awaiting_customer_guidance"
+        record["previous_status"] = None
         fields = record.setdefault("custom_fields", {})
         if isinstance(fields, dict):
             fields["imported_fixture"] = True
@@ -248,6 +268,7 @@ def import_state(
                 "sanitized_fields": sorted(EXCLUDED_FIELDS),
                 "destination_instance": destination_manifest["instance_name"],
                 "original_status": original_status,
+                "resume_requires_review": True,
             }
         outputs.append((dst, record))
     print(
