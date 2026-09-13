@@ -158,6 +158,15 @@ class AgentMCPClient:
             "STATE_STORE_URL": state_store_url,
             "AGENT_NAME": agent_name,
         }
+        session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+        epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+        if session_id and epoch:
+            required.update(
+                {
+                    "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID": session_id,
+                    "AGENTIC_PERF_ORCHESTRATOR_EPOCH": epoch,
+                }
+            )
         missing = [key for key, value in required.items() if not str(value).strip()]
         if missing:
             raise ValueError(

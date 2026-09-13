@@ -4,7 +4,8 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..auth import Principal, require_write_access
 from ..models import TransitionRequest
-from ..store import InvalidTransition, TicketNotFound
+from ..store import ClaimFenceError, InvalidTransition, TicketNotFound
+from .fencing import mutation_fence
 
 router = APIRouter(prefix="/tickets", tags=["transitions"])
 
@@ -34,14 +35,22 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
         )
 
     try:
+        session_id, epoch = mutation_fence(request)
         result = store.transition_ticket(
             ticket_id,
             body,
             triggered_by=principal.username,
             reviewer_authorized=(principal.kind == "service" or principal.is_admin),
+            session_id=session_id,
+            epoch=epoch,
         )
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except InvalidTransition as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     return result

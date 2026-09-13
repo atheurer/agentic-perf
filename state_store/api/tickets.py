@@ -11,8 +11,9 @@ from ..models import (
     TicketStatus,
     UpdateFieldsRequest,
 )
-from ..store import TicketDispatchBlocked, TicketNotFound
+from ..store import ClaimFenceError, TicketDispatchBlocked, TicketNotFound
 from .action_hints import after_create
+from .fencing import mutation_fence
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,18 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     try:
-        return store.update_fields(ticket_id, body.fields)
+        session_id, epoch = mutation_fence(request)
+        return store.update_fields(
+            ticket_id,
+            body.fields,
+            session_id=session_id,
+            epoch=epoch,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
@@ -213,7 +225,20 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
 def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     try:
-        result = store.claim_ticket(ticket_id, body.owner, body.duration_seconds)
+        result = store.claim_ticket(
+            ticket_id,
+            body.owner,
+            body.duration_seconds,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+            instance_name=body.instance_name,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketDispatchBlocked as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except TicketNotFound as e:
@@ -249,7 +274,18 @@ def archive_ticket(ticket_id: str, request: Request):
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     try:
-        released = store.release_claim(ticket_id, body.owner)
+        released = store.release_claim(
+            ticket_id,
+            body.owner,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"released": released}
@@ -259,7 +295,19 @@ def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
 def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     try:
-        result = store.renew_claim(ticket_id, body.owner, body.duration_seconds)
+        result = store.renew_claim(
+            ticket_id,
+            body.owner,
+            body.duration_seconds,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     if result is None:

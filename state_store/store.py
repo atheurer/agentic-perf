@@ -55,6 +55,14 @@ class TicketNotFound(Exception):
     pass
 
 
+class ClaimFenceError(Exception):
+    """A claim mutation was rejected by the state-store fencing contract."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        super().__init__(detail or reason)
+
+
 class OrchestratorLeaseHeld(Exception):
     """Raised when a different live orchestrator owns the control lease."""
 
@@ -372,12 +380,15 @@ class TicketStore:
         ticket_id: str,
         request: TransitionRequest,
         triggered_by: str = "system",
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
         reviewer_authorized: bool = False,
     ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+            self._validate_claim_fence(session_id, epoch)
 
             new_status = request.status
             current = ticket.status
@@ -544,11 +555,18 @@ class TicketStore:
 
             return ticket.model_copy()
 
-    def update_fields(self, ticket_id: str, fields: dict) -> Ticket:
+    def update_fields(
+        self,
+        ticket_id: str,
+        fields: dict,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+    ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+            self._validate_claim_fence(session_id, epoch)
             protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
             if protected:
                 raise ValueError(
@@ -842,11 +860,18 @@ class TicketStore:
             )
             return ticket.model_copy()
 
-    def add_comment(self, ticket_id: str, request: AddCommentRequest) -> Comment:
+    def add_comment(
+        self,
+        ticket_id: str,
+        request: AddCommentRequest,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+    ) -> Comment:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+            self._validate_claim_fence(session_id, epoch)
             comment = Comment(
                 id=uuid.uuid4().hex[:8],
                 author=request.author,
@@ -872,7 +897,15 @@ class TicketStore:
             ]
 
     def claim_ticket(
-        self, ticket_id: str, owner: str, duration_seconds: int = 300
+        self,
+        ticket_id: str,
+        owner: str,
+        duration_seconds: int = 300,
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+        claim_id: str | None = None,
+        instance_name: str | None = None,
     ) -> dict | None:
         """Atomically claim a ticket for dispatch.
 
@@ -883,6 +916,8 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            self._validate_claim_fence(session_id, epoch)
 
             if ticket.custom_fields.get(
                 "imported_fixture"
@@ -907,7 +942,18 @@ class TicketStore:
             existing = ticket.custom_fields.get("claim")
             if existing:
                 expires = datetime.fromisoformat(existing["expires"])
-                if expires > now and existing["owner"] != owner:
+                if expires > now and (
+                    existing["owner"] != owner
+                    or (
+                        session_id is not None
+                        and existing.get("session_id") != str(session_id)
+                    )
+                ):
+                    if session_id is not None:
+                        raise ClaimFenceError(
+                            "claim_owned_by_other_session",
+                            "ticket claim is owned by another orchestrator session",
+                        )
                     self._audit_log(
                         "claim_ticket",
                         ticket_id,
@@ -926,6 +972,15 @@ class TicketStore:
                 "expires": expires.isoformat(),
                 "status": ticket.status.value,
             }
+            if session_id is not None:
+                claim.update(
+                    {
+                        "session_id": str(session_id),
+                        "epoch": epoch,
+                        "claim_id": claim_id or str(uuid.uuid4()),
+                        "instance_name": instance_name or owner,
+                    }
+                )
             ticket.custom_fields["claim"] = claim
             ticket.updated_at = now
             self._persist_ticket(ticket)
@@ -941,12 +996,22 @@ class TicketStore:
             self._trace_mutation(ticket_id, "claim_ticket")
             return claim
 
-    def release_claim(self, ticket_id: str, owner: str) -> bool:
+    def release_claim(
+        self,
+        ticket_id: str,
+        owner: str,
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+        claim_id: str | None = None,
+    ) -> bool:
         """Release a claim if owned by the given owner."""
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            self._validate_claim_fence(session_id, epoch)
 
             existing = ticket.custom_fields.get("claim")
             if not existing or existing["owner"] != owner:
@@ -956,6 +1021,7 @@ class TicketStore:
                     {"owner": owner, "result": "not_owner"},
                 )
                 return False
+            self._validate_claim_owner(existing, session_id, epoch, claim_id)
 
             ticket.custom_fields.pop("claim", None)
             ticket.updated_at = datetime.now(timezone.utc)
@@ -968,13 +1034,22 @@ class TicketStore:
             return True
 
     def renew_claim(
-        self, ticket_id: str, owner: str, duration_seconds: int = 300
+        self,
+        ticket_id: str,
+        owner: str,
+        duration_seconds: int = 300,
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+        claim_id: str | None = None,
     ) -> dict | None:
         """Extend an existing claim's expiry. Returns updated claim or None."""
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+
+            self._validate_claim_fence(session_id, epoch)
 
             existing = ticket.custom_fields.get("claim")
             if not existing or existing["owner"] != owner:
@@ -985,6 +1060,7 @@ class TicketStore:
                 )
                 self._trace_mutation(ticket_id, "renew_claim", rejected=True)
                 return None
+            self._validate_claim_owner(existing, session_id, epoch, claim_id)
 
             now = datetime.now(timezone.utc)
             expires = now + timedelta(seconds=duration_seconds)
@@ -1002,6 +1078,44 @@ class TicketStore:
             )
             self._trace_mutation(ticket_id, "renew_claim")
             return existing
+
+    def _validate_claim_fence(
+        self, session_id: uuid.UUID | None, epoch: int | None
+    ) -> None:
+        if session_id is None and epoch is None:
+            return
+        if session_id is None or epoch is None:
+            raise ClaimFenceError("not_leader", "session_id and epoch are required")
+        lease = self._read_orchestrator_lease()
+        now = self._lease_now()
+        if lease is None or lease.expires_at <= now:
+            raise ClaimFenceError("not_leader", "no active orchestrator lease")
+        if lease.epoch != epoch:
+            raise ClaimFenceError("stale_epoch", "orchestrator fencing epoch is stale")
+        if lease.session_id != session_id:
+            raise ClaimFenceError(
+                "not_leader", "orchestrator session is not the leader"
+            )
+
+    @staticmethod
+    def _validate_claim_owner(
+        existing: dict,
+        session_id: uuid.UUID | None,
+        epoch: int | None,
+        claim_id: str | None,
+    ) -> None:
+        if session_id is None:
+            return
+        if (
+            existing.get("session_id") != str(session_id)
+            or existing.get("epoch") != epoch
+        ):
+            raise ClaimFenceError(
+                "claim_owned_by_other_session",
+                "claim is owned by another session or epoch",
+            )
+        if claim_id is not None and existing.get("claim_id") != claim_id:
+            raise ClaimFenceError("claim_owned_by_other_session", "claim id mismatch")
 
     def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
         """Close a ticket regardless of current status.

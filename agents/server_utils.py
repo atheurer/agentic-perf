@@ -1124,6 +1124,15 @@ async def assert_ticket_active(
     api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
+    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
 
     async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
@@ -1141,6 +1150,17 @@ async def assert_ticket_active(
             "reason": "Ticket has been aborted",
             "ticket_status": status,
         }
+
+    claim = cf.get("claim")
+    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    if isinstance(claim, dict) and claim.get("session_id"):
+        if claim.get("session_id") != session_id or str(claim.get("epoch")) != epoch:
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
 
     if expected_status and status != expected_status:
         return {

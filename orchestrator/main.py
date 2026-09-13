@@ -908,7 +908,11 @@ async def run_agent_task(
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        if success and status in PLAN_AGENT_STATUS.values():
+        if (
+            success
+            and not dispatcher.is_deposed()
+            and status in PLAN_AGENT_STATUS.values()
+        ):
             try:
                 await _advance_plan(
                     dispatcher.store_url,
@@ -923,7 +927,7 @@ async def run_agent_task(
         # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
         # The triage agent transitions the ticket to awaiting_hardware
         # itself; we force-close here if stop_after_step == "triage".
-        if success and status == "triage_pending":
+        if success and not dispatcher.is_deposed() and status == "triage_pending":
             try:
                 async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
@@ -1363,7 +1367,9 @@ async def _add_comment(
         logger.exception("Failed to add comment on %s", ticket_id)
 
 
-async def _renew_leader_lease(lease: Any, interval: float) -> None:
+async def _renew_leader_lease(
+    lease: Any, interval: float, on_lost: Any | None = None
+) -> None:
     """Keep the control-plane lease fenced while the poll loop is active."""
     try:
         while True:
@@ -1372,6 +1378,8 @@ async def _renew_leader_lease(lease: Any, interval: float) -> None:
                 await lease.renew()
             except Exception as exc:
                 logger.critical("Orchestrator leader lease renewal failed: %s", exc)
+                if on_lost is not None:
+                    on_lost()
                 raise RuntimeError("orchestrator leader lease lost") from exc
     finally:
         await lease.release()
@@ -1431,8 +1439,16 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         ttl_seconds=config.leader_lease_ttl_seconds,
     )
     await leader_lease.acquire()
+    if leader_lease.epoch is None:
+        raise RuntimeError("state store returned no leader fencing epoch")
+    os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
+    os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
     lease_renew_task = asyncio.create_task(
-        _renew_leader_lease(leader_lease, config.leader_lease_renew_interval)
+        _renew_leader_lease(
+            leader_lease,
+            config.leader_lease_renew_interval,
+            lambda: dispatcher.mark_deposed(),
+        )
     )
 
     await _validate_models(config)
@@ -1566,6 +1582,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         vault_config=vault_config,
         redactor=redactor,
         introspection_llm=config.introspection_llm,
+        session_id=str(leader_lease.session_id),
+        fencing_epoch=leader_lease.epoch,
     )
 
     logger.info(
@@ -1934,9 +1952,17 @@ def _setup_api_token() -> None:
 
 def _auth_headers() -> dict[str, str]:
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
+    return headers
 
 
 def _sweep_trace_spools() -> None:
