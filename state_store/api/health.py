@@ -14,6 +14,7 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 def health(request: Request):
     store = request.app.state.store
+    lease = store.get_orchestrator_lease()
     all_tickets = store.list_tickets()
     counts = {}
     for status in TicketStatus:
@@ -46,6 +47,18 @@ def health(request: Request):
             "oldest_unacked_age_seconds": oldest,
             "quarantined_frames": quarantined,
         },
+        "orchestrator_lease": (
+            {
+                "active": True,
+                "instance_name": lease.instance_name,
+                "host": lease.host,
+                "pid": lease.pid,
+                "epoch": lease.epoch,
+                "expires_at": lease.expires_at.isoformat(),
+            }
+            if lease
+            else {"active": False}
+        ),
     }
 
 

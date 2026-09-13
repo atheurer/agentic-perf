@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
 from providers.execution import (
@@ -31,9 +33,11 @@ from .directives import parse_verbatim_directives
 from .models import (
     _VALIDATION_RESERVED_FIELDS,
     VALID_TRANSITIONS,
+    AcquireOrchestratorLeaseRequest,
     AddCommentRequest,
     Comment,
     CreateTicketRequest,
+    OrchestratorLease,
     Ticket,
     TicketStatus,
     TransitionRequest,
@@ -50,6 +54,15 @@ class TicketNotFound(Exception):
     pass
 
 
+class OrchestratorLeaseHeld(Exception):
+    """Raised when a different live orchestrator owns the control lease."""
+
+    def __init__(self, holder: OrchestratorLease, remaining_seconds: float) -> None:
+        self.holder = holder
+        self.remaining_seconds = max(0.0, remaining_seconds)
+        super().__init__("another orchestrator holds the state-store lease")
+
+
 class TicketStore:
     def __init__(
         self,
@@ -57,6 +70,7 @@ class TicketStore:
         audit_log: AuditLog | None = None,
         event_bus: object | None = None,
         trace_store: object | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
         self._lock = threading.Lock()
@@ -66,7 +80,170 @@ class TicketStore:
         self._audit = audit_log
         self._event_bus = event_bus
         self._trace_store = trace_store
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._lease_path = self._persist_dir / "orchestrator-lease.json"
         self._load_from_disk()
+
+    def _lease_now(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc)
+
+    def _read_orchestrator_lease(self) -> OrchestratorLease | None:
+        try:
+            return OrchestratorLease.model_validate(
+                json.loads(self._lease_path.read_text(encoding="utf-8"))
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def _write_orchestrator_lease(self, lease: OrchestratorLease | None) -> None:
+        if lease is None:
+            try:
+                self._lease_path.unlink()
+            except FileNotFoundError:
+                return
+            return
+        temporary = self._lease_path.with_name(
+            f".{self._lease_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        payload = json.dumps(lease.model_dump(mode="json"), sort_keys=True) + "\n"
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self._lease_path)
+        try:
+            directory_fd = os.open(self._persist_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            logger.debug("could not fsync lease directory", exc_info=True)
+
+    def get_orchestrator_lease(self) -> OrchestratorLease | None:
+        with self._lock:
+            lease = self._read_orchestrator_lease()
+            if lease is not None and lease.expires_at <= self._lease_now():
+                self._write_orchestrator_lease(None)
+                self._audit_log(
+                    "orchestrator_lease_expire", "-", {"epoch": lease.epoch}
+                )
+                return None
+            return lease.model_copy() if lease else None
+
+    def acquire_orchestrator_lease(
+        self, request: AcquireOrchestratorLeaseRequest
+    ) -> OrchestratorLease:
+        with self._lock:
+            now = self._lease_now()
+            current = self._read_orchestrator_lease()
+            if current is not None and current.expires_at > now:
+                if current.session_id == request.session_id:
+                    renewed = current.model_copy(
+                        update={
+                            "renewed_at": now,
+                            "expires_at": now + timedelta(seconds=request.ttl_seconds),
+                        }
+                    )
+                    self._write_orchestrator_lease(renewed)
+                    self._audit_log(
+                        "orchestrator_lease_acquire",
+                        "-",
+                        {
+                            "session_id": str(request.session_id),
+                            "epoch": current.epoch,
+                            "result": "idempotent",
+                        },
+                    )
+                    return renewed
+                raise OrchestratorLeaseHeld(
+                    current, (current.expires_at - now).total_seconds()
+                )
+            epoch = (current.epoch + 1) if current is not None else 1
+            lease = OrchestratorLease(
+                session_id=request.session_id,
+                instance_name=request.instance_name,
+                host=request.host,
+                pid=request.pid,
+                process_start_id=request.process_start_id,
+                epoch=epoch,
+                acquired_at=now,
+                renewed_at=now,
+                expires_at=now + timedelta(seconds=request.ttl_seconds),
+            )
+            self._write_orchestrator_lease(lease)
+            self._audit_log(
+                "orchestrator_lease_acquire",
+                "-",
+                {
+                    "session_id": str(lease.session_id),
+                    "epoch": epoch,
+                    "result": "acquired",
+                },
+            )
+            return lease.model_copy()
+
+    def renew_orchestrator_lease(
+        self, session_id: uuid.UUID, epoch: int, ttl_seconds: float
+    ) -> OrchestratorLease:
+        with self._lock:
+            now = self._lease_now()
+            current = self._read_orchestrator_lease()
+            if (
+                current is None
+                or current.session_id != session_id
+                or current.epoch != epoch
+                or current.expires_at <= now
+            ):
+                raise PermissionError("orchestrator lease is not owned or has expired")
+            lease = current.model_copy(
+                update={
+                    "renewed_at": now,
+                    "expires_at": now + timedelta(seconds=ttl_seconds),
+                }
+            )
+            self._write_orchestrator_lease(lease)
+            self._audit_log(
+                "orchestrator_lease_renew",
+                "-",
+                {"session_id": str(session_id), "epoch": epoch, "result": "renewed"},
+            )
+            return lease.model_copy()
+
+    def release_orchestrator_lease(self, session_id: uuid.UUID, epoch: int) -> bool:
+        with self._lock:
+            current = self._read_orchestrator_lease()
+            if (
+                current is None
+                or current.session_id != session_id
+                or current.epoch != epoch
+            ):
+                self._audit_log(
+                    "orchestrator_lease_release",
+                    "-",
+                    {
+                        "session_id": str(session_id),
+                        "epoch": epoch,
+                        "result": "not_owner",
+                    },
+                )
+                return False
+            self._write_orchestrator_lease(None)
+            self._audit_log(
+                "orchestrator_lease_release",
+                "-",
+                {"session_id": str(session_id), "epoch": epoch, "result": "released"},
+            )
+            return True
 
     def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
         if self._audit is not None:

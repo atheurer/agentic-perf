@@ -61,6 +61,20 @@ class OrchestratorConfig:
             or cfg.get("poll_interval")
             or 3.0
         )
+        lease_cfg = cfg.get("orchestrator_lease", {})
+        self.leader_lease_ttl_seconds = float(
+            os.environ.get(
+                "ORCHESTRATOR_LEASE_TTL_SECONDS", lease_cfg.get("ttl_seconds", 30.0)
+            )
+        )
+        self.leader_lease_renew_interval = float(
+            os.environ.get(
+                "ORCHESTRATOR_LEASE_RENEW_INTERVAL",
+                lease_cfg.get(
+                    "renew_interval", max(1.0, self.leader_lease_ttl_seconds / 3)
+                ),
+            )
+        )
         self.llm_provider = (
             llm_provider
             or os.environ.get("LLM_PROVIDER")
