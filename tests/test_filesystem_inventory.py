@@ -130,8 +130,8 @@ agents/infra/server.py|232|tempfile.NamedTemporaryFile
 agents/infra/server.py|240|staging.unlink
 agents/infra/server.py|242|unlink
 agents/infra/server.py|307|tempfile.mkdtemp
-orchestrator/main.py|1857|LOCK_FILE.parent.mkdir
-orchestrator/main.py|1889|LOCK_FILE.unlink
+orchestrator/main.py|1885|LOCK_FILE.parent.mkdir
+orchestrator/main.py|1917|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir
@@ -222,15 +222,17 @@ state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
-state_store/store.py|65|self._persist_dir.mkdir
+state_store/store.py|79|self._persist_dir.mkdir
+state_store/store.py|110|self._lease_path.unlink
+state_store/store.py|123|os.replace
 state_store/process_lock.py|56|path.parent.mkdir
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
-state_store/store.py|799|filesystem.mkdir
-state_store/store.py|806|filesystem.mkdir
-state_store/store.py|819|log_filesystem.rename
-state_store/store.py|828|filesystem.rename
+state_store/store.py|981|filesystem.mkdir
+state_store/store.py|988|filesystem.mkdir
+state_store/store.py|1001|log_filesystem.rename
+state_store/store.py|1010|filesystem.rename
 state_store/trace_store.py|77|self.db_path.parent.mkdir
 """
 
