@@ -304,7 +304,9 @@ async def test_server_reads_metadata_from_fastmcp_request_context():
         }
     )
     context = MiddlewareContext(
-        message=CallToolRequestParams(name="read_only"),
+        message=CallToolRequestParams(
+            name="read_only", _meta={"fastmcp": {"version": "3.4.4"}}
+        ),
         method="tools/call",
         fastmcp_context=SimpleNamespace(
             request_id="rpc-1",
@@ -316,6 +318,43 @@ async def test_server_reads_metadata_from_fastmcp_request_context():
     await middleware.on_call_tool(context, AsyncMock(return_value="ok"))
     assert events[0].lifecycle.state == LifecycleState.REQUEST_RECEIVED
     assert events[0].mcp.correlation_request_id == "request-context"
+
+
+@pytest.mark.asyncio
+async def test_server_reads_metadata_from_fastmcp_request_params():
+    events = []
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        record=events.append,
+    )
+    params = CallToolRequestParams(
+        name="read_only",
+        _meta={
+            "agentic-perf": {
+                "ticket_id": "PERF-1",
+                "agent_id": "benchmark",
+                "trace_id": "a" * 32,
+                "action_id": "b" * 16,
+                "correlation_request_id": "request-params",
+            }
+        },
+    )
+    context = MiddlewareContext(
+        message=CallToolRequestParams(name="read_only"),
+        method="tools/call",
+        fastmcp_context=SimpleNamespace(
+            request_id="rpc-1",
+            session_id="session-1",
+            request_context=SimpleNamespace(
+                meta=None, request=SimpleNamespace(params=params)
+            ),
+        ),
+    )
+
+    await middleware.on_call_tool(context, AsyncMock(return_value="ok"))
+    assert events[0].mcp.correlation_request_id == "request-params"
 
 
 @pytest.mark.asyncio

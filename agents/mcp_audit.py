@@ -413,10 +413,13 @@ class MCPAuditMiddleware(Middleware):
         # FastMCP 3.4 reconstructs CallToolRequestParams before invoking
         # middleware, so request metadata is retained on its public request
         # context rather than on ``context.message``.
-        if not values and context.fastmcp_context is not None:
+        if META_KEY not in values and context.fastmcp_context is not None:
             request_context = getattr(context.fastmcp_context, "request_context", None)
             if request_context is not None:
                 values = _meta_values(request_context.meta)
+                if not values:
+                    request = getattr(request_context, "request", None)
+                    values = _meta_values(getattr(request, "params", None))
         propagated = _context_from_meta(values)
         tool_name = str(getattr(context.message, "name", "unknown"))
         # A server can still be used in isolated unit tests without ticket env.
