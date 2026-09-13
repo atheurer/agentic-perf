@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable
 
 Migration = Callable[[sqlite3.Connection], None]
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def _migration_1(connection: sqlite3.Connection) -> None:
@@ -85,11 +85,21 @@ def _migration_4(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE operation_history ADD COLUMN terminal_outcome TEXT")
 
 
+def _migration_5(connection: sqlite3.Connection) -> None:
+    """Store large, replayable terminal operation results out of the descriptor."""
+    connection.execute(
+        "CREATE TABLE operation_results (operation_key TEXT PRIMARY KEY, "
+        "result_json TEXT NOT NULL, "
+        "FOREIGN KEY(operation_key) REFERENCES operations(operation_key))"
+    )
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
 }
 
 

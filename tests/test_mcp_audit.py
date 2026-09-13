@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import socket
+import sys
+import textwrap
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import uvicorn
 from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.tools.base import ToolResult
 from mcp import McpError
@@ -16,6 +20,135 @@ from mcp.types import CallToolRequestParams, RequestParams
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
 from agents.mcp_client import AgentMCPClient, _ServerConnection
 from providers.tracing import LifecycleState, TraceContext
+from providers.tracing.client import TraceClient
+from state_store.trace_store import TraceStore
+from tests.test_trace_ingestion import make_app
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="FastMCP stdio hangs on local Python 3.14; covered in CI 3.12/3.13",
+)
+@pytest.mark.asyncio
+async def test_ticket_stdio_protected_replay_is_durable_and_exact(
+    tmp_path, monkeypatch
+):
+    """A real ticket server replays a large protected result after restart."""
+    app = make_app(tmp_path)
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    )
+    serve_task = asyncio.create_task(server.serve())
+    base_url = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        try:
+            import httpx
+
+            async with httpx.AsyncClient() as health_client:
+                if (
+                    await health_client.get(base_url + "/api/v1/health")
+                ).status_code == 200:
+                    break
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(0.03)
+    else:
+        server.should_exit = True
+        await asyncio.wait_for(serve_task, 5)
+        pytest.fail("temporary state-store did not start")
+    counter = tmp_path / "handler-count"
+    script = tmp_path / "ticket_server.py"
+    script.write_text(
+        textwrap.dedent(f"""\
+        from pathlib import Path
+        from agents.mcp_audit import create_ticket_mcp
+        mcp = create_ticket_mcp("ticket-audit")
+        @mcp.tool()
+        async def execute_benchmark() -> str:
+            path = Path({str(counter)!r})
+            path.write_text(str(int(path.read_text() if path.exists() else "0") + 1))
+            return "X" * 5000
+        if __name__ == "__main__":
+            mcp.run()
+    """)
+    )
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
+    monkeypatch.setenv("STATE_STORE_URL", base_url)
+    recorder = TraceClient(base_url, "service", spool_dir=tmp_path / "client-spool")
+    trace = TraceContext(
+        ticket_id="PERF-786",
+        agent_id="benchmark",
+        mcp_correlation_request_id="stable",
+        idempotency_key="mcp-786",
+        idempotency_request_hash="hash-786",
+    )
+    first = AgentMCPClient(trace_client=recorder)
+    second = AgentMCPClient(trace_client=recorder)
+    try:
+        await asyncio.wait_for(
+            first.connect_ticket_server(
+                str(script),
+                name="ticket",
+                ticket_id="PERF-786",
+                state_store_url=base_url,
+                agent_name="benchmark",
+            ),
+            15,
+        )
+        first_pid = first._servers["ticket"].subprocess_pid
+        result = await asyncio.wait_for(
+            first.call_tool("execute_benchmark", {}, trace), 15
+        )
+        assert result == "X" * 5000
+        await asyncio.wait_for(first.disconnect(), 10)
+        await asyncio.wait_for(
+            second.connect_ticket_server(
+                str(script),
+                name="ticket",
+                ticket_id="PERF-786",
+                state_store_url=base_url,
+                agent_name="benchmark",
+            ),
+            15,
+        )
+        second_pid = second._servers["ticket"].subprocess_pid
+        replay = await asyncio.wait_for(
+            second.call_tool("execute_benchmark", {}, trace), 15
+        )
+        assert replay == result
+        assert counter.read_text() == "1"
+        assert first_pid and second_pid and first_pid != second_pid
+        await asyncio.to_thread(recorder.flush)
+        with TraceStore(tmp_path / "trace.db") as store:
+            operation = store.get_operation("mcp-786")
+            assert operation and operation.state == "terminal"
+            assert operation.result_descriptor == {"operation_result": "stored"}
+            assert store.get_operation_result("mcp-786") is not None
+            events = store.list_events("PERF-786")
+        assert any(
+            e.producer.component == "mcp_client"
+            and e.mcp.server_pid in {first_pid, second_pid}
+            for e in events
+        )
+        assert any(
+            e.producer.component == "mcp_server"
+            and e.mcp.server_pid in {first_pid, second_pid}
+            for e in events
+        )
+    finally:
+        await asyncio.wait_for(first.disconnect(), 10)
+        await asyncio.wait_for(second.disconnect(), 10)
+        await asyncio.to_thread(recorder.close)
+        server.should_exit = True
+        await asyncio.wait_for(serve_task, 10)
+        app.state.trace_store.close()
 
 
 def _request(

@@ -168,7 +168,10 @@ class MCPAuditMiddleware(Middleware):
         if self._record is not None:
             self._record(event)
         elif self._client is not None:
-            self._client.record(event)
+            # Server-side boundaries decide whether a protected action can be
+            # retried.  Acknowledging them before replying makes that audit
+            # trail durable across a subprocess restart.
+            self._client.record_critical(event)
 
     def _validate_identity(self, context: TraceContext | None) -> TraceContext:
         if context is None:
@@ -199,16 +202,15 @@ class MCPAuditMiddleware(Middleware):
         )
 
     @staticmethod
-    def _result_descriptor(result: Any) -> dict[str, Any]:
+    def _result_descriptor(result: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Serialize the actual FastMCP result, bounded for operation storage."""
         if not isinstance(result, ToolResult):
-            return {"mcp_result": json.dumps(result, default=str)[:4096]}
+            return {"mcp_result": json.dumps(result, default=str)[:4096]}, None
         payload = result.model_dump(mode="json")
         encoded = json.dumps(payload, sort_keys=True)
         if len(encoded) > 4096:
-            # A response too large to replay exactly is never silently reused.
-            return {"unreplayable": True, "preview": encoded[:4096]}
-        return {"tool_result": payload}
+            return {"operation_result": "stored"}, {"tool_result": payload}
+        return {"tool_result": payload}, None
 
     def _protect_operation(
         self, trace: TraceContext, tool_name: str
@@ -241,7 +243,9 @@ class MCPAuditMiddleware(Middleware):
         status = acquired.get("status")
         if status == "terminal":
             descriptor = acquired.get("operation", {}).get("result_descriptor", {})
-            payload = descriptor.get("tool_result")
+            payload = descriptor.get("tool_result") or acquired.get("result", {}).get(
+                "tool_result"
+            )
             if isinstance(payload, dict):
                 from fastmcp.tools.base import ContentBlock
 
@@ -407,11 +411,13 @@ class MCPAuditMiddleware(Middleware):
         finally:
             reset_trace_context(token)
         if lease is not None:
+            descriptor, operation_result = self._result_descriptor(result)
             self._client.operation_transition(
                 trace.idempotency_key or "",
                 "fail" if getattr(result, "is_error", False) else "complete",
                 int(lease["fencing_generation"]),
-                descriptor=self._result_descriptor(result),
+                descriptor=descriptor,
+                result=operation_result,
             )
         terminal_state = (
             LifecycleState.FAILED

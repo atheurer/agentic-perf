@@ -75,6 +75,43 @@ async def test_service_acquire_existing_terminal_and_actions(tmp_path) -> None:
     await client.aclose()
 
 
+async def test_service_returns_large_authorized_terminal_result(tmp_path) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app(tmp_path)), base_url="http://test"
+    )
+    headers = {"Authorization": "Bearer service"}
+    body = {"operation_key": "large", "request_hash": "hash", "ttl_seconds": 60}
+    acquired = await client.post(
+        "/api/v1/traces/operations/acquire", json=body, headers=headers
+    )
+    token = acquired.json()["operation"]["fencing_generation"]
+    for action in ("prepared", "side-effect-started"):
+        assert (
+            await client.post(
+                f"/api/v1/traces/operations/large/{action}",
+                json={"fencing_token": token},
+                headers=headers,
+            )
+        ).status_code == 200
+    result = {"tool_result": {"content": [{"type": "text", "text": "X" * 5000}]}}
+    complete = await client.post(
+        "/api/v1/traces/operations/large/complete",
+        json={
+            "fencing_token": token,
+            "descriptor": {"operation_result": "stored"},
+            "result": result,
+        },
+        headers=headers,
+    )
+    assert complete.status_code == 200
+    replay = await client.post(
+        "/api/v1/traces/operations/acquire", json=body, headers=headers
+    )
+    assert replay.json()["status"] == "terminal"
+    assert replay.json()["result"] == result
+    await client.aclose()
+
+
 async def test_operation_api_requires_service_principal(tmp_path) -> None:
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=make_app(tmp_path)), base_url="http://test"
