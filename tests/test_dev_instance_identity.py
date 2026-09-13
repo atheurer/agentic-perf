@@ -146,6 +146,7 @@ def test_imported_fixture_requires_review_before_dispatch_or_resume(
         ticket.id,
         TransitionRequest(status="triage_pending", reviewed_resume=True),
         triggered_by="reviewer",
+        reviewer_authorized=True,
     )
     assert (
         resumed.custom_fields["imported_fixture_reviewed"]["reviewed_by"] == "reviewer"

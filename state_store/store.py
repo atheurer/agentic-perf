@@ -189,6 +189,7 @@ class TicketStore:
         ticket_id: str,
         request: TransitionRequest,
         triggered_by: str = "system",
+        reviewer_authorized: bool = False,
     ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
@@ -231,6 +232,17 @@ class TicketStore:
                         raise InvalidTransition(
                             "Imported fixture requires reviewed_resume=true before "
                             "it can become executable"
+                        )
+                    if not reviewer_authorized:
+                        self._trace_mutation(
+                            ticket_id,
+                            "transition_ticket",
+                            rejected=True,
+                            attributes={"reason": "reviewer_authorization_required"},
+                        )
+                        raise InvalidTransition(
+                            "Imported fixture resume requires an authorized "
+                            "service or administrator reviewer"
                         )
                     # Imported fixtures intentionally have no previous status.
                     # A reviewed operator must explicitly re-enter the normal
