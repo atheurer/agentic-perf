@@ -134,9 +134,9 @@ async def set_ssh_context(ticket_id: str) -> str:
     _ticket_id = ticket_id
 
     _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=15.0, headers=_store_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=_store_headers()) as client:
         r = await client.get(f"{_state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()

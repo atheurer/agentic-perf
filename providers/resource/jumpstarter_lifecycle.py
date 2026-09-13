@@ -18,9 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 from state_store.models import TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -126,7 +124,7 @@ async def sweep_orphaned_leases(
             return
 
         # Check ticket statuses in batch.
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=auth_headers or {}
         ) as client:
             for lease_name, ticket_id in to_release:
@@ -261,7 +259,7 @@ async def resolve_images(
     _headers = auth_headers or {}
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
             if r.status_code != 200:
                 return
@@ -290,7 +288,9 @@ async def resolve_images(
                 board_target = cf.get("resource_provider_metadata", {}).get(
                     "board_target", ""
                 )
-                async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+                async with AuditedAsyncHTTPClient(
+                    timeout=10.0, headers=_headers
+                ) as client:
                     await client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                         json={
@@ -386,7 +386,7 @@ async def resolve_images(
                 f"for {ticket_id} — provisioning agent "
                 f"will need to ask the user"
             )
-            async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
                 await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
@@ -525,7 +525,7 @@ async def resolve_images(
             pass
 
         # Store on ticket
-        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
             await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={

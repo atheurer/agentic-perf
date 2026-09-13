@@ -10,9 +10,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-import httpx
-
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import (
     LLMProvider,
     LLMRateLimitError,
@@ -29,8 +28,10 @@ from providers.tracing import (
     OperationOutcome,
     RetryKind,
     TraceRecorder,
+    bind_trace_context,
     child_context,
     new_trace_context,
+    reset_trace_context,
     trace_headers,
 )
 
@@ -124,7 +125,7 @@ class AgentBase(ABC):
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        self._client = AuditedAsyncHTTPClient(timeout=30.0, headers=headers)
         self._events = event_bus
         self._last_tool_call_time: float = 0.0
         self._tool_min_interval = self._load_tool_rate_limit()
@@ -342,6 +343,7 @@ class AgentBase(ABC):
             trace = TraceRecorder()
             self._trace = trace
         trace.context = trace_context
+        trace_token = bind_trace_context(trace_context)
         header_update = self._client.headers.update(trace_headers(trace_context))
         if inspect.isawaitable(header_update):
             await header_update
@@ -479,6 +481,7 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
+            self._context_truncated = False
             self._hitl_just_resumed = False
             self._post_hitl_nudge_used = False
             while (
@@ -810,24 +813,57 @@ class AgentBase(ABC):
                     )
                     if ctx_action == "pause":
                         if self._wrapup_reason is None:
-                            self._wrapup_reason = "context"
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "[SYSTEM] Your context window "
-                                        "is nearly full. You MUST wrap "
-                                        "up immediately: submit your "
-                                        "best result now using your "
-                                        "submit_* tool, even if "
-                                        "incomplete. Raising the token "
-                                        "budget will NOT help — this "
-                                        "is a model input-size limit. "
-                                        "This is your final LLM call."
-                                    ),
-                                }
-                            )
-                            continue
+                            truncated = False
+                            if not self._context_truncated:
+                                self._context_truncated = True
+                                before = len(messages)
+                                try:
+                                    messages = self._truncate_context(messages)
+                                except Exception:
+                                    logger.exception(
+                                        "[%s] Context truncation failed on %s",
+                                        self.agent_name,
+                                        ticket_id,
+                                    )
+                                else:
+                                    after = len(messages)
+                                    if after < before:
+                                        truncated = True
+                                        logger.info(
+                                            "[%s] Context truncation: "
+                                            "%d → %d messages on %s",
+                                            self.agent_name,
+                                            before,
+                                            after,
+                                            ticket_id,
+                                        )
+                                        self._emit(
+                                            ticket_id,
+                                            "context_truncated",
+                                            {
+                                                "before": before,
+                                                "after": after,
+                                            },
+                                        )
+                            if not truncated:
+                                self._wrapup_reason = "context"
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "[SYSTEM] Your context window "
+                                            "is nearly full. You MUST wrap "
+                                            "up immediately: submit your "
+                                            "best result now using your "
+                                            "submit_* tool, even if "
+                                            "incomplete. Raising the token "
+                                            "budget will NOT help — this "
+                                            "is a model input-size limit. "
+                                            "This is your final LLM call."
+                                        ),
+                                    }
+                                )
+                                continue
                     elif ctx_action == "warn":
                         if not getattr(self, "_context_warned", False):
                             self._context_warned = True
@@ -1277,6 +1313,7 @@ class AgentBase(ABC):
         finally:
             self.max_iterations = configured_max
             self._max_iterations_is_override = False
+            reset_trace_context(trace_token)
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
@@ -1749,6 +1786,54 @@ class AgentBase(ABC):
             "awaiting_customer_guidance",
             comment=(f"{self.agent_name} budget exhausted — pausing for guidance"),
         )
+
+    @staticmethod
+    def _truncate_context(
+        messages: list[dict[str, Any]],
+        keep_recent: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Drop old tool exchanges to free context space.
+
+        Keeps the first message (ticket context) and the
+        last ``keep_recent`` messages (most recent tool
+        exchanges and agent reasoning). Ensures the result
+        maintains valid message alternation (user → assistant
+        → user) as required by LLM APIs.
+
+        Messages alternate assistant(tool_use) → user(tool_results),
+        so ``keep_recent=6`` preserves ~3 recent exchanges.
+        """
+        if len(messages) <= keep_recent + 1:
+            return messages
+
+        initial = messages[0]
+        recent = messages[-keep_recent:]
+
+        # Ensure recent starts with an assistant message
+        # to maintain valid alternation after the initial
+        # user message.
+        while recent and recent[0].get("role") == "user":
+            recent = recent[1:]
+
+        if not recent:
+            return messages
+
+        dropped = len(messages) - 1 - len(recent)
+
+        truncation_note: dict[str, Any] = {
+            "role": "user",
+            "content": (
+                f"[SYSTEM] Context was truncated to fit the "
+                f"model's context window. {dropped} earlier "
+                f"messages (tool calls and results) were "
+                f"removed. The initial ticket context and "
+                f"your {len(recent)} most recent messages "
+                f"are preserved. Continue your work with "
+                f"the available context — re-read artifacts "
+                f"if needed."
+            ),
+        }
+        return [initial, truncation_note] + recent
 
     async def _handle_context_pause(self, ticket_id: str) -> None:
         """Handle context-window pause during agent execution.

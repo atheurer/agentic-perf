@@ -97,7 +97,7 @@ async def _persist_validated_runfile(
     the ticket when running under an agentic-perf ticket.  Execution must use
     this ID rather than supplying an independent runfile.
     """
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
     validation_id = f"val-{uuid.uuid4().hex}"
     record = {
@@ -122,7 +122,7 @@ async def _persist_validated_runfile(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=headers,
         ) as client:
@@ -3741,14 +3741,16 @@ async def execute_boot_time_test(
     # runs so all artifacts remain accessible.
     if _ticket and response.get("output_dir"):
         try:
-            import httpx
+            from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
             token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             ticket_id = _ticket.get("id", "")
             if ticket_id:
-                async with httpx.AsyncClient(timeout=10.0, headers=headers) as _client:
+                async with AuditedAsyncHTTPClient(
+                    timeout=10.0, headers=headers
+                ) as _client:
                     # Fetch current list to append
                     r = await _client.get(
                         f"{store_url}/api/v1/tickets/{ticket_id}",

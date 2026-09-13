@@ -65,9 +65,9 @@ async def get_ticket_results(ticket_id: str) -> str:
     """Retrieve benchmark results, KPIs, and evaluation findings
     from a prior ticket. Use this to compare results across
     investigations or reference earlier work."""
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with AuditedAsyncHTTPClient(timeout=30) as client:
         resp = await client.get(
             f"{_STORE_URL}/api/v1/tickets/{ticket_id}",
             headers=_headers(),
@@ -106,9 +106,9 @@ async def search_tickets(
     Note: fetches all tickets then filters in Python. Acceptable
     for current scale; will need server-side filtering if the
     ticket store grows large."""
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with AuditedAsyncHTTPClient(timeout=30) as client:
         resp = await client.get(
             f"{_STORE_URL}/api/v1/tickets",
             headers=_headers(),

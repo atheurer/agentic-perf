@@ -34,6 +34,10 @@ def trace_headers(context: TraceContext) -> dict[str, str]:
         "X-Agentic-Perf-Invocation-Id": str(context.invocation_id or ""),
         "X-Agentic-Perf-Action-Id": context.action_id,
         "X-Agentic-Perf-Parent-Action-Id": context.parent_action_id or "",
+        # This marker is only emitted by the internal causal transport helper.
+        # State-store middleware ignores correlation-shaped user request headers
+        # unless this complete envelope is present.
+        "X-Agentic-Perf-Causal-Context": "v1",
     }
 
 

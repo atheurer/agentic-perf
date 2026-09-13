@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 
 from .base import BuildResult, BuildSpec, ImageBuildProvider
 
@@ -376,9 +376,7 @@ class CAIBProvider(ImageBuildProvider):
 
             expiration = int(time.time()) + (days * 86400)
 
-            import httpx
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with AuditedAsyncHTTPClient(timeout=10.0) as client:
                 r = await client.put(
                     f"https://quay.io/api/v1/repository/{namespace}/{repo}/tag/{tag}",
                     json={"expiration": expiration},

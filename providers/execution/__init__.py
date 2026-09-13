@@ -1,4 +1,4 @@
-"""Audited local process execution."""
+"""Audited execution boundaries for external and local side effects."""
 
 from .filesystem import (
     AuditedFilesystem,
@@ -6,10 +6,14 @@ from .filesystem import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from .http import AmbiguousHTTPReplayError, AuditedAsyncHTTPClient, AuditedHTTPClient
 from .subprocess import AuditedSubprocessRunner, ProcessResult
 
 __all__ = [
+    "AmbiguousHTTPReplayError",
+    "AuditedAsyncHTTPClient",
     "AuditedFilesystem",
+    "AuditedHTTPClient",
     "AuditedSubprocessRunner",
     "FilesystemAuditError",
     "ProcessResult",

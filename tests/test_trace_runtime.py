@@ -55,6 +55,7 @@ def test_trace_headers_have_w3c_and_agentic_perf_ids() -> None:
     headers = trace_headers(context)
     assert headers["traceparent"] == f"00-{context.trace_id}-{context.action_id}-01"
     assert headers["X-Agentic-Perf-Invocation-Id"] == str(context.invocation_id)
+    assert headers["X-Agentic-Perf-Causal-Context"] == "v1"
 
 
 def test_proposed_tool_reuses_one_action_id_through_terminal_result() -> None:
