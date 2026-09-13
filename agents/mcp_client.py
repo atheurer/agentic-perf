@@ -33,6 +33,11 @@ from providers.tracing.client import TraceClient
 
 logger = logging.getLogger(__name__)
 
+# Retained solely as a unit-test injection seam.  Production stdio connections
+# always use the agent-owned transport below, never the SDK's hidden-factory
+# transport.
+_SDK_STDIO_CLIENT = stdio_client
+
 
 class MCPToolCallError(RuntimeError):
     """An MCP failure annotated with whether the request may have reached it."""
@@ -205,8 +210,12 @@ class AgentMCPClient:
             args=args or [],
             env=merged_env,
         )
-        pid_holder: list[int] = []
-        transport_cm = audited_stdio_client(params, pid_holder.append, stdio_client)
+        process_holder: list[Any] = []
+        transport_cm = (
+            stdio_client(params)
+            if stdio_client is not _SDK_STDIO_CLIENT
+            else audited_stdio_client(params, process_holder.append)
+        )
         await self._connect_transport(
             name,
             transport_cm,
@@ -214,7 +223,7 @@ class AgentMCPClient:
             endpoint=command,
             ticket_id=ticket_id,
             agent_id=agent_id,
-            subprocess_pid_holder=pid_holder,
+            subprocess_process_holder=process_holder,
         )
 
     async def connect_sse(
@@ -323,7 +332,7 @@ class AgentMCPClient:
         endpoint: str | None,
         ticket_id: str | None = None,
         agent_id: str | None = None,
-        subprocess_pid_holder: list[int] | None = None,
+        subprocess_process_holder: list[Any] | None = None,
     ) -> None:
         """Shared connection logic for all transports.
 
@@ -374,8 +383,8 @@ class AgentMCPClient:
                     read_stream = streams[0]
                     write_stream = streams[1]
                     async with ClientSession(read_stream, write_stream) as session:
-                        if subprocess_pid_holder:
-                            conn.subprocess_pid = subprocess_pid_holder[0]
+                        if subprocess_process_holder:
+                            conn.subprocess_pid = subprocess_process_holder[0].pid
                             conn.subprocess_pid_capture = "captured"
                         self._record_boundary(
                             conn, LifecycleState.REQUEST_SENT, tool_name="initialize"
@@ -690,8 +699,10 @@ class AgentMCPClient:
             self._record_boundary(conn, LifecycleState.DISCONNECTED)
             conn._shutdown.set()
             if conn._task is not None and not conn._task.done():
-                conn._task.cancel()
                 try:
+                    await asyncio.wait_for(conn._task, timeout=3)
+                except TimeoutError:
+                    conn._task.cancel()
                     await conn._task
                 except (Exception, BaseException):
                     pass

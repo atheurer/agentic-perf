@@ -6,6 +6,7 @@ commands for non-Python MCP servers (e.g., Jumpstarter).
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import textwrap
 from pathlib import Path
@@ -52,6 +53,39 @@ async def test_connect_command_basic(mock_mcp_server: Path):
         assert tools[0].name == "mock_tool"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stdio_servers_keep_process_ownership_and_reconnect(
+    mock_mcp_server: Path,
+):
+    """Concurrent owned transports never share a PID or SDK launch state."""
+    first = AgentMCPClient()
+    second = AgentMCPClient()
+    try:
+        await asyncio.gather(
+            first.connect_command(sys.executable, [str(mock_mcp_server)], "first"),
+            second.connect_command(sys.executable, [str(mock_mcp_server)], "second"),
+        )
+        first_pid = first._servers["first"].subprocess_pid
+        second_pid = second._servers["second"].subprocess_pid
+        assert first_pid is not None
+        assert second_pid is not None
+        assert first_pid != second_pid
+
+        await first.disconnect()
+        await first.connect_command(
+            sys.executable, [str(mock_mcp_server)], "reconnected"
+        )
+        reconnect_pid = first._servers["reconnected"].subprocess_pid
+        assert reconnect_pid is not None
+        assert reconnect_pid not in {first_pid, second_pid}
+        assert "mock response: later" in await first.call_tool(
+            "mock_tool", {"message": "later"}
+        )
+    finally:
+        await first.disconnect()
+        await second.disconnect()
 
 
 @pytest.mark.asyncio
