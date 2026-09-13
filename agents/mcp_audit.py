@@ -20,7 +20,7 @@ from mcp import McpError
 from mcp.types import ErrorData
 from pydantic import TypeAdapter
 
-from providers.redaction import Redactor
+from providers.redaction import get_shared_redactor
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -51,6 +51,7 @@ _MAX_REPLAY_CACHE = 1024
 # immutable idempotency identity.
 _PROTECTED_TOOLS = frozenset({"execute_benchmark"})
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
+_MAX_ERROR_MESSAGE_BYTES = 4096
 
 
 def _meta_values(message: Any) -> dict[str, Any]:
@@ -173,7 +174,12 @@ class MCPAuditMiddleware(Middleware):
             duration_ms=duration_ms,
             outcome=outcome,
             error=(
-                ErrorDescriptor(type=type(error).__name__, message=str(error))
+                ErrorDescriptor(
+                    type=type(error).__name__,
+                    message=get_shared_redactor().redact_string(
+                        context.ticket_id or "unknown", str(error)
+                    )[:_MAX_ERROR_MESSAGE_BYTES],
+                )
                 if error is not None
                 else None
             ),
@@ -227,9 +233,11 @@ class MCPAuditMiddleware(Middleware):
                     "protected result exceeds operation result quota"
                 )
             root = Path(os.environ.get("AGENTIC_PERF_HOME", ".")) / "trace-payloads"
+            ticket_id = trace.ticket_id or "unknown"
             descriptor = PayloadBuilder(
-                Redactor(), blob_store=PayloadBlobStore(root)
-            ).build(trace.ticket_id or "unknown", payload)
+                get_shared_redactor(),
+                blob_store=PayloadBlobStore(root, ticket_id=ticket_id),
+            ).build(ticket_id, payload)
             return {"operation_result": descriptor.model_dump(mode="json")}
         return {"tool_result": payload}
 
@@ -265,6 +273,19 @@ class MCPAuditMiddleware(Middleware):
         if status == "terminal":
             descriptor = acquired.get("operation", {}).get("result_descriptor", {})
             payload = descriptor.get("tool_result")
+            if payload is None and isinstance(descriptor.get("operation_result"), dict):
+                safe = descriptor["operation_result"]
+                try:
+                    root = Path(os.environ.get("AGENTIC_PERF_HOME", ".")) / "trace-payloads"
+                    ticket_id = trace.ticket_id or "unknown"
+                    content = PayloadBlobStore(root, ticket_id=ticket_id).get(
+                        safe["blob_ref"], max_bytes=_MAX_OPERATION_RESULT_BYTES
+                    )
+                    if len(content) != safe.get("redacted_size_bytes"):
+                        raise PayloadStorageError("payload size mismatch")
+                    payload = json.loads(content).get("tool_result")
+                except (KeyError, ValueError, PayloadStorageError):
+                    payload = None
             if isinstance(payload, dict):
                 from fastmcp.tools.base import ContentBlock
 
@@ -279,7 +300,7 @@ class MCPAuditMiddleware(Middleware):
             return None, self._protected_result(
                 {
                     "status": "indeterminate",
-                    "reason": "cached response unavailable",
+                    "reason": "protected result integrity check failed",
                     "operation": descriptor,
                 },
                 is_error=True,

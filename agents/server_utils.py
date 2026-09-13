@@ -1265,12 +1265,12 @@ _progress_redactor = None
 
 
 def _get_progress_redactor():
-    """Lazy-init a pattern-only Redactor for the bypass path."""
+    """Return the process-wide registry used by secret providers."""
     global _progress_redactor
     if _progress_redactor is None:
-        from providers.redaction import Redactor
+        from providers.redaction import get_shared_redactor
 
-        _progress_redactor = Redactor()
+        _progress_redactor = get_shared_redactor()
     return _progress_redactor
 
 

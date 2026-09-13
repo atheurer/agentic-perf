@@ -123,7 +123,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         replay = await asyncio.wait_for(
             second.call_tool("execute_benchmark", {}, trace), 15
         )
-        assert "cached response unavailable" in replay
+        assert replay == result
         assert counter.read_text() == "1"
         assert first_pid and second_pid and first_pid != second_pid
         await asyncio.to_thread(recorder.flush)

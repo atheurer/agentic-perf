@@ -332,3 +332,12 @@ class Redactor:
             return self.redact_string(ticket_id, data)
 
         return data
+
+
+# Long-lived process registry shared by secret providers, progress reporting,
+# and ticket-local MCP payload capture.
+_shared_redactor = Redactor()
+
+
+def get_shared_redactor() -> Redactor:
+    return _shared_redactor
