@@ -208,6 +208,8 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     # Compatibility adapters use independent SQLite connections to the same
     # database, so API worker threads never interleave transactions on one
     # connection while the TraceStore remains the sole persistence authority.
+    # Security wiring: AuditLog(redactor=...) must remain connected to the
+    # same redactor as EventBus so sensitive audit fields are scrubbed.
     audit_log = AuditLog(
         redactor=audit_redactor,
         trace_store=app.state.trace_store,

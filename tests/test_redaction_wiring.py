@@ -309,11 +309,27 @@ class TestConstructionSites:
 
     def test_state_store_main_wires_redactor(self) -> None:
         """Verify state_store.main constructs AuditLog/EventBus with redactor."""
+        import ast
         import inspect
 
         import state_store.main as mod
 
         source = inspect.getsource(mod)
         assert "Redactor()" in source
+        # Keep this simple source-level guard visible alongside the AST check:
+        # this wiring is security-sensitive and should remain easy to review.
         assert "AuditLog(redactor=" in source
+        tree = ast.parse(source)
+        audit_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AuditLog"
+        ]
+        assert any(
+            keyword.arg == "redactor"
+            for node in audit_calls
+            for keyword in node.keywords
+        )
         assert "EventBus(redactor=" in source
