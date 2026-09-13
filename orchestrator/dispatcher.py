@@ -380,7 +380,7 @@ class Dispatcher:
         self._agents.pop(ticket_id, None)
         self.stop_renewal(ticket_id)
         self.release_claim(ticket_id)
-        self._claim_ids.pop(ticket_id, None)
+        getattr(self, "_claim_ids", {}).pop(ticket_id, None)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
