@@ -65,9 +65,7 @@ def _mode(node: ast.Call, call: str) -> str | None:
     # Path.open(name, mode) has its mode as the first positional argument,
     # while built-in open/tarfile.open and os.fdopen place mode second.
     positional_mode = (
-        0
-        if call.endswith(".open") and call not in {"tarfile.open", "open"}
-        else 1
+        0 if call.endswith(".open") and call not in {"tarfile.open", "open"} else 1
     )
     value: ast.expr | None = (
         node.args[positional_mode] if len(node.args) > positional_mode else None
@@ -232,18 +230,18 @@ state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
-state_store/store.py|79|self._persist_dir.mkdir
-state_store/store.py|110|self._lease_path.unlink
-state_store/store.py|119|temporary.open
-state_store/store.py|123|os.replace
+state_store/store.py|86|self._persist_dir.mkdir
+state_store/store.py|117|self._lease_path.unlink
+state_store/store.py|126|temporary.open
+state_store/store.py|130|os.replace
 state_store/process_lock.py|56|path.parent.mkdir
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
-state_store/store.py|981|filesystem.mkdir
-state_store/store.py|988|filesystem.mkdir
-state_store/store.py|1001|log_filesystem.rename
-state_store/store.py|1010|filesystem.rename
+state_store/store.py|1066|filesystem.mkdir
+state_store/store.py|1073|filesystem.mkdir
+state_store/store.py|1086|log_filesystem.rename
+state_store/store.py|1095|filesystem.rename
 state_store/trace_store.py|77|self.db_path.parent.mkdir
 """
 
@@ -279,7 +277,6 @@ def test_full_production_mutation_inventory_has_reviewed_exclusions() -> None:
 def test_leader_lease_temporary_write_is_inventoried() -> None:
     """Path.open write modes must remain visible to the mutation scanner."""
     assert any(
-        mutation.path == "state_store/store.py"
-        and mutation.call == "temporary.open"
+        mutation.path == "state_store/store.py" and mutation.call == "temporary.open"
         for mutation in _inventory()
     )
