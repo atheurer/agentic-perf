@@ -276,7 +276,10 @@ class MCPAuditMiddleware(Middleware):
             if payload is None and isinstance(descriptor.get("operation_result"), dict):
                 safe = descriptor["operation_result"]
                 try:
-                    root = Path(os.environ.get("AGENTIC_PERF_HOME", ".")) / "trace-payloads"
+                    root = (
+                        Path(os.environ.get("AGENTIC_PERF_HOME", "."))
+                        / "trace-payloads"
+                    )
                     ticket_id = trace.ticket_id or "unknown"
                     content = PayloadBlobStore(root, ticket_id=ticket_id).get(
                         safe["blob_ref"], max_bytes=_MAX_OPERATION_RESULT_BYTES

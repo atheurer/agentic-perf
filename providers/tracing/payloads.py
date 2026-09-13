@@ -55,11 +55,17 @@ def canonicalize_payload(
 class PayloadBlobStore:
     """Private redacted blob files, addressed by their safe content hash."""
 
-    def __init__(self, directory: Path = TRACE_PAYLOAD_DIR, *, ticket_id: str | None = None) -> None:
+    def __init__(
+        self, directory: Path = TRACE_PAYLOAD_DIR, *, ticket_id: str | None = None
+    ) -> None:
         root = Path(directory)
         if ticket_id is not None:
             # Ticket IDs are an immutable scope, never a caller-controlled path.
-            if not ticket_id or Path(ticket_id).name != ticket_id or ticket_id in {".", ".."}:
+            if (
+                not ticket_id
+                or Path(ticket_id).name != ticket_id
+                or ticket_id in {".", ".."}
+            ):
                 raise PayloadStorageError("invalid ticket payload scope")
             root = root / ticket_id
         self.directory = root
@@ -113,13 +119,22 @@ class PayloadBlobStore:
             raise PayloadStorageError("invalid payload reference")
         target = self.directory / ref.removeprefix("sha256:")
         try:
-            if target.parent != self.directory or target.is_symlink() or not target.is_file():
+            if (
+                target.parent != self.directory
+                or target.is_symlink()
+                or not target.is_file()
+            ):
                 raise PayloadStorageError("unsafe payload reference")
             directory_mode = self.directory.stat().st_mode
             if directory_mode & 0o077 or target.stat().st_mode & 0o077:
-                raise PayloadStorageError("payload exceeds policy or has unsafe permissions")
+                raise PayloadStorageError(
+                    "payload exceeds policy or has unsafe permissions"
+                )
             content = target.read_bytes()
-            if len(content) > max_bytes or hashlib.sha256(content).hexdigest() != ref[7:]:
+            if (
+                len(content) > max_bytes
+                or hashlib.sha256(content).hexdigest() != ref[7:]
+            ):
                 raise PayloadStorageError("payload integrity check failed")
             return content
         except OSError as exc:
