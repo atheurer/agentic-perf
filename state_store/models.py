@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from providers.tracing import PayloadDescriptor
+
 
 class TicketStatus(str, Enum):
     NEW = "new"
@@ -254,8 +256,10 @@ class ValidationRecordV1(BaseModel):
     run_command: str = Field(min_length=1, max_length=500)
     validator_command: str = Field(min_length=1, max_length=500)
     validator_version: str = Field(min_length=1, max_length=128)
-    validation_output_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
-    validation_output_summary: str = Field(max_length=1000)
+    # Controller output is never embedded in validation records.  This
+    # descriptor has only redacted, bounded metadata and an optional private
+    # content-addressed reference.
+    validation_output: PayloadDescriptor
 
 
 class CreateValidationRequest(BaseModel):

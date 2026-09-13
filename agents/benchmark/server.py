@@ -143,6 +143,27 @@ def _validation_creator() -> dict[str, Any]:
     }
 
 
+def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]:
+    """Return the only validation-output representation safe to persist.
+
+    Controller diagnostics can contain credentials and are often unbounded.
+    Keep their content behind the same redaction, size-bound, and
+    content-addressed-blob policy used by trace producers.
+    """
+    from providers.redaction import Redactor
+    from providers.tracing import PayloadBuilder
+
+    return (
+        PayloadBuilder(Redactor())
+        .build(
+            ticket_id,
+            output,
+            media_type="text/plain",
+        )
+        .model_dump(mode="json")
+    )
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
@@ -162,6 +183,7 @@ async def _persist_validated_runfile(
     """
     from providers.execution import AuditedAsyncHTTPClient
 
+    ticket_id = os.environ.get("TICKET_ID", "")
     validation_id = f"val-{uuid.uuid4().hex}"
     runfile_digest = _runfile_fingerprint(run_file)
     record = {
@@ -178,17 +200,15 @@ async def _persist_validated_runfile(
         "run_command": run_command,
         "validator_command": validator_command,
         "validator_version": validator_version,
-        "validation_output_digest": hashlib.sha256(
-            validation_output.encode()
-        ).hexdigest(),
-        "validation_output_summary": validation_output[:1000],
+        "validation_output": _validation_output_descriptor(
+            ticket_id, validation_output
+        ),
         "state": "executable",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "creator": _validation_creator(),
     }
     _validation_records[validation_id] = record
 
-    ticket_id = os.environ.get("TICKET_ID", "")
     state_store_url = os.environ.get(
         "STATE_STORE_URL",
         "http://localhost:8090",
@@ -3286,7 +3306,9 @@ async def validate_benchmark(
                     "harness": harness_name,
                     "controller": controller,
                     "validation_id": validation_id,
-                    "validation_output": output,
+                    "validation_output": _validation_output_descriptor(
+                        ticket_id, output
+                    ),
                     "errors": [],
                 }
             )
@@ -3298,7 +3320,7 @@ async def validate_benchmark(
                 "valid": False,
                 "harness": harness_name,
                 "controller": controller,
-                "validation_output": output,
+                "validation_output": _validation_output_descriptor(ticket_id, output),
                 "errors": [details],
                 "exit_code": result.exit_code,
             }

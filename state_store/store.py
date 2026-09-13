@@ -20,6 +20,7 @@ from providers.tracing import (
     LifecycleDescriptor,
     LifecycleState,
     OperationOutcome,
+    PayloadDescriptor,
     TraceEventV1,
     child_context,
     current_trace_context,
@@ -397,8 +398,13 @@ class TicketStore:
             validation_id = record.get("validation_id")
             if isinstance(validation_id, str) and validation_id in manifest["records"]:
                 existing = manifest["records"][validation_id]
-                if existing.get("runfile_fingerprint") == record.get(
-                    "runfile_fingerprint"
+                if all(
+                    existing.get(field) == record.get(field)
+                    for field in (
+                        "runfile_fingerprint",
+                        "execution_intent_digest",
+                        "validation_output",
+                    )
                 ):
                     return ticket.model_copy(), None
                 self._audit_log(
@@ -465,6 +471,11 @@ class TicketStore:
             manifest["version"] += 1
             ticket.custom_fields["validated_run_file"] = immutable
             ticket.updated_at = datetime.now(timezone.utc)
+            descriptor = PayloadDescriptor.model_validate(
+                immutable["validation_output"]
+            )
+            if self._trace_store is not None and descriptor.digest:
+                self._trace_store.put_payload_descriptor(descriptor)
             self._persist_ticket(ticket)
             attrs = {
                 "ticket_id": ticket_id,
@@ -475,6 +486,7 @@ class TicketStore:
                 "execution_plan_fingerprint": immutable["execution_plan_fingerprint"],
                 "validator_command": immutable["validator_command"],
                 "validator_version": immutable["validator_version"],
+                "validation_output": immutable["validation_output"],
                 "creator": immutable["creator"],
             }
             self._audit_log("create_validation", ticket_id, attrs)

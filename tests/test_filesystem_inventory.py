@@ -113,19 +113,19 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|2821|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|2832|staging.unlink
-agents/benchmark/server.py|2834|unlink
-agents/benchmark/server.py|3016|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3104|staging.unlink
-agents/benchmark/server.py|3106|unlink
-agents/benchmark/server.py|3424|open
-agents/benchmark/server.py|3505|artifact_filesystem.unlink
-agents/benchmark/server.py|3507|serial_log_path.unlink
-agents/benchmark/server.py|3538|metadata_file.write_bytes
-agents/benchmark/server.py|3545|metadata_file.write_text
-agents/benchmark/server.py|3551|metadata_file.write_text
-agents/benchmark/server.py|3606|merged_file.write_bytes
+agents/benchmark/server.py|3042|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3053|staging.unlink
+agents/benchmark/server.py|3055|unlink
+agents/benchmark/server.py|3237|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3342|staging.unlink
+agents/benchmark/server.py|3344|unlink
+agents/benchmark/server.py|3662|open
+agents/benchmark/server.py|3743|artifact_filesystem.unlink
+agents/benchmark/server.py|3745|serial_log_path.unlink
+agents/benchmark/server.py|3776|metadata_file.write_bytes
+agents/benchmark/server.py|3783|metadata_file.write_text
+agents/benchmark/server.py|3789|metadata_file.write_text
+agents/benchmark/server.py|3844|merged_file.write_bytes
 agents/infra/server.py|232|tempfile.NamedTemporaryFile
 agents/infra/server.py|240|staging.unlink
 agents/infra/server.py|242|unlink
@@ -210,20 +210,23 @@ providers/tracing/spool.py|236|self.ack_path.unlink
 providers/workspace/manager.py|72|self._filesystem.mkdir
 state_store/api/artifacts.py|136|filesystem.unlink
 state_store/audit.py|41|self._path.parent.mkdir
-state_store/auth.py|64|SECRETS_DIR.mkdir
-state_store/auth.py|66|TOKEN_FILE.write_text
-state_store/auth.py|67|TOKEN_FILE.chmod
+state_store/auth.py|66|SECRETS_DIR.mkdir
+state_store/auth.py|68|TOKEN_FILE.write_text
+state_store/auth.py|69|TOKEN_FILE.chmod
+state_store/auth.py|81|SECRETS_DIR.mkdir
+state_store/auth.py|83|VALIDATOR_TOKEN_FILE.write_text
+state_store/auth.py|84|VALIDATOR_TOKEN_FILE.chmod
 state_store/identity.py|387|self._path.parent.mkdir
 state_store/identity.py|388|tempfile.mkstemp
 state_store/identity.py|393|os.fdopen
 state_store/identity.py|395|os.chmod
 state_store/identity.py|396|os.replace
 state_store/identity.py|399|os.unlink
-state_store/store.py|61|self._persist_dir.mkdir
-state_store/store.py|547|filesystem.mkdir
-state_store/store.py|554|filesystem.mkdir
-state_store/store.py|567|log_filesystem.rename
-state_store/store.py|576|filesystem.rename
+state_store/store.py|65|self._persist_dir.mkdir
+state_store/store.py|774|filesystem.mkdir
+state_store/store.py|781|filesystem.mkdir
+state_store/store.py|794|log_filesystem.rename
+state_store/store.py|803|filesystem.rename
 state_store/trace_store.py|77|self.db_path.parent.mkdir
 """
 

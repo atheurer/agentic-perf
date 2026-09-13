@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 
 from agents.benchmark.server import (
     _execution_intent_digest,
@@ -12,8 +14,10 @@ from agents.benchmark.server import (
     _get_validated_runfile,
     _runfile_fingerprint,
 )
+from state_store.api.router import api_router
 from state_store.api.validations import create_validation
-from state_store.auth import Principal
+from state_store.auth import Principal, make_auth_dependency
+from state_store.main import _set_audit_actor
 from state_store.models import CreateTicketRequest, CreateValidationRequest
 from state_store.store import TicketStore
 
@@ -42,8 +46,17 @@ def _record(validation_id: str, *, value: int = 1) -> dict:
         "run_command": "crucible run",
         "validator_command": "crucible validate",
         "validator_version": "test",
-        "validation_output_digest": "a" * 64,
-        "validation_output_summary": "ok",
+        "validation_output": {
+            "size_bytes": 2,
+            "original_size_bytes": 2,
+            "redacted_size_bytes": 2,
+            "media_type": "text/plain",
+            "digest": "a" * 64,
+            "digest_kind": "sha256",
+            "preview": "ok",
+            "truncated": False,
+            "redaction_applied": False,
+        },
     }
 
 
@@ -205,3 +218,128 @@ def test_user_cannot_forge_controller_validation_post(tmp_path):
     with pytest.raises(HTTPException) as error:
         create_validation(ticket_id, body, request)
     assert error.value.status_code == 403
+
+
+def _app(tmp_path) -> FastAPI:
+    class _Trace:
+        def insert_event_result(self, event):
+            return None
+
+        def put_payload_descriptor(self, descriptor):
+            return None
+
+    app = FastAPI()
+    app.state.store = TicketStore(tmp_path / "tickets", trace_store=_Trace())
+    app.state.multi_user = False
+    app.state.benchmark_validator_token = "validator"
+    app.state.benchmark_validation_capabilities = {}
+    app.include_router(
+        api_router,
+        dependencies=[
+            Depends(make_auth_dependency("service")),
+            Depends(_set_audit_actor),
+        ],
+    )
+    return app
+
+
+async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_path):
+    """Exercise real HTTP auth and capability binding without TestClient."""
+    app = _app(tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        auth = {"Authorization": "Bearer service"}
+        ticket_one = (
+            await client.post(
+                "/api/v1/tickets",
+                json={"summary": "one", "description": "one"},
+                headers=auth,
+            )
+        ).json()["id"]
+        ticket_two = (
+            await client.post(
+                "/api/v1/tickets",
+                json={"summary": "two", "description": "two"},
+                headers=auth,
+            )
+        ).json()["id"]
+
+        def headers(invocation: str = "invocation") -> dict[str, str]:
+            return auth | {
+                "X-Agentic-Perf-Benchmark-Validator": "validator",
+                "X-Agentic-Perf-Agent-Id": "benchmark",
+                "X-Agentic-Perf-Invocation-Id": invocation,
+            }
+
+        async def capability(ticket_id: str, invocation: str = "invocation") -> str:
+            response = await client.post(
+                f"/api/v1/tickets/{ticket_id}/validations/capability",
+                headers=headers(invocation),
+            )
+            assert response.status_code == 200
+            return response.json()["capability"]
+
+        async def create(
+            ticket_id: str,
+            record: dict,
+            cap: str,
+            invocation: str = "invocation",
+            agent: str = "benchmark",
+        ):
+            return await client.post(
+                f"/api/v1/tickets/{ticket_id}/validations",
+                json={"record": record, "expected_version": 0},
+                headers=headers(invocation)
+                | {
+                    "X-Agentic-Perf-Agent-Id": agent,
+                    "X-Agentic-Perf-Validation-Capability": cap,
+                },
+            )
+
+        first, second = _record("val-" + "1" * 32), _record("val-" + "2" * 32, value=2)
+        one, two = (
+            await create(ticket_one, first, await capability(ticket_one)),
+            await create(ticket_one, second, await capability(ticket_one)),
+        )
+        assert one.status_code == two.status_code == 200
+        assert (
+            await client.get(
+                f"/api/v1/tickets/{ticket_one}/validations/{first['validation_id']}",
+                headers=auth,
+            )
+        ).json()["record"]["validation_id"] == first["validation_id"]
+        # Concurrent distinct records append without losing either exact ID.
+        third = _record("val-" + "3" * 32, value=3)
+        fourth = _record("val-" + "4" * 32, value=4)
+        caps = await asyncio.gather(
+            capability(ticket_one, "concurrent-a"),
+            capability(ticket_one, "concurrent-b"),
+        )
+        results = await asyncio.gather(
+            create(ticket_one, third, caps[0], "concurrent-a"),
+            create(ticket_one, fourth, caps[1], "concurrent-b"),
+        )
+        assert [response.status_code for response in results] == [200, 200]
+        for record in (third, fourth):
+            response = await client.get(
+                f"/api/v1/tickets/{ticket_one}/validations/{record['validation_id']}",
+                headers=auth,
+            )
+            assert response.status_code == 200
+            assert response.json()["record"]["validation_id"] == record["validation_id"]
+        # Same ID and immutable hashes are idempotent; changing the output hash conflicts.
+        same = await create(ticket_one, first, await capability(ticket_one))
+        assert same.status_code == 200
+        altered = _record(first["validation_id"])
+        altered["validation_output"]["digest"] = "b" * 64
+        mismatch = await create(ticket_one, altered, await capability(ticket_one))
+        assert mismatch.status_code == 409
+        # A consumed capability cannot be replayed, and is ticket/agent/invocation bound.
+        cap = await capability(ticket_one)
+        assert (await create(ticket_two, first, cap)).status_code == 403
+        assert (await create(ticket_one, first, cap)).status_code == 403
+        cap = await capability(ticket_one)
+        assert (await create(ticket_one, first, cap, agent="other")).status_code == 403
+        cap = await capability(ticket_one)
+        app.state.benchmark_validation_capabilities[cap]["expires_at"] = 0
+        assert (await create(ticket_one, first, cap)).status_code == 403
