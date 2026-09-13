@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from providers.tracing import PayloadDescriptor
 
 
 class TicketStatus(str, Enum):
@@ -203,6 +205,13 @@ class CreateTicketRequest(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     owners: list[str] | None = None
 
+    @model_validator(mode="after")
+    def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        protected = _VALIDATION_RESERVED_FIELDS.intersection(self.custom_fields)
+        if protected:
+            raise ValueError("benchmark validation fields are reserved")
+        return self
+
 
 class TransitionRequest(BaseModel):
     status: TicketStatus
@@ -211,6 +220,66 @@ class TransitionRequest(BaseModel):
 
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
+
+
+_VALIDATION_RESERVED_FIELDS = frozenset(
+    {
+        "benchmark_validation",
+        "benchmark_validations",
+        "benchmark_validation_records",
+        "benchmark_validation_manifest",
+        "validated_run_file",
+    }
+)
+
+
+class InvalidationReason(str, Enum):
+    RELEVANT_PARAMETERS_CHANGED = "relevant_parameters_changed"
+    CONTROLLER_CHANGED = "controller_changed"
+    VALIDATOR_REVOKED = "validator_revoked"
+    OPERATOR_INVALIDATED = "operator_invalidated"
+    RUN_FILE_CHANGED = "run_file_changed"
+    TICKET_REPLANNED = "ticket_replanned"
+
+
+class ValidationRecordV1(BaseModel):
+    """Controller-attested validation evidence; ordinary users cannot create it."""
+
+    # Provenance is server-authoritative: the API constructs creator from the
+    # bound capability and request identity rather than accepting client data.
+    model_config = ConfigDict(extra="forbid")
+
+    validation_id: str = Field(pattern=r"^val-[a-f0-9]{32}$")
+    run_file: dict[str, Any]
+    runfile_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    harness: Literal["crucible"]
+    controller: str = Field(min_length=1, max_length=255)
+    params_fingerprint: str = Field(min_length=1, max_length=64)
+    execution_plan_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    run_command: str = Field(min_length=1, max_length=500)
+    validator_command: str = Field(min_length=1, max_length=500)
+    validator_version: str = Field(min_length=1, max_length=128)
+    # Controller output is never embedded in validation records.  This
+    # descriptor has only redacted, bounded metadata and an optional private
+    # content-addressed reference.
+    validation_output: PayloadDescriptor
+
+
+class CreateValidationRequest(BaseModel):
+    """Create one immutable benchmark-validation record using a manifest CAS."""
+
+    record: ValidationRecordV1
+    expected_version: int = Field(ge=0)
+
+
+class SupersedeValidationRequest(BaseModel):
+    """Append an immutable supersession record using a manifest CAS."""
+
+    validation_id: str
+    replacement_validation_id: str | None = None
+    reason: InvalidationReason
+    expected_version: int = Field(ge=0)
 
 
 class AddCommentRequest(BaseModel):

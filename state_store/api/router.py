@@ -18,6 +18,7 @@ from . import (
     transitions,
     transitions_info,
     users,
+    validations,
     webhooks,
     whoami,
 )
@@ -40,6 +41,7 @@ api_router.include_router(groups.router)
 api_router.include_router(whoami.router)
 api_router.include_router(traces.router)
 api_router.include_router(trace_operations.router)
+api_router.include_router(validations.router)
 # Chat router handles its own auth (supports anonymous read-only)
 chat_router = APIRouter(prefix="/api/v1")
 chat_router.include_router(chat.router)
