@@ -348,7 +348,8 @@ async def test_server_reads_metadata_from_fastmcp_request_params():
             request_id="rpc-1",
             session_id="session-1",
             request_context=SimpleNamespace(
-                meta=None, request=SimpleNamespace(params=params)
+                meta=RequestParams.Meta(**{"fastmcp": {"version": "3.4.4"}}),
+                request=SimpleNamespace(params=params),
             ),
         ),
     )

@@ -417,7 +417,7 @@ class MCPAuditMiddleware(Middleware):
             request_context = getattr(context.fastmcp_context, "request_context", None)
             if request_context is not None:
                 values = _meta_values(request_context.meta)
-                if not values:
+                if META_KEY not in values:
                     request = getattr(request_context, "request", None)
                     values = _meta_values(getattr(request, "params", None))
         propagated = _context_from_meta(values)
