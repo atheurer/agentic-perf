@@ -93,6 +93,40 @@ def _runfile_fingerprint(run_file: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _execution_plan_fingerprint(cf: dict[str, Any]) -> str:
+    """Digest every current-step parameter, not only mv_params."""
+    plan = cf.get("execution_plan", {})
+    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    index = plan.get("current_step", 0) if isinstance(plan, dict) else 0
+    params = (
+        steps[index].get("params", {})
+        if isinstance(index, int) and index < len(steps)
+        else {}
+    )
+    return hashlib.sha256(
+        json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _execution_intent_digest(
+    runfile_digest: str,
+    params_digest: str,
+    harness: str,
+    controller: str,
+    run_command: str,
+) -> str:
+    payload = {
+        "runfile": runfile_digest,
+        "params": params_digest,
+        "harness": harness,
+        "controller": controller,
+        "run_command": run_command,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _validation_creator() -> dict[str, Any]:
     """Capture the causal caller and MCP server identity with the record."""
     from providers.tracing import current_trace_context
@@ -114,6 +148,11 @@ async def _persist_validated_runfile(
     harness: str,
     controller: str,
     params_fingerprint: str,
+    execution_plan_fingerprint: str,
+    run_command: str,
+    validator_command: str,
+    validation_output: str,
+    validator_version: str,
 ) -> str | None:
     """Persist a runfile validation record and return its opaque ID.
 
@@ -124,13 +163,26 @@ async def _persist_validated_runfile(
     from providers.execution import AuditedAsyncHTTPClient
 
     validation_id = f"val-{uuid.uuid4().hex}"
+    runfile_digest = _runfile_fingerprint(run_file)
     record = {
         "validation_id": validation_id,
         "run_file": run_file,
-        "runfile_fingerprint": _runfile_fingerprint(run_file),
+        "runfile_fingerprint": runfile_digest,
         "harness": harness,
         "controller": controller,
         "params_fingerprint": params_fingerprint,
+        "execution_plan_fingerprint": execution_plan_fingerprint,
+        "execution_intent_digest": _execution_intent_digest(
+            runfile_digest, execution_plan_fingerprint, harness, controller, run_command
+        ),
+        "run_command": run_command,
+        "validator_command": validator_command,
+        "validator_version": validator_version,
+        "validation_output_digest": hashlib.sha256(
+            validation_output.encode()
+        ).hexdigest(),
+        "validation_output_summary": validation_output[:1000],
+        "state": "executable",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "creator": _validation_creator(),
     }
@@ -157,17 +209,29 @@ async def _persist_validated_runfile(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}",
             )
             ticket_response.raise_for_status()
-            manifest = (
-                ticket_response.json()
-                .get("custom_fields", {})
-                .get("benchmark_validations", {})
-            )
-            expected_version = manifest.get("version", 0)
-            response = await client.post(
-                f"{state_store_url}/api/v1/tickets/{ticket_id}/validations",
-                json={"record": record, "expected_version": expected_version},
-            )
-            response.raise_for_status()
+            for _ in range(3):
+                manifest = (
+                    ticket_response.json()
+                    .get("custom_fields", {})
+                    .get("benchmark_validations", {})
+                )
+                response = await client.post(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}/validations",
+                    json={
+                        "record": record,
+                        "expected_version": manifest.get("version", 0),
+                    },
+                    headers={"X-Agentic-Perf-Internal-Validation": "v1"},
+                )
+                if response.status_code != 409:
+                    response.raise_for_status()
+                    break
+                ticket_response = await client.get(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}"
+                )
+                ticket_response.raise_for_status()
+            else:
+                response.raise_for_status()
         logger.info(
             "[benchmark] Persisted benchmark validation %s for %s (%s)",
             validation_id,
@@ -299,11 +363,15 @@ def _get_validated_runfile(
     if isinstance(manifest, dict) and isinstance(manifest.get("records"), dict):
         records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
         record = records.get(validation_id)
+        if isinstance(record, dict) and record.get("state") == "legacy_unapproved":
+            return None, "validation token is legacy/unapproved"
         if (
             not isinstance(record, dict)
             or record.get("record_type", "validation") != "validation"
         ):
             return None, "unknown validation token"
+        if record.get("state") != "executable":
+            return None, "validation token is legacy/unapproved"
         supersession = next(
             (
                 item
@@ -324,6 +392,10 @@ def _get_validated_runfile(
             ticket.get("custom_fields", {})
         ):
             return None, "validation token is fingerprint-mismatched"
+        if record.get("execution_plan_fingerprint") != _execution_plan_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is execution-intent-mismatched"
     else:
         record = _validation_records.get(validation_id)
 
@@ -338,6 +410,8 @@ def _get_validated_runfile(
     run_file = record.get("run_file")
     if not isinstance(run_file, dict):
         return None, "Validation record does not contain a runfile"
+    if record.get("runfile_fingerprint") != _runfile_fingerprint(run_file):
+        return None, "validation token has invalid runfile fingerprint"
     return run_file, None
 
 
@@ -1864,14 +1938,40 @@ async def execute_benchmark(
             active_check,
         )
         if validation_error:
+            reason_code = (
+                "superseded"
+                if "superseded" in validation_error
+                else "legacy_unapproved"
+                if "legacy" in validation_error
+                else "fingerprint_mismatch"
+                if "mismatched" in validation_error
+                else "unknown"
+            )
             return json.dumps(
                 {
                     "status": "rejected",
                     "harness": harness_name,
                     "validation_id": validation_id,
+                    "reason_code": reason_code,
                     "message": validation_error,
                 }
             )
+        record = active_check.get("custom_fields", {}).get(
+            "benchmark_validations", {}
+        ).get("records", {}).get(validation_id) or _validation_records.get(
+            validation_id, {}
+        )
+        stored_command = record.get("run_command")
+        if run_command is not None and run_command != stored_command:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "validation_id": validation_id,
+                    "reason_code": "execution_intent_mismatch",
+                    "message": "run_command differs from approved execution intent",
+                }
+            )
+        run_command = stored_command
     elif _skill_provider:
         if run_file is None:
             return json.dumps(
@@ -3097,14 +3197,29 @@ async def validate_benchmark(
         )
         output = (result.stdout or "").strip()
         if result.exit_code == 0:
-            params_fingerprint = _compute_params_fingerprint(
-                _ticket.get("custom_fields", {}) if _ticket else {}
-            )
+            fields = _ticket.get("custom_fields", {}) if _ticket else {}
+            params_fingerprint = _compute_params_fingerprint(fields)
+            execution_plan_fingerprint = _execution_plan_fingerprint(fields)
+            run_command = execution.get("run_command", "crucible run")
+            command_valid, _ = _validate_run_command(run_command, harness_name)
+            if not command_valid:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "valid": False,
+                        "errors": ["Configured execution command rejected"],
+                    }
+                )
             validation_id = await _persist_validated_runfile(
                 run_file,
                 harness_name,
                 controller,
                 params_fingerprint,
+                execution_plan_fingerprint,
+                run_command,
+                validation_command,
+                output,
+                str(execution.get("validator_version", "unknown")),
             )
             if validation_id is None:
                 return json.dumps(

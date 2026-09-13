@@ -353,8 +353,8 @@ class TicketStore:
         if isinstance(legacy, dict) and isinstance(legacy.get("validation_id"), str):
             active_id = legacy["validation_id"]
             record = dict(legacy)
-            record.setdefault("record_type", "validation")
-            record.setdefault("state", "active")
+            record["record_type"] = "legacy_validation"
+            record["state"] = "legacy_unapproved"
             record.setdefault("created_at", ticket.updated_at.isoformat())
             record.setdefault("creator", {"migration": "legacy_benchmark_validation"})
             if isinstance(record.get("run_file"), dict):
@@ -411,9 +411,45 @@ class TicketStore:
                 or validation_id in manifest["records"]
             ):
                 raise ValueError("validation_id must be a new non-empty identifier")
+            run_file = record.get("run_file")
+            if not isinstance(run_file, dict):
+                raise ValueError("validation record requires a run_file")
+            runfile_digest = hashlib.sha256(
+                json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if record.get("runfile_fingerprint") != runfile_digest:
+                raise ValueError("runfile fingerprint does not match")
+            plan = ticket.custom_fields.get("execution_plan", {})
+            steps = plan.get("steps", []) if isinstance(plan, dict) else []
+            index = plan.get("current_step", 0) if isinstance(plan, dict) else 0
+            params = (
+                steps[index].get("params", {})
+                if isinstance(index, int) and index < len(steps)
+                else {}
+            )
+            plan_digest = hashlib.sha256(
+                json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if record.get("execution_plan_fingerprint") != plan_digest:
+                raise ValueError("execution plan fingerprint does not match")
+            intent = {
+                "runfile": runfile_digest,
+                "params": plan_digest,
+                "harness": record.get("harness"),
+                "controller": record.get("controller"),
+                "run_command": record.get("run_command"),
+            }
+            if (
+                record.get("execution_intent_digest")
+                != hashlib.sha256(
+                    json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ):
+                raise ValueError("execution intent digest does not match")
             immutable = dict(record)
             immutable["record_type"] = "validation"
-            immutable["state"] = "active"
+            immutable["state"] = "executable"
+            immutable["ticket_id"] = ticket_id
             immutable.setdefault("created_at", datetime.now(timezone.utc).isoformat())
             immutable.setdefault("creator", get_actor())
             manifest["records"][validation_id] = immutable

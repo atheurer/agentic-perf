@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -213,10 +213,35 @@ class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
 
 
+class InvalidationReason(str, Enum):
+    RELEVANT_PARAMETERS_CHANGED = "relevant_parameters_changed"
+    CONTROLLER_CHANGED = "controller_changed"
+    VALIDATOR_REVOKED = "validator_revoked"
+    OPERATOR_INVALIDATED = "operator_invalidated"
+
+
+class ValidationRecordV1(BaseModel):
+    """Controller-attested validation evidence; ordinary users cannot create it."""
+
+    validation_id: str = Field(pattern=r"^val-[a-f0-9]{32}$")
+    run_file: dict[str, Any]
+    runfile_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    harness: Literal["crucible"]
+    controller: str = Field(min_length=1, max_length=255)
+    params_fingerprint: str = Field(min_length=1, max_length=64)
+    execution_plan_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    run_command: str = Field(min_length=1, max_length=500)
+    validator_command: str = Field(min_length=1, max_length=500)
+    validator_version: str = Field(min_length=1, max_length=128)
+    validation_output_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    validation_output_summary: str = Field(max_length=1000)
+
+
 class CreateValidationRequest(BaseModel):
     """Create one immutable benchmark-validation record using a manifest CAS."""
 
-    record: dict[str, Any]
+    record: ValidationRecordV1
     expected_version: int = Field(ge=0)
 
 
@@ -225,7 +250,7 @@ class SupersedeValidationRequest(BaseModel):
 
     validation_id: str
     replacement_validation_id: str | None = None
-    reason: str = Field(min_length=1, max_length=500)
+    reason: InvalidationReason
     expected_version: int = Field(ge=0)
 
 

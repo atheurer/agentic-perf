@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fastapi import APIRouter, HTTPException, Request
 
 from ..auth import require_write_access
@@ -49,6 +52,21 @@ def get_validation(ticket_id: str, validation_id: str, request: Request):
 
 @router.post("")
 def create_validation(ticket_id: str, body: CreateValidationRequest, request: Request):
+    if (
+        request.state.principal.kind != "service"
+        or request.headers.get("X-Agentic-Perf-Internal-Validation") != "v1"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="validation creation is restricted to the internal controller validator",
+        )
+    canonical_runfile_digest = hashlib.sha256(
+        json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if body.record.runfile_fingerprint != canonical_runfile_digest:
+        raise HTTPException(
+            status_code=422, detail="runfile fingerprint does not match"
+        )
     store = _store(request)
     try:
         ticket = store.get_ticket(ticket_id)
@@ -57,7 +75,7 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
     require_write_access(request.state.principal, ticket, request.app.state.multi_user)
     try:
         updated, conflict = store.create_validation(
-            ticket_id, body.record, body.expected_version
+            ticket_id, body.record.model_dump(mode="json"), body.expected_version
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -65,7 +83,7 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
         raise HTTPException(status_code=409, detail=conflict)
     manifest = updated.custom_fields["benchmark_validations"]
     return {
-        "record": manifest["records"][body.record["validation_id"]],
+        "record": manifest["records"][body.record.validation_id],
         "version": manifest["version"],
         "active_validation_id": manifest["active_validation_id"],
     }
@@ -91,7 +109,7 @@ def supersede_validation(
             ticket_id,
             validation_id,
             body.replacement_validation_id,
-            body.reason,
+            body.reason.value,
             body.expected_version,
         )
     except ValueError as exc:

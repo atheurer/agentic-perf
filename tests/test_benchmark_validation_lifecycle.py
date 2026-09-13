@@ -1,24 +1,49 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
-from agents.benchmark.server import _get_validated_runfile
-from state_store.models import CreateTicketRequest
+from agents.benchmark.server import (
+    _execution_intent_digest,
+    _execution_plan_fingerprint,
+    _get_validated_runfile,
+    _runfile_fingerprint,
+)
+from state_store.api.validations import create_validation
+from state_store.auth import Principal
+from state_store.models import CreateTicketRequest, CreateValidationRequest
 from state_store.store import TicketStore
 
 
 def _record(validation_id: str, *, value: int = 1) -> dict:
+    run_file = {"benchmarks": [{"value": value}]}
+    plan_digest = _execution_plan_fingerprint({})
+    runfile_digest = _runfile_fingerprint(run_file)
     return {
         "validation_id": validation_id,
-        "run_file": {"benchmarks": [{"value": value}]},
-        "runfile_fingerprint": f"digest-{value}",
+        "run_file": run_file,
+        "runfile_fingerprint": runfile_digest,
         "params_fingerprint": "no-plan",
         "harness": "crucible",
         "controller": "controller.example",
         "creator": {"invocation_id": "invocation-1", "request_id": "request-1"},
         "server_pid": 123,
+        "execution_plan_fingerprint": plan_digest,
+        "execution_intent_digest": _execution_intent_digest(
+            runfile_digest,
+            plan_digest,
+            "crucible",
+            "controller.example",
+            "crucible run",
+        ),
+        "run_command": "crucible run",
+        "validator_command": "crucible validate",
+        "validator_version": "test",
+        "validation_output_digest": "a" * 64,
+        "validation_output_summary": "ok",
     }
 
 
@@ -124,6 +149,27 @@ def test_legacy_validation_migrates_deterministically(tmp_path):
     assert (
         manifest["records"]["val-legacy"]["creator"] == _record("val-legacy")["creator"]
     )
+    _, error = _get_validated_runfile(
+        "val-legacy",
+        "controller.example",
+        "crucible",
+        migrated.get_ticket(ticket_id).model_dump(mode="json"),
+    )
+    assert "legacy/unapproved" in error
+
+
+def test_execution_rejects_runfile_or_plan_tampering(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket_id = _ticket(store)
+    store.create_validation(ticket_id, _record("val-one"), 0)
+    ticket = store.get_ticket(ticket_id).model_dump(mode="json")
+    ticket["custom_fields"]["benchmark_validations"]["records"]["val-one"][
+        "run_file"
+    ] = {"tampered": True}
+    _, error = _get_validated_runfile(
+        "val-one", "controller.example", "crucible", ticket
+    )
+    assert "invalid runfile fingerprint" in error
 
 
 def test_generic_field_updates_cannot_replace_validation_manifest(tmp_path):
@@ -132,3 +178,18 @@ def test_generic_field_updates_cannot_replace_validation_manifest(tmp_path):
     store.create_validation(ticket_id, _record("val-one"), 0)
     with pytest.raises(ValueError, match="immutable"):
         store.update_fields(ticket_id, {"benchmark_validations": {}})
+
+
+def test_user_cannot_forge_controller_validation_post(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket_id = _ticket(store)
+    record = _record("val-" + "a" * 32)
+    body = CreateValidationRequest(record=record, expected_version=0)
+    request = SimpleNamespace(
+        state=SimpleNamespace(principal=Principal("user", "writer", False)),
+        headers={},
+        app=SimpleNamespace(state=SimpleNamespace(store=store, multi_user=False)),
+    )
+    with pytest.raises(HTTPException) as error:
+        create_validation(ticket_id, body, request)
+    assert error.value.status_code == 403
