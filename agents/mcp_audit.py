@@ -224,6 +224,54 @@ class MCPAuditMiddleware(Middleware):
             content=json.dumps(payload, sort_keys=True), is_error=is_error
         )
 
+    @staticmethod
+    def _sanitize_value(ticket_id: str, value: Any) -> Any:
+        """Redact text while leaving opaque binary content untouched."""
+        redactor = get_shared_redactor()
+        if isinstance(value, str):
+            return redactor.redact_string(ticket_id, value)
+        if isinstance(value, list):
+            return [
+                MCPAuditMiddleware._sanitize_value(ticket_id, item) for item in value
+            ]
+        if isinstance(value, dict):
+            block_type = value.get("type")
+            return {
+                key: (
+                    item
+                    if key == "data" and block_type in {"image", "audio"}
+                    else MCPAuditMiddleware._sanitize_value(ticket_id, item)
+                )
+                for key, item in value.items()
+            }
+        return value
+
+    def _sanitize_result(self, trace: TraceContext, result: Any) -> Any:
+        """Sanitize the exact ToolResult returned and durably replayed."""
+        if not isinstance(result, ToolResult):
+            return result
+        ticket_id = trace.ticket_id or "unknown"
+        blocks = []
+        for block in result.content:
+            fields = block.model_dump(mode="python")
+            fields = self._sanitize_value(ticket_id, fields)
+            blocks.append(type(block).model_validate(fields))
+        structured = self._sanitize_value(ticket_id, result.structured_content)
+        meta = self._sanitize_value(ticket_id, result.meta)
+        return result.model_copy(
+            update={"content": blocks, "structured_content": structured, "meta": meta}
+        )
+
+    @staticmethod
+    def _redacted_exception(ticket_id: str, exc: BaseException) -> BaseException:
+        message = get_shared_redactor().redact_string(ticket_id, str(exc))[
+            :_MAX_ERROR_MESSAGE_BYTES
+        ]
+        try:
+            return type(exc)(message)
+        except Exception:
+            return RuntimeError(message)
+
     def _result_descriptor(self, trace: TraceContext, result: Any) -> dict[str, Any]:
         """Serialize the actual FastMCP result, bounded for operation storage."""
         if not isinstance(result, ToolResult):
@@ -457,9 +505,10 @@ class MCPAuditMiddleware(Middleware):
                 outcome=OperationOutcome.FAILURE,
                 error=exc,
             )
-            raise
+            raise self._redacted_exception(trace.ticket_id or "unknown", exc) from exc
         finally:
             reset_trace_context(token)
+        result = self._sanitize_result(trace, result)
         if lease is not None:
             descriptor = self._result_descriptor(trace, result)
             self._client.operation_transition(

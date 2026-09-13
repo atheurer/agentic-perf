@@ -17,6 +17,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from agents.mcp_stdio import audited_stdio_client
 from providers.llm.base import ToolDefinition
+from providers.redaction import get_shared_redactor
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -546,6 +547,12 @@ class AgentMCPClient:
                 "idempotency_request_hash": request_hash,
             }
         )
+
+        def redact_client_message(message: str) -> str:
+            return get_shared_redactor().redact_string(
+                context.ticket_id or conn.ticket_id or "unknown", message
+            )[:4096]
+
         metadata = {
             "traceparent": f"00-{context.trace_id}-{context.action_id}-01",
             "agentic-perf": {
@@ -604,7 +611,9 @@ class AgentMCPClient:
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
             )
-            raise MCPToolCallError(str(e), "ambiguous_after_send") from e
+            raise MCPToolCallError(
+                redact_client_message(str(e)), "ambiguous_after_send"
+            ) from e
         parts = []
         for block in result.content:
             if hasattr(block, "text"):
@@ -620,7 +629,9 @@ class AgentMCPClient:
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
             )
-            raise MCPToolCallError(content, "intentional_agent_retry")
+            raise MCPToolCallError(
+                redact_client_message(content), "intentional_agent_retry"
+            )
         self._record_boundary(
             conn,
             LifecycleState.RESPONSE_RECEIVED,

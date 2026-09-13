@@ -115,7 +115,8 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         result = await asyncio.wait_for(
             first.call_tool("execute_benchmark", {}, trace), 15
         )
-        assert result == sentinel + ("X" * 5000)
+        assert sentinel not in result
+        assert result == "[REDACTED:env/MCP_TEST_TOKEN]" + ("X" * 5000)
         await asyncio.wait_for(first.disconnect(), 10)
         await asyncio.wait_for(
             second.connect_ticket_server(
@@ -153,7 +154,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
             and e.mcp.server_pid in {first_pid, second_pid}
             for e in events
         )
-        with pytest.raises(Exception):
+        with pytest.raises(Exception) as error:
             await asyncio.wait_for(
                 second.call_tool(
                     "fail_with_secret",
@@ -168,6 +169,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
                 ),
                 15,
             )
+        assert sentinel not in str(error.value)
         await asyncio.to_thread(recorder.flush)
         surfaces = []
         for path in tmp_path.rglob("*"):
