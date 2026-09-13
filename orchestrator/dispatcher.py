@@ -291,9 +291,14 @@ class Dispatcher:
     def mark_deposed(self) -> None:
         """Stop all agent work after losing the control-plane fence."""
         self._deposed = True
-        for task in self._tasks.values():
+        for task in (
+            list(self._tasks.values())
+            + list(self._renewal_tasks.values())
+            + list(self._introspection_tasks.values())
+        ):
             if not task.done():
                 task.cancel()
+        self._renewal_tasks.clear()
 
     def is_deposed(self) -> bool:
         return self._deposed

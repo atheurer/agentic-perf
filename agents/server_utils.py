@@ -1124,8 +1124,20 @@ async def assert_ticket_active(
     api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
-    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
-    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    from agents.fencing import current_fence_context
+
+    fence = current_fence_context()
+    session_id = (
+        fence.session_id
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    )
+    epoch = (
+        str(fence.epoch)
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    )
+    claim_id = fence.claim_id if fence else os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
     if session_id and epoch:
         headers.update(
             {
@@ -1152,10 +1164,31 @@ async def assert_ticket_active(
         }
 
     claim = cf.get("claim")
-    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
-    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
     if isinstance(claim, dict) and claim.get("session_id"):
-        if claim.get("session_id") != session_id or str(claim.get("epoch")) != epoch:
+        if (
+            claim.get("session_id") != session_id
+            or str(claim.get("epoch")) != epoch
+            or claim.get("claim_id") != claim_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
+
+        async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
+            lease_response = await client.get(
+                f"{state_store_url}/api/v1/control/orchestrator-lease"
+            )
+            lease_response.raise_for_status()
+            active_lease = lease_response.json().get("lease")
+        if not active_lease or active_lease.get("session_id") != session_id:
+            return {
+                "status": "rejected",
+                "reason": "not_leader",
+                "ticket_status": status,
+            }
+        if int(active_lease.get("epoch", 0)) != int(epoch):
             return {
                 "status": "rejected",
                 "reason": "stale_epoch",

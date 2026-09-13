@@ -658,6 +658,13 @@ async def run_agent_task(
         if agent is None:
             return
 
+        if hasattr(agent, "set_fence_context"):
+            agent.set_fence_context(
+                dispatcher._session_id,
+                dispatcher._fencing_epoch,
+                dispatcher._claim_ids.get(ticket_id),
+            )
+
         if getattr(agent, "trace_context", None) is None:
             agent.trace_context = dispatcher._trace_contexts.get(ticket_id)
         if hasattr(agent, "_trace"):
@@ -1385,6 +1392,24 @@ async def _renew_leader_lease(
         await lease.release()
 
 
+class _LeaseLossGate:
+    """Bind lease loss to a dispatcher without an initialization-time race."""
+
+    def __init__(self) -> None:
+        self.dispatcher: Any | None = None
+        self.lost = False
+
+    def mark_deposed(self) -> None:
+        self.lost = True
+        if self.dispatcher is not None:
+            self.dispatcher.mark_deposed()
+
+    def bind(self, dispatcher: Any) -> None:
+        self.dispatcher = dispatcher
+        if self.lost:
+            dispatcher.mark_deposed()
+
+
 def _check_dispatch_quota(
     ticket: dict[str, Any],
     user_store: Any,
@@ -1443,11 +1468,12 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         raise RuntimeError("state store returned no leader fencing epoch")
     os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
     os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
-    lease_renew_task = asyncio.create_task(
+    lease_loss_gate = _LeaseLossGate()
+    lease_renew_task: asyncio.Task | None = asyncio.create_task(
         _renew_leader_lease(
             leader_lease,
             config.leader_lease_renew_interval,
-            lambda: dispatcher.mark_deposed(),
+            lease_loss_gate.mark_deposed,
         )
     )
 
@@ -1585,6 +1611,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         session_id=str(leader_lease.session_id),
         fencing_epoch=leader_lease.epoch,
     )
+    lease_loss_gate.bind(dispatcher)
 
     logger.info(
         f"Orchestrator started (store={config.state_store_url}, "
@@ -1609,7 +1636,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     trace_sweep_task: asyncio.Task | None = None
 
     while True:
-        if lease_renew_task.done():
+        if lease_renew_task is not None and lease_renew_task.done():
             lease_renew_task.result()
         if time.monotonic() - last_trace_sweep >= 60.0 and (
             trace_sweep_task is None or trace_sweep_task.done()

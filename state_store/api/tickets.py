@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
+
+def _require_process_claim_identity(store, body: ClaimRequest) -> None:
+    """Once leadership is active, service claim APIs require its fence fields."""
+    if body.session_id is None and store.get_orchestrator_lease() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "not_leader",
+                "message": "session_id and epoch are required for active leadership",
+            },
+        )
+
+
 # Custom fields stripped from list responses to reduce payload size.
 # These are only needed by agents resuming work via the single-ticket
 # GET endpoint, not by the browser list page or the orchestrator's
@@ -224,6 +237,7 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
 @router.post("/{ticket_id}/claim")
 def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, body)
     try:
         result = store.claim_ticket(
             ticket_id,
@@ -273,6 +287,7 @@ def archive_ticket(ticket_id: str, request: Request):
 @router.delete("/{ticket_id}/claim")
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, body)
     try:
         released = store.release_claim(
             ticket_id,
@@ -294,6 +309,7 @@ def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
 @router.post("/{ticket_id}/claim/renew")
 def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, body)
     try:
         result = store.renew_claim(
             ticket_id,

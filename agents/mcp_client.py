@@ -113,6 +113,9 @@ class AgentMCPClient:
             url = os.environ.get("STATE_STORE_URL", "")
             if token and url:
                 self._trace_client = TraceClient(url, token)
+        from agents.fencing import current_fence_context
+
+        self._fence_context = current_fence_context()
 
     async def connect(
         self,
@@ -165,6 +168,14 @@ class AgentMCPClient:
                 {
                     "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID": session_id,
                     "AGENTIC_PERF_ORCHESTRATOR_EPOCH": epoch,
+                }
+            )
+        if self._fence_context is not None:
+            required.update(
+                {
+                    "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID": self._fence_context.session_id,
+                    "AGENTIC_PERF_ORCHESTRATOR_EPOCH": str(self._fence_context.epoch),
+                    "AGENTIC_PERF_CLAIM_ID": self._fence_context.claim_id,
                 }
             )
         missing = [key for key, value in required.items() if not str(value).strip()]
