@@ -60,12 +60,18 @@ _MAX_REDACTED_KEY_BYTES = 4096
 
 def _meta_values(message: Any) -> dict[str, Any]:
     """Return extension values from an MCP request without depending on internals."""
-    meta = getattr(message, "meta", None) or getattr(message, "_meta", None)
+    if isinstance(message, dict):
+        meta = message.get("meta") or message.get("_meta")
+    else:
+        meta = getattr(message, "meta", None) or getattr(message, "_meta", None)
     if meta is None:
         return {}
     values = getattr(meta, "model_extra", None)
-    if values is None and isinstance(meta, dict):
-        values = meta
+    if values is None:
+        if isinstance(meta, dict):
+            values = meta
+        elif hasattr(meta, "model_dump"):
+            values = meta.model_dump()
     return dict(values or {})
 
 
