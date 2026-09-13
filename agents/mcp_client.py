@@ -558,7 +558,9 @@ class AgentMCPClient:
             "agentic-perf": {
                 "ticket_id": context.ticket_id,
                 "agent_id": context.agent_id,
-                "invocation_id": str(context.invocation_id or ""),
+                "invocation_id": (
+                    str(context.invocation_id) if context.invocation_id else None
+                ),
                 "trace_id": context.trace_id,
                 "action_id": context.action_id,
                 "parent_action_id": context.parent_action_id,
