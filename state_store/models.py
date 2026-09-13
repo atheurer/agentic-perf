@@ -171,6 +171,74 @@ class Comment(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class ApprovalRequest(BaseModel):
+    """Immutable benchmark approval intent with a CAS-resolved lifecycle."""
+
+    approval_request_id: str = Field(pattern=r"^apr-[a-f0-9]{32}$")
+    ticket_id: str
+    kind: Literal["benchmark_run_file"] = "benchmark_run_file"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = ""
+    waiter_owner: str | None = None
+    invocation_id: str | None = None
+    tool_call_id: str | None = None
+    session_id: str | None = None
+    session_epoch: str | None = None
+    validation_id: str
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    summary: str = ""
+    status: Literal[
+        "pending", "approved", "changes_requested", "rejected", "cancelled", "expired"
+    ] = "pending"
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+    resolution_comment_id: str | None = None
+    resolution_reason: str | None = None
+    consumed_at: datetime | None = None
+    expires_at: datetime | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+    record_version: int = 1
+
+
+class CreateApprovalRequest(BaseModel):
+    validation_id: str = Field(min_length=1, max_length=255)
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    summary: str = Field(default="", max_length=4096)
+    invocation_id: str | None = None
+    tool_call_id: str | None = None
+    session_id: str | None = None
+    session_epoch: str | None = None
+    waiter_owner: str | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+    expires_at: datetime | None = None
+
+
+class ResolveApprovalRequest(BaseModel):
+    decision: Literal["approved", "changes_requested", "rejected", "cancelled"]
+    comment_id: str | None = None
+    comment: str | None = Field(default=None, max_length=4096)
+    reason: str | None = Field(default=None, max_length=4096)
+    validation_id: str | None = None
+    presented_run_file_digest: str | None = None
+    execution_intent_digest: str | None = None
+
+
+class ConsumeApprovalRequest(BaseModel):
+    """Execution-side single-use capability check for an approval."""
+
+    validation_id: str = Field(min_length=1, max_length=255)
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    session_id: str | None = None
+    session_epoch: str | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+
+
 class Ticket(BaseModel):
     id: str
     summary: str
