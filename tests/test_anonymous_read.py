@@ -19,7 +19,7 @@ def _make_app(*, anonymous_read: bool):
     from state_store.auth import make_auth_dependency
     from state_store.main import create_app, mount_routers
 
-    app = create_app()
+    app = create_app(initialize_immediately=True)
     token = app.state.api_token
 
     auth = make_auth_dependency(
@@ -72,6 +72,10 @@ class TestAnonymousReadEnabled:
             json={"summary": "test", "description": "test"},
         )
         assert r.status_code == 401
+
+    def test_diagnostics_without_token_rejected(self, anon_client):
+        assert anon_client.get("/api/v1/health").status_code == 200
+        assert anon_client.get("/api/v1/diagnostics").status_code == 401
 
     def test_transition_without_token_rejected(self, authed_client, anon_client):
         r = authed_client.post(

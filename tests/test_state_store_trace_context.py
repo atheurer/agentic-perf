@@ -14,7 +14,7 @@ async def test_state_store_restores_only_internal_causal_context(
 ) -> None:
     """A state mutation handler observes the same invocation carried outbound."""
     monkeypatch.setattr("state_store.main.TRACE_DB_PATH", tmp_path / "trace.db")
-    app: FastAPI = create_app()
+    app: FastAPI = create_app(initialize_immediately=True)
 
     @app.post("/_test_context")
     async def context(request: Request) -> dict[str, str | None]:

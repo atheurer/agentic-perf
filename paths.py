@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -23,6 +24,8 @@ PRICING_PATH = AGENTIC_PERF_HOME / "pricing.yaml"
 TRACE_DB_PATH = AGENTIC_PERF_HOME / "trace.db"
 TRACE_PAYLOAD_DIR = AGENTIC_PERF_HOME / "trace-payloads"
 TRACE_SPOOL_DIR = AGENTIC_PERF_HOME / "trace-spool"
+STATE_STORE_LOCK_PATH = AGENTIC_PERF_HOME / "state-store.lock"
+STATE_STORE_ID_PATH = AGENTIC_PERF_HOME / "state-store.id"
 
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")
@@ -85,6 +88,12 @@ def get_instance_name() -> str:
         except (json.JSONDecodeError, OSError):
             pass
     return socket.gethostname().split(".")[0]
+
+
+def persistence_root_fingerprint(root: Path | None = None) -> str:
+    """Return a non-reversible identifier for a state-store persistence root."""
+    resolved = (root or AGENTIC_PERF_HOME).resolve()
+    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
 
 
 def get_default_ssh_key() -> str:
