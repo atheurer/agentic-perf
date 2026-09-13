@@ -322,6 +322,10 @@ class MCPAuditMiddleware(Middleware):
             descriptor = PayloadBuilder(
                 get_shared_redactor(),
                 blob_store=PayloadBlobStore(root, ticket_id=ticket_id),
+                # Leave room for the descriptor envelope in the state-store's
+                # bounded terminal-operation record; the full result is in the
+                # content-addressed blob.
+                inline_bytes=1024,
             ).build(ticket_id, payload)
             return {"operation_result": descriptor.model_dump(mode="json")}
         return {"tool_result": payload}
@@ -371,7 +375,9 @@ class MCPAuditMiddleware(Middleware):
                     )
                     if len(content) != safe.get("redacted_size_bytes"):
                         raise PayloadStorageError("payload size mismatch")
-                    payload = json.loads(content).get("tool_result")
+                    # The blob stores the canonical ToolResult object itself;
+                    # the operation descriptor is only the bounded envelope.
+                    payload = json.loads(content)
                 except (KeyError, ValueError, PayloadStorageError):
                     payload = None
             if isinstance(payload, dict):
