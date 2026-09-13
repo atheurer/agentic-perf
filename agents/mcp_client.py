@@ -24,7 +24,9 @@ from providers.tracing import (
     ProducerIdentity,
     TraceContext,
     TraceEventV1,
+    current_trace_context,
 )
+from providers.tracing.client import TraceClient
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,7 @@ class MCPToolCallError(RuntimeError):
 @dataclass
 class _ServerConnection:
     name: str
-    session: ClientSession
+    session: ClientSession | None
     transport: str = "unknown"
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     reconnect_generation: int = 0
@@ -58,6 +60,7 @@ class _ServerConnection:
     subprocess_pid: int | None = None
     ticket_id: str | None = None
     agent_id: str | None = None
+    subprocess_pid_capture: str = "not_applicable"
     _shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     _task: asyncio.Task[None] | None = None
 
@@ -77,7 +80,12 @@ class AgentMCPClient:
     ValueError at connect time.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        trace_client: TraceClient | None = None,
+        audit_hook: Any = None,
+    ) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
         # Optional hook for provider-specific call_tool
@@ -89,6 +97,13 @@ class AgentMCPClient:
         # Signature: (name, content) -> str
         self.post_call_hook: Any = None
         self.audit_events: list[TraceEventV1] = []
+        self._audit_hook = audit_hook
+        self._trace_client = trace_client
+        if self._trace_client is None:
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            url = os.environ.get("STATE_STORE_URL", "")
+            if token and url:
+                self._trace_client = TraceClient(url, token)
 
     async def connect(
         self,
@@ -313,23 +328,75 @@ class AgentMCPClient:
         whenever the agent awaits asyncio.to_thread (LLM calls),
         burning 100% CPU on one core.
         """
+        previous = self._servers.pop(name, None)
+        generation = 0
+        if previous is not None:
+            generation = previous.reconnect_generation + 1
+            self._record_boundary(previous, LifecycleState.DISCONNECTED)
+            previous._shutdown.set()
+            if previous._task is not None:
+                previous._task.cancel()
+            self._tool_routing = {
+                tool: server
+                for tool, server in self._tool_routing.items()
+                if server != name
+            }
         ready: asyncio.Future[ClientSession] = (
             asyncio.get_running_loop().create_future()
         )
         shutdown = asyncio.Event()
+        conn = _ServerConnection(
+            name=name,
+            session=None,
+            transport=transport,
+            session_id=uuid.uuid4().hex,
+            reconnect_generation=generation,
+            endpoint=endpoint,
+            client_process_identity=f"pid:{os.getpid()}",
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            subprocess_pid_capture=(
+                "pending" if transport == "stdio" else "not_applicable"
+            ),
+            _shutdown=shutdown,
+        )
+        self._record_boundary(conn, LifecycleState.CONNECTING)
 
         async def _hold_connection() -> None:
             try:
                 async with transport_cm as streams:
+                    process = getattr(transport_cm, "process", None)
+                    pid = getattr(process, "pid", getattr(transport_cm, "pid", None))
+                    if isinstance(pid, int):
+                        conn.subprocess_pid = pid
+                        conn.subprocess_pid_capture = "captured"
+                    elif transport == "stdio":
+                        conn.subprocess_pid_capture = "unavailable_from_sdk"
                     read_stream = streams[0]
                     write_stream = streams[1]
                     async with ClientSession(read_stream, write_stream) as session:
+                        self._record_boundary(
+                            conn, LifecycleState.REQUEST_SENT, tool_name="initialize"
+                        )
                         await session.initialize()
+                        self._record_boundary(
+                            conn,
+                            LifecycleState.RESPONSE_RECEIVED,
+                            tool_name="initialize",
+                            outcome=OperationOutcome.SUCCESS,
+                        )
                         ready.set_result(session)
                         await shutdown.wait()
             except (Exception, BaseException) as exc:
                 if not ready.done():
                     ready.set_exception(exc)
+                elif self._servers.get(name) is conn:
+                    self._record_boundary(
+                        conn,
+                        LifecycleState.FAILED,
+                        outcome=OperationOutcome.FAILURE,
+                        tool_name="server_exit",
+                    )
                 raise
 
         task = asyncio.create_task(_hold_connection(), name=f"mcp:{name}")
@@ -342,7 +409,36 @@ class AgentMCPClient:
                 await task
             raise
 
-        result = await session.list_tools()
+        conn.session = session
+        self._servers[name] = conn
+        self._record_boundary(conn, LifecycleState.CONNECTED)
+        if generation:
+            self._record_boundary(conn, LifecycleState.RECONNECTED)
+        self._record_boundary(conn, LifecycleState.REQUEST_SENT, tool_name="list_tools")
+        try:
+            result = await session.list_tools()
+        except asyncio.CancelledError:
+            self._record_boundary(
+                conn,
+                LifecycleState.CANCELLED,
+                tool_name="list_tools",
+                outcome=OperationOutcome.CANCELLED,
+            )
+            raise
+        except Exception:
+            self._record_boundary(
+                conn,
+                LifecycleState.FAILED,
+                tool_name="list_tools",
+                outcome=OperationOutcome.FAILURE,
+            )
+            raise
+        self._record_boundary(
+            conn,
+            LifecycleState.RESPONSE_RECEIVED,
+            tool_name="list_tools",
+            outcome=OperationOutcome.SUCCESS,
+        )
         for t in result.tools:
             if t.name in self._tool_routing:
                 existing_server = self._tool_routing[t.name]
@@ -357,21 +453,7 @@ class AgentMCPClient:
                 )
             self._tool_routing[t.name] = name
 
-        conn = _ServerConnection(
-            name=name,
-            session=session,
-            transport=transport,
-            session_id=uuid.uuid4().hex,
-            reconnect_generation=0,
-            endpoint=endpoint,
-            client_process_identity=f"pid:{os.getpid()}",
-            ticket_id=ticket_id,
-            agent_id=agent_id,
-            _shutdown=shutdown,
-            _task=task,
-        )
-        self._servers[name] = conn
-        self._record_boundary(conn, LifecycleState.CONNECTED)
+        conn._task = task
         logger.info(
             "MCP client connected to %s (%d tools)",
             name,
@@ -475,7 +557,18 @@ class AgentMCPClient:
             self._record_boundary(
                 conn, LifecycleState.REQUEST_SENT, context=context, tool_name=name
             )
+            if conn.session is None:
+                raise RuntimeError("MCP session closed before tool dispatch")
             result = await conn.session.call_tool(name, arguments, meta=metadata)
+        except asyncio.CancelledError:
+            self._record_boundary(
+                conn,
+                LifecycleState.CANCELLED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.CANCELLED,
+            )
+            raise
         except Exception as e:
             self._record_boundary(
                 conn,
@@ -493,6 +586,13 @@ class AgentMCPClient:
                 parts.append(str(block))
         content = "\n".join(parts) if parts else ""
         if result.isError:
+            self._record_boundary(
+                conn,
+                LifecycleState.FAILED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.FAILURE,
+            )
             raise MCPToolCallError(content, "intentional_agent_retry")
         self._record_boundary(
             conn,
@@ -518,42 +618,54 @@ class AgentMCPClient:
         tool_name: str | None = None,
         outcome: OperationOutcome | None = None,
     ) -> None:
-        context = context or TraceContext(
-            ticket_id=conn.ticket_id,
-            agent_id=conn.agent_id,
-            mcp_correlation_request_id=uuid.uuid4().hex,
+        context = (
+            context
+            or current_trace_context()
+            or TraceContext(
+                ticket_id=conn.ticket_id,
+                agent_id=conn.agent_id,
+                mcp_correlation_request_id=uuid.uuid4().hex,
+            )
         )
         if not context.ticket_id:
             return
-        terminal = state in {LifecycleState.FAILED, LifecycleState.RESPONSE_RECEIVED}
-        self.audit_events.append(
-            TraceEventV1(
-                ticket_id=context.ticket_id,
-                agent_id=context.agent_id,
-                invocation_id=context.invocation_id,
-                trace_id=context.trace_id,
-                action_id=context.action_id,
-                parent_action_id=context.parent_action_id,
-                tool_call_id=context.tool_call_id,
-                producer=ProducerIdentity(component="mcp_client", pid=os.getpid()),
-                mcp=MCPIdentity(
-                    server=conn.name,
-                    transport=conn.transport,
-                    session_id=conn.session_id,
-                    correlation_request_id=context.mcp_correlation_request_id,
-                    server_pid=conn.subprocess_pid,
-                ),
-                action=ActionDescriptor(type=ActionType.MCP, phase=tool_name),
-                lifecycle=LifecycleDescriptor(state=state),
-                duration_ms=0 if terminal else None,
-                outcome=outcome if terminal else None,
-                attributes={
-                    "endpoint": conn.endpoint,
-                    "reconnect_generation": conn.reconnect_generation,
-                    "client_process_identity": conn.client_process_identity,
-                },
-            )
+        terminal = state in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.RESPONSE_RECEIVED,
+        }
+        event = TraceEventV1(
+            ticket_id=context.ticket_id,
+            agent_id=context.agent_id,
+            invocation_id=context.invocation_id,
+            trace_id=context.trace_id,
+            action_id=context.action_id,
+            parent_action_id=context.parent_action_id,
+            tool_call_id=context.tool_call_id,
+            producer=ProducerIdentity(component="mcp_client", pid=os.getpid()),
+            mcp=MCPIdentity(
+                server=conn.name,
+                transport=conn.transport,
+                session_id=conn.session_id,
+                correlation_request_id=context.mcp_correlation_request_id,
+                server_pid=conn.subprocess_pid,
+            ),
+            action=ActionDescriptor(type=ActionType.MCP, phase=tool_name),
+            lifecycle=LifecycleDescriptor(state=state),
+            duration_ms=0 if terminal else None,
+            outcome=outcome if terminal else None,
+            attributes={
+                "endpoint": conn.endpoint,
+                "reconnect_generation": conn.reconnect_generation,
+                "client_process_identity": conn.client_process_identity,
+                "subprocess_pid_capture": conn.subprocess_pid_capture,
+            },
         )
+        self.audit_events.append(event)
+        if self._audit_hook is not None:
+            self._audit_hook(event)
+        if self._trace_client is not None:
+            self._trace_client.record(event)
 
     async def disconnect(self) -> None:
         for conn in list(self._servers.values()):

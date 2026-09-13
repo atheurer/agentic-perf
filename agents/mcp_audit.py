@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools.base import ToolResult
 from mcp import McpError
 from mcp.types import ErrorData
 
@@ -35,6 +37,10 @@ from providers.tracing.client import TraceClient
 
 META_KEY = "agentic-perf"
 _MAX_REPLAY_CACHE = 1024
+# #788 owns each tool's durable operation semantics.  This boundary merely
+# refuses to dispatch a protected handler unless #787 has already accepted its
+# immutable idempotency identity.
+_PROTECTED_TOOLS = frozenset({"execute_benchmark"})
 
 
 def _meta_values(message: Any) -> dict[str, Any]:
@@ -98,7 +104,9 @@ class MCPAuditMiddleware(Middleware):
         url = os.environ.get("STATE_STORE_URL", "")
         if record is None and token and url:
             self._client = TraceClient(url, token)
-        self._seen: OrderedDict[tuple[str, str], str] = OrderedDict()
+        # Correlation IDs remain stable across a transport reconnect.  Retain
+        # them across SDK session IDs so a replay cannot become a second launch.
+        self._seen: OrderedDict[str, str] = OrderedDict()
 
     def _emit(
         self,
@@ -182,6 +190,56 @@ class MCPAuditMiddleware(Middleware):
             )
         return context
 
+    def _protected_result(
+        self, payload: dict[str, Any], *, is_error: bool = False
+    ) -> ToolResult:
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True), is_error=is_error
+        )
+
+    def _protect_operation(
+        self, trace: TraceContext, tool_name: str
+    ) -> tuple[dict[str, Any] | None, ToolResult | None]:
+        """Acquire durable protection or return a cached/in-progress response."""
+        if tool_name not in _PROTECTED_TOOLS:
+            return None, None
+        if not trace.idempotency_key or not trace.idempotency_request_hash:
+            return None, self._protected_result(
+                {
+                    "status": "rejected",
+                    "reason": "protected tool lacks durable operation identity",
+                },
+                is_error=True,
+            )
+        if self._client is None:
+            return None, self._protected_result(
+                {"status": "rejected", "reason": "operation registry unavailable"},
+                is_error=True,
+            )
+        try:
+            acquired = self._client.operation_acquire(
+                trace.idempotency_key, trace.idempotency_request_hash, 300
+            )
+        except Exception:
+            return None, self._protected_result(
+                {"status": "rejected", "reason": "operation registry unavailable"},
+                is_error=True,
+            )
+        status = acquired.get("status")
+        if status == "terminal":
+            return None, self._protected_result(
+                acquired.get("operation", {}).get("result_descriptor", {})
+            )
+        if status != "acquired":
+            return None, self._protected_result(
+                {
+                    "status": status or "in_progress",
+                    "operation": acquired.get("operation", {}),
+                },
+                is_error=True,
+            )
+        return acquired.get("operation", {}), None
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[Any],
@@ -228,11 +286,25 @@ class MCPAuditMiddleware(Middleware):
             LifecycleState.REQUEST_RECEIVED,
             tool_name=tool_name,
         )
-        try:
-            session_id = str(context.fastmcp_context.session_id)
-        except (AttributeError, RuntimeError):
-            session_id = trace.mcp_session_id or "unknown"
-        key = (session_id, trace.mcp_correlation_request_id or "")
+        lease, protected_result = self._protect_operation(trace, tool_name)
+        if protected_result is not None:
+            self._emit(
+                trace,
+                context.fastmcp_context,
+                LifecycleState.DUPLICATE_DETECTED
+                if tool_name in _PROTECTED_TOOLS and trace.idempotency_key
+                else LifecycleState.REJECTED,
+                tool_name=tool_name,
+                duration_ms=(time.monotonic() - started) * 1000,
+                outcome=(
+                    OperationOutcome.SUCCESS
+                    if not protected_result.is_error
+                    else OperationOutcome.REJECTED
+                ),
+                retry_kind=RetryKind.TRANSPORT_REPLAY,
+            )
+            return protected_result
+        key = trace.mcp_correlation_request_id or ""
         prior = self._seen.get(key)
         if prior is not None:
             self._seen.move_to_end(key)
@@ -255,6 +327,12 @@ class MCPAuditMiddleware(Middleware):
 
         token = bind_trace_context(trace)
         try:
+            if lease is not None:
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
+                    "side-effect-started",
+                    int(lease["fencing_generation"]),
+                )
             result = await call_next(context)
         except asyncio.CancelledError:
             self._emit(
@@ -279,6 +357,13 @@ class MCPAuditMiddleware(Middleware):
             raise
         finally:
             reset_trace_context(token)
+        if lease is not None:
+            self._client.operation_transition(
+                trace.idempotency_key or "",
+                "complete",
+                int(lease["fencing_generation"]),
+                descriptor={"status": "completed"},
+            )
         self._emit(
             trace,
             context.fastmcp_context,

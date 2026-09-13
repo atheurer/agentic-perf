@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.server.middleware import MiddlewareContext
@@ -16,7 +17,9 @@ from agents.mcp_client import AgentMCPClient, _ServerConnection
 from providers.tracing import LifecycleState, TraceContext
 
 
-def _request(correlation_id: str, *, ticket: str = "PERF-1") -> MiddlewareContext:
+def _request(
+    correlation_id: str, *, ticket: str = "PERF-1", session_id: str = "session-1"
+) -> MiddlewareContext:
     meta = RequestParams.Meta(
         **{
             "agentic-perf": {
@@ -32,7 +35,7 @@ def _request(correlation_id: str, *, ticket: str = "PERF-1") -> MiddlewareContex
     return MiddlewareContext(
         message=CallToolRequestParams(name="read_only", _meta=meta),
         method="tools/call",
-        fastmcp_context=SimpleNamespace(request_id="rpc-1", session_id="session-1"),
+        fastmcp_context=SimpleNamespace(request_id="rpc-1", session_id=session_id),
     )
 
 
@@ -65,6 +68,23 @@ async def test_server_records_metadata_and_detects_same_session_replay():
     ]
     assert events[0].mcp.protocol_request_id == "rpc-1"
     assert events[0].mcp.correlation_request_id == "correlation-1"
+
+
+@pytest.mark.asyncio
+async def test_server_labels_stable_correlation_after_reconnect_as_replay():
+    events = []
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        record=events.append,
+    )
+    handler = AsyncMock(return_value="ok")
+    await middleware.on_call_tool(_request("stable", session_id="before"), handler)
+    with pytest.raises(McpError, match="duplicate MCP delivery"):
+        await middleware.on_call_tool(_request("stable", session_id="after"), handler)
+    handler.assert_awaited_once()
+    assert events[-1].lifecycle.state == LifecycleState.DUPLICATE_DETECTED
 
 
 @pytest.mark.asyncio
@@ -125,6 +145,62 @@ async def test_client_sends_trace_metadata_without_changing_tool_arguments():
         LifecycleState.REQUEST_SENT,
         LifecycleState.RESPONSE_RECEIVED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_client_spools_boundary_events_and_closes_cancelled_call():
+    recorder = SimpleNamespace(record=MagicMock())
+    session = AsyncMock()
+    session.call_tool = AsyncMock(side_effect=asyncio.CancelledError())
+    client = AgentMCPClient(trace_client=recorder)
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="sse",
+        session_id="session-1",
+        reconnect_generation=0,
+        ticket_id="PERF-1",
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+    assert recorder.record.call_count == 2
+    assert client.audit_events[-1].lifecycle.state == LifecycleState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_protected_tool_uses_registry_and_returns_terminal_result():
+    events = []
+    registry = SimpleNamespace(
+        operation_acquire=lambda *_: {
+            "status": "terminal",
+            "operation": {"result_descriptor": {"run_id": "existing"}},
+        }
+    )
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        record=events.append,
+    )
+    middleware._client = registry
+    handler = AsyncMock()
+    request = _request("operation-replay")
+    request.message.meta.model_extra["agentic-perf"]["idempotency_key"] = "operation-1"
+    request.message.meta.model_extra["agentic-perf"]["idempotency_request_hash"] = (
+        "hash"
+    )
+
+    result = await middleware.on_call_tool(
+        request.copy(
+            message=request.message.model_copy(update={"name": "execute_benchmark"})
+        ),
+        handler,
+    )
+    handler.assert_not_awaited()
+    assert result.is_error is False
+    assert "existing" in str(result.content)
+    assert events[-1].lifecycle.state == LifecycleState.DUPLICATE_DETECTED
 
 
 def test_every_local_fastmcp_server_uses_the_shared_factory():
