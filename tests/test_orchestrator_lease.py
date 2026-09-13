@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import Depends, FastAPI
 
+from state_store.api.health import health
+from state_store.api.router import api_router
+from state_store.auth import make_auth_dependency
+from state_store.identity import UserStore
 from state_store.models import AcquireOrchestratorLeaseRequest
 from state_store.store import OrchestratorLeaseHeld, TicketStore
 
@@ -50,3 +57,65 @@ def test_expiry_takeover_fences_old_session_and_survives_restart():
         assert not restarted.release_orchestrator_lease(first.session_id, lease.epoch)
         with pytest.raises(PermissionError):
             restarted.renew_orchestrator_lease(first.session_id, lease.epoch, 10)
+
+
+def test_release_fsyncs_persistence_directory(tmp_path, monkeypatch):
+    calls = []
+    store = TicketStore(persist_dir=tmp_path)
+    monkeypatch.setattr(
+        store,
+        "_fsync_lease_directory",
+        lambda: calls.append(True),
+    )
+    request = _request()
+    lease = store.acquire_orchestrator_lease(request)
+    calls.clear()
+    assert store.release_orchestrator_lease(lease.session_id, lease.epoch)
+    assert calls, "lease deletion must fsync the persistence directory"
+    assert not (tmp_path / "orchestrator-lease.json").exists()
+
+
+def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    store.acquire_orchestrator_lease(_request())
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                trace_health={},
+            )
+        ),
+        client=None,
+    )
+    result = health(request)
+    assert result["orchestrator_lease"] == {"active": True}
+
+
+@pytest.mark.asyncio
+async def test_user_token_cannot_use_or_inspect_control_lease(tmp_path):
+    users = UserStore(tmp_path / "users.json")
+    _, user_token = users.create_user("alice")
+    app = FastAPI()
+    app.state.store = TicketStore(persist_dir=tmp_path / "tickets")
+    app.include_router(
+        api_router,
+        dependencies=[
+            Depends(make_auth_dependency("service", multi_user=True, user_store=users))
+        ],
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        headers = {"Authorization": f"Bearer {user_token}"}
+        assert (
+            await client.get("/api/v1/control/orchestrator-lease", headers=headers)
+        ).status_code == 403
+        response = await client.post(
+            "/api/v1/control/orchestrator-lease/acquire",
+            json=_request().model_dump(mode="json"),
+            headers=headers,
+        )
+        assert response.status_code == 403
+    finally:
+        await client.aclose()

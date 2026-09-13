@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..auth import Principal
 from ..models import (
     AcquireOrchestratorLeaseRequest,
     ReleaseOrchestratorLeaseRequest,
@@ -12,17 +13,28 @@ from ..store import OrchestratorLeaseHeld
 router = APIRouter(prefix="/control/orchestrator-lease", tags=["control-plane"])
 
 
+async def _service_or_admin(request: Request) -> Principal:
+    """Only control-plane services or explicitly privileged operators may fence."""
+    principal = getattr(request.state, "principal", None)
+    if principal is None or (principal.kind != "service" and not principal.is_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="orchestrator lease requires service or admin authentication",
+        )
+    return principal
+
+
 def _store(request: Request):
     return request.app.state.store
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(_service_or_admin)])
 def inspect_lease(request: Request):
     lease = _store(request).get_orchestrator_lease()
     return {"lease": lease.model_dump(mode="json") if lease else None}
 
 
-@router.post("/acquire", status_code=200)
+@router.post("/acquire", status_code=200, dependencies=[Depends(_service_or_admin)])
 def acquire_lease(body: AcquireOrchestratorLeaseRequest, request: Request):
     try:
         lease = _store(request).acquire_orchestrator_lease(body)
@@ -41,7 +53,7 @@ def acquire_lease(body: AcquireOrchestratorLeaseRequest, request: Request):
     return lease.model_dump(mode="json")
 
 
-@router.post("/renew")
+@router.post("/renew", dependencies=[Depends(_service_or_admin)])
 def renew_lease(body: RenewOrchestratorLeaseRequest, request: Request):
     try:
         lease = _store(request).renew_orchestrator_lease(
@@ -54,7 +66,7 @@ def renew_lease(body: RenewOrchestratorLeaseRequest, request: Request):
     return lease.model_dump(mode="json")
 
 
-@router.post("/release")
+@router.post("/release", dependencies=[Depends(_service_or_admin)])
 def release_lease(body: ReleaseOrchestratorLeaseRequest, request: Request):
     return {
         "released": _store(request).release_orchestrator_lease(

@@ -47,18 +47,9 @@ def health(request: Request):
             "oldest_unacked_age_seconds": oldest,
             "quarantined_frames": quarantined,
         },
-        "orchestrator_lease": (
-            {
-                "active": True,
-                "instance_name": lease.instance_name,
-                "host": lease.host,
-                "pid": lease.pid,
-                "epoch": lease.epoch,
-                "expires_at": lease.expires_at.isoformat(),
-            }
-            if lease
-            else {"active": False}
-        ),
+        # Public health reports only liveness.  Holder identity and fencing
+        # metadata belong behind the authenticated control endpoint.
+        "orchestrator_lease": {"active": lease is not None},
     }
 
 

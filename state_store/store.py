@@ -110,6 +110,7 @@ class TicketStore:
                 self._lease_path.unlink()
             except FileNotFoundError:
                 return
+            self._fsync_lease_directory()
             return
         temporary = self._lease_path.with_name(
             f".{self._lease_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -120,6 +121,10 @@ class TicketStore:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, self._lease_path)
+        self._fsync_lease_directory()
+
+    def _fsync_lease_directory(self) -> None:
+        """Make lease creation and deletion survive a host crash."""
         try:
             directory_fd = os.open(self._persist_dir, os.O_RDONLY)
             try:
