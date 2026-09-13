@@ -1035,6 +1035,42 @@ def cmd_transcript(args):
     _render_transcript(events, ticket, agent_filter=args.agent)
 
 
+def cmd_trace(args):
+    """Query or export the authenticated causal trace projection."""
+    client, _url = get_client(args)
+    params = {
+        key: value
+        for key, value in {
+            "ticket_id": args.ticket_id,
+            "trace_id": args.trace_id,
+            "action_id": args.action_id,
+            "action_type": args.action_type,
+            "lifecycle_state": args.lifecycle_state,
+            "causal": args.causal,
+            "limit": args.limit,
+        }.items()
+        if value is not None
+    }
+    endpoint = "/api/v1/traces/export" if args.export else "/api/v1/traces/query"
+    if args.export:
+        params["format"] = args.format
+    response = client.get(endpoint, params=params)
+    response.raise_for_status()
+    if args.export:
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as stream:
+                stream.write(response.text)
+        else:
+            print(response.text, end="" if response.text.endswith("\n") else "\n")
+        return
+    payload = response.json()
+    print(
+        json.dumps(payload, indent=2, default=str)
+        if args.json
+        else f"{payload['count']} trace event(s)"
+    )
+
+
 def cmd_health(args):
     client, url = get_client(args)
     r = client.get("/api/v1/health")
@@ -1367,6 +1403,25 @@ def main():
     p_transcript.add_argument(
         "--json", action="store_true", help="Output raw events as JSON"
     )
+
+    p_trace = sub.add_parser("trace", help="Query or export causal trace events")
+    p_trace.add_argument("--ticket-id", help="Restrict results to a ticket")
+    p_trace.add_argument("--trace-id", help="Restrict results to a trace")
+    p_trace.add_argument("--action-id", help="Restrict results to an action")
+    p_trace.add_argument("--action-type")
+    p_trace.add_argument("--lifecycle-state")
+    p_trace.add_argument(
+        "--causal", action="store_true", help="Include ancestors and descendants"
+    )
+    p_trace.add_argument("--limit", type=int, default=1000)
+    p_trace.add_argument(
+        "--json", action="store_true", help="Print query response as JSON"
+    )
+    p_trace.add_argument(
+        "--export", action="store_true", help="Export instead of querying"
+    )
+    p_trace.add_argument("--format", choices=("json", "jsonl", "csv"), default="json")
+    p_trace.add_argument("--output", help="Write export to a file")
     p_transcript.add_argument(
         "--agent", help="Filter to a single agent (e.g. triage-agent)"
     )
@@ -1496,6 +1551,7 @@ def main():
         "stop": cmd_stop,
         "stop-all": cmd_stop_all,
         "transcript": cmd_transcript,
+        "trace": cmd_trace,
         "health": cmd_health,
         "archive": cmd_archive,
         "cleanup": cmd_cleanup,

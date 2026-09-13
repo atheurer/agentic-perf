@@ -2,22 +2,145 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from paths import get_instance_name
 from providers.tracing import TraceEventV1
+from providers.tracing.query import TraceQuery, export_events, query_events
 
 from ..auth import Principal
 from ..trace_store import TraceEventConflictError, TraceStoreWriteError
 
 router = APIRouter(prefix="/traces/events", tags=["traces"])
+query_router = APIRouter(prefix="/traces", tags=["traces"])
 
 
 class TraceBatch(BaseModel):
     events: list[TraceEventV1] = Field(min_length=1, max_length=500)
+
+
+def _authorize_query(request: Request, ticket_id: str | None) -> None:
+    """Apply the same ownership boundary as ticket mutations to trace reads."""
+    principal = getattr(request.state, "principal", None)
+    if principal is None or principal.kind == "anonymous":
+        raise HTTPException(
+            status_code=403, detail="trace query requires authentication"
+        )
+    if principal.kind == "service" or principal.is_admin or not ticket_id:
+        if not ticket_id and principal.kind == "user" and not principal.is_admin:
+            raise HTTPException(
+                status_code=403, detail="ticket_id is required for user trace queries"
+            )
+        return
+    if not getattr(request.app.state, "multi_user", False):
+        return
+    try:
+        ticket = request.app.state.store.get_ticket(ticket_id)
+    except Exception as exc:
+        # Do not reveal whether an inaccessible ticket exists.
+        raise HTTPException(status_code=404, detail="ticket not found") from exc
+    owners = getattr(ticket, "owners", [])
+    if owners and principal.username not in owners:
+        raise HTTPException(
+            status_code=403, detail="trace access requires ticket ownership"
+        )
+
+
+def _query_from_params(
+    *,
+    ticket_id: str | None,
+    trace_id: str | None,
+    invocation_id: str | None,
+    action_id: str | None,
+    parent_action_id: str | None,
+    action_type: str | None,
+    lifecycle_state: str | None,
+    outcome: str | None,
+    producer_component: str | None,
+    since: datetime | None,
+    until: datetime | None,
+    causal: bool,
+    limit: int,
+) -> TraceQuery:
+    return TraceQuery(
+        ticket_id=ticket_id,
+        trace_id=trace_id,
+        invocation_id=invocation_id,
+        action_id=action_id,
+        parent_action_id=parent_action_id,
+        action_type=action_type,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        producer_component=producer_component,
+        since=since,
+        until=until,
+        causal=causal,
+        limit=limit,
+    )
+
+
+@query_router.get("/query")
+def query(
+    request: Request,
+    ticket_id: str | None = None,
+    trace_id: str | None = None,
+    invocation_id: str | None = None,
+    action_id: str | None = None,
+    parent_action_id: str | None = None,
+    action_type: str | None = None,
+    lifecycle_state: str | None = None,
+    outcome: str | None = None,
+    producer_component: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    causal: bool = False,
+    limit: int = Query(default=1000, ge=1, le=10000),
+) -> dict[str, object]:
+    _authorize_query(request, ticket_id)
+    selected = query_events(
+        request.app.state.trace_store.list_events(),
+        _query_from_params(
+            ticket_id=ticket_id,
+            trace_id=trace_id,
+            invocation_id=invocation_id,
+            action_id=action_id,
+            parent_action_id=parent_action_id,
+            action_type=action_type,
+            lifecycle_state=lifecycle_state,
+            outcome=outcome,
+            producer_component=producer_component,
+            since=since,
+            until=until,
+            causal=causal,
+            limit=limit,
+        ),
+    )
+    return {
+        "events": [event.model_dump(mode="json") for event in selected],
+        "count": len(selected),
+    }
+
+
+@query_router.get("/export")
+def export(
+    request: Request,
+    format: Literal["json", "jsonl", "csv"] = "json",
+    ticket_id: str | None = None,
+    trace_id: str | None = None,
+    causal: bool = False,
+    limit: int = Query(default=10000, ge=1, le=10000),
+) -> Response:
+    _authorize_query(request, ticket_id)
+    selected = query_events(
+        request.app.state.trace_store.list_events(),
+        TraceQuery(ticket_id=ticket_id, trace_id=trace_id, causal=causal, limit=limit),
+    )
+    media = "text/csv" if format == "csv" else "application/json"
+    return Response(export_events(selected, format), media_type=media)
 
 
 async def _service_principal(request: Request) -> Principal:
