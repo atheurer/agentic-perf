@@ -149,6 +149,27 @@ class AgentBase(ABC):
         self._trace = TraceRecorder()
         self._trace_terminal_state = LifecycleState.COMPLETED
 
+    def set_fence_context(
+        self,
+        session_id: str | None,
+        epoch: int | None,
+        claim_id: str | None,
+    ) -> None:
+        """Bind immutable orchestrator fencing headers to agent state writes."""
+        if not session_id or epoch is None:
+            return
+        from agents.fencing import FenceContext, bind_fence_context
+
+        bind_fence_context(FenceContext(session_id, epoch, claim_id or ""))
+        self._client.headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": str(epoch),
+            }
+        )
+        if claim_id:
+            self._client.headers["X-Agentic-Perf-Claim-Id"] = claim_id
+
     def _register_workspace_tools(self) -> None:
         """Register native workspace tools on the agent."""
         from agents.workspace.tools import WORKSPACE_TOOLS

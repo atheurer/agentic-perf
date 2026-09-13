@@ -579,15 +579,28 @@ class TestAssertTicketActive:
         assert "aborted" in result["reason"].lower()
 
     @pytest.mark.asyncio
-    async def test_allows_active_ticket(self):
+    async def test_allows_active_ticket(self, monkeypatch):
         """assert_ticket_active returns full ticket for active tickets."""
         from agents.server_utils import assert_ticket_active
 
         ticket_data = {
             "id": "PERF-002",
             "status": "executing_benchmark",
-            "custom_fields": {},
+            "custom_fields": {
+                "claim": {
+                    "session_id": "00000000-0000-4000-8000-000000000001",
+                    "epoch": 1,
+                    "claim_id": "claim-1",
+                    "expires": "2099-01-01T00:00:00+00:00",
+                }
+            },
         }
+        monkeypatch.setenv(
+            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID",
+            "00000000-0000-4000-8000-000000000001",
+        )
+        monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "1")
+        monkeypatch.setenv("AGENTIC_PERF_CLAIM_ID", "claim-1")
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -595,7 +608,16 @@ class TestAssertTicketActive:
         mock_response.json.return_value = ticket_data
 
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
+        lease_response = MagicMock()
+        lease_response.raise_for_status = MagicMock()
+        lease_response.json.return_value = {
+            "lease": {
+                "session_id": "00000000-0000-4000-8000-000000000001",
+                "epoch": 1,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        }
+        mock_client.get = AsyncMock(side_effect=[mock_response, lease_response])
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 

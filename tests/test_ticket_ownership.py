@@ -534,7 +534,7 @@ class TestImportedFixtureResumeAuthorization:
             f"/api/v1/tickets/{ticket_id}/claim",
             json={"owner": "attacker", "duration_seconds": 300},
         )
-        assert response.status_code == 409
+        assert response.status_code == 403
 
 
 class TestLegacyMode:

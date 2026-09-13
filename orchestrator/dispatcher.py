@@ -80,6 +80,8 @@ class Dispatcher:
         vault_config: dict | None = None,
         redactor: Any | None = None,
         introspection_llm: bool = True,
+        session_id: str | None = None,
+        fencing_epoch: int | None = None,
     ) -> None:
         self.store_url = state_store_url
         self._introspection_llm = introspection_llm
@@ -91,6 +93,9 @@ class Dispatcher:
         self._llm_factory = llm_factory
         self._iterations_factory = iterations_factory
         self._instance_name = instance_name or "unknown"
+        self._session_id = session_id
+        self._fencing_epoch = fencing_epoch
+        self._deposed = False
         self.lease_seconds = lease_seconds
         self._user_store = user_store
         self._secrets_root = secrets_root
@@ -99,6 +104,7 @@ class Dispatcher:
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
+        self._claim_ids: dict[str, str] = {}
         self._handoff_blocked: set[tuple[str, str]] = set()
         self._quota_blocked: set[str] = set()
         self._quota_warned: set[str] = set()
@@ -125,9 +131,15 @@ class Dispatcher:
 
     def _auth_headers(self) -> dict[str, str]:
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-        if token:
-            return {"Authorization": f"Bearer {token}"}
-        return {}
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if self._session_id and self._fencing_epoch is not None:
+            headers.update(
+                {
+                    "X-Agentic-Perf-Orchestrator-Session": self._session_id,
+                    "X-Agentic-Perf-Orchestrator-Epoch": str(self._fencing_epoch),
+                }
+            )
+        return headers
 
     def try_claim(self, ticket_id: str, status: str) -> bool:
         """Attempt to claim a ticket via the state store. Returns True on success."""
@@ -138,9 +150,13 @@ class Dispatcher:
                     json={
                         "owner": self._instance_name,
                         "duration_seconds": self.lease_seconds,
+                        "session_id": self._session_id,
+                        "epoch": self._fencing_epoch,
+                        "instance_name": self._instance_name,
                     },
                 )
                 if r.status_code == 200:
+                    self._claim_ids[ticket_id] = r.json().get("claim_id", "")
                     context = new_trace_context(ticket_id=ticket_id, agent_id=status)
                     previous = self._previous_invocations.get(ticket_id)
                     attributes = {}
@@ -187,7 +203,12 @@ class Dispatcher:
                 client.request(
                     "DELETE",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
-                    json={"owner": self._instance_name},
+                    json={
+                        "owner": self._instance_name,
+                        "session_id": self._session_id,
+                        "epoch": self._fencing_epoch,
+                        "claim_id": self._claim_ids.get(ticket_id),
+                    },
                 )
         except Exception:
             logger.exception(f"Failed to release claim on {ticket_id}")
@@ -208,6 +229,9 @@ class Dispatcher:
                     json={
                         "owner": self._instance_name,
                         "duration_seconds": self.lease_seconds,
+                        "session_id": self._session_id,
+                        "epoch": self._fencing_epoch,
+                        "claim_id": self._claim_ids.get(ticket_id),
                     },
                 )
                 return r.status_code == 200
@@ -242,6 +266,7 @@ class Dispatcher:
                             phase="claim_renewal",
                             duration_ms=0,
                         )
+                    self.mark_deposed()
                     break
         except asyncio.CancelledError:
             pass
@@ -259,6 +284,21 @@ class Dispatcher:
 
     def set_task(self, ticket_id: str, task: asyncio.Task) -> None:
         self._tasks[ticket_id] = task
+
+    def mark_deposed(self) -> None:
+        """Stop all agent work after losing the control-plane fence."""
+        self._deposed = True
+        for task in (
+            list(self._tasks.values())
+            + list(self._renewal_tasks.values())
+            + list(self._introspection_tasks.values())
+        ):
+            if not task.done():
+                task.cancel()
+        self._renewal_tasks.clear()
+
+    def is_deposed(self) -> bool:
+        return self._deposed
 
     def set_agent(self, ticket_id: str, agent: Any) -> None:
         self._agents[ticket_id] = agent
@@ -340,6 +380,7 @@ class Dispatcher:
         self._agents.pop(ticket_id, None)
         self.stop_renewal(ticket_id)
         self.release_claim(ticket_id)
+        getattr(self, "_claim_ids", {}).pop(ticket_id, None)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
