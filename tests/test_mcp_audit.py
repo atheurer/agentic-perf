@@ -113,14 +113,16 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         textwrap.dedent(f"""\
         from pathlib import Path
         from agents.mcp_audit import create_ticket_mcp
-        from agents.server_utils import _emit_tool_progress
+        from agents.server_utils import _emit_tool_progress_event
         import os
         mcp = create_ticket_mcp("ticket-audit")
         @mcp.tool()
         async def execute_benchmark() -> str:
             path = Path({str(counter)!r})
             path.write_text(str(int(path.read_text() if path.exists() else "0") + 1))
-            _emit_tool_progress("PERF-786", "benchmark", os.environ["MCP_TEST_TOKEN"])
+            _emit_tool_progress_event(
+                "PERF-786", "benchmark", os.environ["MCP_TEST_TOKEN"]
+            )
             return os.environ["MCP_TEST_TOKEN"] + ("X" * 5000)
         @mcp.tool()
         async def fail_with_secret() -> str:
