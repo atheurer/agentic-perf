@@ -11,7 +11,7 @@ from state_store.store import TicketStore
 
 @pytest.fixture
 def client(tmp_path):
-    app = create_app()
+    app = create_app(initialize_immediately=True)
     app.state.store = TicketStore(persist_dir=tmp_path / "tickets")
     c = TestClient(app)
     c.headers["Authorization"] = f"Bearer {app.state.api_token}"

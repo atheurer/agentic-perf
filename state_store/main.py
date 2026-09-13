@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,9 @@ from .trace_store import TraceStore
 STATIC_DIR = Path(__file__).parent / "static"
 
 logger = logging.getLogger(__name__)
+
+_runtime_locks: dict[Path, tuple[PersistenceRootLock, int]] = {}
+_runtime_locks_guard = threading.Lock()
 
 
 def _validate_positive_int(
@@ -253,47 +257,89 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
             logger.exception("Failed to initialize chat agent")
 
 
-def create_app(*, initialize_immediately: bool = True) -> FastAPI:
+def _acquire_runtime_lock(port: int) -> PersistenceRootLock:
+    """Acquire one process-wide reference to the authoritative root lock."""
+    root = AGENTIC_PERF_HOME.resolve()
+    with _runtime_locks_guard:
+        shared = _runtime_locks.get(root)
+        if shared is not None:
+            lock, references = shared
+            _runtime_locks[root] = (lock, references + 1)
+            return lock
+        lock = PersistenceRootLock(root, port)
+        lock.acquire()
+        _runtime_locks[root] = (lock, 1)
+        return lock
+
+
+def _release_runtime_lock(lock: PersistenceRootLock) -> None:
+    root = lock.root.resolve()
+    with _runtime_locks_guard:
+        shared = _runtime_locks.get(root)
+        if shared is None:
+            return
+        _, references = shared
+        if references > 1:
+            _runtime_locks[root] = (lock, references - 1)
+            return
+        del _runtime_locks[root]
+        lock.release()
+
+
+def _start_runtime(app: FastAPI, port: int) -> None:
+    """Acquire the root lock before constructing any writable backend."""
+    if getattr(app.state, "runtime_initialized", False):
+        return
+    lock = _acquire_runtime_lock(port)
+    app.state.process_lock = lock
+    app.state.store_diagnostics = {
+        "store_id": lock.store_id,
+        "process_session_id": lock.session_id,
+        "persistence_root_fingerprint": persistence_root_fingerprint(),
+        "instance_name": get_instance_name(),
+        "process": lock.metadata,
+    }
+    try:
+        _initialize_runtime(app, port)
+        app.state.runtime_initialized = True
+        logger.info(
+            "State store started: store_id=%s session_id=%s root=%s",
+            lock.store_id,
+            lock.session_id,
+            app.state.store_diagnostics["persistence_root_fingerprint"],
+        )
+    except Exception:
+        _release_runtime_lock(lock)
+        app.state.process_lock = None
+        raise
+
+
+def _close_runtime(app: FastAPI) -> None:
+    if not getattr(app.state, "runtime_initialized", False):
+        return
+    for name in ("event_bus", "audit_log"):
+        adapter = getattr(app.state, name, None)
+        if adapter is not None:
+            adapter.close()
+    app.state.trace_store.close()
+    app.state.runtime_initialized = False
+    lock = getattr(app.state, "process_lock", None)
+    if lock is not None:
+        _release_runtime_lock(lock)
+        app.state.process_lock = None
+
+
+def create_app(*, initialize_immediately: bool = False) -> FastAPI:
     port = int(os.environ.get("STORE_PORT", "8090"))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if not getattr(app.state, "runtime_initialized", False):
-            lock = PersistenceRootLock(AGENTIC_PERF_HOME, port)
-            lock.acquire()
-            app.state.process_lock = lock
-            app.state.store_diagnostics = {
-                "store_id": lock.store_id,
-                "process_session_id": lock.session_id,
-                "persistence_root_fingerprint": persistence_root_fingerprint(),
-                "instance_name": get_instance_name(),
-                "process": lock.metadata,
-            }
-            try:
-                _initialize_runtime(app, port)
-                app.state.runtime_initialized = True
-                logger.info(
-                    "State store started: store_id=%s session_id=%s root=%s",
-                    lock.store_id,
-                    lock.session_id,
-                    app.state.store_diagnostics["persistence_root_fingerprint"],
-                )
-            except Exception:
-                lock.release()
-                raise
+            _start_runtime(app, port)
         try:
             yield
         finally:
-            if getattr(app.state, "runtime_initialized", False):
-                for name in ("event_bus", "audit_log"):
-                    adapter = getattr(app.state, name, None)
-                    if adapter is not None:
-                        adapter.close()
-                app.state.trace_store.close()
-                app.state.runtime_initialized = False
-            lock = getattr(app.state, "process_lock", None)
-            if lock is not None:
-                lock.release()
+            _close_runtime(app)
 
     app = FastAPI(title="Agentic Perf State Store", version="0.1.0", lifespan=lifespan)
     app.state.trace_health = {
@@ -364,22 +410,11 @@ def create_app(*, initialize_immediately: bool = True) -> FastAPI:
     )
 
     if initialize_immediately:
-        # Compatibility for in-process callers and existing unit-test helpers.
-        # The production ASGI application below initializes only in lifespan.
-        _initialize_runtime(app, port)
-        app.state.runtime_initialized = True
+        _start_runtime(app, port)
 
     def close_compatibility_runtime() -> None:
         """Keep direct in-process app users able to release test resources."""
-        if getattr(app.state, "process_lock", None) is not None:
-            return
-        if getattr(app.state, "runtime_initialized", False):
-            for name in ("event_bus", "audit_log"):
-                adapter = getattr(app.state, name, None)
-                if adapter is not None:
-                    adapter.close()
-            app.state.trace_store.close()
-            app.state.runtime_initialized = False
+        _close_runtime(app)
 
     app.router.on_shutdown.append(close_compatibility_runtime)
     if STATIC_DIR.is_dir():

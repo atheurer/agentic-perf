@@ -34,6 +34,7 @@ LOG_DIR="$AP_HOME/logs"
 STORE_PID_FILE="$LOG_DIR/state-store.pid"
 STORE_LOG="$LOG_DIR/state-store.log"
 ORCH_LOG="$LOG_DIR/orchestrator.log"
+STORE_LAUNCH_LOCK="$AP_HOME/state-store-launch.lock"
 
 mkdir -p "$LOG_DIR"
 
@@ -95,6 +96,16 @@ _store_pid_detail() {
     fi
 }
 
+_store_lock_pid() {
+    python3 -c "
+import json
+try:
+    print(json.load(open('$AP_HOME/state-store.lock')).get('pid', ''))
+except Exception:
+    pass
+" 2>/dev/null
+}
+
 _is_orch_running() {
     local pid_file="$AP_HOME/orchestrator.pid"
     if [ -f "$pid_file" ]; then
@@ -121,6 +132,15 @@ cmd_start() {
         exit 1
     fi
 
+    # Serialize check/spawn/readiness.  The process lock protects the store,
+    # while this launcher lock prevents two start-bg invocations from mistaking
+    # the winner's health response for their own readiness.
+    exec {store_launch_fd}>"$STORE_LAUNCH_LOCK"
+    if ! flock -n "$store_launch_fd"; then
+        echo "ERROR: another state-store launcher is already checking or starting $AP_HOME"
+        exit 1
+    fi
+
     # The persistence-root lock is authoritative.  PID files only aid diagnosis.
     if _is_store_running; then
         endpoint=$(_store_endpoint_status || true)
@@ -136,12 +156,15 @@ cmd_start() {
             --host 0.0.0.0 --port "$STORE_PORT" \
             --log-level warning \
             > "$STORE_LOG" 2>&1 &
-        echo $! > "$STORE_PID_FILE"
+        local started_pid=$!
+        echo "$started_pid" > "$STORE_PID_FILE"
 
-        # Wait for ready
+        # Health alone is insufficient: another process could own the endpoint.
         for i in $(seq 1 20); do
-            if curl -s "http://localhost:$STORE_PORT/api/v1/health" >/dev/null 2>&1; then
-                echo "State store ready (PID $!)."
+            if [ "$(_store_endpoint_status || true)" = "this-store" ] \
+                && [ "$(_store_lock_pid)" = "$started_pid" ] \
+                && kill -0 "$started_pid" 2>/dev/null; then
+                echo "State store ready (PID $started_pid)."
                 echo "  Dashboard: http://localhost:$STORE_PORT/"
                 echo "  Log: $STORE_LOG"
                 break
@@ -153,6 +176,8 @@ cmd_start() {
             sleep 0.5
         done
     fi
+    flock -u "$store_launch_fd"
+    exec {store_launch_fd}>&-
 
     # Start orchestrator
     if _is_orch_running; then

@@ -85,7 +85,7 @@ class TestStoreIsolation:
     def test_create_app_uses_sandbox(self):
         from state_store.main import create_app
 
-        app = create_app()
+        app = create_app(initialize_immediately=True)
         store = app.state.store
         assert Path(store._persist_dir).resolve().is_relative_to(_SANDBOX)
         assert app.state.trace_store.db_path.resolve().is_relative_to(_SANDBOX)

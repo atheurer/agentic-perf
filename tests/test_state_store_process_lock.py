@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -73,6 +74,18 @@ def _stop(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def test_in_process_initialization_holds_persistence_lock() -> None:
+    """Test helpers must opt into a lock-backed writable application."""
+    from state_store.main import create_app
+
+    app = create_app(initialize_immediately=True)
+    try:
+        assert app.state.process_lock.fd is not None
+        assert app.state.runtime_initialized is True
+    finally:
+        app.router.on_shutdown[0]()
 
 
 def test_second_process_same_home_fails_before_writes(tmp_path: Path) -> None:
@@ -151,6 +164,38 @@ def test_held_lock_with_malformed_metadata_blocks_safely(tmp_path: Path) -> None
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def test_empty_store_id_is_recovered_atomically_while_locked(tmp_path: Path) -> None:
+    (tmp_path / "state-store.id").write_text("")
+    lock = PersistenceRootLock(tmp_path, _port())
+    lock.acquire()
+    try:
+        assert lock.store_id is not None
+        assert uuid.UUID(lock.store_id)
+        assert (tmp_path / "state-store.id").read_text().strip() == lock.store_id
+        assert not list(tmp_path.glob(".state-store.id.*.tmp"))
+    finally:
+        lock.release()
+
+
+def test_failed_setup_releases_lock_for_a_retry(tmp_path: Path, monkeypatch) -> None:
+    import state_store.process_lock as process_lock
+
+    monkeypatch.setattr(
+        process_lock,
+        "ensure_store_id",
+        lambda _path: (_ for _ in ()).throw(OSError("disk failure")),
+    )
+    failed = PersistenceRootLock(tmp_path, _port())
+    with pytest.raises(OSError, match="disk failure"):
+        failed.acquire()
+    assert failed.fd is None
+
+    monkeypatch.undo()
+    retry = PersistenceRootLock(tmp_path, _port())
+    retry.acquire()
+    retry.release()
 
 
 def test_abrupt_exit_releases_kernel_lock(tmp_path: Path) -> None:

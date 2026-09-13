@@ -47,27 +47,39 @@ def _read_metadata(
 
 
 def ensure_store_id(path: Path = STATE_STORE_ID_PATH) -> str:
-    """Atomically create once, then return the persistent random store identity."""
+    """Return the persistent store UUID, recovering atomically after interruption.
+
+    The caller must already hold the persistence-root lock.  Replacing instead
+    of editing the identity file means a crash can leave either the old complete
+    UUID or a complete new UUID, never a partially written identity.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         value = path.read_text(encoding="utf-8").strip()
-        if value:
+        if value and str(uuid.UUID(value)) == value:
             return value
-    except OSError:
+    except (OSError, ValueError):
         pass
     value = str(uuid.uuid4())
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        value = path.read_text(encoding="utf-8").strip()
-        if value:
-            return value
-        raise RuntimeError(f"state-store ID file is empty: {path}")
-    try:
-        os.write(fd, (value + "\n").encode("utf-8"))
-        os.fsync(fd)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, (value + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
-        os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     return value
 
 
@@ -105,15 +117,21 @@ class PersistenceRootLock:
                 f"state-store persistence root is locked: {self.root} (holder metadata: {detail})"
             ) from exc
         self.fd = fd
-        self.session_id = str(uuid.uuid4())
-        self.store_id = ensure_store_id(self.root / STATE_STORE_ID_PATH.name)
-        encoded = json.dumps(self.metadata, sort_keys=True).encode("utf-8")
-        if len(encoded) > _MAX_METADATA_BYTES:
-            raise RuntimeError("state-store lock metadata exceeds bounded size")
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, encoded)
-        os.fsync(fd)
+        try:
+            self.session_id = str(uuid.uuid4())
+            self.store_id = ensure_store_id(self.root / STATE_STORE_ID_PATH.name)
+            encoded = json.dumps(self.metadata, sort_keys=True).encode("utf-8")
+            if len(encoded) > _MAX_METADATA_BYTES:
+                raise RuntimeError("state-store lock metadata exceeds bounded size")
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, encoded)
+            os.fsync(fd)
+        except Exception:
+            self.release()
+            self.session_id = None
+            self.store_id = None
+            raise
 
     def release(self) -> None:
         if self.fd is not None:
