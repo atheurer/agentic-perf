@@ -197,6 +197,11 @@ class MCPAuditMiddleware(Middleware):
             content=json.dumps(payload, sort_keys=True), is_error=is_error
         )
 
+    @staticmethod
+    def _result_descriptor(result: Any) -> dict[str, Any]:
+        content = json.dumps(getattr(result, "content", result), default=str)
+        return {"mcp_result": content[:4096], "truncated": len(content) > 4096}
+
     def _protect_operation(
         self, trace: TraceContext, tool_name: str
     ) -> tuple[dict[str, Any] | None, ToolResult | None]:
@@ -330,11 +335,23 @@ class MCPAuditMiddleware(Middleware):
             if lease is not None:
                 self._client.operation_transition(
                     trace.idempotency_key or "",
+                    "prepared",
+                    int(lease["fencing_generation"]),
+                )
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
                     "side-effect-started",
                     int(lease["fencing_generation"]),
                 )
             result = await call_next(context)
         except asyncio.CancelledError:
+            if lease is not None:
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
+                    "indeterminate",
+                    int(lease["fencing_generation"]),
+                    descriptor={"outcome": "cancelled_after_start"},
+                )
             self._emit(
                 trace,
                 context.fastmcp_context,
@@ -345,6 +362,16 @@ class MCPAuditMiddleware(Middleware):
             )
             raise
         except Exception as exc:
+            if lease is not None:
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
+                    "indeterminate",
+                    int(lease["fencing_generation"]),
+                    descriptor={
+                        "outcome": "exception_after_start",
+                        "type": type(exc).__name__,
+                    },
+                )
             self._emit(
                 trace,
                 context.fastmcp_context,
@@ -360,9 +387,9 @@ class MCPAuditMiddleware(Middleware):
         if lease is not None:
             self._client.operation_transition(
                 trace.idempotency_key or "",
-                "complete",
+                "fail" if getattr(result, "is_error", False) else "complete",
                 int(lease["fencing_generation"]),
-                descriptor={"status": "completed"},
+                descriptor=self._result_descriptor(result),
             )
         self._emit(
             trace,

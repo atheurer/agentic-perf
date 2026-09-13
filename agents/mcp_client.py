@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import sys
@@ -511,12 +513,28 @@ class AgentMCPClient:
             agent_id=conn.agent_id,
         )
         correlation_id = context.mcp_correlation_request_id or uuid.uuid4().hex
+        request_hash = (
+            context.idempotency_request_hash
+            or hashlib.sha256(
+                json.dumps(
+                    {"tool": name, "arguments": arguments},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+            ).hexdigest()
+        )
+        operation_key = context.idempotency_key or (
+            f"mcp-delivery:{context.ticket_id or 'external'}:{conn.name}:{context.action_id}"
+        )
         context = TraceContext.model_validate(
             context.model_dump()
             | {
                 "mcp_server": conn.name,
                 "mcp_session_id": conn.session_id,
                 "mcp_correlation_request_id": correlation_id,
+                "idempotency_key": operation_key,
+                "idempotency_request_hash": request_hash,
             }
         )
         metadata = {

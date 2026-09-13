@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.server.middleware import MiddlewareContext
+from fastmcp.tools.base import ToolResult
 from mcp import McpError
 from mcp.types import CallToolRequestParams, RequestParams
 
@@ -141,6 +142,8 @@ async def test_client_sends_trace_metadata_without_changing_tool_arguments():
     meta = session.call_tool.call_args.kwargs["meta"]
     assert meta["agentic-perf"]["correlation_request_id"] == "stable-correlation"
     assert meta["traceparent"].startswith("00-")
+    assert meta["agentic-perf"]["idempotency_key"].startswith("mcp-delivery:")
+    assert len(meta["agentic-perf"]["idempotency_request_hash"]) == 64
     assert [event.lifecycle.state for event in client.audit_events] == [
         LifecycleState.REQUEST_SENT,
         LifecycleState.RESPONSE_RECEIVED,
@@ -201,6 +204,44 @@ async def test_protected_tool_uses_registry_and_returns_terminal_result():
     assert result.is_error is False
     assert "existing" in str(result.content)
     assert events[-1].lifecycle.state == LifecycleState.DUPLICATE_DETECTED
+
+
+@pytest.mark.asyncio
+async def test_acquired_protected_tool_transitions_legally_and_invokes_once():
+    transitions = []
+    registry = SimpleNamespace(
+        operation_acquire=lambda *_: {
+            "status": "acquired",
+            "operation": {"fencing_generation": 1},
+        },
+        operation_transition=lambda key, action, token, **kwargs: transitions.append(
+            (key, action, token, kwargs)
+        ),
+    )
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        record=lambda _: None,
+    )
+    middleware._client = registry
+    request = _request("delivery")
+    request.message.meta.model_extra["agentic-perf"].update(
+        {"idempotency_key": "delivery-key", "idempotency_request_hash": "hash"}
+    )
+    result = await middleware.on_call_tool(
+        request.copy(
+            message=request.message.model_copy(update={"name": "execute_benchmark"})
+        ),
+        AsyncMock(return_value=ToolResult(content="actual response")),
+    )
+    assert result.content[0].text == "actual response"
+    assert [item[1] for item in transitions] == [
+        "prepared",
+        "side-effect-started",
+        "complete",
+    ]
+    assert "actual response" in transitions[-1][3]["descriptor"]["mcp_result"]
 
 
 def test_every_local_fastmcp_server_uses_the_shared_factory():
