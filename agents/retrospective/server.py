@@ -4,13 +4,12 @@ import json
 import re
 from pathlib import Path
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from paths import LOG_DIR as DEFAULT_LOG_DIR
 from paths import TICKET_DIR as DEFAULT_TICKET_DIR
 from providers.events import EventBus
 
-mcp = FastMCP("retrospective")
+mcp = create_ticket_mcp("retrospective")
 
 SENSITIVE_TOOLS = frozenset(
     {
