@@ -217,7 +217,7 @@ def export_manifest(events: Iterable[TraceEventV1], content: str) -> dict[str, o
     sequences = [event.global_seq for event in values if event.global_seq is not None]
     digests = sorted(
         {
-            descriptor.digest
+            descriptor.blob_ref or descriptor.digest
             for event in values
             for descriptor in (event.input, event.output)
             if descriptor and descriptor.digest

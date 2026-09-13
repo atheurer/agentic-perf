@@ -344,7 +344,23 @@ def action_trace(
 @query_router.get("/{ticket_id}/payloads/{digest}")
 def payload_content(ticket_id: str, digest: str, request: Request) -> Response:
     """Return a referenced redacted blob only to detailed trace principals."""
-    if not _authorize_query(request, ticket_id):
+    audit_log = getattr(request.app.state, "audit_log", None)
+
+    def audit(outcome: str, error: str = "") -> None:
+        if audit_log is not None:
+            audit_log.log(
+                "trace_payload_read",
+                ticket_id,
+                {"digest": digest[:80], "outcome": outcome, "error": error},
+            )
+
+    try:
+        detailed = _authorize_query(request, ticket_id)
+    except HTTPException as exc:
+        audit("denied", str(exc.detail))
+        raise
+    if not detailed:
+        audit("denied", "owner redaction")
         raise HTTPException(
             status_code=403, detail="payload access requires operator authentication"
         )
@@ -357,14 +373,14 @@ def payload_content(ticket_id: str, digest: str, request: Request) -> Response:
         if descriptor
     }
     if ref not in refs:
+        audit("missing", "unreferenced payload")
         raise HTTPException(status_code=404, detail="payload not found")
     try:
         content = PayloadBlobStore(ticket_id=ticket_id).get(ref, max_bytes=1_048_576)
     except PayloadStorageError as exc:
+        audit("unavailable", str(exc))
         raise HTTPException(status_code=404, detail="payload unavailable") from exc
-    audit_log = getattr(request.app.state, "audit_log", None)
-    if audit_log is not None:
-        audit_log.log("trace_payload_read", ticket_id, {"digest": ref})
+    audit("success")
     return Response(content, media_type="application/octet-stream")
 
 
