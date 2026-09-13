@@ -9,6 +9,7 @@ from . import (
     groups,
     health,
     interject,
+    orchestrator_lease,
     owners,
     stop,
     stream,
@@ -35,6 +36,7 @@ api_router.include_router(stop.router)
 api_router.include_router(stream.router)
 api_router.include_router(interject.router)
 api_router.include_router(owners.router)
+api_router.include_router(orchestrator_lease.router)
 api_router.include_router(transitions_info.router)
 api_router.include_router(users.router)
 api_router.include_router(groups.router)
