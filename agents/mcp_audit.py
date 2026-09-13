@@ -60,6 +60,10 @@ _MAX_REDACTED_KEY_BYTES = 4096
 
 def _meta_values(message: Any) -> dict[str, Any]:
     """Return extension values from an MCP request without depending on internals."""
+    if not isinstance(message, dict) and hasattr(message, "model_extra"):
+        values = getattr(message, "model_extra", None)
+        if values:
+            return dict(values)
     if isinstance(message, dict):
         meta = message.get("meta") or message.get("_meta")
     else:
@@ -406,6 +410,13 @@ class MCPAuditMiddleware(Middleware):
     ) -> Any:
         started = time.monotonic()
         values = _meta_values(context.message)
+        # FastMCP 3.4 reconstructs CallToolRequestParams before invoking
+        # middleware, so request metadata is retained on its public request
+        # context rather than on ``context.message``.
+        if not values and context.fastmcp_context is not None:
+            request_context = getattr(context.fastmcp_context, "request_context", None)
+            if request_context is not None:
+                values = _meta_values(request_context.meta)
         propagated = _context_from_meta(values)
         tool_name = str(getattr(context.message, "name", "unknown"))
         # A server can still be used in isolated unit tests without ticket env.

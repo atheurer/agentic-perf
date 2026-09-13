@@ -284,6 +284,41 @@ async def test_server_records_metadata_and_detects_same_session_replay():
 
 
 @pytest.mark.asyncio
+async def test_server_reads_metadata_from_fastmcp_request_context():
+    events = []
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        record=events.append,
+    )
+    meta = RequestParams.Meta(
+        **{
+            "agentic-perf": {
+                "ticket_id": "PERF-1",
+                "agent_id": "benchmark",
+                "trace_id": "a" * 32,
+                "action_id": "b" * 16,
+                "correlation_request_id": "request-context",
+            }
+        }
+    )
+    context = MiddlewareContext(
+        message=CallToolRequestParams(name="read_only"),
+        method="tools/call",
+        fastmcp_context=SimpleNamespace(
+            request_id="rpc-1",
+            session_id="session-1",
+            request_context=SimpleNamespace(meta=meta),
+        ),
+    )
+
+    await middleware.on_call_tool(context, AsyncMock(return_value="ok"))
+    assert events[0].lifecycle.state == LifecycleState.REQUEST_RECEIVED
+    assert events[0].mcp.correlation_request_id == "request-context"
+
+
+@pytest.mark.asyncio
 async def test_result_redaction_sanitizes_structured_keys_without_collision_loss():
     sentinel = "structured-key-secret-786"
     ticket = "PERF-structured-keys"
