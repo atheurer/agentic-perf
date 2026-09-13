@@ -166,11 +166,11 @@ def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]
     Keep their content behind the same redaction, size-bound, and
     content-addressed-blob policy used by trace producers.
     """
-    from providers.redaction import Redactor
+    from providers.redaction import get_shared_redactor
     from providers.tracing import PayloadBuilder
 
     return (
-        PayloadBuilder(Redactor())
+        PayloadBuilder(get_shared_redactor())
         .build(
             ticket_id,
             output,
