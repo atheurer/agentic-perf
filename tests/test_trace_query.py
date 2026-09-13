@@ -18,6 +18,7 @@ def test_causal_query_includes_ancestors_and_descendants() -> None:
     )
     child = TraceEventV1(
         ticket_id="PERF-1",
+        trace_id=root.trace_id,
         parent_action_id=root.action_id,
         action=ActionDescriptor(type=ActionType.STATE),
         lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),

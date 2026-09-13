@@ -1041,12 +1041,13 @@ def cmd_trace(args):
     params = {
         key: value
         for key, value in {
-            "ticket_id": args.ticket_id,
+            "ticket_id": args.ticket_id or args.ticket_id_option,
             "trace_id": args.trace_id,
             "action_id": args.action_id,
+            "invocation_id": args.invocation,
             "action_type": args.action_type,
-            "lifecycle_state": args.lifecycle_state,
-            "causal": args.causal,
+            "outcome": args.outcome,
+            "causal": args.causal or args.tree,
             "limit": args.limit,
         }.items()
         if value is not None
@@ -1405,14 +1406,19 @@ def main():
     )
 
     p_trace = sub.add_parser("trace", help="Query or export causal trace events")
-    p_trace.add_argument("--ticket-id", help="Restrict results to a ticket")
+    p_trace.add_argument("ticket_id", nargs="?", help="Ticket ID")
+    p_trace.add_argument("--ticket-id", dest="ticket_id_option")
     p_trace.add_argument("--trace-id", help="Restrict results to a trace")
     p_trace.add_argument("--action-id", help="Restrict results to an action")
-    p_trace.add_argument("--action-type")
+    p_trace.add_argument("--invocation")
+    p_trace.add_argument("--type", dest="action_type")
+    p_trace.add_argument("--outcome")
     p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument(
         "--causal", action="store_true", help="Include ancestors and descendants"
     )
+    p_trace.add_argument("--tree", action="store_true")
+    p_trace.add_argument("--include-payloads", action="store_true")
     p_trace.add_argument("--limit", type=int, default=1000)
     p_trace.add_argument(
         "--json", action="store_true", help="Print query response as JSON"

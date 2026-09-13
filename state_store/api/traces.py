@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from paths import get_instance_name
 from providers.tracing import TraceEventV1
-from providers.tracing.query import TraceQuery, export_events, query_events
+from providers.tracing.query import TraceQuery, diagnostics, export_events, query_events
 
 from ..auth import Principal
 from ..trace_store import TraceEventConflictError, TraceStoreWriteError
@@ -23,7 +23,7 @@ class TraceBatch(BaseModel):
     events: list[TraceEventV1] = Field(min_length=1, max_length=500)
 
 
-def _authorize_query(request: Request, ticket_id: str | None) -> None:
+def _authorize_query(request: Request, ticket_id: str | None) -> bool:
     """Apply the same ownership boundary as ticket mutations to trace reads."""
     principal = getattr(request.state, "principal", None)
     if principal is None or principal.kind == "anonymous":
@@ -35,9 +35,9 @@ def _authorize_query(request: Request, ticket_id: str | None) -> None:
             raise HTTPException(
                 status_code=403, detail="ticket_id is required for user trace queries"
             )
-        return
+        return True
     if not getattr(request.app.state, "multi_user", False):
-        return
+        return True
     try:
         ticket = request.app.state.store.get_ticket(ticket_id)
     except Exception as exc:
@@ -48,6 +48,16 @@ def _authorize_query(request: Request, ticket_id: str | None) -> None:
         raise HTTPException(
             status_code=403, detail="trace access requires ticket ownership"
         )
+    return False
+
+
+def _event_json(event: TraceEventV1, detailed: bool) -> dict[str, object]:
+    data = event.model_dump(mode="json")
+    if not detailed:
+        data["input"] = None
+        data["output"] = None
+        data["attributes"] = None
+    return data
 
 
 def _query_from_params(
@@ -61,10 +71,13 @@ def _query_from_params(
     lifecycle_state: str | None,
     outcome: str | None,
     producer_component: str | None,
+    retry_kind: str | None,
+    idempotency_outcome: str | None,
     since: datetime | None,
     until: datetime | None,
     causal: bool,
     limit: int,
+    cursor: int,
 ) -> TraceQuery:
     return TraceQuery(
         ticket_id=ticket_id,
@@ -76,10 +89,13 @@ def _query_from_params(
         lifecycle_state=lifecycle_state,
         outcome=outcome,
         producer_component=producer_component,
+        retry_kind=retry_kind,
+        idempotency_outcome=idempotency_outcome,
         since=since,
         until=until,
         causal=causal,
         limit=limit,
+        cursor=cursor,
     )
 
 
@@ -95,12 +111,20 @@ def query(
     lifecycle_state: str | None = None,
     outcome: str | None = None,
     producer_component: str | None = None,
+    retry_kind: str | None = None,
+    idempotency_outcome: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
     causal: bool = False,
     limit: int = Query(default=1000, ge=1, le=10000),
+    cursor: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
-    _authorize_query(request, ticket_id)
+    detailed = _authorize_query(request, ticket_id)
+    audit_log = getattr(request.app.state, "audit_log", None)
+    if audit_log is not None:
+        audit_log.log(
+            "trace_query", ticket_id or "*", {"detailed": detailed, "causal": causal}
+        )
     selected = query_events(
         request.app.state.trace_store.list_events(),
         _query_from_params(
@@ -113,15 +137,20 @@ def query(
             lifecycle_state=lifecycle_state,
             outcome=outcome,
             producer_component=producer_component,
+            retry_kind=retry_kind,
+            idempotency_outcome=idempotency_outcome,
             since=since,
             until=until,
             causal=causal,
             limit=limit,
+            cursor=cursor,
         ),
     )
     return {
-        "events": [event.model_dump(mode="json") for event in selected],
+        "events": [_event_json(event, detailed) for event in selected],
         "count": len(selected),
+        "next_cursor": selected[-1].global_seq if selected else None,
+        "diagnostics": diagnostics(selected) if causal else {},
     }
 
 
@@ -131,16 +160,70 @@ def export(
     format: Literal["json", "jsonl", "csv"] = "json",
     ticket_id: str | None = None,
     trace_id: str | None = None,
+    invocation_id: str | None = None,
+    action_id: str | None = None,
+    action_type: str | None = None,
+    outcome: str | None = None,
+    producer_component: str | None = None,
+    retry_kind: str | None = None,
+    idempotency_outcome: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
     causal: bool = False,
     limit: int = Query(default=10000, ge=1, le=10000),
+    cursor: int = Query(default=0, ge=0),
 ) -> Response:
-    _authorize_query(request, ticket_id)
+    detailed = _authorize_query(request, ticket_id)
+    audit_log = getattr(request.app.state, "audit_log", None)
+    if audit_log is not None:
+        audit_log.log(
+            "trace_export", ticket_id or "*", {"format": format, "detailed": detailed}
+        )
     selected = query_events(
         request.app.state.trace_store.list_events(),
-        TraceQuery(ticket_id=ticket_id, trace_id=trace_id, causal=causal, limit=limit),
+        TraceQuery(
+            ticket_id=ticket_id,
+            trace_id=trace_id,
+            invocation_id=invocation_id,
+            action_id=action_id,
+            action_type=action_type,
+            outcome=outcome,
+            producer_component=producer_component,
+            retry_kind=retry_kind,
+            idempotency_outcome=idempotency_outcome,
+            since=since,
+            until=until,
+            causal=causal,
+            limit=limit,
+            cursor=cursor,
+        ),
     )
-    media = "text/csv" if format == "csv" else "application/json"
+    media = (
+        "text/csv"
+        if format == "csv"
+        else ("application/x-ndjson" if format == "jsonl" else "application/json")
+    )
+    if not detailed:
+        selected = [
+            event.model_copy(update={"input": None, "output": None, "attributes": None})
+            for event in selected
+        ]
     return Response(export_events(selected, format), media_type=media)
+
+
+@query_router.get("/tickets/{ticket_id}")
+def ticket_trace(ticket_id: str, request: Request) -> dict[str, object]:
+    return query(request, ticket_id=ticket_id)
+
+
+@query_router.get("/invocations/{invocation_id}")
+def invocation_trace(invocation_id: str, request: Request) -> dict[str, object]:
+    return query(request, invocation_id=invocation_id)
+
+
+@query_router.get("/actions/{action_id}")
+def action_trace(action_id: str, request: Request) -> dict[str, object]:
+    return query(request, action_id=action_id)
 
 
 async def _service_principal(request: Request) -> Principal:

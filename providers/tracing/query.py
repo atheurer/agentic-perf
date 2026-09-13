@@ -25,10 +25,13 @@ class TraceQuery:
     lifecycle_state: str | None = None
     outcome: str | None = None
     producer_component: str | None = None
+    retry_kind: str | None = None
+    idempotency_outcome: str | None = None
     since: datetime | None = None
     until: datetime | None = None
     causal: bool = False
     limit: int = 1000
+    cursor: int = 0
 
 
 def query_events(
@@ -45,7 +48,12 @@ def query_events(
     if query.causal and direct:
         selected = {event.action_id for event in direct}
         scope_tickets = {event.ticket_id for event in direct}
-        scoped = [event for event in values if event.ticket_id in scope_tickets]
+        scope_traces = {event.trace_id for event in direct}
+        scoped = [
+            event
+            for event in values
+            if event.ticket_id in scope_tickets and event.trace_id in scope_traces
+        ]
         changed = True
         while changed:
             changed = False
@@ -68,7 +76,56 @@ def query_events(
                         changed = True
         direct = [event for event in scoped if event.action_id in selected]
     direct.sort(key=lambda event: (event.global_seq is None, event.global_seq or 0))
+    if query.cursor:
+        direct = [event for event in direct if (event.global_seq or 0) > query.cursor]
     return direct[: query.limit]
+
+
+def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
+    """Report incomplete causal data without inventing relationships."""
+    values = list(events)
+    ids = {event.action_id for event in values}
+    missing = sorted(
+        {
+            event.parent_action_id
+            for event in values
+            if event.parent_action_id and event.parent_action_id not in ids
+        }
+    )
+    cycles: list[str] = []
+    for event in values:
+        seen: set[str] = set()
+        current = event
+        while current.parent_action_id:
+            if current.action_id in seen:
+                cycles.append(event.action_id)
+                break
+            seen.add(current.action_id)
+            parent = next(
+                (item for item in values if item.action_id == current.parent_action_id),
+                None,
+            )
+            if parent is None:
+                break
+            current = parent
+    seqs = sorted(item.global_seq for item in values if item.global_seq is not None)
+    gaps = [
+        number
+        for left, right in zip(seqs, seqs[1:])
+        for number in range(left + 1, right)
+    ]
+    return {
+        "missing_parents": missing,
+        "cycles": sorted(set(cycles)),
+        "sequence_gaps": gaps,
+        "indeterminate_operations": sorted(
+            event.action_id
+            for event in values
+            if event.action.type.value == "operation"
+            and event.outcome is not None
+            and event.outcome.value == "indeterminate"
+        ),
+    }
 
 
 def _matches(event: TraceEventV1, query: TraceQuery) -> bool:
@@ -85,6 +142,8 @@ def _matches(event: TraceEventV1, query: TraceQuery) -> bool:
         (query.lifecycle_state, event.lifecycle.state.value),
         (query.outcome, event.outcome.value if event.outcome else None),
         (query.producer_component, event.producer.component),
+        (query.retry_kind, event.lifecycle.retry_kind.value),
+        (query.idempotency_outcome, event.idempotency.outcome.value),
     )
     if any(expected is not None and expected != actual for expected, actual in checks):
         return False
