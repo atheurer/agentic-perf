@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import threading
 from urllib.parse import quote as url_quote
@@ -26,6 +27,13 @@ _DENYLIST = frozenset(
 
 _MAX_DEPTH = 20
 _MAX_NODES = 10_000
+
+# Only bootstrap values whose names clearly identify credentials.  This keeps
+# process startup from treating arbitrary application configuration as secret.
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:^AGENTIC_PERF_API_TOKEN$|(?:TOKEN|PASSWORD|SECRET|API_KEY|"
+    r"CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY)$)"
+)
 
 _SENSITIVE_JSON_KEYS = frozenset(
     {
@@ -341,3 +349,20 @@ _shared_redactor = Redactor()
 
 def get_shared_redactor() -> Redactor:
     return _shared_redactor
+
+
+def bootstrap_shared_redactor_from_environment(ticket_id: str | None = None) -> None:
+    """Register credential-shaped environment values in this process.
+
+    Stdio MCP children intentionally do not receive secrets through trace
+    metadata.  They inherit only the environment already required to run and
+    use this narrow name allowlist to make those values available to the same
+    redactor used by providers, progress, payloads, and errors.
+    """
+    scope = ticket_id or os.environ.get("TICKET_ID")
+    if not scope:
+        return
+    redactor = get_shared_redactor()
+    for name, value in os.environ.items():
+        if value and _SENSITIVE_ENV_NAME.search(name):
+            redactor.register(scope, f"env/{name}", value)

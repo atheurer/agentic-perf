@@ -20,7 +20,10 @@ from mcp import McpError
 from mcp.types import ErrorData
 from pydantic import TypeAdapter
 
-from providers.redaction import get_shared_redactor
+from providers.redaction import (
+    bootstrap_shared_redactor_from_environment,
+    get_shared_redactor,
+)
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -487,6 +490,7 @@ class MCPAuditMiddleware(Middleware):
 
 def create_ticket_mcp(server_name: str) -> FastMCP:
     """Create the required audited FastMCP instance for a local ticket server."""
+    bootstrap_shared_redactor_from_environment()
     middleware = MCPAuditMiddleware(server_name)
 
     @asynccontextmanager

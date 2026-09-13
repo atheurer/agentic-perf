@@ -904,7 +904,9 @@ def build_secrets_provider():
     with a vault layer when Bitwarden Secrets Manager is configured
     in ``~/.agentic-perf/config.json``.
     """
+    from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
+    from providers.secrets.recording import RecordingSecretsProvider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
     config: dict[str, Any] = {}
@@ -927,18 +929,29 @@ def build_secrets_provider():
                 server_url=bw_config.get("server_url"),
                 cache_ttl_seconds=bw_config.get("cache_ttl_seconds", 60),
             )
-            return CascadingSecretsProvider(
+            provider = CascadingSecretsProvider(
                 [
                     ("shared", local),
                     ("vault:shared", vault),
                 ]
+            )
+            ticket_id = os.environ.get("TICKET_ID")
+            return (
+                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
+                if ticket_id
+                else provider
             )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
 
-    return local
+    ticket_id = os.environ.get("TICKET_ID")
+    return (
+        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        if ticket_id
+        else local
+    )
 
 
 def _load_vault_config() -> dict | None:
@@ -1281,8 +1294,7 @@ def _emit_tool_progress_event(
 ) -> None:
     """Record a tool_progress event through the canonical trace store.
 
-    Applies pattern-only redaction (no value registry — the MCP
-    subprocess has no access to the orchestrator's secret registry).
+    Applies the child process's shared value and pattern registry.
     """
     from paths import TRACE_DB_PATH
     from providers.event_projection import legacy_to_trace

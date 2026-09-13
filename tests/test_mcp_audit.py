@@ -64,17 +64,25 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         await asyncio.wait_for(serve_task, 5)
         pytest.fail("temporary state-store did not start")
     counter = tmp_path / "handler-count"
+    sentinel = "cross-process-secret-sentinel-786"
+    monkeypatch.setenv("MCP_TEST_TOKEN", sentinel)
     script = tmp_path / "ticket_server.py"
     script.write_text(
         textwrap.dedent(f"""\
         from pathlib import Path
         from agents.mcp_audit import create_ticket_mcp
+        from agents.server_utils import _emit_tool_progress
+        import os
         mcp = create_ticket_mcp("ticket-audit")
         @mcp.tool()
         async def execute_benchmark() -> str:
             path = Path({str(counter)!r})
             path.write_text(str(int(path.read_text() if path.exists() else "0") + 1))
-            return "X" * 5000
+            _emit_tool_progress("PERF-786", "benchmark", os.environ["MCP_TEST_TOKEN"])
+            return os.environ["MCP_TEST_TOKEN"] + ("X" * 5000)
+        @mcp.tool()
+        async def fail_with_secret() -> str:
+            raise RuntimeError(os.environ["MCP_TEST_TOKEN"])
         if __name__ == "__main__":
             mcp.run()
     """)
@@ -107,7 +115,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         result = await asyncio.wait_for(
             first.call_tool("execute_benchmark", {}, trace), 15
         )
-        assert result == "X" * 5000
+        assert result == sentinel + ("X" * 5000)
         await asyncio.wait_for(first.disconnect(), 10)
         await asyncio.wait_for(
             second.connect_ticket_server(
@@ -123,7 +131,8 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         replay = await asyncio.wait_for(
             second.call_tool("execute_benchmark", {}, trace), 15
         )
-        assert replay == result
+        assert sentinel not in replay
+        assert replay == "[REDACTED:env/MCP_TEST_TOKEN]" + ("X" * 5000)
         assert counter.read_text() == "1"
         assert first_pid and second_pid and first_pid != second_pid
         await asyncio.to_thread(recorder.flush)
@@ -144,6 +153,30 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
             and e.mcp.server_pid in {first_pid, second_pid}
             for e in events
         )
+        with pytest.raises(Exception):
+            await asyncio.wait_for(
+                second.call_tool(
+                    "fail_with_secret",
+                    {},
+                    trace.model_copy(
+                        update={
+                            "mcp_correlation_request_id": "exception-secret",
+                            "idempotency_key": None,
+                            "idempotency_request_hash": None,
+                        }
+                    ),
+                ),
+                15,
+            )
+        await asyncio.to_thread(recorder.flush)
+        surfaces = []
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                try:
+                    surfaces.append(path.read_bytes())
+                except OSError:
+                    pass
+        assert all(sentinel.encode() not in content for content in surfaces)
     finally:
         await asyncio.wait_for(first.disconnect(), 10)
         await asyncio.wait_for(second.disconnect(), 10)
