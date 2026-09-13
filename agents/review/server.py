@@ -21,8 +21,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_crucible_context_gateway,
     build_repo_cache,
@@ -36,7 +35,7 @@ from agents.server_utils import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("review-agent")
+mcp = create_ticket_mcp("review-agent")
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 

@@ -55,10 +55,24 @@ def canonicalize_payload(
 class PayloadBlobStore:
     """Private redacted blob files, addressed by their safe content hash."""
 
-    def __init__(self, directory: Path = TRACE_PAYLOAD_DIR) -> None:
-        self.directory = Path(directory)
+    def __init__(
+        self, directory: Path = TRACE_PAYLOAD_DIR, *, ticket_id: str | None = None
+    ) -> None:
+        root = Path(directory)
+        if ticket_id is not None:
+            # Ticket IDs are an immutable scope, never a caller-controlled path.
+            if (
+                not ticket_id
+                or Path(ticket_id).name != ticket_id
+                or ticket_id in {".", ".."}
+            ):
+                raise PayloadStorageError("invalid ticket payload scope")
+            root = root / ticket_id
+        self.directory = root
 
-    def put(self, content: bytes) -> str:
+    def put(self, content: bytes, *, max_bytes: int | None = None) -> str:
+        if max_bytes is not None and len(content) > max_bytes:
+            raise PayloadStorageError("payload exceeds quota")
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
         digest = hashlib.sha256(content).hexdigest()
@@ -98,6 +112,33 @@ class PayloadBlobStore:
                 pass
         os.chmod(target, 0o600)
         return f"sha256:{digest}"
+
+    def get(self, ref: str, *, max_bytes: int) -> bytes:
+        """Read a private content-addressed payload after strict verification."""
+        if not ref.startswith("sha256:") or len(ref) != 71:
+            raise PayloadStorageError("invalid payload reference")
+        target = self.directory / ref.removeprefix("sha256:")
+        try:
+            if (
+                target.parent != self.directory
+                or target.is_symlink()
+                or not target.is_file()
+            ):
+                raise PayloadStorageError("unsafe payload reference")
+            directory_mode = self.directory.stat().st_mode
+            if directory_mode & 0o077 or target.stat().st_mode & 0o077:
+                raise PayloadStorageError(
+                    "payload exceeds policy or has unsafe permissions"
+                )
+            content = target.read_bytes()
+            if (
+                len(content) > max_bytes
+                or hashlib.sha256(content).hexdigest() != ref[7:]
+            ):
+                raise PayloadStorageError("payload integrity check failed")
+            return content
+        except OSError as exc:
+            raise PayloadStorageError("could not read payload") from exc
 
     def _fsync_directory(self) -> None:
         fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -172,7 +213,7 @@ class PayloadBuilder:
             # preview can never exceed the byte budget.
             preview = redacted[: self.inline_bytes].decode("utf-8", errors="ignore")
             blob_ref = (
-                self.blob_store.put(redacted)
+                self.blob_store.put(redacted, max_bytes=1_048_576)
                 if truncated and not binary_omitted
                 else None
             )

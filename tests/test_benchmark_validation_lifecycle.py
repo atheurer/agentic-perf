@@ -13,7 +13,9 @@ from agents.benchmark.server import (
     _execution_plan_fingerprint,
     _get_validated_runfile,
     _runfile_fingerprint,
+    _validation_output_descriptor,
 )
+from providers.redaction import get_shared_redactor
 from state_store.api.router import api_router
 from state_store.api.validations import (
     create_validation,
@@ -68,6 +70,21 @@ def _ticket(store: TicketStore) -> str:
     return store.create_ticket(
         CreateTicketRequest(summary="validate", description="validate")
     ).id
+
+
+def test_validation_output_uses_shared_redactor_for_all_persisted_surfaces():
+    ticket_id = "PERF-shared-validation-redaction"
+    sentinel = "arbitrary-non-regex-secret-821"
+    get_shared_redactor().register(ticket_id, "provider/value", sentinel)
+    descriptor = _validation_output_descriptor(ticket_id, sentinel * 300)
+    encoded = str(descriptor)
+    assert sentinel not in encoded
+    assert "REDACTED" in encoded
+    assert descriptor["blob_ref"]
+    from paths import TRACE_PAYLOAD_DIR
+
+    blob = TRACE_PAYLOAD_DIR / descriptor["blob_ref"].split(":", 1)[1]
+    assert sentinel.encode() not in blob.read_bytes()
 
 
 def test_sequential_validations_are_immutable_and_exact_id_addressable(tmp_path):

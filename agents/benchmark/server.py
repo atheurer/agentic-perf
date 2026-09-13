@@ -28,8 +28,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _emit_context_audit_event,
     _public_context_document,
@@ -51,7 +50,7 @@ from providers.execution import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("benchmark-agent")
+mcp = create_ticket_mcp("benchmark-agent")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
@@ -167,11 +166,11 @@ def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]
     Keep their content behind the same redaction, size-bound, and
     content-addressed-blob policy used by trace producers.
     """
-    from providers.redaction import Redactor
+    from providers.redaction import get_shared_redactor
     from providers.tracing import PayloadBuilder
 
     return (
-        PayloadBuilder(Redactor())
+        PayloadBuilder(get_shared_redactor())
         .build(
             ticket_id,
             output,
