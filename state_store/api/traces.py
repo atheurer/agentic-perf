@@ -240,18 +240,96 @@ def export(
 
 
 @query_router.get("/tickets/{ticket_id}")
-def ticket_trace(ticket_id: str, request: Request) -> dict[str, object]:
-    return query(request, ticket_id=ticket_id)
+def ticket_trace(
+    ticket_id: str,
+    request: Request,
+    trace_id: str | None = None,
+    invocation_id: str | None = None,
+    action_id: str | None = None,
+    parent_action_id: str | None = None,
+    action_type: str | None = None,
+    lifecycle_state: str | None = None,
+    outcome: str | None = None,
+    producer_component: str | None = None,
+    causal: bool = False,
+    cursor: int = Query(0, ge=0),
+    include_payloads: bool = False,
+    limit: int = Query(1000, ge=1, le=10000),
+) -> dict[str, object]:
+    return query(
+        request,
+        ticket_id=ticket_id,
+        trace_id=trace_id,
+        invocation_id=invocation_id,
+        action_id=action_id,
+        parent_action_id=parent_action_id,
+        action_type=action_type,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        producer_component=producer_component,
+        causal=causal,
+        cursor=cursor,
+        include_payloads=include_payloads,
+        limit=limit,
+    )
 
 
 @query_router.get("/invocations/{invocation_id}")
-def invocation_trace(invocation_id: str, request: Request) -> dict[str, object]:
-    return query(request, invocation_id=invocation_id)
+def invocation_trace(
+    invocation_id: str,
+    request: Request,
+    ticket_id: str | None = None,
+    trace_id: str | None = None,
+    action_id: str | None = None,
+    causal: bool = False,
+    cursor: int = Query(0, ge=0),
+    include_payloads: bool = False,
+    limit: int = Query(1000, ge=1, le=10000),
+) -> dict[str, object]:
+    return query(
+        request,
+        invocation_id=invocation_id,
+        ticket_id=ticket_id,
+        trace_id=trace_id,
+        action_id=action_id,
+        causal=causal,
+        cursor=cursor,
+        include_payloads=include_payloads,
+        limit=limit,
+    )
 
 
 @query_router.get("/actions/{action_id}")
-def action_trace(action_id: str, request: Request) -> dict[str, object]:
-    return query(request, action_id=action_id)
+def action_trace(
+    action_id: str,
+    request: Request,
+    ticket_id: str | None = None,
+    trace_id: str | None = None,
+    invocation_id: str | None = None,
+    parent_action_id: str | None = None,
+    action_type: str | None = None,
+    lifecycle_state: str | None = None,
+    outcome: str | None = None,
+    causal: bool = False,
+    cursor: int = Query(0, ge=0),
+    include_payloads: bool = False,
+    limit: int = Query(1000, ge=1, le=10000),
+) -> dict[str, object]:
+    return query(
+        request,
+        action_id=action_id,
+        ticket_id=ticket_id,
+        trace_id=trace_id,
+        invocation_id=invocation_id,
+        parent_action_id=parent_action_id,
+        action_type=action_type,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        causal=causal,
+        cursor=cursor,
+        include_payloads=include_payloads,
+        limit=limit,
+    )
 
 
 async def _service_principal(request: Request) -> Principal:

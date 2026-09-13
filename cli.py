@@ -1414,11 +1414,15 @@ def main():
     p_trace.add_argument("ticket_id", nargs="?", help="Ticket ID")
     p_trace.add_argument("--ticket-id", dest="ticket_id_option")
     p_trace.add_argument("--trace-id", help="Restrict results to a trace")
-    p_trace.add_argument("--action-id", help="Restrict results to an action")
+    p_trace.add_argument(
+        "--action",
+        "--action-id",
+        dest="action_id",
+        help="Restrict results to an action",
+    )
     p_trace.add_argument("--invocation")
     p_trace.add_argument("--type", dest="action_type")
     p_trace.add_argument("--outcome")
-    p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument("--lifecycle-state")
     p_trace.add_argument(
         "--causal", action="store_true", help="Include ancestors and descendants"
