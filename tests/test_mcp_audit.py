@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import os
 import socket
+import subprocess
 import sys
 import textwrap
 import uuid
@@ -11,7 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import uvicorn
 from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.tools.base import ToolResult
 from mcp import McpError
@@ -23,7 +24,6 @@ from providers.redaction import get_shared_redactor
 from providers.tracing import LifecycleState, TraceContext
 from providers.tracing.client import TraceClient
 from state_store.trace_store import TraceStore
-from tests.test_trace_ingestion import make_app
 
 
 def _free_port() -> int:
@@ -41,14 +41,41 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
     tmp_path, monkeypatch
 ):
     """A real ticket server replays a large protected result after restart."""
-    app = make_app(tmp_path)
+    # Keep the spawned state store's persistence root separate from the test
+    # process.  In particular, importing/initializing a parent app must never
+    # hold the lock needed by the child process.
+    store_home = tmp_path / "state-store"
+    store_home.mkdir()
     port = _free_port()
-    server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    store_env = os.environ | {
+        "AGENTIC_PERF_HOME": str(store_home),
+        "AGENTIC_PERF_API_TOKEN": "service",
+        "STORE_PORT": str(port),
+    }
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "state_store.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=store_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    serve_task = asyncio.create_task(server.serve())
     base_url = f"http://127.0.0.1:{port}"
     for _ in range(100):
+        if server.poll() is not None:
+            output = server.stdout.read() if server.stdout else ""
+            pytest.fail(f"temporary state-store exited during startup: {output}")
         try:
             import httpx
 
@@ -61,9 +88,10 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
             pass
         await asyncio.sleep(0.03)
     else:
-        server.should_exit = True
-        await asyncio.wait_for(serve_task, 5)
-        pytest.fail("temporary state-store did not start")
+        output = server.stdout.read() if server.stdout else ""
+        server.terminate()
+        server.wait(timeout=5)
+        pytest.fail(f"temporary state-store did not start: {output}")
     counter = tmp_path / "handler-count"
     sentinel = "cross-process-secret-sentinel-786"
     monkeypatch.setenv("MCP_TEST_TOKEN", sentinel)
@@ -90,7 +118,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
     )
     monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
     monkeypatch.setenv("STATE_STORE_URL", base_url)
-    monkeypatch.setenv("AGENTIC_PERF_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENTIC_PERF_HOME", str(store_home))
     recorder = TraceClient(base_url, "service", spool_dir=tmp_path / "client-spool")
     trace = TraceContext(
         ticket_id="PERF-786",
@@ -138,7 +166,7 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         assert counter.read_text() == "1"
         assert first_pid and second_pid and first_pid != second_pid
         await asyncio.to_thread(recorder.flush)
-        with TraceStore(tmp_path / "trace.db") as store:
+        with TraceStore(store_home / "trace.db") as store:
             operation = store.get_operation("mcp-786")
             assert operation and operation.state == "terminal"
             descriptor = operation.result_descriptor["operation_result"]
@@ -184,9 +212,12 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         await asyncio.wait_for(first.disconnect(), 10)
         await asyncio.wait_for(second.disconnect(), 10)
         await asyncio.to_thread(recorder.close)
-        server.should_exit = True
-        await asyncio.wait_for(serve_task, 10)
-        app.state.trace_store.close()
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
 
 
 def _request(

@@ -248,6 +248,8 @@ async def test_ticket_server_connection_injects_required_context():
             "STATE_STORE_URL": "http://state-store:8090",
             "AGENT_NAME": "triage-agent",
         },
+        ticket_id="PERF-12345678",
+        agent_id="triage-agent",
     )
 
 
