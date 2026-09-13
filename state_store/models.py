@@ -236,6 +236,34 @@ _VALIDATION_RESERVED_FIELDS = frozenset(
     }
 )
 
+# These fields are written only by the managed-instance import and reviewed
+# resume flows.  Generic field updates must not be able to erase the fixture
+# boundary or forge its provenance.
+IMPORTED_FIXTURE_RESERVED_FIELDS = frozenset(
+    {
+        "imported_fixture",
+        "imported_fixture_reviewed",
+        "import_provenance",
+        "resume_requires_review",
+    }
+)
+
+
+def imported_fixture_reserved_field(key: object) -> bool:
+    """Return whether a key names protected fixture control metadata.
+
+    Normalize separators and casing so JSON aliases such as camelCase or
+    hyphenated names cannot evade the generic update guard.  Callers recurse
+    through nested custom-field objects separately.
+    """
+    if not isinstance(key, str):
+        return False
+    normalized = "".join(character for character in key.lower() if character.isalnum())
+    return any(
+        normalized == "".join(character for character in field if character.isalnum())
+        for field in IMPORTED_FIXTURE_RESERVED_FIELDS
+    )
+
 
 class InvalidationReason(str, Enum):
     RELEVANT_PARAMETERS_CHANGED = "relevant_parameters_changed"

@@ -37,6 +37,7 @@ from .models import (
     Ticket,
     TicketStatus,
     TransitionRequest,
+    imported_fixture_reserved_field,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,11 @@ class TicketStore:
                 raise ValueError(
                     "benchmark validation fields are immutable; use the validations API"
                 )
+            if self._contains_imported_fixture_reserved_field(fields):
+                raise ValueError(
+                    "imported fixture control and provenance fields are immutable; "
+                    "use import-state or the reviewed resume operation"
+                )
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
@@ -381,6 +387,22 @@ class TicketStore:
             )
             self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
+
+    @staticmethod
+    def _contains_imported_fixture_reserved_field(value: object) -> bool:
+        """Find protected fixture metadata at any nested update path."""
+        if isinstance(value, dict):
+            return any(
+                imported_fixture_reserved_field(key)
+                or TicketStore._contains_imported_fixture_reserved_field(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(
+                TicketStore._contains_imported_fixture_reserved_field(item)
+                for item in value
+            )
+        return False
 
     @staticmethod
     def _validation_manifest(ticket: Ticket) -> dict:

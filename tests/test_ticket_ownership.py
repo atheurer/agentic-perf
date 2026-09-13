@@ -502,6 +502,40 @@ class TestImportedFixtureResumeAuthorization:
             == "deployment"
         )
 
+    def test_ordinary_writer_cannot_mutate_fixture_controls_or_claim(
+        self, admin_client, app
+    ):
+        user_token = _create_user(admin_client, "alice")
+        response = admin_client.post(
+            "/api/v1/tickets",
+            json={
+                "summary": "fixture",
+                "description": "fixture",
+                "custom_fields": {"imported_fixture": True},
+            },
+        )
+        response.raise_for_status()
+        ticket_id = response.json()["id"]
+        writer = _user_client(app, user_token)
+        for fields in (
+            {"imported_fixture": False},
+            {"imported_fixture_reviewed": {"reviewed_by": "attacker"}},
+            {"import_provenance": {}},
+            {"custom_fields": {"imported_fixture": False}},
+            {"importedFixture": False},
+        ):
+            response = writer.patch(
+                f"/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": fields},
+            )
+            assert response.status_code == 422
+
+        response = writer.post(
+            f"/api/v1/tickets/{ticket_id}/claim",
+            json={"owner": "attacker", "duration_seconds": 300},
+        )
+        assert response.status_code == 409
+
 
 class TestLegacyMode:
     """When multi_user=False, all write gating is disabled."""

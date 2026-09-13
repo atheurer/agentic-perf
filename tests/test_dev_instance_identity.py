@@ -152,3 +152,32 @@ def test_imported_fixture_requires_review_before_dispatch_or_resume(
         resumed.custom_fields["imported_fixture_reviewed"]["reviewed_by"] == "reviewer"
     )
     assert store.claim_ticket(ticket.id, "test-owner")["owner"] == "test-owner"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"imported_fixture": False},
+        {"imported_fixture_reviewed": {"reviewed_by": "attacker"}},
+        {"import_provenance": {}},
+        {"custom_fields": {"imported_fixture": False}},
+        {"importedFixture": False},
+    ],
+)
+def test_generic_updates_cannot_mutate_fixture_controls(
+    tmp_path: Path, fields: dict
+) -> None:
+    store = TicketStore(persist_dir=tmp_path / "store")
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="fixture",
+            description="fixture",
+            custom_fields={"imported_fixture": True},
+        )
+    )
+
+    with pytest.raises(ValueError, match="fixture control"):
+        store.update_fields(ticket.id, fields)
+    assert store.get_ticket(ticket.id).custom_fields == {"imported_fixture": True}
+    with pytest.raises(TicketDispatchBlocked, match="non-dispatchable"):
+        store.claim_ticket(ticket.id, "attacker")
