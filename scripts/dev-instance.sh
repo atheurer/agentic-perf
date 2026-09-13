@@ -13,6 +13,8 @@
 #   ./scripts/dev-instance.sh stop --name issue-123
 #   ./scripts/dev-instance.sh cleanup --name issue-123
 #   ./scripts/dev-instance.sh commit --name issue-123 -m "fix: ..."
+#   ./scripts/dev-instance.sh import-state --source NAME --destination NAME \
+#       --ticket PERF-123   # dry-run; add --apply to write
 
 set -euo pipefail
 
@@ -33,6 +35,7 @@ Commands:
   stop --name NAME
   test --name NAME [-- pytest arguments]
   validate --name NAME
+  import-state --source NAME --destination NAME --ticket ID [--apply]
   commit --name NAME -m MESSAGE
   cleanup --name NAME [--delete-state] [--delete-branch] [--force]
 
@@ -50,6 +53,7 @@ Prepare options:
   --delete-state       Delete the isolated runtime directory during cleanup
   --delete-branch      Delete the local branch during cleanup
   --force              Allow removal of dirty worktrees or active state
+  --dangerous-default  Permit an intentional test using the default port 8090
   --yes                Do not prompt before deleting state
   -h, --help           Show this help
 EOF
@@ -80,6 +84,13 @@ delete_branch=0
 force=0
 yes=0
 include_default=0
+dangerous_default=0
+source_name=""
+destination_name=""
+apply_import=0
+ticket_ids=()
+
+identity_helper="$script_repo/scripts/dev_instance_identity.py"
 
 instance_paths() {
     [ -n "$name" ] || die "--name is required"
@@ -194,6 +205,8 @@ prepare() {
     write_config
     printf '%s\n' "$worktree" > "$instance_home/worktree.path"
     printf '%s\n' "$clone_mode" > "$instance_home/clone.mode"
+    python3 "$identity_helper" create --home "$instance_home" \
+        --worktree "$worktree" --name "$name" --port "$port"
 
     cat <<EOF
 Prepared isolated instance.
@@ -268,8 +281,14 @@ list_one_instance() {
 
 list_instances() {
     local found=0
+    local -a endpoints=()
+    local -a fingerprints=()
     if [ "$include_default" -eq 1 ] && [ -d "$HOME/.agentic-perf" ]; then
         list_one_instance "default" "$HOME/.agentic-perf"
+        if [ -f "$HOME/.agentic-perf/config.json" ]; then
+            endpoints+=("$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("state_store", {}).get("url", ""))' "$HOME/.agentic-perf/config.json" 2>/dev/null || true)")
+            fingerprints+=("$(python3 -c 'import hashlib,sys; from pathlib import Path; p=Path(sys.argv[1]); print(hashlib.sha256(p.read_bytes().strip()).hexdigest()[:12] if p.is_file() else "")' "$HOME/.agentic-perf/secrets/api-token" 2>/dev/null || true)")
+        fi
         found=1
     fi
     if [ -d "$home_root" ]; then
@@ -277,9 +296,25 @@ list_instances() {
         for ap_home in "$home_root"/*; do
             [ -d "$ap_home" ] || continue
             list_one_instance "$(basename "$ap_home")" "$ap_home"
+            if [ -f "$ap_home/identity.manifest.json" ]; then
+                endpoints+=("$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("url", ""))' "$ap_home/identity.manifest.json" 2>/dev/null || true)")
+                fingerprints+=("$(python3 -c 'import hashlib,sys; from pathlib import Path; p=Path(sys.argv[1]); print(hashlib.sha256(p.read_bytes().strip()).hexdigest()[:12] if p.is_file() else "")' "$ap_home/secrets/api-token" 2>/dev/null || true)")
+            fi
             found=1
         done
     fi
+    for endpoint in "${endpoints[@]}"; do
+        [ -n "$endpoint" ] || continue
+        if [ "$(printf '%s\n' "${endpoints[@]}" | grep -Fxc "$endpoint")" -gt 1 ]; then
+            echo "WARNING: endpoint collision detected for $endpoint"
+        fi
+    done
+    for fingerprint in "${fingerprints[@]}"; do
+        [ -n "$fingerprint" ] || continue
+        if [ "$(printf '%s\n' "${fingerprints[@]}" | grep -Fxc "$fingerprint")" -gt 1 ]; then
+            echo "WARNING: token fingerprint collision detected ($fingerprint; token value withheld)"
+        fi
+    done
     [ "$found" -eq 1 ] || echo "No managed instances found."
 }
 
@@ -287,6 +322,7 @@ run_instance_command() {
     instance_paths
     [ -d "$worktree" ] || die "worktree not found: $worktree"
     [ -f "$config" ] || die "instance config not found: $config"
+    identity_validate
     instance_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")"
     AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$instance_url" \
         "$worktree/scripts/start-bg.sh" "$@"
@@ -297,6 +333,12 @@ load_instance() {
     [ -d "$worktree" ] || die "worktree not found: $worktree"
     [ -f "$config" ] || die "instance config not found: $config"
     instance_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")"
+}
+
+identity_validate() {
+    local args=(validate --home "$instance_home" --worktree "$worktree" --name "$name")
+    [ "$dangerous_default" -eq 1 ] && args+=(--dangerous-default)
+    python3 "$identity_helper" "${args[@]}"
 }
 
 instance_services_running() {
@@ -347,6 +389,7 @@ PY
 
 open_shell() {
     load_instance
+    identity_validate
     local prompt_name="$name"
     if [[ "$name" =~ ^issue-([0-9]+) ]]; then
         prompt_name="issue-${BASH_REMATCH[1]}"
@@ -430,6 +473,23 @@ cleanup() {
     fi
 }
 
+import_state() {
+    [ -n "$source_name" ] || die "import-state requires --source NAME"
+    [ -n "$destination_name" ] || die "import-state requires --destination NAME"
+    [ "$source_name" != "$destination_name" ] || die "source and destination must differ"
+    local source_home="$home_root/$source_name"
+    local destination_home="$home_root/$destination_name"
+    [ -d "$source_home" ] || die "source instance not found: $source_name"
+    [ -d "$destination_home" ] || die "destination instance not found: $destination_name"
+    local args=(import-state --source-home "$source_home" --destination-home "$destination_home")
+    local ticket
+    for ticket in "${ticket_ids[@]}"; do
+        args+=(--ticket "$ticket")
+    done
+    [ "$apply_import" -eq 1 ] && args+=(--apply)
+    python3 "$identity_helper" "${args[@]}"
+}
+
 parse_common() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -444,8 +504,13 @@ parse_common() {
             --delete-state) delete_state=1; shift ;;
             --delete-branch) delete_branch=1; shift ;;
             --force) force=1; shift ;;
+            --dangerous-default) dangerous_default=1; shift ;;
             --yes) yes=1; shift ;;
             --include-default) include_default=1; shift ;;
+            --source) source_name="${2:?missing value for --source}"; shift 2 ;;
+            --destination) destination_name="${2:?missing value for --destination}"; shift 2 ;;
+            --ticket) ticket_ids+=("${2:?missing value for --ticket}"); shift 2 ;;
+            --apply) apply_import=1; shift ;;
             --issue) issue="${2:?missing value for --issue}"; shift 2 ;;
             --base) base="${2:?missing value for --base}"; shift 2 ;;
             -m|--message) message="${2:?missing value for --message}"; shift 2 ;;
@@ -474,21 +539,25 @@ case "$command_name" in
     test)
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
+        identity_validate
         AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/test.sh" "${extra_args[@]}"
         ;;
     validate)
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
+        identity_validate
         AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/validate.sh"
         ;;
     commit)
         instance_paths
+        identity_validate
         [ -n "$message" ] || die "commit requires -m MESSAGE"
         git -C "$worktree" add -A
         git -C "$worktree" commit -m "$message"
         ;;
+    import-state) import_state ;;
     cleanup) cleanup ;;
     *) die "unknown command: $command_name" ;;
 esac
