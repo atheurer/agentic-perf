@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import uuid
@@ -18,14 +20,16 @@ from providers.tracing import (
     LifecycleDescriptor,
     LifecycleState,
     OperationOutcome,
+    PayloadDescriptor,
     TraceEventV1,
     child_context,
     current_trace_context,
 )
 
-from .audit import AuditLog
+from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
 from .models import (
+    _VALIDATION_RESERVED_FIELDS,
     VALID_TRANSITIONS,
     AddCommentRequest,
     Comment,
@@ -134,6 +138,9 @@ class TicketStore:
         with self._lock:
             self._global_seq += 1
             custom_fields = dict(request.custom_fields)
+            protected = _VALIDATION_RESERVED_FIELDS.intersection(custom_fields)
+            if protected:
+                raise ValueError("benchmark validation fields are reserved")
             verbatim = parse_verbatim_directives(request.description)
             if verbatim:
                 custom_fields["verbatim_directives"] = verbatim
@@ -315,6 +322,11 @@ class TicketStore:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
+            protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
+            if protected:
+                raise ValueError(
+                    "benchmark validation fields are immutable; use the validations API"
+                )
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
@@ -325,6 +337,246 @@ class TicketStore:
             )
             self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
+
+    @staticmethod
+    def _validation_manifest(ticket: Ticket) -> dict:
+        """Return the canonical validation manifest, migrating legacy data once.
+
+        The old overwrite-only field is retained as a display compatibility
+        snapshot, but is never used for authorization after this migration.
+        """
+        manifest = ticket.custom_fields.get("benchmark_validations")
+        if isinstance(manifest, dict) and isinstance(manifest.get("records"), dict):
+            return manifest
+        legacy = ticket.custom_fields.get("benchmark_validation")
+        records: dict[str, dict] = {}
+        active_id = None
+        if isinstance(legacy, dict) and isinstance(legacy.get("validation_id"), str):
+            active_id = legacy["validation_id"]
+            record = dict(legacy)
+            record["record_type"] = "legacy_validation"
+            record["state"] = "legacy_unapproved"
+            record.setdefault("created_at", ticket.updated_at.isoformat())
+            record.setdefault("creator", {"migration": "legacy_benchmark_validation"})
+            if isinstance(record.get("run_file"), dict):
+                record.setdefault(
+                    "runfile_fingerprint",
+                    hashlib.sha256(
+                        json.dumps(
+                            record["run_file"], sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest(),
+                )
+            records[active_id] = record
+        manifest = {
+            "schema_version": 1,
+            "version": 0,
+            "active_validation_id": active_id,
+            "records": records,
+        }
+        ticket.custom_fields["benchmark_validations"] = manifest
+        return manifest
+
+    def _validation_conflict(self, ticket: Ticket, manifest: dict) -> dict:
+        return {
+            "current_version": manifest["version"],
+            "active_validation_id": manifest.get("active_validation_id"),
+        }
+
+    def create_validation(
+        self, ticket_id: str, record: dict, expected_version: int
+    ) -> tuple[Ticket | None, dict | None]:
+        """Append a validation record iff the caller observed this manifest version."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            manifest = self._validation_manifest(ticket)
+            # Append-only validation evidence is safe to merge: concurrent
+            # controller successes must not be thrown away merely because the
+            # active-pointer version advanced.  Only a duplicate ID conflicts.
+            validation_id = record.get("validation_id")
+            if isinstance(validation_id, str) and validation_id in manifest["records"]:
+                existing = manifest["records"][validation_id]
+                request_hash = hashlib.sha256(
+                    json.dumps(
+                        record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode()
+                ).hexdigest()
+                existing_hash = existing.get("_validation_record_hash")
+                if existing_hash is None:
+                    legacy = {
+                        key: value
+                        for key, value in existing.items()
+                        if key
+                        not in {
+                            "record_type",
+                            "state",
+                            "ticket_id",
+                            "created_at",
+                            "_validation_record_hash",
+                        }
+                    }
+                    existing_hash = hashlib.sha256(
+                        json.dumps(
+                            legacy,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    ).hexdigest()
+                if existing_hash == request_hash:
+                    return ticket.model_copy(), None
+                self._audit_log(
+                    "create_validation_rejected",
+                    ticket_id,
+                    self._validation_conflict(ticket, manifest),
+                )
+                self._trace_mutation(
+                    ticket_id,
+                    "create_validation",
+                    rejected=True,
+                    attributes=self._validation_conflict(ticket, manifest),
+                )
+                return None, self._validation_conflict(ticket, manifest)
+            if (
+                not isinstance(validation_id, str)
+                or not validation_id
+                or validation_id in manifest["records"]
+            ):
+                raise ValueError("validation_id must be a new non-empty identifier")
+            run_file = record.get("run_file")
+            if not isinstance(run_file, dict):
+                raise ValueError("validation record requires a run_file")
+            runfile_digest = hashlib.sha256(
+                json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if record.get("runfile_fingerprint") != runfile_digest:
+                raise ValueError("runfile fingerprint does not match")
+            plan = ticket.custom_fields.get("execution_plan", {})
+            steps = plan.get("steps", []) if isinstance(plan, dict) else []
+            index = plan.get("current_step", 0) if isinstance(plan, dict) else 0
+            params = (
+                steps[index].get("params", {})
+                if isinstance(index, int) and index < len(steps)
+                else {}
+            )
+            plan_digest = hashlib.sha256(
+                json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if record.get("execution_plan_fingerprint") != plan_digest:
+                raise ValueError("execution plan fingerprint does not match")
+            intent = {
+                "runfile": runfile_digest,
+                "params": plan_digest,
+                "harness": record.get("harness"),
+                "controller": record.get("controller"),
+                "run_command": record.get("run_command"),
+            }
+            if (
+                record.get("execution_intent_digest")
+                != hashlib.sha256(
+                    json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ):
+                raise ValueError("execution intent digest does not match")
+            immutable = dict(record)
+            immutable["_validation_record_hash"] = hashlib.sha256(
+                json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode()
+            ).hexdigest()
+            immutable["record_type"] = "validation"
+            immutable["state"] = "executable"
+            immutable["ticket_id"] = ticket_id
+            immutable.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+            immutable.setdefault("creator", get_actor())
+            manifest["records"][validation_id] = immutable
+            manifest["active_validation_id"] = validation_id
+            manifest["version"] += 1
+            ticket.custom_fields["validated_run_file"] = immutable
+            ticket.updated_at = datetime.now(timezone.utc)
+            descriptor = PayloadDescriptor.model_validate(
+                immutable["validation_output"]
+            )
+            if self._trace_store is not None and descriptor.digest:
+                self._trace_store.put_payload_descriptor(descriptor)
+            self._persist_ticket(ticket)
+            attrs = {
+                "ticket_id": ticket_id,
+                "validation_id": validation_id,
+                "version": manifest["version"],
+                "runfile_fingerprint": immutable["runfile_fingerprint"],
+                "execution_intent_digest": immutable["execution_intent_digest"],
+                "execution_plan_fingerprint": immutable["execution_plan_fingerprint"],
+                "validator_command": immutable["validator_command"],
+                "validator_version": immutable["validator_version"],
+                "validation_output": immutable["validation_output"],
+                "creator": immutable["creator"],
+            }
+            self._audit_log("create_validation", ticket_id, attrs)
+            self._trace_mutation(ticket_id, "create_validation", attributes=attrs)
+            return ticket.model_copy(), None
+
+    def supersede_validation(
+        self,
+        ticket_id: str,
+        validation_id: str,
+        replacement_validation_id: str | None,
+        reason: str,
+        expected_version: int,
+    ) -> tuple[Ticket | None, dict | None]:
+        """Append, rather than mutate, the evidence that retires a validation."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            manifest = self._validation_manifest(ticket)
+            if manifest["version"] != expected_version:
+                self._audit_log(
+                    "supersede_validation_rejected",
+                    ticket_id,
+                    self._validation_conflict(ticket, manifest),
+                )
+                self._trace_mutation(
+                    ticket_id,
+                    "supersede_validation",
+                    rejected=True,
+                    attributes=self._validation_conflict(ticket, manifest),
+                )
+                return None, self._validation_conflict(ticket, manifest)
+            if validation_id not in manifest["records"]:
+                raise ValueError("unknown validation_id")
+            if (
+                replacement_validation_id
+                and replacement_validation_id not in manifest["records"]
+            ):
+                raise ValueError("unknown replacement_validation_id")
+            supersession_id = f"sup-{uuid.uuid4().hex}"
+            manifest["records"][supersession_id] = {
+                "record_type": "supersession",
+                "state": "superseded",
+                "validation_id": supersession_id,
+                "supersedes_validation_id": validation_id,
+                "replacement_validation_id": replacement_validation_id,
+                "reason": reason,
+                "writer": get_actor(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if manifest.get("active_validation_id") == validation_id:
+                manifest["active_validation_id"] = replacement_validation_id
+            manifest["version"] += 1
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            attrs = {
+                "validation_id": validation_id,
+                "replacement_validation_id": replacement_validation_id,
+                "reason": reason,
+                "version": manifest["version"],
+            }
+            self._audit_log("supersede_validation", ticket_id, attrs)
+            self._trace_mutation(ticket_id, "supersede_validation", attributes=attrs)
+            return ticket.model_copy(), None
 
     def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
         with self._lock:
@@ -603,6 +855,14 @@ class TicketStore:
         for path in sorted(self._persist_dir.glob("PERF-*.json")):
             try:
                 ticket = Ticket.model_validate_json(path.read_text(encoding="utf-8"))
+                if "benchmark_validations" not in ticket.custom_fields and isinstance(
+                    ticket.custom_fields.get("benchmark_validation"), dict
+                ):
+                    self._validation_manifest(ticket)
+                    self._persist_ticket(ticket)
+                    self._audit_log(
+                        "migrate_benchmark_validation", ticket.id, {"version": 0}
+                    )
                 self._tickets[ticket.id] = ticket
                 if ticket.transition_seq > self._global_seq:
                     self._global_seq = ticket.transition_seq
