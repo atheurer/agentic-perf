@@ -15,6 +15,7 @@ from typing import Any, Literal
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from agents.mcp_stdio import audited_stdio_client
 from providers.llm.base import ToolDefinition
 from providers.tracing import (
     ActionDescriptor,
@@ -204,7 +205,8 @@ class AgentMCPClient:
             args=args or [],
             env=merged_env,
         )
-        transport_cm = stdio_client(params)
+        pid_holder: list[int] = []
+        transport_cm = audited_stdio_client(params, pid_holder.append, stdio_client)
         await self._connect_transport(
             name,
             transport_cm,
@@ -212,6 +214,7 @@ class AgentMCPClient:
             endpoint=command,
             ticket_id=ticket_id,
             agent_id=agent_id,
+            subprocess_pid_holder=pid_holder,
         )
 
     async def connect_sse(
@@ -320,6 +323,7 @@ class AgentMCPClient:
         endpoint: str | None,
         ticket_id: str | None = None,
         agent_id: str | None = None,
+        subprocess_pid_holder: list[int] | None = None,
     ) -> None:
         """Shared connection logic for all transports.
 
@@ -367,16 +371,12 @@ class AgentMCPClient:
         async def _hold_connection() -> None:
             try:
                 async with transport_cm as streams:
-                    process = getattr(transport_cm, "process", None)
-                    pid = getattr(process, "pid", getattr(transport_cm, "pid", None))
-                    if isinstance(pid, int):
-                        conn.subprocess_pid = pid
-                        conn.subprocess_pid_capture = "captured"
-                    elif transport == "stdio":
-                        conn.subprocess_pid_capture = "unavailable_from_sdk"
                     read_stream = streams[0]
                     write_stream = streams[1]
                     async with ClientSession(read_stream, write_stream) as session:
+                        if subprocess_pid_holder:
+                            conn.subprocess_pid = subprocess_pid_holder[0]
+                            conn.subprocess_pid_capture = "captured"
                         self._record_boundary(
                             conn, LifecycleState.REQUEST_SENT, tool_name="initialize"
                         )
