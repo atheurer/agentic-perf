@@ -143,6 +143,23 @@ def _validation_creator() -> dict[str, Any]:
     }
 
 
+def _validation_identity_headers(creator: dict[str, Any]) -> dict[str, str]:
+    """Propagate the trace identity required to spend a validation capability."""
+    headers = {
+        "X-Agentic-Perf-Agent-Id": str(creator.get("agent_id", "benchmark")),
+        "X-Agentic-Perf-Invocation-Id": str(creator.get("invocation_id", "")),
+        "X-Agentic-Perf-Action-Id": str(creator.get("action_id", "")),
+        "X-Agentic-Perf-Request-Id": str(creator.get("request_id", "")),
+    }
+    for key, header in (
+        ("session_id", "X-Agentic-Perf-Session-Id"),
+        ("session_epoch", "X-Agentic-Perf-Session-Epoch"),
+    ):
+        if creator.get(key):
+            headers[header] = str(creator[key])
+    return {key: value for key, value in headers.items() if value}
+
+
 def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]:
     """Return the only validation-output representation safe to persist.
 
@@ -207,6 +224,7 @@ async def _persist_validated_runfile(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "creator": _validation_creator(),
     }
+    creator = record["creator"]
     _validation_records[validation_id] = record
 
     state_store_url = os.environ.get(
@@ -234,7 +252,8 @@ async def _persist_validated_runfile(
                 headers={
                     "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
                         "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
-                    )
+                    ),
+                    **_validation_identity_headers(creator),
                 },
             )
             capability_response.raise_for_status()
@@ -253,6 +272,7 @@ async def _persist_validated_runfile(
                     },
                     headers={
                         "X-Agentic-Perf-Validation-Capability": capability,
+                        **_validation_identity_headers(creator),
                     },
                 )
                 if response.status_code != 409:

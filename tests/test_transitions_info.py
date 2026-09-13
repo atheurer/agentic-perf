@@ -24,7 +24,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def app(store):
-    application = create_app()
+    application = create_app(initialize_immediately=True)
     application.state.store = store
     return application
 

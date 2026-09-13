@@ -32,7 +32,7 @@ def event_bus(tmp_path):
 
 @pytest.fixture
 def app(store, event_bus):
-    application = create_app()
+    application = create_app(initialize_immediately=True)
     application.state.store = store
     application.state.event_bus = event_bus
     return application

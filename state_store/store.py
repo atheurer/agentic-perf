@@ -398,14 +398,34 @@ class TicketStore:
             validation_id = record.get("validation_id")
             if isinstance(validation_id, str) and validation_id in manifest["records"]:
                 existing = manifest["records"][validation_id]
-                if all(
-                    existing.get(field) == record.get(field)
-                    for field in (
-                        "runfile_fingerprint",
-                        "execution_intent_digest",
-                        "validation_output",
-                    )
-                ):
+                request_hash = hashlib.sha256(
+                    json.dumps(
+                        record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode()
+                ).hexdigest()
+                existing_hash = existing.get("_validation_record_hash")
+                if existing_hash is None:
+                    legacy = {
+                        key: value
+                        for key, value in existing.items()
+                        if key
+                        not in {
+                            "record_type",
+                            "state",
+                            "ticket_id",
+                            "created_at",
+                            "_validation_record_hash",
+                        }
+                    }
+                    existing_hash = hashlib.sha256(
+                        json.dumps(
+                            legacy,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    ).hexdigest()
+                if existing_hash == request_hash:
                     return ticket.model_copy(), None
                 self._audit_log(
                     "create_validation_rejected",
@@ -461,6 +481,11 @@ class TicketStore:
             ):
                 raise ValueError("execution intent digest does not match")
             immutable = dict(record)
+            immutable["_validation_record_hash"] = hashlib.sha256(
+                json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode()
+            ).hexdigest()
             immutable["record_type"] = "validation"
             immutable["state"] = "executable"
             immutable["ticket_id"] = ticket_id

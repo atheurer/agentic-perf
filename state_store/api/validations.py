@@ -32,16 +32,20 @@ def issue_capability(ticket_id: str, request: Request):
         )
     agent = request.headers.get("X-Agentic-Perf-Agent-Id", "")
     invocation = request.headers.get("X-Agentic-Perf-Invocation-Id", "")
-    if agent != "benchmark" or not invocation:
+    action = request.headers.get("X-Agentic-Perf-Action-Id", "")
+    if agent != "benchmark" or not invocation or not action:
         raise HTTPException(
-            status_code=403, detail="benchmark invocation identity required"
+            status_code=403, detail="benchmark invocation identity and action required"
         )
     nonce = secrets.token_urlsafe(24)
     request.app.state.benchmark_validation_capabilities[nonce] = {
         "ticket_id": ticket_id,
         "agent": agent,
         "invocation": invocation,
-        "action": request.headers.get("X-Agentic-Perf-Action-Id", ""),
+        "action": action,
+        "session": request.headers.get("X-Agentic-Perf-Session-Id", ""),
+        "epoch": request.headers.get("X-Agentic-Perf-Session-Epoch", ""),
+        "request": request.headers.get("X-Agentic-Perf-Request-Id", ""),
         "expires_at": time.monotonic() + 60,
     }
     _store(request)._audit_log(
@@ -58,6 +62,7 @@ def get_validation(ticket_id: str, validation_id: str, request: Request):
         ticket = _store(request).get_ticket(ticket_id)
     except TicketNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    require_write_access(request.state.principal, ticket, request.app.state.multi_user)
     manifest = ticket.custom_fields.get("benchmark_validations", {})
     records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
     record = records.get(validation_id)
@@ -92,7 +97,14 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
             detail="validation creation requires a bound, unexpired capability",
         )
     capability = request.headers.get("X-Agentic-Perf-Validation-Capability", "")
-    grant = request.app.state.benchmark_validation_capabilities.pop(capability, None)
+    grants = request.app.state.benchmark_validation_capabilities
+    grant = grants.get(capability)
+    identity = {
+        "action": request.headers.get("X-Agentic-Perf-Action-Id", ""),
+        "session": request.headers.get("X-Agentic-Perf-Session-Id", ""),
+        "epoch": request.headers.get("X-Agentic-Perf-Session-Epoch", ""),
+        "request": request.headers.get("X-Agentic-Perf-Request-Id", ""),
+    }
     if (
         not grant
         or grant["expires_at"] < time.monotonic()
@@ -100,11 +112,32 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
         or grant["agent"] != request.headers.get("X-Agentic-Perf-Agent-Id", "")
         or grant["invocation"]
         != request.headers.get("X-Agentic-Perf-Invocation-Id", "")
+        or not identity["action"]
+        or grant["action"] != identity["action"]
+        or any(grant[key] != value for key, value in identity.items() if grant[key])
     ):
         raise HTTPException(
             status_code=403,
             detail="validation creation requires a bound, unexpired capability",
         )
+    creator = body.record.creator
+    creator_bindings = {
+        "action": creator.get("action_id", ""),
+        "session": creator.get("session_id", "") or creator.get("mcp_session_id", ""),
+        "epoch": creator.get("epoch", "") or creator.get("session_epoch", ""),
+        "request": creator.get("request_id", ""),
+    }
+    if any(
+        creator_bindings[key] and creator_bindings[key] != grant[key]
+        for key in creator_bindings
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="validation creator identity does not match capability",
+        )
+    # Consume only after every capability binding has been checked.  A rejected
+    # cross-ticket/action request must not burn the caller's valid capability.
+    grants.pop(capability, None)
     canonical_runfile_digest = hashlib.sha256(
         json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

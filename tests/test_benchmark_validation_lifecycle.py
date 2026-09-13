@@ -15,7 +15,7 @@ from agents.benchmark.server import (
     _runfile_fingerprint,
 )
 from state_store.api.router import api_router
-from state_store.api.validations import create_validation
+from state_store.api.validations import create_validation, get_validation
 from state_store.auth import Principal, make_auth_dependency
 from state_store.main import _set_audit_actor
 from state_store.models import CreateTicketRequest, CreateValidationRequest
@@ -220,6 +220,93 @@ def test_user_cannot_forge_controller_validation_post(tmp_path):
     assert error.value.status_code == 403
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("harness", "evil"),
+        ("controller", "evil.controller"),
+        ("params_fingerprint", "b" * 64),
+        ("execution_plan_fingerprint", "b" * 64),
+        ("run_command", "evil --steal-token"),
+        ("validator_command", "evil-validator"),
+        ("validator_version", "evil-version"),
+        ("creator", {"invocation_id": "evil", "request_id": "evil"}),
+        (
+            "validation_output",
+            {
+                "size_bytes": 2,
+                "original_size_bytes": 2,
+                "redacted_size_bytes": 2,
+                "media_type": "text/plain",
+                "digest": "b" * 64,
+                "digest_kind": "sha256",
+                "preview": "ok",
+                "truncated": False,
+                "redaction_applied": False,
+            },
+        ),
+    ],
+)
+def test_duplicate_validation_id_requires_canonical_whole_record_match(
+    tmp_path, field, value
+):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket_id = _ticket(store)
+    original = _record("val-" + "a" * 32)
+    store.create_validation(ticket_id, original, 0)
+    changed = dict(original)
+    changed[field] = value
+    _, conflict = store.create_validation(ticket_id, changed, 0)
+    assert conflict is not None
+    assert (
+        store.get_ticket(ticket_id).custom_fields["benchmark_validations"]["version"]
+        == 1
+    )
+
+
+def test_validation_get_requires_ticket_access_for_multi_user(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket_id = store.create_ticket(
+        CreateTicketRequest(summary="owned", description="owned"),
+        owners=["alice"],
+    ).id
+    record = _record("val-" + "b" * 32)
+    store.create_validation(ticket_id, record, 0)
+
+    def request(principal):
+        return SimpleNamespace(
+            state=SimpleNamespace(principal=principal),
+            app=SimpleNamespace(state=SimpleNamespace(store=store, multi_user=True)),
+        )
+
+    assert (
+        get_validation(
+            ticket_id,
+            record["validation_id"],
+            request(Principal("user", "alice", False)),
+        )["record"]["validation_id"]
+        == record["validation_id"]
+    )
+    with pytest.raises(HTTPException, match="not an owner"):
+        get_validation(
+            ticket_id, record["validation_id"], request(Principal("user", "bob", False))
+        )
+    assert (
+        get_validation(
+            ticket_id,
+            record["validation_id"],
+            request(Principal("user", "admin", True)),
+        )["record"]["validation_id"]
+        == record["validation_id"]
+    )
+    with pytest.raises(HTTPException, match="Anonymous"):
+        get_validation(
+            ticket_id,
+            record["validation_id"],
+            request(Principal("anonymous", "anonymous", False)),
+        )
+
+
 def _app(tmp_path) -> FastAPI:
     class _Trace:
         def insert_event_result(self, event):
@@ -230,6 +317,9 @@ def _app(tmp_path) -> FastAPI:
 
     app = FastAPI()
     app.state.store = TicketStore(tmp_path / "tickets", trace_store=_Trace())
+    # Keep the HTTP authorization test focused and avoid blocking Python 3.14's
+    # worker thread on fsync for this synthetic in-memory application.
+    app.state.store._persist_ticket = lambda ticket: None
     app.state.multi_user = False
     app.state.benchmark_validator_token = "validator"
     app.state.benchmark_validation_capabilities = {}
@@ -264,11 +354,17 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             )
         ).json()["id"]
 
-        def headers(invocation: str = "invocation") -> dict[str, str]:
+        def headers(
+            invocation: str = "invocation",
+            action: str = "action-1",
+            agent: str = "benchmark",
+        ) -> dict[str, str]:
             return auth | {
                 "X-Agentic-Perf-Benchmark-Validator": "validator",
-                "X-Agentic-Perf-Agent-Id": "benchmark",
+                "X-Agentic-Perf-Agent-Id": agent,
                 "X-Agentic-Perf-Invocation-Id": invocation,
+                "X-Agentic-Perf-Action-Id": action,
+                "X-Agentic-Perf-Request-Id": "request-1",
             }
 
         async def capability(ticket_id: str, invocation: str = "invocation") -> str:
@@ -285,13 +381,13 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             cap: str,
             invocation: str = "invocation",
             agent: str = "benchmark",
+            action: str = "action-1",
         ):
             return await client.post(
                 f"/api/v1/tickets/{ticket_id}/validations",
                 json={"record": record, "expected_version": 0},
-                headers=headers(invocation)
+                headers=headers(invocation, action, agent)
                 | {
-                    "X-Agentic-Perf-Agent-Id": agent,
                     "X-Agentic-Perf-Validation-Capability": cap,
                 },
             )
@@ -337,9 +433,15 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
         # A consumed capability cannot be replayed, and is ticket/agent/invocation bound.
         cap = await capability(ticket_one)
         assert (await create(ticket_two, first, cap)).status_code == 403
+        # Invalid scope attempts do not burn a still-valid capability.
+        assert (await create(ticket_one, first, cap)).status_code == 200
         assert (await create(ticket_one, first, cap)).status_code == 403
         cap = await capability(ticket_one)
         assert (await create(ticket_one, first, cap, agent="other")).status_code == 403
+        cap = await capability(ticket_one)
+        assert (
+            await create(ticket_one, first, cap, action="action-2")
+        ).status_code == 403
         cap = await capability(ticket_one)
         app.state.benchmark_validation_capabilities[cap]["expires_at"] = 0
         assert (await create(ticket_one, first, cap)).status_code == 403
