@@ -353,6 +353,16 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
                 headers=auth,
             )
         ).json()["id"]
+        missing_action = await client.post(
+            f"/api/v1/tickets/{ticket_one}/validations/capability",
+            headers=auth
+            | {
+                "X-Agentic-Perf-Benchmark-Validator": "validator",
+                "X-Agentic-Perf-Agent-Id": "benchmark",
+                "X-Agentic-Perf-Invocation-Id": "invocation",
+            },
+        )
+        assert missing_action.status_code == 403
 
         def headers(
             invocation: str = "invocation",
