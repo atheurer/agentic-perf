@@ -26,8 +26,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _emit_context_audit_event,
     _public_context_document,
@@ -49,7 +48,7 @@ from providers.execution import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("benchmark-agent")
+mcp = create_ticket_mcp("benchmark-agent")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
