@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -62,6 +67,24 @@ class TicketStore:
     def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
         if self._audit is not None:
             self._audit.log(mutation, ticket_id, data)
+
+    def _filesystem(self, ticket_id: str) -> AuditedFilesystem:
+        """Return the ticket-owned mutation boundary without exposing host paths."""
+        emit = (
+            self._trace_store.insert_event_result
+            if self._trace_store is not None
+            else durable_filesystem_emitter()
+        )
+        return AuditedFilesystem(
+            RootedPath(
+                self._persist_dir.parent,
+                "ticket",
+                physical_prefix=self._persist_dir.name,
+            ),
+            ticket_id=ticket_id,
+            emit=emit,
+            critical=True,
+        )
 
     def _trace_mutation(
         self,
@@ -520,37 +543,56 @@ class TicketStore:
                     f"Ticket {ticket_id} is {ticket.status.value}, not closed. "
                     "Only closed tickets can be archived."
                 )
-            del self._tickets[ticket_id]
-
-        archive_dir = self._persist_dir.parent / "archive" / "tickets"
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        filesystem = self._filesystem(ticket_id)
+        filesystem.mkdir("archive/tickets")
         archived = []
-
-        ticket_path = self._persist_dir / f"{ticket_id}.json"
-        if ticket_path.exists():
-            dest = archive_dir / f"{ticket_id}.json"
-            ticket_path.rename(dest)
-            archived.append(str(dest))
 
         from paths import LOG_DIR
 
         log_path = LOG_DIR / f"{ticket_id}.jsonl"
         if log_path.exists():
-            log_archive_dir = self._persist_dir.parent / "archive" / "logs"
-            log_archive_dir.mkdir(parents=True, exist_ok=True)
-            dest = log_archive_dir / f"{ticket_id}.jsonl"
-            log_path.rename(dest)
-            archived.append(str(dest))
+            filesystem.mkdir("archive/logs")
+            # Logs are outside the ticket persistence root.  Their move remains
+            # explicitly scoped and emits only ticket-owned logical references.
+            log_filesystem = AuditedFilesystem(
+                RootedPath(LOG_DIR.parent, "ticket"),
+                ticket_id=ticket_id,
+                emit=(
+                    self._trace_store.insert_event_result
+                    if self._trace_store
+                    else durable_filesystem_emitter()
+                ),
+                critical=True,
+            )
+            log_filesystem.rename(
+                f"logs/{ticket_id}.jsonl", f"archive/logs/{ticket_id}.jsonl"
+            )
+            archived.append(f"ticket://archive/logs/{ticket_id}.jsonl")
+
+        # Move the durable ticket record last.  If an earlier companion move
+        # fails, restart still loads the ticket and can safely retry archive.
+        ticket_path = self._persist_dir / f"{ticket_id}.json"
+        if ticket_path.exists():
+            filesystem.rename(
+                f"{self._persist_dir.name}/{ticket_id}.json",
+                f"archive/tickets/{ticket_id}.json",
+            )
+            archived.insert(0, f"ticket://archive/tickets/{ticket_id}.json")
+
+        # Keep the closed ticket reachable if any durable move fails.  This is
+        # intentionally after both moves, so a primary archive failure is not
+        # hidden by an in-memory deletion.
+        with self._lock:
+            self._tickets.pop(ticket_id, None)
 
         logger.info(f"Archived ticket {ticket_id}: {archived}")
         return {"ticket_id": ticket_id, "archived_files": archived}
 
     def _persist_ticket(self, ticket: Ticket) -> None:
-        path = self._persist_dir / f"{ticket.id}.json"
         try:
-            path.write_text(
+            self._filesystem(ticket.id).write(
+                f"{self._persist_dir.name}/{ticket.id}.json",
                 ticket.model_dump_json(indent=2),
-                encoding="utf-8",
             )
         except OSError:
             logger.exception(f"Failed to persist ticket {ticket.id}")

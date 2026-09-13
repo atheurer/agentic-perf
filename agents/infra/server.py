@@ -37,6 +37,11 @@ from agents.server_utils import (
 from agents.server_utils import (
     build_secrets_provider as _build_secrets,
 )
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from providers.ssh import _PID_SENTINEL, SSHExecutor, SSHResult, parse_pid_sentinel
 
 logger = logging.getLogger(__name__)
@@ -213,14 +218,28 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
             }
         )
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
-        f.write(content)
-        local_path = f.name
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        staging = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        name = f"agentic-perf-{ticket_id}-{os.urandom(8).hex()}.tmp"
+        local_path = str(staging.write(name, content))
+    else:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
+            f.write(content)
+            local_path = f.name
 
     try:
         scp_result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     finally:
-        Path(local_path).unlink(missing_ok=True)
+        if ticket_id:
+            staging.unlink(Path(local_path).name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
 
     return json.dumps(
         {

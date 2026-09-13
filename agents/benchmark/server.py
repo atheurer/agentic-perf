@@ -40,7 +40,12 @@ from agents.server_utils import (
     read_skill_documents,
     tool_progress,
 )
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import (
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,20 @@ mcp = FastMCP("benchmark-agent")
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
+
+
+def _write_ticket_staging_file(
+    ticket_id: str, content: str
+) -> tuple[AuditedFilesystem, str, str]:
+    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
+    filesystem = AuditedFilesystem(
+        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+        ticket_id=ticket_id,
+        emit=durable_filesystem_emitter(),
+        critical=True,
+    )
+    name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
+    return filesystem, name, str(filesystem.write(name, content))
 
 
 def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -2791,13 +2810,28 @@ async def execute_benchmark(
     # Default: crucible (and any unknown harness that uses JSON run-files)
     remote_path = f"/tmp/run-file-{run_uuid}.json"
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(run_file, f, indent=2)
-        local_path = f.name
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
+    else:
+        staging = None
+        staging_name = ""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(run_file, f, indent=2)
+            local_path = f.name
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
-    scp_result = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
-    Path(local_path).unlink(missing_ok=True)
+    try:
+        scp_result = await _ssh.copy_to(
+            controller, local_path, remote_path, mutating=True
+        )
+    finally:
+        if staging:
+            staging.unlink(staging_name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
 
     if scp_result.exit_code != 0:
         return json.dumps(
@@ -2971,11 +3005,19 @@ async def validate_benchmark(
     remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
     local_path = ""
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as file:
-            json.dump(run_file, file, indent=2)
-            local_path = file.name
+        ticket_id = os.environ.get("TICKET_ID", "")
+        staging = None
+        staging_name = ""
+        if ticket_id:
+            staging, staging_name, local_path = _write_ticket_staging_file(
+                ticket_id, json.dumps(run_file, indent=2)
+            )
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as file:
+                json.dump(run_file, file, indent=2)
+                local_path = file.name
 
         copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
@@ -3058,7 +3100,10 @@ async def validate_benchmark(
         )
     finally:
         if local_path:
-            Path(local_path).unlink(missing_ok=True)
+            if staging:
+                staging.unlink(staging_name, missing_ok=True)
+            else:
+                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -3274,6 +3319,18 @@ async def execute_boot_time_test(
 
     _ticket_id = os.environ.get("TICKET_ID", "")
     output_dir = create_artifact_dir(_ticket_id, run_uuid)
+    artifact_filesystem = (
+        AuditedFilesystem(
+            RootedPath(
+                output_dir, "artifact", logical_prefix=f"{_ticket_id}/{run_uuid}"
+            ),
+            ticket_id=_ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        if _ticket_id
+        else None
+    )
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -3361,10 +3418,10 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = open(
-                    serial_log_path,
-                    "w",
-                    encoding="utf-8",
+                serial_log_fh = (
+                    artifact_filesystem.open_stream("serial-capture.log")
+                    if artifact_filesystem
+                    else open(serial_log_path, "wb")
                 )
                 serial_proc = await AuditedSubprocessRunner().start(
                     [
@@ -3435,10 +3492,7 @@ async def execute_boot_time_test(
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")
     if serial_log_fh is not None:
-        try:
-            serial_log_fh.close()
-        except Exception:
-            pass
+        serial_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
@@ -3447,7 +3501,10 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            serial_log_path.unlink(missing_ok=True)
+            if artifact_filesystem:
+                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+            else:
+                serial_log_path.unlink(missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -3475,14 +3532,23 @@ async def execute_boot_time_test(
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            metadata_file.write_bytes(meta_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", meta_out)
+            else:
+                metadata_file.write_bytes(meta_out)
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            metadata_file.write_text("{}")
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", "{}")
+            else:
+                metadata_file.write_text("{}")
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        metadata_file.write_text("{}")
+        if artifact_filesystem:
+            artifact_filesystem.write("metadata.json", "{}")
+        else:
+            metadata_file.write_text("{}")
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -3534,7 +3600,10 @@ async def execute_boot_time_test(
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            merged_file.write_bytes(merge_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("merged-results.json", merge_out)
+            else:
+                merged_file.write_bytes(merge_out)
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(
