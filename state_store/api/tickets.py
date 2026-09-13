@@ -203,7 +203,10 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
 
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
-    return store.update_fields(ticket_id, body.fields)
+    try:
+        return store.update_fields(ticket_id, body.fields)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 @router.post("/{ticket_id}/claim")

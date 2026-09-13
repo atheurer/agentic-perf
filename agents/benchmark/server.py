@@ -16,9 +16,11 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,28 @@ def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(mv_params, sort_keys=True).encode()).hexdigest()
 
 
+def _runfile_fingerprint(run_file: dict[str, Any]) -> str:
+    """Return the canonical digest that approval and execution bind to."""
+    encoded = json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validation_creator() -> dict[str, Any]:
+    """Capture the causal caller and MCP server identity with the record."""
+    from providers.tracing import current_trace_context
+
+    context = current_trace_context()
+    return {
+        "agent_id": context.agent_id if context else "",
+        "invocation_id": str(context.invocation_id) if context else "",
+        "action_id": context.action_id if context else "",
+        "request_id": (context.mcp_correlation_request_id if context else "")
+        or os.environ.get("AGENTIC_PERF_REQUEST_ID", ""),
+        "server_pid": os.getpid(),
+        "server_host": socket.gethostname(),
+    }
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
@@ -103,9 +127,12 @@ async def _persist_validated_runfile(
     record = {
         "validation_id": validation_id,
         "run_file": run_file,
+        "runfile_fingerprint": _runfile_fingerprint(run_file),
         "harness": harness,
         "controller": controller,
         "params_fingerprint": params_fingerprint,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "creator": _validation_creator(),
     }
     _validation_records[validation_id] = record
 
@@ -126,16 +153,19 @@ async def _persist_validated_runfile(
             timeout=10.0,
             headers=headers,
         ) as client:
-            response = await client.patch(
-                f"{state_store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {
-                        "benchmark_validation": record,
-                        # Keep this compatibility field for ticket context and
-                        # audit consumers that already display the runfile.
-                        "validated_run_file": record,
-                    }
-                },
+            ticket_response = await client.get(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}",
+            )
+            ticket_response.raise_for_status()
+            manifest = (
+                ticket_response.json()
+                .get("custom_fields", {})
+                .get("benchmark_validations", {})
+            )
+            expected_version = manifest.get("version", 0)
+            response = await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/validations",
+                json={"record": record, "expected_version": expected_version},
             )
             response.raise_for_status()
         logger.info(
@@ -265,16 +295,42 @@ def _get_validated_runfile(
     ticket: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Resolve the exact runfile previously validated for this ticket."""
-    ticket_id = os.environ.get("TICKET_ID", "")
-    if ticket_id:
-        record = ticket.get("custom_fields", {}).get("benchmark_validation")
+    manifest = ticket.get("custom_fields", {}).get("benchmark_validations", {})
+    if isinstance(manifest, dict) and isinstance(manifest.get("records"), dict):
+        records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+        record = records.get(validation_id)
+        if (
+            not isinstance(record, dict)
+            or record.get("record_type", "validation") != "validation"
+        ):
+            return None, "unknown validation token"
+        supersession = next(
+            (
+                item
+                for item in records.values()
+                if isinstance(item, dict)
+                and item.get("record_type") == "supersession"
+                and item.get("supersedes_validation_id") == validation_id
+            ),
+            None,
+        )
+        if supersession:
+            replacement = supersession.get("replacement_validation_id")
+            return None, (
+                "validation token is superseded"
+                + (f"; replacement_validation_id={replacement}" if replacement else "")
+            )
+        if record.get("params_fingerprint") != _compute_params_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is fingerprint-mismatched"
     else:
         record = _validation_records.get(validation_id)
 
     if not isinstance(record, dict):
-        return None, "No validation record exists for this ticket"
+        return None, "unknown validation token"
     if record.get("validation_id") != validation_id:
-        return None, "Validation ID does not match the ticket's latest validation"
+        return None, "unknown validation token"
     if record.get("harness") != harness:
         return None, "Validation was performed for a different harness"
     if record.get("controller") != controller:

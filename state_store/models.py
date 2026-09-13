@@ -213,6 +213,22 @@ class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
 
 
+class CreateValidationRequest(BaseModel):
+    """Create one immutable benchmark-validation record using a manifest CAS."""
+
+    record: dict[str, Any]
+    expected_version: int = Field(ge=0)
+
+
+class SupersedeValidationRequest(BaseModel):
+    """Append an immutable supersession record using a manifest CAS."""
+
+    validation_id: str
+    replacement_validation_id: str | None = None
+    reason: str = Field(min_length=1, max_length=500)
+    expected_version: int = Field(ge=0)
+
+
 class AddCommentRequest(BaseModel):
     author: str
     body: str
