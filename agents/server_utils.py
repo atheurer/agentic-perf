@@ -14,6 +14,7 @@ import shlex
 import sys
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1140,6 +1141,27 @@ async def assert_ticket_active(
     api_token = _state_store_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
+    from agents.fencing import current_fence_context
+
+    fence = current_fence_context()
+    session_id = (
+        fence.session_id
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    )
+    epoch = (
+        str(fence.epoch)
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    )
+    claim_id = fence.claim_id if fence else os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
 
     async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
@@ -1164,6 +1186,82 @@ async def assert_ticket_active(
             "reason": (f"Ticket status is {status}, expected {expected_status}"),
             "ticket_status": status,
         }
+
+    claim = cf.get("claim")
+    requires_fence = bool(expected_status or status == "executing_benchmark")
+    if requires_fence and not isinstance(claim, dict):
+        return {
+            "status": "rejected",
+            "reason": "claim_missing",
+            "ticket_status": status,
+        }
+    if requires_fence and isinstance(claim, dict):
+        try:
+            claim_expires = datetime.fromisoformat(str(claim["expires"]))
+            if claim_expires.tzinfo is None:
+                claim_expires = claim_expires.replace(tzinfo=timezone.utc)
+            if claim_expires <= datetime.now(timezone.utc):
+                return {
+                    "status": "rejected",
+                    "reason": "claim_expired",
+                    "ticket_status": status,
+                }
+            if (
+                not all(
+                    isinstance(claim.get(key), str) and claim.get(key)
+                    for key in ("session_id", "claim_id")
+                )
+                or not isinstance(claim.get("epoch"), int)
+                or claim["epoch"] <= 0
+            ):
+                raise ValueError("malformed claim identity")
+        except (KeyError, TypeError, ValueError):
+            return {
+                "status": "rejected",
+                "reason": "claim_malformed",
+                "ticket_status": status,
+            }
+    if isinstance(claim, dict) and claim.get("session_id"):
+        if (
+            claim.get("session_id") != session_id
+            or str(claim.get("epoch")) != epoch
+            or claim.get("claim_id") != claim_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
+
+        async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
+            lease_response = await client.get(
+                f"{state_store_url}/api/v1/control/orchestrator-lease"
+            )
+            lease_response.raise_for_status()
+            active_lease = lease_response.json().get("lease")
+        try:
+            lease_expires = datetime.fromisoformat(str(active_lease["expires_at"]))
+            if lease_expires.tzinfo is None:
+                lease_expires = lease_expires.replace(tzinfo=timezone.utc)
+            lease_valid = lease_expires > datetime.now(timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            lease_valid = False
+        if (
+            not active_lease
+            or not lease_valid
+            or active_lease.get("session_id") != session_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "not_leader",
+                "ticket_status": status,
+            }
+        if int(active_lease.get("epoch", 0)) != int(epoch):
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
 
     return ticket
 

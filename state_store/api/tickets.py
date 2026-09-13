@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..auth import Principal, require_write_access
 from ..models import (
@@ -11,12 +11,44 @@ from ..models import (
     TicketStatus,
     UpdateFieldsRequest,
 )
-from ..store import TicketDispatchBlocked, TicketNotFound
+from ..store import ClaimFenceError, TicketDispatchBlocked, TicketNotFound
 from .action_hints import after_create
+from .fencing import mutation_fence
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+
+
+async def _require_claim_control(request: Request) -> Principal:
+    """Restrict claim control-plane operations to trusted principals."""
+    principal = getattr(request.state, "principal", None)
+    if principal is None or (principal.kind != "service" and not principal.is_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="ticket claim control requires service or admin authentication",
+        )
+    return principal
+
+
+def _require_process_claim_identity(
+    store, ticket_id: str, body: ClaimRequest, *, require_claim_id: bool = False
+) -> None:
+    """Require an active state-store leader and exact claim attempt identity."""
+    try:
+        store.require_claim_fence(ticket_id, body.session_id, body.epoch)
+        if require_claim_id and not body.claim_id:
+            store.reject_claim_fence(
+                ticket_id,
+                "claim_owned_by_other_session",
+                "claim_id is required for renew/release",
+            )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
+
 
 # Custom fields stripped from list responses to reduce payload size.
 # These are only needed by agents resuming work via the single-ticket
@@ -204,16 +236,42 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     try:
-        return store.update_fields(ticket_id, body.fields)
+        session_id, epoch, claim_id = mutation_fence(request)
+        return store.update_fields(
+            ticket_id,
+            body.fields,
+            session_id=session_id,
+            epoch=epoch,
+            claim_id=claim_id,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
 
-@router.post("/{ticket_id}/claim")
+@router.post("/{ticket_id}/claim", dependencies=[Depends(_require_claim_control)])
 def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, ticket_id, body)
     try:
-        result = store.claim_ticket(ticket_id, body.owner, body.duration_seconds)
+        result = store.claim_ticket(
+            ticket_id,
+            body.owner,
+            body.duration_seconds,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+            instance_name=body.instance_name,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketDispatchBlocked as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except TicketNotFound as e:
@@ -245,21 +303,46 @@ def archive_ticket(ticket_id: str, request: Request):
     return result
 
 
-@router.delete("/{ticket_id}/claim")
+@router.delete("/{ticket_id}/claim", dependencies=[Depends(_require_claim_control)])
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)
     try:
-        released = store.release_claim(ticket_id, body.owner)
+        released = store.release_claim(
+            ticket_id,
+            body.owner,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"released": released}
 
 
-@router.post("/{ticket_id}/claim/renew")
+@router.post("/{ticket_id}/claim/renew", dependencies=[Depends(_require_claim_control)])
 def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
+    _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)
     try:
-        result = store.renew_claim(ticket_id, body.owner, body.duration_seconds)
+        result = store.renew_claim(
+            ticket_id,
+            body.owner,
+            body.duration_seconds,
+            session_id=body.session_id,
+            epoch=body.epoch,
+            claim_id=body.claim_id,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     if result is None:
