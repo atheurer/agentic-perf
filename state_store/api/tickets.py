@@ -20,16 +20,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
-def _require_process_claim_identity(store, body: ClaimRequest) -> None:
-    """Once leadership is active, service claim APIs require its fence fields."""
-    if body.session_id is None and store.get_orchestrator_lease() is not None:
+def _require_process_claim_identity(
+    store, ticket_id: str, body: ClaimRequest, *, require_claim_id: bool = False
+) -> None:
+    """Require an active state-store leader and exact claim attempt identity."""
+    try:
+        store.require_claim_fence(ticket_id, body.session_id, body.epoch)
+        if require_claim_id and not body.claim_id:
+            store.reject_claim_fence(
+                ticket_id,
+                "claim_owned_by_other_session",
+                "claim_id is required for renew/release",
+            )
+    except ClaimFenceError as e:
         raise HTTPException(
             status_code=409,
-            detail={
-                "reason": "not_leader",
-                "message": "session_id and epoch are required for active leadership",
-            },
-        )
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
 
 
 # Custom fields stripped from list responses to reduce payload size.
@@ -218,12 +225,13 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     try:
-        session_id, epoch = mutation_fence(request)
+        session_id, epoch, claim_id = mutation_fence(request)
         return store.update_fields(
             ticket_id,
             body.fields,
             session_id=session_id,
             epoch=epoch,
+            claim_id=claim_id,
         )
     except ClaimFenceError as e:
         raise HTTPException(
@@ -237,7 +245,7 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
 @router.post("/{ticket_id}/claim")
 def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
-    _require_process_claim_identity(store, body)
+    _require_process_claim_identity(store, ticket_id, body)
     try:
         result = store.claim_ticket(
             ticket_id,
@@ -287,7 +295,7 @@ def archive_ticket(ticket_id: str, request: Request):
 @router.delete("/{ticket_id}/claim")
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
-    _require_process_claim_identity(store, body)
+    _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)
     try:
         released = store.release_claim(
             ticket_id,
@@ -309,7 +317,7 @@ def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
 @router.post("/{ticket_id}/claim/renew")
 def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
-    _require_process_claim_identity(store, body)
+    _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)
     try:
         result = store.renew_claim(
             ticket_id,

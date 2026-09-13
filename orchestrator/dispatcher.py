@@ -266,10 +266,7 @@ class Dispatcher:
                             phase="claim_renewal",
                             duration_ms=0,
                         )
-                    self._deposed = True
-                    task = self._tasks.get(ticket_id)
-                    if task is not None and not task.done():
-                        task.cancel()
+                    self.mark_deposed()
                     break
         except asyncio.CancelledError:
             pass

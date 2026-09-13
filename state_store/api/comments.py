@@ -34,9 +34,15 @@ def add_comment(ticket_id: str, body: AddCommentRequest, request: Request):
     if multi_user and principal.kind == "user":
         body = AddCommentRequest(author=principal.username, body=body.body)
 
-    session_id, epoch = mutation_fence(request)
+    session_id, epoch, claim_id = mutation_fence(request)
     try:
-        comment = store.add_comment(ticket_id, body, session_id=session_id, epoch=epoch)
+        comment = store.add_comment(
+            ticket_id,
+            body,
+            session_id=session_id,
+            epoch=epoch,
+            claim_id=claim_id,
+        )
     except ClaimFenceError as e:
         raise HTTPException(
             status_code=409,

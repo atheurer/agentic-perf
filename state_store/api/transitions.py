@@ -35,7 +35,7 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
         )
 
     try:
-        session_id, epoch = mutation_fence(request)
+        session_id, epoch, claim_id = mutation_fence(request)
         result = store.transition_ticket(
             ticket_id,
             body,
@@ -43,6 +43,7 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
             reviewer_authorized=(principal.kind == "service" or principal.is_admin),
             session_id=session_id,
             epoch=epoch,
+            claim_id=claim_id,
         )
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))

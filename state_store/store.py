@@ -382,6 +382,7 @@ class TicketStore:
         triggered_by: str = "system",
         session_id: uuid.UUID | None = None,
         epoch: int | None = None,
+        claim_id: str | None = None,
         reviewer_authorized: bool = False,
     ) -> Ticket:
         with self._lock:
@@ -389,6 +390,7 @@ class TicketStore:
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             self._validate_claim_fence(session_id, epoch, ticket_id)
+            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
 
             new_status = request.status
             current = ticket.status
@@ -561,12 +563,14 @@ class TicketStore:
         fields: dict,
         session_id: uuid.UUID | None = None,
         epoch: int | None = None,
+        claim_id: str | None = None,
     ) -> Ticket:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             self._validate_claim_fence(session_id, epoch, ticket_id)
+            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
             protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
             if protected:
                 raise ValueError(
@@ -866,12 +870,14 @@ class TicketStore:
         request: AddCommentRequest,
         session_id: uuid.UUID | None = None,
         epoch: int | None = None,
+        claim_id: str | None = None,
     ) -> Comment:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             self._validate_claim_fence(session_id, epoch, ticket_id)
+            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
             comment = Comment(
                 id=uuid.uuid4().hex[:8],
                 author=request.author,
@@ -1104,6 +1110,8 @@ class TicketStore:
         session_id: uuid.UUID | None,
         epoch: int | None,
         ticket_id: str,
+        *,
+        require_active: bool = False,
     ) -> None:
         def reject(reason: str, detail: str) -> None:
             self._audit_log(
@@ -1123,7 +1131,7 @@ class TicketStore:
             )
             raise ClaimFenceError(reason, detail)
 
-        if session_id is None and epoch is None:
+        if session_id is None and epoch is None and not require_active:
             return
         if session_id is None or epoch is None:
             reject("not_leader", "session_id and epoch are required")
@@ -1136,6 +1144,56 @@ class TicketStore:
         if lease.session_id != session_id:
             reject("not_leader", "orchestrator session is not the leader")
 
+    def require_claim_fence(
+        self,
+        ticket_id: str,
+        session_id: uuid.UUID | None,
+        epoch: int | None,
+    ) -> None:
+        """Validate a claim API identity, including the active lease requirement."""
+        self._validate_claim_fence(
+            session_id,
+            epoch,
+            ticket_id,
+            require_active=True,
+        )
+
+    def reject_claim_fence(self, ticket_id: str, reason: str, detail: str) -> None:
+        self._audit_log("claim_fence_rejected", ticket_id, {"reason": reason})
+        self._trace_mutation(
+            ticket_id,
+            "claim_fence",
+            rejected=True,
+            attributes={"reason": reason},
+        )
+        raise ClaimFenceError(reason, detail)
+
+    def _validate_ticket_claim(
+        self,
+        ticket_id: str,
+        session_id: uuid.UUID | None,
+        epoch: int | None,
+        claim_id: str | None,
+    ) -> None:
+        if session_id is None and epoch is None and claim_id is None:
+            return
+        ticket = self._tickets.get(ticket_id)
+        claim = ticket.custom_fields.get("claim") if ticket else None
+        if not isinstance(claim, dict) or not claim_id:
+            self.reject_claim_fence(
+                ticket_id, "claim_missing", "ticket claim is missing"
+            )
+        if (
+            claim.get("session_id") != str(session_id)
+            or claim.get("epoch") != epoch
+            or claim.get("claim_id") != claim_id
+        ):
+            self.reject_claim_fence(
+                ticket_id,
+                "claim_owned_by_other_session",
+                "mutation claim fence does not match ticket claim",
+            )
+
     def _validate_claim_owner(
         self,
         existing: dict,
@@ -1146,6 +1204,13 @@ class TicketStore:
     ) -> None:
         if session_id is None:
             return
+        if not claim_id:
+            reason = "claim_owned_by_other_session"
+            self._audit_log("claim_fence_rejected", ticket_id, {"reason": reason})
+            self._trace_mutation(
+                ticket_id, "claim_fence", rejected=True, attributes={"reason": reason}
+            )
+            raise ClaimFenceError(reason, "claim_id is required")
         if (
             existing.get("session_id") != str(session_id)
             or existing.get("epoch") != epoch
