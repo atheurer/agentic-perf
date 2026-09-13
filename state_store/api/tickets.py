@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..auth import Principal, require_write_access
 from ..models import (
@@ -18,6 +18,17 @@ from .fencing import mutation_fence
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+
+
+async def _require_claim_control(request: Request) -> Principal:
+    """Restrict claim control-plane operations to trusted principals."""
+    principal = getattr(request.state, "principal", None)
+    if principal is None or (principal.kind != "service" and not principal.is_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="ticket claim control requires service or admin authentication",
+        )
+    return principal
 
 
 def _require_process_claim_identity(
@@ -242,7 +253,7 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
         raise HTTPException(status_code=422, detail=str(e)) from e
 
 
-@router.post("/{ticket_id}/claim")
+@router.post("/{ticket_id}/claim", dependencies=[Depends(_require_claim_control)])
 def claim_ticket(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     _require_process_claim_identity(store, ticket_id, body)
@@ -292,7 +303,7 @@ def archive_ticket(ticket_id: str, request: Request):
     return result
 
 
-@router.delete("/{ticket_id}/claim")
+@router.delete("/{ticket_id}/claim", dependencies=[Depends(_require_claim_control)])
 def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)
@@ -314,7 +325,7 @@ def release_claim(ticket_id: str, body: ClaimRequest, request: Request):
     return {"released": released}
 
 
-@router.post("/{ticket_id}/claim/renew")
+@router.post("/{ticket_id}/claim/renew", dependencies=[Depends(_require_claim_control)])
 def renew_claim(ticket_id: str, body: ClaimRequest, request: Request):
     store = _get_store(request)
     _require_process_claim_identity(store, ticket_id, body, require_claim_id=True)

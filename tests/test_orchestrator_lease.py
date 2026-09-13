@@ -13,7 +13,7 @@ from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
-from state_store.models import AcquireOrchestratorLeaseRequest
+from state_store.models import AcquireOrchestratorLeaseRequest, CreateTicketRequest
 from state_store.store import OrchestratorLeaseHeld, TicketStore
 
 
@@ -114,6 +114,29 @@ async def test_user_token_cannot_use_or_inspect_control_lease(tmp_path):
         response = await client.post(
             "/api/v1/control/orchestrator-lease/acquire",
             json=_request().model_dump(mode="json"),
+            headers=headers,
+        )
+        assert response.status_code == 403
+        ticket = app.state.store.create_ticket(
+            CreateTicketRequest(summary="claim auth", description="claim auth")
+        )
+        fence = {
+            "owner": "orch",
+            "duration_seconds": 30,
+            "session_id": str(uuid4()),
+            "epoch": 1,
+            "claim_id": "user-must-not-claim",
+        }
+        for method, path in (
+            ("post", f"/api/v1/tickets/{ticket.id}/claim"),
+            ("post", f"/api/v1/tickets/{ticket.id}/claim/renew"),
+        ):
+            response = await getattr(client, method)(path, json=fence, headers=headers)
+            assert response.status_code == 403
+        response = await client.request(
+            "DELETE",
+            f"/api/v1/tickets/{ticket.id}/claim",
+            json=fence,
             headers=headers,
         )
         assert response.status_code == 403

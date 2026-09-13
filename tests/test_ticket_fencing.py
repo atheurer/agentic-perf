@@ -102,3 +102,88 @@ def test_expired_claim_renewal_is_structured_and_audited(tmp_path):
         for mutation, _, data in audit.entries
         if mutation == "claim_fence_rejected"
     )
+
+
+def test_expired_claim_rejects_fenced_mutation_even_with_active_lease(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(CreateTicketRequest(summary="x", description="x"))
+    session = uuid4()
+    lease = store.acquire_orchestrator_lease(_lease(session))
+    claim = store.claim_ticket(
+        ticket.id, "same-hostname", session_id=session, epoch=lease.epoch
+    )
+    store._tickets[ticket.id].custom_fields["claim"]["expires"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    with pytest.raises(ClaimFenceError) as error:
+        store.update_fields(
+            ticket.id,
+            {"note": "must be fenced"},
+            session_id=session,
+            epoch=lease.epoch,
+            claim_id=claim["claim_id"],
+        )
+    assert error.value.reason == "claim_expired"
+
+
+def test_malformed_claim_rejects_fenced_mutation_with_audit(tmp_path):
+    class Audit:
+        def __init__(self):
+            self.entries = []
+
+        def log(self, mutation, ticket_id, data):
+            self.entries.append((mutation, ticket_id, data))
+
+    audit = Audit()
+    store = TicketStore(persist_dir=tmp_path, audit_log=audit)
+    ticket = store.create_ticket(CreateTicketRequest(summary="x", description="x"))
+    session = uuid4()
+    lease = store.acquire_orchestrator_lease(_lease(session))
+    claim = store.claim_ticket(
+        ticket.id, "same-hostname", session_id=session, epoch=lease.epoch
+    )
+    store._tickets[ticket.id].custom_fields["claim"]["epoch"] = "bad"
+    with pytest.raises(ClaimFenceError) as error:
+        store.update_fields(
+            ticket.id,
+            {"note": "must be fenced"},
+            session_id=session,
+            epoch=lease.epoch,
+            claim_id=claim["claim_id"],
+        )
+    assert error.value.reason == "claim_malformed"
+    assert any(
+        data.get("reason") == "claim_malformed"
+        for mutation, _, data in audit.entries
+        if mutation == "claim_fence_rejected"
+    )
+
+
+def test_claim_conflict_is_audited_before_fenced_rejection(tmp_path):
+    class Audit:
+        def __init__(self):
+            self.entries = []
+
+        def log(self, mutation, ticket_id, data):
+            self.entries.append((mutation, ticket_id, data))
+
+    audit = Audit()
+    store = TicketStore(persist_dir=tmp_path, audit_log=audit)
+    ticket = store.create_ticket(CreateTicketRequest(summary="x", description="x"))
+    first = uuid4()
+    lease = store.acquire_orchestrator_lease(_lease(first))
+    store.claim_ticket(ticket.id, "same-hostname", session_id=first, epoch=lease.epoch)
+    with pytest.raises(ClaimFenceError) as error:
+        store.claim_ticket(
+            ticket.id,
+            "other",
+            session_id=first,
+            epoch=lease.epoch,
+            claim_id="two",
+        )
+    assert error.value.reason == "claim_owned_by_other_session"
+    assert any(
+        data.get("reason") == "claim_owned_by_other_session"
+        for mutation, _, data in audit.entries
+        if mutation == "claim_fence_rejected"
+    )

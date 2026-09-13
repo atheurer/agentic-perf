@@ -956,8 +956,20 @@ class TicketStore:
                     )
                 ):
                     if session_id is not None:
+                        reason = "claim_owned_by_other_session"
+                        self._audit_log(
+                            "claim_fence_rejected",
+                            ticket_id,
+                            {"reason": reason},
+                        )
+                        self._trace_mutation(
+                            ticket_id,
+                            "claim_ticket",
+                            rejected=True,
+                            attributes={"reason": reason},
+                        )
                         raise ClaimFenceError(
-                            "claim_owned_by_other_session",
+                            reason,
                             "ticket claim is owned by another orchestrator session",
                         )
                     self._audit_log(
@@ -1182,6 +1194,30 @@ class TicketStore:
         if not isinstance(claim, dict) or not claim_id:
             self.reject_claim_fence(
                 ticket_id, "claim_missing", "ticket claim is missing"
+            )
+        try:
+            expires = datetime.fromisoformat(claim["expires"])
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if expires <= self._lease_now():
+                self.reject_claim_fence(
+                    ticket_id, "claim_expired", "ticket claim has expired"
+                )
+            if (
+                not isinstance(claim["session_id"], str)
+                or not claim["session_id"]
+                or not isinstance(claim["epoch"], int)
+                or isinstance(claim["epoch"], bool)
+                or claim["epoch"] <= 0
+                or not isinstance(claim["claim_id"], str)
+                or not claim["claim_id"]
+            ):
+                raise ValueError("invalid claim identity")
+        except (KeyError, TypeError, ValueError):
+            self.reject_claim_fence(
+                ticket_id,
+                "claim_malformed",
+                "ticket claim identity or expiry is malformed",
             )
         if (
             claim.get("session_id") != str(session_id)
