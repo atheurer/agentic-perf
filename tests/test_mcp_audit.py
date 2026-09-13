@@ -177,7 +177,13 @@ async def test_protected_tool_uses_registry_and_returns_terminal_result():
     registry = SimpleNamespace(
         operation_acquire=lambda *_: {
             "status": "terminal",
-            "operation": {"result_descriptor": {"run_id": "existing"}},
+            "operation": {
+                "result_descriptor": {
+                    "tool_result": ToolResult(content="existing").model_dump(
+                        mode="json"
+                    )
+                }
+            },
         }
     )
     middleware = MCPAuditMiddleware(
@@ -202,7 +208,7 @@ async def test_protected_tool_uses_registry_and_returns_terminal_result():
     )
     handler.assert_not_awaited()
     assert result.is_error is False
-    assert "existing" in str(result.content)
+    assert result.content[0].text == "existing"
     assert events[-1].lifecycle.state == LifecycleState.DUPLICATE_DETECTED
 
 
@@ -241,7 +247,10 @@ async def test_acquired_protected_tool_transitions_legally_and_invokes_once():
         "side-effect-started",
         "complete",
     ]
-    assert "actual response" in transitions[-1][3]["descriptor"]["mcp_result"]
+    assert (
+        transitions[-1][3]["descriptor"]["tool_result"]["content"][0]["text"]
+        == "actual response"
+    )
 
 
 def test_every_local_fastmcp_server_uses_the_shared_factory():

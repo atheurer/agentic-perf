@@ -16,6 +16,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.base import ToolResult
 from mcp import McpError
 from mcp.types import ErrorData
+from pydantic import TypeAdapter
 
 from providers.tracing import (
     ActionDescriptor,
@@ -199,8 +200,15 @@ class MCPAuditMiddleware(Middleware):
 
     @staticmethod
     def _result_descriptor(result: Any) -> dict[str, Any]:
-        content = json.dumps(getattr(result, "content", result), default=str)
-        return {"mcp_result": content[:4096], "truncated": len(content) > 4096}
+        """Serialize the actual FastMCP result, bounded for operation storage."""
+        if not isinstance(result, ToolResult):
+            return {"mcp_result": json.dumps(result, default=str)[:4096]}
+        payload = result.model_dump(mode="json")
+        encoded = json.dumps(payload, sort_keys=True)
+        if len(encoded) > 4096:
+            # A response too large to replay exactly is never silently reused.
+            return {"unreplayable": True, "preview": encoded[:4096]}
+        return {"tool_result": payload}
 
     def _protect_operation(
         self, trace: TraceContext, tool_name: str
@@ -232,8 +240,22 @@ class MCPAuditMiddleware(Middleware):
             )
         status = acquired.get("status")
         if status == "terminal":
+            descriptor = acquired.get("operation", {}).get("result_descriptor", {})
+            payload = descriptor.get("tool_result")
+            if isinstance(payload, dict):
+                from fastmcp.tools.base import ContentBlock
+
+                return None, ToolResult(
+                    content=TypeAdapter(list[ContentBlock]).validate_python(
+                        payload.get("content", [])
+                    ),
+                    structured_content=payload.get("structured_content"),
+                    meta=payload.get("meta"),
+                    is_error=bool(payload.get("is_error")),
+                )
             return None, self._protected_result(
-                acquired.get("operation", {}).get("result_descriptor", {})
+                {"status": "indeterminate", "reason": "cached response unavailable"},
+                is_error=True,
             )
         if status != "acquired":
             return None, self._protected_result(
@@ -391,13 +413,22 @@ class MCPAuditMiddleware(Middleware):
                 int(lease["fencing_generation"]),
                 descriptor=self._result_descriptor(result),
             )
+        terminal_state = (
+            LifecycleState.FAILED
+            if getattr(result, "is_error", False)
+            else LifecycleState.RESPONSE_SENT
+        )
         self._emit(
             trace,
             context.fastmcp_context,
-            LifecycleState.RESPONSE_SENT,
+            terminal_state,
             tool_name=tool_name,
             duration_ms=(time.monotonic() - started) * 1000,
-            outcome=OperationOutcome.SUCCESS,
+            outcome=(
+                OperationOutcome.FAILURE
+                if getattr(result, "is_error", False)
+                else OperationOutcome.SUCCESS
+            ),
         )
         return result
 
