@@ -19,6 +19,7 @@ from mcp.types import CallToolRequestParams, RequestParams
 
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
 from agents.mcp_client import AgentMCPClient, _ServerConnection
+from providers.redaction import get_shared_redactor
 from providers.tracing import LifecycleState, TraceContext
 from providers.tracing.client import TraceClient
 from state_store.trace_store import TraceStore
@@ -239,6 +240,31 @@ async def test_server_records_metadata_and_detects_same_session_replay():
     ]
     assert events[0].mcp.protocol_request_id == "rpc-1"
     assert events[0].mcp.correlation_request_id == "correlation-1"
+
+
+@pytest.mark.asyncio
+async def test_result_redaction_sanitizes_structured_keys_without_collision_loss():
+    sentinel = "structured-key-secret-786"
+    ticket = "PERF-structured-keys"
+    get_shared_redactor().register(ticket, "secret/key", sentinel)
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent", ticket_id=ticket, agent_id="benchmark", record=lambda _: None
+    )
+
+    async def handler(_):
+        return ToolResult(
+            content="safe",
+            structured_content={sentinel: "first", "secret/key": "second"},
+            meta={sentinel: "metadata"},
+        )
+
+    result = await middleware.on_call_tool(
+        _request("structured-keys", ticket=ticket), handler
+    )
+    encoded = result.model_dump_json()
+    assert sentinel not in encoded
+    assert len(result.structured_content) == 2
+    assert len(result.meta) == 1
 
 
 @pytest.mark.asyncio

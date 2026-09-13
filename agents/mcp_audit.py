@@ -55,6 +55,7 @@ _MAX_REPLAY_CACHE = 1024
 _PROTECTED_TOOLS = frozenset({"execute_benchmark"})
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 _MAX_ERROR_MESSAGE_BYTES = 4096
+_MAX_REDACTED_KEY_BYTES = 4096
 
 
 def _meta_values(message: Any) -> dict[str, Any]:
@@ -236,14 +237,37 @@ class MCPAuditMiddleware(Middleware):
             ]
         if isinstance(value, dict):
             block_type = value.get("type")
-            return {
-                key: (
+            sanitized: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, str):
+                    safe_key = get_shared_redactor().redact_string(ticket_id, key)[
+                        :_MAX_REDACTED_KEY_BYTES
+                    ]
+                elif not isinstance(key, (int, float, bool, type(None))):
+                    # Arbitrary object keys cannot be represented safely in MCP
+                    # JSON structures; stringify them without exposing repr data.
+                    safe_key = get_shared_redactor().redact_string(ticket_id, str(key))[
+                        :_MAX_REDACTED_KEY_BYTES
+                    ]
+                else:
+                    safe_key = key
+                # Redaction can map distinct schema keys to one marker. Keep
+                # every field with a deterministic suffix rather than letting
+                # a dict assignment silently discard a value.
+                if safe_key in sanitized:
+                    base = str(safe_key)
+                    index = 2
+                    candidate = f"{base}#{index}"
+                    while candidate in sanitized:
+                        index += 1
+                        candidate = f"{base}#{index}"
+                    safe_key = candidate
+                sanitized[safe_key] = (
                     item
-                    if key == "data" and block_type in {"image", "audio"}
+                    if safe_key == "data" and block_type in {"image", "audio"}
                     else MCPAuditMiddleware._sanitize_value(ticket_id, item)
                 )
-                for key, item in value.items()
-            }
+            return sanitized
         return value
 
     def _sanitize_result(self, trace: TraceContext, result: Any) -> Any:
