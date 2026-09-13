@@ -458,7 +458,17 @@ class TicketStore:
             ticket.custom_fields["validated_run_file"] = immutable
             ticket.updated_at = datetime.now(timezone.utc)
             self._persist_ticket(ticket)
-            attrs = {"validation_id": validation_id, "version": manifest["version"]}
+            attrs = {
+                "ticket_id": ticket_id,
+                "validation_id": validation_id,
+                "version": manifest["version"],
+                "runfile_fingerprint": immutable["runfile_fingerprint"],
+                "execution_intent_digest": immutable["execution_intent_digest"],
+                "execution_plan_fingerprint": immutable["execution_plan_fingerprint"],
+                "validator_command": immutable["validator_command"],
+                "validator_version": immutable["validator_version"],
+                "creator": immutable["creator"],
+            }
             self._audit_log("create_validation", ticket_id, attrs)
             self._trace_mutation(ticket_id, "create_validation", attributes=attrs)
             return ticket.model_copy(), None
