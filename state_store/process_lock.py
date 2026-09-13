@@ -139,5 +139,18 @@ class PersistenceRootLock:
             os.close(self.fd)
             self.fd = None
 
+    def close_inherited(self) -> None:
+        """Discard a descriptor inherited across fork without unlocking it.
+
+        ``flock`` ownership is attached to the inherited open-file description.
+        Unlocking it in a child would also release the parent's process lock.
+        Closing only the child's descriptor leaves the parent's lock intact.
+        """
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        self.session_id = None
+        self.store_id = None
+
     def holder_metadata(self) -> dict[str, object]:
         return _read_metadata(fd=self.fd, path=self.root / STATE_STORE_LOCK_PATH.name)

@@ -286,10 +286,26 @@ def _release_runtime_lock(lock: PersistenceRootLock) -> None:
         lock.release()
 
 
+def _reset_runtime_locks_after_fork() -> None:
+    """Discard parent lock descriptors and cache state in a forked child."""
+    global _runtime_locks_guard
+    for lock, _ in _runtime_locks.values():
+        lock.close_inherited()
+    _runtime_locks.clear()
+    # A thread other than the forking thread may have held the old mutex.
+    _runtime_locks_guard = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_runtime_locks_after_fork)
+
+
 def _start_runtime(app: FastAPI, port: int) -> None:
     """Acquire the root lock before constructing any writable backend."""
     if getattr(app.state, "runtime_initialized", False):
-        return
+        if getattr(app.state, "runtime_pid", None) == os.getpid():
+            return
+        _discard_inherited_runtime(app)
     lock = _acquire_runtime_lock(port)
     app.state.process_lock = lock
     app.state.store_diagnostics = {
@@ -302,6 +318,7 @@ def _start_runtime(app: FastAPI, port: int) -> None:
     try:
         _initialize_runtime(app, port)
         app.state.runtime_initialized = True
+        app.state.runtime_pid = os.getpid()
         logger.info(
             "State store started: store_id=%s session_id=%s root=%s",
             lock.store_id,
@@ -314,8 +331,25 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         raise
 
 
+def _discard_inherited_runtime(app: FastAPI) -> None:
+    """Close fork-inherited backend objects without touching parent locks."""
+    for name in ("event_bus", "audit_log"):
+        adapter = getattr(app.state, name, None)
+        if adapter is not None:
+            adapter.close()
+    trace_store = getattr(app.state, "trace_store", None)
+    if trace_store is not None:
+        trace_store.close()
+    app.state.runtime_initialized = False
+    app.state.runtime_pid = None
+    app.state.process_lock = None
+
+
 def _close_runtime(app: FastAPI) -> None:
     if not getattr(app.state, "runtime_initialized", False):
+        return
+    if getattr(app.state, "runtime_pid", None) != os.getpid():
+        _discard_inherited_runtime(app)
         return
     for name in ("event_bus", "audit_log"):
         adapter = getattr(app.state, name, None)
@@ -323,6 +357,7 @@ def _close_runtime(app: FastAPI) -> None:
             adapter.close()
     app.state.trace_store.close()
     app.state.runtime_initialized = False
+    app.state.runtime_pid = None
     lock = getattr(app.state, "process_lock", None)
     if lock is not None:
         _release_runtime_lock(lock)

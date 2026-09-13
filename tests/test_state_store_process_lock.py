@@ -88,6 +88,59 @@ def test_in_process_initialization_holds_persistence_lock() -> None:
         app.router.on_shutdown[0]()
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_cannot_reuse_parent_lock_or_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    """A fork must use a fresh lock FD, never the parent's open description."""
+    import state_store.main as main
+
+    monkeypatch.setattr(main, "AGENTIC_PERF_HOME", tmp_path)
+    monkeypatch.setattr(main, "TRACE_DB_PATH", tmp_path / "trace.db")
+    parent_app = main.create_app(initialize_immediately=True)
+    read_fd, write_fd = os.pipe()
+    try:
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            try:
+                # Reusing the inherited app must discard inherited backends and
+                # attempt a new lock, which remains held by the parent.
+                main._start_runtime(parent_app, 12345)
+            except Exception as exc:
+                os.write(write_fd, type(exc).__name__.encode())
+            else:
+                os.write(write_fd, b"unexpected-success")
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        result = os.read(read_fd, 256)
+        os.close(read_fd)
+        assert os.waitpid(child, 0)[1] == 0
+        assert result == b"PersistenceRootLockedError"
+    finally:
+        main._close_runtime(parent_app)
+
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            child_app = main.create_app(initialize_immediately=True)
+            assert child_app.state.process_lock.fd is not None
+            main._close_runtime(child_app)
+            os.write(write_fd, b"acquired")
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 256)
+    os.close(read_fd)
+    assert os.waitpid(child, 0)[1] == 0
+    assert result == b"acquired"
+
+
 def test_second_process_same_home_fails_before_writes(tmp_path: Path) -> None:
     first_port = _port()
     first = _start(tmp_path, first_port)
