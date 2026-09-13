@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from dataclasses import dataclass
@@ -192,3 +193,25 @@ def export_events(events: Iterable[TraceEventV1], format: str = "json") -> str:
             )
         return output.getvalue()
     raise ValueError("format must be json, jsonl, or csv")
+
+
+def export_manifest(events: Iterable[TraceEventV1], content: str) -> dict[str, object]:
+    """Return integrity metadata for an export without including payload bytes."""
+    values = list(events)
+    sequences = [event.global_seq for event in values if event.global_seq is not None]
+    digests = sorted(
+        {
+            descriptor.digest
+            for event in values
+            for descriptor in (event.input, event.output)
+            if descriptor and descriptor.digest
+        }
+    )
+    return {
+        "schema_versions": sorted({event.schema_version for event in values}),
+        "first_seq": min(sequences) if sequences else None,
+        "last_seq": max(sequences) if sequences else None,
+        "count": len(values),
+        "blob_digests": digests,
+        "export_digest": hashlib.sha256(content.encode()).hexdigest(),
+    }

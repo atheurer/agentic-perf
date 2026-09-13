@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -10,7 +11,13 @@ from pydantic import BaseModel, Field
 
 from paths import get_instance_name
 from providers.tracing import TraceEventV1
-from providers.tracing.query import TraceQuery, diagnostics, export_events, query_events
+from providers.tracing.query import (
+    TraceQuery,
+    diagnostics,
+    export_events,
+    export_manifest,
+    query_events,
+)
 
 from ..auth import Principal
 from ..trace_store import TraceEventConflictError, TraceStoreWriteError
@@ -118,6 +125,7 @@ def query(
     causal: bool = False,
     limit: int = Query(default=1000, ge=1, le=10000),
     cursor: int = Query(default=0, ge=0),
+    include_payloads: bool = False,
 ) -> dict[str, object]:
     detailed = _authorize_query(request, ticket_id)
     audit_log = getattr(request.app.state, "audit_log", None)
@@ -147,7 +155,9 @@ def query(
         ),
     )
     return {
-        "events": [_event_json(event, detailed) for event in selected],
+        "events": [
+            _event_json(event, detailed and include_payloads) for event in selected
+        ],
         "count": len(selected),
         "next_cursor": selected[-1].global_seq if selected else None,
         "diagnostics": diagnostics(selected) if causal else {},
@@ -172,6 +182,7 @@ def export(
     causal: bool = False,
     limit: int = Query(default=10000, ge=1, le=10000),
     cursor: int = Query(default=0, ge=0),
+    include_payloads: bool = False,
 ) -> Response:
     detailed = _authorize_query(request, ticket_id)
     audit_log = getattr(request.app.state, "audit_log", None)
@@ -203,12 +214,17 @@ def export(
         if format == "csv"
         else ("application/x-ndjson" if format == "jsonl" else "application/json")
     )
-    if not detailed:
+    if not detailed or not include_payloads:
         selected = [
             event.model_copy(update={"input": None, "output": None, "attributes": None})
             for event in selected
         ]
-    return Response(export_events(selected, format), media_type=media)
+    content = export_events(selected, format)
+    response = Response(content, media_type=media)
+    response.headers["X-Trace-Manifest"] = json.dumps(
+        export_manifest(selected, content), separators=(",", ":")
+    )
+    return response
 
 
 @query_router.get("/tickets/{ticket_id}")

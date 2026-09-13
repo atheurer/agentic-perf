@@ -7,7 +7,12 @@ from providers.tracing import (
     LifecycleState,
     TraceEventV1,
 )
-from providers.tracing.query import TraceQuery, export_events, query_events
+from providers.tracing.query import (
+    TraceQuery,
+    export_events,
+    export_manifest,
+    query_events,
+)
 
 
 def test_causal_query_includes_ancestors_and_descendants() -> None:
@@ -38,3 +43,7 @@ def test_export_formats_are_stable() -> None:
     assert '"action_id"' in export_events([event], "json")
     assert export_events([event], "jsonl").endswith("\n")
     assert "global_seq,ticket_id" in export_events([event], "csv")
+    content = export_events([event], "jsonl")
+    manifest = export_manifest([event], content)
+    assert manifest["count"] == 1
+    assert len(manifest["export_digest"]) == 64

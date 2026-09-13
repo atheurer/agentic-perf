@@ -1048,6 +1048,7 @@ def cmd_trace(args):
             "action_type": args.action_type,
             "outcome": args.outcome,
             "causal": args.causal or args.tree,
+            "include_payloads": args.include_payloads,
             "limit": args.limit,
         }.items()
         if value is not None
@@ -1065,11 +1066,13 @@ def cmd_trace(args):
             print(response.text, end="" if response.text.endswith("\n") else "\n")
         return
     payload = response.json()
-    print(
-        json.dumps(payload, indent=2, default=str)
-        if args.json
-        else f"{payload['count']} trace event(s)"
-    )
+    if args.json or args.tree:
+        print(json.dumps(payload, indent=2, default=str))
+    elif args.jsonl:
+        for event in payload.get("events", []):
+            print(json.dumps(event, separators=(",", ":")))
+    else:
+        print(f"{payload['count']} trace event(s)")
 
 
 def cmd_health(args):
@@ -1423,6 +1426,7 @@ def main():
     p_trace.add_argument(
         "--json", action="store_true", help="Print query response as JSON"
     )
+    p_trace.add_argument("--jsonl", action="store_true")
     p_trace.add_argument(
         "--export", action="store_true", help="Export instead of querying"
     )
