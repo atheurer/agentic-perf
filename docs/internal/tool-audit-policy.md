@@ -1,7 +1,7 @@
 # Tool audit policy
 
-`agents/tool_audit_policy.py` is the reviewed inventory of every MCP tool and
-native agent handler exposed to an LLM. `tests/test_tool_audit_policy.py` AST
+`agents/tool_audit_policy.py` is the reviewed inventory of every MCP tool,
+native agent handler, and chat tool exposed to an LLM. `tests/test_tool_audit_policy.py` AST
 discovers the registrations and fails if the inventory is incomplete, contains
 stale entries, or a production FastMCP/native registration bypasses the shared
 audit boundary.
@@ -14,9 +14,11 @@ whose handler directly calls a protected mutating API.
 Concrete production handlers are intentionally not run by the unit suite: many
 require a real ticket, provider credentials, or remote hosts. Each policy entry
 therefore carries a reviewed fixture exemption with owner and expiry. The test
-suite invokes schema-valid synthetic read-only and side-effecting tools through
-the canonical MCP factory and asserts the native dispatcher lifecycle contract.
-The AST checks prove every production registration uses one of those
+suite invokes every discovered MCP name through the canonical factory and every
+`CHAT_TOOLS` name through `ChatToolAudit`; the latter writes a correlated
+`started`/terminal trace pair around the real dispatch branch using the
+embedded state-store's service credential. The AST checks
+prove every production registration uses one of those
 already-tested boundaries. Exemptions are review debt, not a permanent
 allowlist: an expired or unexplained exemption fails CI.
 

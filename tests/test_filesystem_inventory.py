@@ -68,6 +68,33 @@ def _call_name(node: ast.expr) -> str:
     return ""
 
 
+def _import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Map locally-spelled imports back to their protected API names."""
+    aliases: dict[str, str] = {}
+    protected_modules = {"os", "pathlib", "shutil", "tempfile", "tarfile"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name in protected_modules:
+                    aliases[imported.asname or imported.name] = imported.name
+        elif isinstance(node, ast.ImportFrom) and node.module in protected_modules:
+            for imported in node.names:
+                aliases[imported.asname or imported.name] = (
+                    f"{node.module}.{imported.name}"
+                )
+    return aliases
+
+
+def _resolved_call_name(node: ast.expr, aliases: dict[str, str]) -> str:
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Call):
+        constructor = _resolved_call_name(node.value.func, aliases)
+        if constructor == "pathlib.Path" and node.attr == "open":
+            return f"{constructor}.{node.attr}"
+    raw = _call_name(node)
+    root, dot, rest = raw.partition(".")
+    return f"{aliases.get(root, root)}{dot}{rest}" if raw else raw
+
+
 def _mode(node: ast.Call, call: str) -> str | None:
     # Path.open(name, mode) has its mode as the first positional argument,
     # while built-in open/tarfile.open and os.fdopen place mode second.
@@ -147,10 +174,11 @@ def _inventory() -> list[Mutation]:
     for path in paths:
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        aliases = _import_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            call = _call_name(node.func)
+            call = _resolved_call_name(node.func, aliases)
             if _is_mutation(node, call):
                 found.append(Mutation(relative, node.lineno, call))
     return sorted(found, key=lambda item: (item.path, item.line, item.call))
@@ -312,6 +340,21 @@ def _expected_manifest() -> frozenset[Mutation]:
 
 
 EXPECTED_MUTATIONS = _expected_manifest()
+
+
+def test_aliases_cannot_hide_os_open_mutations() -> None:
+    tree = ast.parse(
+        "from os import open as fd_open\nimport os as operating_system\n"
+        "from pathlib import Path as LocalPath\n"
+        "fd_open('created', operating_system.O_CREAT)\n"
+        "operating_system.open('written', operating_system.O_WRONLY)\n"
+        "LocalPath('written').open('w')\n"
+    )
+    aliases = _import_aliases(tree)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    resolved = [_resolved_call_name(node.func, aliases) for node in calls]
+    assert resolved == ["os.open", "os.open", "pathlib.Path.open", "pathlib.Path"]
+    assert all(_is_mutation(node, name) for node, name in zip(calls[:3], resolved[:3]))
 
 
 def test_full_production_mutation_inventory_has_reviewed_exclusions() -> None:

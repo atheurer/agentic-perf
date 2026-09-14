@@ -8,11 +8,22 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
 from providers.llm.base import ToolDefinition
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    MonotonicTimer,
+    OperationOutcome,
+    TraceEventV1,
+    TraceRecorder,
+    child_context,
+    new_trace_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +51,112 @@ DESTRUCTIVE_TOOLS = frozenset(
         "rotate_user_token",
     }
 )
+
+
+class ChatToolAudit:
+    """Durably pair every chat-tool dispatch with a trace lifecycle.
+
+    Chat tools do not inherit :class:`AgentBase`'s loop, so they must not rely
+    on its audit boundary.  This small adapter is the sole production entry
+    point for ``CHAT_TOOLS`` and writes the same trace envelope used by native
+    agents.  Trace delivery deliberately remains best-effort: a temporarily
+    unavailable observability endpoint must not turn a user-approved action
+    into a second attempt.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        store_url: str,
+        auth_token: str,
+        *,
+        record: Callable[[TraceEventV1], Any] | None = None,
+    ) -> None:
+        self._client = client
+        self._store_url = store_url.rstrip("/")
+        self._headers = {"Authorization": f"Bearer {auth_token}"}
+        self._record = record
+
+    async def _emit(
+        self,
+        context: Any,
+        state: LifecycleState,
+        *,
+        tool_name: str,
+        timer: MonotonicTimer | None = None,
+        outcome: OperationOutcome | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        event = TraceRecorder().record(
+            context,
+            ActionType.TOOL,
+            state,
+            phase=tool_name,
+            duration_ms=timer.elapsed_ms() if timer else None,
+            outcome=outcome,
+            error=error,
+            attributes={"tool_surface": "chat"},
+        )
+        try:
+            if self._record is not None:
+                result = self._record(event)
+                if hasattr(result, "__await__"):
+                    await result
+                return
+            response = await self._client.post(
+                f"{self._store_url}/api/v1/traces/events",
+                headers=self._headers,
+                json=event.model_dump(mode="json"),
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.exception("failed to record chat tool audit event")
+
+    async def invoke(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        handler: Callable[[], Awaitable[str]],
+        *,
+        tool_call_id: str | None = None,
+    ) -> str:
+        """Record ``STARTED`` and one terminal event around one named tool."""
+        ticket_id = tool_input.get("ticket_id")
+        root_context = new_trace_context(
+            ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
+            agent_id="chat-agent",
+        )
+        context = child_context(
+            root_context, tool_call_id=tool_call_id or f"chat-{root_context.action_id}"
+        )
+        timer = MonotonicTimer()
+        await self._emit(context, LifecycleState.STARTED, tool_name=tool_name)
+        try:
+            result = await handler()
+        except Exception as exc:
+            await self._emit(
+                context,
+                LifecycleState.FAILED,
+                tool_name=tool_name,
+                timer=timer,
+                outcome=OperationOutcome.FAILURE,
+                error=exc,
+            )
+            raise
+        failed = False
+        try:
+            payload = json.loads(result)
+            failed = isinstance(payload, dict) and "error" in payload
+        except (TypeError, json.JSONDecodeError):
+            pass
+        await self._emit(
+            context,
+            LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
+            tool_name=tool_name,
+            timer=timer,
+            outcome=OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS,
+        )
+        return result
 
 
 def _require(params: dict[str, Any], *keys: str) -> str | None:
@@ -390,50 +507,74 @@ async def execute_tool(
     client: httpx.AsyncClient,
     store_url: str,
     auth_token: str,
+    *,
+    audit: ChatToolAudit | None = None,
+    tool_call_id: str | None = None,
 ) -> str:
-    """Execute a chat tool and return the result as a string."""
+    """Execute a chat tool through its required audit boundary."""
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    try:
-        if tool_name == "search_tickets":
-            return await _search_tickets(client, store_url, headers, tool_input)
-        elif tool_name == "get_ticket":
-            return await _get_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "create_ticket":
-            return await _create_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "start_ticket":
-            return await _start_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "send_interjection":
-            return await _send_interjection(client, store_url, headers, tool_input)
-        elif tool_name == "reply_to_guidance":
-            return await _reply_to_guidance(client, store_url, headers, tool_input)
-        elif tool_name == "list_skills":
-            return _list_skills(tool_input)
-        elif tool_name == "read_skill":
-            return _read_skill(tool_input)
-        elif tool_name == "read_doc":
-            return _read_doc(tool_input)
-        elif tool_name == "list_users":
-            return await _list_users(client, store_url, headers, tool_input)
-        elif tool_name == "create_user":
-            return await _create_user(client, store_url, headers, tool_input)
-        elif tool_name == "rotate_user_token":
-            return await _rotate_user_token(client, store_url, headers, tool_input)
-        elif tool_name == "list_field_options":
-            return await _list_field_options(client, store_url, headers, tool_input)
-        elif tool_name == "update_ticket_fields":
-            return await _update_ticket_fields(client, store_url, headers, tool_input)
-        elif tool_name == "stop_ticket":
-            return await _stop_ticket(client, store_url, headers, tool_input)
-        else:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
-    except Exception as exc:
-        # Sanitize: do not expose internal paths or stack traces
-        msg = str(exc)
-        # Strip file paths and module references
-        if "/" in msg or "\\" in msg:
-            msg = "An internal error occurred"
-        return json.dumps({"error": msg[:200]})
+    async def _dispatch() -> str:
+        try:
+            return await _dispatch_tool(
+                tool_name, tool_input, client, store_url, headers
+            )
+        except Exception as exc:
+            # Sanitize: do not expose internal paths or stack traces
+            msg = str(exc)
+            # Strip file paths and module references
+            if "/" in msg or "\\" in msg:
+                msg = "An internal error occurred"
+            return json.dumps({"error": msg[:200]})
+
+    # Direct unit users may intentionally omit a transport.  Production
+    # ChatAgent always supplies ChatToolAudit, and CI enforces those call sites.
+    return (
+        await audit.invoke(tool_name, tool_input, _dispatch, tool_call_id=tool_call_id)
+        if audit
+        else await _dispatch()
+    )
+
+
+async def _dispatch_tool(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    client: httpx.AsyncClient,
+    store_url: str,
+    headers: dict[str, str],
+) -> str:
+    """Resolve one advertised chat name to its concrete implementation."""
+    if tool_name == "search_tickets":
+        return await _search_tickets(client, store_url, headers, tool_input)
+    elif tool_name == "get_ticket":
+        return await _get_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "create_ticket":
+        return await _create_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "start_ticket":
+        return await _start_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "send_interjection":
+        return await _send_interjection(client, store_url, headers, tool_input)
+    elif tool_name == "reply_to_guidance":
+        return await _reply_to_guidance(client, store_url, headers, tool_input)
+    elif tool_name == "list_skills":
+        return _list_skills(tool_input)
+    elif tool_name == "read_skill":
+        return _read_skill(tool_input)
+    elif tool_name == "read_doc":
+        return _read_doc(tool_input)
+    elif tool_name == "list_users":
+        return await _list_users(client, store_url, headers, tool_input)
+    elif tool_name == "create_user":
+        return await _create_user(client, store_url, headers, tool_input)
+    elif tool_name == "rotate_user_token":
+        return await _rotate_user_token(client, store_url, headers, tool_input)
+    elif tool_name == "list_field_options":
+        return await _list_field_options(client, store_url, headers, tool_input)
+    elif tool_name == "update_ticket_fields":
+        return await _update_ticket_fields(client, store_url, headers, tool_input)
+    elif tool_name == "stop_ticket":
+        return await _stop_ticket(client, store_url, headers, tool_input)
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
 async def _search_tickets(

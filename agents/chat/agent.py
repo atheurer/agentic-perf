@@ -19,7 +19,7 @@ import httpx
 from providers.llm.base import LLMProvider
 
 from .prompts import CHAT_SYSTEM_PROMPT
-from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, execute_tool
+from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, ChatToolAudit, execute_tool
 
 # Default fallback values if provider doesn't expose them
 _DEFAULT_MAX_TOKENS = 4096
@@ -186,12 +186,17 @@ class ChatAgent:
         store_url: str,
         session_store: ChatSessionStore | None = None,
         max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
+        audit_token: str | None = None,
     ) -> None:
         self._llm = llm
         self._store_url = store_url
         self._sessions = session_store or ChatSessionStore()
         self._client = httpx.AsyncClient(timeout=30.0)
         self._max_tool_rounds = max_tool_rounds
+        # The web caller's token may be a restricted user credential. Trace
+        # ingestion is intentionally service-only, so the embedded state-store
+        # supplies its deployment token instead.
+        self._audit_token = audit_token
 
     async def handle_message(
         self,
@@ -230,6 +235,10 @@ class ChatAgent:
                 self._client,
                 self._store_url,
                 auth_token,
+                audit=ChatToolAudit(
+                    self._client, self._store_url, self._audit_token or auth_token
+                ),
+                tool_call_id=action.get("tool_call_id"),
             )
             parsed = json.loads(result)
             if "error" in parsed:
@@ -391,6 +400,7 @@ class ChatAgent:
                     session.pending_action = {
                         "tool": tc.name,
                         "input": tc.input,
+                        "tool_call_id": tc.id,
                     }
                     confirm_msg = (
                         "Here is the ticket I’m ready to create:\n\n"
@@ -420,6 +430,10 @@ class ChatAgent:
                     self._client,
                     self._store_url,
                     auth_token,
+                    audit=ChatToolAudit(
+                        self._client, self._store_url, self._audit_token or auth_token
+                    ),
+                    tool_call_id=tc.id,
                 )
                 tool_results.append(
                     {

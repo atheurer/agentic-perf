@@ -64,12 +64,22 @@ _NATIVE_FIXTURE = FixtureExemption(
         "enforcement proves this registration cannot bypass that dispatcher."
     ),
 )
+_CHAT_FIXTURE = FixtureExemption(
+    owner="chat-maintainers",
+    expires_on="2027-12-31",
+    reason=(
+        "Chat tools use the process-local ChatToolAudit boundary. Its schema-valid "
+        "fixtures exercise every registered chat name without creating tickets, "
+        "changing users, or contacting a live state store. This exemption only "
+        "avoids production effects; it does not exempt the audit boundary."
+    ),
+)
 
 
 def _read_only(
-    *registrations: str, native: bool = False
+    *registrations: str, native: bool = False, chat: bool = False
 ) -> tuple[ToolAuditPolicy, ...]:
-    fixture = _NATIVE_FIXTURE if native else _MCP_FIXTURE
+    fixture = _CHAT_FIXTURE if chat else _NATIVE_FIXTURE if native else _MCP_FIXTURE
     return tuple(
         ToolAuditPolicy(
             registration=registration,
@@ -81,9 +91,9 @@ def _read_only(
 
 
 def _side_effecting(
-    owner: str, *registrations: str, native: bool = False
+    owner: str, *registrations: str, native: bool = False, chat: bool = False
 ) -> tuple[ToolAuditPolicy, ...]:
-    fixture = _NATIVE_FIXTURE if native else _MCP_FIXTURE
+    fixture = _CHAT_FIXTURE if chat else _NATIVE_FIXTURE if native else _MCP_FIXTURE
     return tuple(
         ToolAuditPolicy(
             registration=registration,
@@ -280,9 +290,55 @@ TOOL_AUDIT_POLICY = (
         "agents/triage/agent.py:submit_triage_result",
         native=True,
     ),
+    # Chat is a native LLM tool surface too.  Keep it in this inventory rather
+    # than treating its direct execute_tool dispatch as an out-of-band UI path.
+    *_read_only(
+        "agents/chat/tools.py:search_tickets",
+        "agents/chat/tools.py:get_ticket",
+        "agents/chat/tools.py:list_field_options",
+        "agents/chat/tools.py:list_skills",
+        "agents/chat/tools.py:read_skill",
+        "agents/chat/tools.py:read_doc",
+        "agents/chat/tools.py:list_users",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.ChatToolAudit",
+        "agents/chat/tools.py:create_ticket",
+        "agents/chat/tools.py:start_ticket",
+        "agents/chat/tools.py:send_interjection",
+        "agents/chat/tools.py:reply_to_guidance",
+        "agents/chat/tools.py:update_ticket_fields",
+        "agents/chat/tools.py:stop_ticket",
+        "agents/chat/tools.py:create_user",
+        "agents/chat/tools.py:rotate_user_token",
+        chat=True,
+    ),
 )
 
 POLICY_BY_REGISTRATION = {policy.registration: policy for policy in TOOL_AUDIT_POLICY}
+
+# Every mutating classification points to a concrete implementation that owns
+# the effect.  The CI checker validates this map against both the classified
+# registration and its canonical audit/operation boundary; it prevents a
+# plausible-looking owner label from becoming dead documentation.
+OPERATION_OWNER_CONTRACTS = {
+    "state_store.ticket_transition": "agents/base.py:_transition_ticket",
+    "providers.ssh.SSHExecutor": "providers/ssh.py:SSHExecutor",
+    "agents.mcp_audit.MCPAuditMiddleware.operation_transition": (
+        "agents/mcp_audit.py:MCPAuditMiddleware"
+    ),
+    "providers.execution.AuditedFilesystem": (
+        "providers/execution/filesystem.py:AuditedFilesystem"
+    ),
+    "providers.investigation.repository": "providers/investigation:file",
+    "providers.resource.jumpstarter_lifecycle": "providers/resource:provision",
+    "providers.resource.ResourceProvider.reserve": "providers/resource:reserve",
+    "providers.workspace.manager.WorkspaceManager": (
+        "providers/workspace/manager.py:WorkspaceManager"
+    ),
+    "agents.chat.ChatToolAudit": "agents/chat/tools.py:ChatToolAudit",
+}
 
 # Exceptions are intentionally empty.  Do not add a broad module exemption:
 # an exception must identify the exact symbol and have an accountable expiry.
