@@ -3462,9 +3462,24 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
-        await operation_guard.transition(
-            "prepared", operation_record, descriptor={"intent": immutable_intent}
-        )
+        try:
+            await operation_guard.transition(
+                "prepared", operation_record, descriptor={"intent": immutable_intent}
+            )
+        except Exception:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {"outcome": "indeterminate", "prepare_persist_failed": True},
+            )
+            await operation_guard.close()
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key,
+                    "message": "Execution intent preparation could not be persisted",
+                }
+            )
 
     remote_path = f"/tmp/run-file-{run_uuid}.json"
 
