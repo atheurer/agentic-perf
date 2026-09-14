@@ -197,7 +197,14 @@ class MCPAuditMiddleware(Middleware):
                 if error is not None
                 else None
             ),
-            attributes=attributes,
+            attributes={
+                # These fields make the runtime proof inspect the same
+                # production boundary that the AST inventory permits.
+                "audit_boundary": "MCPAuditMiddleware.on_call_tool",
+                "audit_transport": "local",
+                "causal_ancestor": context.parent_action_id,
+                **(attributes or {}),
+            },
         )
         if self._record is not None:
             self._record(event)
@@ -409,6 +416,55 @@ class MCPAuditMiddleware(Middleware):
             )
         return acquired.get("operation", {}), None
 
+    def _emit_terminal(
+        self,
+        trace: TraceContext,
+        fastmcp_context: Any,
+        state: LifecycleState,
+        *,
+        tool_name: str,
+        duration_ms: float,
+        outcome: OperationOutcome,
+        lease: dict[str, Any] | None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Persist a terminal audit event or make a protected effect explicit.
+
+        A started protected operation cannot safely be presented as completed
+        when the terminal trace acknowledgement is lost.  Mark the operation
+        indeterminate when possible and fail the MCP request so reconciliation
+        is required instead of silently losing the audit pair.
+        """
+        try:
+            self._emit(
+                trace,
+                fastmcp_context,
+                state,
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                error=error,
+            )
+        except Exception as audit_error:
+            if lease is not None and self._client is not None:
+                try:
+                    self._client.operation_transition(
+                        trace.idempotency_key or "",
+                        "indeterminate",
+                        int(lease["fencing_generation"]),
+                        descriptor={"outcome": "terminal_audit_delivery_failed"},
+                    )
+                except Exception:
+                    # The failed response below is deliberately the visible
+                    # signal even if the operation registry is unavailable too.
+                    pass
+            raise McpError(
+                ErrorData(
+                    code=-32000,
+                    message="MCP tool outcome is indeterminate; audit terminal was not persisted",
+                )
+            ) from audit_error
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[Any],
@@ -458,6 +514,15 @@ class MCPAuditMiddleware(Middleware):
                 error=exc,
             )
             raise
+
+        # A ticket-owned MCP process may not execute a tool with no durable
+        # audit transport.  Unit-only servers without ticket identity retain
+        # their in-memory recorder behaviour, but production callers fail
+        # before the handler can cause an effect.
+        if self.ticket_id and self._record is None and self._client is None:
+            raise McpError(
+                ErrorData(code=-32000, message="MCP audit transport is unavailable")
+            )
 
         self._emit(
             trace,
@@ -526,13 +591,14 @@ class MCPAuditMiddleware(Middleware):
                     int(lease["fencing_generation"]),
                     descriptor={"outcome": "cancelled_after_start"},
                 )
-            self._emit(
+            self._emit_terminal(
                 trace,
                 context.fastmcp_context,
                 LifecycleState.CANCELLED,
                 tool_name=tool_name,
                 duration_ms=(time.monotonic() - started) * 1000,
                 outcome=OperationOutcome.CANCELLED,
+                lease=lease,
             )
             raise
         except Exception as exc:
@@ -546,13 +612,14 @@ class MCPAuditMiddleware(Middleware):
                         "type": type(exc).__name__,
                     },
                 )
-            self._emit(
+            self._emit_terminal(
                 trace,
                 context.fastmcp_context,
                 LifecycleState.FAILED,
                 tool_name=tool_name,
                 duration_ms=(time.monotonic() - started) * 1000,
                 outcome=OperationOutcome.FAILURE,
+                lease=lease,
                 error=exc,
             )
             raise self._redacted_exception(trace.ticket_id or "unknown", exc) from exc
@@ -572,7 +639,7 @@ class MCPAuditMiddleware(Middleware):
             if getattr(result, "is_error", False)
             else LifecycleState.RESPONSE_SENT
         )
-        self._emit(
+        self._emit_terminal(
             trace,
             context.fastmcp_context,
             terminal_state,
@@ -583,6 +650,7 @@ class MCPAuditMiddleware(Middleware):
                 if getattr(result, "is_error", False)
                 else OperationOutcome.SUCCESS
             ),
+            lease=lease,
         )
         return result
 

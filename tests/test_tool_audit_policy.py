@@ -132,10 +132,11 @@ def _factory_aliases(tree: ast.AST) -> set[str]:
 def _mcp_registrations() -> tuple[set[Registration], list[str]]:
     registrations: set[Registration] = set()
     violations: list[str] = []
-    # Nested agent packages are first-class capability surfaces.  Scanning all
-    # servers, rather than a hand-picked one-level glob, means a newly added
-    # nested FastMCP service cannot silently escape the manifest.
-    for path in sorted(SERVER_ROOT.rglob("server.py")):
+    # Every importable module under ``agents`` is a capability surface.  A
+    # service need not be named ``server.py`` (and registration wrappers are
+    # often placed beside an agent), so a filename convention must never hide
+    # a new decorator from the policy inventory.
+    for path in sorted(SERVER_ROOT.rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         audited_instances = {
@@ -416,6 +417,10 @@ def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
         exemption = policy.fixture_exemption
         assert exemption.owner and exemption.reason
         assert date.fromisoformat(exemption.expires_on) >= date.today()
+        assert policy.registration in exemption.reason, (
+            "remote fixture exemptions must be per registration, not a broad "
+            f"MCP/native surface waiver: {policy.registration}"
+        )
         if policy.classification == "side_effecting":
             assert policy.operation_owner, policy.registration
             contract = OPERATION_OWNER_CONTRACTS.get(policy.operation_owner)
@@ -760,6 +765,43 @@ async def test_chat_audit_cancellation_emits_terminal_and_preserves_parent() -> 
     ]
     assert {event.trace_id for event in events} == {parent.trace_id}
     assert {event.parent_action_id for event in events} == {parent.action_id}
+
+
+@pytest.mark.asyncio
+async def test_chat_terminal_delivery_failure_is_indeterminate_not_silent() -> None:
+    """A completed mutation cannot quietly lose its terminal audit record."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agents.chat.tools import ChatAuditUnavailable, ChatToolAudit
+
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[response, OSError("trace unavailable")])
+    handler = AsyncMock(return_value='{"status": "ok"}')
+
+    with pytest.raises(ChatAuditUnavailable, match="outcome is indeterminate"):
+        await ChatToolAudit(
+            client, "http://state-store.invalid", "service-token"
+        ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_rejection_terminal_delivery_is_required() -> None:
+    """Confirmation invalidation also has a durable started/rejected pair."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agents.chat.tools import ChatAuditUnavailable, ChatToolAudit
+
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[response, OSError("trace unavailable")])
+    with pytest.raises(ChatAuditUnavailable):
+        await ChatToolAudit(
+            client, "http://state-store.invalid", "service-token"
+        ).reject("create_ticket", {"summary": "safe"})
 
 
 def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:

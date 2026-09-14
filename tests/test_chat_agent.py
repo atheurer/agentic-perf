@@ -440,6 +440,38 @@ class TestHandleMessage:
             for call in agent._client.post.await_args_list
         ] == ["started", "rejected"]
 
+    async def test_unrelated_reply_invalidates_pending_action_with_audit_pair(self):
+        """A stale confirmation cannot disappear without a rejected lifecycle."""
+        from agents.chat.agent import ChatAgent
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        agent._client.post = AsyncMock(return_value=response)
+        session = agent._sessions.get_or_create("alice")
+        session.pending_action = {
+            "tool": "create_ticket",
+            "input": {"summary": "test"},
+            "tool_call_id": "tc-stale",
+        }
+        llm_response = MagicMock(text="fresh response", tool_calls=[], raw_content=[])
+        llm_response.usage = {}
+        llm.complete = AsyncMock(return_value=llm_response)
+
+        assert await agent.handle_message(
+            "alice", "tell me something else", "token"
+        ) == ("fresh response")
+        assert session.pending_action is None
+        assert [
+            call.kwargs["json"]["lifecycle"]["state"]
+            for call in agent._client.post.await_args_list
+        ] == ["started", "rejected"]
+
     async def test_ticket_context_only_first_message(self):
         from agents.chat.agent import ChatAgent
 

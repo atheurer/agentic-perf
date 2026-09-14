@@ -307,7 +307,20 @@ class ChatAgent:
             session.add_assistant_message(cancel_msg)
             return cancel_msg
         elif session.pending_action:
-            # Any other message clears the pending action
+            # Treat an unrelated reply as an explicit invalidation, rather
+            # than silently discarding an agent-visible pending capability.
+            # Keep the pending action until the started/rejected pair is
+            # durable: if the audit service is down, do not continue this
+            # conversation as though no decision had been made.
+            action = session.pending_action
+            await ChatToolAudit(
+                self._client, self._store_url, self._audit_token or ""
+            ).reject(
+                action["tool"],
+                action["input"],
+                tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
+            )
             session.pending_action = None
 
         # Add context prefix for ticket-scoped chat.

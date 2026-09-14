@@ -252,6 +252,10 @@ class ChatToolAudit:
                 else OperationOutcome.FAILURE
             )
             try:
+                # The handler has already crossed its effect boundary.  Never
+                # quietly return an ordinary handler failure when its terminal
+                # audit outcome could not be persisted: callers must treat the
+                # operation as indeterminate and reconcile it.
                 await self._emit(
                     context,
                     state,
@@ -260,9 +264,12 @@ class ChatToolAudit:
                     timer=timer,
                     outcome=outcome,
                     error=exc,
+                    required=True,
                 )
-            except BaseException:
-                logger.exception("failed to record terminal chat tool audit event")
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
             raise
         failed = False
         try:
@@ -270,14 +277,22 @@ class ChatToolAudit:
             failed = isinstance(payload, dict) and "error" in payload
         except (TypeError, json.JSONDecodeError):
             pass
-        await self._emit(
-            context,
-            LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            timer=timer,
-            outcome=OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS,
-        )
+        try:
+            await self._emit(
+                context,
+                LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                timer=timer,
+                outcome=(
+                    OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS
+                ),
+                required=True,
+            )
+        except ChatAuditUnavailable as audit_error:
+            raise ChatAuditUnavailable(
+                "chat tool outcome is indeterminate; audit terminal was not persisted"
+            ) from audit_error
         return result
 
     async def reject(
@@ -328,6 +343,7 @@ class ChatToolAudit:
             tool_input=tool_input,
             timer=timer,
             outcome=OperationOutcome.REJECTED,
+            required=True,
         )
 
 

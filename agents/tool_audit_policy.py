@@ -45,46 +45,46 @@ class AuditBypass:
     expires_on: str
 
 
-_MCP_FIXTURE = FixtureExemption(
-    owner="observability-maintainers",
-    expires_on="2027-12-31",
-    reason=(
-        "The concrete handler needs provider credentials, ticket state, or remote "
-        "hosts. The canonical create_ticket_mcp middleware contract is exercised "
-        "with synthetic schema-valid tools; AST enforcement proves this handler "
-        "uses that factory."
-    ),
-)
-_NATIVE_FIXTURE = FixtureExemption(
-    owner="observability-maintainers",
-    expires_on="2027-12-31",
-    reason=(
-        "The native handler is dispatched only by AgentBase._execute_tool. Its "
-        "tool entry/terminal contract is exercised with synthetic handlers; AST "
-        "enforcement proves this registration cannot bypass that dispatcher."
-    ),
-)
-_CHAT_FIXTURE = FixtureExemption(
-    owner="chat-maintainers",
-    expires_on="2027-12-31",
-    reason=(
-        "Chat tools use the process-local ChatToolAudit boundary. Its schema-valid "
-        "fixtures exercise every registered chat name without creating tickets, "
-        "changing users, or contacting a live state store. This exemption only "
-        "avoids production effects; it does not exempt the audit boundary."
-    ),
-)
+def _fixture_exemption(
+    registration: str, *, native: bool, chat: bool
+) -> FixtureExemption:
+    """Make remote-test exemptions explicit, single-registration review items.
+
+    The policy must never grant a server- or surface-wide fixture exception:
+    adding a new tool creates a distinct expiring declaration which the CI test
+    proves is consumed by the canonical boundary test.
+    """
+    if chat:
+        owner = "chat-maintainers"
+        boundary = "ChatToolAudit.invoke"
+    elif native:
+        owner = "observability-maintainers"
+        boundary = "AgentBase._execute_tool"
+    else:
+        owner = "observability-maintainers"
+        boundary = "MCPAuditMiddleware.on_call_tool"
+    return FixtureExemption(
+        owner=owner,
+        expires_on="2027-12-31",
+        reason=(
+            f"{registration} may require provider credentials, ticket state, or a "
+            f"remote host. CI intercepts its actual {boundary} entry/terminal "
+            "boundary with a schema-valid harmless fixture; this exception avoids "
+            "only the remote effect and expires with this exact registration."
+        ),
+    )
 
 
 def _read_only(
     *registrations: str, native: bool = False, chat: bool = False
 ) -> tuple[ToolAuditPolicy, ...]:
-    fixture = _CHAT_FIXTURE if chat else _NATIVE_FIXTURE if native else _MCP_FIXTURE
     return tuple(
         ToolAuditPolicy(
             registration=registration,
             classification="read_only",
-            fixture_exemption=fixture,
+            fixture_exemption=_fixture_exemption(
+                registration, native=native, chat=chat
+            ),
         )
         for registration in registrations
     )
@@ -93,13 +93,14 @@ def _read_only(
 def _side_effecting(
     owner: str, *registrations: str, native: bool = False, chat: bool = False
 ) -> tuple[ToolAuditPolicy, ...]:
-    fixture = _CHAT_FIXTURE if chat else _NATIVE_FIXTURE if native else _MCP_FIXTURE
     return tuple(
         ToolAuditPolicy(
             registration=registration,
             classification="side_effecting",
             operation_owner=owner,
-            fixture_exemption=fixture,
+            fixture_exemption=_fixture_exemption(
+                registration, native=native, chat=chat
+            ),
         )
         for registration in registrations
     )

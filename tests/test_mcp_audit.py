@@ -281,6 +281,8 @@ async def test_server_records_metadata_and_detects_same_session_replay():
     ]
     assert events[0].mcp.protocol_request_id == "rpc-1"
     assert events[0].mcp.correlation_request_id == "correlation-1"
+    assert events[0].attributes["audit_boundary"] == "MCPAuditMiddleware.on_call_tool"
+    assert events[0].attributes["audit_transport"] == "local"
 
 
 @pytest.mark.asyncio
@@ -420,6 +422,62 @@ async def test_server_rejects_mismatched_ticket_before_handler():
     assert [event.lifecycle.state for event in events] == [
         LifecycleState.REQUEST_RECEIVED,
         LifecycleState.REJECTED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ticket_mcp_fails_closed_without_audit_transport():
+    """A real ticket server cannot use a no-op audit configuration."""
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent", ticket_id="PERF-1", agent_id="benchmark"
+    )
+    handler = AsyncMock(return_value="unexpected")
+    with pytest.raises(McpError, match="audit transport is unavailable"):
+        await middleware.on_call_tool(_request("no-audit"), handler)
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protected_terminal_audit_failure_marks_operation_indeterminate():
+    """A lost MCP terminal is visible to replay/reconciliation, never silent."""
+    transitions = []
+    registry = SimpleNamespace(
+        operation_acquire=lambda *_: {
+            "status": "acquired",
+            "operation": {"fencing_generation": 1},
+        },
+        operation_transition=lambda key, action, token, **kwargs: transitions.append(
+            (key, action, token, kwargs)
+        ),
+    )
+    event_count = 0
+
+    def record(_event):
+        nonlocal event_count
+        event_count += 1
+        if event_count == 2:
+            raise OSError("trace service unavailable")
+
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent", ticket_id="PERF-1", agent_id="benchmark", record=record
+    )
+    middleware._client = registry
+    request = _request("terminal-loss")
+    request.message.meta.model_extra["agentic-perf"].update(
+        {"idempotency_key": "terminal-loss", "idempotency_request_hash": "hash"}
+    )
+    with pytest.raises(McpError, match="outcome is indeterminate"):
+        await middleware.on_call_tool(
+            request.copy(
+                message=request.message.model_copy(update={"name": "execute_benchmark"})
+            ),
+            AsyncMock(return_value=ToolResult(content="effect happened")),
+        )
+    assert [transition[1] for transition in transitions] == [
+        "prepared",
+        "side-effect-started",
+        "complete",
+        "indeterminate",
     ]
 
 
