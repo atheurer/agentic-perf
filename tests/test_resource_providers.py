@@ -1860,6 +1860,17 @@ class TestFreeFormExtraction:
         assert result["targets"] == []
 
     @pytest.mark.asyncio
+    async def test_invalid_dotted_suffix_does_not_yield_ip_prefix(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller: 10.1.2.3.999",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
     async def test_ip_inside_fqdn_not_double_counted(self, no_secrets):
         from tests.conftest import make_resource_handlers
 

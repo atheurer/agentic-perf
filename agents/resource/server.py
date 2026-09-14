@@ -76,7 +76,12 @@ async def _ensure_init():
 # Stage-1 candidate patterns: broad regexes that search within free-form
 # text (e.g. "controller=10.1.2.3", "root@host.example.com:22").
 # Candidates are validated in stage 2 before acceptance.
-_IP_CANDIDATE = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+# Do not accept an IPv4-looking substring from a larger hostname or dotted
+# sequence (``10.1.2.3.999`` must not yield ``10.1.2.3``).  A trailing dot is
+# still allowed when it is sentence punctuation rather than another label.
+_IP_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9.-])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9-])(?!\.[A-Za-z0-9-])"
+)
 _FQDN_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9-])"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)"
