@@ -121,13 +121,12 @@ class RetrospectiveAgent(AgentBase):
         retro_server = str(Path(__file__).with_name("server.py"))
 
         mcp = AgentMCPClient()
-        await mcp.connect(
+        await mcp.connect_ticket_server(
             retro_server,
             name="retrospective",
-            env={
-                "TICKET_ID": ticket_id,
-                "STATE_STORE_URL": self.store_url,
-            },
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
         )
         self._mcp = mcp
         mcp_tools = await mcp.list_tools()

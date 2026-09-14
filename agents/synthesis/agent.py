@@ -122,10 +122,22 @@ class SynthesisAgent(AgentBase):
         ir_server = str(Path(__file__).parent.parent / "investigation" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(synth_server, name="synthesis")
+        await mcp.connect_ticket_server(
+            synth_server,
+            name="synthesis",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         try:
-            await mcp.connect(ir_server, name="investigation-records")
+            await mcp.connect_ticket_server(
+                ir_server,
+                name="investigation-records",
+                ticket_id=ticket_id,
+                state_store_url=self.store_url,
+                agent_name=self.agent_name,
+            )
         except Exception:
             logger.info(
                 "[synthesis-agent] Investigation records MCP "

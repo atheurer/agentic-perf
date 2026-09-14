@@ -16,11 +16,10 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import read_skill_documents
 
-mcp = FastMCP("analyze-agent")
+mcp = create_ticket_mcp("analyze-agent")
 
 SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
 
@@ -65,9 +64,9 @@ async def get_ticket_results(ticket_id: str) -> str:
     """Retrieve benchmark results, KPIs, and evaluation findings
     from a prior ticket. Use this to compare results across
     investigations or reference earlier work."""
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with AuditedAsyncHTTPClient(timeout=30) as client:
         resp = await client.get(
             f"{_STORE_URL}/api/v1/tickets/{ticket_id}",
             headers=_headers(),
@@ -106,9 +105,9 @@ async def search_tickets(
     Note: fetches all tickets then filters in Python. Acceptable
     for current scale; will need server-side filtering if the
     ticket store grows large."""
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with AuditedAsyncHTTPClient(timeout=30) as client:
         resp = await client.get(
             f"{_STORE_URL}/api/v1/tickets",
             headers=_headers(),
