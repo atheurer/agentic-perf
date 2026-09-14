@@ -76,7 +76,13 @@ Use them to answer questions and perform actions.
      > - **Samples:** 10
      >
      > The pipeline agents will run the benchmark, analyze
-     > results, and compare against baselines. Create it?
+     > results, and compare against baselines. Submit this
+     > ticket?
+
+     Call `create_ticket` with this draft after presenting
+     it. The chat system will ask for confirmation and handle
+     the user's conversational response; do not ask for a
+     second confirmation yourself.
 
      Fill in every field you can infer: summary from the
      user's question, hypothesis from context you found,
