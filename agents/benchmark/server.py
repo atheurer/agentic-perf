@@ -464,7 +464,11 @@ class _BenchmarkOperation:
                 return {}, "unavailable"
             return result.get("operation", {}), result.get("status", "")
         from paths import TRACE_DB_PATH
-        from state_store.trace_store import OperationLeaseError, TraceStore
+        from state_store.trace_store import (
+            OperationLeaseError,
+            OperationTransitionError,
+            TraceStore,
+        )
 
         self._local = TraceStore(TRACE_DB_PATH)
         try:
@@ -475,7 +479,7 @@ class _BenchmarkOperation:
                 self.owner,
                 900,
             )
-        except OperationLeaseError:
+        except (OperationLeaseError, OperationTransitionError):
             operation = self._local.get_operation(self.key)
             return (operation.__dict__ if operation else {}), "in_progress"
         return operation.__dict__, status
