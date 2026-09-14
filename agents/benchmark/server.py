@@ -3362,12 +3362,14 @@ async def execute_benchmark(
                 }
             _emit_context_audit_event(
                 ticket_id,
+                agent_name="benchmark-agent",
                 phase="duplicate",
                 benchmark=str(run_file.get("benchmark", "")),
                 operation=intent_key,
                 namespace="benchmark-execution",
                 result={"status": "existing_operation"},
             )
+            await operation_guard.close()
             return json.dumps(duplicate_result)
         if acquisition != "acquired":
             await operation_guard.close()

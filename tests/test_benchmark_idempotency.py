@@ -84,3 +84,56 @@ async def test_execute_rejects_invalid_validation_without_controller_mutation(
         "controller", validation_id="missing", approval_request_id="approval"
     )
     assert '"status": "rejected"' in result
+
+
+@pytest.mark.asyncio
+async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> None:
+    """The actual server entrypoint returns the durable cached operation."""
+    record = {
+        "validation_id": "val-1",
+        "run_file": {"benchmark": "demo"},
+        "runfile_fingerprint": "fp",
+        "harness": "crucible",
+        "controller": "controller",
+        "params_fingerprint": "no-mv-params",
+        "execution_plan_fingerprint": "x",
+        "run_command": "crucible run",
+        "state": "executable",
+    }
+    active = {"id": "", "status": "executing_benchmark", "custom_fields": {}}
+    calls: list[str] = []
+
+    async def no_init() -> None:
+        benchmark_server._ssh = object()
+
+    async def active_check(**_kwargs: object) -> dict:
+        return active
+
+    monkeypatch.setattr(benchmark_server, "_ensure_init", no_init)
+    monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
+    monkeypatch.setattr(
+        benchmark_server,
+        "_get_validated_runfile",
+        lambda *_: (record["run_file"], None),
+    )
+    monkeypatch.setattr(benchmark_server, "_validation_records", {"val-1": record})
+
+    class DuplicateOperation:
+        async def acquire(self):
+            calls.append("acquire")
+            return (
+                {"result_descriptor": {"benchmark_result": {"status": "completed"}}},
+                "terminal",
+            )
+
+        async def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(
+        benchmark_server, "_BenchmarkOperation", lambda *_: DuplicateOperation()
+    )
+    result = await benchmark_server.execute_benchmark(
+        "controller", validation_id="val-1"
+    )
+    assert '"existing_operation": true' in result
+    assert calls == ["acquire", "close"]
