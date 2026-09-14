@@ -35,6 +35,7 @@ from providers.tracing import (
     reset_trace_context,
     trace_headers,
 )
+from state_store.models import VALID_TRANSITIONS, TicketStatus
 
 logger = logging.getLogger(__name__)
 
@@ -1313,22 +1314,32 @@ class AgentBase(ABC):
                     f"[{self.agent_name}] Hit max iterations"
                     f" ({self.max_iterations}) on {ticket_id}"
                 )
-                await self._add_comment(
-                    ticket_id,
-                    f"**Agent {self.agent_name} reached maximum"
-                    f" iteration limit ({self.max_iterations}).**"
-                    f" The agent could not complete its work within"
-                    f" the iteration budget. You can reply to guide"
-                    f" next steps (e.g., retry, skip to review,"
-                    f" or abort).",
-                )
-                await self._transition_ticket(
-                    ticket_id,
-                    "awaiting_customer_guidance",
-                    comment=(
-                        f"{self.agent_name} hit max iterations — pausing for guidance"
-                    ),
-                )
+                ticket = await self._get_ticket(ticket_id)
+                current_status = ticket.get("status", "")
+                if self._can_pause_for_guidance(current_status):
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Agent {self.agent_name} reached maximum"
+                        f" iteration limit ({self.max_iterations}).**"
+                        f" The agent could not complete its work within"
+                        f" the iteration budget. You can reply to guide"
+                        f" next steps (e.g., retry, skip to review,"
+                        f" or abort).",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=(
+                            f"{self.agent_name} hit max iterations"
+                            f" — pausing for guidance"
+                        ),
+                    )
+                else:
+                    await self._abort_unpausable(
+                        ticket_id,
+                        current_status,
+                        "max_iterations",
+                    )
         except (HITLDriftError, AgentAbortedError):
             raise
         except HITLTimeoutError as e:
@@ -2374,6 +2385,77 @@ class AgentBase(ABC):
         }
     )
 
+    @staticmethod
+    def _can_pause_for_guidance(status: str) -> bool:
+        """Check if the ticket can enter or remain in the guidance pause."""
+        try:
+            current = TicketStatus(status)
+        except ValueError:
+            return False
+        if current is TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
+            return True
+        targets = VALID_TRANSITIONS.get(current, [])
+        return TicketStatus.AWAITING_CUSTOMER_GUIDANCE in targets
+
+    async def _abort_unpausable(
+        self,
+        ticket_id: str,
+        current_status: str,
+        trigger: str,
+    ) -> None:
+        """Handle escalation when the ticket cannot be paused.
+
+        Emits an escalation event, attempts to close the ticket
+        (the only safe fallback for terminal-adjacent statuses
+        like retrospective_pending), and raises AgentAbortedError
+        so the orchestrator skips further transitions.
+        """
+        self._emit(
+            ticket_id,
+            "escalation",
+            {
+                "reason": "pause_blocked",
+                "from_status": current_status,
+                "trigger": trigger,
+            },
+        )
+        try:
+            current = TicketStatus(current_status)
+        except ValueError:
+            current = None
+        targets = VALID_TRANSITIONS.get(current, []) if current else []
+        if TicketStatus.CLOSED in targets:
+            logger.info(
+                "[%s] Closing %s from %s (pause not available)",
+                self.agent_name,
+                ticket_id,
+                current_status,
+            )
+            await self._add_comment(
+                ticket_id,
+                f"**Agent {self.agent_name} could not complete"
+                f" its task and cannot pause for guidance from"
+                f" {current_status}.** Closing ticket.",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "closed",
+                comment=(
+                    f"{self.agent_name}: pause blocked from {current_status}, closing"
+                ),
+            )
+        else:
+            logger.warning(
+                "[%s] Cannot pause or close from %s on %s",
+                self.agent_name,
+                current_status,
+                ticket_id,
+            )
+        raise AgentAbortedError(
+            f"Cannot pause from {current_status} — "
+            f"ticket closed or left for orchestrator"
+        )
+
     async def _request_human_input(self, ticket_id: str, question: str) -> str:
         """Pause for human input and return the user's reply.
 
@@ -2382,6 +2464,19 @@ class AgentBase(ABC):
         reply text. The agent's LLM loop continues with full context.
         """
         ticket = await self._get_ticket(ticket_id)
+        current_status = ticket.get("status", "")
+        if not self._can_pause_for_guidance(current_status):
+            logger.warning(
+                "[%s] Cannot pause for guidance from %s — "
+                "awaiting_customer_guidance is not a valid transition",
+                self.agent_name,
+                current_status,
+            )
+            await self._abort_unpausable(
+                ticket_id,
+                current_status,
+                "escalation",
+            )
         comment_count = len(ticket.get("comments", []))
         await self._add_comment(ticket_id, f"**Input needed:** {question}")
         await self._transition_ticket(
