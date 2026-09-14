@@ -215,7 +215,7 @@ providers/tracing/spool.py|225|self.lock_path.unlink
 providers/tracing/spool.py|234|os.replace
 providers/tracing/spool.py|235|self.path.touch
 providers/tracing/spool.py|236|self.ack_path.unlink
-providers/workspace/manager.py|72|self._filesystem.mkdir
+providers/workspace/manager.py|78|self._filesystem.mkdir
 state_store/api/artifacts.py|136|filesystem.unlink
 state_store/audit.py|42|self._path.parent.mkdir
 state_store/auth.py|66|SECRETS_DIR.mkdir
