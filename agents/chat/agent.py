@@ -67,6 +67,7 @@ def _is_cancellation(message: str) -> bool:
         return True
     return normalized.startswith(("no, ", "no ", "cancel, ", "cancel "))
 
+
 # Maximum tool-use iterations per user message to prevent
 # runaway loops.
 _DEFAULT_MAX_TOOL_ROUNDS = 10
