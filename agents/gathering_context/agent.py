@@ -260,7 +260,7 @@ class GatheringContextAgent(AgentBase):
                 f"build history to {matched_id}: {e}"
             )
 
-        record_url = getattr(matched, "record_url", "") or ""
+        record_url = matched.record_url
 
         dedup_fields: dict[str, Any] = {
             "decision": "MATCH_FOUND",
