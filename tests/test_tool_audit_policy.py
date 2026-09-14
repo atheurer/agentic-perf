@@ -10,6 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from agents.side_effect_inventory import (
+    INVENTORIED_SIDE_EFFECTS,
+    INVENTORY_DISPOSITIONS,
+)
 from agents.tool_audit_policy import (
     AUDIT_BYPASS_ALLOWLIST,
     OPERATION_OWNER_CONTRACTS,
@@ -97,6 +101,87 @@ def _resolved_call_name(node: ast.expr, aliases: dict[str, str]) -> str:
     raw = _call_name(node)
     root, dot, rest = raw.partition(".")
     return f"{aliases.get(root, root)}{dot}{rest}" if raw else raw
+
+
+def _enclosing_symbol(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return current.name
+    return "<module>"
+
+
+def _side_effect_category(path: str, call: str) -> str | None:
+    """Classify a sensitive call after resolving its import spelling.
+
+    The categories deliberately describe capability domains rather than a
+    particular package spelling.  This catches ``import os as operating`` and
+    ``from asyncio import create_subprocess_exec as spawn`` just as it catches
+    their canonical spellings.
+    """
+    lowered = f"{path}:{call}".lower()
+    leaf = call.rsplit(".", 1)[-1]
+    if "mcp" in lowered and ("call_tool" in lowered or "fastmcp" in lowered):
+        return "mcp"
+    if "ssh" in lowered and leaf in {"run", "copy_to", "copy_from", "connect"}:
+        return "ssh"
+    if "image_build" in path or "image_builder" in path:
+        return "image"
+    if "resource/" in path or "boto3" in lowered or "ec2" in lowered:
+        return "cloud_resource"
+    if "github" in lowered or "repo_cache" in path:
+        return "github"
+    if leaf in {
+        "run",
+        "Popen",
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+        "start",
+    } and ("subprocess" in lowered or "auditedsubprocess" in lowered):
+        return "subprocess"
+    if (
+        leaf
+        in _PROTECTED_METHODS
+        | {
+            "open",
+            "makedirs",
+            "remove",
+            "replace",
+        }
+        or call in _PROTECTED_MUTATORS
+    ):
+        return "filesystem"
+    if leaf in {"post", "put", "patch", "delete"}:
+        return "mutating_http_state"
+    return None
+
+
+def _discover_side_effect_inventory() -> set[tuple[str, str, str]]:
+    """Return all capability boundaries in production code, never test code."""
+    paths: list[Path] = []
+    for candidate in ("agents", "orchestrator", "providers", "state_store"):
+        paths.extend((ROOT / candidate).rglob("*.py"))
+    paths.append(ROOT / "cli.py")
+    discovered: set[tuple[str, str, str]] = set()
+    for path in sorted(paths):
+        relative = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        aliases = _import_aliases(tree)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            category = _side_effect_category(
+                relative, _resolved_call_name(node.func, aliases)
+            )
+            if category:
+                discovered.add((relative, _enclosing_symbol(node, parents), category))
+    return discovered
 
 
 def _tool_name(node: ast.Call, default: str) -> str:
@@ -409,6 +494,48 @@ def test_tool_registration_inventory_is_complete_and_classified() -> None:
         f"stale={sorted(expected - actual_keys)!r}"
     )
     assert len(POLICY_BY_REGISTRATION) == len(TOOL_AUDIT_POLICY)
+
+
+def test_checked_in_side_effect_inventory_has_zero_unexplained_boundaries() -> None:
+    """CI rejects new direct or aliased sensitive capability use by default."""
+    actual = _discover_side_effect_inventory()
+    expected = set(INVENTORIED_SIDE_EFFECTS)
+    assert actual == expected, (
+        "sensitive capability inventory changed; classify the exact path/symbol "
+        "as audited, system-only, unsupported, or a precise expiring exception. "
+        f"unexplained={sorted(actual - expected)!r}; "
+        f"stale={sorted(expected - actual)!r}"
+    )
+    # These compound inventory categories deliberately cover the requested
+    # subdomains at the adapter level: container effects run through the
+    # subprocess boundary, while cloud/resource provider effects share one
+    # lifecycle boundary.  Keeping them explicit avoids a loophole caused by
+    # provider-specific aliases.
+    categories = {entry[2] for entry in expected}
+    assert {
+        "ssh",
+        "subprocess",
+        "mutating_http_state",
+        "filesystem",
+        "mcp",
+        "github",
+        "image",
+        "cloud_resource",
+    } <= categories
+    assert set(INVENTORY_DISPOSITIONS) == expected, (
+        "every sensitive boundary needs one exact reviewed disposition; "
+        f"missing={sorted(expected - set(INVENTORY_DISPOSITIONS))!r}; "
+        f"stale={sorted(set(INVENTORY_DISPOSITIONS) - expected)!r}"
+    )
+    for entry, (
+        disposition,
+        owner,
+        scope,
+        expires_on,
+    ) in INVENTORY_DISPOSITIONS.items():
+        assert disposition in {"audited", "system_only", "unsupported", "exception"}
+        assert owner and scope == f"{entry[0]}:{entry[1]}"
+        assert date.fromisoformat(expires_on) >= date.today()
 
 
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
