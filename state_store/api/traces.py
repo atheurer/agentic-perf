@@ -169,7 +169,6 @@ def query(
             request, "trace_query", ticket_id, "denied", str(exc.detail)
         )
         raise
-    _record_query_audit(request, "trace_query", ticket_id, "success")
     raw_events = request.app.state.trace_store.list_events()
     base_query = _query_from_params(
         ticket_id=ticket_id,
@@ -195,7 +194,9 @@ def query(
             all_selected, cursor=cursor, limit=limit
         )
     except ValueError as exc:
+        _record_query_audit(request, "trace_query", ticket_id, "failed", str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _record_query_audit(request, "trace_query", ticket_id, "success")
     return {
         "events": [
             _event_json(event, detailed and include_payloads) for event in selected
@@ -237,7 +238,6 @@ def export(
             request, "trace_export", ticket_id, "denied", str(exc.detail)
         )
         raise
-    _record_query_audit(request, "trace_export", ticket_id, "success")
     raw_events = request.app.state.trace_store.list_events()
     selected = query_events(
         raw_events,
@@ -265,6 +265,7 @@ def export(
             selected, cursor=cursor, limit=limit
         )
     except ValueError as exc:
+        _record_query_audit(request, "trace_export", ticket_id, "failed", str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     verified_blob_refs = _verified_blob_refs(selected) if detailed else set()
     media = (
@@ -306,6 +307,7 @@ def export(
     response.headers["X-Trace-Manifest"] = json.dumps(
         export_meta, separators=(",", ":")
     )
+    _record_query_audit(request, "trace_export", ticket_id, "success")
     return response
 
 
