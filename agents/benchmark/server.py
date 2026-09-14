@@ -2245,6 +2245,17 @@ async def execute_benchmark(
                         },
                     }
                 )
+            _emit_context_audit_event(
+                os.environ.get("TICKET_ID", ""),
+                agent_name="benchmark-agent",
+                phase="validation_rejected",
+                benchmark=str(run_file.get("benchmark", ""))
+                if isinstance(run_file, dict)
+                else "",
+                operation=validation_id,
+                namespace="benchmark-execution",
+                result=rejection,
+            )
             return json.dumps(rejection)
         record = active_check.get("custom_fields", {}).get(
             "benchmark_validations", {}
@@ -2308,6 +2319,61 @@ async def execute_benchmark(
                 }
             )
 
+    # Claim the durable intent before consuming the one-shot approval. A
+    # reconnect that already consumed approval must still receive its cached
+    # operation result rather than failing approval binding with 409.
+    operation_guard: _BenchmarkOperation | None = None
+    operation_record: dict[str, Any] | None = None
+    operation_owned = False
+    if validation_id and approval_request_id:
+        ticket_id = os.environ.get("TICKET_ID", "")
+        preclaim_record = record
+        intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
+            ticket_id,
+            validation_id,
+            preclaim_record,
+            controller,
+            harness_name,
+            run_command or "crucible run",
+        )
+        operation_guard = _BenchmarkOperation(
+            intent_key,
+            intent_hash,
+            os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+        )
+        operation_record, acquisition = await operation_guard.acquire()
+        if acquisition == "terminal":
+            cached = (operation_record.get("result_descriptor") or {}).get(
+                "benchmark_result"
+            )
+            await operation_guard.close()
+            if isinstance(cached, dict):
+                return json.dumps(
+                    {**cached, "operation_id": intent_key, "existing_operation": True}
+                )
+        if acquisition != "acquired":
+            await operation_guard.close()
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "operation_registry_unavailable"
+                    if acquisition == "unavailable"
+                    else "existing_operation",
+                    "operation_id": intent_key,
+                }
+            )
+        operation_owned = True
+        try:
+            await operation_guard.transition(
+                "prepared", operation_record, descriptor={"intent": immutable_intent}
+            )
+        except Exception:
+            await operation_guard.terminalize(
+                operation_record, "indeterminate", {"outcome": "indeterminate"}
+            )
+            await operation_guard.close()
+            return json.dumps({"status": "indeterminate", "operation_id": intent_key})
+
     if approval_request_id:
         # #798 owns the approval capability boundary.  #788 may add richer
         # operation claims later; this optional token is deliberately checked
@@ -2363,11 +2429,21 @@ async def execute_benchmark(
                     },
                 )
             if consumed.status_code >= 300:
+                if operation_guard and operation_owned:
+                    await operation_guard.terminalize(
+                        operation_record, "fail", {"outcome": "rejected"}
+                    )
+                    await operation_guard.close()
                 return json.dumps(
                     {"status": "rejected", "reason_code": "approval_not_approved"}
                 )
         except Exception:
             logger.exception("[benchmark] approval capability consumption failed")
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record, "fail", {"outcome": "rejected"}
+                )
+                await operation_guard.close()
             return json.dumps(
                 {"status": "rejected", "reason_code": "approval_check_failed"}
             )
@@ -3325,10 +3401,7 @@ async def execute_benchmark(
 
     # Default: crucible (and any unknown harness that uses JSON run-files)
     ticket_id = os.environ.get("TICKET_ID", "")
-    operation_guard: _BenchmarkOperation | None = None
-    operation_record: dict[str, Any] | None = None
-    operation_owned = False
-    if validation_id:
+    if validation_id and operation_guard is None:
         intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
             ticket_id,
             validation_id,
@@ -3432,7 +3505,21 @@ async def execute_benchmark(
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     try:
         if operation_guard and operation_owned:
-            await operation_guard.transition("side-effect-started", operation_record)
+            try:
+                await operation_guard.transition(
+                    "side-effect-started", operation_record
+                )
+            except Exception:
+                await operation_guard.terminalize(
+                    operation_record, "indeterminate", {"outcome": "indeterminate"}
+                )
+                await operation_guard.close()
+                return json.dumps(
+                    {
+                        "status": "indeterminate",
+                        "message": "Operation launch boundary could not be persisted",
+                    }
+                )
         try:
             scp_result = await _ssh.copy_to(
                 controller, local_path, remote_path, mutating=True
