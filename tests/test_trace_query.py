@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -10,6 +13,7 @@ from providers.tracing import (
 from providers.tracing.models import PayloadDescriptor
 from providers.tracing.query import (
     TraceQuery,
+    decode_cursor,
     diagnostics,
     export_events,
     export_manifest,
@@ -125,3 +129,13 @@ def test_cursor_continuation_survives_interleaved_insert_and_legacy_events() -> 
         inserted.action_id,
         legacy.action_id,
     ]
+
+
+def test_cursor_decoder_rejects_malformed_shapes() -> None:
+    malformed = base64.urlsafe_b64encode(json.dumps(["bad", {}, 1]).encode()).decode()
+    try:
+        decode_cursor(malformed)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("malformed cursor was accepted")

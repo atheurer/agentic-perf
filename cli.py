@@ -1082,12 +1082,19 @@ def cmd_trace(args):
             print(json.dumps(event, separators=(",", ":")))
     else:
         events = payload.get("events", [])
-        if args.tree or args.ticket_id:
+        if args.tree or args.ticket_id or args.ticket_id_option:
             children = {}
             for event in events:
                 children.setdefault(event.get("parent_action_id"), []).append(event)
 
+            visited = set()
+
             def render(event, depth=0):
+                action_id = event.get("action_id")
+                if action_id in visited:
+                    print(f"{'  ' * depth}[cycle] action={action_id}")
+                    return
+                visited.add(action_id)
                 action = event.get("action", {})
                 life = event.get("lifecycle", {})
                 producer = event.get("producer", {})
@@ -1115,8 +1122,18 @@ def cmd_trace(args):
                     render(child, depth + 1)
 
             roots = [event for event in events if not event.get("parent_action_id")]
+            roots.extend(
+                event
+                for event in events
+                if event.get("parent_action_id")
+                and event.get("parent_action_id") not in children
+            )
             for event in roots:
                 render(event)
+            for event in events:
+                if event.get("action_id") not in visited:
+                    print("[incomplete component]")
+                    render(event)
             diagnostics = payload.get("diagnostics") or {}
             if any(diagnostics.values()):
                 print(

@@ -261,12 +261,12 @@ def export(
         ),
     )
     try:
-        selected, _has_more, _next_cursor = page_events(
+        selected, has_more, next_cursor = page_events(
             selected, cursor=cursor, limit=limit
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    verified_blob_refs = _verified_blob_refs(selected)
+    verified_blob_refs = _verified_blob_refs(selected) if detailed else set()
     media = (
         "text/csv"
         if format == "csv"
@@ -281,6 +281,8 @@ def export(
     export_meta = export_manifest(
         selected, content, verified_blob_refs=verified_blob_refs
     )
+    export_meta["has_more"] = has_more
+    export_meta["next_cursor"] = next_cursor
     # Every artifact is self-describing; ``manifest`` remains accepted for
     # compatibility but cannot disable integrity metadata.
     manifest = True

@@ -61,7 +61,15 @@ def decode_cursor(cursor: str | None) -> tuple[int, int | str, str] | None:
         value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
         if not isinstance(value, list) or len(value) != 3:
             raise ValueError
-        return (int(value[0]), value[1], str(value[2]))
+        if value[0] not in (0, 1) or not isinstance(value[2], str):
+            raise ValueError
+        if value[0] == 0 and (
+            isinstance(value[1], bool) or not isinstance(value[1], int)
+        ):
+            raise ValueError
+        if value[0] == 1 and not isinstance(value[1], str):
+            raise ValueError
+        return (value[0], value[1], value[2])
     except (
         ValueError,
         TypeError,

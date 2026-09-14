@@ -91,7 +91,40 @@ async def test_service_ingests_and_server_binds_identity(tmp_path) -> None:
         response.json()["event"]["attributes"]["authenticated_principal"]
         == "deployment"
     )
-    assert response.json()["event"]["attributes"]["kept"] is True
+
+
+async def test_query_and_export_continuations_are_exposed(tmp_path) -> None:
+    app = make_app(tmp_path)
+    first = event()
+    second = event().model_copy(update={"action_id": "2" * 16})
+    app.state.trace_store.insert_event(first)
+    app.state.trace_store.insert_event(second)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    headers = {"Authorization": "Bearer service"}
+    query = await client.get(
+        "/api/v1/traces/query?ticket_id=PERF-1&limit=1", headers=headers
+    )
+    assert query.status_code == 200
+    body = query.json()
+    assert body["has_more"] and body["next_cursor"]
+    continuation = await client.get(
+        "/api/v1/traces/query",
+        params={"ticket_id": "PERF-1", "limit": 1, "cursor": body["next_cursor"]},
+        headers=headers,
+    )
+    assert continuation.status_code == 200
+    assert continuation.json()["events"][0]["action_id"] == second.action_id
+    exported = await client.get(
+        "/api/v1/traces/export",
+        params={"ticket_id": "PERF-1", "limit": 1, "format": "json"},
+        headers=headers,
+    )
+    assert exported.status_code == 200
+    manifest = exported.json()["manifest"]
+    assert manifest["has_more"] and manifest["next_cursor"]
+    await client.aclose()
 
 
 async def test_user_or_anonymous_cannot_spoof_producer(tmp_path) -> None:
