@@ -4,12 +4,12 @@ import json
 import re
 from pathlib import Path
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from paths import LOG_DIR as DEFAULT_LOG_DIR
 from paths import TICKET_DIR as DEFAULT_TICKET_DIR
+from providers.events import EventBus
 
-mcp = FastMCP("retrospective")
+mcp = create_ticket_mcp("retrospective")
 
 SENSITIVE_TOOLS = frozenset(
     {
@@ -165,20 +165,11 @@ def _detect_suspicious_tool_use(
 
 
 def _read_transcript(ticket_id: str) -> list[dict]:
-    path = DEFAULT_LOG_DIR / f"{ticket_id}.jsonl"
-    if not path.exists():
-        return []
-    events = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
+    bus = EventBus(log_dir=DEFAULT_LOG_DIR)
+    try:
+        return bus.get_events(ticket_id, since=0, limit=100_000)
+    finally:
+        bus.close()
 
 
 def _get_context(events: list[dict], idx: int, radius: int = 2) -> list[dict]:

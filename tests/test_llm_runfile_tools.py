@@ -120,10 +120,8 @@ def handlers_without_schema(provider_without_schema):
 @pytest.mark.asyncio
 async def test_get_runfile_schema_found(handlers_with_schema):
     result = await handlers_with_schema["get_runfile_schema"]()
-    assert result["found"] is True
-    assert result["harness"] == "crucible"
-    assert result["schema"] == MOCK_SCHEMA
-    assert "benchmarks" in result["schema"]["properties"]
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -135,11 +133,8 @@ async def test_get_runfile_schema_not_found(handlers_without_schema):
 @pytest.mark.asyncio
 async def test_get_benchmark_params_found(handlers_with_schema):
     result = await handlers_with_schema["get_benchmark_params"](benchmark="uperf")
-    assert result["found"] is True
-    assert result["benchmark"] == "uperf"
-    assert result["harness"] == "crucible"
-    assert "presets" in result["params"]
-    assert "validations" in result["params"]
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -151,10 +146,8 @@ async def test_get_benchmark_params_not_found(handlers_with_schema):
 @pytest.mark.asyncio
 async def test_get_example_runfile_found(handlers_with_schema):
     result = await handlers_with_schema["get_example_runfile"](benchmark="uperf")
-    assert result["found"] is True
-    assert result["benchmark"] == "uperf"
-    assert "benchmarks" in result["run_file"]
-    assert result["run_file"]["benchmarks"][0]["name"] == "uperf"
+    assert result["found"] is False
+    assert "controller-sourced context" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -195,7 +188,7 @@ async def test_present_runfile_for_approval():
 
 @pytest.mark.asyncio
 async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_schema):
-    """execute_benchmark should pass the LLM's run-file directly to the controller."""
+    """execute_benchmark uses the exact runfile returned by validation."""
     llm_runfile = {
         "benchmarks": [{"name": "uperf", "ids": "1", "mv-params": {}}],
         "endpoints": [
@@ -214,12 +207,17 @@ async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_s
             },
         ],
     }
-    result = await handlers_with_schema["execute_benchmark"](
+    validation = await handlers_with_schema["validate_benchmark"](
         controller="10.0.0.1",
         run_file=llm_runfile,
         harness="crucible",
+    )
+    result = await handlers_with_schema["execute_benchmark"](
+        controller="10.0.0.1",
+        validation_id=validation["validation_id"],
+        harness="crucible",
         run_command="crucible run",
     )
-    # May fail at SCP (no real SSH in tests) but must not be "rejected"
-    # by any local validation — the controller is the single source of truth.
+    # May fail at SCP (no real SSH in tests), but must not be rejected for
+    # supplying an unvalidated or mismatched runfile.
     assert result["status"] != "rejected"

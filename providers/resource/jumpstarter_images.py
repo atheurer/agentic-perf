@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import httpx
+from providers.execution import AuditedAsyncHTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ async def _resolve_latest_monthly(
     and returns the path to the latest build.
     """
     try:
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=15.0,
             verify=not trust_server,
         ) as client:
@@ -113,7 +113,7 @@ async def resolve_image_urls(
 
     manifest_url = f"{base_url}/{image_version}/{release}/info/test_images_info.json"
 
-    async with httpx.AsyncClient(
+    async with AuditedAsyncHTTPClient(
         timeout=30.0,
         follow_redirects=True,
         verify=not trust_server,

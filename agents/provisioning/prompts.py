@@ -46,6 +46,13 @@ Your tasks:
    get_private_config with that harness name and key "provisioning" to learn the
    harness's provisioning requirements.
 
+For Crucible, use the private provisioning configuration returned by
+`get_private_config(harness_name="crucible", key="provisioning")` as the source of
+truth for installation. Provisioning does not need benchmark repositories,
+benchmark parameters, run-file semantics, or benchmark-specific documentation.
+Those are resolved later by the benchmark agent after the controller is prepared.
+The controller remains authoritative for installed-runtime facts.
+
 2. Call check_platform_contract with all hosts and the harness_name to verify each
    host's OS, repos, and packages are compatible with the harness. If the platform is
    incompatible (status "failed"), report the mismatch — do not attempt installation.
@@ -79,8 +86,11 @@ Your tasks:
    - If not present in directives, fall back to the provisioning config's
      "on_existing_install".
    - Then act on the resolved value:
-     - "skip": proceed directly to submit_provisioning_result with
-       provisioning_complete=true. Do NOT ask the user.
+     - "skip": do not install, update, or remove anything. Call
+       verify_harness_install with the controller host as a read-only check,
+       then report its result (including Crucible controller context readiness)
+       in submit_provisioning_result. "skip" means preserve the existing
+       installation, not skip verification. Do NOT ask the user.
      - "update": run update_install with the controller host.
      - "reinstall": call uninstall_harness with the controller host FIRST,
        wait for completion, then call install_harness with the controller host.

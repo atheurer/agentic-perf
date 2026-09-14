@@ -20,6 +20,14 @@ def test_workspace_dir_creation(workspace, tmp_path):
     assert (
         workspace.workspace_dir == tmp_path / "tickets" / "PERF-6E200FFE" / "workspace"
     )
+    assert {
+        "context",
+        "runfiles",
+        "results",
+        "logs",
+        "metadata",
+        "scratch",
+    }.issubset({p.name for p in workspace.workspace_dir.iterdir()})
 
 
 def test_path_resolution_and_security(workspace):
@@ -49,6 +57,129 @@ def test_save_and_list_files(workspace):
     assert len(files) == 2
     filenames = {f["filename"] for f in files}
     assert filenames == {"metrics.json", "dmesg.txt"}
+
+
+def test_namespaced_manifest_kinds_and_artifact_reference(workspace):
+    workspace.save_file("context/harnesses/crucible/source.json", "{}")
+    workspace.save_file("context/benchmarks/fio/README.md", "guidance")
+    workspace.save_file("runfiles/fio.json", "{}")
+    workspace.save_file("results/summaries/fio.json", "{}")
+    workspace.save_file("results/metrics/fio.json", "{}")
+    workspace.save_file("logs/fio.log", "ok")
+    workspace.save_file("metadata/run.json", "{}")
+    workspace.save_artifact_reference(
+        "fio.json", "artifact://PERF-1/run/raw.tar", metadata={"size": 1000}
+    )
+
+    entries = {entry["filename"]: entry for entry in workspace.list_files()}
+    assert entries["context/harnesses/crucible/source.json"]["kind"] == "source_context"
+    assert entries["context/benchmarks/fio/README.md"]["namespace"] == "context"
+    assert entries["runfiles/fio.json"]["kind"] == "runfile"
+    assert entries["results/summaries/fio.json"]["kind"] == "result_summary"
+    assert entries["results/raw/fio.json"]["kind"] == "raw_artifact"
+    assert entries["logs/fio.log"]["kind"] == "log"
+    assert entries["metadata/run.json"]["kind"] == "metadata"
+
+    assert workspace.jq_query("workspace://results/raw/fio.json", ".artifact_ref")[
+        "result"
+    ] == ("artifact://PERF-1/run/raw.tar")
+
+
+def test_effective_context_filters_alternate_sources(workspace):
+    github_ref, _ = workspace.save_file("context/sources/github/fio.md", "github")
+    controller_ref, _ = workspace.save_file(
+        "context/sources/controller/fio.md", "controller"
+    )
+    workspace.save_effective_context(
+        {
+            "phase": "benchmark",
+            "effective_source": "controller",
+            "workspace_refs": [controller_ref],
+            "alternate_refs": [github_ref],
+        }
+    )
+
+    visible = {entry["file_ref"] for entry in workspace.list_effective_files()}
+    assert controller_ref not in visible
+    assert github_ref not in visible
+    assert "workspace://context/effective-context.json" in visible
+
+
+def test_phase_and_audience_visibility_blocks_triage_source_from_benchmark(
+    workspace,
+):
+    triage = WorkspaceManager(
+        workspace_dir=workspace.workspace_dir,
+        agent_name="triage-agent",
+        phase="triage",
+    )
+    snapshot = triage.save_source_snapshot(
+        "github", {"commit": "github-pin"}, {"README.md": "triage github"}, "fio"
+    )
+    triage.save_effective_context(
+        {
+            "phase": "triage",
+            "effective_source": "github",
+            "workspace_refs": list(snapshot["files"].values()),
+        }
+    )
+    benchmark = WorkspaceManager(
+        workspace_dir=workspace.workspace_dir,
+        agent_name="benchmark-agent",
+        phase="benchmark",
+    )
+    github_ref = next(iter(snapshot["files"].values()))
+
+    assert github_ref not in {entry["file_ref"] for entry in benchmark.list_files()}
+    with pytest.raises(WorkspaceSecurityError):
+        benchmark.read_file_slice(github_ref)
+    with pytest.raises(WorkspaceSecurityError):
+        benchmark.grep_file(github_ref, "github")
+    with pytest.raises(WorkspaceSecurityError):
+        benchmark.jq_query(github_ref, ".")
+
+    # Explicit comparison access remains available, and legacy root files do
+    # not acquire a visibility restriction merely because they lack metadata.
+    assert (
+        benchmark.read_file_slice(github_ref, include_alternates=True)["status"] == "ok"
+    )
+    legacy_ref, _ = benchmark.save_file("legacy.json", '{"ok": true}')
+    assert benchmark.jq_query(legacy_ref, ".ok")["result"] is True
+
+
+def test_context_index_does_not_short_circuit_a_different_phase(workspace):
+    triage = WorkspaceManager(
+        workspace_dir=workspace.workspace_dir,
+        agent_name="triage-agent",
+        phase="triage",
+    )
+    snapshot = triage.save_source_snapshot(
+        "github", {"commit": "abc"}, {"README.md": "triage only"}, "fio"
+    )
+    workspace_ref = snapshot["files"]["README.md"]
+    triage.save_effective_context(
+        {"effective_source": "github", "workspace_refs": [workspace_ref]}
+    )
+    triage.index_context_documents(
+        [
+            {
+                "ref": "benchmark/fio/README.md",
+                "namespace": "benchmark/fio",
+                "source": "github",
+                "authority": "effective",
+                "workspace_ref": workspace_ref,
+            }
+        ]
+    )
+
+    benchmark = WorkspaceManager(
+        workspace_dir=workspace.workspace_dir,
+        agent_name="benchmark-agent",
+        phase="benchmark",
+    )
+    assert benchmark.context_scope_indexed("benchmark/fio") is False
+    assert benchmark.read_document("benchmark/fio/README.md")["status"] == "error"
+    assert benchmark.search_documents("triage")["results"] == []
 
 
 def test_jq_query_cdm_dataset(workspace):

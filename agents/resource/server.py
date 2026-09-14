@@ -23,8 +23,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
     build_ssh_from_ticket,
@@ -34,7 +33,7 @@ from paths import get_default_ssh_key
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("resource-agent")
+mcp = create_ticket_mcp("resource-agent")
 
 # Module-level globals -- lazily initialized by _ensure_init()
 _initialized = False
@@ -177,12 +176,11 @@ async def check_available_resources(
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     if ticket_id:
         try:
-            import httpx
-
+            from providers.execution import AuditedAsyncHTTPClient
             from state_store.auth import read_token_from_file
 
             token = read_token_from_file()
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 base_url=store_url,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10.0,

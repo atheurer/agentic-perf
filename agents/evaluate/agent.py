@@ -262,13 +262,22 @@ class EvaluateAgent(AgentBase):
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
         mcp = AgentMCPClient()
-        await mcp.connect(eval_server, name="evaluate")
+        await mcp.connect_ticket_server(
+            eval_server,
+            name="evaluate",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Investigation records — may not be configured
         try:
-            await mcp.connect(
+            await mcp.connect_ticket_server(
                 ir_server,
                 name="investigation-records",
+                ticket_id=ticket_id,
+                state_store_url=self.store_url,
+                agent_name=self.agent_name,
             )
         except Exception:
             logger.info(
@@ -277,7 +286,13 @@ class EvaluateAgent(AgentBase):
 
         # Infra — may not be available for result queries
         try:
-            await mcp.connect(infra_server, name="infra")
+            await mcp.connect_ticket_server(
+                infra_server,
+                name="infra",
+                ticket_id=ticket_id,
+                state_store_url=self.store_url,
+                agent_name=self.agent_name,
+            )
         except Exception:
             logger.info(
                 "[evaluate-agent] Infra MCP not available "

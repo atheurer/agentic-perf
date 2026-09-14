@@ -26,10 +26,10 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict
 
 from agents.infra.topology import discover_cache_topology
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _resolve_vault_secret_name,
     resolve_ssh_key,
@@ -37,11 +37,16 @@ from agents.server_utils import (
 from agents.server_utils import (
     build_secrets_provider as _build_secrets,
 )
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from providers.ssh import _PID_SENTINEL, SSHExecutor, SSHResult, parse_pid_sentinel
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("infra")
+mcp = create_ticket_mcp("infra")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
@@ -129,9 +134,9 @@ async def set_ssh_context(ticket_id: str) -> str:
     _ticket_id = ticket_id
 
     _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
-    async with httpx.AsyncClient(timeout=15.0, headers=_store_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=_store_headers()) as client:
         r = await client.get(f"{_state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -213,14 +218,28 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
             }
         )
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
-        f.write(content)
-        local_path = f.name
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        staging = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        name = f"agentic-perf-{ticket_id}-{os.urandom(8).hex()}.tmp"
+        local_path = str(staging.write(name, content))
+    else:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
+            f.write(content)
+            local_path = f.name
 
     try:
-        scp_result = await ssh.copy_to(host, local_path, remote_path)
+        scp_result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     finally:
-        Path(local_path).unlink(missing_ok=True)
+        if ticket_id:
+            staging.unlink(Path(local_path).name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
 
     return json.dumps(
         {
@@ -768,7 +787,7 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
                 }
             )
 
-        result = await ssh.copy_to(host, str(local_path), remote_path)
+        result = await ssh.copy_to(host, str(local_path), remote_path, mutating=True)
         return json.dumps(
             {
                 "success": result.exit_code == 0,
@@ -793,33 +812,9 @@ async def transfer_file(
     ssh = _get_ssh()
 
     if direction == "push":
-        result = await ssh.copy_to(host, local_path, remote_path)
+        result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     elif direction == "pull":
-        args = [
-            "scp",
-            "-r",
-            "-o",
-            f"ConnectTimeout={ssh.connect_timeout}",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-        ]
-        if ssh.key_path:
-            args.extend(["-i", ssh.key_path])
-        args.extend([f"{ssh.user}@{host}:{remote_path}", local_path])
-
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        result = SSHResult(
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-            exit_code=proc.returncode or 0,
-        )
+        result = await ssh.copy_from(host, remote_path, local_path)
     else:
         return json.dumps(
             {"success": False, "error": f"Unknown direction: {direction}"}
