@@ -594,11 +594,8 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             if item.__class__.__name__ == "MCPAuditMiddleware"
         )
         events = []
-        original_emit = middleware._emit
         original_handler = tool.fn
-
-        def emit(trace, _context, state, **kwargs):
-            events.append((trace, state, kwargs))
+        original_record = middleware._record
 
         async def harmless_handler(**_kwargs):
             # FastMCP validates declared output schemas after the handler.  A
@@ -606,7 +603,7 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             # keeps this fixture from invoking its remote implementation.
             return {"result": "policy fixture result"}
 
-        middleware._emit = emit
+        middleware._record = events.append
         tool.fn = harmless_handler
         try:
             result = await server.mcp.call_tool(
@@ -614,20 +611,31 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             )
         finally:
             tool.fn = original_handler
-            middleware._emit = original_emit
+            middleware._record = original_record
         # Protected tools reject the harmless fixture before the handler when
         # it deliberately lacks a durable operation identity.  That is the
         # canonical real-boundary rejection path, not a fixture bypass.
-        assert [event[1] for event in events] in (
+        assert [event.lifecycle.state for event in events] in (
             [LifecycleState.REQUEST_RECEIVED, LifecycleState.RESPONSE_SENT],
             [LifecycleState.REQUEST_RECEIVED, LifecycleState.REJECTED],
         ), registration.key
-        assert result.is_error == (events[-1][1] == LifecycleState.REJECTED)
-        assert {event[2]["tool_name"] for event in events} == {
+        assert result.is_error == (
+            events[-1].lifecycle.state == LifecycleState.REJECTED
+        )
+        assert {event.action.phase for event in events} == {
             registration.key.rsplit(":", 1)[1]
         }
-        assert len({event[0].action_id for event in events}) == 1
-        assert all(event[0].mcp_correlation_request_id for event in events)
+        assert len({event.action_id for event in events}) == 1
+        assert all(event.mcp.correlation_request_id for event in events)
+        assert {event.attributes["policy_registration"] for event in events} == {
+            registration.key
+        }
+        assert {event.attributes["policy_classification"] for event in events} == {
+            POLICY_BY_REGISTRATION[registration.key].classification
+        }
+        assert {event.attributes["operation_owner"] for event in events} == {
+            POLICY_BY_REGISTRATION[registration.key].operation_owner
+        }
 
 
 @pytest.mark.asyncio

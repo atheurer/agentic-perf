@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -115,6 +116,7 @@ class MCPAuditMiddleware(Middleware):
         ticket_id: str | None = None,
         agent_id: str | None = None,
         record: Callable[[TraceEventV1], None] | None = None,
+        registration_path: str | None = None,
     ) -> None:
         self.server_name = server_name
         self.ticket_id = (
@@ -124,6 +126,7 @@ class MCPAuditMiddleware(Middleware):
             agent_id if agent_id is not None else os.environ.get("AGENT_NAME")
         )
         self._record = record
+        self.registration_path = registration_path
         self._client: TraceClient | None = None
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         url = os.environ.get("STATE_STORE_URL", "")
@@ -159,6 +162,20 @@ class MCPAuditMiddleware(Middleware):
             session_id = context.mcp_session_id or "unknown"
         if not context.ticket_id:
             return
+        policy_attributes: dict[str, Any] = {}
+        if self.registration_path:
+            # The policy is resolved at the real FastMCP boundary, not from a
+            # test-only symbol lookup.  A new registered tool therefore cannot
+            # emit an apparently valid audit pair without its declared owner.
+            from agents.tool_audit_policy import POLICY_BY_REGISTRATION
+
+            policy = POLICY_BY_REGISTRATION.get(f"{self.registration_path}:{tool_name}")
+            if policy is not None:
+                policy_attributes = {
+                    "policy_registration": policy.registration,
+                    "policy_classification": policy.classification,
+                    "operation_owner": policy.operation_owner,
+                }
         event = TraceEventV1(
             ticket_id=context.ticket_id,
             agent_id=context.agent_id,
@@ -203,6 +220,7 @@ class MCPAuditMiddleware(Middleware):
                 "audit_boundary": "MCPAuditMiddleware.on_call_tool",
                 "audit_transport": "local",
                 "causal_ancestor": context.parent_action_id,
+                **policy_attributes,
                 **(attributes or {}),
             },
         )
@@ -658,7 +676,16 @@ class MCPAuditMiddleware(Middleware):
 def create_ticket_mcp(server_name: str) -> FastMCP:
     """Create the required audited FastMCP instance for a local ticket server."""
     bootstrap_shared_redactor_from_environment()
-    middleware = MCPAuditMiddleware(server_name)
+    caller = Path(inspect.stack()[1].filename).resolve()
+    project_root = Path(__file__).resolve().parents[1]
+    try:
+        registration_path = caller.relative_to(project_root).as_posix()
+    except ValueError:
+        # External integration fixtures may create a private server script;
+        # production package servers are always project-relative and enforced
+        # below by the registration inventory test.
+        registration_path = None
+    middleware = MCPAuditMiddleware(server_name, registration_path=registration_path)
 
     @asynccontextmanager
     async def lifespan(_: FastMCP):
