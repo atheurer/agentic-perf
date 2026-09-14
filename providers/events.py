@@ -38,7 +38,17 @@ EVENT_TYPES = {
     "agent_stopped",
     "user_interjection",
     "escalation",
+    "circuit_breaker",
 }
+
+TERMINAL_EVENTS = frozenset(
+    {
+        "agent_finished",
+        "agent_aborted",
+        "agent_error",
+        "agent_stopped",
+    }
+)
 
 
 class Event:
@@ -459,6 +469,19 @@ class EventBus:
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
         return [item for item in merged if item["seq"] > since][:limit]
+
+    def get_terminal_events(
+        self,
+        ticket_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return terminal events for a ticket regardless of window limits.
+
+        Use the normal event projection so this works for both the
+        trace-backed store and legacy JSONL records, including after a
+        process restart.
+        """
+        events = self.get_events(ticket_id, since=0, limit=100_000)
+        return [event for event in events if event.get("event_type") in TERMINAL_EVENTS]
 
     def _read_from_file(
         self,

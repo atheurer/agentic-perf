@@ -25,10 +25,15 @@ def get_events(
 ):
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
-        return {"events": [], "latest_seq": 0}
+        return {"events": [], "latest_seq": 0, "terminal_events": []}
     events = event_bus.get_events(ticket_id, since=since, limit=limit)
     latest_seq = events[-1]["seq"] if events else since
-    return {"events": events, "latest_seq": latest_seq}
+    terminal_events = event_bus.get_terminal_events(ticket_id)
+    return {
+        "events": events,
+        "latest_seq": latest_seq,
+        "terminal_events": terminal_events,
+    }
 
 
 @router.get("/{ticket_id}/transcript")
