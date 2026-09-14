@@ -190,12 +190,18 @@ class HorreumRecordProvider(InvestigationRecordProvider):
         payload.pop("$schema", None)
 
         try:
-            return InvestigationRecord.model_validate(payload)
+            record = InvestigationRecord.model_validate(payload)
+            record.record_url = self._run_url(run_id)
+            return record
         except Exception:
             logger.warning(
                 f"[horreum] Failed to parse record {investigation_id} from run {run_id}"
             )
             return None
+
+    def _run_url(self, run_id: int) -> str:
+        """Build a direct URL to a Horreum run."""
+        return f"{self._url}/run/{run_id}"
 
     async def query(
         self,
@@ -235,6 +241,7 @@ class HorreumRecordProvider(InvestigationRecordProvider):
             payload.pop("$schema", None)
             try:
                 record = InvestigationRecord.model_validate(payload)
+                record.record_url = self._run_url(run_id)
             except Exception:
                 continue
 
