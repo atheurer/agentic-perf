@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -666,6 +668,23 @@ def _build_deployer_config(
     }
 
 
+# Writable config dir for podman in OCP pods where HOME
+# (/opt/app-root/src) is owned by root but the container
+# runs as an arbitrary UID.
+_podman_config_dir: str | None = None
+
+
+def _podman_env() -> dict[str, str]:
+    """Return env overrides so podman can write its config."""
+    global _podman_config_dir
+    if _podman_config_dir is None:
+        _podman_config_dir = tempfile.mkdtemp(prefix="podman-cfg-")
+    env = os.environ.copy()
+    env["XDG_CONFIG_HOME"] = _podman_config_dir
+    env["XDG_RUNTIME_DIR"] = _podman_config_dir
+    return env
+
+
 async def _ensure_podman_connection(
     ticket: dict[str, Any],
 ) -> bool:
@@ -734,6 +753,7 @@ async def _run_cmd(*args: str) -> bool:
             *args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=_podman_env(),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
