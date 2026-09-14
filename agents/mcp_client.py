@@ -383,6 +383,7 @@ async def connect_external_servers(
     agent_type: str,
     config: dict[str, Any] | None = None,
     secrets_dir: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[list[str], set[str] | None]:
     """Connect an MCP client to external servers configured
     for the given agent type.
@@ -537,11 +538,15 @@ async def connect_external_servers(
                         f"[mcp] Skipping stdio server {name!r}: missing command"
                     )
                     continue
+                cmd_env = entry.get("env")
+                if extra_env:
+                    cmd_env = dict(cmd_env or {})
+                    cmd_env.update(extra_env)
                 await client.connect_command(
                     command=command[0],
                     args=command[1:] if len(command) > 1 else [],
                     name=name,
-                    env=entry.get("env"),
+                    env=cmd_env,
                 )
             elif transport == "sse":
                 await client.connect_sse(
