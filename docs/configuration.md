@@ -239,10 +239,26 @@ Individual tickets can override the LLM at runtime via
     "llm_override": {
         "provider": "anthropic",
         "model": "claude-opus-4-8",
-        "reasoning_effort": "high"
+        "reasoning_effort": "high",
+        "timeout": 300
     }
 }
 ```
+
+Supported fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `provider` | string | LLM provider name (e.g. `anthropic`, `openai`) |
+| `model` | string | Model identifier |
+| `api` | string | API base URL |
+| `reasoning_effort` | string | Thinking level (`low`, `medium`, `high`) |
+| `max_tokens` | int | Maximum output tokens |
+| `timeout` | float | LLM call timeout in seconds (0 = no timeout) |
+
+When `timeout` is omitted, the global `llm.timeout` from config
+applies. When the entire `llm_override` block is omitted, the
+per-agent model configuration applies normally.
 
 This override is cleared after the agent completes.
 
