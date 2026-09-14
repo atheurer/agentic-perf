@@ -18,6 +18,7 @@ from agents.tool_audit_policy import (
     AUDIT_BYPASS_ALLOWLIST,
     OPERATION_OWNER_CONTRACTS,
     POLICY_BY_REGISTRATION,
+    REGISTRATION_DISCOVERY_EXCEPTIONS,
     TOOL_AUDIT_POLICY,
 )
 from providers.tracing import (
@@ -214,6 +215,186 @@ def _factory_aliases(tree: ast.AST) -> set[str]:
     return names
 
 
+def _assignment_names(node: ast.Assign | ast.AnnAssign) -> list[str]:
+    """Return simple names bound by an assignment without guessing attributes."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return [target.id for target in targets if isinstance(target, ast.Name)]
+
+
+def _assignment_handler_targets(node: ast.Assign | ast.AnnAssign) -> list[str]:
+    """Return named and attribute map targets without resolving arbitrary objects."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return [
+        target.id if isinstance(target, ast.Name) else target.attr
+        for target in targets
+        if isinstance(target, (ast.Name, ast.Attribute))
+    ]
+
+
+def _literal_tool_name(decorator: ast.expr, default: str) -> tuple[str, str | None]:
+    """Resolve a FastMCP decorator name or report an unreviewable dynamic name."""
+    if not isinstance(decorator, ast.Call):
+        return default, None
+    for keyword in decorator.keywords:
+        if keyword.arg != "name":
+            continue
+        if isinstance(keyword.value, ast.Constant) and isinstance(
+            keyword.value.value, str
+        ):
+            return keyword.value.value, None
+        return default, "dynamic MCP advertised name"
+    # FastMCP accepts its advertised name as the first positional argument.
+    if decorator.args:
+        candidate = decorator.args[0]
+        if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+            return candidate.value, None
+        return default, "dynamic MCP advertised name"
+    return default, None
+
+
+def _mcp_registrations_from_tree(
+    relative: str, tree: ast.Module
+) -> tuple[set[Registration], list[str]]:
+    """Discover decorators through simple aliases and audited wrapper bindings.
+
+    Registration is deliberately conservative.  When a decorator cannot be
+    tied to a ``create_ticket_mcp`` instance at parse time, it is a CI failure;
+    silently treating a dynamic wrapper as a local convention would reopen the
+    unaudited-tool bypass this policy is intended to close.
+    """
+    registrations: set[Registration] = set()
+    violations: list[str] = []
+    audited_instances: set[str] = set()
+    tool_decorators: set[str] = set()
+    audited_wrappers: set[str] = set()
+
+    # Resolve the intentionally small, local alias graph to a fixed point:
+    # ``server = factory()``, ``alias = server``, and ``register = alias.tool``.
+    # This covers ordinary aliases without pretending arbitrary code execution
+    # or dynamically selected factories are statically auditable.
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            names = _assignment_names(node)
+            is_audited_instance = (
+                isinstance(value, ast.Call)
+                and _call_name(value.func) in _factory_aliases(tree)
+            ) or (isinstance(value, ast.Name) and value.id in audited_instances)
+            if is_audited_instance:
+                before = len(audited_instances)
+                audited_instances.update(names)
+                changed |= len(audited_instances) != before
+            is_tool_decorator = (
+                (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "tool"
+                    and _call_name(value.value) in audited_instances
+                )
+                or (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "tool"
+                    and _call_name(value.func.value) in audited_instances
+                )
+                or (isinstance(value, ast.Name) and value.id in tool_decorators)
+            )
+            if is_tool_decorator:
+                before = len(tool_decorators)
+                tool_decorators.update(names)
+                changed |= len(tool_decorators) != before
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            returns_audited_tool = any(
+                isinstance(descendant, ast.Return)
+                and isinstance(descendant.value, ast.Call)
+                and isinstance(descendant.value.func, ast.Attribute)
+                and descendant.value.func.attr == "tool"
+                and _call_name(descendant.value.func.value) in audited_instances
+                for descendant in ast.walk(node)
+            )
+            if returns_audited_tool and node.name not in audited_wrappers:
+                audited_wrappers.add(node.name)
+                changed = True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            call = decorator if isinstance(decorator, ast.Call) else None
+            callee = _call_name(call.func if call else decorator)
+            receiver = ""
+            is_tool = False
+            if (
+                call
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "tool"
+            ):
+                receiver = _call_name(call.func.value)
+                is_tool = True
+            elif callee in tool_decorators or callee in audited_wrappers:
+                is_tool = True
+                receiver = callee
+            elif call and _call_name(call.func) in {"getattr", "builtins.getattr"}:
+                if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+                    if call.args[1].value == "tool":
+                        violations.append(
+                            f"{relative}:{node.lineno}:dynamic MCP tool registrar is not auditable"
+                        )
+                continue
+            if not is_tool:
+                continue
+            audited = (
+                receiver in audited_instances
+                or receiver in tool_decorators
+                or receiver in audited_wrappers
+            )
+            if not audited:
+                violations.append(
+                    f"{relative}:{node.lineno}:{node.name} decorates "
+                    f"{receiver or '<dynamic>'}.tool outside create_ticket_mcp"
+                )
+            name, name_error = _literal_tool_name(decorator, node.name)
+            if name_error:
+                violations.append(f"{relative}:{node.lineno}:{name_error}")
+            registrations.add(
+                Registration(
+                    key=f"{relative}:{name}",
+                    path=relative,
+                    function=node.name,
+                    line=node.lineno,
+                    kind="mcp",
+                )
+            )
+    # A dynamic `getattr(mcp, "tool")` / decorator factory defeats static
+    # inventory.  It must be made explicit instead of silently ignored.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _call_name(node.func) in {
+            "getattr",
+            "builtins.getattr",
+            "setattr",
+            "builtins.setattr",
+        } and any(
+            isinstance(arg, ast.Constant) and arg.value == "tool"
+            for arg in node.args[1:2]
+        ):
+            marker = (
+                f"{relative}:{node.lineno}:dynamic MCP tool registrar is not auditable"
+            )
+            if marker not in violations:
+                violations.append(marker)
+    return registrations, violations
+
+
 def _mcp_registrations() -> tuple[set[Registration], list[str]]:
     registrations: set[Registration] = set()
     violations: list[str] = []
@@ -223,59 +404,157 @@ def _mcp_registrations() -> tuple[set[Registration], list[str]]:
     # a new decorator from the policy inventory.
     for path in sorted(SERVER_ROOT.rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
-        audited_instances = {
-            target.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and _call_name(node.value.func) in _factory_aliases(tree)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
+        found, errors = _mcp_registrations_from_tree(
+            relative,
+            ast.parse(path.read_text(encoding="utf-8"), filename=relative),
+        )
+        registrations.update(found)
+        violations.extend(errors)
+    return registrations, violations
+
+
+def _tool_definition_aliases(tree: ast.AST) -> set[str]:
+    """Return import and simple assignment spellings of ``ToolDefinition``."""
+    aliases = {"ToolDefinition"}
+    changed = True
+    while changed:
+        changed = False
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for decorator in node.decorator_list:
-                if not (
-                    isinstance(decorator, ast.Call)
-                    and isinstance(decorator.func, ast.Attribute)
-                    and decorator.func.attr == "tool"
-                ):
-                    continue
-                receiver = _call_name(decorator.func.value)
-                if receiver not in audited_instances:
-                    violations.append(
-                        f"{relative}:{node.lineno}:{node.name} decorates "
-                        f"{receiver or '<dynamic>'}.tool outside create_ticket_mcp"
+            if isinstance(node, ast.ImportFrom):
+                for item in node.names:
+                    if item.name == "ToolDefinition":
+                        before = len(aliases)
+                        aliases.add(item.asname or item.name)
+                        changed |= len(aliases) != before
+                    elif node.module and node.module.startswith("providers.llm"):
+                        # ``from providers.llm import base as llm_base``.
+                        before = len(aliases)
+                        aliases.add(f"{item.asname or item.name}.ToolDefinition")
+                        changed |= len(aliases) != before
+            elif isinstance(node, ast.Import):
+                for item in node.names:
+                    if item.name.startswith("providers.llm"):
+                        before = len(aliases)
+                        local = item.asname or item.name.split(".")[0]
+                        aliases.add(f"{local}.ToolDefinition")
+                        aliases.add(f"{item.asname or item.name}.ToolDefinition")
+                        changed |= len(aliases) != before
+            elif isinstance(node, ast.Assign):
+                if _call_name(node.value) in aliases:
+                    before = len(aliases)
+                    aliases.update(_assignment_names(node))
+                    changed |= len(aliases) != before
+    return aliases
+
+
+def _native_registrations_from_tree(
+    relative: str, module: ast.Module
+) -> tuple[set[Registration], list[str]]:
+    """Discover literal native tools and fail closed on dynamic registrations."""
+    registrations: set[Registration] = set()
+    violations: list[str] = []
+    aliases = _tool_definition_aliases(module)
+    parents = {
+        child: parent
+        for parent in ast.walk(module)
+        for child in ast.iter_child_nodes(parent)
+    }
+    exceptions = {
+        (exception.path, exception.symbol)
+        for exception in REGISTRATION_DISCOVERY_EXCEPTIONS
+    }
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call) or _call_name(node.func) not in aliases:
+            continue
+        name_keyword = next(
+            (item for item in node.keywords if item.arg == "name"), None
+        )
+        if name_keyword is None:
+            # ToolDefinition is also used for dynamically relaying already
+            # registered external MCP schemas.  That is not a native
+            # registration unless it is inserted into a local handler map.
+            continue
+        if not (
+            isinstance(name_keyword.value, ast.Constant)
+            and isinstance(name_keyword.value.value, str)
+        ):
+            symbol = _enclosing_symbol(node, parents)
+            if (relative, symbol) not in exceptions:
+                violations.append(
+                    f"{relative}:{node.lineno}:dynamic native tool name is not auditable"
+                )
+            continue
+        registrations.add(
+            Registration(
+                key=f"{relative}:{name_keyword.value.value}",
+                path=relative,
+                function="ToolDefinition",
+                line=node.lineno,
+                kind="native",
+            )
+        )
+
+    # Native maps need not be named local_handlers and may be filled with
+    # ``update`` after construction.  Discover explicit literal keys in both
+    # forms so an alternate map cannot evade policy classification.
+    for node in ast.walk(module):
+        dictionary: ast.Dict | None = None
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(
+            node.value, ast.Dict
+        ):
+            line = node.lineno
+            targets = _assignment_handler_targets(node)
+            if any(
+                name.endswith("handlers") or name.endswith("tool_map")
+                for name in targets
+            ):
+                dictionary = node.value
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"update", "setdefault"}
+            and _call_name(node.func.value).endswith(("handlers", "tool_map"))
+        ):
+            line = node.lineno
+            if node.args and isinstance(node.args[0], ast.Dict):
+                dictionary = node.args[0]
+            elif node.func.attr == "setdefault" and node.args:
+                key = node.args[0]
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    registrations.add(
+                        Registration(
+                            key=f"{relative}:{key.value}",
+                            path=relative,
+                            function="native_handlers",
+                            line=line,
+                            kind="native",
+                        )
                     )
-                name = _tool_name(decorator, node.name)
+                else:
+                    violations.append(
+                        f"{relative}:{line}:dynamic native handler name is not auditable"
+                    )
+        if dictionary is None:
+            continue
+        for key in dictionary.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 registrations.add(
                     Registration(
-                        key=f"{relative}:{name}",
+                        key=f"{relative}:{key.value}",
                         path=relative,
-                        function=node.name,
-                        line=node.lineno,
-                        kind="mcp",
+                        function="native_handlers",
+                        line=line,
+                        kind="native",
                     )
                 )
-        # A dynamic `getattr(mcp, "tool")` / decorator factory defeats static
-        # inventory.  It must be made explicit (or added as a precise reviewed
-        # exemption) instead of silently being ignored by this guardrail.
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-                continue
-            if node.func.id in {"getattr", "setattr"} and any(
-                isinstance(arg, ast.Constant) and arg.value == "tool"
-                for arg in node.args[1:2]
-            ):
+            else:
                 violations.append(
-                    f"{relative}:{node.lineno}:dynamic MCP tool registrar is not auditable"
+                    f"{relative}:{line}:dynamic native handler name is not auditable"
                 )
     return registrations, violations
 
 
-def _native_registrations() -> set[Registration]:
+def _native_registrations() -> tuple[set[Registration], list[str]]:
     """Discover every native LLM surface in every production agent module.
 
     Do not limit this to ``*/agent.py``: native ``ToolDefinition`` collections
@@ -283,60 +562,14 @@ def _native_registrations() -> set[Registration]:
     would let a new unclassified capability evade the CI contract.
     """
     registrations: set[Registration] = set()
+    violations: list[str] = []
     for path in sorted(SERVER_ROOT.rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
         module = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
-        for node in ast.walk(module):
-            if not (
-                isinstance(node, ast.Call)
-                and _call_name(node.func).endswith("ToolDefinition")
-            ):
-                continue
-            for keyword in node.keywords:
-                if (
-                    keyword.arg == "name"
-                    and isinstance(keyword.value, ast.Constant)
-                    and isinstance(keyword.value.value, str)
-                ):
-                    registrations.add(
-                        Registration(
-                            key=f"{relative}:{keyword.value.value}",
-                            path=relative,
-                            function="ToolDefinition",
-                            line=node.lineno,
-                            kind="native",
-                        )
-                    )
-        # Native maps may be assigned in a constructor or method, not just a
-        # module-level ``local_handlers`` name.  Inspect every dict attached to
-        # a ``*_handlers`` target and require its literal advertised names to
-        # participate in the same manifest as ToolDefinition declarations.
-        for node in ast.walk(module):
-            if not (
-                isinstance(node, ast.Assign)
-                and any(
-                    (isinstance(target, ast.Name) and target.id.endswith("handlers"))
-                    or (
-                        isinstance(target, ast.Attribute)
-                        and target.attr.endswith("handlers")
-                    )
-                    for target in node.targets
-                )
-                and isinstance(node.value, ast.Dict)
-            ):
-                continue
-            for key in node.value.keys:
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    registrations.add(
-                        Registration(
-                            key=f"{relative}:{key.value}",
-                            path=relative,
-                            function="native_handlers",
-                            line=node.lineno,
-                            kind="native",
-                        )
-                    )
-    return registrations
+        found, errors = _native_registrations_from_tree(relative, module)
+        registrations.update(found)
+        violations.extend(errors)
+    return registrations, violations
 
 
 def _chat_registrations() -> set[Registration]:
@@ -472,9 +705,12 @@ def _read_only_direct_mutations(registration: Registration) -> list[str]:
 
 def test_tool_registration_inventory_is_complete_and_classified() -> None:
     """A new MCP/native action must add an explicit reviewed policy entry."""
-    mcp, violations = _mcp_registrations()
-    actual = mcp | _native_registrations() | _chat_registrations()
-    assert not violations, "\n".join(violations)
+    mcp, mcp_violations = _mcp_registrations()
+    native, native_violations = _native_registrations()
+    actual = mcp | native | _chat_registrations()
+    assert not (mcp_violations + native_violations), "\n".join(
+        mcp_violations + native_violations
+    )
     expected = set(POLICY_BY_REGISTRATION)
     actual_keys = {registration.key for registration in actual}
     assert expected == actual_keys, (
@@ -484,6 +720,122 @@ def test_tool_registration_inventory_is_complete_and_classified() -> None:
         f"stale={sorted(expected - actual_keys)!r}"
     )
     assert len(POLICY_BY_REGISTRATION) == len(TOOL_AUDIT_POLICY)
+
+
+def test_dynamic_native_registration_exceptions_are_precise_and_consumed() -> None:
+    """Schema relay exceptions cannot become a broad native registration waiver."""
+    consumed: set[tuple[str, str]] = set()
+    for exception in REGISTRATION_DISCOVERY_EXCEPTIONS:
+        assert exception.owner and exception.reason
+        assert exception.scope == f"{exception.path}:{exception.symbol}"
+        assert date.fromisoformat(exception.expires_on) >= date.today()
+        tree = ast.parse(
+            (ROOT / exception.path).read_text(encoding="utf-8"),
+            filename=exception.path,
+        )
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        assert any(
+            isinstance(node, ast.Call)
+            and _call_name(node.func) in _tool_definition_aliases(tree)
+            and any(keyword.arg == "name" for keyword in node.keywords)
+            and not isinstance(
+                next(
+                    keyword for keyword in node.keywords if keyword.arg == "name"
+                ).value,
+                ast.Constant,
+            )
+            and _enclosing_symbol(node, parents) == exception.symbol
+            for node in ast.walk(tree)
+        ), f"stale dynamic native registration exception: {exception}"
+        consumed.add((exception.path, exception.symbol))
+    dynamic: set[tuple[str, str]] = set()
+    for path in SERVER_ROOT.rglob("*.py"):
+        relative = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        aliases = _tool_definition_aliases(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _call_name(node.func) not in aliases:
+                continue
+            name = next((item for item in node.keywords if item.arg == "name"), None)
+            if name is not None and not isinstance(name.value, ast.Constant):
+                dynamic.add((relative, _enclosing_symbol(node, parents)))
+    assert consumed == dynamic, (
+        "dynamic native ToolDefinition calls require a precise, consumed exception; "
+        f"missing={sorted(dynamic - consumed)!r}; stale={sorted(consumed - dynamic)!r}"
+    )
+
+
+def test_registration_discovery_tracks_audited_mcp_aliases_and_wrappers() -> None:
+    tree = ast.parse(
+        """
+from agents.mcp_audit import create_ticket_mcp as factory
+mcp = factory("test")
+alias = mcp
+register = alias.tool
+
+@register(name="alias_tool")
+async def first(): pass
+
+def audited_registration():
+    return alias.tool()
+
+@audited_registration()
+async def second(): pass
+"""
+    )
+    registrations, violations = _mcp_registrations_from_tree("agents/test.py", tree)
+    assert not violations
+    assert {registration.key for registration in registrations} == {
+        "agents/test.py:alias_tool",
+        "agents/test.py:second",
+    }
+
+
+def test_registration_discovery_fails_closed_for_dynamic_mcp_and_native_names() -> None:
+    mcp_tree = ast.parse(
+        """
+from agents.mcp_audit import create_ticket_mcp
+mcp = create_ticket_mcp("test")
+name = external_name()
+@mcp.tool(name=name)
+async def dynamic_name(): pass
+@getattr(mcp, "tool")()
+async def dynamic_registrar(): pass
+"""
+    )
+    _, mcp_violations = _mcp_registrations_from_tree("agents/test.py", mcp_tree)
+    assert any("dynamic MCP advertised name" in item for item in mcp_violations)
+    assert any("dynamic MCP tool registrar" in item for item in mcp_violations)
+
+    native_tree = ast.parse(
+        """
+from providers.llm import base as llm_base
+NativeDefinition = llm_base.ToolDefinition
+name = external_name()
+TOOLS = [NativeDefinition(name=name, description="x", input_schema={})]
+self.alternate_tool_map = {"literal": handler}
+self.alternate_tool_map.update({"also_literal": handler})
+"""
+    )
+    registrations, native_violations = _native_registrations_from_tree(
+        "agents/test.py", native_tree
+    )
+    assert {registration.key for registration in registrations} == {
+        "agents/test.py:literal",
+        "agents/test.py:also_literal",
+    }
+    assert native_violations == [
+        "agents/test.py:5:dynamic native tool name is not auditable"
+    ]
 
 
 def test_checked_in_side_effect_inventory_has_zero_unexplained_boundaries() -> None:
@@ -532,12 +884,13 @@ def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
     for policy in TOOL_AUDIT_POLICY:
         exemption = policy.fixture_exemption
-        assert exemption.owner and exemption.reason
-        assert date.fromisoformat(exemption.expires_on) >= date.today()
-        assert policy.registration in exemption.reason, (
-            "remote fixture exemptions must be per registration, not a broad "
-            f"MCP/native surface waiver: {policy.registration}"
-        )
+        if exemption is not None:
+            assert exemption.owner and exemption.reason
+            assert date.fromisoformat(exemption.expires_on) >= date.today()
+            assert policy.registration in exemption.reason, (
+                "remote fixture exemptions must be per registration, not a broad "
+                f"MCP/native surface waiver: {policy.registration}"
+            )
         if policy.classification == "side_effecting":
             assert policy.operation_owner, policy.registration
             contract = OPERATION_OWNER_CONTRACTS.get(policy.operation_owner)

@@ -29,7 +29,7 @@ class ToolAuditPolicy:
 
     registration: str
     classification: ToolClassification
-    fixture_exemption: FixtureExemption
+    fixture_exemption: FixtureExemption | None = None
     operation_owner: str | None = None
 
 
@@ -45,62 +45,42 @@ class AuditBypass:
     expires_on: str
 
 
-def _fixture_exemption(
-    registration: str, *, native: bool, chat: bool
-) -> FixtureExemption:
-    """Make remote-test exemptions explicit, single-registration review items.
+@dataclass(frozen=True)
+class RegistrationDiscoveryException:
+    """A precise non-registration dynamic ToolDefinition construction.
 
-    The policy must never grant a server- or surface-wide fixture exception:
-    adding a new tool creates a distinct expiring declaration which the CI test
-    proves is consumed by the canonical boundary test.
+    Dynamic names normally fail closed because CI cannot prove which tool was
+    exposed.  These entries cover only server introspection and the MCP-client
+    schema relay, which construct a descriptor for an already registered tool
+    and never install a local handler.
     """
-    if chat:
-        owner = "chat-maintainers"
-        boundary = "ChatToolAudit.invoke"
-    elif native:
-        owner = "observability-maintainers"
-        boundary = "AgentBase._execute_tool"
-    else:
-        owner = "observability-maintainers"
-        boundary = "MCPAuditMiddleware.on_call_tool"
-    return FixtureExemption(
-        owner=owner,
-        expires_on="2027-12-31",
-        reason=(
-            f"{registration} may require provider credentials, ticket state, or a "
-            f"remote host. CI intercepts its actual {boundary} entry/terminal "
-            "boundary with a schema-valid harmless fixture; this exception avoids "
-            "only the remote effect and expires with this exact registration."
-        ),
-    )
+
+    path: str
+    symbol: str
+    owner: str
+    scope: str
+    reason: str
+    expires_on: str
 
 
-def _read_only(
-    *registrations: str, native: bool = False, chat: bool = False
-) -> tuple[ToolAuditPolicy, ...]:
+def _read_only(*registrations: str, **_unused: bool) -> tuple[ToolAuditPolicy, ...]:
     return tuple(
         ToolAuditPolicy(
             registration=registration,
             classification="read_only",
-            fixture_exemption=_fixture_exemption(
-                registration, native=native, chat=chat
-            ),
         )
         for registration in registrations
     )
 
 
 def _side_effecting(
-    owner: str, *registrations: str, native: bool = False, chat: bool = False
+    owner: str, *registrations: str, **_unused: bool
 ) -> tuple[ToolAuditPolicy, ...]:
     return tuple(
         ToolAuditPolicy(
             registration=registration,
             classification="side_effecting",
             operation_owner=owner,
-            fixture_exemption=_fixture_exemption(
-                registration, native=native, chat=chat
-            ),
         )
         for registration in registrations
     )
@@ -393,3 +373,65 @@ OPERATION_OWNER_CONTRACTS = {
 # Exceptions are intentionally empty.  Do not add a broad module exemption:
 # an exception must identify the exact symbol and have an accountable expiry.
 AUDIT_BYPASS_ALLOWLIST: tuple[AuditBypass, ...] = ()
+
+# This is intentionally not a module-wide waiver.  Each dynamic descriptor is
+# a non-registration adapter whose exact enclosing symbol is checked and
+# consumed by the AST guardrail.  A new dynamic local tool must fail CI.
+REGISTRATION_DISCOVERY_EXCEPTIONS = (
+    RegistrationDiscoveryException(
+        path="agents/benchmark/server.py",
+        symbol="get_registered_tools",
+        owner="benchmark-maintainers",
+        scope="agents/benchmark/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/mcp_client.py",
+        symbol="list_tools",
+        owner="observability-maintainers",
+        scope="agents/mcp_client.py:list_tools",
+        reason="relays schemas from an already-connected external MCP server",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/provisioning/server.py",
+        symbol="get_registered_tools",
+        owner="provisioning-maintainers",
+        scope="agents/provisioning/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/resource/server.py",
+        symbol="get_registered_tools",
+        owner="resource-maintainers",
+        scope="agents/resource/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/retrospective/server.py",
+        symbol="get_registered_tools",
+        owner="retrospective-maintainers",
+        scope="agents/retrospective/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/review/server.py",
+        symbol="get_registered_tools",
+        owner="review-maintainers",
+        scope="agents/review/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+    RegistrationDiscoveryException(
+        path="agents/triage/server.py",
+        symbol="get_registered_tools",
+        owner="triage-maintainers",
+        scope="agents/triage/server.py:get_registered_tools",
+        reason="mirrors already-audited FastMCP registrations for client discovery",
+        expires_on="2026-12-31",
+    ),
+)
