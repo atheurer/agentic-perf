@@ -7,8 +7,11 @@ import importlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp import McpError
 
 from agents.side_effect_inventory import (
     INVENTORIED_SIDE_EFFECTS,
@@ -22,7 +25,9 @@ from agents.tool_audit_policy import (
     TOOL_AUDIT_POLICY,
 )
 from providers.tracing import (
+    ActionType,
     LifecycleState,
+    TraceRecorder,
     bind_trace_context,
     new_trace_context,
     reset_trace_context,
@@ -1049,7 +1054,19 @@ def test_production_fastmcp_and_native_dispatch_have_one_audit_boundary() -> Non
 
 @pytest.mark.asyncio
 async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
-    """Exercise each registration through its actual FastMCP middleware stack."""
+    """Exercise each registration through its installed FastMCP audit boundary.
+
+    This deliberately does *not* replace ``tool.fn``.  Replacing every handler
+    with a pleasant generic coroutine made the old check prove only that a
+    test double could traverse the middleware.  Instead, this invokes each
+    actual FastMCP registration with a schema-valid request while the server is
+    in its ticket-owned mode.  The missing causal envelope is rejected before
+    dispatch, which is the safe, real production interception for a request
+    that is not attributable to an agent invocation.  Thus remote handlers are
+    never contacted, but the registered tool name, factory-installed
+    middleware, policy lookup, and correlated request/terminal audit pair all
+    run exactly as they do in a ticket process.
+    """
     registrations, _ = _mcp_registrations()
     for registration in registrations:
         module_name = registration.path.removesuffix(".py").replace("/", ".")
@@ -1064,34 +1081,28 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             if item.__class__.__name__ == "MCPAuditMiddleware"
         )
         events = []
-        original_handler = tool.fn
         original_record = middleware._record
-
-        async def harmless_handler(**_kwargs):
-            # FastMCP validates declared output schemas after the handler.  A
-            # mapping is accepted by the common wrapped-result contract and
-            # keeps this fixture from invoking its remote implementation.
-            return {"result": "policy fixture result"}
-
+        original_ticket_id = middleware.ticket_id
+        original_agent_id = middleware.agent_id
         middleware._record = events.append
-        tool.fn = harmless_handler
+        # A ticket-local server rejects a call without AgentMCPClient's causal
+        # metadata.  That is the deliberately safe fixture: no handler is
+        # substituted and no remote/state-changing implementation can run.
+        middleware.ticket_id = "PERF-policy"
+        middleware.agent_id = "policy-agent"
         try:
-            result = await server.mcp.call_tool(
-                registration.key.rsplit(":", 1)[1], arguments
-            )
+            with pytest.raises(McpError, match="missing agentic-perf trace metadata"):
+                await server.mcp.call_tool(
+                    registration.key.rsplit(":", 1)[1], arguments
+                )
         finally:
-            tool.fn = original_handler
             middleware._record = original_record
-        # Protected tools reject the harmless fixture before the handler when
-        # it deliberately lacks a durable operation identity.  That is the
-        # canonical real-boundary rejection path, not a fixture bypass.
-        assert [event.lifecycle.state for event in events] in (
-            [LifecycleState.REQUEST_RECEIVED, LifecycleState.RESPONSE_SENT],
-            [LifecycleState.REQUEST_RECEIVED, LifecycleState.REJECTED],
-        ), registration.key
-        assert result.is_error == (
-            events[-1].lifecycle.state == LifecycleState.REJECTED
-        )
+            middleware.ticket_id = original_ticket_id
+            middleware.agent_id = original_agent_id
+        assert [event.lifecycle.state for event in events] == [
+            LifecycleState.REQUEST_RECEIVED,
+            LifecycleState.REJECTED,
+        ], registration.key
         assert {event.action.phase for event in events} == {
             registration.key.rsplit(":", 1)[1]
         }
@@ -1106,6 +1117,10 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
         assert {event.attributes["operation_owner"] for event in events} == {
             POLICY_BY_REGISTRATION[registration.key].operation_owner
         }
+        assert {event.attributes["audit_boundary"] for event in events} == {
+            "MCPAuditMiddleware.on_call_tool"
+        }
+        assert {event.attributes["audit_transport"] for event in events} == {"local"}
 
 
 @pytest.mark.asyncio
@@ -1158,6 +1173,124 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair() -> None:
             ] == (POLICY_BY_REGISTRATION[registration.key].operation_owner)
             assert events[0].idempotency.key == events[0].attributes["operation_key"]
             assert events[0].idempotency.request_hash
+
+
+@pytest.mark.asyncio
+async def test_real_agentbase_native_dispatch_records_the_registered_workspace_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive an installed native handler through AgentBase's production loop.
+
+    ``AgentBase`` owns the native tool lifecycle for every agent using local
+    handlers.  This runs its actual ``list_files_from_workspace`` closure, not
+    a replacement handler, through an LLM tool-use turn.  The workspace
+    manager is the one precise test adapter: it prevents the handler from
+    touching a real ticket workspace while preserving its production call
+    shape.  Chat has its own dispatcher and is exercised per registration
+    above.
+    """
+    from agents.base import AgentBase
+    from providers.llm.base import LLMResponse, ToolCall
+
+    calls: list[str] = []
+
+    class SafeWorkspaceManager:
+        def __init__(self, *, ticket_id: str | None, agent_name: str) -> None:
+            assert ticket_id == "PERF-policy"
+            assert agent_name == "policy-agent"
+
+        def list_effective_files(self) -> list[dict[str, object]]:
+            return []
+
+        def read_effective_context(self) -> str:
+            return ""
+
+        def list_files(self) -> dict[str, object]:
+            calls.append("list_files")
+            return {"files": []}
+
+    class PolicyAgent(AgentBase):
+        def _system_prompt(self, _ticket: dict[str, object]) -> str:
+            return "policy fixture"
+
+        def _build_messages(self, _ticket: dict[str, object]) -> list[dict[str, str]]:
+            return [{"role": "user", "content": "policy fixture"}]
+
+        async def _handle_completion(
+            self, _ticket_id: str, _response: LLMResponse
+        ) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "providers.workspace.manager.WorkspaceManager", SafeWorkspaceManager
+    )
+    responses = [
+        LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="native-policy-call",
+                    name="list_files_from_workspace",
+                    input={},
+                )
+            ],
+            stop_reason="tool_use",
+            raw_content=[],
+        )
+    ]
+
+    async def complete(**_kwargs: object) -> LLMResponse:
+        if responses:
+            return responses.pop(0)
+        return LLMResponse(
+            text="done", tool_calls=[], stop_reason="end_turn", raw_content=[]
+        )
+
+    llm = SimpleNamespace(complete=AsyncMock(side_effect=complete))
+    agent = PolicyAgent(
+        agent_name="policy-agent",
+        llm_provider=llm,  # type: ignore[arg-type]
+        state_store_url="http://state-store.invalid",
+        max_iterations=2,
+    )
+    agent._tool_min_interval = 0
+    events = []
+    agent._trace = TraceRecorder(client=SimpleNamespace(record=events.append))
+
+    async def ticket(_ticket_id: str) -> dict[str, object]:
+        return {
+            "id": "PERF-policy",
+            "status": "triaging",
+            "custom_fields": {"global_max_iterations_override": 4},
+        }
+
+    async def no_interjection(_ticket_id: str) -> None:
+        return None
+
+    agent._get_ticket = ticket  # type: ignore[method-assign]
+    agent._check_interject = no_interjection  # type: ignore[method-assign]
+    agent._check_drift = lambda: None  # type: ignore[method-assign]
+    agent._get_previous_iteration_counts = lambda _ticket_id: (0, 0)  # type: ignore[method-assign]
+    try:
+        await agent.run("PERF-policy")
+    finally:
+        await agent.close()
+
+    assert calls == ["list_files"]
+    tool_events = [
+        event
+        for event in events
+        if event.action.type == ActionType.TOOL
+        and event.action.phase == "list_files_from_workspace"
+    ]
+    assert [event.lifecycle.state for event in tool_events] == [
+        LifecycleState.PROPOSED,
+        LifecycleState.STARTED,
+        LifecycleState.COMPLETED,
+    ]
+    assert len({event.action_id for event in tool_events}) == 1
+    assert tool_events[0].parent_action_id
+    assert tool_events[0].tool_call_id == "native-policy-call"
 
 
 @pytest.mark.asyncio
