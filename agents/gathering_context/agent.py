@@ -260,28 +260,33 @@ class GatheringContextAgent(AgentBase):
                 f"build history to {matched_id}: {e}"
             )
 
+        record_url = getattr(matched, "record_url", "") or ""
+
+        dedup_fields: dict[str, Any] = {
+            "decision": "MATCH_FOUND",
+            "matched_investigation_id": matched_id,
+            "match_confidence": match_confidence,
+            "match_rationale": (
+                "Deterministic match on "
+                f"metric='{dedup_metric}' "
+                f"platform='{dedup_platform}'.{age_note}"
+            ),
+            "match_method": "deterministic",
+            "record_age_days": age_days,
+        }
+        if record_url:
+            dedup_fields["record_url"] = record_url
+
         await self._update_fields(
             ticket_id,
-            {
-                "dedup_result": {
-                    "decision": "MATCH_FOUND",
-                    "matched_investigation_id": matched_id,
-                    "match_confidence": match_confidence,
-                    "match_rationale": (
-                        "Deterministic match on "
-                        f"metric='{dedup_metric}' "
-                        f"platform='{dedup_platform}'.{age_note}"
-                    ),
-                    "match_method": "deterministic",
-                    "record_age_days": age_days,
-                },
-            },
+            {"dedup_result": dedup_fields},
         )
 
+        record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
         summary = (
             "**Dedup Match Found** "
             "(deterministic)\n\n"
-            f"- **Matched Record:** {matched_id}\n"
+            f"- **Matched Record:** {record_label}\n"
             f"- **Metric:** {dedup_metric}\n"
             f"- **Platform:** {dedup_platform}\n"
             f"- **Record Age:** {age_days} days\n"
