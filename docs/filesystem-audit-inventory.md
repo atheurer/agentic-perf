@@ -2,7 +2,8 @@
 
 `tests/test_filesystem_inventory.py` parses every Python module under `agents`,
 `orchestrator`, `providers`, and `state_store`, plus `paths.py`. It recognizes
-path mutation methods, write-mode `open`/`fdopen`/`tarfile.open`, OS and shutil
+path mutation methods, write-mode `open`/`fdopen`/`tarfile.open`, write-creating
+`os.open` flags, descriptor writes/truncation/permission changes, OS and shutil
 mutators, and temporary-file constructors. Its fixed `file:line:call` manifest
 must exactly equal the discovered set, so additions, removals, and moved calls
 require review.
@@ -36,7 +37,8 @@ The manifest entries fall into these reviewed classes:
 * `providers/image_build/caib.py`, `providers/skills/arcaflow_plugins.py`,
   `providers/skills/repo_cache.py`, and `providers/investigation/file.py` own
   build caches or global provider records without a ticket ownership contract.
-* `orchestrator/main.py` lock mutations and remaining agent scratch-directory
+* `orchestrator/main.py` and `state_store/process_lock.py` lock mutations,
+  including write-creating `os.open` calls, and remaining agent scratch-directory
   constructors are process coordination/bootstrap operations without a ticket.
 
 Operator diagnostics may retain physical paths only in local process logs.  Trace
