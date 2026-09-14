@@ -4384,15 +4384,85 @@ async def execute_boot_time_test(
         env=run_env,
         mutating=True,
     )
+    _STALL_CHECK_INTERVAL = 60
+    _STALL_TIMEOUT = 300
+
+    # Keep communicate() running for the whole lifetime of the process so
+    # stdout/stderr pipes are drained while we poll for artifact progress.
+    # Waiting on proc.wait() with PIPEs can deadlock when the child produces
+    # more output than the pipe buffer can hold.
+    communicate_task = _asyncio.create_task(proc.communicate())
+    loop = _asyncio.get_running_loop()
+    start_time = loop.time()
+    deadline = start_time + benchmark_timeout
     try:
-        stdout_bytes, stderr_bytes = await proc.communicate(timeout=benchmark_timeout)
+        last_file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
+    except OSError:
+        last_file_count = 0
+    last_progress_time = start_time
+    stall_killed = False
+
+    while not communicate_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning(
+                "[boot-time] Subprocess timed out after %ds, killing",
+                benchmark_timeout,
+            )
+            proc.kill()
+            break
+
+        try:
+            await _asyncio.wait_for(
+                _asyncio.shield(communicate_task),
+                timeout=min(_STALL_CHECK_INTERVAL, remaining),
+            )
+            break
+        except _asyncio.TimeoutError:
+            now = loop.time()
+            try:
+                file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
+            except OSError:
+                file_count = last_file_count
+
+            if file_count > last_file_count:
+                last_file_count = file_count
+                last_progress_time = now
+            elif now - last_progress_time >= _STALL_TIMEOUT:
+                logger.warning(
+                    "[boot-time] No new artifacts for %ds (stall detected at "
+                    "%d files), killing subprocess",
+                    int(now - last_progress_time),
+                    file_count,
+                )
+                proc.kill()
+                stall_killed = True
+                break
+
+    # The communicate task continues draining output after kill. Bound the
+    # cleanup in case a descendant inherited one of the pipe file descriptors.
+    try:
+        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
+            _asyncio.shield(communicate_task),
+            timeout=10,
+        )
     except _asyncio.TimeoutError:
-        logger.warning(f"[boot-time] Subprocess timed out after {benchmark_timeout}s")
+        communicate_task.cancel()
+        try:
+            await communicate_task
+        except _asyncio.CancelledError:
+            pass
         stdout_bytes, stderr_bytes = b"", b""
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
     stderr_str = stderr_bytes.decode(errors="replace")
+    if stall_killed:
+        stderr_str += (
+            "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
+            "minutes (stall detected). This may indicate the board is "
+            "unresponsive after a cold reboot or the serial connection is dead."
+        )
 
     # ── Stop passive serial capture ─────────────────────────
     if serial_proc is not None:
