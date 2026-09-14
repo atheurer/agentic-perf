@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import socket
@@ -24,7 +25,9 @@ def wait_for_store(port: int, process: subprocess.Popen[str]) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read() if process.stdout else ""
+            output = "<log unavailable>"
+            if process.stdout:
+                output = process.stdout.read(4096)
             raise AssertionError(f"state store exited: {output[-2000:]}")
         try:
             if (
@@ -41,11 +44,13 @@ def wait_for_store(port: int, process: subprocess.Popen[str]) -> None:
 
 
 def start_store(home: Path, port: int) -> subprocess.Popen[str]:
+    home.mkdir(parents=True, exist_ok=True)
     env = os.environ | {
         "AGENTIC_PERF_HOME": str(home),
         "STORE_PORT": str(port),
         "AGENTIC_PERF_API_TOKEN": "fault-token",
     }
+    log = (home / "state-store.log").open("w+", encoding="utf-8")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -61,10 +66,12 @@ def start_store(home: Path, port: int) -> subprocess.Popen[str]:
         ],
         cwd=Path(__file__).parents[2],
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    process._fault_log = log  # type: ignore[attr-defined]
+    log.close()
     wait_for_store(port, process)
     return process
 
@@ -85,9 +92,15 @@ def diagnostics(processes: list[subprocess.Popen[str]]) -> str:
     chunks: list[str] = []
     for process in processes:
         output = ""
-        if process.stdout:
+        log_path = getattr(process, "_fault_log", None)
+        if log_path:
             try:
-                output = process.stdout.read()
+                output = Path(log_path.name).read_text(encoding="utf-8")[-1500:]
+            except (OSError, ValueError):
+                output = "<log unavailable>"
+        elif process.stdout:
+            try:
+                output = process.stdout.read(4096)
             except (OSError, ValueError):
                 output = "<log unavailable>"
         chunks.append(f"pid={process.pid} rc={process.poll()} log={output[-1500:]}")
@@ -142,6 +155,7 @@ class FakeBenchmarkController:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.ledger = root / "controller.jsonl"
+        self.lock = root / "controller.lock"
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _append(self, operation: str, **identifiers: str) -> None:
@@ -172,19 +186,28 @@ class FakeBenchmarkController:
             raise TimeoutError(f"controller barrier was not released: {barrier}")
 
     def launch(self, intent_id: str, approval_id: str, session_id: str) -> bool:
-        records = self.records()
-        if any(
-            record.get("operation") == "launch" and record.get("intent_id") == intent_id
-            for record in records
-        ):
-            return False
-        self._append(
-            "launch",
-            intent_id=intent_id,
-            approval_id=approval_id,
-            session_id=session_id,
-        )
-        return True
+        # This is deliberately the same atomic shape required of an external
+        # controller: serialize the check and durable record, so two reconnects
+        # cannot both observe an empty ledger and launch.
+        with self.lock.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                records = self.records()
+                if any(
+                    record.get("operation") == "launch"
+                    and record.get("intent_id") == intent_id
+                    for record in records
+                ):
+                    return False
+                self._append(
+                    "launch",
+                    intent_id=intent_id,
+                    approval_id=approval_id,
+                    session_id=session_id,
+                )
+                return True
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def records(self) -> list[dict[str, Any]]:
         if not self.ledger.exists():

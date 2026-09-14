@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,7 +39,8 @@ def _run_worker(
         "FAULT_RESULT": str(result),
         "FAULT_STOP": str(stop),
     }
-    return subprocess.Popen(
+    log = result.with_suffix(".log").open("w+", encoding="utf-8")
+    process = subprocess.Popen(
         [
             sys.executable,
             "-c",
@@ -46,10 +48,13 @@ def _run_worker(
         ],
         cwd=Path(__file__).parents[1],
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    process._fault_log = log  # type: ignore[attr-defined]
+    log.close()
+    return process
 
 
 def _result(path: Path) -> dict:
@@ -166,3 +171,152 @@ def test_controller_replay_after_restart_launches_once(tmp_path: Path) -> None:
     assert len(launches) == 1
     assert launches[0]["intent_id"] == "intent-1"
     assert launches[0]["approval_id"] == "approval-1"
+
+
+def test_concurrent_controller_reconnects_have_one_external_launch(
+    tmp_path: Path,
+) -> None:
+    """Concurrent delivery/reconnect cannot duplicate the external side effect."""
+    controller = FakeBenchmarkController(tmp_path / "controller")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda session: controller.launch("intent-race", "approval-1", session),
+                ("session-a", "session-b"),
+            )
+        )
+    assert sorted(results) == [False, True]
+    assert [
+        record for record in controller.records() if record["operation"] == "launch"
+    ] == [
+        {
+            "operation": "launch",
+            "intent_id": "intent-race",
+            "approval_id": "approval-1",
+            "session_id": "session-a" if results[0] else "session-b",
+        }
+    ]
+
+
+def _operation_store(tmp_path: Path):
+    from state_store.trace_store import TraceStore
+
+    return TraceStore(tmp_path / "trace.sqlite")
+
+
+def test_operation_registration_rejects_ambiguous_replay_and_preserves_identity(
+    tmp_path: Path,
+) -> None:
+    """A request key is immutable across validators and reconnects."""
+    from state_store.trace_store import OperationConflictError, OperationRecord
+
+    store = _operation_store(tmp_path)
+    try:
+        original, existed = store.register_or_get(
+            OperationRecord("run-1", "digest-a", "registered")
+        )
+        assert not existed
+        replay, existed = store.register_or_get(
+            OperationRecord("run-1", "digest-a", "registered")
+        )
+        assert existed and replay == original
+        with pytest.raises(OperationConflictError):
+            store.register_or_get(OperationRecord("run-1", "digest-b", "registered"))
+        reasons = [item["reason"] for item in store.operation_history("run-1")]
+        assert "rejected:request_hash_conflict" in reasons
+    finally:
+        store.close()
+
+
+def test_fenced_operation_crash_boundaries_never_relaunch_side_effect(
+    tmp_path: Path,
+) -> None:
+    """Restart recovery distinguishes pre-launch work from indeterminate work."""
+    from state_store.trace_store import (
+        OperationRecord,
+        OperationTransitionError,
+        TraceStore,
+    )
+
+    db = tmp_path / "trace.sqlite"
+    first = TraceStore(db)
+    try:
+        record, existed = first.register_or_get(
+            OperationRecord("run-crash", "digest", "registered")
+        )
+        assert not existed and record.state == "registered"
+        claimed, disposition = first.acquire_operation_result(
+            "run-crash", "digest", "leader-a", 60
+        )
+        assert disposition == "acquired"
+        prepared = first.mark_prepared(
+            "run-crash", "leader-a", claimed.fencing_generation
+        )
+        started = first.mark_side_effect_started(
+            "run-crash", "leader-a", prepared.fencing_generation
+        )
+        assert started.state == "side_effect_started"
+    finally:
+        first.close()
+
+    restarted = TraceStore(db)
+    try:
+        with pytest.raises(OperationTransitionError):
+            restarted.acquire_operation_result("run-crash", "digest", "leader-b", 60)
+        history = restarted.operation_history("run-crash")
+        assert history[-1]["reason"] == "rejected:post_launch_takeover"
+        # Only reconciliation may finish an indeterminate side effect; a normal
+        # reconnect is never allowed to start it a second time.
+        reconciled = restarted.transition_operation(
+            "run-crash",
+            "leader-a",
+            started.fencing_generation,
+            "terminal",
+            descriptor={"reconciled": True},
+            terminal_outcome="indeterminate",
+            allow_expired_reconciliation=True,
+        )
+        assert reconciled.terminal_outcome == "indeterminate"
+        assert [e.lifecycle.state.value for e in restarted.list_events("run-crash")][
+            -1
+        ] == "indeterminate"
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["before_validation", "after_validation", "after_approval", "before_side_effect"],
+)
+def test_pre_launch_crash_recovery_allows_one_fenced_claim(
+    tmp_path: Path, boundary: str
+) -> None:
+    """Each pre-launch crash boundary is recoverable by one successor."""
+    from state_store.trace_store import OperationRecord, TraceStore
+
+    db = tmp_path / f"{boundary}.sqlite"
+    store = TraceStore(db)
+    try:
+        store.register_or_get(OperationRecord("run", "digest", "registered"))
+        if boundary != "before_validation":
+            store.acquire_operation_result("run", "digest", "leader-a", 60)
+        if boundary in {"after_approval", "before_side_effect"}:
+            store.mark_prepared("run", "leader-a", 1)
+    finally:
+        store.close()
+    recovered = TraceStore(db)
+    try:
+        # The old lease is live, so takeover is correctly refused. This proves
+        # recovery never bypasses the production lease/fence contract.
+        if boundary == "before_validation":
+            record, disposition = recovered.acquire_operation_result(
+                "run", "digest", "leader-b", 60
+            )
+            assert disposition == "acquired" and record.fencing_generation == 1
+        else:
+            from state_store.trace_store import OperationLeaseError
+
+            with pytest.raises(OperationLeaseError):
+                recovered.acquire_operation_result("run", "digest", "leader-b", 60)
+    finally:
+        recovered.close()
