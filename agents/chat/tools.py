@@ -97,6 +97,7 @@ READONLY_TOOLS = frozenset(
         "list_skills",
         "read_skill",
         "read_doc",
+        "list_available_benchmarks",
     }
 )
 
@@ -686,6 +687,31 @@ CHAT_TOOLS: list[ToolDefinition] = [
             "required": ["username"],
         },
     ),
+    ToolDefinition(
+        name="list_available_benchmarks",
+        description=(
+            "List available benchmark suites with optional filtering. "
+            "Use this when users ask what benchmarks, harnesses, or "
+            "workloads are available."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "harness": {
+                    "type": "string",
+                    "description": (
+                        "Filter by harness name (e.g. crucible, arcaflow-plugins)"
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Search term to filter by benchmark name or description"
+                    ),
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -703,6 +729,7 @@ async def execute_tool(
     """Execute a chat tool through its required audit boundary."""
     headers = {"Authorization": f"Bearer {auth_token}"}
 
+<<<<<<< HEAD
     async def _dispatch() -> str:
         try:
             return await _dispatch_tool(
@@ -767,6 +794,8 @@ async def _dispatch_tool(
         return await _update_ticket_fields(client, store_url, headers, tool_input)
     elif tool_name == "stop_ticket":
         return await _stop_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "list_available_benchmarks":
+        return await _list_available_benchmarks(tool_input)
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
@@ -1390,3 +1419,70 @@ async def _stop_ticket(
     )
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
+
+
+# ── Benchmark catalog ────────────────────────────────
+
+# Module-level skill provider, lazily initialized.
+_skill_provider = None
+
+
+def _get_skill_provider():
+    """Lazily build a catalog-only skill provider."""
+    global _skill_provider
+    if _skill_provider is None:
+        try:
+            from agents.server_utils import build_skill_provider
+
+            _skill_provider = build_skill_provider(catalog_only=True)
+        except Exception:
+            logger.debug(
+                "Failed to build skill provider for chat",
+                exc_info=True,
+            )
+    return _skill_provider
+
+
+async def _list_available_benchmarks(
+    params: dict[str, Any],
+) -> str:
+    """List available benchmarks from the skill provider catalog."""
+    provider = _get_skill_provider()
+    if provider is None:
+        return json.dumps({"error": "Benchmark catalog not available"})
+
+    benchmarks = await provider.list_benchmarks()
+
+    harness_filter = params.get("harness", "").lower()
+    query = params.get("query", "").lower()
+
+    results = []
+    for b in benchmarks:
+        if harness_filter and b.harness.lower() != harness_filter:
+            continue
+        if query and query not in b.name.lower() and query not in b.description.lower():
+            continue
+        entry: dict[str, Any] = {
+            "name": b.name,
+            "harness": b.harness,
+            "description": b.description,
+        }
+        if b.endpoint_types:
+            entry["endpoint_types"] = b.endpoint_types
+        if b.roles:
+            entry["roles"] = b.roles
+        results.append(entry)
+
+    # Group by harness for readability.
+    harnesses: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        h = r.get("harness", "unknown")
+        harnesses.setdefault(h, []).append(r)
+
+    return json.dumps(
+        {
+            "total": len(results),
+            "harnesses": list(harnesses.keys()),
+            "benchmarks": harnesses,
+        },
+    )

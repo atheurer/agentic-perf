@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from agents.chat.agent import ChatSession, ChatSessionStore
 from agents.chat.tools import CHAT_TOOLS, ChatToolAudit, execute_tool
 
@@ -570,3 +572,127 @@ class TestChatAPI:
             json={"message": "hello"},
         )
         assert r.status_code == 401
+
+
+class TestListAvailableBenchmarks:
+    """Tests for the list_available_benchmarks chat tool."""
+
+    @pytest.mark.asyncio
+    async def test_lists_benchmarks(self):
+        from unittest.mock import patch
+
+        from agents.chat.tools import _list_available_benchmarks
+        from providers.skills.base import BenchmarkSuite
+
+        mock_provider = AsyncMock()
+        mock_provider.list_benchmarks = AsyncMock(
+            return_value=[
+                BenchmarkSuite(
+                    name="uperf",
+                    description="Network throughput",
+                    harness="crucible",
+                    endpoint_types=["remotehosts"],
+                ),
+                BenchmarkSuite(
+                    name="fio",
+                    description="Storage I/O",
+                    harness="crucible",
+                ),
+                BenchmarkSuite(
+                    name="stress-ng",
+                    description="CPU stress",
+                    harness="arcaflow-plugins",
+                ),
+            ],
+        )
+
+        with patch(
+            "agents.chat.tools._get_skill_provider",
+            return_value=mock_provider,
+        ):
+            result = json.loads(await _list_available_benchmarks({}))
+            assert result["total"] == 3
+            assert "crucible" in result["harnesses"]
+            assert "arcaflow-plugins" in result["harnesses"]
+
+    @pytest.mark.asyncio
+    async def test_filters_by_harness(self):
+        from unittest.mock import patch
+
+        from agents.chat.tools import _list_available_benchmarks
+        from providers.skills.base import BenchmarkSuite
+
+        mock_provider = AsyncMock()
+        mock_provider.list_benchmarks = AsyncMock(
+            return_value=[
+                BenchmarkSuite(
+                    name="uperf",
+                    description="Network",
+                    harness="crucible",
+                ),
+                BenchmarkSuite(
+                    name="fio",
+                    description="Storage",
+                    harness="arcaflow-plugins",
+                ),
+            ],
+        )
+
+        with patch(
+            "agents.chat.tools._get_skill_provider",
+            return_value=mock_provider,
+        ):
+            result = json.loads(
+                await _list_available_benchmarks({"harness": "crucible"})
+            )
+            assert result["total"] == 1
+            assert result["benchmarks"]["crucible"][0]["name"] == "uperf"
+
+    @pytest.mark.asyncio
+    async def test_filters_by_query(self):
+        from unittest.mock import patch
+
+        from agents.chat.tools import _list_available_benchmarks
+        from providers.skills.base import BenchmarkSuite
+
+        mock_provider = AsyncMock()
+        mock_provider.list_benchmarks = AsyncMock(
+            return_value=[
+                BenchmarkSuite(
+                    name="uperf",
+                    description="Network throughput",
+                    harness="crucible",
+                ),
+                BenchmarkSuite(
+                    name="fio",
+                    description="Storage I/O",
+                    harness="crucible",
+                ),
+            ],
+        )
+
+        with patch(
+            "agents.chat.tools._get_skill_provider",
+            return_value=mock_provider,
+        ):
+            result = json.loads(await _list_available_benchmarks({"query": "storage"}))
+            assert result["total"] == 1
+            assert result["benchmarks"]["crucible"][0]["name"] == "fio"
+
+    @pytest.mark.asyncio
+    async def test_no_provider(self):
+        from unittest.mock import patch
+
+        from agents.chat.tools import _list_available_benchmarks
+
+        with patch(
+            "agents.chat.tools._get_skill_provider",
+            return_value=None,
+        ):
+            result = json.loads(await _list_available_benchmarks({}))
+            assert "error" in result
+
+    def test_tool_in_readonly(self):
+        from agents.chat.tools import READONLY_TOOLS
+
+        assert "list_available_benchmarks" in READONLY_TOOLS
