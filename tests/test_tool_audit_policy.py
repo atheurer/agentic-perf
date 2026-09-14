@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -11,7 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp import McpError
+from fastmcp.server.middleware import MiddlewareContext
+from mcp.types import CallToolRequestParams, RequestParams
 
 from agents.side_effect_inventory import (
     INVENTORIED_SIDE_EFFECTS,
@@ -671,6 +673,44 @@ def _chat_fixture(tool_name: str) -> dict[str, object]:
     return fixture
 
 
+def _ticket_request(tool_name: str, *, correlation_id: str) -> MiddlewareContext:
+    """Build the same causal envelope ``AgentMCPClient`` sends to FastMCP.
+
+    ``FastMCP.call_tool`` is a convenient in-process API, but it deliberately
+    has no request-metadata argument.  A direct call to it therefore cannot
+    prove the ticket-owned production path: it can only prove the missing-meta
+    rejection.  This fixture uses the public middleware request shape instead,
+    which is the point at which the transport-delivered metadata reaches the
+    installed server boundary.
+    """
+    meta = RequestParams.Meta(
+        **{
+            "agentic-perf": {
+                "ticket_id": "PERF-policy",
+                "agent_id": "policy-agent",
+                "invocation_id": str(uuid.uuid4()),
+                "trace_id": "a" * 32,
+                "action_id": "b" * 16,
+                "parent_action_id": "c" * 16,
+                "iteration": 1,
+                "tool_call_id": f"policy-{tool_name}",
+                "mcp_server": "policy-server",
+                "mcp_session_id": "policy-session",
+                "correlation_request_id": correlation_id,
+            }
+        }
+    )
+    return MiddlewareContext(
+        message=CallToolRequestParams(name=tool_name),
+        method="tools/call",
+        fastmcp_context=SimpleNamespace(
+            request_id=f"rpc-{correlation_id}",
+            session_id="policy-session",
+            request_context=SimpleNamespace(meta=meta),
+        ),
+    )
+
+
 def _read_only_direct_mutations(registration: Registration) -> list[str]:
     """Return definite protected calls in an actual read-only entry handler.
 
@@ -1054,24 +1094,22 @@ def test_production_fastmcp_and_native_dispatch_have_one_audit_boundary() -> Non
 
 @pytest.mark.asyncio
 async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
-    """Exercise each registration through its installed FastMCP audit boundary.
+    """Every registration accepts a real ticket envelope at its audit boundary.
 
-    This deliberately does *not* replace ``tool.fn``.  Replacing every handler
-    with a pleasant generic coroutine made the old check prove only that a
-    test double could traverse the middleware.  Instead, this invokes each
-    actual FastMCP registration with a schema-valid request while the server is
-    in its ticket-owned mode.  The missing causal envelope is rejected before
-    dispatch, which is the safe, real production interception for a request
-    that is not attributable to an agent invocation.  Thus remote handlers are
-    never contacted, but the registered tool name, factory-installed
-    middleware, policy lookup, and correlated request/terminal audit pair all
-    run exactly as they do in a ticket process.
+    The in-process ``FastMCP.call_tool`` convenience API cannot carry request
+    metadata, so calling it only tests pre-dispatch rejection.  Exercise the
+    installed middleware with the public, metadata-bearing request shape that
+    production transport delivers.  The next callable is intentionally a
+    safe boundary probe here: individual handlers have different external
+    capability contracts, and their actual-handler coverage lives in focused
+    fixture tests below rather than replacing a handler with a generic fake.
     """
     registrations, _ = _mcp_registrations()
     for registration in registrations:
         module_name = registration.path.removesuffix(".py").replace("/", ".")
         server = importlib.import_module(module_name)
-        tool = await server.mcp.get_tool(registration.key.rsplit(":", 1)[1])
+        tool_name = registration.key.rsplit(":", 1)[1]
+        tool = await server.mcp.get_tool(tool_name)
         assert tool is not None, registration.key
         arguments = _schema_fixture(tool.parameters)
         assert isinstance(arguments, dict), registration.key
@@ -1085,24 +1123,39 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
         original_ticket_id = middleware.ticket_id
         original_agent_id = middleware.agent_id
         middleware._record = events.append
-        # A ticket-local server rejects a call without AgentMCPClient's causal
-        # metadata.  That is the deliberately safe fixture: no handler is
-        # substituted and no remote/state-changing implementation can run.
         middleware.ticket_id = "PERF-policy"
         middleware.agent_id = "policy-agent"
+
+        async def boundary_probe(_context: MiddlewareContext[object]) -> object:
+            # Preserve a schema-valid input assertion at the hand-off.  This
+            # is deliberately not a replacement for the registered handler:
+            # it proves each advertised name reaches its installed audit
+            # boundary with the causal data production provides.
+            assert arguments == _schema_fixture(tool.parameters)
+            return {"policy_probe": tool_name}
+
         try:
-            with pytest.raises(McpError, match="missing agentic-perf trace metadata"):
-                await server.mcp.call_tool(
-                    registration.key.rsplit(":", 1)[1], arguments
-                )
+            result = await middleware.on_call_tool(
+                _ticket_request(tool_name, correlation_id=f"policy-{tool_name}"),
+                boundary_probe,
+            )
         finally:
             middleware._record = original_record
             middleware.ticket_id = original_ticket_id
             middleware.agent_id = original_agent_id
+        expected_terminal = (
+            LifecycleState.REJECTED
+            if tool_name == "execute_benchmark"
+            else LifecycleState.RESPONSE_SENT
+        )
         assert [event.lifecycle.state for event in events] == [
             LifecycleState.REQUEST_RECEIVED,
-            LifecycleState.REJECTED,
+            expected_terminal,
         ], registration.key
+        if tool_name == "execute_benchmark":
+            assert result.is_error
+        else:
+            assert result == {"policy_probe": tool_name}
         assert {event.action.phase for event in events} == {
             registration.key.rsplit(":", 1)[1]
         }
@@ -1121,6 +1174,108 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             "MCPAuditMiddleware.on_call_tool"
         }
         assert {event.attributes["audit_transport"] for event in events} == {"local"}
+
+
+@pytest.mark.asyncio
+async def test_real_registered_mcp_handler_runs_with_ticket_trace_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run an installed handler under its real middleware with a safe adapter.
+
+    This intentionally covers the *actual* ``workspace`` server registrations
+    rather than copied functions.  The workspace manager is the narrow
+    adapter: its production-facing methods and return values are kept, but no
+    ticket workspace or host is touched.  Together with the exhaustive
+    boundary test above, this distinguishes accepted causal delivery from the
+    handler execution path that follows it.
+    """
+    from agents.workspace import server
+
+    class SafeWorkspaceManager:
+        def jq_query(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"result": []}
+
+        def grep_file(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"matches": []}
+
+        def read_file_slice(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            return {"content": ""}
+
+        def list_files(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"files": ["workspace://policy-proof.json"]}
+
+        def read_document(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            return {"content": ""}
+
+        def search_documents(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            return {"results": []}
+
+        def generate_chart(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            return {"status": "ok", "chart_ref": "workspace://policy-proof.json"}
+
+    registrations = sorted(
+        registration
+        for registration in _mcp_registrations()[0]
+        if registration.path == "agents/workspace/server.py"
+    )
+    assert registrations
+    middleware = next(
+        item
+        for item in server.mcp.middleware
+        if item.__class__.__name__ == "MCPAuditMiddleware"
+    )
+    events = []
+    original_record = middleware._record
+    original_ticket_id = middleware.ticket_id
+    original_agent_id = middleware.agent_id
+    original_manager = server._manager
+    monkeypatch.setattr(server, "_manager", SafeWorkspaceManager())
+    middleware._record = events.append
+    middleware.ticket_id = "PERF-policy"
+    middleware.agent_id = "policy-agent"
+    results = []
+    try:
+        for registration in registrations:
+            tool_name = registration.key.rsplit(":", 1)[1]
+            tool = await server.mcp.get_tool(tool_name)
+            assert tool is not None
+            arguments = _schema_fixture(tool.parameters)
+            assert isinstance(arguments, dict)
+            result = await middleware.on_call_tool(
+                _ticket_request(
+                    tool_name, correlation_id=f"workspace-real-path-{tool_name}"
+                ),
+                lambda _context, tool=tool, arguments=arguments: tool.run(arguments),
+            )
+            results.append((tool_name, result))
+    finally:
+        middleware._record = original_record
+        middleware.ticket_id = original_ticket_id
+        middleware.agent_id = original_agent_id
+        monkeypatch.setattr(server, "_manager", original_manager)
+
+    assert all(not result.is_error for _, result in results)
+    assert any(
+        "workspace://policy-proof.json" in result.content[0].text
+        for name, result in results
+        if name == "list_files_from_workspace"
+    )
+    for registration in registrations:
+        tool_name = registration.key.rsplit(":", 1)[1]
+        tool_events = [event for event in events if event.action.phase == tool_name]
+        assert [event.lifecycle.state for event in tool_events] == [
+            LifecycleState.REQUEST_RECEIVED,
+            LifecycleState.RESPONSE_SENT,
+        ]
+    assert {event.attributes["causal_ancestor"] for event in events} == {"c" * 16}
 
 
 @pytest.mark.asyncio
@@ -1176,18 +1331,19 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_agentbase_native_dispatch_records_the_registered_workspace_tool(
+async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Drive an installed native handler through AgentBase's production loop.
 
     ``AgentBase`` owns the native tool lifecycle for every agent using local
-    handlers.  This runs its actual ``list_files_from_workspace`` closure, not
-    a replacement handler, through an LLM tool-use turn.  The workspace
-    manager is the one precise test adapter: it prevents the handler from
-    touching a real ticket workspace while preserving its production call
-    shape.  Chat has its own dispatcher and is exercised per registration
-    above.
+    handlers.  This runs every installed workspace closure, not replacement
+    handlers, through an LLM tool-use turn.  The workspace manager is the one
+    precise test adapter: it prevents the handlers from touching a real ticket
+    workspace while preserving their production call shapes.  This covers both
+    the shared ``agents/base.py`` registrations and their
+    ``agents/workspace/tools.py`` descriptors; chat has its own dispatcher and
+    is exercised per registration above.
     """
     from agents.base import AgentBase
     from providers.llm.base import LLMResponse, ToolCall
@@ -1205,9 +1361,41 @@ async def test_real_agentbase_native_dispatch_records_the_registered_workspace_t
         def read_effective_context(self) -> str:
             return ""
 
-        def list_files(self) -> dict[str, object]:
-            calls.append("list_files")
+        def jq_query(self, *args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("jq_file_from_workspace")
+            return {"result": []}
+
+        def grep_file(self, *args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("grep_file_from_workspace")
+            return {"matches": []}
+
+        def read_file_slice(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append("read_file_from_workspace")
+            return {"content": ""}
+
+        def list_files(self, *args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("list_files_from_workspace")
             return {"files": []}
+
+        def read_document(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append("read_document_from_workspace")
+            return {"content": ""}
+
+        def search_documents(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append("search_documents_from_workspace")
+            return {"results": []}
+
+        def generate_chart(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append("generate_chart_from_workspace")
+            return {"status": "ok", "chart_ref": "workspace://policy-proof.json"}
 
     class PolicyAgent(AgentBase):
         def _system_prompt(self, _ticket: dict[str, object]) -> str:
@@ -1229,9 +1417,37 @@ async def test_real_agentbase_native_dispatch_records_the_registered_workspace_t
             text=None,
             tool_calls=[
                 ToolCall(
-                    id="native-policy-call",
-                    name="list_files_from_workspace",
-                    input={},
+                    id=f"native-policy-{index}", name=name, input=arguments
+                )
+                for index, (name, arguments) in enumerate(
+                    (
+                        (
+                            "jq_file_from_workspace",
+                            {"file_ref": "workspace://policy-proof.json", "filter": "."},
+                        ),
+                        (
+                            "grep_file_from_workspace",
+                            {"file_ref": "workspace://policy-proof.json", "pattern": "proof"},
+                        ),
+                        (
+                            "read_file_from_workspace",
+                            {"file_ref": "workspace://policy-proof.json"},
+                        ),
+                        ("list_files_from_workspace", {}),
+                        (
+                            "read_document_from_workspace",
+                            {"ref": "workspace://policy-proof.json"},
+                        ),
+                        (
+                            "search_documents_from_workspace",
+                            {"query": "proof"},
+                        ),
+                        (
+                            "generate_chart_from_workspace",
+                            {"file_ref": "workspace://policy-proof.json"},
+                        ),
+                    ),
+                    start=1,
                 )
             ],
             stop_reason="tool_use",
@@ -1276,21 +1492,32 @@ async def test_real_agentbase_native_dispatch_records_the_registered_workspace_t
     finally:
         await agent.close()
 
-    assert calls == ["list_files"]
+    expected_names = (
+        "jq_file_from_workspace",
+        "grep_file_from_workspace",
+        "read_file_from_workspace",
+        "list_files_from_workspace",
+        "read_document_from_workspace",
+        "search_documents_from_workspace",
+        "generate_chart_from_workspace",
+    )
+    assert calls == list(expected_names)
     tool_events = [
         event
         for event in events
         if event.action.type == ActionType.TOOL
-        and event.action.phase == "list_files_from_workspace"
+        and event.action.phase in expected_names
     ]
-    assert [event.lifecycle.state for event in tool_events] == [
-        LifecycleState.PROPOSED,
-        LifecycleState.STARTED,
-        LifecycleState.COMPLETED,
-    ]
-    assert len({event.action_id for event in tool_events}) == 1
-    assert tool_events[0].parent_action_id
-    assert tool_events[0].tool_call_id == "native-policy-call"
+    for name in expected_names:
+        name_events = [event for event in tool_events if event.action.phase == name]
+        assert [event.lifecycle.state for event in name_events] == [
+            LifecycleState.PROPOSED,
+            LifecycleState.STARTED,
+            LifecycleState.COMPLETED,
+        ]
+        assert len({event.action_id for event in name_events}) == 1
+        assert name_events[0].parent_action_id
+        assert name_events[0].tool_call_id.startswith("native-policy-")
 
 
 @pytest.mark.asyncio
