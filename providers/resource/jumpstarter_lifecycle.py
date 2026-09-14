@@ -15,12 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
 
-import httpx
-
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 from state_store.models import TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -51,11 +49,10 @@ async def release_lease_for_ticket(
         return
 
     try:
-        _r = subprocess.run(
+        _r = await AuditedSubprocessRunner().run(
             ["jmp", "delete", "leases", lease_id],
-            capture_output=True,
-            text=True,
             timeout=15,
+            mutating=True,
         )
         if _r.returncode == 0:
             logger.info(
@@ -88,17 +85,15 @@ async def sweep_orphaned_leases(
     gRPC call; ticket status checks are batched.
     """
     try:
-        result = subprocess.run(
+        result = await AuditedSubprocessRunner().run(
             ["jmp", "get", "leases", "-o", "json"],
-            capture_output=True,
-            text=True,
             timeout=15,
         )
         if result.returncode != 0:
             return
 
         try:
-            data = json.loads(result.stdout)
+            data = json.loads(result.stdout.decode(errors="replace"))
         except (ValueError, TypeError):
             return
         # jmp get leases -o json returns
@@ -129,7 +124,7 @@ async def sweep_orphaned_leases(
             return
 
         # Check ticket statuses in batch.
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=auth_headers or {}
         ) as client:
             for lease_name, ticket_id in to_release:
@@ -146,11 +141,15 @@ async def sweep_orphaned_leases(
 
                 if status in LEASE_RELEASE_STATUSES:
                     try:
-                        _dr = subprocess.run(
+                        _dr = await AuditedSubprocessRunner().run(
                             ["jmp", "delete", "leases", lease_name],
-                            capture_output=True,
-                            text=True,
                             timeout=15,
+                            mutating=True,
+                            # The periodic orphan sweep is a daemon failsafe,
+                            # not an agent-owned ticket operation.  Mark this
+                            # narrow maintenance action explicitly rather than
+                            # weakening ticket-bound mutation checks globally.
+                            system_context=True,
                         )
                         if _dr.returncode == 0:
                             logger.info(
@@ -260,7 +259,7 @@ async def resolve_images(
     _headers = auth_headers or {}
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
             if r.status_code != 200:
                 return
@@ -289,7 +288,9 @@ async def resolve_images(
                 board_target = cf.get("resource_provider_metadata", {}).get(
                     "board_target", ""
                 )
-                async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+                async with AuditedAsyncHTTPClient(
+                    timeout=10.0, headers=_headers
+                ) as client:
                     await client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                         json={
@@ -385,7 +386,7 @@ async def resolve_images(
                 f"for {ticket_id} — provisioning agent "
                 f"will need to ask the user"
             )
-            async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
                 await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
@@ -524,7 +525,7 @@ async def resolve_images(
             pass
 
         # Store on ticket
-        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
             await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={

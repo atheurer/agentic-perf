@@ -193,6 +193,10 @@ CHAT_TOOLS: list[ToolDefinition] = [
                         "action_required hint."
                     ),
                 },
+                "approval_request_id": {
+                    "type": "string",
+                    "description": "Explicit approval request ID when selecting among multiple pending requests.",
+                },
             },
             "required": ["ticket_id", "message"],
         },
@@ -612,6 +616,62 @@ async def _reply_to_guidance(
 ) -> str:
     ticket_id = params["ticket_id"]
     message = params["message"]
+
+    # Approval replies are authority-bearing only when exactly one immutable
+    # request is pending.  Generic clarification replies retain the legacy
+    # comment/transition behavior below.
+    approvals_response = await client.get(
+        f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
+        headers=headers,
+    )
+    approvals_response.raise_for_status()
+    pending = [
+        item
+        for item in approvals_response.json().get("approvals", [])
+        if item.get("status") == "pending"
+    ]
+    selected_id = params.get("approval_request_id")
+    if selected_id:
+        pending = [
+            item for item in pending if item.get("approval_request_id") == selected_id
+        ]
+        if not pending:
+            return json.dumps(
+                {
+                    "status": "approval_rejected",
+                    "message": "approval_request_id is unknown or no longer pending",
+                }
+            )
+    normalized = message.strip().lower()
+    decision = {
+        "approve": "approved",
+        "approved": "approved",
+        "reject": "rejected",
+        "rejected": "rejected",
+        "request changes": "changes_requested",
+        "changes_requested": "changes_requested",
+    }.get(normalized)
+    if decision and pending:
+        if len(pending) != 1:
+            return json.dumps(
+                {
+                    "status": "ambiguous_approval",
+                    "message": "Multiple approval requests are pending; specify approval_request_id.",
+                    "approval_request_ids": [
+                        item["approval_request_id"] for item in pending
+                    ],
+                }
+            )
+        resolved = await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/approvals/"
+            f"{pending[0]['approval_request_id']}/resolve",
+            headers=headers,
+            json={"decision": decision, "comment": message},
+        )
+        resolved.raise_for_status()
+        if decision != "approved":
+            return json.dumps({"status": "approval_resolved", "decision": decision})
+        return json.dumps({"status": "approval_resolved", "decision": decision})
 
     # Determine resume status BEFORE adding comment
     # (adding a comment changes the last comment, losing

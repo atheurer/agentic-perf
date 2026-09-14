@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 from pathlib import Path
 
 from paths import SKILL_CACHE_DIR as DEFAULT_CACHE_DIR
+from providers.execution import AuditedSubprocessRunner
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +17,11 @@ class RepoCache:
         repo_path = self._dir / name
         if repo_path.exists() and (repo_path / ".git").exists():
             logger.info(f"[repo-cache] Updating {name} from {url}")
-            result = subprocess.run(
+            result = AuditedSubprocessRunner().run_sync(
                 ["git", "pull", "--ff-only"],
                 cwd=repo_path,
-                capture_output=True,
                 timeout=60,
+                mutating=True,
             )
             if result.returncode != 0:
                 stderr = (
@@ -33,10 +33,10 @@ class RepoCache:
         else:
             repo_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"[repo-cache] Cloning {name} from {url}")
-            result = subprocess.run(
+            result = AuditedSubprocessRunner().run_sync(
                 ["git", "clone", "--depth", "1", url, str(repo_path)],
-                capture_output=True,
                 timeout=120,
+                mutating=True,
             )
             if result.returncode != 0:
                 stderr = (

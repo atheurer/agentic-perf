@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from providers.tracing import PayloadDescriptor
 
 
 class TicketStatus(str, Enum):
@@ -168,6 +171,74 @@ class Comment(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class ApprovalRequest(BaseModel):
+    """Immutable benchmark approval intent with a CAS-resolved lifecycle."""
+
+    approval_request_id: str = Field(pattern=r"^apr-[a-f0-9]{32}$")
+    ticket_id: str
+    kind: Literal["benchmark_run_file"] = "benchmark_run_file"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = ""
+    waiter_owner: str | None = None
+    invocation_id: str | None = None
+    tool_call_id: str | None = None
+    session_id: str | None = None
+    session_epoch: str | None = None
+    validation_id: str
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    summary: str = ""
+    status: Literal[
+        "pending", "approved", "changes_requested", "rejected", "cancelled", "expired"
+    ] = "pending"
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+    resolution_comment_id: str | None = None
+    resolution_reason: str | None = None
+    consumed_at: datetime | None = None
+    expires_at: datetime | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+    record_version: int = 1
+
+
+class CreateApprovalRequest(BaseModel):
+    validation_id: str = Field(min_length=1, max_length=255)
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    summary: str = Field(default="", max_length=4096)
+    invocation_id: str | None = None
+    tool_call_id: str | None = None
+    session_id: str | None = None
+    session_epoch: str | None = None
+    waiter_owner: str | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+    expires_at: datetime | None = None
+
+
+class ResolveApprovalRequest(BaseModel):
+    decision: Literal["approved", "changes_requested", "rejected", "cancelled"]
+    comment_id: str | None = None
+    comment: str | None = Field(default=None, max_length=4096)
+    reason: str | None = Field(default=None, max_length=4096)
+    validation_id: str | None = None
+    presented_run_file_digest: str | None = None
+    execution_intent_digest: str | None = None
+
+
+class ConsumeApprovalRequest(BaseModel):
+    """Execution-side single-use capability check for an approval."""
+
+    validation_id: str = Field(min_length=1, max_length=255)
+    presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    session_id: str | None = None
+    session_epoch: str | None = None
+    ticket_attempt: str | None = None
+    claim_id: str | None = None
+
+
 class Ticket(BaseModel):
     id: str
     summary: str
@@ -203,14 +274,147 @@ class CreateTicketRequest(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     owners: list[str] | None = None
 
+    @model_validator(mode="after")
+    def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        protected = _VALIDATION_RESERVED_FIELDS.intersection(self.custom_fields)
+        if protected:
+            raise ValueError("benchmark validation fields are reserved")
+        return self
+
 
 class TransitionRequest(BaseModel):
     status: TicketStatus
     comment: str | None = None
+    # Imported fixtures remain blocked even if their status is edited.  A
+    # reviewed resume is an explicit, auditable opt-in rather than an
+    # incidental transition from awaiting_customer_guidance.
+    reviewed_resume: bool = False
 
 
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
+
+
+class OrchestratorLease(BaseModel):
+    """The state-store-owned fencing lease for an active orchestrator."""
+
+    session_id: UUID
+    instance_name: str = Field(min_length=1, max_length=255)
+    host: str = Field(min_length=1, max_length=255)
+    pid: int = Field(gt=0)
+    process_start_id: str = Field(min_length=1, max_length=255)
+    epoch: int = Field(gt=0)
+    acquired_at: datetime
+    renewed_at: datetime
+    expires_at: datetime
+
+
+class AcquireOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    instance_name: str = Field(min_length=1, max_length=255)
+    host: str = Field(min_length=1, max_length=255)
+    pid: int = Field(gt=0)
+    process_start_id: str = Field(min_length=1, max_length=255)
+    ttl_seconds: float = Field(gt=0, le=3600)
+
+
+class RenewOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    epoch: int = Field(gt=0)
+    ttl_seconds: float = Field(gt=0, le=3600)
+
+
+class ReleaseOrchestratorLeaseRequest(BaseModel):
+    session_id: UUID
+    epoch: int = Field(gt=0)
+
+
+_VALIDATION_RESERVED_FIELDS = frozenset(
+    {
+        "benchmark_validation",
+        "benchmark_validations",
+        "benchmark_validation_records",
+        "benchmark_validation_manifest",
+        "validated_run_file",
+    }
+)
+
+# These fields are written only by the managed-instance import and reviewed
+# resume flows.  Generic field updates must not be able to erase the fixture
+# boundary or forge its provenance.
+IMPORTED_FIXTURE_RESERVED_FIELDS = frozenset(
+    {
+        "imported_fixture",
+        "imported_fixture_reviewed",
+        "import_provenance",
+        "resume_requires_review",
+    }
+)
+
+
+def imported_fixture_reserved_field(key: object) -> bool:
+    """Return whether a key names protected fixture control metadata.
+
+    Normalize separators and casing so JSON aliases such as camelCase or
+    hyphenated names cannot evade the generic update guard.  Callers recurse
+    through nested custom-field objects separately.
+    """
+    if not isinstance(key, str):
+        return False
+    normalized = "".join(character for character in key.lower() if character.isalnum())
+    return any(
+        normalized == "".join(character for character in field if character.isalnum())
+        for field in IMPORTED_FIXTURE_RESERVED_FIELDS
+    )
+
+
+class InvalidationReason(str, Enum):
+    RELEVANT_PARAMETERS_CHANGED = "relevant_parameters_changed"
+    CONTROLLER_CHANGED = "controller_changed"
+    VALIDATOR_REVOKED = "validator_revoked"
+    OPERATOR_INVALIDATED = "operator_invalidated"
+    RUN_FILE_CHANGED = "run_file_changed"
+    TICKET_REPLANNED = "ticket_replanned"
+
+
+class ValidationRecordV1(BaseModel):
+    """Controller-attested validation evidence; ordinary users cannot create it."""
+
+    # Provenance is server-authoritative: the API constructs creator from the
+    # bound capability and request identity rather than accepting client data.
+    model_config = ConfigDict(extra="forbid")
+
+    validation_id: str = Field(pattern=r"^val-[a-f0-9]{32}$")
+    run_file: dict[str, Any]
+    runfile_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    harness: Literal["crucible"]
+    controller: str = Field(min_length=1, max_length=255)
+    params_fingerprint: str = Field(min_length=1, max_length=64)
+    execution_plan_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    run_command: str = Field(min_length=1, max_length=500)
+    validator_command: str = Field(min_length=1, max_length=500)
+    validator_version: str = Field(min_length=1, max_length=128)
+    # Controller output is never embedded in validation records.  This
+    # descriptor has only redacted, bounded metadata and an optional private
+    # content-addressed reference.
+    validation_output: PayloadDescriptor
+
+
+class CreateValidationRequest(BaseModel):
+    """Create one immutable benchmark-validation record using a manifest CAS."""
+
+    record: ValidationRecordV1
+    expected_version: int = Field(ge=0)
+
+
+class SupersedeValidationRequest(BaseModel):
+    """Append an immutable supersession record using a manifest CAS."""
+
+    validation_id: str
+    replacement_validation_id: str | None = None
+    reason: InvalidationReason
+    expected_version: int = Field(ge=0)
 
 
 class AddCommentRequest(BaseModel):
@@ -237,3 +441,7 @@ class AbortRequest(BaseModel):
 class ClaimRequest(BaseModel):
     owner: str
     duration_seconds: int = 300
+    session_id: UUID | None = None
+    epoch: int | None = Field(default=None, gt=0)
+    claim_id: str | None = Field(default=None, min_length=1, max_length=128)
+    instance_name: str | None = Field(default=None, max_length=255)

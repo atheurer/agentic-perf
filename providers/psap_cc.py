@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from providers.execution import AuditedAsyncHTTPClient
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +32,7 @@ class PSAPControlCenterClient:
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
-        self._client = httpx.AsyncClient(
+        self._client = AuditedAsyncHTTPClient(
             timeout=30.0,
             verify=verify_ssl,
             auth=httpx.BasicAuth(username, password),

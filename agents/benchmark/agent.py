@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,10 @@ _LOCAL_TOOLS = [
                 "summary": {
                     "type": "string",
                     "description": "Brief summary of what this run-file will do",
+                },
+                "validation_id": {
+                    "type": "string",
+                    "description": "Immutable validation record to approve",
                 },
             },
             "required": ["run_file"],
@@ -103,15 +109,14 @@ class BenchmarkAgent(AgentBase):
             run_file: dict,
             benchmark: str | None = None,
             summary: str | None = None,
+            validation_id: str | None = None,
         ) -> str:
-            bench_label = f" for {benchmark}" if benchmark else ""
-            summary_line = f"\n\n{summary}" if summary else ""
-            question = (
-                f"Please review this run-file{bench_label}{summary_line}\n\n"
-                f"```json\n{json.dumps(run_file, indent=2)}\n```\n\n"
-                "Do you approve this configuration? (approve / request changes / reject)"
+            return await self._request_benchmark_approval(
+                run_file,
+                benchmark=benchmark,
+                summary=summary,
+                validation_id=validation_id,
             )
-            return await self._do_request_clarification(question)
 
         local_handlers = {
             "request_clarification": _request_clarification,
@@ -170,6 +175,160 @@ class BenchmarkAgent(AgentBase):
                     question = f"{question}\n\n## Node Diagnostics\n{diag}"
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _request_benchmark_approval(
+        self,
+        run_file: dict[str, Any],
+        *,
+        benchmark: str | None,
+        summary: str | None,
+        validation_id: str | None,
+    ) -> str:
+        """Create and wait on one immutable approval request.
+
+        Execution integration remains owned by the benchmark operation work
+        (#788); this method only binds the human decision to validation and
+        execution intent before returning to the LLM.
+        """
+        if not self._ticket_id:
+            return "No ticket context available."
+        ticket = await self._get_ticket(self._ticket_id)
+        cf = ticket.get("custom_fields", {})
+        manifest = cf.get("benchmark_validations", {})
+        records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+        validation = records.get(validation_id) if validation_id else None
+        if not isinstance(validation, dict):
+            validation = cf.get("validated_run_file") or {}
+        validation_id = validation_id or validation.get("validation_id")
+        intent = validation.get("execution_intent_digest")
+        immutable_run_file = validation.get("run_file")
+        if not validation_id or not intent or not isinstance(immutable_run_file, dict):
+            return "Approval rejected: run-file has no immutable validation record."
+        digest = hashlib.sha256(
+            json.dumps(
+                immutable_run_file, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        if digest != validation.get("runfile_fingerprint"):
+            return (
+                "Approval rejected: validation record has an invalid run-file digest."
+            )
+        if (
+            hashlib.sha256(
+                json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            != digest
+        ):
+            return "Approval rejected: supplied run-file differs from immutable validation."
+        fence_headers = {
+            "X-Agentic-Perf-Orchestrator-Session": os.environ.get(
+                "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", ""
+            ),
+            "X-Agentic-Perf-Orchestrator-Epoch": os.environ.get(
+                "AGENTIC_PERF_ORCHESTRATOR_EPOCH", ""
+            ),
+            "X-Agentic-Perf-Claim-Id": os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
+            or (cf.get("claim") or {}).get("claim_id", ""),
+            "X-Agentic-Perf-Invocation-Id": str(self.trace_context.invocation_id)
+            if self.trace_context and self.trace_context.invocation_id
+            else "",
+            "X-Agentic-Perf-Tool-Call-Id": self.trace_context.tool_call_id
+            if self.trace_context and self.trace_context.tool_call_id
+            else "",
+        }
+        request = await self._client.post(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals",
+            headers={key: value for key, value in fence_headers.items() if value},
+            json={
+                "validation_id": validation_id,
+                "presented_run_file_digest": digest,
+                "execution_intent_digest": intent,
+                "execution_intent_id": validation.get("execution_intent_id"),
+                "attempt_id": validation.get("attempt_id"),
+                "summary": summary or benchmark or "Benchmark run-file approval",
+                "invocation_id": str(self.trace_context.invocation_id)
+                if self.trace_context and self.trace_context.invocation_id
+                else None,
+                "tool_call_id": self.trace_context.tool_call_id
+                if self.trace_context
+                else None,
+                "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
+                "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
+                "waiter_owner": (
+                    str(self.trace_context.invocation_id)
+                    if self.trace_context and self.trace_context.invocation_id
+                    else None
+                ),
+                "ticket_attempt": os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                or (cf.get("claim") or {}).get("claim_id"),
+                "claim_id": os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                or (cf.get("claim") or {}).get("claim_id"),
+            },
+        )
+        request.raise_for_status()
+        approval = request.json()
+        approval_id = approval["approval_request_id"]
+        bench_label = f" for {benchmark}" if benchmark else ""
+        question = (
+            f"Approval request {approval_id} for run-file{bench_label}.\n"
+            f"Validation ID: {validation_id}\n"
+            f"Presented digest: {digest}\n\n"
+            f"{summary or ''}\n\n"
+            f"```json\n{json.dumps(immutable_run_file, indent=2)}\n```\n\n"
+            "Reply approve / request changes / reject, or use the structured approval action."
+        )
+        await self._add_comment(self._ticket_id, f"**Approval requested:**\n{question}")
+        await self._transition_ticket(
+            self._ticket_id,
+            "awaiting_customer_guidance",
+            comment=f"Approval request {approval_id} pending",
+        )
+        return await self._wait_for_benchmark_approval(approval_id)
+
+    async def _wait_for_benchmark_approval(self, approval_id: str) -> str:
+        while True:
+            await asyncio.sleep(self._HITL_POLL_INTERVAL)
+            response = await self._client.get(
+                f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals"
+            )
+            response.raise_for_status()
+            records = response.json().get("approvals", [])
+            record = next(
+                (
+                    item
+                    for item in records
+                    if item["approval_request_id"] == approval_id
+                ),
+                None,
+            )
+            if record is None:
+                return "Approval request is no longer available."
+            expected_owner = (
+                str(self.trace_context.invocation_id)
+                if self.trace_context and self.trace_context.invocation_id
+                else None
+            )
+            if record.get("waiter_owner") and expected_owner != record["waiter_owner"]:
+                return "Approval request is owned by another active waiter."
+            if record["status"] == "approved":
+                ticket = await self._get_ticket(self._ticket_id)
+                previous = ticket.get("previous_status")
+                if previous:
+                    await self._transition_ticket(self._ticket_id, previous)
+                return (
+                    f"Approval granted for request {approval_id}; pass "
+                    f"approval_request_id={approval_id} to execute_benchmark."
+                )
+            if record["status"] in {
+                "changes_requested",
+                "rejected",
+                "cancelled",
+                "expired",
+            }:
+                return f"Approval {record['status']} for request {approval_id}."
+            ticket = await self._get_ticket(self._ticket_id)
+            if ticket.get("custom_fields", {}).get("abort_requested"):
+                return f"Approval request {approval_id} cancelled because the ticket was aborted."
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id

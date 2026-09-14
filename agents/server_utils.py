@@ -14,8 +14,13 @@ import shlex
 import sys
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import httpx  # noqa: F401 - retained as a stable test patch seam
+
+from providers.execution import AuditedAsyncHTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -236,36 +241,30 @@ def emit_private_tool_audit_event(
     """Record private tool diagnostics outside the MCP response.
 
     Local MCP tools can use this for structured diagnostics that must be
-    available to operators but must not become model context.  The payload is
-    redacted and written only to the ticket event log.
+    available to operators but must not become model context. The payload is
+    redacted and written through the canonical trace store.
     """
     if not ticket_id:
         return
     import json as _json
-    from datetime import datetime, timezone
 
-    from paths import LOG_DIR
+    from paths import TRACE_DB_PATH
+    from providers.event_projection import legacy_to_trace
+    from state_store.trace_store import TraceStore, TraceStoreWriteError
 
     redactor = _get_progress_redactor()
     payload = redactor.redact_string(ticket_id, _json.dumps(data, default=str))
     try:
-        path = LOG_DIR / f"{ticket_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(
-                _json.dumps(
-                    {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "ticket_id": ticket_id,
-                        "agent": agent_name,
-                        "event_type": event_type,
-                        "data": {"tool": tool_name, "details": _json.loads(payload)},
-                    },
-                    default=str,
+        with TraceStore(TRACE_DB_PATH) as trace_store:
+            trace_store.insert_event(
+                legacy_to_trace(
+                    ticket_id,
+                    agent_name,
+                    event_type,
+                    {"tool": tool_name, "details": _json.loads(payload)},
                 )
-                + "\n"
             )
-    except (OSError, ValueError):
+    except (OSError, ValueError, TraceStoreWriteError):
         logger.debug(
             "Failed to write context audit event for %s", ticket_id, exc_info=True
         )
@@ -906,7 +905,9 @@ def build_secrets_provider():
     with a vault layer when Bitwarden Secrets Manager is configured
     in ``~/.agentic-perf/config.json``.
     """
+    from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
+    from providers.secrets.recording import RecordingSecretsProvider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
     config: dict[str, Any] = {}
@@ -929,18 +930,29 @@ def build_secrets_provider():
                 server_url=bw_config.get("server_url"),
                 cache_ttl_seconds=bw_config.get("cache_ttl_seconds", 60),
             )
-            return CascadingSecretsProvider(
+            provider = CascadingSecretsProvider(
                 [
                     ("shared", local),
                     ("vault:shared", vault),
                 ]
+            )
+            ticket_id = os.environ.get("TICKET_ID")
+            return (
+                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
+                if ticket_id
+                else provider
             )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
 
-    return local
+    ticket_id = os.environ.get("TICKET_ID")
+    return (
+        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        if ticket_id
+        else local
+    )
 
 
 def _load_vault_config() -> dict | None:
@@ -1101,8 +1113,6 @@ async def assert_ticket_active(
     drifted — the caller should return this to the LLM as a tool result
     instead of proceeding with the side-effecting operation.
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL", "http://localhost:8090"
@@ -1115,8 +1125,29 @@ async def assert_ticket_active(
     api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
+    from agents.fencing import current_fence_context
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    fence = current_fence_context()
+    session_id = (
+        fence.session_id
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    )
+    epoch = (
+        str(fence.epoch)
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    )
+    claim_id = fence.claim_id if fence else os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
+
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
             f"{state_store_url}/api/v1/tickets/{ticket_id}",
         )
@@ -1140,6 +1171,82 @@ async def assert_ticket_active(
             "ticket_status": status,
         }
 
+    claim = cf.get("claim")
+    requires_fence = bool(expected_status or status == "executing_benchmark")
+    if requires_fence and not isinstance(claim, dict):
+        return {
+            "status": "rejected",
+            "reason": "claim_missing",
+            "ticket_status": status,
+        }
+    if requires_fence and isinstance(claim, dict):
+        try:
+            claim_expires = datetime.fromisoformat(str(claim["expires"]))
+            if claim_expires.tzinfo is None:
+                claim_expires = claim_expires.replace(tzinfo=timezone.utc)
+            if claim_expires <= datetime.now(timezone.utc):
+                return {
+                    "status": "rejected",
+                    "reason": "claim_expired",
+                    "ticket_status": status,
+                }
+            if (
+                not all(
+                    isinstance(claim.get(key), str) and claim.get(key)
+                    for key in ("session_id", "claim_id")
+                )
+                or not isinstance(claim.get("epoch"), int)
+                or claim["epoch"] <= 0
+            ):
+                raise ValueError("malformed claim identity")
+        except (KeyError, TypeError, ValueError):
+            return {
+                "status": "rejected",
+                "reason": "claim_malformed",
+                "ticket_status": status,
+            }
+    if isinstance(claim, dict) and claim.get("session_id"):
+        if (
+            claim.get("session_id") != session_id
+            or str(claim.get("epoch")) != epoch
+            or claim.get("claim_id") != claim_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
+
+        async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
+            lease_response = await client.get(
+                f"{state_store_url}/api/v1/control/orchestrator-lease"
+            )
+            lease_response.raise_for_status()
+            active_lease = lease_response.json().get("lease")
+        try:
+            lease_expires = datetime.fromisoformat(str(active_lease["expires_at"]))
+            if lease_expires.tzinfo is None:
+                lease_expires = lease_expires.replace(tzinfo=timezone.utc)
+            lease_valid = lease_expires > datetime.now(timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            lease_valid = False
+        if (
+            not active_lease
+            or not lease_valid
+            or active_lease.get("session_id") != session_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "not_leader",
+                "ticket_status": status,
+            }
+        if int(active_lease.get("epoch", 0)) != int(epoch):
+            return {
+                "status": "rejected",
+                "reason": "stale_epoch",
+                "ticket_status": status,
+            }
+
     return ticket
 
 
@@ -1152,9 +1259,9 @@ async def build_ssh_from_ticket(
     Returns (SSHExecutor, ticket_dict). If ticket_id is None, reads from
     TICKET_ID env var. If state_store_url is None, reads from STATE_STORE_URL.
     """
-    import httpx
-
     from providers.ssh import SSHExecutor
+    from providers.tracing import new_trace_context
+    from providers.tracing.client import TraceClient
 
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
@@ -1169,7 +1276,7 @@ async def build_ssh_from_ticket(
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(f"{state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -1186,20 +1293,34 @@ async def build_ssh_from_ticket(
     # checking to avoid stale key errors.
     strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
 
+    # This stack owns resources held by the process-global MCP SSH executor.
+    # Rebuilding the executor (for a new ticket or server reinitialization)
+    # closes its predecessor's key material and TraceClient transport first.
+    global _ssh_key_stack
+    if _ssh_key_stack is not None:
+        await _ssh_key_stack.aclose()
+    _ssh_key_stack = AsyncExitStack()
+
     vault_secret_name = _resolve_vault_secret_name(fields)
     resolved_key = ssh_key
     if vault_secret_name:
-        global _ssh_key_stack
-        if _ssh_key_stack is not None:
-            await _ssh_key_stack.aclose()
-        _ssh_key_stack = AsyncExitStack()
         sp = build_secrets_provider()
         resolved_key = await _ssh_key_stack.enter_async_context(
             resolve_ssh_key(ssh_key, sp, vault_secret_name),
         )
 
+    trace_recorder = TraceClient(state_store_url, api_token) if api_token else None
+    if trace_recorder is not None:
+        _ssh_key_stack.callback(trace_recorder.close)
     return SSHExecutor(
-        user=ssh_user, key_path=resolved_key, strict_host_key=strict
+        user=ssh_user,
+        key_path=resolved_key,
+        strict_host_key=strict,
+        trace_context=new_trace_context(
+            ticket_id=ticket_id,
+            agent_id=os.environ.get("AGENT_NAME"),
+        ),
+        trace_recorder=trace_recorder,
     ), ticket
 
 
@@ -1211,8 +1332,7 @@ async def tool_progress(
 ) -> None:
     """Post a progress update to the ticket from within an MCP tool.
 
-    Creates both a comment (via the state store API) and an event
-    (appended directly to the JSONL event log) so the web UI can
+    Creates both a comment (via the state store API) and a canonical event so the web UI can
     display progress in real time.
 
     The event uses type "tool_progress" so the UI can distinguish
@@ -1225,8 +1345,6 @@ async def tool_progress(
     Reads TICKET_ID and STATE_STORE_URL from env if not provided.
     Silently no-ops if ticket_id is unavailable (e.g., in tests).
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL",
@@ -1243,7 +1361,7 @@ async def tool_progress(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
             await client.post(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={"author": author, "body": message},
@@ -1258,12 +1376,12 @@ _progress_redactor = None
 
 
 def _get_progress_redactor():
-    """Lazy-init a pattern-only Redactor for the bypass path."""
+    """Return the process-wide registry used by secret providers."""
     global _progress_redactor
     if _progress_redactor is None:
-        from providers.redaction import Redactor
+        from providers.redaction import get_shared_redactor
 
-        _progress_redactor = Redactor()
+        _progress_redactor = get_shared_redactor()
     return _progress_redactor
 
 
@@ -1272,33 +1390,23 @@ def _emit_tool_progress_event(
     author: str,
     message: str,
 ) -> None:
-    """Append a tool_progress event directly to the JSONL event log.
+    """Record a tool_progress event through the canonical trace store.
 
-    Applies pattern-only redaction (no value registry — the MCP
-    subprocess has no access to the orchestrator's secret registry).
+    Applies the child process's shared value and pattern registry.
     """
-    import json as _json
-    from datetime import datetime, timezone
-
-    from paths import LOG_DIR
+    from paths import TRACE_DB_PATH
+    from providers.event_projection import legacy_to_trace
+    from state_store.trace_store import TraceStore, TraceStoreWriteError
 
     redactor = _get_progress_redactor()
     message = redactor.redact_string(ticket_id, message)
 
-    log_dir = LOG_DIR
-    path = log_dir / f"{ticket_id}.jsonl"
-
     try:
-        event = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ticket_id": ticket_id,
-            "agent": author,
-            "event_type": "tool_progress",
-            "data": {"body": message},
-        }
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(_json.dumps(event, default=str) + "\n")
-    except OSError:
+        with TraceStore(TRACE_DB_PATH) as trace_store:
+            trace_store.insert_event(
+                legacy_to_trace(ticket_id, author, "tool_progress", {"body": message})
+            )
+    except (OSError, TraceStoreWriteError):
         logger.debug(
             "Failed to write tool_progress event for %s", ticket_id, exc_info=True
         )
@@ -1436,3 +1544,20 @@ def get_board_selector(ticket: dict) -> str:
     cf = ticket.get("custom_fields", {})
     directives = cf.get("directives", {})
     return directives.get("board_selector", "") or cf.get("board_selector", "")
+
+
+def extract_ticket_references(text: str) -> list[str]:
+    """Extract PERF-XXXXXXXX ticket IDs from text.
+
+    Returns deduplicated list preserving first-seen order.
+    """
+    import re
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"PERF-[A-F0-9]{8}", text):
+        tid = match.group()
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids

@@ -121,17 +121,19 @@ class CrucibleSourceResolver:
         if path is None:
             return None
         try:
-            result = subprocess.run(
+            result = AuditedSubprocessRunner().run_sync(
                 ["git", "rev-parse", "HEAD"],
                 cwd=path,
-                capture_output=True,
-                text=True,
                 timeout=5,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        return result.stdout.strip() if result.returncode == 0 else None
+        return (
+            result.stdout.decode(errors="replace").strip()
+            if result.returncode == 0
+            else None
+        )
 
     def resolve(self) -> CrucibleSourceResolution:
         if self._resolution is not None:
@@ -630,33 +632,33 @@ class CrucibleContextGateway:
         repo_path = self._source_benchmark_path(name, entry)
         if repo_path:
             try:
-                revision = subprocess.run(
+                revision = AuditedSubprocessRunner().run_sync(
                     ["git", "rev-parse", "HEAD"],
                     cwd=repo_path,
-                    capture_output=True,
-                    text=True,
                     timeout=5,
                     check=False,
                 )
                 if revision.returncode == 0:
-                    source["commit"] = revision.stdout.strip()
+                    source["commit"] = revision.stdout.decode(errors="replace").strip()
             except (OSError, subprocess.SubprocessError):
                 pass
         return source
 
     def _git_revision(self, repo_path: Path) -> str | None:
         try:
-            revision = subprocess.run(
+            revision = AuditedSubprocessRunner().run_sync(
                 ["git", "rev-parse", "HEAD"],
                 cwd=repo_path,
-                capture_output=True,
-                text=True,
                 timeout=5,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        return revision.stdout.strip() if revision.returncode == 0 else None
+        return (
+            revision.stdout.decode(errors="replace").strip()
+            if revision.returncode == 0
+            else None
+        )
 
     def _ensure_source_benchmark(self, name: str, entry: dict[str, Any]) -> Path | None:
         existing = self._source_benchmark_path(name, entry)
@@ -1655,3 +1657,6 @@ class CrucibleContextGateway:
             errors.append(e.message)
 
         return {"valid": len(errors) == 0, "errors": errors}
+
+
+from providers.execution import AuditedSubprocessRunner

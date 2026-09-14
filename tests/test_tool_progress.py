@@ -49,7 +49,7 @@ async def test_posts_comment_when_ticket_id_set(monkeypatch):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("agents.server_utils.AuditedAsyncHTTPClient", return_value=mock_client):
         from agents.server_utils import tool_progress
 
         await tool_progress("SSH ready on 10.0.0.1", "setup_ssh")
@@ -65,7 +65,7 @@ async def test_posts_comment_when_ticket_id_set(monkeypatch):
 
 async def test_noops_without_ticket_id():
     """tool_progress should silently do nothing when no ticket_id."""
-    with patch("httpx.AsyncClient") as mock_cls:
+    with patch("agents.server_utils.AuditedAsyncHTTPClient") as mock_cls:
         from agents.server_utils import tool_progress
 
         await tool_progress("some message", "some_tool")
@@ -82,7 +82,7 @@ async def test_uses_system_when_no_agent_name(monkeypatch):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("agents.server_utils.AuditedAsyncHTTPClient", return_value=mock_client):
         from agents.server_utils import tool_progress
 
         await tool_progress("Installing...", "install_harness")
@@ -100,7 +100,7 @@ async def test_swallows_exceptions(monkeypatch):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("agents.server_utils.AuditedAsyncHTTPClient", return_value=mock_client):
         from agents.server_utils import tool_progress
 
         await tool_progress("this should not raise", "some_tool")
@@ -117,7 +117,7 @@ async def test_explicit_params_override_env(monkeypatch):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("agents.server_utils.AuditedAsyncHTTPClient", return_value=mock_client):
         from agents.server_utils import tool_progress
 
         await tool_progress(

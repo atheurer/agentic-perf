@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx  # noqa: F401 - retained as a stable test patch seam
 
 from agents.mcp_client import AgentMCPClient
 
@@ -189,7 +189,9 @@ async def attach_jumpstarter_mcp(
     try:
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         _headers = {"Authorization": f"Bearer {token}"} if token else {}
-        async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
+        from providers.execution import AuditedAsyncHTTPClient
+
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=_headers) as client:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
             if r.status_code != 200:
                 return False
