@@ -7,15 +7,9 @@ import importlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
-from fastmcp.server.middleware import MiddlewareContext
-from fastmcp.tools.base import ToolResult
-from mcp.types import CallToolRequestParams, RequestParams
 
-from agents.mcp_audit import MCPAuditMiddleware
 from agents.tool_audit_policy import (
     AUDIT_BYPASS_ALLOWLIST,
     OPERATION_OWNER_CONTRACTS,
@@ -578,35 +572,9 @@ def test_production_fastmcp_and_native_dispatch_have_one_audit_boundary() -> Non
     )
 
 
-def _synthetic_mcp_request(
-    name: str, arguments: dict[str, object]
-) -> MiddlewareContext:
-    meta = RequestParams.Meta(
-        **{
-            "agentic-perf": {
-                "ticket_id": "PERF-policy",
-                "agent_id": "audit-policy",
-                "invocation_id": str(uuid4()),
-                "trace_id": "a" * 32,
-                "action_id": "b" * 16,
-                "correlation_request_id": uuid4().hex,
-                "idempotency_key": "policy-operation",
-                "idempotency_request_hash": "policy-request-hash",
-            }
-        }
-    )
-    return MiddlewareContext(
-        message=CallToolRequestParams(name=name, arguments=arguments, _meta=meta),
-        method="tools/call",
-        fastmcp_context=SimpleNamespace(
-            request_id="policy-rpc", session_id="policy-session"
-        ),
-    )
-
-
 @pytest.mark.asyncio
 async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
-    """Exercise each real registered MCP schema through its audit contract."""
+    """Exercise each registration through its actual FastMCP middleware stack."""
     registrations, _ = _mcp_registrations()
     for registration in registrations:
         module_name = registration.path.removesuffix(".py").replace("/", ".")
@@ -615,37 +583,46 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
         assert tool is not None, registration.key
         arguments = _schema_fixture(tool.parameters)
         assert isinstance(arguments, dict), registration.key
+        middleware = next(
+            item
+            for item in server.mcp.middleware
+            if item.__class__.__name__ == "MCPAuditMiddleware"
+        )
         events = []
-        middleware = MCPAuditMiddleware(
-            "policy-fixture",
-            ticket_id="PERF-policy",
-            agent_id="audit-policy",
-            record=events.append,
-        )
+        original_emit = middleware._emit
+        original_handler = tool.fn
 
-        async def handler(_: MiddlewareContext) -> ToolResult:
-            return ToolResult(content="ok")
+        def emit(trace, _context, state, **kwargs):
+            events.append((trace, state, kwargs))
 
-        await middleware.on_call_tool(
-            _synthetic_mcp_request(registration.key.rsplit(":", 1)[1], arguments),
-            handler,
-        )
-        assert events[0].lifecycle.state == LifecycleState.REQUEST_RECEIVED, (
-            registration.key
-        )
-        assert events[-1].lifecycle.state in {
-            LifecycleState.RESPONSE_SENT,
-            LifecycleState.FAILED,
-            LifecycleState.REJECTED,
-            LifecycleState.DUPLICATE_DETECTED,
-            LifecycleState.CANCELLED,
-        }, registration.key
-        assert len(events) == 2, registration.key
-        assert {event.action.phase for event in events} == {
+        async def harmless_handler(**_kwargs):
+            # FastMCP validates declared output schemas after the handler.  A
+            # mapping is accepted by the common wrapped-result contract and
+            # keeps this fixture from invoking its remote implementation.
+            return {"result": "policy fixture result"}
+
+        middleware._emit = emit
+        tool.fn = harmless_handler
+        try:
+            result = await server.mcp.call_tool(
+                registration.key.rsplit(":", 1)[1], arguments
+            )
+        finally:
+            tool.fn = original_handler
+            middleware._emit = original_emit
+        # Protected tools reject the harmless fixture before the handler when
+        # it deliberately lacks a durable operation identity.  That is the
+        # canonical real-boundary rejection path, not a fixture bypass.
+        assert [event[1] for event in events] in (
+            [LifecycleState.REQUEST_RECEIVED, LifecycleState.RESPONSE_SENT],
+            [LifecycleState.REQUEST_RECEIVED, LifecycleState.REJECTED],
+        ), registration.key
+        assert result.is_error == (events[-1][1] == LifecycleState.REJECTED)
+        assert {event[2]["tool_name"] for event in events} == {
             registration.key.rsplit(":", 1)[1]
         }
-        assert len({event.action_id for event in events}) == 1
-        assert all(event.mcp.correlation_request_id for event in events)
+        assert len({event[0].action_id for event in events}) == 1
+        assert all(event[0].mcp_correlation_request_id for event in events)
 
 
 @pytest.mark.asyncio
@@ -786,17 +763,19 @@ async def test_chat_audit_cancellation_emits_terminal_and_preserves_parent() -> 
 
 
 def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:
-    """Any production call to execute_tool must explicitly construct its boundary."""
+    """Any direct *or aliased* production dispatcher needs an audit boundary."""
     calls: list[tuple[str, ast.Call]] = []
     for path in (ROOT / "agents").rglob("*.py"):
         relative = path.relative_to(ROOT).as_posix()
         if relative == "agents/chat/tools.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        aliases = _import_aliases(tree)
         calls.extend(
             (relative, node)
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _call_name(node.func) == "execute_tool"
+            if isinstance(node, ast.Call)
+            and _resolved_call_name(node.func, aliases).endswith("tools.execute_tool")
         )
     assert calls, "CHAT_TOOLS has no production dispatcher"
     for relative, call in calls:
@@ -847,6 +826,23 @@ def test_chat_agent_does_not_fallback_to_the_user_bearer_for_audit() -> None:
         assert len(constructor.args) >= 3
         rendered = ast.unparse(constructor.args[2])
         assert "auth_token" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_chat_execute_tool_fails_closed_without_audit_boundary() -> None:
+    """The public dispatcher must not retain a test-only raw execution path."""
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatAuditUnavailable, execute_tool
+
+    with pytest.raises(ChatAuditUnavailable, match="requires an audit boundary"):
+        await execute_tool(
+            "search_tickets",
+            {},
+            AsyncMock(),
+            "http://state-store.invalid",
+            "user-token",
+        )
 
 
 def test_protected_call_aliases_resolve_to_the_canonical_api() -> None:

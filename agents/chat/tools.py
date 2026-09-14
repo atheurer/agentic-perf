@@ -209,15 +209,26 @@ class ChatToolAudit:
         handler: Callable[[], Awaitable[str]],
         *,
         tool_call_id: str | None = None,
+        parent_context: Any | None = None,
     ) -> str:
         """Record ``STARTED`` and one terminal event around one named tool."""
         ticket_id = tool_input.get("ticket_id")
-        root_context = current_trace_context() or new_trace_context(
-            ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
-            agent_id="chat-agent",
+        root_context = (
+            parent_context
+            or current_trace_context()
+            or new_trace_context(
+                ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
+                agent_id="chat-agent",
+            )
         )
         context = child_context(
-            root_context, tool_call_id=tool_call_id or f"chat-{root_context.action_id}"
+            root_context,
+            tool_call_id=tool_call_id or f"chat-{root_context.action_id}",
+            **(
+                {"ticket_id": ticket_id}
+                if isinstance(ticket_id, str) and ticket_id
+                else {}
+            ),
         )
         timer = MonotonicTimer()
         await self._emit(
@@ -268,6 +279,56 @@ class ChatToolAudit:
             outcome=OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS,
         )
         return result
+
+    async def reject(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        tool_call_id: str | None = None,
+        parent_context: Any | None = None,
+    ) -> None:
+        """Record a user-rejected confirmation without running its handler.
+
+        A confirmation is an agent-visible capability invocation.  Recording a
+        started/rejected pair makes a later user cancellation causally visible
+        while preserving the original web-request root across the two HTTP
+        requests that make up the confirmation flow.
+        """
+        ticket_id = tool_input.get("ticket_id")
+        root_context = (
+            parent_context
+            or current_trace_context()
+            or new_trace_context(
+                ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
+                agent_id="chat-agent",
+            )
+        )
+        context = child_context(
+            root_context,
+            tool_call_id=tool_call_id or f"chat-{root_context.action_id}",
+            **(
+                {"ticket_id": ticket_id}
+                if isinstance(ticket_id, str) and ticket_id
+                else {}
+            ),
+        )
+        timer = MonotonicTimer()
+        await self._emit(
+            context,
+            LifecycleState.STARTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            required=True,
+        )
+        await self._emit(
+            context,
+            LifecycleState.REJECTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            timer=timer,
+            outcome=OperationOutcome.REJECTED,
+        )
 
 
 def _require(params: dict[str, Any], *keys: str) -> str | None:
@@ -621,6 +682,7 @@ async def execute_tool(
     *,
     audit: ChatToolAudit | None = None,
     tool_call_id: str | None = None,
+    parent_context: Any | None = None,
 ) -> str:
     """Execute a chat tool through its required audit boundary."""
     headers = {"Authorization": f"Bearer {auth_token}"}
@@ -638,12 +700,16 @@ async def execute_tool(
                 msg = "An internal error occurred"
             return json.dumps({"error": msg[:200]})
 
-    # Direct unit users may intentionally omit a transport.  Production
-    # ChatAgent always supplies ChatToolAudit, and CI enforces those call sites.
-    return (
-        await audit.invoke(tool_name, tool_input, _dispatch, tool_call_id=tool_call_id)
-        if audit
-        else await _dispatch()
+    # This is the sole production dispatcher.  A missing audit transport is a
+    # fail-closed error, never a convenience route around trace evidence.
+    if audit is None:
+        raise ChatAuditUnavailable("chat tool dispatch requires an audit boundary")
+    return await audit.invoke(
+        tool_name,
+        tool_input,
+        _dispatch,
+        tool_call_id=tool_call_id,
+        parent_context=parent_context,
     )
 
 

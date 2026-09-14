@@ -17,6 +17,12 @@ from typing import Any
 import httpx
 
 from providers.llm.base import LLMProvider
+from providers.tracing import (
+    bind_trace_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 
 from .prompts import CHAT_SYSTEM_PROMPT
 from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, ChatToolAudit, execute_tool
@@ -223,6 +229,32 @@ class ChatAgent:
             Optional ticket ID for context-aware chat on
             the ticket detail page.
         """
+        # Every web request has a root context before it can reach
+        # ChatToolAudit.  Destructive confirmation actions persist this root in
+        # the session so their later confirmation/cancellation is still a
+        # child of the original request rather than an unrelated trace.
+        root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
+        token = bind_trace_context(root)
+        try:
+            return await self._handle_message(
+                user,
+                message,
+                auth_token,
+                ticket_context=ticket_context,
+                readonly=readonly,
+            )
+        finally:
+            reset_trace_context(token)
+
+    async def _handle_message(
+        self,
+        user: str,
+        message: str,
+        auth_token: str,
+        ticket_context: str | None = None,
+        readonly: bool = False,
+    ) -> str:
+        """Handle one already-context-bound web chat request."""
         session = self._sessions.get_or_create(user)
 
         # Check for pending action confirmation
@@ -239,6 +271,7 @@ class ChatAgent:
                     self._client, self._store_url, self._audit_token or ""
                 ),
                 tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
             )
             parsed = json.loads(result)
             if "error" in parsed:
@@ -256,7 +289,16 @@ class ChatAgent:
             session.add_assistant_message(response_text)
             return response_text
         elif session.pending_action and _is_cancellation(message):
+            action = session.pending_action
             session.pending_action = None
+            await ChatToolAudit(
+                self._client, self._store_url, self._audit_token or ""
+            ).reject(
+                action["tool"],
+                action["input"],
+                tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
+            )
             # Remove the entire confirmation exchange (3 msgs)
             if len(session.messages) >= 3:
                 session.messages = session.messages[:-3]
@@ -401,6 +443,7 @@ class ChatAgent:
                         "tool": tc.name,
                         "input": tc.input,
                         "tool_call_id": tc.id,
+                        "trace_context": current_trace_context(),
                     }
                     confirm_msg = (
                         "Here is the ticket I’m ready to create:\n\n"
