@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 
 from providers.tracing import (
     ActionDescriptor,
@@ -12,7 +14,8 @@ from providers.tracing import (
     TraceEventV1,
 )
 from state_store.api.router import api_router
-from state_store.auth import make_auth_dependency
+from state_store.api.traces import _authorize_query, _event_json
+from state_store.auth import Principal, make_auth_dependency
 from state_store.identity import UserStore
 from state_store.main import _set_audit_actor, create_app
 from state_store.trace_store import TraceStore
@@ -125,6 +128,52 @@ async def test_query_and_export_continuations_are_exposed(tmp_path) -> None:
     manifest = exported.json()["manifest"]
     assert manifest["has_more"] and manifest["next_cursor"]
     await client.aclose()
+
+
+async def test_trace_access_matrix_and_audit_outcomes(tmp_path) -> None:
+    app = make_app(tmp_path)
+    app.state.store = SimpleNamespace(
+        get_ticket=lambda _ticket_id: SimpleNamespace(owners=["owner"])
+    )
+    app.state.trace_store.insert_event(event())
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    operator = await client.get(
+        "/api/v1/traces/query",
+        params={"ticket_id": "PERF-1", "include_payloads": "true"},
+        headers={"Authorization": "Bearer service"},
+    )
+    assert operator.status_code == 200
+    await client.aclose()
+
+
+def test_owner_projection_and_access_decisions_are_redacted(tmp_path) -> None:
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            principal=Principal(kind="user", username="owner", is_admin=False)
+        ),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                multi_user=True,
+                store=SimpleNamespace(
+                    get_ticket=lambda _ticket_id: SimpleNamespace(owners=["owner"])
+                ),
+            )
+        ),
+    )
+    assert _authorize_query(request, "PERF-1") is False
+    hidden = _event_json(
+        event().model_copy(update={"attributes": {"secret": "no"}}), False
+    )
+    assert hidden["attributes"] is None
+    request.state.principal = Principal(kind="user", username="other", is_admin=False)
+    try:
+        _authorize_query(request, "PERF-1")
+    except HTTPException as exc:
+        assert exc.status_code == 403
+    else:
+        raise AssertionError("non-owner was authorized")
 
 
 async def test_user_or_anonymous_cannot_spoof_producer(tmp_path) -> None:
