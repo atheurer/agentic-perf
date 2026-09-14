@@ -283,6 +283,14 @@ async def check_available_resources(
         )
     result = await prov.check_available(requirements or {})
 
+    # Code-enforce: when a specific device was requested by
+    # name and is unavailable, escalate to HITL immediately.
+    # Retrying won't help — the board is leased, offline, or
+    # doesn't exist.  The result includes the reason and any
+    # alternatives of the same board type.
+    if not result.get("available") and result.get("selector", "").startswith("name="):
+        _auto_escalate_named_device(result)
+
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
     global _fleet_next_device
@@ -506,6 +514,44 @@ async def get_accumulated_metadata() -> str:
         if key in _last_reservation:
             result[key] = _last_reservation[key]
     return json.dumps(result)
+
+
+def _auto_escalate_named_device(result: dict) -> None:
+    """Transition ticket to HITL when a named device is unavailable.
+
+    Called from check_available_resources when a name= selector
+    returns unavailable.  Retrying is pointless for a specific
+    device — escalate immediately so the user can choose an
+    alternative or wait.
+    """
+    ticket_id = os.environ.get("TICKET_ID", "")
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if not ticket_id:
+        return
+
+    reason = result.get("error", "Device unavailable")
+    alternatives = result.get("alternatives", [])
+    comment = f"Requested device unavailable: {reason}"
+    if alternatives:
+        comment += f" Available alternatives: {', '.join(alternatives)}"
+
+    import httpx
+
+    try:
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        with httpx.Client(timeout=10.0, headers=headers) as client:
+            client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": "awaiting_customer_guidance",
+                    "comment": comment,
+                },
+            )
+    except Exception:
+        logger.exception("Failed to escalate named device unavailability")
 
 
 async def get_registered_tools():
