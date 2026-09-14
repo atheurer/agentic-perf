@@ -123,6 +123,23 @@ def _record_query_audit(
         )
 
 
+def _verified_blob_refs(events: list[TraceEventV1]) -> set[str]:
+    refs: set[str] = set()
+    for event in events:
+        if not event.ticket_id:
+            continue
+        store = PayloadBlobStore(ticket_id=event.ticket_id)
+        for descriptor in (event.input, event.output):
+            if not descriptor or not descriptor.blob_ref:
+                continue
+            try:
+                store.get(descriptor.blob_ref, max_bytes=1_048_576)
+            except PayloadStorageError:
+                continue
+            refs.add(descriptor.blob_ref)
+    return refs
+
+
 @query_router.get("/query")
 def query(
     request: Request,
@@ -152,6 +169,7 @@ def query(
         )
         raise
     _record_query_audit(request, "trace_query", ticket_id, "success")
+    raw_events = request.app.state.trace_store.list_events()
     base_query = _query_from_params(
         ticket_id=ticket_id,
         trace_id=trace_id,
@@ -167,22 +185,20 @@ def query(
         since=since,
         until=until,
         causal=causal,
-        limit=10000,
+        limit=max(len(raw_events), limit),
         cursor=0,
     )
-    all_selected = query_events(request.app.state.trace_store.list_events(), base_query)
-    selected = [event for event in all_selected if (event.global_seq or 0) > cursor][
-        :limit
-    ]
-    has_more = len(all_selected) > len(
-        [event for event in all_selected if (event.global_seq or 0) > cursor][:limit]
-    )
+    all_selected = query_events(raw_events, base_query)
+    # Cursor is a stable ordinal in the fully filtered, globally ordered scope;
+    # this remains usable for legacy events without global_seq.
+    selected = all_selected[cursor : cursor + limit]
+    has_more = cursor + len(selected) < len(all_selected)
     return {
         "events": [
             _event_json(event, detailed and include_payloads) for event in selected
         ],
         "count": len(selected),
-        "next_cursor": selected[-1].global_seq if has_more and selected else None,
+        "next_cursor": cursor + len(selected) if has_more else None,
         "has_more": has_more,
         "diagnostics": diagnostics(all_selected) if causal else {},
     }
@@ -219,8 +235,9 @@ def export(
         )
         raise
     _record_query_audit(request, "trace_export", ticket_id, "success")
+    raw_events = request.app.state.trace_store.list_events()
     selected = query_events(
-        request.app.state.trace_store.list_events(),
+        raw_events,
         TraceQuery(
             ticket_id=ticket_id,
             trace_id=trace_id,
@@ -236,10 +253,11 @@ def export(
             since=since,
             until=until,
             causal=causal,
-            limit=limit,
+            limit=max(len(raw_events), limit),
             cursor=cursor,
         ),
     )
+    verified_blob_refs = _verified_blob_refs(selected)
     media = (
         "text/csv"
         if format == "csv"
@@ -251,7 +269,9 @@ def export(
             for event in selected
         ]
     content = export_events(selected, format)
-    export_meta = export_manifest(selected, content)
+    export_meta = export_manifest(
+        selected, content, verified_blob_refs=verified_blob_refs
+    )
     # Every artifact is self-describing; ``manifest`` remains accepted for
     # compatibility but cannot disable integrity metadata.
     manifest = True

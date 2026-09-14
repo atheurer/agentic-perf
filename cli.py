@@ -1082,7 +1082,7 @@ def cmd_trace(args):
             print(json.dumps(event, separators=(",", ":")))
     else:
         events = payload.get("events", [])
-        if args.tree:
+        if args.tree or args.ticket_id:
             children = {}
             for event in events:
                 children.setdefault(event.get("parent_action_id"), []).append(event)

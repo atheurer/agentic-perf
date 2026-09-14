@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -211,20 +212,30 @@ def export_events(events: Iterable[TraceEventV1], format: str = "json") -> str:
     raise ValueError("format must be json, jsonl, or csv")
 
 
-def export_manifest(events: Iterable[TraceEventV1], content: str) -> dict[str, object]:
+def export_manifest(
+    events: Iterable[TraceEventV1],
+    content: str,
+    *,
+    verified_blob_refs: Iterable[str] | None = None,
+) -> dict[str, object]:
     """Return integrity metadata for an export without including payload bytes."""
     values = list(events)
     sequences = [event.global_seq for event in values if event.global_seq is not None]
     # A descriptor digest may be HMAC'd metadata and is not an address for a
     # stored blob.  Exports must only claim references that can be resolved by
     # the payload endpoint.
-    digests = sorted(
-        {
+    candidates = (
+        verified_blob_refs
+        if verified_blob_refs is not None
+        else (
             descriptor.blob_ref
             for event in values
             for descriptor in (event.input, event.output)
             if descriptor and descriptor.blob_ref
-        }
+        )
+    )
+    digests = sorted(
+        {ref for ref in candidates if re.fullmatch(r"sha256:[0-9a-f]{64}", ref)}
     )
     return {
         "manifest_version": "trace-export-v1",
