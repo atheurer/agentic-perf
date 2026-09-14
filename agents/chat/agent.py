@@ -27,6 +27,47 @@ _DEFAULT_TIMEOUT = 60
 
 logger = logging.getLogger(__name__)
 
+
+def _is_confirmation(message: str) -> bool:
+    """Return whether a conversational reply approves a pending action."""
+    normalized = message.lower().strip().rstrip(".!?")
+    if normalized in {
+        "yes",
+        "y",
+        "confirm",
+        "ok",
+        "okay",
+        "go",
+        "go ahead",
+        "do it",
+        "proceed",
+        "submit",
+    }:
+        return True
+    return normalized.startswith(
+        (
+            "yes, ",
+            "yes ",
+            "okay, ",
+            "okay ",
+            "ok, ",
+            "ok ",
+            "go ahead, ",
+            "go ahead ",
+            "please submit",
+            "please create",
+        )
+    )
+
+
+def _is_cancellation(message: str) -> bool:
+    """Return whether a conversational reply cancels a pending action."""
+    normalized = message.lower().strip().rstrip(".!?")
+    if normalized in {"no", "n", "cancel", "abort", "nevermind", "never mind"}:
+        return True
+    return normalized.startswith(("no, ", "no ", "cancel, ", "cancel "))
+
+
 # Maximum tool-use iterations per user message to prevent
 # runaway loops.
 _DEFAULT_MAX_TOOL_ROUNDS = 10
@@ -180,17 +221,7 @@ class ChatAgent:
         session = self._sessions.get_or_create(user)
 
         # Check for pending action confirmation
-        lower_msg = message.lower().strip()
-        if session.pending_action and lower_msg in (
-            "yes",
-            "y",
-            "confirm",
-            "ok",
-            "go",
-            "do it",
-            "proceed",
-            "submit",
-        ):
+        if session.pending_action and _is_confirmation(message):
             action = session.pending_action
             session.pending_action = None
             result = await execute_tool(
@@ -215,13 +246,7 @@ class ChatAgent:
             session.add_user_message(message)
             session.add_assistant_message(response_text)
             return response_text
-        elif session.pending_action and lower_msg in (
-            "no",
-            "n",
-            "cancel",
-            "abort",
-            "nevermind",
-        ):
+        elif session.pending_action and _is_cancellation(message):
             session.pending_action = None
             # Remove the entire confirmation exchange (3 msgs)
             if len(session.messages) >= 3:
@@ -368,13 +393,10 @@ class ChatAgent:
                         "input": tc.input,
                     }
                     confirm_msg = (
-                        f"**Action requires confirmation:** "
-                        f"`{tc.name}`\n\n"
-                        f"```json\n"
-                        f"{json.dumps(tc.input, indent=2)}"
-                        f"\n```\n\n"
-                        f"Type **yes** to proceed or **no** "
-                        f"to cancel."
+                        "Here is the ticket I’m ready to create:\n\n"
+                        f"```json\n{json.dumps(tc.input, indent=2)}\n```\n\n"
+                        "Please provide confirmation that you’d like me to submit it. "
+                        "You can reply naturally, or say no to cancel."
                     )
                     tool_results.append(
                         {
