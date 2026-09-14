@@ -3015,7 +3015,11 @@ async function pollEvents(ticketId) {
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
       var cf = ticket.custom_fields || {};
       var gs = cf.guidance_summary || (cf.introspection || {}).guidance_summary;
-      if (gs && !document.getElementById('chat-guidance-' + ticketId)) {
+      var guidancePayload = gs ? JSON.stringify({a: gs.agent || '', r: gs.reason || '', d: gs.details || '', sa: gs.suggested_actions || [], sr: gs.suggested_response || ''}) : '';
+      var guidanceHash = 0;
+      for (var i = 0; i < guidancePayload.length; i++) { guidanceHash = ((guidanceHash << 5) - guidanceHash + guidancePayload.charCodeAt(i)) | 0; }
+      var guidanceKey = ticketId + '-' + (guidanceHash >>> 0).toString(36);
+      if (gs && !document.getElementById('chat-guidance-' + guidanceKey)) {
         var guidanceMsg = '\ud83d\udd14 **' + ticketId + '** needs guidance\n\n';
         guidanceMsg += '**Agent:** ' + (gs.agent || '?') + '\n';
         guidanceMsg += '**Reason:** ' + (gs.reason || 'unknown') + '\n';
@@ -3027,7 +3031,7 @@ async function pollEvents(ticketId) {
         if (gs.suggested_response) guidanceMsg += '\n**Suggestion:** ' + gs.suggested_response;
         var container = document.getElementById('ticket-chat-messages') || document.getElementById('chat-messages');
         if (container) {
-          container.innerHTML += '<div class="chat-msg assistant" id="chat-guidance-' + escHtml(ticketId) + '">' + chatRender(guidanceMsg, 'assistant') + '</div>';
+          container.innerHTML += '<div class="chat-msg assistant" id="chat-guidance-' + escHtml(guidanceKey) + '">' + chatRender(guidanceMsg, 'assistant') + '</div>';
           container.scrollTop = container.scrollHeight;
         }
       }
