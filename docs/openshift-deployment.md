@@ -561,3 +561,148 @@ before a hardware lease, and stores `image_build_result`; success advances to
 See [CAIB image building](../skills/caib/image-building.md) for target
 resolution, package/bootc modes, manifests, token/registry setup, and
 recovery. Use `system_config` for post-flash runtime changes instead.
+
+## Arcaflow MCP workflow execution
+
+The Arcaflow MCP server enables multi-plugin workflow execution
+(e.g., fio + PCP metrics collection). The engine resolves plugin
+schemas by running plugin containers via ATP, which requires
+access to a container runtime.
+
+### Deployer options
+
+Choose the deployer that fits your environment:
+
+#### Kubernetes deployer (recommended for OCP)
+
+Plugin containers run as ephemeral pods in the same cluster.
+No privileged security contexts needed.
+
+**Setup:**
+
+1. Create a ServiceAccount with pod management permissions:
+
+```bash
+oc create sa arcaflow-engine -n <namespace>
+
+oc apply -n <namespace> -f - <<YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arcaflow-engine-role
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list", "watch"]
+YAML
+
+oc create rolebinding arcaflow-engine-binding \
+  --role=arcaflow-engine-role \
+  --serviceaccount=<namespace>:arcaflow-engine -n <namespace>
+```
+
+2. Set the deployment to use the ServiceAccount:
+
+```bash
+oc patch deployment agentic-perf -n <namespace> --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/serviceAccountName","value":"arcaflow-engine"}]'
+```
+
+3. Create the MCP config ConfigMap:
+
+```bash
+oc apply -n <namespace> -f - <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arcaflow-mcp-config
+data:
+  config.yaml: |
+    engine:
+      deployer: kubernetes
+      deployment:
+        metadata:
+          namespace: <namespace>
+YAML
+```
+
+4. Mount the ConfigMap in the deployment:
+
+```bash
+oc patch deployment agentic-perf -n <namespace> --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/volumes/-",
+   "value":{"name":"arcaflow-mcp-config","configMap":{"name":"arcaflow-mcp-config"}}},
+  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-",
+   "value":{"name":"arcaflow-mcp-config","mountPath":"/etc/arcaflow-mcp","readOnly":true}}
+]'
+```
+
+5. Update `external_mcp_servers` in agentic-perf config:
+
+```json
+{
+    "name": "arcaflow",
+    "command": ["arcaflow-mcp", "--enable-execution", "--config", "/etc/arcaflow-mcp/config.yaml"],
+    "transport": "stdio",
+    "agents": { ... }
+}
+```
+
+#### Podman with remote connection
+
+Use a named podman connection to a remote host with podman.
+The engine runs containers on the remote host via SSH.
+
+**Requirements:**
+- A host with podman accessible via SSH
+- SSH key access from the orchestrator pod
+- Podman connection configured
+
+**Setup:**
+
+```bash
+# On the orchestrator pod:
+podman system connection add schema-host ssh://root@<host> --identity /path/to/key
+```
+
+MCP config (`/etc/arcaflow-mcp/config.yaml`):
+
+```yaml
+engine:
+  deployer: podman
+  deployment:
+    connectionName: "schema-host"
+```
+
+**Best for:** Environments with a dedicated VM or lab host
+with podman available.
+
+#### Podman local (privileged pod)
+
+Run podman directly in the orchestrator pod.
+
+**Requirements:**
+- `privileged: true` security context, or
+- Namespace labeled: `pod-security.kubernetes.io/enforce=privileged`
+- podman installed in the container image (already included)
+
+MCP config:
+
+```yaml
+engine:
+  deployer: podman
+```
+
+**Best for:** Development/testing with relaxed security.
+
+#### Without a deployer
+
+If no container runtime is available, the MCP can still serve:
+- `plugin_list` / `plugin_describe` (Quay API + metadata)
+- `workflow_load` / `workflow_list` (YAML parsing)
+
+But `workflow_input_validate` and `workflow_execute` will
+fail because they require plugin schema resolution via ATP.
