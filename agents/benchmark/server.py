@@ -449,11 +449,19 @@ class _BenchmarkOperation:
                 result = await asyncio.to_thread(
                     self._client.operation_acquire, self.key, self.request_hash, 900
                 )
-            except Exception:
-                # A 409 means another worker owns this immutable intent. The
-                # caller must return an existing-operation response; it must
-                # never retry the external launch.
-                return {}, "in_progress"
+            except Exception as exc:
+                # Only a conflict proves that another worker owns the intent.
+                # Authentication, transport, and 5xx failures must fail closed.
+                cause = exc
+                while cause is not None:
+                    response = getattr(cause, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    if status_code is not None:
+                        if status_code == 409:
+                            return {}, "in_progress"
+                        return {}, "unavailable"
+                    cause = cause.__cause__
+                return {}, "unavailable"
             return result.get("operation", {}), result.get("status", "")
         from paths import TRACE_DB_PATH
         from state_store.trace_store import OperationLeaseError, TraceStore
@@ -3363,6 +3371,14 @@ async def execute_benchmark(
             return json.dumps(duplicate_result)
         if acquisition != "acquired":
             await operation_guard.close()
+            if acquisition == "unavailable":
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "reason_code": "operation_registry_unavailable",
+                        "message": "Benchmark operation registry unavailable; launch was not attempted",
+                    }
+                )
             return json.dumps(
                 {
                     "status": "existing_operation",
@@ -3391,9 +3407,25 @@ async def execute_benchmark(
     try:
         if operation_guard and operation_owned:
             await operation_guard.transition("side-effect-started", operation_record)
-        scp_result = await _ssh.copy_to(
-            controller, local_path, remote_path, mutating=True
-        )
+        try:
+            scp_result = await _ssh.copy_to(
+                controller, local_path, remote_path, mutating=True
+            )
+        except Exception as exc:
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                )
+                await operation_guard.close()
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key if operation_guard else None,
+                    "message": "Run-file copy outcome is ambiguous; reconciliation required",
+                }
+            )
     finally:
         if staging:
             staging.unlink(staging_name, missing_ok=True)
@@ -3497,6 +3529,23 @@ async def execute_benchmark(
         uuid_match = re.search(r"--([0-9a-f-]{36})$", dirname)
         run_id = uuid_match.group(1) if uuid_match else dirname
 
+    if not run_dir or not run_id:
+        response = {
+            "status": "indeterminate",
+            "exit_code": result.exit_code,
+            "harness": "crucible",
+            "operation_id": intent_key if operation_guard else None,
+            "message": "Crucible launch completed without a parseable external run identity; reconciliation required",
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {"benchmark_result": response, "external_id_missing": True},
+            )
+            await operation_guard.close()
+        return json.dumps(response)
+
     # Persist the external identity before reading summaries or logs.  A lost
     # response after this point is therefore reconciled by identity rather
     # than replaying the launch command.
@@ -3567,13 +3616,18 @@ async def execute_benchmark(
         response["output"] = result.stdout[-3000:] if result.stdout else ""
         response["error"] = result.stderr[-1000:] if result.stderr else ""
     if operation_guard and operation_owned:
-        await operation_guard.terminalize(
+        terminal_ok = await operation_guard.terminalize(
             operation_record,
             "complete" if response["status"] == "completed" else "fail",
             {"benchmark_result": response},
         )
         await operation_guard.close()
         response["operation_id"] = intent_key
+        if not terminal_ok:
+            response["status"] = "indeterminate"
+            response["message"] = (
+                "Operation result could not be durably recorded; reconciliation required"
+            )
     return json.dumps(response)
 
 
