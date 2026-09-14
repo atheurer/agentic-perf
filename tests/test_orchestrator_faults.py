@@ -20,8 +20,10 @@ from tests.integration.orchestration_faults import (
     FakeBenchmarkController,
     diagnostics,
     free_port,
+    start_orchestrator,
     start_store,
     stop_process,
+    wait_for_log,
 )
 
 
@@ -101,6 +103,51 @@ def test_concurrent_startup_has_one_fenced_leader(tmp_path: Path) -> None:
         )
     finally:
         stop.touch()
+        for process in reversed(processes):
+            stop_process(process)
+
+
+def test_two_real_orchestrators_share_one_fenced_production_leader(
+    tmp_path: Path,
+) -> None:
+    """Real ``orchestrator.main`` processes cannot both enter the poll loop.
+
+    The runtime homes are intentionally separate (as are normal dev instances),
+    but both mains use the same service URL and token.  The winning readiness
+    line occurs after the production lease acquisition; the other main must
+    fail *before* it creates a dispatcher or can claim any ticket.
+    """
+    port = free_port()
+    store = start_store(tmp_path / "shared-store", port)
+    winner = loser = None
+    processes = [store]
+    try:
+        store_url = f"http://127.0.0.1:{port}"
+        winner = start_orchestrator(
+            tmp_path / "runtime-a", store_url, instance_name="fault-a"
+        )
+        processes.append(winner)
+        wait_for_log(winner, "Orchestrator started")
+        loser = start_orchestrator(
+            tmp_path / "runtime-b", store_url, instance_name="fault-b"
+        )
+        processes.append(loser)
+        # A losing real main exits on the production 409 leader-lease response.
+        deadline = __import__("time").monotonic() + 10
+        while loser.poll() is None and __import__("time").monotonic() < deadline:
+            __import__("time").sleep(0.02)
+        assert loser.poll() not in (None, 0), diagnostics(processes)
+        loser_log = (tmp_path / "runtime-b" / "orchestrator.log").read_text()
+        assert "orchestrator leader lease unavailable" in loser_log
+        assert "Orchestrator started" not in loser_log
+        lease = httpx.get(
+            f"{store_url}/api/v1/control/orchestrator-lease",
+            headers={"Authorization": "Bearer fault-token"},
+            timeout=2,
+        )
+        assert lease.status_code == 200, diagnostics(processes)
+        assert lease.json()["lease"]["pid"] == winner.pid
+    finally:
         for process in reversed(processes):
             stop_process(process)
 

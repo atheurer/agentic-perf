@@ -50,7 +50,8 @@ def start_store(home: Path, port: int) -> subprocess.Popen[str]:
         "STORE_PORT": str(port),
         "AGENTIC_PERF_API_TOKEN": "fault-token",
     }
-    log = (home / "state-store.log").open("w+", encoding="utf-8")
+    log_path = home / "state-store.log"
+    log = log_path.open("w+", encoding="utf-8")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -70,9 +71,86 @@ def start_store(home: Path, port: int) -> subprocess.Popen[str]:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    process._fault_log = log  # type: ignore[attr-defined]
+    process._fault_log_path = log_path  # type: ignore[attr-defined]
     log.close()
     wait_for_store(port, process)
+    return process
+
+
+def wait_for_log(
+    process: subprocess.Popen[str], needle: str, *, timeout: float = 15
+) -> None:
+    """Wait for a production process to emit its readiness event.
+
+    This is deliberately a predicate wait, rather than a fixed startup sleep:
+    the log line is emitted only after ``poll_loop`` has acquired the real
+    leader lease and constructed its dispatcher.
+    """
+    deadline = time.monotonic() + timeout
+    log_path = Path(getattr(process, "_fault_log_path"))
+    while time.monotonic() < deadline:
+        output = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        if needle in output:
+            return
+        if process.poll() is not None:
+            raise AssertionError(f"process exited before {needle!r}: {output[-2000:]}")
+        time.sleep(0.02)
+    output = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    raise AssertionError(f"timed out waiting for {needle!r}: {output[-2000:]}")
+
+
+def start_orchestrator(
+    home: Path, store_url: str, *, instance_name: str
+) -> subprocess.Popen[str]:
+    """Start the real ``orchestrator.main`` with an isolated runtime home."""
+    home.mkdir(parents=True, exist_ok=True)
+    # ``poll_loop`` creates a cache for every known harness before it starts.
+    # Empty local git repositories make those intentional no-network failures
+    # immediate, while preserving the production startup path.
+    for name in (
+        "crucible-examples",
+        "zathras",
+        "kube-burner",
+        "k8s-netperf",
+        "benchmark-runner",
+        "clusterbuster",
+        "vstorm",
+        "ioscale",
+        "forge",
+        "boot-time-analysis-scripts",
+    ):
+        (home / "skill-cache" / name / ".git").mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(
+        json.dumps(
+            {
+                "instance_name": instance_name,
+                "state_store": {"url": store_url},
+                "llm": {"provider": "mock"},
+                "poll_interval": 0.05,
+                "orchestrator_lease": {"ttl_seconds": 30, "renew_interval": 1},
+                "max_concurrent_agents": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ | {
+        "AGENTIC_PERF_HOME": str(home),
+        "STATE_STORE_URL": store_url,
+        "AGENTIC_PERF_API_TOKEN": "fault-token",
+        "PYTHONUNBUFFERED": "1",
+    }
+    log_path = home / "orchestrator.log"
+    log = log_path.open("w+", encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "orchestrator.main"],
+        cwd=Path(__file__).parents[2],
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    process._fault_log_path = log_path  # type: ignore[attr-defined]
+    log.close()
     return process
 
 
@@ -92,11 +170,11 @@ def diagnostics(processes: list[subprocess.Popen[str]]) -> str:
     chunks: list[str] = []
     for process in processes:
         output = ""
-        log_path = getattr(process, "_fault_log", None)
+        log_path = getattr(process, "_fault_log_path", None)
         if log_path:
             try:
-                output = Path(log_path.name).read_text(encoding="utf-8")[-1500:]
-            except (OSError, ValueError):
+                output = Path(log_path).read_text(encoding="utf-8")[-1500:]
+            except OSError:
                 output = "<log unavailable>"
         elif process.stdout:
             try:
