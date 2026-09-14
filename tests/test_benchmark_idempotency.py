@@ -245,8 +245,10 @@ async def test_execute_concurrent_workers_only_one_launches(tmp_path, monkeypatc
         await release.wait()
 
     _, calls = _crucible_fixture(tmp_path, monkeypatch, launch=launch)
+    monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "worker-1")
     first_task = asyncio.create_task(_execute())
     await entered.wait()
+    monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "worker-2")
     second = await _execute()
     assert second["status"] == "rejected"
     assert second["reason_code"] == "existing_operation"
@@ -315,8 +317,25 @@ async def test_execute_postlaunch_crash_is_indeterminate_and_replay_never_relaun
     with pytest.raises(ConnectionError):
         await _execute()
     replay = await _execute()
-    assert replay["status"] == "rejected"
-    assert replay["reason_code"] == "existing_operation"
+    assert replay["status"] == "indeterminate"
+    assert replay["reason_code"] == "indeterminate"
+    assert replay["existing_operation"] is True
+    assert replay["operation"]["terminal_outcome"] == "indeterminate"
+    assert len([c for c in calls if c[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_reconnect_same_correlation_replays_without_launch(tmp_path, monkeypatch):
+    _, calls = _crucible_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "session-788")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "7")
+    monkeypatch.setenv("AGENTIC_PERF_REQUEST_ID", "mcp-request-788")
+    first = await _execute()
+    # Simulate a new MCP delivery with the same causal correlation but a new worker.
+    monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "reconnected-worker")
+    second = await _execute()
+    assert first["status"] == second["status"] == "completed"
+    assert second["existing_operation"] is True
     assert len([c for c in calls if c[0] == "launch"]) == 1
 
 

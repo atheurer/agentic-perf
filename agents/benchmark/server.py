@@ -2355,6 +2355,17 @@ async def execute_benchmark(
                 return json.dumps(
                     {**cached, "operation_id": intent_key, "existing_operation": True}
                 )
+            return json.dumps(
+                {
+                    "status": operation_record.get("terminal_outcome", "indeterminate"),
+                    "reason_code": operation_record.get(
+                        "terminal_outcome", "indeterminate"
+                    ),
+                    "operation_id": intent_key,
+                    "operation": operation_record,
+                    "existing_operation": True,
+                }
+            )
         if acquisition != "acquired":
             await operation_guard.close()
             return json.dumps(
