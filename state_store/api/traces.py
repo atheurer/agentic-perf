@@ -107,6 +107,22 @@ def _query_from_params(
     )
 
 
+def _record_query_audit(
+    request: Request,
+    operation: str,
+    ticket_id: str | None,
+    outcome: str,
+    error: str | None = None,
+) -> None:
+    audit_log = getattr(request.app.state, "audit_log", None)
+    if audit_log is not None:
+        audit_log.log(
+            operation,
+            ticket_id or "*",
+            {"outcome": outcome, "error": error, "ticket_scoped": bool(ticket_id)},
+        )
+
+
 @query_router.get("/query")
 def query(
     request: Request,
@@ -128,40 +144,47 @@ def query(
     cursor: int = Query(default=0, ge=0),
     include_payloads: bool = False,
 ) -> dict[str, object]:
-    detailed = _authorize_query(request, ticket_id)
-    audit_log = getattr(request.app.state, "audit_log", None)
-    if audit_log is not None:
-        audit_log.log(
-            "trace_query", ticket_id or "*", {"detailed": detailed, "causal": causal}
+    try:
+        detailed = _authorize_query(request, ticket_id)
+    except HTTPException as exc:
+        _record_query_audit(
+            request, "trace_query", ticket_id, "denied", str(exc.detail)
         )
-    selected = query_events(
-        request.app.state.trace_store.list_events(),
-        _query_from_params(
-            ticket_id=ticket_id,
-            trace_id=trace_id,
-            invocation_id=invocation_id,
-            action_id=action_id,
-            parent_action_id=parent_action_id,
-            action_type=action_type,
-            lifecycle_state=lifecycle_state,
-            outcome=outcome,
-            producer_component=producer_component,
-            retry_kind=retry_kind,
-            idempotency_outcome=idempotency_outcome,
-            since=since,
-            until=until,
-            causal=causal,
-            limit=limit,
-            cursor=cursor,
-        ),
+        raise
+    _record_query_audit(request, "trace_query", ticket_id, "success")
+    base_query = _query_from_params(
+        ticket_id=ticket_id,
+        trace_id=trace_id,
+        invocation_id=invocation_id,
+        action_id=action_id,
+        parent_action_id=parent_action_id,
+        action_type=action_type,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        producer_component=producer_component,
+        retry_kind=retry_kind,
+        idempotency_outcome=idempotency_outcome,
+        since=since,
+        until=until,
+        causal=causal,
+        limit=10000,
+        cursor=0,
+    )
+    all_selected = query_events(request.app.state.trace_store.list_events(), base_query)
+    selected = [event for event in all_selected if (event.global_seq or 0) > cursor][
+        :limit
+    ]
+    has_more = len(all_selected) > len(
+        [event for event in all_selected if (event.global_seq or 0) > cursor][:limit]
     )
     return {
         "events": [
             _event_json(event, detailed and include_payloads) for event in selected
         ],
         "count": len(selected),
-        "next_cursor": selected[-1].global_seq if selected else None,
-        "diagnostics": diagnostics(selected) if causal else {},
+        "next_cursor": selected[-1].global_seq if has_more and selected else None,
+        "has_more": has_more,
+        "diagnostics": diagnostics(all_selected) if causal else {},
     }
 
 
@@ -188,12 +211,14 @@ def export(
     include_payloads: bool = False,
     manifest: bool = False,
 ) -> Response:
-    detailed = _authorize_query(request, ticket_id)
-    audit_log = getattr(request.app.state, "audit_log", None)
-    if audit_log is not None:
-        audit_log.log(
-            "trace_export", ticket_id or "*", {"format": format, "detailed": detailed}
+    try:
+        detailed = _authorize_query(request, ticket_id)
+    except HTTPException as exc:
+        _record_query_audit(
+            request, "trace_export", ticket_id, "denied", str(exc.detail)
         )
+        raise
+    _record_query_audit(request, "trace_export", ticket_id, "success")
     selected = query_events(
         request.app.state.trace_store.list_events(),
         TraceQuery(
@@ -226,16 +251,29 @@ def export(
             for event in selected
         ]
     content = export_events(selected, format)
-    if manifest and format == "jsonl":
-        content += (
-            json.dumps(
-                {"_manifest": export_manifest(selected, content)}, separators=(",", ":")
+    export_meta = export_manifest(selected, content)
+    # Every artifact is self-describing; ``manifest`` remains accepted for
+    # compatibility but cannot disable integrity metadata.
+    manifest = True
+    if manifest:
+        if format == "json":
+            content = json.dumps(
+                {"manifest": export_meta, "events": json.loads(content)}, indent=2
             )
-            + "\n"
-        )
+        elif format == "jsonl":
+            content += (
+                json.dumps({"_manifest": export_meta}, separators=(",", ":")) + "\n"
+            )
+        else:
+            content = (
+                "# trace-export-manifest: "
+                + json.dumps(export_meta, separators=(",", ":"))
+                + "\n"
+                + content
+            )
     response = Response(content, media_type=media)
     response.headers["X-Trace-Manifest"] = json.dumps(
-        export_manifest(selected, content), separators=(",", ":")
+        export_meta, separators=(",", ":")
     )
     return response
 
@@ -290,6 +328,15 @@ def invocation_trace(
     ticket_id: str | None = None,
     trace_id: str | None = None,
     action_id: str | None = None,
+    parent_action_id: str | None = None,
+    action_type: str | None = None,
+    lifecycle_state: str | None = None,
+    outcome: str | None = None,
+    producer_component: str | None = None,
+    retry_kind: str | None = None,
+    idempotency_outcome: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
     causal: bool = False,
     cursor: int = Query(0, ge=0),
     include_payloads: bool = False,
@@ -301,6 +348,15 @@ def invocation_trace(
         ticket_id=ticket_id,
         trace_id=trace_id,
         action_id=action_id,
+        parent_action_id=parent_action_id,
+        action_type=action_type,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        producer_component=producer_component,
+        retry_kind=retry_kind,
+        idempotency_outcome=idempotency_outcome,
+        since=since,
+        until=until,
         causal=causal,
         cursor=cursor,
         include_payloads=include_payloads,
@@ -319,6 +375,11 @@ def action_trace(
     action_type: str | None = None,
     lifecycle_state: str | None = None,
     outcome: str | None = None,
+    producer_component: str | None = None,
+    retry_kind: str | None = None,
+    idempotency_outcome: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
     causal: bool = False,
     cursor: int = Query(0, ge=0),
     include_payloads: bool = False,
@@ -334,6 +395,11 @@ def action_trace(
         action_type=action_type,
         lifecycle_state=lifecycle_state,
         outcome=outcome,
+        producer_component=producer_component,
+        retry_kind=retry_kind,
+        idempotency_outcome=idempotency_outcome,
+        since=since,
+        until=until,
         causal=causal,
         cursor=cursor,
         include_payloads=include_payloads,

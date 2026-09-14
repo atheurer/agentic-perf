@@ -215,19 +215,26 @@ def export_manifest(events: Iterable[TraceEventV1], content: str) -> dict[str, o
     """Return integrity metadata for an export without including payload bytes."""
     values = list(events)
     sequences = [event.global_seq for event in values if event.global_seq is not None]
+    # A descriptor digest may be HMAC'd metadata and is not an address for a
+    # stored blob.  Exports must only claim references that can be resolved by
+    # the payload endpoint.
     digests = sorted(
         {
-            descriptor.blob_ref or descriptor.digest
+            descriptor.blob_ref
             for event in values
             for descriptor in (event.input, event.output)
-            if descriptor and descriptor.digest
+            if descriptor and descriptor.blob_ref
         }
     )
     return {
+        "manifest_version": "trace-export-v1",
         "schema_versions": sorted({event.schema_version for event in values}),
         "first_seq": min(sequences) if sequences else None,
         "last_seq": max(sequences) if sequences else None,
         "count": len(values),
         "blob_digests": digests,
+        "content_digest_algorithm": "sha256-utf8",
+        "content_digest": hashlib.sha256(content.encode()).hexdigest(),
+        # Kept as an alias for consumers of the initial PR contract.
         "export_digest": hashlib.sha256(content.encode()).hexdigest(),
     }

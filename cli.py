@@ -1057,6 +1057,7 @@ def cmd_trace(args):
             "causal": args.causal or args.tree or bool(args.ticket_id),
             "include_payloads": args.include_payloads,
             "limit": args.limit,
+            "cursor": args.cursor,
         }.items()
         if value is not None
     }
@@ -1074,12 +1075,54 @@ def cmd_trace(args):
             print(response.text, end="" if response.text.endswith("\n") else "\n")
         return
     payload = response.json()
-    if args.json or args.tree:
+    if args.json:
         print(json.dumps(payload, indent=2, default=str))
     elif args.jsonl:
         for event in payload.get("events", []):
             print(json.dumps(event, separators=(",", ":")))
     else:
+        events = payload.get("events", [])
+        if args.tree:
+            children = {}
+            for event in events:
+                children.setdefault(event.get("parent_action_id"), []).append(event)
+
+            def render(event, depth=0):
+                action = event.get("action", {})
+                life = event.get("lifecycle", {})
+                producer = event.get("producer", {})
+                mcp = event.get("mcp", {})
+                error = event.get("error") or {}
+                external = action.get("target") or action.get("target_type") or "-"
+                print(
+                    f"{'  ' * depth}{action.get('type', '?')} "
+                    f"{life.get('state', '?')} attempt={life.get('attempt', 1)} "
+                    f"retry={life.get('retry_kind', 'none')} "
+                    f"replay_of={life.get('replay_of_action_id') or '-'} "
+                    f"action={event.get('action_id', '?')} "
+                    f"duration={event.get('duration_ms') or 0}ms external={external} "
+                    f"process={producer.get('process_start_id') or '-'} "
+                    f"session={mcp.get('session_id') or '-'} "
+                    f"request={mcp.get('protocol_request_id') or '-'} "
+                    f"correlation={mcp.get('correlation_request_id') or '-'}"
+                    + (
+                        f" error={error.get('message') or error.get('code')}"
+                        if error
+                        else ""
+                    )
+                )
+                for child in children.get(event.get("action_id"), []):
+                    render(child, depth + 1)
+
+            roots = [event for event in events if not event.get("parent_action_id")]
+            for event in roots:
+                render(event)
+            diagnostics = payload.get("diagnostics") or {}
+            if any(diagnostics.values()):
+                print(
+                    f"incomplete diagnostics: {json.dumps(diagnostics, sort_keys=True)}"
+                )
+            return
         for event in payload.get("events", []):
             action = event.get("action", {})
             producer = event.get("producer", {})
@@ -1447,6 +1490,7 @@ def main():
     p_trace.add_argument("--tree", action="store_true")
     p_trace.add_argument("--include-payloads", action="store_true")
     p_trace.add_argument("--limit", type=int, default=1000)
+    p_trace.add_argument("--cursor", type=int, default=0)
     p_trace.add_argument(
         "--json", action="store_true", help="Print query response as JSON"
     )
