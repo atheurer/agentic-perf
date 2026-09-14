@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from paths import get_ticket_workspace_dir
+from providers.execution import (
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 from providers.workspace.charts.models import ChartValidationError, validate_chart_spec
 
 logger = logging.getLogger(__name__)
@@ -45,6 +51,7 @@ class WorkspaceManager:
         workspace_dir: Path | str | None = None,
         agent_name: str | None = None,
         phase: str | None = None,
+        audit_emit: Any | None = None,
     ) -> None:
         self.ticket_id = ticket_id or ""
         self.agent_name = agent_name or "unknown"
@@ -52,11 +59,23 @@ class WorkspaceManager:
         self.audience = self._audience_for_agent(self.agent_name)
         if workspace_dir is not None:
             self.workspace_dir = Path(workspace_dir).resolve()
-            self.workspace_dir.mkdir(parents=True, exist_ok=True)
         else:
-            self.workspace_dir = get_ticket_workspace_dir(self.ticket_id).resolve()
+            self.workspace_dir = get_ticket_workspace_dir(
+                self.ticket_id, create=False
+            ).resolve()
+        emitter = audit_emit or (
+            durable_filesystem_emitter() if self.ticket_id else None
+        )
+        self._filesystem = AuditedFilesystem(
+            RootedPath(self.workspace_dir, "workspace"),
+            ticket_id=self.ticket_id or "workspace-scratch",
+            emit=emitter,
+            critical=bool(self.ticket_id),
+            # Only no-ticket scratch work is an allowed system context.
+            system_context=not self.ticket_id,
+        )
         for namespace in self.NAMESPACES:
-            (self.workspace_dir / namespace).mkdir(parents=True, exist_ok=True)
+            self._filesystem.mkdir(namespace)
 
     @staticmethod
     def _audience_for_agent(agent_name: str) -> str:
@@ -97,8 +116,9 @@ class WorkspaceManager:
             "agent": self.agent_name,
             "kind": self.infer_kind(filename),
         }
-        self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        self._manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        self._filesystem.write(
+            "metadata/workspace-manifest.json", json.dumps(manifest, indent=2) + "\n"
+        )
 
     def _is_visible(self, file_ref: str, include_alternates: bool = False) -> bool:
         cleaned = file_ref.strip()
@@ -177,8 +197,6 @@ class WorkspaceManager:
         Returns (file_ref, resolved_path).
         """
         path = self.resolve_path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
         if not overwrite and path.exists():
             base_stem = path.stem
             suffix = path.suffix
@@ -187,12 +205,8 @@ class WorkspaceManager:
                 path = path.parent / f"{base_stem}_{counter}{suffix}"
                 counter += 1
 
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            path.write_text(content, encoding="utf-8")
-
         rel_name = str(path.relative_to(self.workspace_dir))
+        path = self._filesystem.write(rel_name, content)
         self._stamp(rel_name)
         return f"workspace://{rel_name}", path
 
@@ -720,10 +734,8 @@ class WorkspaceManager:
         jq_bin = shutil.which("jq")
         if jq_bin:
             try:
-                proc = subprocess.run(
+                proc = AuditedSubprocessRunner().run_sync(
                     [jq_bin, query, str(path)],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
                 if proc.returncode != 0:
@@ -731,7 +743,7 @@ class WorkspaceManager:
                         "status": "error",
                         "error": f"jq error (exit {proc.returncode}): {proc.stderr.strip()}",
                     }
-                raw_out = proc.stdout.strip()
+                raw_out = proc.stdout.decode(errors="replace").strip()
             except subprocess.TimeoutExpired:
                 return {
                     "status": "error",
@@ -996,11 +1008,9 @@ class WorkspaceManager:
                 "jq executable is required when jq_filter is provided"
             )
         try:
-            proc = subprocess.run(
+            proc = AuditedSubprocessRunner().run_sync(
                 [jq_bin, "-c", jq_filter],
-                input=raw_text,
-                capture_output=True,
-                text=True,
+                stdin=raw_text.encode("utf-8"),
                 timeout=5,
             )
         except subprocess.TimeoutExpired as exc:
@@ -1009,12 +1019,16 @@ class WorkspaceManager:
             raise ChartGenerationError(f"failed to execute jq: {exc}") from exc
 
         if proc.returncode != 0:
-            detail = proc.stderr.strip() or "unknown jq error"
+            detail = proc.stderr.decode(errors="replace").strip() or "unknown jq error"
             raise ChartGenerationError(
                 f"jq filter failed with exit {proc.returncode}: {detail}"
             )
 
-        outputs = [line for line in proc.stdout.splitlines() if line.strip()]
+        outputs = [
+            line
+            for line in proc.stdout.decode(errors="replace").splitlines()
+            if line.strip()
+        ]
         if len(outputs) != 1:
             raise ChartGenerationError(
                 "jq_filter must produce exactly one JSON value; "

@@ -259,6 +259,14 @@ a guardrail. Existing examples to follow:
 
 ### Security Model & Current Limitations
 
+Managed development instances are identity-bound. Use
+`scripts/dev-instance.sh prepare` and its manifest validation rather than
+copying runtime homes. Use `import-state` for selected, sanitized ticket
+fixtures; it defaults to a dry-run and never transfers credentials, locks,
+leases, claims, approvals, or live operation state. Treat `--dangerous-default`
+as a collision-test escape hatch only: state-store locking and fencing remain
+the correctness boundary.
+
 The system uses defense-in-depth, but several controls are not yet
 hardened to the level of a full sandbox. Contributors (human and AI)
 should understand what is enforced today and what is not.

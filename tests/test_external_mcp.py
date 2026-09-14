@@ -6,6 +6,8 @@ commands for non-Python MCP servers (e.g., Jumpstarter).
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -52,6 +54,66 @@ async def test_connect_command_basic(mock_mcp_server: Path):
         assert tools[0].name == "mock_tool"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="FastMCP stdio hangs on local Python 3.14; covered in CI 3.12/3.13",
+)
+@pytest.mark.asyncio
+async def test_concurrent_stdio_servers_keep_process_ownership_and_reconnect(
+    mock_mcp_server: Path,
+):
+    """Concurrent owned transports never share a PID or SDK launch state."""
+    first = AgentMCPClient()
+    second = AgentMCPClient()
+    first_pid = second_pid = reconnect_pid = None
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                first.connect_command(sys.executable, [str(mock_mcp_server)], "first"),
+                second.connect_command(
+                    sys.executable, [str(mock_mcp_server)], "second"
+                ),
+            ),
+            timeout=15,
+        )
+        first_pid = first._servers["first"].subprocess_pid
+        second_pid = second._servers["second"].subprocess_pid
+        assert first_pid is not None
+        assert second_pid is not None
+        assert first_pid != second_pid
+
+        await asyncio.wait_for(first.disconnect(), timeout=10)
+        for pid in (first_pid,):
+            for _ in range(50):
+                if not os.path.exists(f"/proc/{pid}"):
+                    break
+                await asyncio.sleep(0.05)
+            assert not os.path.exists(f"/proc/{pid}")
+        await asyncio.wait_for(
+            first.connect_command(
+                sys.executable, [str(mock_mcp_server)], "reconnected"
+            ),
+            timeout=10,
+        )
+        reconnect_pid = first._servers["reconnected"].subprocess_pid
+        assert reconnect_pid is not None
+        assert reconnect_pid not in {first_pid, second_pid}
+        assert "mock response: later" in await first.call_tool(
+            "mock_tool", {"message": "later"}
+        )
+    finally:
+        await asyncio.wait_for(first.disconnect(), timeout=10)
+        await asyncio.wait_for(second.disconnect(), timeout=10)
+        for pid in (second_pid, reconnect_pid):
+            if pid is None:
+                continue
+            for _ in range(50):
+                if not os.path.exists(f"/proc/{pid}"):
+                    break
+                await asyncio.sleep(0.05)
+            assert not os.path.exists(f"/proc/{pid}")
 
 
 @pytest.mark.asyncio
@@ -186,6 +248,8 @@ async def test_ticket_server_connection_injects_required_context():
             "STATE_STORE_URL": "http://state-store:8090",
             "AGENT_NAME": "triage-agent",
         },
+        ticket_id="PERF-12345678",
+        agent_id="triage-agent",
     )
 
 

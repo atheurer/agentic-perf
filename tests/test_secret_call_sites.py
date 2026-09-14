@@ -33,9 +33,11 @@ class TestSSHStdinData:
 
     async def test_stdin_data_piped_to_subprocess(self) -> None:
         """When stdin_data is provided, it flows to proc.communicate()."""
-        mock_proc = AsyncMock()
-        mock_proc.communicate.return_value = (b"ok\n", b"")
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"ok\n", b""))
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.drain = AsyncMock()
 
         with patch(
             "providers.ssh.asyncio.create_subprocess_exec",
@@ -200,15 +202,23 @@ class TestV4QuadsStdin:
 
     async def test_password_not_in_process_args(self) -> None:
         """default_root_password must not appear in python3 -c string."""
+        from providers.execution import AuditedSubprocessRunner
         from providers.quads import QuadsClient
+        from providers.tracing import (
+            bind_trace_context,
+            new_trace_context,
+            reset_trace_context,
+        )
 
         password = "quads-root-pw-67890"
 
         captured_args: list[tuple] = []
 
-        mock_proc = AsyncMock()
-        mock_proc.communicate.return_value = (b"ok\n", b"")
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"ok\n", b""))
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.drain = AsyncMock()
 
         async def mock_create_subprocess_exec(*args, **kwargs):
             captured_args.append(args)
@@ -216,16 +226,34 @@ class TestV4QuadsStdin:
 
         provider = QuadsClient.__new__(QuadsClient)
         provider.default_root_password = password
+        events = []
 
-        with patch(
-            "providers.quads.asyncio.create_subprocess_exec",
-            side_effect=mock_create_subprocess_exec,
-        ):
-            result = await provider._copy_ssh_key(
-                "10.0.0.1", "ssh-rsa AAAA... test@host"
-            )
+        async def emit(event):
+            events.append(event)
+
+        token = bind_trace_context(new_trace_context(ticket_id="PERF-QUADS"))
+        runner = AuditedSubprocessRunner(emit)
+
+        try:
+            with (
+                patch("providers.quads.AuditedSubprocessRunner", return_value=runner),
+                patch(
+                    "providers.quads.asyncio.create_subprocess_exec",
+                    side_effect=mock_create_subprocess_exec,
+                ),
+            ):
+                result = await provider._copy_ssh_key(
+                    "10.0.0.1", "ssh-rsa AAAA... test@host"
+                )
+        finally:
+            reset_trace_context(token)
 
         assert result == "ok"
+        assert [event.lifecycle.state.value for event in events] == [
+            "requested",
+            "started",
+            "completed",
+        ]
 
         for args in captured_args:
             args_str = " ".join(str(a) for a in args)
@@ -233,16 +261,7 @@ class TestV4QuadsStdin:
                 f"Password found in process args: {args_str}"
             )
 
-        comm_call = mock_proc.communicate.call_args
-        input_data = comm_call.kwargs.get("input") or (
-            comm_call.args[0] if comm_call.args else None
-        )
-        assert input_data is not None, (
-            "Password should be passed via communicate(input=...)"
-        )
-        assert password.encode() in input_data, (
-            "communicate() input should contain the password"
-        )
+        mock_proc.stdin.write.assert_called_once_with(password.encode() + b"\n")
 
 
 # ── Scrub script ───────────────────────────────────────────────

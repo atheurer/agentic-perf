@@ -358,7 +358,7 @@ class TestWorkspaceManagerGenerateChart:
         mgr.save_file("source.json", json.dumps({"results": [{"value": 1}]}))
 
         with patch(
-            "providers.workspace.manager.subprocess.run",
+            "providers.workspace.manager.AuditedSubprocessRunner.run_sync",
             side_effect=subprocess.TimeoutExpired("jq", 5),
         ):
             res = mgr.generate_chart(

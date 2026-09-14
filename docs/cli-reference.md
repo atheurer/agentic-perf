@@ -8,18 +8,43 @@ The global `--store-url URL` option must appear before the command. It
 overrides the state store address (default: `http://localhost:8090`) and can
 also be set with `STATE_STORE_URL`.
 
+## trace
+
+Query or export an authenticated causal trace:
+
+```text
+python3 cli.py trace TICKET_ID [--causal|--tree] [selectors]
+python3 cli.py trace --ticket-id TICKET_ID --export --format jsonl --output trace.jsonl
+```
+
+Selectors include `--trace-id`, `--action/--action-id`, `--invocation`,
+`--type`, `--outcome`, `--parent`, `--producer`, `--since`, `--until`,
+`--retry-kind`, `--idempotency-outcome`, `--lifecycle-state`, `--cursor`,
+`--limit`, and `--include-payloads`. Output may be human-readable, `--json`,
+or `--jsonl`; `--export` supports `--format json|jsonl|csv` and `--output`.
+For a positional ticket ID, causal tree rendering is the default and includes
+ancestry, attempts/replays, producer and MCP identities, durations, external
+targets, errors, and disconnected/missing-parent/cyclic incomplete components.
+
+Trace access uses the configured bearer token. Owner principals receive
+redacted data and no payload blob references; detailed authorized principals
+may request verified payloads. Export files contain a manifest with
+continuation metadata and an `event_content_digest` over the canonical event
+body excluding the manifest.
+
 ## submit
 
 Create a new test ticket and start the pipeline.
 
 ```
-python3 cli.py submit SUMMARY [-d DESCRIPTION] [--owners USER1,USER2] [--stop-after STEP]
+python3 cli.py submit SUMMARY [-d DESCRIPTION | -f FILE] [--owners USER1,USER2] [--stop-after STEP]
 ```
 
 | Argument | Required | Description |
 |---|---|---|
 | `SUMMARY` | Yes | Natural-language test request (also used as the ticket summary) |
-| `-d`, `--description` | No | Detailed description. Defaults to the summary if omitted. |
+| `-d`, `--description` | No | Detailed description. Defaults to the summary if omitted. Mutually exclusive with `-f`. |
+| `-f`, `--description-file` | No | Read description from a file. Use `-` for stdin. Mutually exclusive with `-d`. |
 | `--owners` | No | Comma-separated owners (multi-user mode). |
 | `--stop-after STEP` | No | Stop after `triage`, `resource`, `provision`, `benchmark`, or `review` (debugging). |
 
@@ -46,6 +71,12 @@ python3 cli.py submit \
 python3 cli.py submit \
   "Run kube-burner node-density test" \
   -d "Use AWS EC2. Deploy K3s. 100 pods per node."
+
+# Description from a file (useful for multi-line configs)
+python3 cli.py submit "Latency sweep" -f benchmark-spec.md
+
+# Description from stdin (pipe from another command)
+cat benchmark-spec.md | python3 cli.py submit "Latency sweep" -f -
 ```
 
 ## list

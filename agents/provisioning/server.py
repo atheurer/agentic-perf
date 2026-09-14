@@ -28,8 +28,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
     build_skill_provider,
@@ -41,7 +40,7 @@ from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("provisioning-agent")
+mcp = create_ticket_mcp("provisioning-agent")
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
@@ -536,6 +535,7 @@ async def _validate_and_deploy_contract(host: str, private_config: dict) -> dict
                 host,
                 item["local_path"],
                 item["remote_path"],
+                mutating=True,
             )
             if scp_result.exit_code != 0:
                 return {

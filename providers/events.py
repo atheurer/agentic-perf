@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from paths import LOG_DIR as DEFAULT_LOG_DIR
+from providers.event_projection import (
+    event_order_key,
+    legacy_record,
+    legacy_to_trace,
+    trace_to_legacy,
+)
+from state_store.trace_store import TraceStore
 
 logger = logging.getLogger(__name__)
 
@@ -126,14 +135,28 @@ class EventBus:
         log_dir: str | Path | None = None,
         redactor: Any | None = None,
         usage_ledger: Any | None = None,
+        trace_store: TraceStore | None = None,
+        comparison_mode: bool = False,
+        comparison_writer: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        if comparison_mode and "PYTEST_CURRENT_TEST" not in os.environ:
+            raise RuntimeError("trace dual-write comparison mode is tests-only")
+        if comparison_mode and comparison_writer is None:
+            raise ValueError(
+                "trace dual-write comparison mode requires a comparison sink"
+            )
         self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
         self._lock = threading.Lock()
-        self._file_handles: dict[str, Any] = {}
+        # JSONL is strictly a read-only schema-0 compatibility source.  SQLite
+        # serializes producers, avoiding the former independent append handles.
+        self._trace_store = trace_store or TraceStore(self._log_dir.parent / "trace.db")
+        self._owns_trace_store = trace_store is None
+        self._comparison_mode = comparison_mode
+        self._comparison_writer = comparison_writer
         self._cumulative: dict[str, CumulativeUsage] = {}
         self._last_event_time: dict[str, float] = {}
         self._usage_ledger = usage_ledger
@@ -149,45 +172,34 @@ class EventBus:
 
         self._seq[ticket_id] = 0
         path = self._log_dir / f"{ticket_id}.jsonl"
-        if not path.exists():
-            return
-
         line_count = 0
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    line_count += 1
-                    try:
-                        evt = json.loads(line)
-                        if evt.get("event_type") == "llm_usage":
-                            data = evt.get("data", {})
-                            agent_name = evt.get("agent", "")
-                            input_tokens = data.get("input_tokens", 0)
-                            output_tokens = data.get("output_tokens", 0)
-                            duration_ms = (
-                                data.get("duration_ms", 0)
-                                or data.get("total_duration_ms", 0)
-                                or 0
-                            )
-                            model = data.get("model", "")
-                            cache_read = data.get("cache_read_input_tokens", 0)
-                            cache_creation = data.get("cache_creation_input_tokens", 0)
-
-                            self._record_cumulative_in_memory(
-                                ticket_id,
-                                input_tokens,
-                                output_tokens,
-                                duration_ms,
-                                model,
-                                cache_read,
-                                cache_creation,
-                            )
-                            if agent_name:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        line_count += 1
+                        try:
+                            evt = json.loads(line)
+                            if evt.get("event_type") == "llm_usage":
+                                data = evt.get("data", {})
+                                agent_name = evt.get("agent", "")
+                                input_tokens = data.get("input_tokens", 0)
+                                output_tokens = data.get("output_tokens", 0)
+                                duration_ms = (
+                                    data.get("duration_ms", 0)
+                                    or data.get("total_duration_ms", 0)
+                                    or 0
+                                )
+                                model = data.get("model", "")
+                                cache_read = data.get("cache_read_input_tokens", 0)
+                                cache_creation = data.get(
+                                    "cache_creation_input_tokens", 0
+                                )
                                 self._record_cumulative_in_memory(
-                                    f"{ticket_id}:{agent_name}",
+                                    ticket_id,
                                     input_tokens,
                                     output_tokens,
                                     duration_ms,
@@ -195,12 +207,59 @@ class EventBus:
                                     cache_read,
                                     cache_creation,
                                 )
-                    except Exception:
-                        continue
-        except Exception:
-            logger.exception(f"Failed to load ticket events from {path}")
+                                if agent_name:
+                                    self._record_cumulative_in_memory(
+                                        f"{ticket_id}:{agent_name}",
+                                        input_tokens,
+                                        output_tokens,
+                                        duration_ms,
+                                        model,
+                                        cache_read,
+                                        cache_creation,
+                                    )
+                        except Exception:
+                            continue
+            except Exception:
+                logger.exception(f"Failed to load ticket events from {path}")
 
-        self._seq[ticket_id] = line_count
+        # New records are durable trace envelopes.  Rebuild the same in-memory
+        # budget snapshot on restart without treating a comparison projection as
+        # a second usage record.
+        for trace_event in self._trace_store.list_events(ticket_id):
+            evt = trace_to_legacy(trace_event)
+            if evt.get("event_type") != "llm_usage":
+                continue
+            data = evt.get("data", {})
+            agent_name = evt.get("agent", "")
+            input_tokens = data.get("input_tokens", 0)
+            output_tokens = data.get("output_tokens", 0)
+            duration_ms = data.get("duration_ms", 0) or data.get("total_duration_ms", 0)
+            model = data.get("model", "")
+            cache_read = data.get("cache_read_input_tokens", 0)
+            cache_creation = data.get("cache_creation_input_tokens", 0)
+            self._record_cumulative_in_memory(
+                ticket_id,
+                input_tokens,
+                output_tokens,
+                duration_ms,
+                model,
+                cache_read,
+                cache_creation,
+            )
+            if agent_name:
+                self._record_cumulative_in_memory(
+                    f"{ticket_id}:{agent_name}",
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    model,
+                    cache_read,
+                    cache_creation,
+                )
+
+        self._seq[ticket_id] = line_count + len(
+            self._trace_store.list_events(ticket_id)
+        )
 
     def _record_cumulative_in_memory(
         self,
@@ -236,15 +295,23 @@ class EventBus:
         event_type: str,
         data: dict[str, Any] | None = None,
     ) -> Event:
+        if data and self._redactor:
+            data = self._redactor.redact(ticket_id, data)
+        payload = data or {}
         with self._lock:
-            if data and self._redactor:
-                data = self._redactor.redact(ticket_id, data)
-            seq = self._next_seq(ticket_id)
-            event = Event(seq, ticket_id, agent, event_type, data)
+            # The trace commit is the publication barrier. Never expose an event
+            # locally if a durable canonical record was not accepted.
+            stored = self._trace_store.insert_event(
+                legacy_to_trace(ticket_id, agent, event_type, payload)
+            )
+            if self._comparison_mode and self._comparison_writer is not None:
+                # The test-only sink is deliberately outside all readers: it
+                # compares the legacy projection without producing a second
+                # visible usage/iteration/event record.
+                self._comparison_writer(trace_to_legacy(stored))
+            event = Event(stored.ticket_seq or 0, ticket_id, agent, event_type, payload)
             self._events.setdefault(ticket_id, []).append(event)
             self._last_event_time[ticket_id] = time.time()
-
-        self._write_to_file(ticket_id, event)
         return event
 
     def last_event_time(self, ticket_id: str) -> float | None:
@@ -379,14 +446,19 @@ class EventBus:
         since: int = 0,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        in_memory = [
-            e.to_dict() for e in self._events.get(ticket_id, []) if e.seq > since
-        ]
-        from_file = self._read_from_file(ticket_id, since=since, limit=limit)
-        seen_seqs = {e["seq"] for e in in_memory}
-        merged = in_memory + [e for e in from_file if e["seq"] not in seen_seqs]
-        merged.sort(key=lambda e: e["seq"])
-        return merged[:limit]
+        # Project both sources once, then assign compatibility cursors after the
+        # stable mixed-history ordering. Cursors therefore advance over filtered
+        # SSE records without skips or trace/legacy sequence collisions.
+        legacy = self._read_from_file(ticket_id, since=0, limit=100_000)
+        with self._lock:
+            traces = [
+                trace_to_legacy(event)
+                for event in self._trace_store.list_events(ticket_id)
+            ]
+        merged = sorted(legacy + traces, key=event_order_key)
+        for cursor, item in enumerate(merged, start=1):
+            item["seq"] = cursor
+        return [item for item in merged if item["seq"] > since][:limit]
 
     def _read_from_file(
         self,
@@ -410,7 +482,7 @@ class EventBus:
                     except json.JSONDecodeError:
                         continue
                     line_num += 1
-                    evt["seq"] = line_num
+                    evt = legacy_record(evt, line_num)
                     if line_num > since:
                         results.append(evt)
                         if len(results) >= limit:
@@ -418,17 +490,6 @@ class EventBus:
         except Exception:
             logger.exception(f"Failed to read events from file for {ticket_id}")
         return results
-
-    def _write_to_file(self, ticket_id: str, event: Event) -> None:
-        try:
-            if ticket_id not in self._file_handles:
-                path = self._log_dir / f"{ticket_id}.jsonl"
-                self._file_handles[ticket_id] = open(path, "a", encoding="utf-8")
-            fh = self._file_handles[ticket_id]
-            fh.write(json.dumps(event.to_dict(), default=str) + "\n")
-            fh.flush()
-        except Exception:
-            logger.exception(f"Failed to write event to file for {ticket_id}")
 
     def _write_ledger_entry(
         self,
@@ -475,9 +536,5 @@ class EventBus:
     def close(self) -> None:
         if self._usage_ledger is not None:
             self._usage_ledger.close()
-        for fh in self._file_handles.values():
-            try:
-                fh.close()
-            except Exception:
-                pass
-        self._file_handles.clear()
+        if self._owns_trace_store:
+            self._trace_store.close()

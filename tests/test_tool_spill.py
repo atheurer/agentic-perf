@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -237,6 +237,7 @@ async def test_mcp_chart_tool_receives_schema_declared_jq_filter(agent):
             "file_ref": "workspace://source.json",
             "jq_filter": ".uperf_s1",
         },
+        trace_context=ANY,
     )
 
 
@@ -258,5 +259,5 @@ async def test_mcp_generic_tool_preserves_post_result_filtering(agent):
     assert filtered["status"] == "filtered"
     assert filtered["data"] == {"id": 1}
     agent._mcp.call_tool.assert_awaited_once_with(
-        "remote_json_tool", {"kind": "sample"}
+        "remote_json_tool", {"kind": "sample"}, trace_context=ANY
     )

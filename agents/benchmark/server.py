@@ -10,15 +10,18 @@ Run directly:  python agents/benchmark/server.py
 Connected via: AgentMCPClient (agents/mcp_client.py)
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +29,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _emit_context_audit_event,
     _public_context_document,
@@ -40,14 +42,34 @@ from agents.server_utils import (
     read_skill_documents,
     tool_progress,
 )
+from providers.execution import (
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("benchmark-agent")
+mcp = create_ticket_mcp("benchmark-agent")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
+
+
+def _write_ticket_staging_file(
+    ticket_id: str, content: str
+) -> tuple[AuditedFilesystem, str, str]:
+    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
+    filesystem = AuditedFilesystem(
+        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+        ticket_id=ticket_id,
+        emit=durable_filesystem_emitter(),
+        critical=True,
+    )
+    name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
+    return filesystem, name, str(filesystem.write(name, content))
 
 
 def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -65,11 +87,110 @@ def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(mv_params, sort_keys=True).encode()).hexdigest()
 
 
+def _runfile_fingerprint(run_file: dict[str, Any]) -> str:
+    """Return the canonical digest that approval and execution bind to."""
+    encoded = json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_plan_fingerprint(cf: dict[str, Any]) -> str:
+    """Digest every current-step parameter, not only mv_params."""
+    plan = cf.get("execution_plan", {})
+    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    index = plan.get("current_step", 0) if isinstance(plan, dict) else 0
+    params = (
+        steps[index].get("params", {})
+        if isinstance(index, int) and index < len(steps)
+        else {}
+    )
+    return hashlib.sha256(
+        json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _execution_intent_digest(
+    runfile_digest: str,
+    params_digest: str,
+    harness: str,
+    controller: str,
+    run_command: str,
+) -> str:
+    payload = {
+        "runfile": runfile_digest,
+        "params": params_digest,
+        "harness": harness,
+        "controller": controller,
+        "run_command": run_command,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validation_creator() -> dict[str, Any]:
+    """Capture the causal caller and MCP server identity with the record."""
+    from providers.tracing import current_trace_context
+
+    context = current_trace_context()
+    return {
+        "agent_id": context.agent_id if context else "",
+        "invocation_id": str(context.invocation_id) if context else "",
+        "action_id": context.action_id if context else "",
+        "request_id": (context.mcp_correlation_request_id if context else "")
+        or os.environ.get("AGENTIC_PERF_REQUEST_ID", ""),
+        "server_pid": os.getpid(),
+        "server_host": socket.gethostname(),
+    }
+
+
+def _validation_identity_headers(creator: dict[str, Any]) -> dict[str, str]:
+    """Propagate the trace identity required to spend a validation capability."""
+    headers = {
+        "X-Agentic-Perf-Agent-Id": str(creator.get("agent_id") or "benchmark"),
+        "X-Agentic-Perf-Invocation-Id": str(creator.get("invocation_id", "")),
+        "X-Agentic-Perf-Action-Id": str(creator.get("action_id", "")),
+        "X-Agentic-Perf-Request-Id": str(creator.get("request_id", "")),
+    }
+    for key, header in (
+        ("session_id", "X-Agentic-Perf-Session-Id"),
+        ("session_epoch", "X-Agentic-Perf-Session-Epoch"),
+    ):
+        if creator.get(key):
+            headers[header] = str(creator[key])
+    return {key: value for key, value in headers.items() if value}
+
+
+def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]:
+    """Return the only validation-output representation safe to persist.
+
+    Controller diagnostics can contain credentials and are often unbounded.
+    Keep their content behind the same redaction, size-bound, and
+    content-addressed-blob policy used by trace producers.
+    """
+    from providers.redaction import get_shared_redactor
+    from providers.tracing import PayloadBuilder
+
+    return (
+        PayloadBuilder(get_shared_redactor())
+        .build(
+            ticket_id,
+            output,
+            media_type="text/plain",
+        )
+        .model_dump(mode="json")
+    )
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
     controller: str,
     params_fingerprint: str,
+    execution_plan_fingerprint: str,
+    run_command: str,
+    validator_command: str,
+    validation_output: str,
+    validator_version: str,
 ) -> str | None:
     """Persist a runfile validation record and return its opaque ID.
 
@@ -77,19 +198,40 @@ async def _persist_validated_runfile(
     the ticket when running under an agentic-perf ticket.  Execution must use
     this ID rather than supplying an independent runfile.
     """
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
+    ticket_id = os.environ.get("TICKET_ID", "")
     validation_id = f"val-{uuid.uuid4().hex}"
+    runfile_digest = _runfile_fingerprint(run_file)
     record = {
         "validation_id": validation_id,
+        "attempt_id": validation_id,
+        "execution_intent_id": validation_id,
+        "execution_plan_step_id": str(
+            (os.environ.get("EXECUTION_PLAN_STEP_ID") or "current")
+        ),
         "run_file": run_file,
+        "runfile_fingerprint": runfile_digest,
         "harness": harness,
         "controller": controller,
         "params_fingerprint": params_fingerprint,
+        "execution_plan_fingerprint": execution_plan_fingerprint,
+        "execution_intent_digest": _execution_intent_digest(
+            runfile_digest, execution_plan_fingerprint, harness, controller, run_command
+        ),
+        "run_command": run_command,
+        "validator_command": validator_command,
+        "validator_version": validator_version,
+        "validation_output": _validation_output_descriptor(
+            ticket_id, validation_output
+        ),
+        "state": "executable",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "creator": _validation_creator(),
     }
+    creator = record["creator"]
     _validation_records[validation_id] = record
 
-    ticket_id = os.environ.get("TICKET_ID", "")
     state_store_url = os.environ.get(
         "STATE_STORE_URL",
         "http://localhost:8090",
@@ -102,22 +244,51 @@ async def _persist_validated_runfile(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=headers,
         ) as client:
-            response = await client.patch(
-                f"{state_store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {
-                        "benchmark_validation": record,
-                        # Keep this compatibility field for ticket context and
-                        # audit consumers that already display the runfile.
-                        "validated_run_file": record,
-                    }
+            ticket_response = await client.get(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}",
+            )
+            ticket_response.raise_for_status()
+            capability_response = await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/validations/capability",
+                headers={
+                    "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
+                        "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
+                    ),
+                    **_validation_identity_headers(creator),
                 },
             )
-            response.raise_for_status()
+            capability_response.raise_for_status()
+            capability = capability_response.json()["capability"]
+            for _ in range(3):
+                manifest = (
+                    ticket_response.json()
+                    .get("custom_fields", {})
+                    .get("benchmark_validations", {})
+                )
+                response = await client.post(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}/validations",
+                    json={
+                        "record": record,
+                        "expected_version": manifest.get("version", 0),
+                    },
+                    headers={
+                        "X-Agentic-Perf-Validation-Capability": capability,
+                        **_validation_identity_headers(creator),
+                    },
+                )
+                if response.status_code != 409:
+                    response.raise_for_status()
+                    break
+                ticket_response = await client.get(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}"
+                )
+                ticket_response.raise_for_status()
+            else:
+                response.raise_for_status()
         logger.info(
             "[benchmark] Persisted benchmark validation %s for %s (%s)",
             validation_id,
@@ -223,6 +394,161 @@ _ticket: dict[str, Any] = {}
 _validation_records: dict[str, dict[str, Any]] = {}
 
 
+def _benchmark_intent_identity(
+    ticket_id: str,
+    validation_id: str,
+    record: dict[str, Any],
+    controller: str,
+    harness: str,
+    run_command: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Return the immutable attempt, operation key, and request hash.
+
+    A validation record is the lifecycle authority for an execution intent.
+    Consequently a replay keeps the same attempt and operation identity while
+    a new validation (the explicit rerun boundary) gets a new one.
+    """
+    attempt_id = str(record.get("attempt_id") or validation_id)
+    intent_id = str(record.get("execution_intent_id") or validation_id)
+    operation_key = f"benchmark-execution:{ticket_id or 'external'}:{intent_id}"
+    immutable = {
+        "ticket_id": ticket_id,
+        "execution_plan_step_id": record.get("execution_plan_step_id", "current"),
+        "attempt_id": attempt_id,
+        "execution_intent_id": intent_id,
+        "validation_id": validation_id,
+        "validation_fingerprint": record.get("runfile_fingerprint"),
+        "harness": harness,
+        "controller": controller,
+        "run_command": run_command,
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return operation_key, request_hash, immutable
+
+
+class _BenchmarkOperation:
+    """Small async adapter over the shared fenced operation registry."""
+
+    def __init__(self, key: str, request_hash: str, owner: str) -> None:
+        self.key = key
+        self.request_hash = request_hash
+        self.owner = owner
+        self._client = None
+        self._local = None
+
+    async def acquire(self) -> tuple[dict[str, Any], str]:
+        from providers.tracing.client import TraceClient
+
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+        if token:
+            self._client = TraceClient(url, token)
+            try:
+                result = await asyncio.to_thread(
+                    self._client.operation_acquire, self.key, self.request_hash, 900
+                )
+            except Exception as exc:
+                # Only a conflict proves that another worker owns the intent.
+                # Authentication, transport, and 5xx failures must fail closed.
+                cause = exc
+                while cause is not None:
+                    response = getattr(cause, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    if status_code is not None:
+                        if status_code == 409:
+                            return {}, "in_progress"
+                        return {}, "unavailable"
+                    cause = cause.__cause__
+                return {}, "unavailable"
+            return result.get("operation", {}), result.get("status", "")
+        from paths import TRACE_DB_PATH
+        from state_store.trace_store import (
+            OperationLeaseError,
+            OperationTransitionError,
+            TraceStore,
+        )
+
+        self._local = TraceStore(TRACE_DB_PATH)
+        try:
+            operation, status = await asyncio.to_thread(
+                self._local.acquire_operation_result,
+                self.key,
+                self.request_hash,
+                self.owner,
+                900,
+            )
+        except (OperationLeaseError, OperationTransitionError):
+            operation = self._local.get_operation(self.key)
+            return (operation.__dict__ if operation else {}), "in_progress"
+        return operation.__dict__, status
+
+    async def transition(
+        self, action: str, operation: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        token = int(operation["fencing_generation"])
+        if self._client is not None:
+            result = await asyncio.to_thread(
+                self._client.operation_transition,
+                self.key,
+                action,
+                token,
+                **kwargs,
+            )
+            return result.get("operation", {})
+        method = {
+            "prepared": "mark_prepared",
+            "side-effect-started": "mark_side_effect_started",
+            "external-id": "attach_external_id",
+            "complete": "complete",
+            "fail": "fail",
+            "indeterminate": "mark_indeterminate",
+        }[action]
+        call_kwargs = {"descriptor": kwargs.get("descriptor", {})}
+        if action in {"prepared", "side-effect-started"}:
+            call_kwargs = {}
+        elif action == "external-id":
+            call_kwargs = {"external_ids": kwargs.get("external_ids", {})}
+        result = await asyncio.to_thread(
+            getattr(self._local, method), self.key, self.owner, token, **call_kwargs
+        )
+        return result.__dict__
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await asyncio.to_thread(self._client.close)
+        if self._local is not None:
+            self._local.close()
+
+    async def terminalize(
+        self,
+        operation: dict[str, Any],
+        outcome: str,
+        descriptor: dict[str, Any],
+    ) -> bool:
+        """Persist a terminal outcome; retry ambiguous writes as indeterminate."""
+        try:
+            await self.transition(outcome, operation, descriptor=descriptor)
+            return True
+        except Exception:
+            logger.exception("benchmark operation terminal write failed")
+            if outcome != "indeterminate":
+                try:
+                    await self.transition(
+                        "indeterminate",
+                        operation,
+                        descriptor={
+                            "outcome": "indeterminate",
+                            "terminal_write_failed": True,
+                        },
+                    )
+                    return True
+                except Exception:
+                    logger.exception("benchmark operation indeterminate write failed")
+            return False
+
+
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
     global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
@@ -245,16 +571,50 @@ def _get_validated_runfile(
     ticket: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Resolve the exact runfile previously validated for this ticket."""
-    ticket_id = os.environ.get("TICKET_ID", "")
-    if ticket_id:
-        record = ticket.get("custom_fields", {}).get("benchmark_validation")
+    manifest = ticket.get("custom_fields", {}).get("benchmark_validations", {})
+    if isinstance(manifest, dict) and isinstance(manifest.get("records"), dict):
+        records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+        record = records.get(validation_id)
+        if isinstance(record, dict) and record.get("state") == "legacy_unapproved":
+            return None, "validation token is legacy/unapproved"
+        if (
+            not isinstance(record, dict)
+            or record.get("record_type", "validation") != "validation"
+        ):
+            return None, "unknown validation token"
+        if record.get("state") != "executable":
+            return None, "validation token is legacy/unapproved"
+        supersession = next(
+            (
+                item
+                for item in records.values()
+                if isinstance(item, dict)
+                and item.get("record_type") == "supersession"
+                and item.get("supersedes_validation_id") == validation_id
+            ),
+            None,
+        )
+        if supersession:
+            replacement = supersession.get("replacement_validation_id")
+            return None, (
+                "validation token is superseded"
+                + (f"; replacement_validation_id={replacement}" if replacement else "")
+            )
+        if record.get("params_fingerprint") != _compute_params_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is fingerprint-mismatched"
+        if record.get("execution_plan_fingerprint") != _execution_plan_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is execution-intent-mismatched"
     else:
         record = _validation_records.get(validation_id)
 
     if not isinstance(record, dict):
-        return None, "No validation record exists for this ticket"
+        return None, "unknown validation token"
     if record.get("validation_id") != validation_id:
-        return None, "Validation ID does not match the ticket's latest validation"
+        return None, "unknown validation token"
     if record.get("harness") != harness:
         return None, "Validation was performed for a different harness"
     if record.get("controller") != controller:
@@ -262,6 +622,8 @@ def _get_validated_runfile(
     run_file = record.get("run_file")
     if not isinstance(run_file, dict):
         return None, "Validation record does not contain a runfile"
+    if record.get("runfile_fingerprint") != _runfile_fingerprint(run_file):
+        return None, "validation token has invalid runfile fingerprint"
     return run_file, None
 
 
@@ -1733,6 +2095,7 @@ async def setup_passwordless_ssh(
 async def execute_benchmark(
     controller: str,
     validation_id: str | None = None,
+    approval_request_id: str | None = None,
     harness: str | None = None,
     run_command: str | None = None,
     run_file: dict | None = None,
@@ -1753,10 +2116,84 @@ async def execute_benchmark(
         expected_status="executing_benchmark",
     )
     if active_check.get("status") == "rejected":
+        # A terminal replay is safe even after the ticket has advanced or
+        # paused. Resolve it before enforcing the current execution status so
+        # reconnects can retrieve the durable result without relaunching.
+        ticket_id = os.environ.get("TICKET_ID", "")
+        fields = _ticket.get("custom_fields", {}) if _ticket else {}
+        records = fields.get("benchmark_validations", {}).get("records", {})
+        replay_record = records.get(validation_id, {}) if validation_id else {}
+        if validation_id and isinstance(replay_record, dict):
+            replay_key, replay_hash, _ = _benchmark_intent_identity(
+                ticket_id,
+                validation_id,
+                replay_record,
+                controller,
+                harness or "crucible",
+                replay_record.get("run_command", "crucible run"),
+            )
+            replay_guard = _BenchmarkOperation(
+                replay_key,
+                replay_hash,
+                os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+            )
+            try:
+                replay_operation, replay_status = await replay_guard.acquire()
+                if replay_status == "terminal":
+                    descriptor = replay_operation.get("result_descriptor") or {}
+                    cached = descriptor.get("benchmark_result") or descriptor.get(
+                        "result"
+                    )
+                    if isinstance(cached, dict):
+                        return json.dumps(
+                            {
+                                **cached,
+                                "operation_id": replay_key,
+                                "existing_operation": True,
+                            }
+                        )
+            finally:
+                await replay_guard.close()
         return json.dumps(active_check)
+    if (
+        active_check.get("id") or os.environ.get("TICKET_ID")
+    ) and not approval_request_id:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "approval_required",
+                "message": "ticket-scoped benchmark execution requires approval_request_id",
+            }
+        )
 
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
+
+    async def pause_for_reconciliation(reason: str) -> None:
+        """Put ambiguous executions in the canonical human-guidance state."""
+        ticket_id = active_check.get("id") or os.environ.get("TICKET_ID", "")
+        if not ticket_id:
+            return
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": f"Benchmark execution is indeterminate: {reason}",
+                    },
+                )
+                if response.status_code >= 300:
+                    logger.warning(
+                        "Could not pause ticket %s for reconciliation", ticket_id
+                    )
+        except Exception:
+            logger.exception("Failed to pause ticket %s for reconciliation", ticket_id)
 
     if harness_name == "crucible":
         if run_file is not None:
@@ -1788,14 +2225,84 @@ async def execute_benchmark(
             active_check,
         )
         if validation_error:
+            reason_code = (
+                "superseded"
+                if "superseded" in validation_error
+                else "legacy_unapproved"
+                if "legacy" in validation_error
+                else "fingerprint_mismatch"
+                if "mismatched" in validation_error
+                else "unknown"
+            )
+            rejection = {
+                "status": "rejected",
+                "harness": harness_name,
+                "validation_id": validation_id,
+                "reason_code": reason_code,
+                "message": validation_error,
+            }
+            records = (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+            )
+            supersession = next(
+                (
+                    item
+                    for item in records.values()
+                    if isinstance(item, dict)
+                    and item.get("supersedes_validation_id") == validation_id
+                ),
+                None,
+            )
+            if supersession:
+                replacement_id = supersession.get("replacement_validation_id")
+                replacement = records.get(replacement_id, {})
+                rejection.update(
+                    {
+                        "invalidated_at": supersession.get("created_at"),
+                        "invalidated_by": supersession.get("writer"),
+                        "invalidation_reason": supersession.get("reason"),
+                        "replacement_validation_id": replacement_id,
+                        "replacement": {
+                            key: replacement.get(key)
+                            for key in (
+                                "validation_id",
+                                "harness",
+                                "controller",
+                                "runfile_fingerprint",
+                            )
+                        },
+                    }
+                )
+            _emit_context_audit_event(
+                os.environ.get("TICKET_ID", ""),
+                agent_name="benchmark-agent",
+                phase="validation_rejected",
+                benchmark=str(run_file.get("benchmark", ""))
+                if isinstance(run_file, dict)
+                else "",
+                operation=validation_id,
+                namespace="benchmark-execution",
+                result=rejection,
+            )
+            return json.dumps(rejection)
+        record = active_check.get("custom_fields", {}).get(
+            "benchmark_validations", {}
+        ).get("records", {}).get(validation_id) or _validation_records.get(
+            validation_id, {}
+        )
+        stored_command = record.get("run_command")
+        if run_command is not None and run_command != stored_command:
             return json.dumps(
                 {
                     "status": "rejected",
-                    "harness": harness_name,
                     "validation_id": validation_id,
-                    "message": validation_error,
+                    "reason_code": "execution_intent_mismatch",
+                    "message": "run_command differs from approved execution intent",
                 }
             )
+        run_command = stored_command
     elif _skill_provider:
         if run_file is None:
             return json.dumps(
@@ -1842,6 +2349,179 @@ async def execute_benchmark(
                 }
             )
 
+    # Claim the durable intent before consuming the one-shot approval. A
+    # reconnect that already consumed approval must still receive its cached
+    # operation result rather than failing approval binding with 409.
+    operation_guard: _BenchmarkOperation | None = None
+    operation_record: dict[str, Any] | None = None
+    operation_owned = False
+    if validation_id and approval_request_id:
+        ticket_id = os.environ.get("TICKET_ID", "")
+        preclaim_record = record
+        intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
+            ticket_id,
+            validation_id,
+            preclaim_record,
+            controller,
+            harness_name,
+            run_command or "crucible run",
+        )
+        operation_guard = _BenchmarkOperation(
+            intent_key,
+            intent_hash,
+            os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+        )
+        operation_record, acquisition = await operation_guard.acquire()
+        if acquisition == "terminal":
+            cached = (operation_record.get("result_descriptor") or {}).get(
+                "benchmark_result"
+            )
+            await operation_guard.close()
+            if isinstance(cached, dict):
+                _emit_context_audit_event(
+                    ticket_id,
+                    agent_name="benchmark-agent",
+                    phase="duplicate",
+                    benchmark=str(run_file.get("benchmark", "")),
+                    operation=intent_key,
+                    namespace="benchmark-execution",
+                    result={"status": "existing_operation"},
+                )
+                return json.dumps(
+                    {**cached, "operation_id": intent_key, "existing_operation": True}
+                )
+            _emit_context_audit_event(
+                ticket_id,
+                agent_name="benchmark-agent",
+                phase="duplicate",
+                benchmark=str(run_file.get("benchmark", "")),
+                operation=intent_key,
+                namespace="benchmark-execution",
+                result={"status": "indeterminate"},
+            )
+            return json.dumps(
+                {
+                    "status": operation_record.get("terminal_outcome", "indeterminate"),
+                    "reason_code": operation_record.get(
+                        "terminal_outcome", "indeterminate"
+                    ),
+                    "operation_id": intent_key,
+                    "operation": operation_record,
+                    "existing_operation": True,
+                }
+            )
+        if acquisition != "acquired":
+            await operation_guard.close()
+            _emit_context_audit_event(
+                ticket_id,
+                agent_name="benchmark-agent",
+                phase="duplicate",
+                benchmark=str(run_file.get("benchmark", "")),
+                operation=intent_key,
+                namespace="benchmark-execution",
+                result={"status": "existing_operation"},
+            )
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "operation_registry_unavailable"
+                    if acquisition == "unavailable"
+                    else "existing_operation",
+                    "operation_id": intent_key,
+                }
+            )
+        operation_owned = True
+        try:
+            await operation_guard.transition(
+                "prepared", operation_record, descriptor={"intent": immutable_intent}
+            )
+        except Exception:
+            await operation_guard.terminalize(
+                operation_record, "indeterminate", {"outcome": "indeterminate"}
+            )
+            await operation_guard.close()
+            await pause_for_reconciliation("execution intent preparation failed")
+            return json.dumps({"status": "indeterminate", "operation_id": intent_key})
+
+    if approval_request_id:
+        # #798 owns the approval capability boundary.  #788 may add richer
+        # operation claims later; this optional token is deliberately checked
+        # immediately before any benchmark-side effect.
+        ticket_id = active_check.get("id") or os.environ.get("TICKET_ID", "")
+        record = (
+            (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+                .get(validation_id, {})
+            )
+            if validation_id
+            else {}
+        )
+        if not ticket_id or not validation_id or not isinstance(record, dict):
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record, "fail", {"outcome": "approval_binding_missing"}
+                )
+                await operation_guard.close()
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_binding_missing"}
+            )
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                consumed = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/approvals/{approval_request_id}/consume",
+                    json={
+                        "validation_id": validation_id,
+                        "presented_run_file_digest": record.get("runfile_fingerprint"),
+                        "execution_intent_digest": record.get(
+                            "execution_intent_digest"
+                        ),
+                        "session_id": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
+                        ),
+                        "session_epoch": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_EPOCH"
+                        ),
+                        "ticket_attempt": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                        "claim_id": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                    },
+                )
+            if consumed.status_code >= 300:
+                if operation_guard and operation_owned:
+                    await operation_guard.terminalize(
+                        operation_record, "fail", {"outcome": "rejected"}
+                    )
+                    await operation_guard.close()
+                return json.dumps(
+                    {"status": "rejected", "reason_code": "approval_not_approved"}
+                )
+        except Exception:
+            logger.exception("[benchmark] approval capability consumption failed")
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record, "fail", {"outcome": "rejected"}
+                )
+                await operation_guard.close()
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_check_failed"}
+            )
+
     async def _benchmark_progress(output_line: str, elapsed: int) -> None:
         minutes = elapsed // 60
         await tool_progress(
@@ -1849,6 +2529,12 @@ async def execute_benchmark(
             "execute_benchmark",
         )
 
+    # The validated Crucible path below is the only path with a durable
+    # validation lifecycle and controller-side reconciliation identity.  The
+    # legacy harness branches still perform side effects directly; they are
+    # intentionally not advertised as idempotent until their own validation
+    # records and safe external identity queries exist.  MCP middleware still
+    # prevents duplicate delivery, but cannot safely replay a lost launch.
     if harness_name == "kube-burner":
         try:
             import yaml
@@ -2704,21 +3390,20 @@ async def execute_benchmark(
                     }
                 )
 
-            proc = await _asyncio.create_subprocess_exec(
-                podman_path,
-                "run",
-                "-i",
-                "--rm",
-                "--network=host",
-                plugin_image,
-                *container_args,
-                stdin=_asyncio.subprocess.PIPE,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
+            proc = await AuditedSubprocessRunner().start(
+                [
+                    podman_path,
+                    "run",
+                    "-i",
+                    "--rm",
+                    "--network=host",
+                    plugin_image,
+                    *container_args,
+                ],
+                stdin=input_content.encode(),
+                mutating=True,
             )
-            stdout_bytes, stderr_bytes = await proc.communicate(
-                input=input_content.encode()
-            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
             stdout_str = stdout_bytes.decode(errors="replace")
             stderr_str = stderr_bytes.decode(errors="replace")
@@ -2789,31 +3474,192 @@ async def execute_benchmark(
         return json.dumps(response)
 
     # Default: crucible (and any unknown harness that uses JSON run-files)
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if validation_id and operation_guard is None:
+        intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
+            ticket_id,
+            validation_id,
+            record,
+            controller,
+            harness_name,
+            run_command or "crucible run",
+        )
+        operation_guard = _BenchmarkOperation(
+            intent_key,
+            intent_hash,
+            os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+        )
+        operation_record, acquisition = await operation_guard.acquire()
+        if acquisition == "terminal":
+            cached = operation_record.get("result_descriptor") or {}
+            duplicate_result = (
+                cached.get("benchmark_result")
+                or cached.get("result")
+                or {
+                    "status": operation_record.get("terminal_outcome", "success"),
+                    "operation_id": intent_key,
+                    "existing_operation": True,
+                }
+            )
+            if isinstance(duplicate_result, dict):
+                duplicate_result = {
+                    **duplicate_result,
+                    "operation_id": intent_key,
+                    "existing_operation": True,
+                }
+            _emit_context_audit_event(
+                ticket_id,
+                agent_name="benchmark-agent",
+                phase="duplicate",
+                benchmark=str(run_file.get("benchmark", "")),
+                operation=intent_key,
+                namespace="benchmark-execution",
+                result={"status": "existing_operation"},
+            )
+            await operation_guard.close()
+            return json.dumps(duplicate_result)
+        if acquisition != "acquired":
+            await operation_guard.close()
+            if acquisition == "unavailable":
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "reason_code": "operation_registry_unavailable",
+                        "message": "Benchmark operation registry unavailable; launch was not attempted",
+                    }
+                )
+            return json.dumps(
+                {
+                    "status": "existing_operation",
+                    "operation_id": intent_key,
+                    "operation": operation_record,
+                }
+            )
+        operation_owned = True
+        try:
+            await operation_guard.transition(
+                "prepared", operation_record, descriptor={"intent": immutable_intent}
+            )
+        except Exception:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {"outcome": "indeterminate", "prepare_persist_failed": True},
+            )
+            await operation_guard.close()
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key,
+                    "message": "Execution intent preparation could not be persisted",
+                }
+            )
+
     remote_path = f"/tmp/run-file-{run_uuid}.json"
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(run_file, f, indent=2)
-        local_path = f.name
+    async def guarded_maintenance(command: str, **kwargs: Any) -> Any:
+        """Convert any post-boundary controller failure into indeterminate."""
+        try:
+            return await _ssh.run(controller, command, **kwargs)
+        except Exception as exc:
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                )
+                await operation_guard.close()
+            return None
 
-    logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
-    scp_result = await _ssh.copy_to(controller, local_path, remote_path)
-    Path(local_path).unlink(missing_ok=True)
-
-    if scp_result.exit_code != 0:
+    async def maintenance_failure() -> str:
+        await pause_for_reconciliation("controller maintenance outcome is ambiguous")
         return json.dumps(
             {
-                "status": "failed",
-                "message": f"Failed to copy run-file: {scp_result.stderr}",
+                "status": "indeterminate",
+                "operation_id": intent_key if operation_guard else None,
+                "message": "Controller maintenance outcome is ambiguous; reconciliation required",
             }
         )
 
+    if ticket_id:
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
+    else:
+        staging = None
+        staging_name = ""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(run_file, f, indent=2)
+            local_path = f.name
+
+    logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
+    try:
+        if operation_guard and operation_owned:
+            try:
+                await operation_guard.transition(
+                    "side-effect-started", operation_record
+                )
+            except Exception:
+                await operation_guard.terminalize(
+                    operation_record, "indeterminate", {"outcome": "indeterminate"}
+                )
+                await operation_guard.close()
+                await pause_for_reconciliation("launch boundary persistence failed")
+                return json.dumps(
+                    {
+                        "status": "indeterminate",
+                        "message": "Operation launch boundary could not be persisted",
+                    }
+                )
+        try:
+            scp_result = await _ssh.copy_to(
+                controller, local_path, remote_path, mutating=True
+            )
+        except Exception as exc:
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                )
+                await operation_guard.close()
+            await pause_for_reconciliation("run-file copy outcome is ambiguous")
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key if operation_guard else None,
+                    "message": "Run-file copy outcome is ambiguous; reconciliation required",
+                }
+            )
+    finally:
+        if staging:
+            staging.unlink(staging_name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
+
+    if scp_result.exit_code != 0:
+        response = {
+            "status": "failed",
+            "message": f"Failed to copy run-file: {scp_result.stderr}",
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "fail",
+                {"benchmark_result": response},
+            )
+            await operation_guard.close()
+            response["operation_id"] = intent_key
+        return json.dumps(response)
+
     # Stop stale valkey container if no run is active (crucible issue #607)
-    valkey_check = await _ssh.run(
-        controller,
+    valkey_check = await guarded_maintenance(
         "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-valkey"
         " && ! podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-rickshaw-run"
         " && podman stop crucible-valkey 2>/dev/null && echo STOPPED || echo OK",
     )
+    if valkey_check is None:
+        return await maintenance_failure()
     if "STOPPED" in (valkey_check.stdout or ""):
         logger.info(
             f"[benchmark] Stopped stale crucible-valkey container on {controller}"
@@ -2828,24 +3674,31 @@ async def execute_benchmark(
     logger.info(
         f"[benchmark] Cycling OpenSearch on {controller} to ensure CDM server is fresh"
     )
-    await _ssh.run(
-        controller, "crucible stop opensearch 2>/dev/null || true", timeout=60
-    )
+    if (
+        await guarded_maintenance(
+            "crucible stop opensearch 2>/dev/null || true", timeout=60
+        )
+        is None
+    ):
+        return await maintenance_failure()
     # Wait up to 30s for the container to be fully gone
     for _ in range(6):
-        gone = await _ssh.run(
-            controller,
+        gone = await guarded_maintenance(
             "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-opensearch"
             " && echo RUNNING || echo GONE",
         )
+        if gone is None:
+            return await maintenance_failure()
         if "GONE" in (gone.stdout or ""):
             break
         import asyncio as _asyncio
 
         await _asyncio.sleep(5)
-    start_result = await _ssh.run(
-        controller, "crucible start opensearch 2>&1", timeout=180
+    start_result = await guarded_maintenance(
+        "crucible start opensearch 2>&1", timeout=180
     )
+    if start_result is None:
+        return await maintenance_failure()
     if "Successfully started OpenSearch" not in (start_result.stdout or ""):
         logger.warning(
             f"[benchmark] OpenSearch may not have started cleanly: "
@@ -2856,11 +3709,25 @@ async def execute_benchmark(
 
     cmd = f"{run_command or 'crucible run'} {remote_path}"
     logger.info(f"[benchmark] Executing: {cmd}")
-    result = await _ssh.run_with_progress(
-        controller,
-        cmd,
-        progress_callback=_benchmark_progress,
-    )
+    try:
+        result = await _ssh.run_with_progress(
+            controller,
+            cmd,
+            progress_callback=_benchmark_progress,
+        )
+    except Exception as exc:
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                descriptor={
+                    "outcome": "indeterminate",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await operation_guard.close()
+        await pause_for_reconciliation("launch response was lost")
+        raise
 
     run_dir = ""
     run_dir_re = re.compile(r"(/var/lib/crucible/run/[^/\s]+)")
@@ -2876,6 +3743,56 @@ async def execute_benchmark(
         uuid_match = re.search(r"--([0-9a-f-]{36})$", dirname)
         run_id = uuid_match.group(1) if uuid_match else dirname
 
+    if not run_dir or not run_id:
+        response = {
+            "status": "indeterminate",
+            "exit_code": result.exit_code,
+            "harness": "crucible",
+            "operation_id": intent_key if operation_guard else None,
+            "message": "Crucible launch completed without a parseable external run identity; reconciliation required",
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {"benchmark_result": response, "external_id_missing": True},
+            )
+            await operation_guard.close()
+        await pause_for_reconciliation("Crucible run identity was not returned")
+        return json.dumps(response)
+
+    # Persist the external identity before reading summaries or logs.  A lost
+    # response after this point is therefore reconciled by identity rather
+    # than replaying the launch command.
+    if operation_guard and operation_owned and (run_id or run_dir):
+        try:
+            await operation_guard.transition(
+                "external-id",
+                operation_record,
+                external_ids={"run_id": run_id, "run_dir": run_dir},
+            )
+        except Exception as exc:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {
+                    "outcome": "indeterminate",
+                    "external_id_persist_failed": True,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await operation_guard.close()
+            await pause_for_reconciliation(
+                "external run identity could not be persisted"
+            )
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key,
+                    "message": "External benchmark identity could not be persisted; reconciliation required",
+                }
+            )
+
     response = {
         "status": "completed" if result.exit_code == 0 else "failed",
         "exit_code": result.exit_code,
@@ -2887,11 +3804,12 @@ async def execute_benchmark(
         else f"Benchmark failed (exit {result.exit_code})",
     }
     if result.exit_code == 0 and run_dir:
-        summary_result = await _ssh.run(
-            controller,
+        summary_result = await guarded_maintenance(
             f"cat {run_dir}/run/result-summary.json",
             timeout=30,
         )
+        if summary_result is None:
+            return await maintenance_failure()
         if summary_result.exit_code == 0 and summary_result.stdout:
             try:
                 response["result_summary"] = json.loads(summary_result.stdout)
@@ -2904,18 +3822,32 @@ async def execute_benchmark(
                 "is missing — the run did not produce results. "
                 "Read the run logs with get_run_logs to diagnose."
             )
-            log_result = await _ssh.run(
-                controller,
+            log_result = await guarded_maintenance(
                 f"test -f {run_dir}/crucible.log.xz"
                 f" && xzcat {run_dir}/crucible.log.xz | tail -c 50000"
                 f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c 50000",
                 timeout=60,
             )
+            if log_result is None:
+                return await maintenance_failure()
             if log_result.exit_code == 0 and log_result.stdout:
                 response["run_log"] = log_result.stdout
     if result.exit_code != 0:
         response["output"] = result.stdout[-3000:] if result.stdout else ""
         response["error"] = result.stderr[-1000:] if result.stderr else ""
+    if operation_guard and operation_owned:
+        terminal_ok = await operation_guard.terminalize(
+            operation_record,
+            "complete" if response["status"] == "completed" else "fail",
+            {"benchmark_result": response},
+        )
+        await operation_guard.close()
+        response["operation_id"] = intent_key
+        if not terminal_ok:
+            response["status"] = "indeterminate"
+            response["message"] = (
+                "Operation result could not be durably recorded; reconciliation required"
+            )
     return json.dumps(response)
 
 
@@ -2971,13 +3903,21 @@ async def validate_benchmark(
     remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
     local_path = ""
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as file:
-            json.dump(run_file, file, indent=2)
-            local_path = file.name
+        ticket_id = os.environ.get("TICKET_ID", "")
+        staging = None
+        staging_name = ""
+        if ticket_id:
+            staging, staging_name, local_path = _write_ticket_staging_file(
+                ticket_id, json.dumps(run_file, indent=2)
+            )
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as file:
+                json.dump(run_file, file, indent=2)
+                local_path = file.name
 
-        copied = await _ssh.copy_to(controller, local_path, remote_path)
+        copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
             return json.dumps(
                 {
@@ -2999,14 +3939,29 @@ async def validate_benchmark(
         )
         output = (result.stdout or "").strip()
         if result.exit_code == 0:
-            params_fingerprint = _compute_params_fingerprint(
-                _ticket.get("custom_fields", {}) if _ticket else {}
-            )
+            fields = _ticket.get("custom_fields", {}) if _ticket else {}
+            params_fingerprint = _compute_params_fingerprint(fields)
+            execution_plan_fingerprint = _execution_plan_fingerprint(fields)
+            run_command = execution.get("run_command", "crucible run")
+            command_valid, _ = _validate_run_command(run_command, harness_name)
+            if not command_valid:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "valid": False,
+                        "errors": ["Configured execution command rejected"],
+                    }
+                )
             validation_id = await _persist_validated_runfile(
                 run_file,
                 harness_name,
                 controller,
                 params_fingerprint,
+                execution_plan_fingerprint,
+                run_command,
+                validation_command,
+                output,
+                str(execution.get("validator_version", "unknown")),
             )
             if validation_id is None:
                 return json.dumps(
@@ -3028,7 +3983,9 @@ async def validate_benchmark(
                     "harness": harness_name,
                     "controller": controller,
                     "validation_id": validation_id,
-                    "validation_output": output,
+                    "validation_output": _validation_output_descriptor(
+                        ticket_id, output
+                    ),
                     "errors": [],
                 }
             )
@@ -3040,7 +3997,7 @@ async def validate_benchmark(
                 "valid": False,
                 "harness": harness_name,
                 "controller": controller,
-                "validation_output": output,
+                "validation_output": _validation_output_descriptor(ticket_id, output),
                 "errors": [details],
                 "exit_code": result.exit_code,
             }
@@ -3058,7 +4015,10 @@ async def validate_benchmark(
         )
     finally:
         if local_path:
-            Path(local_path).unlink(missing_ok=True)
+            if staging:
+                staging.unlink(staging_name, missing_ok=True)
+            else:
+                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -3238,14 +4198,15 @@ async def execute_boot_time_test(
         # Security: password on argv is visible in /proc/pid/cmdline.
         # The external scripts require --password= on the command line;
         # upstream fix: accept --password-file or SSHPASS env var.
-        install_proc = await _asyncio.create_subprocess_exec(
-            str(install_script),
-            sut_host,
-            f"--username={ssh_user}",
-            f"--password={ssh_password}",
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        install_proc = await AuditedSubprocessRunner().start(
+            [
+                str(install_script),
+                sut_host,
+                f"--username={ssh_user}",
+                f"--password={ssh_password}",
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         install_out, install_err = await install_proc.communicate()
         if install_proc.returncode != 0:
@@ -3273,6 +4234,18 @@ async def execute_boot_time_test(
 
     _ticket_id = os.environ.get("TICKET_ID", "")
     output_dir = create_artifact_dir(_ticket_id, run_uuid)
+    artifact_filesystem = (
+        AuditedFilesystem(
+            RootedPath(
+                output_dir, "artifact", logical_prefix=f"{_ticket_id}/{run_uuid}"
+            ),
+            ticket_id=_ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        if _ticket_id
+        else None
+    )
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -3360,21 +4333,24 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = open(
-                    serial_log_path,
-                    "w",
-                    encoding="utf-8",
+                serial_log_fh = (
+                    artifact_filesystem.open_stream("serial-capture.log")
+                    if artifact_filesystem
+                    else open(serial_log_path, "wb")
                 )
-                serial_proc = await _asyncio.create_subprocess_exec(
-                    "jmp",
-                    "shell",
-                    f"--lease={_lease_id}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
+                serial_proc = await AuditedSubprocessRunner().start(
+                    [
+                        "jmp",
+                        "shell",
+                        f"--lease={_lease_id}",
+                        "--",
+                        "j",
+                        "serial",
+                        "pipe",
+                    ],
                     stdout=serial_log_fh,
                     stderr=_asyncio.subprocess.DEVNULL,
+                    mutating=True,
                 )
                 logger.info(
                     f"[boot-time] Passive serial capture "
@@ -3402,24 +4378,17 @@ async def execute_boot_time_test(
     # capture-boot timed out but jmp shell child lingered).
     benchmark_timeout = (samples * 90) + 900
 
-    proc = await _asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
+    proc = await AuditedSubprocessRunner().start(
+        cmd,
         cwd=str(output_dir),
         env=run_env,
+        mutating=True,
     )
     try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=benchmark_timeout,
-        )
+        stdout_bytes, stderr_bytes = await proc.communicate(timeout=benchmark_timeout)
     except _asyncio.TimeoutError:
-        logger.warning(
-            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
-        )
-        proc.kill()
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        logger.warning(f"[boot-time] Subprocess timed out after {benchmark_timeout}s")
+        stdout_bytes, stderr_bytes = b"", b""
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
@@ -3430,21 +4399,15 @@ async def execute_boot_time_test(
         try:
             serial_proc.terminate()
             try:
-                await _asyncio.wait_for(
-                    serial_proc.wait(),
-                    timeout=10,
-                )
+                await serial_proc.wait(timeout=10)
             except _asyncio.TimeoutError:
-                serial_proc.kill()
-                await serial_proc.wait()
+                # The tracked wait has already escalated to kill.
+                pass
             logger.info("[boot-time] Passive serial capture stopped")
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")
     if serial_log_fh is not None:
-        try:
-            serial_log_fh.close()
-        except Exception:
-            pass
+        serial_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
@@ -3453,7 +4416,10 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            serial_log_path.unlink(missing_ok=True)
+            if artifact_filesystem:
+                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+            else:
+                serial_log_path.unlink(missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -3471,23 +4437,33 @@ async def execute_boot_time_test(
     collect_metadata = scripts_dir / "collect-system-metadata.sh"
     if collect_metadata.exists():
         logger.info(f"[boot-time] Collecting system metadata from {sut_host}")
-        meta_proc = await _asyncio.create_subprocess_exec(
-            str(collect_metadata),
-            sut_host,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        meta_proc = await AuditedSubprocessRunner().start(
+            [
+                str(collect_metadata),
+                sut_host,
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            metadata_file.write_bytes(meta_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", meta_out)
+            else:
+                metadata_file.write_bytes(meta_out)
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            metadata_file.write_text("{}")
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", "{}")
+            else:
+                metadata_file.write_text("{}")
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        metadata_file.write_text("{}")
+        if artifact_filesystem:
+            artifact_filesystem.write("metadata.json", "{}")
+        else:
+            metadata_file.write_text("{}")
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -3532,15 +4508,17 @@ async def execute_boot_time_test(
                 break
         merge_cmd.extend(str(f) for f in boot_time_logs)
 
-        merge_proc = await _asyncio.create_subprocess_exec(
-            *merge_cmd,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        merge_proc = await AuditedSubprocessRunner().start(
+            merge_cmd,
             cwd=str(scripts_dir),
+            mutating=True,
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            merged_file.write_bytes(merge_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("merged-results.json", merge_out)
+            else:
+                merged_file.write_bytes(merge_out)
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(
@@ -3678,14 +4656,16 @@ async def execute_boot_time_test(
     # runs so all artifacts remain accessible.
     if _ticket and response.get("output_dir"):
         try:
-            import httpx
+            from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
             token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             ticket_id = _ticket.get("id", "")
             if ticket_id:
-                async with httpx.AsyncClient(timeout=10.0, headers=headers) as _client:
+                async with AuditedAsyncHTTPClient(
+                    timeout=10.0, headers=headers
+                ) as _client:
                     # Fetch current list to append
                     r = await _client.get(
                         f"{store_url}/api/v1/tickets/{ticket_id}",

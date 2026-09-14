@@ -7,6 +7,9 @@ with agents/base.py.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +20,8 @@ from providers.context_guard import (
     context_guard_from_config,
     context_guard_from_custom_fields,
 )
+from providers.events import EventBus
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 # ------------------------------------------------------------------
 # Pure-function tests: check_context_usage
@@ -513,3 +518,299 @@ class TestGraceNoStacking:
 
         assert agent._wrapup_reason is not None
         assert agent._wrapup_reason == "budget"
+
+
+class _ContextRunLLM(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = responses
+        self.messages: list[list[dict[str, Any]]] = []
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        self.messages.append(deepcopy(messages))
+        return self.responses.pop(0)
+
+
+def _context_run_messages() -> list[dict[str, Any]]:
+    messages = [{"role": "user", "content": "Initial ticket context"}]
+    for index in range(4):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": f"Reasoning {index}",
+                },
+                {
+                    "role": "user",
+                    "content": f"Earlier result {index}",
+                },
+            ]
+        )
+    return messages
+
+
+def _make_context_run_agent(
+    tmp_path: Path,
+    llm: _ContextRunLLM,
+    messages: list[dict[str, Any]] | None = None,
+) -> Any:
+    from agents.base import AgentBase
+
+    class StubAgent(AgentBase):
+        def _system_prompt(self, ticket: dict[str, Any]) -> str:
+            return "test"
+
+        def _build_messages(
+            self,
+            ticket: dict[str, Any],
+        ) -> list[dict[str, Any]]:
+            return messages or _context_run_messages()
+
+        async def _handle_completion(
+            self,
+            ticket_id: str,
+            response: LLMResponse,
+        ) -> None:
+            pass
+
+    agent = StubAgent(
+        agent_name="test-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=EventBus(log_dir=tmp_path / "logs"),
+        max_iterations=0,
+        tool_handlers={
+            "read_file": AsyncMock(return_value="current tool response"),
+        },
+    )
+    agent._client.get = AsyncMock()
+    agent._client.patch = AsyncMock()
+    agent._client.post = AsyncMock()
+    agent._get_ticket = AsyncMock(
+        return_value={
+            "status": "triage_pending",
+            "custom_fields": {},
+        },
+    )
+    agent._check_context = AsyncMock(side_effect=["pause", "ok"])
+    agent._handle_context_pause = AsyncMock()
+    agent._handle_completion = AsyncMock()
+    agent._save_messages = AsyncMock()
+    agent._add_comment = AsyncMock()
+    agent._transition_ticket = AsyncMock()
+    return agent
+
+
+async def _run_and_close(agent: Any, ticket_id: str) -> None:
+    try:
+        await agent.run(ticket_id)
+    finally:
+        await agent.close()
+
+
+def _tool_response() -> LLMResponse:
+    return LLMResponse(
+        text=None,
+        tool_calls=[ToolCall(id="tool-1", name="read_file", input={})],
+        stop_reason="tool_use",
+        raw_content=[
+            {
+                "type": "tool_use",
+                "id": "tool-1",
+                "name": "read_file",
+                "input": {},
+            },
+        ],
+        usage={"context_tokens": 170_000, "model": "claude-opus-4-6"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_processes_current_tool_response(
+    tmp_path: Path,
+) -> None:
+    completion_response = LLMResponse(
+        text="done",
+        stop_reason="end_turn",
+        raw_content=[{"type": "text", "text": "done"}],
+        usage={
+            "context_tokens": 50_000,
+            "model": "claude-opus-4-6",
+        },
+    )
+    llm = _ContextRunLLM(
+        [
+            _tool_response(),
+            completion_response,
+        ]
+    )
+    agent = _make_context_run_agent(tmp_path, llm)
+
+    await _run_and_close(agent, "T-1")
+
+    assert agent._tool_handlers["read_file"].await_count == 1
+    assert len(llm.messages) == 2
+    next_messages = llm.messages[1]
+    assert next_messages[0]["content"] == "Initial ticket context"
+    assert "Context was truncated" in next_messages[1]["content"]
+    assert not any(
+        message.get("content") == "Earlier result 0" for message in next_messages
+    )
+    assert next_messages[-2]["content"][0]["id"] == "tool-1"
+    assert next_messages[-1]["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "content": "current tool response",
+            "is_error": False,
+        }
+    ]
+    assert [message["role"] for message in next_messages] == [
+        "user",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    truncation_events = [
+        event
+        for event in agent._events.get_events("T-1")
+        if event["event_type"] == "context_truncated"
+    ]
+    assert len(truncation_events) == 1
+    assert agent._wrapup_reason is None
+    agent._handle_context_pause.assert_not_awaited()
+    agent._handle_completion.assert_awaited_once_with("T-1", completion_response)
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_processes_current_text_response(
+    tmp_path: Path,
+) -> None:
+    response = LLMResponse(
+        text="completed before compaction",
+        stop_reason="end_turn",
+        raw_content=[
+            {"type": "text", "text": "completed before compaction"},
+        ],
+        usage={
+            "context_tokens": 170_000,
+            "model": "claude-opus-4-6",
+        },
+    )
+    llm = _ContextRunLLM([response])
+    agent = _make_context_run_agent(tmp_path, llm)
+
+    await _run_and_close(agent, "T-1")
+
+    assert len(llm.messages) == 1
+    agent._handle_completion.assert_awaited_once_with("T-1", response)
+    assert agent._wrapup_reason is None
+    agent._handle_context_pause.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_falls_back_after_one_attempt(
+    tmp_path: Path,
+) -> None:
+    llm = _ContextRunLLM(
+        [
+            _tool_response(),
+            _tool_response(),
+            LLMResponse(text="final"),
+        ]
+    )
+    agent = _make_context_run_agent(tmp_path, llm)
+    agent._check_context = AsyncMock(side_effect=["pause", "pause"])
+    agent._truncate_context = MagicMock(wraps=agent._truncate_context)
+
+    await _run_and_close(agent, "T-1")
+
+    assert len(llm.messages) == 3
+    assert agent._truncate_context.call_count == 1
+    assert agent._handle_context_pause.await_count == 1
+    assert agent._wrapup_reason == "context"
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_noop_uses_bounded_fallback(
+    tmp_path: Path,
+) -> None:
+    llm = _ContextRunLLM([_tool_response(), _tool_response()])
+    agent = _make_context_run_agent(tmp_path, llm)
+    agent._truncate_context = MagicMock(side_effect=lambda messages: messages)
+
+    await _run_and_close(agent, "T-1")
+
+    assert agent._truncate_context.call_count == 1
+    assert agent._handle_context_pause.await_count == 1
+    assert not any(
+        event["event_type"] == "context_truncated"
+        for event in agent._events.get_events("T-1")
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_exception_uses_bounded_fallback(
+    tmp_path: Path,
+) -> None:
+    llm = _ContextRunLLM([_tool_response(), LLMResponse(text="final")])
+    agent = _make_context_run_agent(tmp_path, llm)
+    agent._check_context = AsyncMock(side_effect=["pause"])
+    agent._truncate_context = MagicMock(side_effect=RuntimeError("failed"))
+
+    await _run_and_close(agent, "T-1")
+
+    assert agent._truncate_context.call_count == 1
+    assert agent._handle_context_pause.await_count == 1
+    assert agent._wrapup_reason == "context"
+
+
+@pytest.mark.asyncio
+async def test_context_truncation_state_resets_each_run(tmp_path: Path) -> None:
+    llm = _ContextRunLLM(
+        [
+            _tool_response(),
+            LLMResponse(
+                text="first",
+                stop_reason="end_turn",
+                usage={"context_tokens": 50_000, "model": "claude-opus-4-6"},
+            ),
+            _tool_response(),
+            LLMResponse(
+                text="second",
+                stop_reason="end_turn",
+                usage={"context_tokens": 50_000, "model": "claude-opus-4-6"},
+            ),
+        ]
+    )
+    agent = _make_context_run_agent(tmp_path, llm)
+    agent._check_context = AsyncMock(side_effect=["pause", "ok", "pause", "ok"])
+
+    try:
+        await agent.run("T-1")
+        await agent.run("T-1")
+    finally:
+        await agent.close()
+
+    assert agent._context_truncated is True
+    assert agent._handle_completion.await_count == 2
+    assert agent._handle_context_pause.await_count == 0
+    assert (
+        sum(
+            event["event_type"] == "context_truncated"
+            for event in agent._events.get_events("T-1")
+        )
+        == 2
+    )
