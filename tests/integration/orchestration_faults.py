@@ -9,10 +9,13 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 
 def free_port() -> int:
@@ -152,6 +155,226 @@ def start_orchestrator(
     process._fault_log_path = log_path  # type: ignore[attr-defined]
     log.close()
     return process
+
+
+class ScriptedMockLLM(LLMProvider):
+    """A deterministic transcript provider for real agent/MCP integration tests.
+
+    Transcript arguments may refer to values generated earlier in the workflow
+    with ``${name}`` (for example ``${validation_id}`` or
+    ``${approval_request_id}``).  Tests bind those values after observing the
+    real MCP result, rather than predicting UUIDs produced by the service.
+    The provider deliberately lives in ``tests``: production mock behavior
+    remains simple and cannot accidentally acquire test-only interpolation.
+    """
+
+    def __init__(self, transcript: list[dict[str, Any]]) -> None:
+        self._transcript = list(transcript)
+        self._values: dict[str, Any] = {}
+        self.calls: list[dict[str, Any]] = []
+
+    def bind(self, **values: Any) -> None:
+        """Expose runtime service identifiers to later transcript entries."""
+        self._values.update(values)
+
+    def bind_json(self, result: str | dict[str, Any], *names: str) -> dict[str, Any]:
+        """Capture named IDs from a real MCP JSON response and return it."""
+        decoded = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(decoded, dict):
+            raise AssertionError(f"expected object result, got {decoded!r}")
+        missing = [name for name in names if name not in decoded]
+        if missing:
+            raise AssertionError(f"MCP response did not contain {missing}: {decoded}")
+        self.bind(**{name: decoded[name] for name in names})
+        return decoded
+
+    def _resolve(self, value: Any) -> Any:
+        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+            name = value[2:-1]
+            if name not in self._values:
+                raise AssertionError(
+                    f"transcript references unbound runtime value: {name}"
+                )
+            return self._values[name]
+        if isinstance(value, dict):
+            return {key: self._resolve(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._resolve(item) for item in value]
+        return value
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        del system_prompt, tools, max_tokens, timeout
+        if not self._transcript:
+            return LLMResponse(text="", stop_reason="end_turn")
+        step = self._transcript.pop(0)
+        resolved = self._resolve(step)
+        self.calls.append({"step": resolved, "messages": messages})
+        calls = [
+            ToolCall(
+                id=str(call.get("id", f"tc-{len(self.calls)}")),
+                name=str(call["name"]),
+                input=dict(call.get("input", {})),
+            )
+            for call in resolved.get("tool_calls", [])
+        ]
+        return LLMResponse(
+            text=resolved.get("text"),
+            tool_calls=calls,
+            stop_reason="tool_use" if calls else "end_turn",
+            raw_content=[],
+        )
+
+
+class FakeControllerCommand:
+    """A process-visible external controller/SSH substitute with a durable ledger.
+
+    ``command`` is intended for a test subprocess ``PATH``.  Each invocation
+    obtains the same advisory lock used by :class:`FakeBenchmarkController`,
+    records argv durably, and can be paused by a named file barrier.  This lets
+    a test crash a real main or MCP subprocess exactly after an external
+    request is accepted without relying on wall-clock sleeps.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.controller = FakeBenchmarkController(root)
+        self.bin_dir = root / "bin"
+        self.command = self.bin_dir / "fault-controller"
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
+        self.command.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "sys.path.insert(0, os.environ['FAULT_PROJECT_ROOT'])\n"
+            "from tests.integration.orchestration_faults import fake_controller_command\n"
+            "fake_controller_command()\n",
+            encoding="utf-8",
+        )
+        self.command.chmod(0o755)
+        # These names let a transcript or a subprocess exercise the same
+        # durable ledger through the command shape it normally sees.
+        for alias in ("ssh", "crucible"):
+            alias_path = self.bin_dir / alias
+            if not alias_path.exists():
+                alias_path.symlink_to(self.command.name)
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "FAULT_CONTROLLER_ROOT": str(self.root),
+            "FAULT_PROJECT_ROOT": str(Path(__file__).parents[2]),
+            "PATH": str(self.bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        }
+
+    def arm_barrier(self, name: str) -> Path:
+        return self.controller.arm_barrier(name)
+
+    def records(self) -> list[dict[str, Any]]:
+        return self.controller.records()
+
+
+def fake_controller_command() -> None:
+    """Entry point installed by :class:`FakeControllerCommand` for subprocesses."""
+    root = Path(os.environ["FAULT_CONTROLLER_ROOT"])
+    controller = FakeBenchmarkController(root)
+    operation = os.environ.get("FAULT_CONTROLLER_OPERATION", "launch")
+    barrier_name = os.environ.get("FAULT_CONTROLLER_BARRIER", "")
+    if barrier_name:
+        controller.wait_for_release(root / f"barrier.{barrier_name}")
+    # The argv itself is the durable, process-visible external request identity.
+    digest = json.dumps(sys.argv[1:], sort_keys=True, separators=(",", ":"))
+    accepted = controller.launch(
+        intent_id=f"{operation}:{digest}",
+        approval_id=os.environ.get("FAULT_APPROVAL_ID", "test-approval"),
+        session_id=os.environ.get("FAULT_SESSION_ID", "test-session"),
+    )
+    print(
+        json.dumps(
+            {"status": "launched" if accepted else "replayed", "operation": operation}
+        ),
+        flush=True,
+    )
+
+
+@dataclass
+class FaultHarness:
+    """Owns isolated runtime homes sharing one real local state-store service.
+
+    Scenarios must use predicate/file-barrier waits instead of fixed sleeps and
+    must call :meth:`close` (or use the context manager) so failures retain
+    bounded diagnostics while processes cannot leak into later tests.
+    """
+
+    root: Path
+    token: str = "fault-token"
+    port: int = field(default_factory=free_port)
+    store: subprocess.Popen[str] | None = None
+    processes: list[subprocess.Popen[str]] = field(default_factory=list)
+    controller: FakeControllerCommand = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.controller = FakeControllerCommand(self.root / "controller")
+
+    @property
+    def store_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def start(self) -> None:
+        if self.store is not None:
+            raise RuntimeError("fault harness state store is already running")
+        self.store = start_store(self.root / "shared-store", self.port)
+        self.processes.append(self.store)
+
+    def start_main(self, name: str) -> subprocess.Popen[str]:
+        if self.store is None:
+            raise RuntimeError("start the shared state store before a main process")
+        process = start_orchestrator(
+            self.root / f"runtime-{name}", self.store_url, instance_name=name
+        )
+        self.processes.append(process)
+        return process
+
+    def barrier(self, name: str) -> Path:
+        return self.controller.arm_barrier(name)
+
+    def release(self, barrier: Path) -> None:
+        self.controller.controller.release(barrier)
+
+    def restart_store(self) -> None:
+        if self.store is None:
+            raise RuntimeError("state store is not running")
+        stop_process(self.store)
+        self.store = start_store(self.root / "shared-store", self.port)
+        self.processes.append(self.store)
+
+    def crash(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+
+    def evidence(self) -> str:
+        return diagnostics(self.processes)
+
+    def close(self) -> None:
+        for process in reversed(self.processes):
+            stop_process(process)
+
+    def __enter__(self) -> "FaultHarness":
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:

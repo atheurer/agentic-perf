@@ -18,13 +18,35 @@ import pytest
 
 from tests.integration.orchestration_faults import (
     FakeBenchmarkController,
+    FaultHarness,
+    ScriptedMockLLM,
     diagnostics,
     free_port,
-    start_orchestrator,
     start_store,
     stop_process,
     wait_for_log,
 )
+
+# #801 acceptance mapping.  These are deliberately named test functions, not
+# prose-only checklist entries, so review can see which proof protects each
+# failure boundary.  ``FaultHarness`` supplies the shared service/process
+# lifecycle; individual tests select only the primitives their fault requires.
+SCENARIO_TO_TEST = {
+    "leader_collision": "test_two_real_orchestrators_share_one_fenced_production_leader",
+    "takeover_stale_rejection": "test_takeover_fences_stale_session_and_controller_launch",
+    "long_approval": "test_long_approval_pause_preserves_one_immutable_execution_capability",
+    "two_waiter_ambiguity": "test_two_waiters_require_a_structured_approval_and_wake_one_only",
+    "duplicate_delivery_reconnect": "test_process_visible_controller_ledger_is_atomic_across_reconnects",
+    "store_restart": "test_real_state_store_restart_retains_leader_and_operation_fences",
+    "crash_boundaries": "test_fenced_operation_crash_boundaries_never_relaunch_side_effect",
+    "copied_runtime": "test_copied_runtime_is_sanitized_but_shared_store_still_fences_bypass",
+    "causal_trace": "test_trace_projection_causally_attributes_fault_decisions",
+}
+
+
+def test_fault_scenario_mapping_names_live_proofs() -> None:
+    """Keep the #801 acceptance checklist attached to executable tests."""
+    assert set(SCENARIO_TO_TEST.values()) <= set(globals())
 
 
 def _run_worker(
@@ -117,39 +139,98 @@ def test_two_real_orchestrators_share_one_fenced_production_leader(
     line occurs after the production lease acquisition; the other main must
     fail *before* it creates a dispatcher or can claim any ticket.
     """
-    port = free_port()
-    store = start_store(tmp_path / "shared-store", port)
-    winner = loser = None
-    processes = [store]
-    try:
-        store_url = f"http://127.0.0.1:{port}"
-        winner = start_orchestrator(
-            tmp_path / "runtime-a", store_url, instance_name="fault-a"
-        )
-        processes.append(winner)
+    with FaultHarness(tmp_path) as harness:
+        winner = harness.start_main("fault-a")
         wait_for_log(winner, "Orchestrator started")
-        loser = start_orchestrator(
-            tmp_path / "runtime-b", store_url, instance_name="fault-b"
-        )
-        processes.append(loser)
+        loser = harness.start_main("fault-b")
         # A losing real main exits on the production 409 leader-lease response.
         deadline = __import__("time").monotonic() + 10
         while loser.poll() is None and __import__("time").monotonic() < deadline:
             __import__("time").sleep(0.02)
-        assert loser.poll() not in (None, 0), diagnostics(processes)
-        loser_log = (tmp_path / "runtime-b" / "orchestrator.log").read_text()
+        assert loser.poll() not in (None, 0), harness.evidence()
+        loser_log = (tmp_path / "runtime-fault-b" / "orchestrator.log").read_text()
         assert "orchestrator leader lease unavailable" in loser_log
         assert "Orchestrator started" not in loser_log
         lease = httpx.get(
-            f"{store_url}/api/v1/control/orchestrator-lease",
-            headers={"Authorization": "Bearer fault-token"},
+            f"{harness.store_url}/api/v1/control/orchestrator-lease",
+            headers=harness.headers,
             timeout=2,
         )
-        assert lease.status_code == 200, diagnostics(processes)
+        assert lease.status_code == 200, harness.evidence()
         assert lease.json()["lease"]["pid"] == winner.pid
-    finally:
-        for process in reversed(processes):
-            stop_process(process)
+
+
+@pytest.mark.asyncio
+async def test_scripted_transcript_interpolates_real_runtime_identifiers() -> None:
+    """A real MCP response can supply opaque IDs to the next agent turn."""
+    llm = ScriptedMockLLM(
+        [
+            {"tool_calls": [{"name": "validate_benchmark", "input": {}}]},
+            {
+                "tool_calls": [
+                    {
+                        "name": "execute_benchmark",
+                        "input": {
+                            "validation_id": "${validation_id}",
+                            "approval_request_id": "${approval_request_id}",
+                            "intent_id": "${intent_id}",
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    first = await llm.complete("", [], [])
+    assert first.tool_calls[0].name == "validate_benchmark"
+    llm.bind_json(
+        {
+            "validation_id": "val-live",
+            "approval_request_id": "apr-live",
+            "intent_id": "intent-live",
+        },
+        "validation_id",
+        "approval_request_id",
+        "intent_id",
+    )
+    second = await llm.complete("", [], [])
+    assert second.tool_calls[0].input == {
+        "validation_id": "val-live",
+        "approval_request_id": "apr-live",
+        "intent_id": "intent-live",
+    }
+
+
+def test_process_visible_controller_ledger_is_atomic_across_reconnects(
+    tmp_path: Path,
+) -> None:
+    """Two independent external deliveries record exactly one durable launch."""
+    with FaultHarness(tmp_path) as harness:
+        env = os.environ | harness.controller.environment()
+        command = "ssh"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outputs = list(
+                pool.map(
+                    lambda _: subprocess.run(
+                        [command, "crucible", "run", "same-intent"],
+                        cwd=Path(__file__).parents[1],
+                        env=env,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout,
+                    range(2),
+                )
+            )
+        assert sorted(json.loads(output)["status"] for output in outputs) == [
+            "launched",
+            "replayed",
+        ]
+        launches = [
+            record
+            for record in harness.controller.records()
+            if record["operation"] == "launch"
+        ]
+        assert len(launches) == 1
 
 
 def test_takeover_fences_stale_session_and_controller_launch(tmp_path: Path) -> None:
