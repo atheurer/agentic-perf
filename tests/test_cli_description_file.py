@@ -166,6 +166,19 @@ class TestResolveDescription:
             with pytest.raises(SystemExit):
                 _resolve_description(args)
 
+    def test_invalid_utf8_file_exits(self, tmp_path: Path) -> None:
+        from cli import _resolve_description
+
+        desc_file = tmp_path / "invalid.txt"
+        desc_file.write_bytes(b"\xff\xfe")
+        args = argparse.Namespace(
+            description=None,
+            description_file=str(desc_file),
+            summary="test summary",
+        )
+        with pytest.raises(SystemExit):
+            _resolve_description(args)
+
     def test_inline_description_used(self) -> None:
         from cli import _resolve_description
 

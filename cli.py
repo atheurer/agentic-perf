@@ -78,7 +78,7 @@ def _resolve_description(args) -> str:
                 sys.exit(1)
             try:
                 content = path.read_text(encoding="utf-8")
-            except OSError as e:
+            except (OSError, UnicodeError) as e:
                 print(f"Error reading file: {e}", file=sys.stderr)
                 sys.exit(1)
         if not content.strip():
