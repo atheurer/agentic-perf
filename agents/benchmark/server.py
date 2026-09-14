@@ -4421,9 +4421,7 @@ async def execute_boot_time_test(
         except _asyncio.TimeoutError:
             now = loop.time()
             try:
-                file_count = sum(
-                    1 for path in output_dir.rglob("*") if path.is_file()
-                )
+                file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
             except OSError:
                 file_count = last_file_count
 
