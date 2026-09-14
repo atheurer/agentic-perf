@@ -6,6 +6,8 @@ LLM calls these via tool_use to interact with tickets.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -16,16 +18,71 @@ import httpx
 from providers.llm.base import ToolDefinition
 from providers.tracing import (
     ActionType,
+    IdempotencyDescriptor,
     LifecycleState,
     MonotonicTimer,
     OperationOutcome,
     TraceEventV1,
     TraceRecorder,
     child_context,
+    current_trace_context,
     new_trace_context,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ChatAuditUnavailable(RuntimeError):
+    """The required durable audit entry could not be accepted.
+
+    Chat mutations must never be attempted without an audit entry.  This is
+    deliberately distinct from a handler error so callers can safely tell the
+    user that no action was attempted.
+    """
+
+
+# This maps the advertised chat capability to the concrete handler and the
+# state-store API domain it mutates.  It is intentionally local to the
+# dispatcher: the audit event records the same operation owner that executes
+# the request, rather than treating ChatToolAudit as the owner of every effect.
+_CHAT_MUTATION_CONTRACTS: dict[str, tuple[str, str]] = {
+    "create_ticket": ("agents.chat.tools._create_ticket", "/api/v1/tickets"),
+    "start_ticket": (
+        "agents.chat.tools._start_ticket",
+        "/api/v1/tickets/{ticket_id}/transition",
+    ),
+    "send_interjection": (
+        "agents.chat.tools._send_interjection",
+        "/api/v1/tickets/{ticket_id}/interject",
+    ),
+    "reply_to_guidance": (
+        "agents.chat.tools._reply_to_guidance",
+        "/api/v1/tickets/{ticket_id}/comments",
+    ),
+    "update_ticket_fields": (
+        "agents.chat.tools._update_ticket_fields",
+        "/api/v1/tickets/{ticket_id}/fields",
+    ),
+    "stop_ticket": (
+        "agents.chat.tools._stop_ticket",
+        "/api/v1/tickets/{ticket_id}/stop",
+    ),
+    "create_user": ("agents.chat.tools._create_user", "/api/v1/users"),
+    "rotate_user_token": (
+        "agents.chat.tools._rotate_user_token",
+        "/api/v1/users/{username}/rotate-token",
+    ),
+}
+
+
+def _chat_target(context: Any, tool_name: str) -> str | None:
+    """Return a redacted, stable external API target for a mutation event."""
+    contract = _CHAT_MUTATION_CONTRACTS.get(tool_name)
+    if not contract:
+        return None
+    _, route = contract
+    return f"state-store:{route.format(ticket_id=context.ticket_id or 'unknown', username='redacted')}"
+
 
 # High-impact actions that require code-level confirmation.
 # Low-risk transitions (start, reply, interject) rely on
@@ -59,9 +116,10 @@ class ChatToolAudit:
     Chat tools do not inherit :class:`AgentBase`'s loop, so they must not rely
     on its audit boundary.  This small adapter is the sole production entry
     point for ``CHAT_TOOLS`` and writes the same trace envelope used by native
-    agents.  Trace delivery deliberately remains best-effort: a temporarily
-    unavailable observability endpoint must not turn a user-approved action
-    into a second attempt.
+    agents.  The entry event is a fail-closed authorization boundary: a tool
+    handler is not called until trace ingestion accepts it.  Terminal delivery
+    is always attempted, including cancellation, so a started operation has a
+    correlated outcome whenever the transport remains available.
     """
 
     def __init__(
@@ -72,6 +130,8 @@ class ChatToolAudit:
         *,
         record: Callable[[TraceEventV1], Any] | None = None,
     ) -> None:
+        if not auth_token:
+            raise ValueError("chat audit requires a service trace-ingestion token")
         self._client = client
         self._store_url = store_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {auth_token}"}
@@ -83,20 +143,46 @@ class ChatToolAudit:
         state: LifecycleState,
         *,
         tool_name: str,
+        tool_input: dict[str, Any],
         timer: MonotonicTimer | None = None,
         outcome: OperationOutcome | None = None,
         error: BaseException | None = None,
+        required: bool = False,
     ) -> None:
+        contract = _CHAT_MUTATION_CONTRACTS.get(tool_name)
+        target = _chat_target(context, tool_name)
+        attributes: dict[str, Any] = {"tool_surface": "chat"}
+        if contract:
+            owner, _ = contract
+            attributes.update(
+                operation_owner=owner,
+                operation_key=f"chat:{tool_name}:{context.tool_call_id or context.action_id}",
+            )
         event = TraceRecorder().record(
             context,
             ActionType.TOOL,
             state,
             phase=tool_name,
+            target=target,
             duration_ms=timer.elapsed_ms() if timer else None,
             outcome=outcome,
             error=error,
-            attributes={"tool_surface": "chat"},
+            attributes=attributes,
         )
+        if contract:
+            # Do not persist raw chat input in traces.  A stable digest links
+            # retries/replays while the per-call key identifies this operation
+            # lifecycle to the event consumer.
+            request_hash = hashlib.sha256(
+                json.dumps(tool_input, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            event = event.model_copy(
+                update={
+                    "idempotency": IdempotencyDescriptor(
+                        key=attributes["operation_key"], request_hash=request_hash
+                    )
+                }
+            )
         try:
             if self._record is not None:
                 result = self._record(event)
@@ -109,8 +195,12 @@ class ChatToolAudit:
                 json=event.model_dump(mode="json"),
             )
             response.raise_for_status()
-        except Exception:
+        except Exception as exc:
             logger.exception("failed to record chat tool audit event")
+            if required:
+                raise ChatAuditUnavailable(
+                    "audit ingestion unavailable; chat tool was not attempted"
+                ) from exc
 
     async def invoke(
         self,
@@ -122,7 +212,7 @@ class ChatToolAudit:
     ) -> str:
         """Record ``STARTED`` and one terminal event around one named tool."""
         ticket_id = tool_input.get("ticket_id")
-        root_context = new_trace_context(
+        root_context = current_trace_context() or new_trace_context(
             ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
             agent_id="chat-agent",
         )
@@ -130,18 +220,38 @@ class ChatToolAudit:
             root_context, tool_call_id=tool_call_id or f"chat-{root_context.action_id}"
         )
         timer = MonotonicTimer()
-        await self._emit(context, LifecycleState.STARTED, tool_name=tool_name)
+        await self._emit(
+            context,
+            LifecycleState.STARTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            required=True,
+        )
         try:
             result = await handler()
-        except Exception as exc:
-            await self._emit(
-                context,
-                LifecycleState.FAILED,
-                tool_name=tool_name,
-                timer=timer,
-                outcome=OperationOutcome.FAILURE,
-                error=exc,
+        except BaseException as exc:
+            state = (
+                LifecycleState.CANCELLED
+                if isinstance(exc, asyncio.CancelledError)
+                else LifecycleState.FAILED
             )
+            outcome = (
+                OperationOutcome.CANCELLED
+                if state == LifecycleState.CANCELLED
+                else OperationOutcome.FAILURE
+            )
+            try:
+                await self._emit(
+                    context,
+                    state,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=outcome,
+                    error=exc,
+                )
+            except BaseException:
+                logger.exception("failed to record terminal chat tool audit event")
             raise
         failed = False
         try:
@@ -153,6 +263,7 @@ class ChatToolAudit:
             context,
             LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
             tool_name=tool_name,
+            tool_input=tool_input,
             timer=timer,
             outcome=OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS,
         )

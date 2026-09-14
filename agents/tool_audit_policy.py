@@ -303,14 +303,38 @@ TOOL_AUDIT_POLICY = (
         chat=True,
     ),
     *_side_effecting(
-        "agents.chat.ChatToolAudit",
+        "agents.chat.tools._create_ticket",
         "agents/chat/tools.py:create_ticket",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.tools._start_ticket",
         "agents/chat/tools.py:start_ticket",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.tools._send_interjection",
         "agents/chat/tools.py:send_interjection",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.tools._reply_to_guidance",
         "agents/chat/tools.py:reply_to_guidance",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.tools._update_ticket_fields",
         "agents/chat/tools.py:update_ticket_fields",
-        "agents/chat/tools.py:stop_ticket",
-        "agents/chat/tools.py:create_user",
+        chat=True,
+    ),
+    *_side_effecting(
+        "agents.chat.tools._stop_ticket", "agents/chat/tools.py:stop_ticket", chat=True
+    ),
+    *_side_effecting(
+        "agents.chat.tools._create_user", "agents/chat/tools.py:create_user", chat=True
+    ),
+    *_side_effecting(
+        "agents.chat.tools._rotate_user_token",
         "agents/chat/tools.py:rotate_user_token",
         chat=True,
     ),
@@ -337,7 +361,14 @@ OPERATION_OWNER_CONTRACTS = {
     "providers.workspace.manager.WorkspaceManager": (
         "providers/workspace/manager.py:WorkspaceManager"
     ),
-    "agents.chat.ChatToolAudit": "agents/chat/tools.py:ChatToolAudit",
+    "agents.chat.tools._create_ticket": "agents/chat/tools.py:_create_ticket",
+    "agents.chat.tools._start_ticket": "agents/chat/tools.py:_start_ticket",
+    "agents.chat.tools._send_interjection": "agents/chat/tools.py:_send_interjection",
+    "agents.chat.tools._reply_to_guidance": "agents/chat/tools.py:_reply_to_guidance",
+    "agents.chat.tools._update_ticket_fields": "agents/chat/tools.py:_update_ticket_fields",
+    "agents.chat.tools._stop_ticket": "agents/chat/tools.py:_stop_ticket",
+    "agents.chat.tools._create_user": "agents/chat/tools.py:_create_user",
+    "agents.chat.tools._rotate_user_token": "agents/chat/tools.py:_rotate_user_token",
 }
 
 # Exceptions are intentionally empty.  Do not add a broad module exemption:

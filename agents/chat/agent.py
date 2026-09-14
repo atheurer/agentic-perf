@@ -236,7 +236,7 @@ class ChatAgent:
                 self._store_url,
                 auth_token,
                 audit=ChatToolAudit(
-                    self._client, self._store_url, self._audit_token or auth_token
+                    self._client, self._store_url, self._audit_token or ""
                 ),
                 tool_call_id=action.get("tool_call_id"),
             )
@@ -431,7 +431,7 @@ class ChatAgent:
                     self._store_url,
                     auth_token,
                     audit=ChatToolAudit(
-                        self._client, self._store_url, self._audit_token or auth_token
+                        self._client, self._store_url, self._audit_token or ""
                     ),
                     tool_call_id=tc.id,
                 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -21,7 +22,12 @@ from agents.tool_audit_policy import (
     POLICY_BY_REGISTRATION,
     TOOL_AUDIT_POLICY,
 )
-from providers.tracing import LifecycleState
+from providers.tracing import (
+    LifecycleState,
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 
 ROOT = Path(__file__).parents[1]
 SERVER_ROOT = ROOT / "agents"
@@ -110,18 +116,40 @@ def _tool_name(node: ast.Call, default: str) -> str:
     return default
 
 
+def _factory_aliases(tree: ast.AST) -> set[str]:
+    """Return every local spelling of the canonical audited MCP factory."""
+    names = {"create_ticket_mcp"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "agents.mcp_audit":
+            names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "create_ticket_mcp"
+            )
+        elif isinstance(node, ast.Import):
+            names.update(
+                f"{alias.asname or alias.name}.create_ticket_mcp"
+                for alias in node.names
+                if alias.name == "agents.mcp_audit"
+            )
+    return names
+
+
 def _mcp_registrations() -> tuple[set[Registration], list[str]]:
     registrations: set[Registration] = set()
     violations: list[str] = []
-    for path in sorted(SERVER_ROOT.glob("*/server.py")):
+    # Nested agent packages are first-class capability surfaces.  Scanning all
+    # servers, rather than a hand-picked one-level glob, means a newly added
+    # nested FastMCP service cannot silently escape the manifest.
+    for path in sorted(SERVER_ROOT.rglob("server.py")):
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         audited_instances = {
             target.id
-            for node in tree.body
+            for node in ast.walk(tree)
             if isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Call)
-            and _call_name(node.value.func) == "create_ticket_mcp"
+            and _call_name(node.value.func) in _factory_aliases(tree)
             for target in node.targets
             if isinstance(target, ast.Name)
         }
@@ -150,6 +178,19 @@ def _mcp_registrations() -> tuple[set[Registration], list[str]]:
                         line=node.lineno,
                         kind="mcp",
                     )
+                )
+        # A dynamic `getattr(mcp, "tool")` / decorator factory defeats static
+        # inventory.  It must be made explicit (or added as a precise reviewed
+        # exemption) instead of silently being ignored by this guardrail.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id in {"getattr", "setattr"} and any(
+                isinstance(arg, ast.Constant) and arg.value == "tool"
+                for arg in node.args[1:2]
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno}:dynamic MCP tool registrar is not auditable"
                 )
     return registrations, violations
 
@@ -180,7 +221,7 @@ def _native_registrations() -> set[Registration]:
                 )
             )
 
-    for path in sorted(SERVER_ROOT.glob("*/agent.py")):
+    for path in sorted(SERVER_ROOT.rglob("agent.py")):
         relative = path.relative_to(ROOT).as_posix()
         module = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         for node in ast.walk(module):
@@ -277,6 +318,51 @@ def _chat_handler_name(tree: ast.AST, tool_name: str) -> str | None:
     return None
 
 
+def _schema_fixture(schema: dict[str, object]) -> object:
+    """Build a schema-valid harmless value; never use empty dict shortcuts."""
+    if "enum" in schema:
+        return schema["enum"][0]  # type: ignore[index]
+    kind = schema.get("type")
+    if kind == "string":
+        return "PERF-policy"
+    if kind == "integer":
+        return 1
+    if kind == "number":
+        return 1
+    if kind == "boolean":
+        return False
+    if kind == "array":
+        return [_schema_fixture(schema.get("items", {"type": "string"}))]  # type: ignore[arg-type]
+    if kind == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        return {
+            name: _schema_fixture(properties[name])  # type: ignore[index]
+            for name in required
+            if name in properties  # type: ignore[operator]
+        }
+    return "PERF-policy"
+
+
+def _chat_fixture(tool_name: str) -> dict[str, object]:
+    """Return a per-registration schema-valid fixture with safe overrides."""
+    from agents.chat.tools import CHAT_TOOLS
+
+    definition = next(tool for tool in CHAT_TOOLS if tool.name == tool_name)
+    fixture = _schema_fixture(definition.input_schema)
+    assert isinstance(fixture, dict)
+    # Stable non-secret values make any mocked state-store target inspectable.
+    fixture.update(
+        ticket_id="PERF-policy",
+        username="policy-user",
+        summary="policy fixture",
+        description="safe audit policy fixture",
+        message="safe audit policy fixture",
+        fields={"policy_marker": "safe"},
+    )
+    return fixture
+
+
 def _read_only_direct_mutations(registration: Registration) -> list[str]:
     """Return definite protected calls in an actual read-only entry handler.
 
@@ -363,6 +449,38 @@ def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
         "operation owner contracts must not become stale documentation; "
         f"unused={set(OPERATION_OWNER_CONTRACTS) - used_owners!r}"
     )
+
+
+def test_chat_mutation_owners_follow_real_dispatch_handlers() -> None:
+    """A chat mutation cannot satisfy policy by naming its shared wrapper."""
+    from agents.chat.tools import _CHAT_MUTATION_CONTRACTS
+
+    tree = ast.parse(
+        (ROOT / "agents/chat/tools.py").read_text(encoding="utf-8"),
+        filename="agents/chat/tools.py",
+    )
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for registration in _chat_registrations():
+        policy = POLICY_BY_REGISTRATION[registration.key]
+        if policy.classification != "side_effecting":
+            continue
+        name = registration.key.rsplit(":", 1)[1]
+        owner, route = _CHAT_MUTATION_CONTRACTS[name]
+        assert policy.operation_owner == owner
+        handler = functions[owner.rsplit(".", 1)[1]]
+        calls = [
+            _call_name(call.func)
+            for call in ast.walk(handler)
+            if isinstance(call, ast.Call)
+        ]
+        assert any(
+            call in {"client.post", "client.patch", "client.delete"} for call in calls
+        ), f"{name} owner {owner} has no state-store mutation"
+        assert route.startswith("/api/v1/")
 
 
 def test_read_only_tool_declarations_do_not_call_protected_mutators() -> None:
@@ -460,7 +578,9 @@ def test_production_fastmcp_and_native_dispatch_have_one_audit_boundary() -> Non
     )
 
 
-def _synthetic_mcp_request(name: str) -> MiddlewareContext:
+def _synthetic_mcp_request(
+    name: str, arguments: dict[str, object]
+) -> MiddlewareContext:
     meta = RequestParams.Meta(
         **{
             "agentic-perf": {
@@ -476,7 +596,7 @@ def _synthetic_mcp_request(name: str) -> MiddlewareContext:
         }
     )
     return MiddlewareContext(
-        message=CallToolRequestParams(name=name, _meta=meta),
+        message=CallToolRequestParams(name=name, arguments=arguments, _meta=meta),
         method="tools/call",
         fastmcp_context=SimpleNamespace(
             request_id="policy-rpc", session_id="policy-session"
@@ -486,9 +606,15 @@ def _synthetic_mcp_request(name: str) -> MiddlewareContext:
 
 @pytest.mark.asyncio
 async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
-    """Exercise the audited factory contract for every discovered MCP name."""
+    """Exercise each real registered MCP schema through its audit contract."""
     registrations, _ = _mcp_registrations()
     for registration in registrations:
+        module_name = registration.path.removesuffix(".py").replace("/", ".")
+        server = importlib.import_module(module_name)
+        tool = await server.mcp.get_tool(registration.key.rsplit(":", 1)[1])
+        assert tool is not None, registration.key
+        arguments = _schema_fixture(tool.parameters)
+        assert isinstance(arguments, dict), registration.key
         events = []
         middleware = MCPAuditMiddleware(
             "policy-fixture",
@@ -501,7 +627,8 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             return ToolResult(content="ok")
 
         await middleware.on_call_tool(
-            _synthetic_mcp_request(registration.key.rsplit(":", 1)[1]), handler
+            _synthetic_mcp_request(registration.key.rsplit(":", 1)[1], arguments),
+            handler,
         )
         assert events[0].lifecycle.state == LifecycleState.REQUEST_RECEIVED, (
             registration.key
@@ -539,9 +666,9 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair() -> None:
         client.post = AsyncMock(return_value=response)
         client.patch = AsyncMock(return_value=response)
         tool_name = registration.key.rsplit(":", 1)[1]
-        await execute_tool(
+        result = await execute_tool(
             tool_name,
-            {},
+            _chat_fixture(tool_name),
             client,
             "http://state-store.invalid",
             "policy-token",
@@ -561,6 +688,16 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair() -> None:
         ], registration.key
         assert len({event.action_id for event in events}) == 1
         assert {event.action.phase for event in events} == {tool_name}
+        # The real dispatcher branch ran with a schema-valid input, rather
+        # than only proving a shared wrapper around an artificial `{}` call.
+        assert result
+        if POLICY_BY_REGISTRATION[registration.key].classification == "side_effecting":
+            assert client.post.await_count + client.patch.await_count >= 1, tool_name
+            assert events[0].action.target and events[0].attributes[
+                "operation_owner"
+            ] == (POLICY_BY_REGISTRATION[registration.key].operation_owner)
+            assert events[0].idempotency.key == events[0].attributes["operation_key"]
+            assert events[0].idempotency.request_hash
 
 
 @pytest.mark.asyncio
@@ -599,6 +736,55 @@ async def test_chat_audit_uses_the_service_credential_for_trace_ingestion() -> N
     } == {"toolu-verified"}
 
 
+@pytest.mark.asyncio
+async def test_chat_audit_fails_closed_before_handler_when_entry_is_unavailable() -> (
+    None
+):
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatAuditUnavailable, ChatToolAudit
+
+    handler = AsyncMock(return_value='{"status": "unexpected"}')
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=OSError("trace service offline"))
+    audit = ChatToolAudit(client, "http://state-store.invalid", "service-token")
+    with pytest.raises(ChatAuditUnavailable):
+        await audit.invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_cancellation_emits_terminal_and_preserves_parent() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    parent = new_trace_context(ticket_id="PERF-policy", agent_id="web-request")
+    token = bind_trace_context(parent)
+    try:
+
+        async def cancelled() -> str:
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await ChatToolAudit(
+                AsyncMock(),
+                "http://state-store.invalid",
+                "service-token",
+                record=events.append,
+            ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, cancelled)
+    finally:
+        reset_trace_context(token)
+    assert [event.lifecycle.state for event in events] == [
+        LifecycleState.STARTED,
+        LifecycleState.CANCELLED,
+    ]
+    assert {event.trace_id for event in events} == {parent.trace_id}
+    assert {event.parent_action_id for event in events} == {parent.action_id}
+
+
 def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:
     """Any production call to execute_tool must explicitly construct its boundary."""
     calls: list[tuple[str, ast.Call]] = []
@@ -623,6 +809,12 @@ def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:
         assert any(item.arg == "tool_call_id" for item in call.keywords), (
             f"{relative}:{call.lineno} drops the LLM tool-call correlation id"
         )
+        # The user's bearer must never become the trace producer credential.
+        positional = audit.args[2:]
+        token = positional[0] if positional else None
+        assert not (isinstance(token, ast.Name) and token.id == "auth_token"), (
+            f"{relative}:{call.lineno} supplies a user credential to ChatToolAudit"
+        )
 
     store = ast.parse(
         (ROOT / "state_store/main.py").read_text(encoding="utf-8"),
@@ -637,6 +829,24 @@ def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:
     assert any(item.arg == "audit_token" for item in constructors[0].keywords), (
         "embedded ChatAgent must use the service credential required by trace ingestion"
     )
+
+
+def test_chat_agent_does_not_fallback_to_the_user_bearer_for_audit() -> None:
+    """Audit must use the deployment credential, or fail closed before mutation."""
+    tree = ast.parse(
+        (ROOT / "agents/chat/agent.py").read_text(encoding="utf-8"),
+        filename="agents/chat/agent.py",
+    )
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _call_name(node.func) == "ChatToolAudit"
+    ]
+    assert constructors
+    for constructor in constructors:
+        assert len(constructor.args) >= 3
+        rendered = ast.unparse(constructor.args[2])
+        assert "auth_token" not in rendered
 
 
 def test_protected_call_aliases_resolve_to_the_canonical_api() -> None:

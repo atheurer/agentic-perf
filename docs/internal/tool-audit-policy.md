@@ -14,11 +14,15 @@ whose handler directly calls a protected mutating API.
 Concrete production handlers are intentionally not run by the unit suite: many
 require a real ticket, provider credentials, or remote hosts. Each policy entry
 therefore carries a reviewed fixture exemption with owner and expiry. The test
-suite invokes every discovered MCP name through the canonical factory and every
-`CHAT_TOOLS` name through `ChatToolAudit`; the latter writes a correlated
-`started`/terminal trace pair around the real dispatch branch using the
-embedded state-store's service credential. The AST checks
-prove every production registration uses one of those
+suite resolves every discovered MCP name from its actual FastMCP server,
+generates a schema-valid safe fixture from that registration, and exercises the
+canonical middleware contract. It also runs every `CHAT_TOOLS` dispatcher
+branch using a schema-valid fixture. Chat writes a correlated
+`started`/terminal trace pair using only the embedded state-store deployment
+credential; trace-entry delivery is fail-closed, so a handler is not invoked
+when ingestion cannot acknowledge the entry. Side-effecting chat events carry
+their concrete handler owner, stable idempotency key/hash, and redacted API
+target. The AST checks prove every production registration uses one of those
 already-tested boundaries. Exemptions are review debt, not a permanent
 allowlist: an expired or unexplained exemption fails CI.
 
