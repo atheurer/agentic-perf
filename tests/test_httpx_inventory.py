@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {
     "agents/chat/agent.py",
     "agents/mcp_client.py",
+    "orchestrator/leader_lease.py",
     "orchestrator/poller.py",
     "providers/execution/http.py",
     "providers/skills/arcaflow_plugins.py",
