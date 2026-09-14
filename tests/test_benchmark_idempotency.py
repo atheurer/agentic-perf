@@ -17,7 +17,9 @@ class _ControllerResult:
         self.exit_code, self.stdout, self.stderr = exit_code, stdout, stderr
 
 
-def _crucible_fixture(tmp_path, monkeypatch, *, launch=None, run_result=None, run_error=None):
+def _crucible_fixture(
+    tmp_path, monkeypatch, *, launch=None, run_result=None, run_error=None
+):
     """Wire the real execute handler to a deterministic fake controller."""
     import paths
 
@@ -32,13 +34,18 @@ def _crucible_fixture(tmp_path, monkeypatch, *, launch=None, run_result=None, ru
         "runfile_fingerprint": benchmark_server._runfile_fingerprint(
             {"benchmarks": [{"name": "uperf"}]}
         ),
-        "harness": "crucible", "controller": "controller",
+        "harness": "crucible",
+        "controller": "controller",
         "params_fingerprint": "no-mv-params",
         "execution_plan_fingerprint": benchmark_server._execution_plan_fingerprint({}),
-        "run_command": "crucible run", "state": "executable",
+        "run_command": "crucible run",
+        "state": "executable",
     }
-    ticket = {"id": "T-788", "status": "executing_benchmark",
-              "custom_fields": {"benchmark_validations": {"records": {"val-788": record}}}}
+    ticket = {
+        "id": "T-788",
+        "status": "executing_benchmark",
+        "custom_fields": {"benchmark_validations": {"records": {"val-788": record}}},
+    }
     calls = []
 
     class SSH:
@@ -75,24 +82,39 @@ def _crucible_fixture(tmp_path, monkeypatch, *, launch=None, run_result=None, ru
 
     monkeypatch.setattr(benchmark_server, "_ensure_init", ensure_init)
     monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
-    monkeypatch.setattr(benchmark_server, "_get_validated_runfile",
-                        lambda *_args: (record["run_file"], None))
+    monkeypatch.setattr(
+        benchmark_server,
+        "_get_validated_runfile",
+        lambda *_args: (record["run_file"], None),
+    )
 
     class Approval:
         status_code = 200
-        def __init__(self, *args, **kwargs): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def post(self, *args, **kwargs): return self
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, *args, **kwargs):
+            if "/transition" in str(url):
+                calls.append(("pause", kwargs.get("json", {})))
+            return self
 
     monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", Approval)
     return record, calls
 
 
 async def _execute():
-    return json.loads(await benchmark_server.execute_benchmark(
-        "controller", validation_id="val-788", approval_request_id="approval-1"
-    ))
+    return json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="val-788", approval_request_id="approval-1"
+        )
+    )
 
 
 def test_execution_intent_identity_is_stable_for_replay() -> None:
@@ -226,7 +248,9 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_execute_sequential_duplicate_replays_terminal_without_second_launch(tmp_path, monkeypatch):
+async def test_execute_sequential_duplicate_replays_terminal_without_second_launch(
+    tmp_path, monkeypatch
+):
     _, calls = _crucible_fixture(tmp_path, monkeypatch)
     first, second = await _execute(), await _execute()
     assert first["status"] == "completed"
@@ -259,50 +283,83 @@ async def test_execute_concurrent_workers_only_one_launches(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_execute_new_validation_attempt_launches_second_time(tmp_path, monkeypatch):
+async def test_execute_new_validation_attempt_launches_second_time(
+    tmp_path, monkeypatch
+):
     record, calls = _crucible_fixture(tmp_path, monkeypatch)
     first = await _execute()
     record["validation_id"] = "val-789"
     record["attempt_id"] = "attempt-2"
     record["execution_intent_id"] = "intent-2"
-    record["runfile_fingerprint"] = benchmark_server._runfile_fingerprint(record["run_file"])
-    monkeypatch.setattr(benchmark_server, "_get_validated_runfile",
-                        lambda *_args: (record["run_file"], None))
+    record["runfile_fingerprint"] = benchmark_server._runfile_fingerprint(
+        record["run_file"]
+    )
+    monkeypatch.setattr(
+        benchmark_server,
+        "_get_validated_runfile",
+        lambda *_args: (record["run_file"], None),
+    )
     # execute uses the ticket manifest only for resolution; swap its token too.
-    active = {"id": "T-788", "status": "executing_benchmark", "custom_fields": {
-        "benchmark_validations": {"records": {"val-789": record}}}}
-    async def active_check(**kwargs): return active
+    active = {
+        "id": "T-788",
+        "status": "executing_benchmark",
+        "custom_fields": {"benchmark_validations": {"records": {"val-789": record}}},
+    }
+
+    async def active_check(**kwargs):
+        return active
+
     monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
-    result = json.loads(await benchmark_server.execute_benchmark(
-        "controller", validation_id="val-789", approval_request_id="approval-2"))
+    result = json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="val-789", approval_request_id="approval-2"
+        )
+    )
     assert first["status"] == "completed"
     assert result["status"] == "completed"
     assert len([c for c in calls if c[0] == "launch"]) == 2
 
 
 @pytest.mark.asyncio
-async def test_execute_validation_rejection_has_zero_controller_mutation(tmp_path, monkeypatch):
+async def test_execute_validation_rejection_has_zero_controller_mutation(
+    tmp_path, monkeypatch
+):
     _, calls = _crucible_fixture(tmp_path, monkeypatch)
-    def invalid(*args): return None, "unknown validation token"
+
+    def invalid(*args):
+        return None, "unknown validation token"
+
     monkeypatch.setattr(benchmark_server, "_get_validated_runfile", invalid)
-    result = json.loads(await benchmark_server.execute_benchmark(
-        "controller", validation_id="bad", approval_request_id="approval-1"))
+    result = json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="bad", approval_request_id="approval-1"
+        )
+    )
     assert result["status"] == "rejected"
     assert not calls
 
 
 @pytest.mark.asyncio
-async def test_execute_prelaunch_controller_crash_is_takeover_safe(tmp_path, monkeypatch):
+async def test_execute_prelaunch_controller_crash_is_takeover_safe(
+    tmp_path, monkeypatch
+):
     _, calls = _crucible_fixture(tmp_path, monkeypatch)
+
     class CrashingSSH:
         async def copy_to(self, *args, **kwargs):
             calls.append(("copy_to", "crash"))
             raise ConnectionError("controller lost before launch")
-        async def run(self, *args, **kwargs): return _ControllerResult(stdout="GONE")
+
+        async def run(self, *args, **kwargs):
+            return _ControllerResult(stdout="GONE")
+
         async def run_with_progress(self, *args, **kwargs):
             calls.append(("launch", "must-not-run"))
             return _ControllerResult()
-    async def ensure(): benchmark_server._ssh = CrashingSSH()
+
+    async def ensure():
+        benchmark_server._ssh = CrashingSSH()
+
     monkeypatch.setattr(benchmark_server, "_ensure_init", ensure)
     result = await _execute()
     assert result["status"] == "indeterminate"
@@ -310,7 +367,9 @@ async def test_execute_prelaunch_controller_crash_is_takeover_safe(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_execute_postlaunch_crash_is_indeterminate_and_replay_never_relaunches(tmp_path, monkeypatch):
+async def test_execute_postlaunch_crash_is_indeterminate_and_replay_never_relaunches(
+    tmp_path, monkeypatch
+):
     _, calls = _crucible_fixture(
         tmp_path, monkeypatch, run_error=ConnectionError("lost response after launch")
     )
@@ -322,10 +381,16 @@ async def test_execute_postlaunch_crash_is_indeterminate_and_replay_never_relaun
     assert replay["existing_operation"] is True
     assert replay["operation"]["terminal_outcome"] == "indeterminate"
     assert len([c for c in calls if c[0] == "launch"]) == 1
+    assert any(
+        c[0] == "pause" and c[1]["status"] == "awaiting_customer_guidance"
+        for c in calls
+    )
 
 
 @pytest.mark.asyncio
-async def test_execute_mcp_reconnect_same_correlation_replays_without_launch(tmp_path, monkeypatch):
+async def test_execute_mcp_reconnect_same_correlation_replays_without_launch(
+    tmp_path, monkeypatch
+):
     _, calls = _crucible_fixture(tmp_path, monkeypatch)
     monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "session-788")
     monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "7")
@@ -340,10 +405,14 @@ async def test_execute_mcp_reconnect_same_correlation_replays_without_launch(tmp
 
 
 @pytest.mark.asyncio
-async def test_execute_terminal_failure_survives_restart_and_external_identity_is_durable(tmp_path, monkeypatch):
-    run_result = _ControllerResult(exit_code=1, stdout=
-        "Results stored in: /var/lib/crucible/run/uperf--12345678-1234-1234-1234-123456789abc\n",
-        stderr="benchmark failed")
+async def test_execute_terminal_failure_survives_restart_and_external_identity_is_durable(
+    tmp_path, monkeypatch
+):
+    run_result = _ControllerResult(
+        exit_code=1,
+        stdout="Results stored in: /var/lib/crucible/run/uperf--12345678-1234-1234-1234-123456789abc\n",
+        stderr="benchmark failed",
+    )
     _, calls = _crucible_fixture(tmp_path, monkeypatch, run_result=run_result)
     first = await _execute()
     assert first["status"] == "failed"

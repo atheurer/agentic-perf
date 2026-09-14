@@ -2169,6 +2169,32 @@ async def execute_benchmark(
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
 
+    async def pause_for_reconciliation(reason: str) -> None:
+        """Put ambiguous executions in the canonical human-guidance state."""
+        ticket_id = active_check.get("id") or os.environ.get("TICKET_ID", "")
+        if not ticket_id:
+            return
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": f"Benchmark execution is indeterminate: {reason}",
+                    },
+                )
+                if response.status_code >= 300:
+                    logger.warning(
+                        "Could not pause ticket %s for reconciliation", ticket_id
+                    )
+        except Exception:
+            logger.exception("Failed to pause ticket %s for reconciliation", ticket_id)
+
     if harness_name == "crucible":
         if run_file is not None:
             return json.dumps(
@@ -2352,9 +2378,27 @@ async def execute_benchmark(
             )
             await operation_guard.close()
             if isinstance(cached, dict):
+                _emit_context_audit_event(
+                    ticket_id,
+                    agent_name="benchmark-agent",
+                    phase="duplicate",
+                    benchmark=str(run_file.get("benchmark", "")),
+                    operation=intent_key,
+                    namespace="benchmark-execution",
+                    result={"status": "existing_operation"},
+                )
                 return json.dumps(
                     {**cached, "operation_id": intent_key, "existing_operation": True}
                 )
+            _emit_context_audit_event(
+                ticket_id,
+                agent_name="benchmark-agent",
+                phase="duplicate",
+                benchmark=str(run_file.get("benchmark", "")),
+                operation=intent_key,
+                namespace="benchmark-execution",
+                result={"status": "indeterminate"},
+            )
             return json.dumps(
                 {
                     "status": operation_record.get("terminal_outcome", "indeterminate"),
@@ -2368,6 +2412,15 @@ async def execute_benchmark(
             )
         if acquisition != "acquired":
             await operation_guard.close()
+            _emit_context_audit_event(
+                ticket_id,
+                agent_name="benchmark-agent",
+                phase="duplicate",
+                benchmark=str(run_file.get("benchmark", "")),
+                operation=intent_key,
+                namespace="benchmark-execution",
+                result={"status": "existing_operation"},
+            )
             return json.dumps(
                 {
                     "status": "rejected",
@@ -2387,6 +2440,7 @@ async def execute_benchmark(
                 operation_record, "indeterminate", {"outcome": "indeterminate"}
             )
             await operation_guard.close()
+            await pause_for_reconciliation("execution intent preparation failed")
             return json.dumps({"status": "indeterminate", "operation_id": intent_key})
 
     if approval_request_id:
@@ -2405,6 +2459,11 @@ async def execute_benchmark(
             else {}
         )
         if not ticket_id or not validation_id or not isinstance(record, dict):
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record, "fail", {"outcome": "approval_binding_missing"}
+                )
+                await operation_guard.close()
             return json.dumps(
                 {"status": "rejected", "reason_code": "approval_binding_missing"}
             )
@@ -3512,7 +3571,8 @@ async def execute_benchmark(
                 await operation_guard.close()
             return None
 
-    def maintenance_failure() -> str:
+    async def maintenance_failure() -> str:
+        await pause_for_reconciliation("controller maintenance outcome is ambiguous")
         return json.dumps(
             {
                 "status": "indeterminate",
@@ -3544,6 +3604,7 @@ async def execute_benchmark(
                     operation_record, "indeterminate", {"outcome": "indeterminate"}
                 )
                 await operation_guard.close()
+                await pause_for_reconciliation("launch boundary persistence failed")
                 return json.dumps(
                     {
                         "status": "indeterminate",
@@ -3562,6 +3623,7 @@ async def execute_benchmark(
                     {"outcome": "indeterminate", "error_type": type(exc).__name__},
                 )
                 await operation_guard.close()
+            await pause_for_reconciliation("run-file copy outcome is ambiguous")
             return json.dumps(
                 {
                     "status": "indeterminate",
@@ -3597,7 +3659,7 @@ async def execute_benchmark(
         " && podman stop crucible-valkey 2>/dev/null && echo STOPPED || echo OK",
     )
     if valkey_check is None:
-        return maintenance_failure()
+        return await maintenance_failure()
     if "STOPPED" in (valkey_check.stdout or ""):
         logger.info(
             f"[benchmark] Stopped stale crucible-valkey container on {controller}"
@@ -3618,7 +3680,7 @@ async def execute_benchmark(
         )
         is None
     ):
-        return maintenance_failure()
+        return await maintenance_failure()
     # Wait up to 30s for the container to be fully gone
     for _ in range(6):
         gone = await guarded_maintenance(
@@ -3626,7 +3688,7 @@ async def execute_benchmark(
             " && echo RUNNING || echo GONE",
         )
         if gone is None:
-            return maintenance_failure()
+            return await maintenance_failure()
         if "GONE" in (gone.stdout or ""):
             break
         import asyncio as _asyncio
@@ -3636,7 +3698,7 @@ async def execute_benchmark(
         "crucible start opensearch 2>&1", timeout=180
     )
     if start_result is None:
-        return maintenance_failure()
+        return await maintenance_failure()
     if "Successfully started OpenSearch" not in (start_result.stdout or ""):
         logger.warning(
             f"[benchmark] OpenSearch may not have started cleanly: "
@@ -3664,6 +3726,7 @@ async def execute_benchmark(
                 },
             )
             await operation_guard.close()
+        await pause_for_reconciliation("launch response was lost")
         raise
 
     run_dir = ""
@@ -3695,6 +3758,7 @@ async def execute_benchmark(
                 {"benchmark_result": response, "external_id_missing": True},
             )
             await operation_guard.close()
+        await pause_for_reconciliation("Crucible run identity was not returned")
         return json.dumps(response)
 
     # Persist the external identity before reading summaries or logs.  A lost
@@ -3718,6 +3782,9 @@ async def execute_benchmark(
                 },
             )
             await operation_guard.close()
+            await pause_for_reconciliation(
+                "external run identity could not be persisted"
+            )
             return json.dumps(
                 {
                     "status": "indeterminate",
@@ -3742,7 +3809,7 @@ async def execute_benchmark(
             timeout=30,
         )
         if summary_result is None:
-            return maintenance_failure()
+            return await maintenance_failure()
         if summary_result.exit_code == 0 and summary_result.stdout:
             try:
                 response["result_summary"] = json.loads(summary_result.stdout)
@@ -3762,7 +3829,7 @@ async def execute_benchmark(
                 timeout=60,
             )
             if log_result is None:
-                return maintenance_failure()
+                return await maintenance_failure()
             if log_result.exit_code == 0 and log_result.stdout:
                 response["run_log"] = log_result.stdout
     if result.exit_code != 0:
