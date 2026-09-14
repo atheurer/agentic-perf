@@ -396,9 +396,11 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
-            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON-returning "
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
-            "to slice and return the exact data in a single turn without multi-step querying."
+            "to slice and return the exact data in a single turn without multi-step querying. When a tool "
+            "declares `jq_filter` in its schema, such as `generate_chart_from_workspace`, the tool applies "
+            "the filter to its own input instead."
         )
         try:
             from providers.workspace.manager import WorkspaceManager
@@ -1109,6 +1111,10 @@ class AgentBase(ABC):
                         f"{submit_call.name} (iter {iteration})"
                     )
                     block_msg = self._should_block_submit(ticket_id)
+                    if not block_msg:
+                        block_msg = await self._validate_submit_call(
+                            ticket_id, submit_call
+                        )
                     if block_msg:
                         self._emit(
                             ticket_id,
@@ -1398,6 +1404,12 @@ class AgentBase(ABC):
         string to block, or None to allow the submit to proceed."""
         return None
 
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        """Override to validate submit payloads before completing an agent run."""
+        return None
+
     @staticmethod
     def _get_submit_result(response: LLMResponse) -> dict[str, Any] | None:
         for tc in response.tool_calls:
@@ -1546,6 +1558,9 @@ class AgentBase(ABC):
             "list_files_from_workspace",
             "read_document_from_workspace",
             "search_documents_from_workspace",
+            # Chart responses are compact control-plane metadata whose
+            # chart_ref must remain directly visible to the caller.
+            "generate_chart_from_workspace",
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
@@ -1697,6 +1712,9 @@ class AgentBase(ABC):
         )
         properties = tool_def.input_schema.get("properties", {}) if tool_def else {}
         if "jq_filter" in properties:
+            if "jq_filter" in call_input:
+                value = str(call_input["jq_filter"]).strip()
+                call_input["jq_filter"] = value or None
             return call_input, None
 
         jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
