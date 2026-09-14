@@ -107,6 +107,14 @@ class InvestigationRecordProvider(ABC):
         """
         ...
 
+    def record_url(self, investigation_id: str) -> str:
+        """Return a direct URL to the record in the backend.
+
+        Returns an empty string if the backend doesn't support
+        URLs (e.g., local file storage).
+        """
+        return ""
+
     async def close(self) -> None:
         """Release any held connections or resources."""
         pass
