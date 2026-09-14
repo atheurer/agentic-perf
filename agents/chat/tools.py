@@ -98,9 +98,9 @@ CHAT_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="create_ticket",
         description=(
-            "Create a new ticket. Always show the user the "
-            "ticket details and ask for confirmation before "
-            "calling this tool."
+            "Create a new ticket draft. The chat system shows "
+            "the draft and asks the user for conversational "
+            "confirmation before executing this tool."
         ),
         input_schema={
             "type": "object",
