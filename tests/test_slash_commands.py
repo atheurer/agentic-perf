@@ -197,7 +197,7 @@ class TestAgentBaseHITLTimeout:
         agent._get_ticket = AsyncMock(
             side_effect=[
                 {
-                    "status": "some_other_status",
+                    "status": "executing_benchmark",
                     "comments": [],
                 },  # initial call in _request_human_input
                 {
