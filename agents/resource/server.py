@@ -463,6 +463,7 @@ async def get_accumulated_metadata() -> str:
             "ssh_key_path",
             "reservation_id",
             "fresh_host",
+            "lease_expiration",
         }
     )
     for key, val in _last_reservation.items():

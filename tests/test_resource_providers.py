@@ -6,7 +6,9 @@ All tests use mocks — no real API calls.
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1780,3 +1782,47 @@ class TestGetBoardSelector:
             }
         }
         assert get_board_selector(ticket) == "board-type=rcar-s4"
+
+
+class TestStandardFieldExclusion:
+    """Verify standard reservation fields are excluded from
+    resource_provider_metadata (PR #745 regression)."""
+
+    def test_skip_keys_excludes_standard_fields(self):
+        """All standard reservation fields must be in _SKIP_KEYS."""
+        import importlib
+
+        import agents.resource.server as srv
+
+        importlib.reload(srv)
+        source = inspect.getsource(srv)
+        # Extract _SKIP_KEYS from source
+        match = re.search(
+            r"_SKIP_KEYS\s*=\s*frozenset\(\s*\{([^}]+)\}",
+            source,
+            re.DOTALL,
+        )
+        assert match, "_SKIP_KEYS not found in server.py"
+        skip_text = match.group(1)
+
+        required = {
+            "provider",
+            "hosts",
+            "matching_devices",
+            "requested",
+            "count",
+            "message",
+            "ssh_user",
+            "ssh_key_path",
+            "reservation_id",
+            "fresh_host",
+            "lease_expiration",
+            "provider_metadata",
+            "error",
+            "available",
+            "status",
+        }
+        for field in required:
+            assert f'"{field}"' in skip_text, (
+                f"Standard field '{field}' missing from _SKIP_KEYS"
+            )
