@@ -245,6 +245,8 @@ class BenchmarkAgent(AgentBase):
                 "validation_id": validation_id,
                 "presented_run_file_digest": digest,
                 "execution_intent_digest": intent,
+                "execution_intent_id": validation.get("execution_intent_id"),
+                "attempt_id": validation.get("attempt_id"),
                 "summary": summary or benchmark or "Benchmark run-file approval",
                 "invocation_id": str(approval_context.invocation_id)
                 if approval_context and approval_context.invocation_id
