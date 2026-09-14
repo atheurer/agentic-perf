@@ -283,13 +283,10 @@ async def check_available_resources(
         )
     result = await prov.check_available(requirements or {})
 
-    # Remember exporter_name for reserve_resources:
-    # - name= selector: check_available returns it
-    # - fleet: pick the first available device
+    # Fleet: remember the first available device so
+    # reserve_resources can target it by name.
     global _fleet_next_device
-    if result.get("exporter_name"):
-        _fleet_next_device = result["exporter_name"]
-    elif is_fleet_investigation(fresh_cf):
+    if is_fleet_investigation(fresh_cf):
         devices = result.get("devices", [])
         _fleet_next_device = devices[0]["name"] if devices else None
 

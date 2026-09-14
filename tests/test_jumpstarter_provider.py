@@ -245,8 +245,8 @@ class TestNameSelector:
     async def test_reserve_resolves_name_selector(self):
         exp = self._make_exporter("board-01", board_type="qc8775")
         provider = self._make_provider([exp])
-        # Mock CreateLease
-        mock_lease = MagicMock()
+        # Mock CreateLease — use spec to avoid spurious attributes
+        mock_lease = MagicMock(spec=["name"])
         mock_lease.name = "test-lease"
         provider._service.CreateLease = AsyncMock(
             return_value=mock_lease,
