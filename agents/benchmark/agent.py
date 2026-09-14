@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +222,10 @@ class BenchmarkAgent(AgentBase):
             # example configs) or running diagnostic SSH
             # commands instead of its one job.
             self._apply_tool_scoping(ticket)
+
+            # Install pre-call hook for deterministic
+            # Arcaflow deployer config injection.
+            _install_arcaflow_hook(mcp, ticket)
 
             ssh_key = ticket.get("custom_fields", {}).get("ssh_key_path")
             if ssh_key:
@@ -625,3 +631,192 @@ class BenchmarkAgent(AgentBase):
                     "awaiting_review",
                     comment=("Benchmark completed, ready for review"),
                 )
+
+
+# ── Arcaflow deployer config hook ────────────────────────
+
+_ARCAFLOW_CONNECTION_NAME = "arcaflow-target"
+
+
+def _build_deployer_config(
+    ticket: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build a deterministic Arcaflow deployer config from ticket data.
+
+    Returns None if the ticket doesn't have the required fields
+    (non-Arcaflow workflows).  The config uses a podman
+    connection to the target board over SSH.
+    """
+    cf = ticket.get("custom_fields", {})
+    ips = cf.get("assigned_hardware_ips", {})
+    controller_ip = ips.get("controller", "")
+    if not controller_ip:
+        return None
+
+    return {
+        "deployers": {
+            "image": {
+                "deployer_name": "podman",
+                "podman": {
+                    "path": "/usr/bin/podman",
+                    "connectionName": _ARCAFLOW_CONNECTION_NAME,
+                },
+            },
+        },
+    }
+
+
+async def _ensure_podman_connection(
+    ticket: dict[str, Any],
+) -> bool:
+    """Set up a podman system connection to the target board.
+
+    Creates (or replaces) a named connection pointing to the
+    board's SSH address.  Returns True on success.
+    """
+    cf = ticket.get("custom_fields", {})
+    ips = cf.get("assigned_hardware_ips", {})
+    controller_ip = ips.get("controller", "")
+    ssh_user = cf.get("ssh_user", "root")
+    ssh_key = cf.get("ssh_key_path", "")
+
+    if not controller_ip:
+        logger.warning("[arcaflow-hook] No controller IP on ticket")
+        return False
+
+    if not shutil.which("podman"):
+        logger.warning("[arcaflow-hook] podman not found in PATH")
+        return False
+
+    uri = f"ssh://{ssh_user}@{controller_ip}/run/podman/podman.sock"
+
+    # Remove stale connection (ignore errors).
+    await _run_cmd(
+        "podman",
+        "system",
+        "connection",
+        "remove",
+        _ARCAFLOW_CONNECTION_NAME,
+    )
+
+    cmd = [
+        "podman",
+        "system",
+        "connection",
+        "add",
+        _ARCAFLOW_CONNECTION_NAME,
+        uri,
+    ]
+    if ssh_key:
+        # Expand ~ for container paths.
+        resolved = ssh_key.replace("~", "/root")
+        cmd.extend(["--identity", resolved])
+
+    ok = await _run_cmd(*cmd)
+    if ok:
+        logger.info(
+            "[arcaflow-hook] Podman connection '%s' → %s",
+            _ARCAFLOW_CONNECTION_NAME,
+            uri,
+        )
+    else:
+        logger.error(
+            "[arcaflow-hook] Failed to create podman connection to %s",
+            controller_ip,
+        )
+    return ok
+
+
+async def _run_cmd(*args: str) -> bool:
+    """Run a command and return True on success."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.debug(
+                "[arcaflow-hook] %s → rc=%d: %s",
+                " ".join(args),
+                proc.returncode,
+                stderr.decode(errors="replace").strip(),
+            )
+            return False
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _install_arcaflow_hook(
+    mcp: AgentMCPClient,
+    ticket: dict[str, Any],
+) -> None:
+    """Install a pre-call hook that injects deployer config.
+
+    Intercepts ``workflow_execute`` calls and replaces the
+    LLM-provided ``deployer_config`` with a deterministic
+    config built from ticket data.  Also sets up the podman
+    SSH connection on first use.
+    """
+    directives = ticket.get("custom_fields", {}).get(
+        "directives",
+        {},
+    )
+    if not directives.get("workflow_source"):
+        # Not an Arcaflow ticket — no hook needed.
+        return
+
+    connection_ready = False
+
+    existing_hook = mcp.pre_call_hook
+
+    async def _hook(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> str | None:
+        nonlocal connection_ready
+
+        # Chain to any existing hook first.
+        if existing_hook is not None:
+            result = await existing_hook(name, arguments)
+            if result is not None:
+                return result
+
+        if name != "workflow_execute":
+            return None
+
+        # Ensure podman connection exists (once).
+        if not connection_ready:
+            connection_ready = await _ensure_podman_connection(
+                ticket,
+            )
+
+        if not connection_ready:
+            return json.dumps(
+                {
+                    "error": (
+                        "Failed to set up podman connection "
+                        "to the target board. Check that the "
+                        "board is provisioned and SSH is "
+                        "reachable."
+                    ),
+                }
+            )
+
+        # Replace deployer_config deterministically.
+        cfg = _build_deployer_config(ticket)
+        if cfg is not None:
+            arguments["deployer_config"] = cfg
+            logger.info(
+                "[arcaflow-hook] Injected deployer_config for workflow_execute",
+            )
+
+        # Return None to continue with the (modified) call.
+        return None
+
+    mcp.pre_call_hook = _hook
+    logger.info(
+        "[arcaflow-hook] Installed deployer config hook for Arcaflow ticket",
+    )

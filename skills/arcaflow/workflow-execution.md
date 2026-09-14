@@ -48,22 +48,17 @@ do NOT run the engine directly.
      source={kind: "git", location: "<workflow_source>"},
      selector={path: "<workflow_name>.yaml"},
      input={...},
-     deployer_config={
-       deployers: {
-         image: {
-           deployer_name: "podman",
-           podman: {
-             path: "/usr/bin/podman",
-             connection: {
-               host: "ssh://<ssh_user>@<controller_ip>"
-             }
-           }
-         }
-       }
-     }
+     deployer_config={}
    )
    ```
    This returns an `execution_id` immediately.
+
+   **Do NOT construct deployer_config.** Pass an empty
+   object — the system injects the correct deployer
+   configuration deterministically from the ticket's
+   assigned hardware (SSH user, IP, key). The engine
+   uses podman-over-SSH to run plugin containers on
+   the provisioned board.
 
 5. **Poll for completion:**
    ```
@@ -77,15 +72,17 @@ do NOT run the engine directly.
 
 ## Deployer Config
 
-The deployer config tells the engine how to run plugin
-containers on the target host. Build it from the ticket's
-assigned hardware:
+The deployer config is **code-enforced** — you do not
+need to build it. The system automatically:
 
-- `controller_ip`: from `assigned_hardware_ips.controller`
-- `ssh_user`: from ticket's `ssh_user` field
-- `ssh_key_path`: from ticket's `ssh_key_path` field
+- Reads the target IP from `assigned_hardware_ips.controller`
+- Reads `ssh_user` and `ssh_key_path` from the ticket
+- Sets up a podman SSH connection to the target board
+- Injects the correct deployer config into every
+  `workflow_execute` call
 
-Use podman as the deployer for bare-metal hosts.
+This prevents format errors and ensures plugins always
+run on the provisioned board, not locally.
 
 ## Source Resolution
 
@@ -99,6 +96,8 @@ Use podman as the deployer for bare-metal hosts.
   MCP's `workflow_execute` tool
 - Do NOT construct workflow YAML — the workflow comes
   from the user's `workflow_source`
+- Do NOT construct `deployer_config` — it is injected
+  automatically from ticket data
 - The `workflow_execute` call is async — it returns
   immediately. Poll `workflow_execution_status` for
   completion.
