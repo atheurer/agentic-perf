@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+import agents.benchmark.server as benchmark_server
+import agents.server_utils as server_utils
 from agents.benchmark.server import _benchmark_intent_identity, _BenchmarkOperation
 
 
@@ -60,3 +62,25 @@ async def test_terminal_write_failure_is_reclassified_indeterminate(
     monkeypatch.setattr(operation, "transition", transition)
     assert await operation.terminalize({}, "complete", {"result": "ok"})
     assert calls == ["complete", "indeterminate"]
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_invalid_validation_without_controller_mutation(
+    monkeypatch,
+) -> None:
+    async def no_init() -> None:
+        benchmark_server._ssh = type("Unused", (), {})()
+
+    async def active(**_kwargs: object) -> dict:
+        return {
+            "id": "T-4",
+            "status": "executing_benchmark",
+            "custom_fields": {"benchmark_validations": {"records": {}}},
+        }
+
+    monkeypatch.setattr(benchmark_server, "_ensure_init", no_init)
+    monkeypatch.setattr(server_utils, "assert_ticket_active", active)
+    result = await benchmark_server.execute_benchmark(
+        "controller", validation_id="missing", approval_request_id="approval"
+    )
+    assert '"status": "rejected"' in result

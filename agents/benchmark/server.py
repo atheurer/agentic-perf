@@ -3392,6 +3392,30 @@ async def execute_benchmark(
         )
 
     remote_path = f"/tmp/run-file-{run_uuid}.json"
+
+    async def guarded_maintenance(command: str, **kwargs: Any) -> Any:
+        """Convert any post-boundary controller failure into indeterminate."""
+        try:
+            return await _ssh.run(controller, command, **kwargs)
+        except Exception as exc:
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                )
+                await operation_guard.close()
+            return None
+
+    def maintenance_failure() -> str:
+        return json.dumps(
+            {
+                "status": "indeterminate",
+                "operation_id": intent_key if operation_guard else None,
+                "message": "Controller maintenance outcome is ambiguous; reconciliation required",
+            }
+        )
+
     if ticket_id:
         staging, staging_name, local_path = _write_ticket_staging_file(
             ticket_id, json.dumps(run_file, indent=2)
@@ -3448,12 +3472,13 @@ async def execute_benchmark(
         return json.dumps(response)
 
     # Stop stale valkey container if no run is active (crucible issue #607)
-    valkey_check = await _ssh.run(
-        controller,
+    valkey_check = await guarded_maintenance(
         "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-valkey"
         " && ! podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-rickshaw-run"
         " && podman stop crucible-valkey 2>/dev/null && echo STOPPED || echo OK",
     )
+    if valkey_check is None:
+        return maintenance_failure()
     if "STOPPED" in (valkey_check.stdout or ""):
         logger.info(
             f"[benchmark] Stopped stale crucible-valkey container on {controller}"
@@ -3468,24 +3493,31 @@ async def execute_benchmark(
     logger.info(
         f"[benchmark] Cycling OpenSearch on {controller} to ensure CDM server is fresh"
     )
-    await _ssh.run(
-        controller, "crucible stop opensearch 2>/dev/null || true", timeout=60
-    )
+    if (
+        await guarded_maintenance(
+            "crucible stop opensearch 2>/dev/null || true", timeout=60
+        )
+        is None
+    ):
+        return maintenance_failure()
     # Wait up to 30s for the container to be fully gone
     for _ in range(6):
-        gone = await _ssh.run(
-            controller,
+        gone = await guarded_maintenance(
             "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-opensearch"
             " && echo RUNNING || echo GONE",
         )
+        if gone is None:
+            return maintenance_failure()
         if "GONE" in (gone.stdout or ""):
             break
         import asyncio as _asyncio
 
         await _asyncio.sleep(5)
-    start_result = await _ssh.run(
-        controller, "crucible start opensearch 2>&1", timeout=180
+    start_result = await guarded_maintenance(
+        "crucible start opensearch 2>&1", timeout=180
     )
+    if start_result is None:
+        return maintenance_failure()
     if "Successfully started OpenSearch" not in (start_result.stdout or ""):
         logger.warning(
             f"[benchmark] OpenSearch may not have started cleanly: "
@@ -3586,11 +3618,12 @@ async def execute_benchmark(
         else f"Benchmark failed (exit {result.exit_code})",
     }
     if result.exit_code == 0 and run_dir:
-        summary_result = await _ssh.run(
-            controller,
+        summary_result = await guarded_maintenance(
             f"cat {run_dir}/run/result-summary.json",
             timeout=30,
         )
+        if summary_result is None:
+            return maintenance_failure()
         if summary_result.exit_code == 0 and summary_result.stdout:
             try:
                 response["result_summary"] = json.loads(summary_result.stdout)
@@ -3603,13 +3636,14 @@ async def execute_benchmark(
                 "is missing — the run did not produce results. "
                 "Read the run logs with get_run_logs to diagnose."
             )
-            log_result = await _ssh.run(
-                controller,
+            log_result = await guarded_maintenance(
                 f"test -f {run_dir}/crucible.log.xz"
                 f" && xzcat {run_dir}/crucible.log.xz | tail -c 50000"
                 f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c 50000",
                 timeout=60,
             )
+            if log_result is None:
+                return maintenance_failure()
             if log_result.exit_code == 0 and log_result.stdout:
                 response["run_log"] = log_result.stdout
     if result.exit_code != 0:
