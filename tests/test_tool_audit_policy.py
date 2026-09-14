@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import uuid
 from dataclasses import dataclass
@@ -1518,6 +1519,235 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
         assert len({event.action_id for event in name_events}) == 1
         assert name_events[0].parent_action_id
         assert name_events[0].tool_call_id.startswith("native-policy-")
+
+
+@pytest.mark.asyncio
+async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair() -> None:
+    """Exercise every agent-local tool through the canonical native dispatcher.
+
+    These are production agent instances, not a synthetic ``AgentBase``
+    subclass.  Their state-store methods are the deliberately narrow adapter:
+    each real completion handler computes its real fields/comments/transitions,
+    while the adapter records the resulting mutation instead of contacting a
+    service.  Resource metadata is intentionally a schema relay to its MCP
+    server (there is no local handler), so its production ``_mcp.call_tool``
+    branch is exercised rather than misrepresenting it as a local closure.
+    """
+    from agents.base import AgentBase
+    from agents.benchmark.agent import BenchmarkAgent
+    from agents.provisioning.agent import ProvisioningAgent
+    from agents.resource.agent import ResourceAgent
+    from agents.retrospective.agent import RetrospectiveAgent
+    from agents.review.agent import ReviewAgent
+    from agents.triage.agent import TriageAgent
+    from providers.llm.base import LLMResponse, ToolCall
+
+    class SafeMCP:
+        def __init__(self, effects: list[tuple[str, object]]) -> None:
+            self.effects = effects
+
+        async def call_tool(
+            self, name: str, arguments: dict[str, object], **_kwargs: object
+        ) -> str:
+            self.effects.append((f"mcp:{name}", arguments))
+            return "{}"
+
+    async def exercise(
+        agent: AgentBase,
+        *,
+        names: tuple[str, ...],
+        relay_names: tuple[str, ...] = (),
+    ) -> tuple[list[object], list[object]]:
+        effects: list[object] = []
+        events: list[object] = []
+        ticket = {
+            "id": "PERF-policy",
+            "summary": "policy fixture",
+            "description": "policy fixture",
+            "status": "triaging",
+            "custom_fields": {"global_max_iterations_override": 8},
+        }
+        # The benchmark approval handler is a real native closure whose
+        # effect is an approval request followed by a bounded approval poll.
+        # Provide its immutable record and a transport-shaped in-process
+        # state-store adapter, so the installed handler takes its successful
+        # path without creating a ticket or touching a host.
+        if isinstance(agent, BenchmarkAgent):
+            run_file: dict[str, object] = {}
+            ticket["custom_fields"]["benchmark_validations"] = {
+                "records": {
+                    "policy-validation": {
+                        "validation_id": "policy-validation",
+                        "execution_intent_digest": "policy-intent",
+                        "execution_intent_id": "policy-intent-id",
+                        "run_file": run_file,
+                        "runfile_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+                    }
+                }
+            }
+
+            class Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self.payload = payload
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, object]:
+                    return self.payload
+
+            async def post_approval(url: str, **kwargs: object) -> Response:
+                effects.append(("approval_post", (url, kwargs)))
+                return Response({"approval_request_id": "policy-approval"})
+
+            async def get_approval(url: str, **_kwargs: object) -> Response:
+                effects.append(("approval_get", url))
+                return Response(
+                    {
+                        "approvals": [
+                            {
+                                "approval_request_id": "policy-approval",
+                                "status": "approved",
+                            }
+                        ]
+                    }
+                )
+
+            async def close_client() -> None:
+                return None
+
+            agent._client = SimpleNamespace(
+                headers={}, post=post_approval, get=get_approval, aclose=close_client
+            )
+            agent._HITL_POLL_INTERVAL = 0
+        calls = []
+        for index, name in enumerate(names, start=1):
+            definition = next(tool for tool in agent.tools if tool.name == name)
+            argument = _schema_fixture(definition.input_schema)
+            assert isinstance(argument, dict), name
+            if name == "present_runfile_for_approval":
+                argument["validation_id"] = "policy-validation"
+            calls.append(
+                ToolCall(id=f"native-real-{index}", name=name, input=argument)
+            )
+        responses = [
+            LLMResponse(
+                text=None,
+                tool_calls=[call],
+                stop_reason="tool_use",
+                raw_content=[],
+            )
+            for call in calls
+        ]
+
+        async def complete(**_kwargs: object) -> LLMResponse:
+            return responses.pop(0)
+
+        agent.llm = SimpleNamespace(complete=AsyncMock(side_effect=complete))
+        agent._tool_min_interval = 0
+        agent._ticket_id = "PERF-policy"  # type: ignore[attr-defined]
+        agent._trace = TraceRecorder(client=SimpleNamespace(record=events.append))
+        agent._system_prompt = lambda _ticket: "policy fixture"  # type: ignore[method-assign]
+        agent._build_messages = lambda _ticket: [  # type: ignore[method-assign]
+            {"role": "user", "content": "policy fixture"}
+        ]
+
+        async def get_ticket(_ticket_id: str) -> dict[str, object]:
+            return ticket
+
+        async def human_input(_ticket_id: str, question: str) -> str:
+            effects.append(("human_input", question))
+            return "policy guidance"
+
+        async def update_fields(_ticket_id: str, fields: dict[str, object]) -> None:
+            effects.append(("update_fields", fields))
+
+        async def add_comment(_ticket_id: str, comment: str) -> None:
+            effects.append(("add_comment", comment))
+
+        async def transition(
+            _ticket_id: str, status: str, **_kwargs: object
+        ) -> None:
+            effects.append(("transition", status))
+
+        async def no_plan_control(_ticket_id: str) -> bool:
+            return False
+
+        async def no_interjection(_ticket_id: str) -> None:
+            return None
+
+        agent._get_ticket = get_ticket  # type: ignore[method-assign]
+        agent._request_human_input = human_input  # type: ignore[method-assign]
+        agent._update_fields = update_fields  # type: ignore[method-assign]
+        agent._add_comment = add_comment  # type: ignore[method-assign]
+        agent._transition_ticket = transition  # type: ignore[method-assign]
+        agent._plan_controls_next_transition = no_plan_control  # type: ignore[method-assign]
+        agent._check_interject = no_interjection  # type: ignore[method-assign]
+        agent._check_drift = lambda: None  # type: ignore[method-assign]
+        agent._get_previous_iteration_counts = lambda _ticket_id: (0, 0)  # type: ignore[method-assign]
+        if relay_names:
+            agent._mcp = SafeMCP(effects)  # type: ignore[assignment]
+        try:
+            # Deliberately call the base implementation: production agent
+            # ``run`` overrides only connect its MCP transports, while this
+            # is the exact native dispatch loop all of them share.
+            await AgentBase.run(agent, "PERF-policy")
+        finally:
+            await agent.close()
+
+        for name in names:
+            lifecycle = [
+                event.lifecycle.state
+                for event in events
+                if event.action.type == ActionType.TOOL and event.action.phase == name
+            ]
+            assert lifecycle == [
+                LifecycleState.PROPOSED,
+                LifecycleState.STARTED,
+                LifecycleState.COMPLETED,
+            ], name
+        for name in relay_names:
+            assert (f"mcp:{name}", {}) in effects
+        return events, effects
+
+    llm = SimpleNamespace(complete=AsyncMock())
+    submitted = (
+        (BenchmarkAgent(llm, "http://state-store.invalid"), "submit_benchmark_result"),
+        (ProvisioningAgent(llm, "http://state-store.invalid"), "submit_provisioning_result"),
+        (ResourceAgent(llm, "http://state-store.invalid"), "submit_resource_result"),
+        (RetrospectiveAgent(llm, "http://state-store.invalid"), "submit_retrospective"),
+        (ReviewAgent(llm, "http://state-store.invalid"), "submit_review_result"),
+        (TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()), "submit_triage_result"),
+    )
+    for agent, submit_name in submitted:
+        _, effects = await exercise(agent, names=(submit_name,))
+        assert any(effect[0] == "update_fields" for effect in effects)
+        assert any(effect[0] == "transition" for effect in effects)
+
+    for agent, submit_name in (
+        (BenchmarkAgent(llm, "http://state-store.invalid"), "submit_benchmark_result"),
+        (ProvisioningAgent(llm, "http://state-store.invalid"), "submit_provisioning_result"),
+        (ReviewAgent(llm, "http://state-store.invalid"), "submit_review_result"),
+        (TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()), "submit_triage_result"),
+    ):
+        _, effects = await exercise(
+            agent, names=("request_clarification", submit_name)
+        )
+        assert any(effect[0] == "human_input" for effect in effects)
+
+    _, effects = await exercise(
+        BenchmarkAgent(llm, "http://state-store.invalid"),
+        names=("present_runfile_for_approval", "submit_benchmark_result"),
+    )
+    assert any(effect[0] == "approval_post" for effect in effects)
+    assert any(effect[0] == "approval_get" for effect in effects)
+
+    _, effects = await exercise(
+        ResourceAgent(llm, "http://state-store.invalid"),
+        names=("get_accumulated_metadata", "submit_resource_result"),
+        relay_names=("get_accumulated_metadata",),
+    )
+    assert any(effect[0] == "mcp:get_accumulated_metadata" for effect in effects)
 
 
 @pytest.mark.asyncio
