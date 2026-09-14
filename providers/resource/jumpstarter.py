@@ -15,7 +15,7 @@ Configuration via ~/.agentic-perf/secrets/jumpstarter/config.json:
         "token": "...",
         "namespace": "jumpstarter-lab",
         "default_selector": "",
-        "default_lease_duration_seconds": 7200,
+        "default_lease_duration_seconds": 14400,
         "ssh_user": "root",
         "tls_insecure": true
     }
@@ -84,7 +84,7 @@ class JumpstarterResourceProvider(ResourceProvider):
         config_path: Path | None = None,
         namespace: str = "",
         default_selector: str = "",
-        default_lease_duration: int = 7200,
+        default_lease_duration: int = 14400,
         ssh_user: str = "root",
     ) -> None:
         self._client_name = client_name
@@ -149,7 +149,7 @@ class JumpstarterResourceProvider(ResourceProvider):
             config_path=config_path,
             namespace=cfg.get("namespace", ""),
             default_selector=cfg.get("default_selector", ""),
-            default_lease_duration=cfg.get("default_lease_duration_seconds", 7200),
+            default_lease_duration=cfg.get("default_lease_duration_seconds", 14400),
             ssh_user=cfg.get("ssh_user", "root"),
         )
 

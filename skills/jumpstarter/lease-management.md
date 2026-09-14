@@ -2,9 +2,11 @@
 
 ## Lease Duration
 
-Jumpstarter leases have a maximum duration set by the controller
-(typically 2 hours). Plan benchmark sample counts to fit within
-the available lease time.
+Jumpstarter leases have a configurable duration. The resource
+agent requests a duration based on the workload (default 4 hours).
+The provisioning system passes this duration through to the
+lease context. Plan benchmark sample counts to fit within the
+allocated lease time.
 
 ### Boot-time harness timing
 

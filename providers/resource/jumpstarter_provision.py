@@ -46,6 +46,12 @@ class ProvisionResult:
     serial_log_path: str = ""
 
 
+# Default lease duration for provisioning (seconds).
+# Used when the resource agent's allocated duration is
+# not passed through.
+_DEFAULT_PROVISION_DURATION_S = 14400  # 4 hours
+
+
 async def provision_jumpstarter(
     lease_name: str,
     flash_url: str | dict[str, str],
@@ -56,6 +62,7 @@ async def provision_jumpstarter(
     selector: str = "",
     serial_capture: bool = False,
     artifact_dir: str = "",
+    lease_duration_seconds: int = _DEFAULT_PROVISION_DURATION_S,
 ) -> ProvisionResult:
     """Run the deterministic flash + boot + verify sequence.
 
@@ -77,6 +84,9 @@ async def provision_jumpstarter(
             during provisioning via jmp serial pipe.
         artifact_dir: Directory for serial log. Falls
             back to a temp file if empty.
+        lease_duration_seconds: Duration for the lease
+            context. Should match the resource agent's
+            allocation. Defaults to 4 hours.
 
     Returns:
         ProvisionResult with success/failure and diagnostics.
@@ -145,6 +155,7 @@ async def provision_jumpstarter(
             board_name,
             client_config_path,
             selector,
+            lease_duration_seconds,
         )
         result = prov_result
     except Exception as exc:
@@ -196,6 +207,7 @@ def _provision_sync(
     board_name: str,
     client_config_path: str,
     selector: str = "",
+    lease_duration_seconds: int = _DEFAULT_PROVISION_DURATION_S,
 ) -> ProvisionResult:
     """Synchronous provisioning — runs in executor thread.
 
@@ -212,6 +224,7 @@ def _provision_sync(
         board_name,
         client_config_path,
         selector,
+        lease_duration_seconds,
     )
 
 
@@ -222,6 +235,7 @@ async def _provision_async(
     board_name: str,
     client_config_path: str,
     selector: str = "",
+    lease_duration_seconds: int = _DEFAULT_PROVISION_DURATION_S,
 ) -> ProvisionResult:
     """Async provisioning using the Jumpstarter SDK."""
     from anyio.from_thread import BlockingPortal
@@ -251,7 +265,7 @@ async def _provision_async(
             selector=None if lease_name else (selector or None),
             exporter_name=None,
             lease_name=lease_name,
-            duration=timedelta(hours=2),
+            duration=timedelta(seconds=lease_duration_seconds),
             portal=portal,
         ) as lease:
             result.board_name = getattr(lease, "exporter_name", "") or board_name

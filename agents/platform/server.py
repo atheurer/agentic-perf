@@ -176,16 +176,25 @@ async def _provision_jumpstarter(
 
             artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
 
-    result = await provision_jumpstarter(
-        lease_name=lease_id,
-        flash_url=flash_url,
-        ssh_public_key=ssh_public_key,
-        ssh_key_path=ssh_key_path,
-        board_name=board_name,
-        selector=selector,
-        serial_capture=serial_enabled,
-        artifact_dir=artifact_dir,
-    )
+    # Pass through the lease duration from the resource
+    # agent's allocation.  Prevents the hardcoded default
+    # from shortening longer leases.
+    lease_duration = metadata.get("duration_seconds", 0)
+
+    provision_kwargs: dict[str, Any] = {
+        "lease_name": lease_id,
+        "flash_url": flash_url,
+        "ssh_public_key": ssh_public_key,
+        "ssh_key_path": ssh_key_path,
+        "board_name": board_name,
+        "selector": selector,
+        "serial_capture": serial_enabled,
+        "artifact_dir": artifact_dir,
+    }
+    if lease_duration:
+        provision_kwargs["lease_duration_seconds"] = lease_duration
+
+    result = await provision_jumpstarter(**provision_kwargs)
 
     return json.dumps(
         {
