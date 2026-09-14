@@ -79,6 +79,9 @@ class TestCanPauseForGuidance:
     def test_valid_from_triage_pending(self) -> None:
         assert AgentBase._can_pause_for_guidance("triage_pending") is True
 
+    def test_valid_when_already_awaiting_guidance(self) -> None:
+        assert AgentBase._can_pause_for_guidance("awaiting_customer_guidance") is True
+
     def test_invalid_from_retrospective_pending(self) -> None:
         assert AgentBase._can_pause_for_guidance("retrospective_pending") is False
 

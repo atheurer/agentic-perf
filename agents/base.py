@@ -1877,11 +1877,13 @@ class AgentBase(ABC):
 
     @staticmethod
     def _can_pause_for_guidance(status: str) -> bool:
-        """Check if awaiting_customer_guidance is reachable from *status*."""
+        """Check if the ticket can enter or remain in the guidance pause."""
         try:
             current = TicketStatus(status)
         except ValueError:
             return False
+        if current is TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
+            return True
         targets = VALID_TRANSITIONS.get(current, [])
         return TicketStatus.AWAITING_CUSTOMER_GUIDANCE in targets
 
