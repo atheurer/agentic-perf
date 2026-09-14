@@ -8,6 +8,30 @@ The global `--store-url URL` option must appear before the command. It
 overrides the state store address (default: `http://localhost:8090`) and can
 also be set with `STATE_STORE_URL`.
 
+## trace
+
+Query or export an authenticated causal trace:
+
+```text
+python3 cli.py trace TICKET_ID [--causal|--tree] [selectors]
+python3 cli.py trace --ticket-id TICKET_ID --export --format jsonl --output trace.jsonl
+```
+
+Selectors include `--trace-id`, `--action/--action-id`, `--invocation`,
+`--type`, `--outcome`, `--parent`, `--producer`, `--since`, `--until`,
+`--retry-kind`, `--idempotency-outcome`, `--lifecycle-state`, `--cursor`,
+`--limit`, and `--include-payloads`. Output may be human-readable, `--json`,
+or `--jsonl`; `--export` supports `--format json|jsonl|csv` and `--output`.
+For a positional ticket ID, causal tree rendering is the default and includes
+ancestry, attempts/replays, producer and MCP identities, durations, external
+targets, errors, and disconnected/missing-parent/cyclic incomplete components.
+
+Trace access uses the configured bearer token. Owner principals receive
+redacted data and no payload blob references; detailed authorized principals
+may request verified payloads. Export files contain a manifest with
+continuation metadata and an `event_content_digest` over the canonical event
+body excluding the manifest.
+
 ## submit
 
 Create a new test ticket and start the pipeline.

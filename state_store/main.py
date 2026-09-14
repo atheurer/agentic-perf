@@ -428,6 +428,27 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
         finally:
             reset_trace_context(token)
 
+    @app.middleware("http")
+    async def audit_trace_auth_attempt(request: Request, call_next):
+        """Audit trace reads rejected before route dependencies run."""
+        response = await call_next(request)
+        if request.url.path.endswith(
+            ("/traces/query", "/traces/export")
+        ) and response.status_code in (401, 429):
+            audit_log = getattr(request.app.state, "audit_log", None)
+            if audit_log is not None:
+                operation = (
+                    "trace_export"
+                    if request.url.path.endswith("/export")
+                    else "trace_query"
+                )
+                audit_log.log(
+                    operation,
+                    request.query_params.get("ticket_id") or "*",
+                    {"outcome": "denied", "error": "authentication rejected"},
+                )
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def count_trace_schema_rejections(
         request: Request, exc: RequestValidationError

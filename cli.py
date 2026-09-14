@@ -1035,6 +1035,119 @@ def cmd_transcript(args):
     _render_transcript(events, ticket, agent_filter=args.agent)
 
 
+def cmd_trace(args):
+    """Query or export the authenticated causal trace projection."""
+    client, _url = get_client(args)
+    params = {
+        key: value
+        for key, value in {
+            "ticket_id": args.ticket_id or args.ticket_id_option,
+            "trace_id": args.trace_id,
+            "action_id": args.action_id,
+            "invocation_id": args.invocation,
+            "action_type": args.action_type,
+            "outcome": args.outcome,
+            "parent_action_id": args.parent_action_id,
+            "producer_component": args.producer_component,
+            "since": args.since,
+            "until": args.until,
+            "retry_kind": args.retry_kind,
+            "idempotency_outcome": args.idempotency_outcome,
+            "lifecycle_state": args.lifecycle_state,
+            "causal": args.causal or args.tree or bool(args.ticket_id),
+            "include_payloads": args.include_payloads,
+            "limit": args.limit,
+            "cursor": args.cursor,
+        }.items()
+        if value is not None
+    }
+    endpoint = "/api/v1/traces/export" if args.export else "/api/v1/traces/query"
+    if args.export:
+        params["format"] = args.format
+        params["manifest"] = "true"
+    response = client.get(endpoint, params=params)
+    response.raise_for_status()
+    if args.export:
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as stream:
+                stream.write(response.text)
+        else:
+            print(response.text, end="" if response.text.endswith("\n") else "\n")
+        return
+    payload = response.json()
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+    elif args.jsonl:
+        for event in payload.get("events", []):
+            print(json.dumps(event, separators=(",", ":")))
+    else:
+        events = payload.get("events", [])
+        if args.tree or args.ticket_id or args.ticket_id_option:
+            children = {}
+            for event in events:
+                children.setdefault(event.get("parent_action_id"), []).append(event)
+
+            visited = set()
+
+            def render(event, depth=0):
+                action_id = event.get("action_id")
+                if action_id in visited:
+                    print(f"{'  ' * depth}[cycle] action={action_id}")
+                    return
+                visited.add(action_id)
+                action = event.get("action", {})
+                life = event.get("lifecycle", {})
+                producer = event.get("producer", {})
+                mcp = event.get("mcp", {})
+                error = event.get("error") or {}
+                external = action.get("target") or action.get("target_type") or "-"
+                print(
+                    f"{'  ' * depth}{action.get('type', '?')} "
+                    f"{life.get('state', '?')} attempt={life.get('attempt', 1)} "
+                    f"retry={life.get('retry_kind', 'none')} "
+                    f"replay_of={life.get('replay_of_action_id') or '-'} "
+                    f"action={event.get('action_id', '?')} "
+                    f"duration={event.get('duration_ms') or 0}ms external={external} "
+                    f"process={producer.get('process_start_id') or '-'} "
+                    f"session={mcp.get('session_id') or '-'} "
+                    f"request={mcp.get('protocol_request_id') or '-'} "
+                    f"correlation={mcp.get('correlation_request_id') or '-'}"
+                    + (
+                        f" error={error.get('message') or error.get('code')}"
+                        if error
+                        else ""
+                    )
+                )
+                for child in children.get(event.get("action_id"), []):
+                    render(child, depth + 1)
+
+            roots = [event for event in events if not event.get("parent_action_id")]
+            roots.extend(
+                event
+                for event in events
+                if event.get("parent_action_id")
+                and event.get("parent_action_id") not in children
+            )
+            for event in roots:
+                render(event)
+            for event in events:
+                if event.get("action_id") not in visited:
+                    print("[incomplete component]")
+                    render(event)
+            diagnostics = payload.get("diagnostics") or {}
+            if any(diagnostics.values()):
+                print(
+                    f"incomplete diagnostics: {json.dumps(diagnostics, sort_keys=True)}"
+                )
+            return
+        for event in payload.get("events", []):
+            action = event.get("action", {})
+            producer = event.get("producer", {})
+            print(
+                f"{event.get('global_seq', '?'):>6} {action.get('type', '?'):12} {event.get('lifecycle', {}).get('state', '?'):16} action={event.get('action_id', '?')} parent={event.get('parent_action_id') or '-'} duration={event.get('duration_ms') or 0}ms process={producer.get('process_start_id') or '-'} session={event.get('mcp', {}).get('session_id') or '-'}"
+            )
+
+
 def cmd_health(args):
     client, url = get_client(args)
     r = client.get("/api/v1/health")
@@ -1367,6 +1480,43 @@ def main():
     p_transcript.add_argument(
         "--json", action="store_true", help="Output raw events as JSON"
     )
+
+    p_trace = sub.add_parser("trace", help="Query or export causal trace events")
+    p_trace.add_argument("ticket_id", nargs="?", help="Ticket ID")
+    p_trace.add_argument("--ticket-id", dest="ticket_id_option")
+    p_trace.add_argument("--trace-id", help="Restrict results to a trace")
+    p_trace.add_argument(
+        "--action",
+        "--action-id",
+        dest="action_id",
+        help="Restrict results to an action",
+    )
+    p_trace.add_argument("--invocation")
+    p_trace.add_argument("--type", dest="action_type")
+    p_trace.add_argument("--outcome")
+    p_trace.add_argument("--parent", dest="parent_action_id")
+    p_trace.add_argument("--producer", dest="producer_component")
+    p_trace.add_argument("--since")
+    p_trace.add_argument("--until")
+    p_trace.add_argument("--retry-kind")
+    p_trace.add_argument("--idempotency-outcome")
+    p_trace.add_argument("--lifecycle-state")
+    p_trace.add_argument(
+        "--causal", action="store_true", help="Include ancestors and descendants"
+    )
+    p_trace.add_argument("--tree", action="store_true")
+    p_trace.add_argument("--include-payloads", action="store_true")
+    p_trace.add_argument("--limit", type=int, default=1000)
+    p_trace.add_argument("--cursor", default=None)
+    p_trace.add_argument(
+        "--json", action="store_true", help="Print query response as JSON"
+    )
+    p_trace.add_argument("--jsonl", action="store_true")
+    p_trace.add_argument(
+        "--export", action="store_true", help="Export instead of querying"
+    )
+    p_trace.add_argument("--format", choices=("json", "jsonl", "csv"), default="json")
+    p_trace.add_argument("--output", help="Write export to a file")
     p_transcript.add_argument(
         "--agent", help="Filter to a single agent (e.g. triage-agent)"
     )
@@ -1496,6 +1646,7 @@ def main():
         "stop": cmd_stop,
         "stop-all": cmd_stop_all,
         "transcript": cmd_transcript,
+        "trace": cmd_trace,
         "health": cmd_health,
         "archive": cmd_archive,
         "cleanup": cmd_cleanup,
