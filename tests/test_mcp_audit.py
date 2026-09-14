@@ -438,18 +438,39 @@ async def test_ticket_mcp_fails_closed_without_audit_transport():
 
 
 @pytest.mark.asyncio
-async def test_protected_terminal_audit_failure_marks_operation_indeterminate():
-    """A lost MCP terminal is visible to replay/reconciliation, never silent."""
-    transitions = []
-    registry = SimpleNamespace(
-        operation_acquire=lambda *_: {
-            "status": "acquired",
-            "operation": {"fencing_generation": 1},
-        },
-        operation_transition=lambda key, action, token, **kwargs: transitions.append(
-            (key, action, token, kwargs)
-        ),
-    )
+async def test_protected_terminal_audit_failure_marks_real_operation_indeterminate(
+    tmp_path,
+):
+    """A lost terminal trace cannot leave a real operation terminal-success."""
+
+    class StoreBackedRegistry:
+        """Minimal service-client facade backed by the production TraceStore."""
+
+        def __init__(self, store: TraceStore) -> None:
+            self.store = store
+            self.owner = "test-service"
+
+        def operation_acquire(self, key: str, request_hash: str, ttl: float) -> dict:
+            operation, status = self.store.acquire_operation_result(
+                key, request_hash, self.owner, ttl
+            )
+            return {"status": status, "operation": operation.__dict__}
+
+        def operation_transition(
+            self, key: str, action: str, token: int, **kwargs
+        ) -> dict:
+            descriptor = kwargs.get("descriptor") or {}
+            operation = {
+                "prepared": self.store.mark_prepared,
+                "side-effect-started": self.store.mark_side_effect_started,
+                "complete": lambda *args: self.store.complete(*args, descriptor),
+                "fail": lambda *args: self.store.fail(*args, descriptor),
+                "indeterminate": lambda *args: self.store.mark_indeterminate(
+                    *args, descriptor
+                ),
+            }[action](key, self.owner, token)
+            return {"operation": operation.__dict__}
+
     event_count = 0
 
     def record(_event):
@@ -458,27 +479,40 @@ async def test_protected_terminal_audit_failure_marks_operation_indeterminate():
         if event_count == 2:
             raise OSError("trace service unavailable")
 
-    middleware = MCPAuditMiddleware(
-        "benchmark-agent", ticket_id="PERF-1", agent_id="benchmark", record=record
-    )
-    middleware._client = registry
-    request = _request("terminal-loss")
-    request.message.meta.model_extra["agentic-perf"].update(
-        {"idempotency_key": "terminal-loss", "idempotency_request_hash": "hash"}
-    )
-    with pytest.raises(McpError, match="outcome is indeterminate"):
-        await middleware.on_call_tool(
-            request.copy(
-                message=request.message.model_copy(update={"name": "execute_benchmark"})
-            ),
-            AsyncMock(return_value=ToolResult(content="effect happened")),
+    with TraceStore(tmp_path / "trace.db") as store:
+        middleware = MCPAuditMiddleware(
+            "benchmark-agent",
+            ticket_id="PERF-1",
+            agent_id="benchmark",
+            record=record,
         )
-    assert [transition[1] for transition in transitions] == [
-        "prepared",
-        "side-effect-started",
-        "complete",
-        "indeterminate",
-    ]
+        middleware._client = StoreBackedRegistry(store)
+        request = _request("terminal-loss")
+        request.message.meta.model_extra["agentic-perf"].update(
+            {"idempotency_key": "terminal-loss", "idempotency_request_hash": "hash"}
+        )
+        with pytest.raises(McpError, match="outcome is indeterminate"):
+            await middleware.on_call_tool(
+                request.copy(
+                    message=request.message.model_copy(
+                        update={"name": "execute_benchmark"}
+                    )
+                ),
+                AsyncMock(return_value=ToolResult(content="effect happened")),
+            )
+        operation = store.get_operation("terminal-loss")
+        assert operation is not None
+        assert operation.state == "terminal"
+        assert operation.terminal_outcome == "indeterminate"
+        assert [
+            entry["reason"] for entry in store.operation_history("terminal-loss")
+        ] == [
+            "registered",
+            "lease_acquired",
+            "prepared",
+            "side_effect_started",
+            "terminal",
+        ]
 
 
 @pytest.mark.asyncio

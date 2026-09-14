@@ -644,14 +644,6 @@ class MCPAuditMiddleware(Middleware):
         finally:
             reset_trace_context(token)
         result = self._sanitize_result(trace, result)
-        if lease is not None:
-            descriptor = self._result_descriptor(trace, result)
-            self._client.operation_transition(
-                trace.idempotency_key or "",
-                "fail" if getattr(result, "is_error", False) else "complete",
-                int(lease["fencing_generation"]),
-                descriptor=descriptor,
-            )
         terminal_state = (
             LifecycleState.FAILED
             if getattr(result, "is_error", False)
@@ -670,6 +662,35 @@ class MCPAuditMiddleware(Middleware):
             ),
             lease=lease,
         )
+        # A protected operation must not become a durable success/failure
+        # before its correlated terminal audit has been acknowledged.  If the
+        # audit write above fails, ``_emit_terminal`` can still transition the
+        # live side-effect-started operation to indeterminate.  Reversing this
+        # order would leave an immutable terminal success behind after a lost
+        # terminal trace and make the loss invisible to replay/reconciliation.
+        if lease is not None:
+            descriptor = self._result_descriptor(trace, result)
+            try:
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
+                    "fail" if getattr(result, "is_error", False) else "complete",
+                    int(lease["fencing_generation"]),
+                    descriptor=descriptor,
+                )
+            except Exception as operation_error:
+                # The trace is durable but we do not know whether the terminal
+                # operation acknowledgement was lost before or after commit.
+                # Do not return a success/failure result in that ambiguity;
+                # preserve the side-effect-started record for reconciliation.
+                raise McpError(
+                    ErrorData(
+                        code=-32000,
+                        message=(
+                            "MCP tool outcome is indeterminate; operation terminal "
+                            "was not acknowledged"
+                        ),
+                    )
+                ) from operation_error
         return result
 
 

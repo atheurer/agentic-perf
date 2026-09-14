@@ -188,6 +188,10 @@ TOOL_AUDIT_POLICY = (
         "providers.resource.jumpstarter_lifecycle",
         "agents/platform/server.py:provision_platform",
     ),
+    *_side_effecting(
+        "state_store.ticket_transition",
+        "agents/platform/server.py:request_clarification",
+    ),
     *_read_only(
         "agents/provisioning/server.py:check_platform_contract",
         "agents/provisioning/server.py:check_host_prerequisites",
@@ -261,6 +265,20 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "providers.workspace.manager.WorkspaceManager",
         "agents/workspace/server.py:generate_chart_from_workspace",
+    ),
+    *_read_only(
+        "agents/workspace/tools.py:jq_file_from_workspace",
+        "agents/workspace/tools.py:grep_file_from_workspace",
+        "agents/workspace/tools.py:read_file_from_workspace",
+        "agents/workspace/tools.py:list_files_from_workspace",
+        "agents/workspace/tools.py:read_document_from_workspace",
+        "agents/workspace/tools.py:search_documents_from_workspace",
+        native=True,
+    ),
+    *_side_effecting(
+        "providers.workspace.manager.WorkspaceManager",
+        "agents/workspace/tools.py:generate_chart_from_workspace",
+        native=True,
     ),
     *_read_only(
         "agents/base.py:jq_file_from_workspace",

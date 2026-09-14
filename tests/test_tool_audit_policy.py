@@ -276,32 +276,14 @@ def _mcp_registrations() -> tuple[set[Registration], list[str]]:
 
 
 def _native_registrations() -> set[Registration]:
-    """Discover every native LLM surface, including the chat-only dispatcher."""
-    base_path = ROOT / "agents/base.py"
-    tree = ast.parse(base_path.read_text(encoding="utf-8"), filename="agents/base.py")
-    registrations: set[Registration] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        keys = [key.value for key in node.keys if isinstance(key, ast.Constant)]
-        if not keys or not all(isinstance(key, str) for key in keys):
-            continue
-        # The native workspace registration map is the only literal dict in
-        # AgentBase containing the canonical workspace tool names.
-        if "jq_file_from_workspace" not in keys:
-            continue
-        for key in keys:
-            registrations.add(
-                Registration(
-                    key=f"agents/base.py:{key}",
-                    path="agents/base.py",
-                    function="_register_workspace_tools",
-                    line=node.lineno,
-                    kind="native",
-                )
-            )
+    """Discover every native LLM surface in every production agent module.
 
-    for path in sorted(SERVER_ROOT.rglob("agent.py")):
+    Do not limit this to ``*/agent.py``: native ``ToolDefinition`` collections
+    are deliberately allowed beside servers and helpers, and a filename rule
+    would let a new unclassified capability evade the CI contract.
+    """
+    registrations: set[Registration] = set()
+    for path in sorted(SERVER_ROOT.rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
         module = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         for node in ast.walk(module):
@@ -325,11 +307,19 @@ def _native_registrations() -> set[Registration]:
                             kind="native",
                         )
                     )
+        # Native maps may be assigned in a constructor or method, not just a
+        # module-level ``local_handlers`` name.  Inspect every dict attached to
+        # a ``*_handlers`` target and require its literal advertised names to
+        # participate in the same manifest as ToolDefinition declarations.
         for node in ast.walk(module):
             if not (
                 isinstance(node, ast.Assign)
                 and any(
-                    isinstance(target, ast.Name) and target.id == "local_handlers"
+                    (isinstance(target, ast.Name) and target.id.endswith("handlers"))
+                    or (
+                        isinstance(target, ast.Attribute)
+                        and target.attr.endswith("handlers")
+                    )
                     for target in node.targets
                 )
                 and isinstance(node.value, ast.Dict)
@@ -341,7 +331,7 @@ def _native_registrations() -> set[Registration]:
                         Registration(
                             key=f"{relative}:{key.value}",
                             path=relative,
-                            function="local_handlers",
+                            function="native_handlers",
                             line=node.lineno,
                             kind="native",
                         )
