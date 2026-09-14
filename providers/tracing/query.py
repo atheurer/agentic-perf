@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import hashlib
 import io
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable
 
 from .models import TraceEventV1
@@ -34,6 +36,57 @@ class TraceQuery:
     causal: bool = False
     limit: int = 1000
     cursor: int = 0
+
+
+def _ordering_key(event: TraceEventV1) -> tuple[int, int | str, str]:
+    """Return an immutable ordering key, including a legacy-event fallback."""
+    if event.global_seq is not None:
+        return (0, event.global_seq, str(event.event_id))
+    occurred = event.occurred_at.astimezone(timezone.utc).isoformat()
+    return (1, occurred, str(event.event_id))
+
+
+def encode_cursor(event: TraceEventV1) -> str:
+    """Encode the last ordering key as an opaque continuation cursor."""
+    key = _ordering_key(event)
+    raw = json.dumps(key, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> tuple[int, int | str, str] | None:
+    if not cursor:
+        return None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if not isinstance(value, list) or len(value) != 3:
+            raise ValueError
+        return (int(value[0]), value[1], str(value[2]))
+    except (
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        UnicodeError,
+        binascii.Error,
+    ) as exc:
+        raise ValueError("invalid trace cursor") from exc
+
+
+def page_events(
+    events: Iterable[TraceEventV1], *, cursor: str | None, limit: int
+) -> tuple[list[TraceEventV1], bool, str | None]:
+    """Page a complete ordered scope without ordinal insert races."""
+    ordered = sorted(events, key=_ordering_key)
+    marker = decode_cursor(cursor)
+    if marker is not None:
+        ordered = [event for event in ordered if _ordering_key(event) > marker]
+    selected = ordered[:limit]
+    has_more = len(ordered) > len(selected)
+    return (
+        selected,
+        has_more,
+        encode_cursor(selected[-1]) if has_more and selected else None,
+    )
 
 
 def query_events(
@@ -247,5 +300,6 @@ def export_manifest(
         "content_digest_algorithm": "sha256-utf8",
         "content_digest": hashlib.sha256(content.encode()).hexdigest(),
         # Kept as an alias for consumers of the initial PR contract.
-        "export_digest": hashlib.sha256(content.encode()).hexdigest(),
+        "event_content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "digest_scope": "canonical event body excluding manifest",
     }

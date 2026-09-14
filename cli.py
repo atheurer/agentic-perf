@@ -1490,7 +1490,7 @@ def main():
     p_trace.add_argument("--tree", action="store_true")
     p_trace.add_argument("--include-payloads", action="store_true")
     p_trace.add_argument("--limit", type=int, default=1000)
-    p_trace.add_argument("--cursor", type=int, default=0)
+    p_trace.add_argument("--cursor", default=None)
     p_trace.add_argument(
         "--json", action="store_true", help="Print query response as JSON"
     )

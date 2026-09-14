@@ -13,6 +13,7 @@ from providers.tracing.query import (
     diagnostics,
     export_events,
     export_manifest,
+    page_events,
     query_events,
 )
 
@@ -48,7 +49,7 @@ def test_export_formats_are_stable() -> None:
     content = export_events([event], "jsonl")
     manifest = export_manifest([event], content)
     assert manifest["count"] == 1
-    assert len(manifest["export_digest"]) == 64
+    assert len(manifest["event_content_digest"]) == 64
 
 
 def test_manifest_only_lists_resolvable_blob_references() -> None:
@@ -102,3 +103,25 @@ def test_query_scope_can_exceed_ten_thousand_events() -> None:
     result = query_events(events, TraceQuery(limit=20_000))
     assert len(result) == 10_001
     assert result[-1].global_seq is None
+
+
+def test_cursor_continuation_survives_interleaved_insert_and_legacy_events() -> None:
+    first = TraceEventV1(
+        ticket_id="PERF-page",
+        global_seq=1,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    second = first.model_copy(update={"global_seq": 2, "action_id": "2" * 16})
+    legacy = first.model_copy(update={"global_seq": None, "action_id": "3" * 16})
+    page, more, cursor = page_events([first, second], cursor=None, limit=1)
+    assert more and cursor
+    inserted = first.model_copy(update={"global_seq": 3, "action_id": "4" * 16})
+    continuation, _, _ = page_events(
+        [first, second, inserted, legacy], cursor=cursor, limit=10
+    )
+    assert [event.action_id for event in continuation] == [
+        second.action_id,
+        inserted.action_id,
+        legacy.action_id,
+    ]

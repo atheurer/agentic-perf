@@ -17,6 +17,7 @@ from providers.tracing.query import (
     diagnostics,
     export_events,
     export_manifest,
+    page_events,
     query_events,
 )
 
@@ -158,7 +159,7 @@ def query(
     producer_component: str | None = None,
     causal: bool = False,
     limit: int = Query(default=1000, ge=1, le=10000),
-    cursor: int = Query(default=0, ge=0),
+    cursor: str | None = None,
     include_payloads: bool = False,
 ) -> dict[str, object]:
     try:
@@ -189,16 +190,18 @@ def query(
         cursor=0,
     )
     all_selected = query_events(raw_events, base_query)
-    # Cursor is a stable ordinal in the fully filtered, globally ordered scope;
-    # this remains usable for legacy events without global_seq.
-    selected = all_selected[cursor : cursor + limit]
-    has_more = cursor + len(selected) < len(all_selected)
+    try:
+        selected, has_more, next_cursor = page_events(
+            all_selected, cursor=cursor, limit=limit
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "events": [
             _event_json(event, detailed and include_payloads) for event in selected
         ],
         "count": len(selected),
-        "next_cursor": cursor + len(selected) if has_more else None,
+        "next_cursor": next_cursor,
         "has_more": has_more,
         "diagnostics": diagnostics(all_selected) if causal else {},
     }
@@ -223,7 +226,7 @@ def export(
     until: datetime | None = None,
     causal: bool = False,
     limit: int = Query(default=10000, ge=1, le=10000),
-    cursor: int = Query(default=0, ge=0),
+    cursor: str | None = None,
     include_payloads: bool = False,
     manifest: bool = False,
 ) -> Response:
@@ -254,9 +257,15 @@ def export(
             until=until,
             causal=causal,
             limit=max(len(raw_events), limit),
-            cursor=cursor,
+            cursor=0,
         ),
     )
+    try:
+        selected, _has_more, _next_cursor = page_events(
+            selected, cursor=cursor, limit=limit
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     verified_blob_refs = _verified_blob_refs(selected)
     media = (
         "text/csv"
@@ -315,7 +324,7 @@ def ticket_trace(
     since: datetime | None = None,
     until: datetime | None = None,
     causal: bool = False,
-    cursor: int = Query(0, ge=0),
+    cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
@@ -358,7 +367,7 @@ def invocation_trace(
     since: datetime | None = None,
     until: datetime | None = None,
     causal: bool = False,
-    cursor: int = Query(0, ge=0),
+    cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
@@ -401,7 +410,7 @@ def action_trace(
     since: datetime | None = None,
     until: datetime | None = None,
     causal: bool = False,
-    cursor: int = Query(0, ge=0),
+    cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
