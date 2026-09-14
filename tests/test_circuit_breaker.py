@@ -503,6 +503,14 @@ def _mock_client(ticket_id, custom_fields=None):
     return client
 
 
+def _circuit_breaker_events(event_bus, ticket_id):
+    return [
+        event
+        for event in event_bus.get_events(ticket_id, since=0, limit=100_000)
+        if event.get("event_type") == "circuit_breaker"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_system_message_injected_after_threshold(tmp_path):
     """After 3 consecutive failures, a [SYSTEM] message is appended."""
@@ -523,12 +531,7 @@ async def test_system_message_injected_after_threshold(tmp_path):
 
     await agent.run(ticket_id)
 
-    jsonl = (log_dir / f"{ticket_id}.jsonl").read_text()
-    cb_events = [
-        json.loads(line)
-        for line in jsonl.strip().split("\n")
-        if json.loads(line).get("event_type") == "circuit_breaker"
-    ]
+    cb_events = _circuit_breaker_events(event_bus, ticket_id)
     assert len(cb_events) >= 1
     assert cb_events[0]["data"]["tool"] == "retrieve_results"
     assert cb_events[0]["data"]["consecutive"] == 3
@@ -607,12 +610,7 @@ async def test_max_trips_caps_injections(tmp_path):
 
     await agent.run(ticket_id)
 
-    jsonl = (log_dir / f"{ticket_id}.jsonl").read_text()
-    cb_events = [
-        json.loads(line)
-        for line in jsonl.strip().split("\n")
-        if json.loads(line).get("event_type") == "circuit_breaker"
-    ]
+    cb_events = _circuit_breaker_events(event_bus, ticket_id)
     assert len(cb_events) == 1
 
 
@@ -641,12 +639,7 @@ async def test_disabled_no_injection(tmp_path):
 
     await agent.run(ticket_id)
 
-    jsonl = (log_dir / f"{ticket_id}.jsonl").read_text()
-    cb_events = [
-        json.loads(line)
-        for line in jsonl.strip().split("\n")
-        if json.loads(line).get("event_type") == "circuit_breaker"
-    ]
+    cb_events = _circuit_breaker_events(event_bus, ticket_id)
     assert len(cb_events) == 0
 
 
@@ -675,12 +668,7 @@ async def test_exempt_tool_not_tripped(tmp_path):
 
     await agent.run(ticket_id)
 
-    jsonl = (log_dir / f"{ticket_id}.jsonl").read_text()
-    cb_events = [
-        json.loads(line)
-        for line in jsonl.strip().split("\n")
-        if json.loads(line).get("event_type") == "circuit_breaker"
-    ]
+    cb_events = _circuit_breaker_events(event_bus, ticket_id)
     assert len(cb_events) == 0
 
 
@@ -744,7 +732,7 @@ async def test_no_files_found_payload_triggers(tmp_path):
                 ),
             ]
 
-        async def _execute_tool(self, tool_call):
+        async def _execute_tool(self, tool_call, **kwargs):
             return ToolResult(
                 tool_use_id=tool_call.id,
                 content=no_files_payload,
@@ -763,11 +751,6 @@ async def test_no_files_found_payload_triggers(tmp_path):
 
     await agent.run(ticket_id)
 
-    jsonl = (log_dir / f"{ticket_id}.jsonl").read_text()
-    cb_events = [
-        json.loads(line)
-        for line in jsonl.strip().split("\n")
-        if json.loads(line).get("event_type") == "circuit_breaker"
-    ]
+    cb_events = _circuit_breaker_events(event_bus, ticket_id)
     assert len(cb_events) >= 1
     assert cb_events[0]["data"]["tool"] == "retrieve_results"
