@@ -509,6 +509,33 @@ class _BenchmarkOperation:
         if self._local is not None:
             self._local.close()
 
+    async def terminalize(
+        self,
+        operation: dict[str, Any],
+        outcome: str,
+        descriptor: dict[str, Any],
+    ) -> bool:
+        """Persist a terminal outcome; retry ambiguous writes as indeterminate."""
+        try:
+            await self.transition(outcome, operation, descriptor=descriptor)
+            return True
+        except Exception:
+            logger.exception("benchmark operation terminal write failed")
+            if outcome != "indeterminate":
+                try:
+                    await self.transition(
+                        "indeterminate",
+                        operation,
+                        descriptor={
+                            "outcome": "indeterminate",
+                            "terminal_write_failed": True,
+                        },
+                    )
+                    return True
+                except Exception:
+                    logger.exception("benchmark operation indeterminate write failed")
+            return False
+
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
@@ -2077,6 +2104,44 @@ async def execute_benchmark(
         expected_status="executing_benchmark",
     )
     if active_check.get("status") == "rejected":
+        # A terminal replay is safe even after the ticket has advanced or
+        # paused. Resolve it before enforcing the current execution status so
+        # reconnects can retrieve the durable result without relaunching.
+        ticket_id = os.environ.get("TICKET_ID", "")
+        fields = _ticket.get("custom_fields", {}) if _ticket else {}
+        records = fields.get("benchmark_validations", {}).get("records", {})
+        replay_record = records.get(validation_id, {}) if validation_id else {}
+        if validation_id and isinstance(replay_record, dict):
+            replay_key, replay_hash, _ = _benchmark_intent_identity(
+                ticket_id,
+                validation_id,
+                replay_record,
+                controller,
+                harness or "crucible",
+                replay_record.get("run_command", "crucible run"),
+            )
+            replay_guard = _BenchmarkOperation(
+                replay_key,
+                replay_hash,
+                os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+            )
+            try:
+                replay_operation, replay_status = await replay_guard.acquire()
+                if replay_status == "terminal":
+                    descriptor = replay_operation.get("result_descriptor") or {}
+                    cached = descriptor.get("benchmark_result") or descriptor.get(
+                        "result"
+                    )
+                    if isinstance(cached, dict):
+                        return json.dumps(
+                            {
+                                **cached,
+                                "operation_id": replay_key,
+                                "existing_operation": True,
+                            }
+                        )
+            finally:
+                await replay_guard.close()
         return json.dumps(active_check)
     if (
         active_check.get("id") or os.environ.get("TICKET_ID")
@@ -2306,6 +2371,12 @@ async def execute_benchmark(
             "execute_benchmark",
         )
 
+    # The validated Crucible path below is the only path with a durable
+    # validation lifecycle and controller-side reconciliation identity.  The
+    # legacy harness branches still perform side effects directly; they are
+    # intentionally not advertised as idempotent until their own validation
+    # records and safe external identity queries exist.  MCP middleware still
+    # prevents duplicate delivery, but cannot safely replay a lost launch.
     if harness_name == "kube-burner":
         try:
             import yaml
@@ -3335,8 +3406,10 @@ async def execute_benchmark(
             "message": f"Failed to copy run-file: {scp_result.stderr}",
         }
         if operation_guard and operation_owned:
-            await operation_guard.transition(
-                "fail", operation_record, descriptor={"benchmark_result": response}
+            await operation_guard.terminalize(
+                operation_record,
+                "fail",
+                {"benchmark_result": response},
             )
             await operation_guard.close()
             response["operation_id"] = intent_key
@@ -3399,9 +3472,9 @@ async def execute_benchmark(
         )
     except Exception as exc:
         if operation_guard and operation_owned:
-            await operation_guard.transition(
-                "indeterminate",
+            await operation_guard.terminalize(
                 operation_record,
+                "indeterminate",
                 descriptor={
                     "outcome": "indeterminate",
                     "error_type": type(exc).__name__,
@@ -3428,11 +3501,30 @@ async def execute_benchmark(
     # response after this point is therefore reconciled by identity rather
     # than replaying the launch command.
     if operation_guard and operation_owned and (run_id or run_dir):
-        await operation_guard.transition(
-            "external-id",
-            operation_record,
-            external_ids={"run_id": run_id, "run_dir": run_dir},
-        )
+        try:
+            await operation_guard.transition(
+                "external-id",
+                operation_record,
+                external_ids={"run_id": run_id, "run_dir": run_dir},
+            )
+        except Exception as exc:
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {
+                    "outcome": "indeterminate",
+                    "external_id_persist_failed": True,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await operation_guard.close()
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key,
+                    "message": "External benchmark identity could not be persisted; reconciliation required",
+                }
+            )
 
     response = {
         "status": "completed" if result.exit_code == 0 else "failed",
@@ -3475,10 +3567,10 @@ async def execute_benchmark(
         response["output"] = result.stdout[-3000:] if result.stdout else ""
         response["error"] = result.stderr[-1000:] if result.stderr else ""
     if operation_guard and operation_owned:
-        await operation_guard.transition(
-            "complete" if response["status"] == "completed" else "fail",
+        await operation_guard.terminalize(
             operation_record,
-            descriptor={"benchmark_result": response},
+            "complete" if response["status"] == "completed" else "fail",
+            {"benchmark_result": response},
         )
         await operation_guard.close()
         response["operation_id"] = intent_key

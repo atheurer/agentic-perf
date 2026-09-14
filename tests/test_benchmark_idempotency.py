@@ -42,3 +42,21 @@ async def test_operation_claims_once_and_caches_terminal_result(
     assert status == "terminal"
     assert cached["result_descriptor"]["benchmark_result"]["status"] == "completed"
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_failure_is_reclassified_indeterminate(
+    monkeypatch,
+) -> None:
+    operation = _BenchmarkOperation("benchmark-execution:T-3:val-1", "hash", "worker")
+    calls: list[str] = []
+
+    async def transition(action: str, _record: dict, **_kwargs: object) -> dict:
+        calls.append(action)
+        if action == "complete":
+            raise RuntimeError("lost terminal acknowledgement")
+        return {}
+
+    monkeypatch.setattr(operation, "transition", transition)
+    assert await operation.terminalize({}, "complete", {"result": "ok"})
+    assert calls == ["complete", "indeterminate"]
