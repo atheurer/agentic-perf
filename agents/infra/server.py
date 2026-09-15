@@ -160,7 +160,13 @@ async def set_ssh_context(ticket_id: str) -> str:
             resolve_ssh_key(ssh_key, sp, vault_secret_name),
         )
 
-    _ssh = SSHExecutor(user=ssh_user, key_path=resolved_key, strict_host_key=strict)
+    from agents.server_utils import make_traced_ssh
+
+    _ssh = make_traced_ssh(
+        user=ssh_user,
+        key_path=resolved_key,
+        strict_host_key=strict,
+    )
 
     return json.dumps(
         {

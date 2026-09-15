@@ -1324,6 +1324,35 @@ async def build_ssh_from_ticket(
     ), ticket
 
 
+def make_traced_ssh(
+    user: str = "root",
+    key_path: str | None = None,
+    strict_host_key: str = "accept-new",
+) -> Any:
+    """Create an SSHExecutor with trace recorder.
+
+    Use this instead of bare SSHExecutor() for any
+    ticket-scoped SSH to satisfy the audited execution
+    trace readiness requirement.
+    """
+    from providers.ssh import SSHExecutor
+    from providers.tracing import current_trace_context
+    from providers.tracing.client import TraceClient
+
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    url = os.environ.get("STATE_STORE_URL", "")
+    recorder = TraceClient(url, token) if url and token else None
+    context = current_trace_context()
+
+    return SSHExecutor(
+        user=user,
+        key_path=key_path,
+        strict_host_key=strict_host_key,
+        trace_context=context,
+        trace_recorder=recorder,
+    )
+
+
 async def tool_progress(
     message: str,
     tool_name: str,

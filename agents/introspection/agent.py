@@ -37,7 +37,9 @@ from providers.tracing import (
     LifecycleState,
     OperationOutcome,
     TraceRecorder,
+    bind_trace_context,
     new_trace_context,
+    reset_trace_context,
     trace_headers,
 )
 from state_store.models import TERMINAL_STATUSES as _MODEL_TERMINAL
@@ -149,6 +151,31 @@ class IntrospectionAgent:
     async def close(self) -> None:
         """Clean up HTTP client."""
         await self._client.aclose()
+
+    async def _patch_fields(
+        self,
+        ticket_id: str,
+        fields: dict,
+    ) -> None:
+        """PATCH ticket fields with a bound trace context.
+
+        The introspection agent is not dispatched per-ticket,
+        so it must bind a synthetic trace context before
+        making mutating HTTP calls.
+        """
+        token = bind_trace_context(
+            new_trace_context(
+                ticket_id=ticket_id,
+                agent_id="introspection",
+            )
+        )
+        try:
+            await self._client.patch(
+                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
+                json={"fields": fields},
+            )
+        finally:
+            reset_trace_context(token)
 
     async def run(self, ticket_id: str) -> None:
         """Continuously observe a ticket until it reaches a terminal state.
@@ -591,11 +618,9 @@ class IntrospectionAgent:
             )
 
         try:
-            await self._client.patch(
-                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {"introspection_summary": summary},
-                },
+            await self._patch_fields(
+                ticket_id,
+                {"introspection_summary": summary},
             )
             logger.info(f"[introspection] Final summary written for {ticket_id}")
         except Exception:
@@ -948,9 +973,9 @@ class IntrospectionAgent:
     ) -> None:
         """Write observation to ticket custom_fields."""
         try:
-            await self._client.patch(
-                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={"fields": {"introspection": observation}},
+            await self._patch_fields(
+                ticket_id,
+                {"introspection": observation},
             )
         except Exception:
             logger.debug(
@@ -991,13 +1016,9 @@ class IntrospectionAgent:
         # successful persistence so transient failures allow
         # retry on the next poll cycle.
         try:
-            await self._client.patch(
-                f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {
-                        "guidance_summary": summary,
-                    }
-                },
+            await self._patch_fields(
+                ticket_id,
+                {"guidance_summary": summary},
             )
             self._guidance_produced = True
         except Exception:
