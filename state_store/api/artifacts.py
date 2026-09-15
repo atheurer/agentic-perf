@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-import uuid
+import tarfile
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -11,11 +12,6 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from paths import ARTIFACT_DIR
-from providers.execution import (
-    AuditedFilesystem,
-    RootedPath,
-    durable_filesystem_emitter,
-)
 
 router = APIRouter(
     prefix="/tickets/{ticket_id}/artifacts",
@@ -110,32 +106,21 @@ def download_archive(ticket_id: str):
             detail=f"No artifacts for ticket {ticket_id}",
         )
 
-    filesystem = AuditedFilesystem(
-        RootedPath(ARTIFACT_DIR, "artifact"),
-        ticket_id=ticket_id,
-        emit=durable_filesystem_emitter(),
-        critical=True,
-    )
-    export_name = f"{ticket_id}/.exports/{uuid.uuid4().hex}.tar.gz"
+    tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
     try:
-        members = [
-            f"{ticket_id}/{path.relative_to(artifact_dir)}"
-            for path in artifact_dir.rglob("*")
-            if path.is_file() and ".exports" not in path.relative_to(artifact_dir).parts
-        ]
-        archive_path = filesystem.archive(export_name, members)
+        with tarfile.open(fileobj=tmp, mode="w:gz") as tar:
+            for f in artifact_dir.rglob("*"):
+                if f.is_file():
+                    arcname = f"{ticket_id}/{f.relative_to(artifact_dir)}"
+                    tar.add(str(f), arcname=arcname)
+        tmp.close()
 
         return FileResponse(
-            path=archive_path,
+            path=tmp.name,
             filename=f"{ticket_id}-artifacts.tar.gz",
             media_type="application/gzip",
-            background=BackgroundTask(filesystem.unlink, export_name, missing_ok=True),
+            background=BackgroundTask(Path(tmp.name).unlink, missing_ok=True),
         )
-    except Exception as primary:
-        try:
-            filesystem.unlink(export_name, missing_ok=True)
-        except Exception as cleanup_error:
-            primary.add_note(
-                f"artifact export cleanup failed: {type(cleanup_error).__name__}"
-            )
+    except Exception:
+        Path(tmp.name).unlink(missing_ok=True)
         raise

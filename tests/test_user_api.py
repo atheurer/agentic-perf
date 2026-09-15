@@ -17,9 +17,7 @@ def _make_multi_user_app(tmp_path, *, token_ttl_days: int = 0):
     from state_store.main import mount_routers
 
     app = (
-        create_app.__wrapped__(initialize_immediately=True)
-        if hasattr(create_app, "__wrapped__")
-        else create_app(initialize_immediately=True)
+        create_app.__wrapped__() if hasattr(create_app, "__wrapped__") else create_app()
     )
 
     token = app.state.api_token

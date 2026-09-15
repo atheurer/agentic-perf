@@ -48,14 +48,9 @@ directive uses Jumpstarter label syntax:
 | "SA8775P", "Qualcomm Ride4", "8775" | `board-type=qc8775` |
 | "SA8650P", "8650" | `board-type=qc8650` |
 
-To target a specific board instance, use `name=<exporter>`:
-- `name=nxp-s32g-vnp-rdb3-01`
-- `name=qti-snapdragon-ride4-sa8775p-23`
-
-When a specific board is requested but unavailable, the
-system reports why (leased, offline, disabled) and suggests
-alternative boards of the same type. Do not retry
-indefinitely — escalate to the user if the board is in use.
+To target a specific board instance, use `device=<name>`:
+- `device=nxp-s32g-vnp-rdb3-01`
+- `device=qti-snapdragon-ride4-sa8775p-23`
 
 ## OS Image Servers
 

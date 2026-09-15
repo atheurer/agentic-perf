@@ -4,9 +4,8 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..auth import Principal, require_write_access
 from ..models import AddCommentRequest
-from ..store import ClaimFenceError, TicketNotFound
+from ..store import TicketNotFound
 from .action_hints import after_comment
-from .fencing import mutation_fence
 
 router = APIRouter(prefix="/tickets", tags=["comments"])
 
@@ -34,20 +33,7 @@ def add_comment(ticket_id: str, body: AddCommentRequest, request: Request):
     if multi_user and principal.kind == "user":
         body = AddCommentRequest(author=principal.username, body=body.body)
 
-    session_id, epoch, claim_id = mutation_fence(request)
-    try:
-        comment = store.add_comment(
-            ticket_id,
-            body,
-            session_id=session_id,
-            epoch=epoch,
-            claim_id=claim_id,
-        )
-    except ClaimFenceError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={"reason": e.reason, "message": str(e)},
-        ) from e
+    comment = store.add_comment(ticket_id, body)
     result = comment.model_dump(mode="json")
 
     ticket = store.get_ticket(ticket_id)

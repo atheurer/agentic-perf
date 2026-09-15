@@ -90,22 +90,3 @@ The final route behavior, Pydantic schemas, and exact status codes are always
 the live OpenAPI document. Routes used only by orchestrator/admin control are
 marked by their purpose above; clients should prefer ticket/list/detail,
 events, artifacts, transitions, comments, and stop APIs.
-
-## Trace query and export
-
-Trace projections are available at `/traces/query`, `/traces/export`,
-`/traces/tickets/{id}`, `/traces/invocations/{id}`, and
-`/traces/actions/{id}`. Common selectors are `ticket_id`, `trace_id`,
-`invocation_id`, `action_id`, `parent_action_id`, `action_type`,
-`lifecycle_state`, `outcome`, `producer_component`, `retry_kind`,
-`idempotency_outcome`, `since`, `until`, `causal`, `limit`, `cursor`, and
-`include_payloads`. Query and export continuation responses expose
-`has_more` and opaque `next_cursor` values.
-
-Export `format` may be `json`, `jsonl`, or `csv`. Every export body and the
-`X-Trace-Manifest` header carries a manifest, including continuation metadata
-and `event_content_digest`: SHA-256 over the canonical event body excluding
-the manifest wrapper. Trace reads require authentication plus service/admin or
-ticket ownership authorization. Owner responses are redacted and omit blob
-references/digests; only authorized detailed principals may retrieve an
-existing, verified `sha256:<64 lowercase hex>` payload blob.

@@ -14,10 +14,11 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from agents.mcp_audit import create_ticket_mcp
+from fastmcp import FastMCP
+
 from providers.llm.base import ToolDefinition
 
-mcp = create_ticket_mcp("evaluate-agent")
+mcp = FastMCP("evaluate-agent")
 
 
 @mcp.tool()

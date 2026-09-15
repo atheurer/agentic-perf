@@ -56,7 +56,6 @@ async def provision_jumpstarter(
     selector: str = "",
     serial_capture: bool = False,
     artifact_dir: str = "",
-    ticket_id: str = "",
 ) -> ProvisionResult:
     """Run the deterministic flash + boot + verify sequence.
 
@@ -95,46 +94,25 @@ async def provision_jumpstarter(
     serial_proc = None
     serial_log_fh = None
     serial_log_path = ""
-    serial_filesystem = None
 
     if serial_capture and lease_name:
         if artifact_dir:
-            if ticket_id:
-                from providers.execution import (
-                    AuditedFilesystem,
-                    RootedPath,
-                    durable_filesystem_emitter,
-                )
-
-                serial_filesystem = AuditedFilesystem(
-                    RootedPath(
-                        artifact_dir, "artifact", logical_prefix="platform-provision"
-                    ),
-                    ticket_id=ticket_id,
-                    emit=durable_filesystem_emitter(),
-                    critical=True,
-                )
+            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
             serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
         else:
             import tempfile
 
             serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
         try:
-            serial_log_fh = (
-                serial_filesystem.open_stream("serial-capture.log")
-                if serial_filesystem
-                else open(serial_log_path, "wb")
-            )
-            serial_proc = await AuditedSubprocessRunner().start(
-                [
-                    "jmp",
-                    "shell",
-                    f"--lease={lease_name}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
-                ],
+            serial_log_fh = open(serial_log_path, "w", encoding="utf-8")
+            serial_proc = await asyncio.create_subprocess_exec(
+                "jmp",
+                "shell",
+                f"--lease={lease_name}",
+                "--",
+                "j",
+                "serial",
+                "pipe",
                 stdout=serial_log_fh,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -176,10 +154,9 @@ async def provision_jumpstarter(
         if serial_proc:
             try:
                 serial_proc.terminate()
-                await serial_proc.wait(timeout=5)
+                await asyncio.wait_for(serial_proc.wait(), timeout=5)
             except Exception:
-                # The tracked wait has already escalated to kill.
-                pass
+                serial_proc.kill()
         if serial_log_fh:
             serial_log_fh.close()
 
@@ -516,6 +493,3 @@ async def _run_provision_steps(
         ip,
     )
     return result
-
-
-from providers.execution import AuditedSubprocessRunner

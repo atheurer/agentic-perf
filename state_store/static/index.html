@@ -1361,15 +1361,11 @@ th.col-right { text-align: right; }
 .chat-bar button:hover { opacity: 0.9; }
 .chat-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
 .chat-messages {
-  height: 200px;
-  min-height: 80px;
-  max-height: 80vh;
+  max-height: 200px;
   overflow-y: auto;
   padding: 4px 0;
   font-size: 13px;
-  resize: vertical;
 }
-
 .chat-msg {
   margin: 6px 0;
   padding: 6px 10px;
@@ -2317,10 +2313,7 @@ async function renderDetail(ticketId) {
     if (chatEnabled) {
       currentTicketForChat = ticketId;
       var chatSection = document.getElementById('ticket-chat-section');
-      if (chatSection) {
-        chatSection.style.display = 'block';
-        restoreChatHeight('ticket-chat-messages');
-      }
+      if (chatSection) chatSection.style.display = 'block';
       var globalChat = document.getElementById('chat-container');
       if (globalChat) globalChat.style.display = 'none';
     }
@@ -2390,14 +2383,7 @@ async function loadArtifacts(ticketId) {
       });
     });
     html += '</details>';
-    // Snapshot open state before re-render
-    var wasOpen = false;
-    var existing = content.querySelector('details');
-    if (existing) wasOpen = existing.open;
     content.innerHTML = html;
-    // Restore open state after re-render
-    var restored = content.querySelector('details');
-    if (restored && wasOpen) restored.open = true;
   } catch (e) {
     // No artifacts or API error — hide section
   }
@@ -3029,11 +3015,7 @@ async function pollEvents(ticketId) {
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
       var cf = ticket.custom_fields || {};
       var gs = cf.guidance_summary || (cf.introspection || {}).guidance_summary;
-      var guidancePayload = gs ? JSON.stringify({a: gs.agent || '', r: gs.reason || '', d: gs.details || '', sa: gs.suggested_actions || [], sr: gs.suggested_response || ''}) : '';
-      var guidanceHash = 0;
-      for (var i = 0; i < guidancePayload.length; i++) { guidanceHash = ((guidanceHash << 5) - guidanceHash + guidancePayload.charCodeAt(i)) | 0; }
-      var guidanceKey = ticketId + '-' + (guidanceHash >>> 0).toString(36);
-      if (gs && !document.getElementById('chat-guidance-' + guidanceKey)) {
+      if (gs && !document.getElementById('chat-guidance-' + ticketId)) {
         var guidanceMsg = '\ud83d\udd14 **' + ticketId + '** needs guidance\n\n';
         guidanceMsg += '**Agent:** ' + (gs.agent || '?') + '\n';
         guidanceMsg += '**Reason:** ' + (gs.reason || 'unknown') + '\n';
@@ -3045,7 +3027,7 @@ async function pollEvents(ticketId) {
         if (gs.suggested_response) guidanceMsg += '\n**Suggestion:** ' + gs.suggested_response;
         var container = document.getElementById('ticket-chat-messages') || document.getElementById('chat-messages');
         if (container) {
-          container.innerHTML += '<div class="chat-msg assistant" id="chat-guidance-' + escHtml(guidanceKey) + '">' + chatRender(guidanceMsg, 'assistant') + '</div>';
+          container.innerHTML += '<div class="chat-msg assistant" id="chat-guidance-' + escHtml(ticketId) + '">' + chatRender(guidanceMsg, 'assistant') + '</div>';
           container.scrollTop = container.scrollHeight;
         }
       }
@@ -3918,36 +3900,6 @@ render();
 var chatEnabled = false;
 var currentTicketForChat = null;
 
-function restoreChatHeight(containerId) {
-  var key = 'chatHeight_' + containerId;
-  var saved = localStorage.getItem(key);
-  var el = document.getElementById(containerId);
-  if (el && saved) {
-    var h = parseInt(saved, 10);
-    if (h >= 80 && h <= window.innerHeight * 0.8) {
-      el.style.height = h + 'px';
-    }
-  }
-  if (el) {
-    // Observe resize (CSS resize: vertical) and persist.
-    // Use offsetHeight (border-box) to avoid shrinking
-    // from contentRect (content-box) mismatch.
-    // Debounce localStorage writes to avoid thrashing
-    // during drag (ResizeObserver fires at 60fps).
-    var saveTimer = null;
-    var observer = new ResizeObserver(function() {
-      var height = el.offsetHeight;
-      if (height >= 80) {
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(function() {
-          localStorage.setItem(key, height);
-        }, 300);
-      }
-    });
-    observer.observe(el);
-  }
-}
-
 async function initChat() {
   // Check if chat API is available. Authenticated users get
   // full access; anonymous users get read-only if enabled.
@@ -3960,7 +3912,6 @@ async function initChat() {
       var data = await r.json();
       renderChatMessages('chat-messages', data.messages || []);
       updateChatCost(data.usage || {});
-      restoreChatHeight('chat-messages');
     }
   } catch(e) { /* chat not available */ }
 }

@@ -21,12 +21,13 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from agents.mcp_audit import create_ticket_mcp
+from fastmcp import FastMCP
+
 from providers.workspace.manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
-mcp = create_ticket_mcp("workspace")
+mcp = FastMCP("workspace")
 
 _manager: WorkspaceManager | None = None
 
@@ -190,7 +191,6 @@ async def generate_chart_from_workspace(
     y_field: str | None = None,
     group_by: str | None = None,
     metric: str | None = None,
-    metrics: list[str] | None = None,
     breakout: str | None = None,
     unit: str | None = None,
     max_points: int = 60,
@@ -208,8 +208,6 @@ async def generate_chart_from_workspace(
         y_field: field name for Y-axis numeric values (e.g. 'busy_pct', 'gbps', 'iops')
         group_by: field name to group multiple series by (e.g. 'host', 'queue')
         metric: metric name for CDM/Crucible data (e.g. 'mpstat::Busy-CPU')
-        metrics: optional list of CDM/Crucible metrics for synchronized panels
-        breakout: optional CDM breakout field to visualize
         unit: metric unit (e.g. 'Gbps', '%', 'IOPS', 'ms')
         max_points: maximum data points to plot for line charts (default 60)
         jq_filter: optional in-flight jq expression to filter file content before charting
@@ -225,7 +223,6 @@ async def generate_chart_from_workspace(
         y_field=y_field,
         group_by=group_by,
         metric=metric,
-        metrics=metrics,
         breakout=breakout,
         unit=unit,
         max_points=max_points,

@@ -7,7 +7,6 @@ from fastapi.testclient import TestClient
 
 from state_store.identity import UserStore
 from state_store.main import create_app
-from state_store.models import TicketStatus
 
 
 def _make_multi_user_app(tmp_path):
@@ -18,9 +17,7 @@ def _make_multi_user_app(tmp_path):
     from state_store.main import mount_routers
 
     app = (
-        create_app.__wrapped__(initialize_immediately=True)
-        if hasattr(create_app, "__wrapped__")
-        else create_app(initialize_immediately=True)
+        create_app.__wrapped__() if hasattr(create_app, "__wrapped__") else create_app()
     )
 
     token = app.state.api_token
@@ -449,103 +446,15 @@ class TestClaimCarveout:
         assert "alice" in r.json()["owners"]
 
 
-class TestImportedFixtureResumeAuthorization:
-    def test_ordinary_writer_cannot_self_authorize_fixture_resume(
-        self, admin_client, app
-    ):
-        user_token = _create_user(admin_client, "alice")
-        response = admin_client.post(
-            "/api/v1/tickets",
-            json={
-                "summary": "fixture",
-                "description": "fixture",
-                "custom_fields": {"imported_fixture": True},
-            },
-        )
-        response.raise_for_status()
-        ticket_id = response.json()["id"]
-        stored = app.state.store._tickets[ticket_id]
-        stored.status = TicketStatus.AWAITING_CUSTOMER_GUIDANCE
-        stored.previous_status = None
-        app.state.store._persist_ticket(stored)
-
-        writer = _user_client(app, user_token)
-        response = writer.post(
-            f"/api/v1/tickets/{ticket_id}/transition",
-            json={"status": "triage_pending", "reviewed_resume": True},
-        )
-        assert response.status_code == 403
-
-    def test_admin_can_authorize_fixture_resume(self, admin_client, app):
-        response = admin_client.post(
-            "/api/v1/tickets",
-            json={
-                "summary": "fixture",
-                "description": "fixture",
-                "custom_fields": {"imported_fixture": True},
-            },
-        )
-        response.raise_for_status()
-        ticket_id = response.json()["id"]
-        stored = app.state.store._tickets[ticket_id]
-        stored.status = TicketStatus.AWAITING_CUSTOMER_GUIDANCE
-        stored.previous_status = None
-        app.state.store._persist_ticket(stored)
-
-        response = admin_client.post(
-            f"/api/v1/tickets/{ticket_id}/transition",
-            json={"status": "triage_pending", "reviewed_resume": True},
-        )
-        assert response.status_code == 200
-        assert (
-            response.json()["custom_fields"]["imported_fixture_reviewed"]["reviewed_by"]
-            == "deployment"
-        )
-
-    def test_ordinary_writer_cannot_mutate_fixture_controls_or_claim(
-        self, admin_client, app
-    ):
-        user_token = _create_user(admin_client, "alice")
-        response = admin_client.post(
-            "/api/v1/tickets",
-            json={
-                "summary": "fixture",
-                "description": "fixture",
-                "custom_fields": {"imported_fixture": True},
-            },
-        )
-        response.raise_for_status()
-        ticket_id = response.json()["id"]
-        writer = _user_client(app, user_token)
-        for fields in (
-            {"imported_fixture": False},
-            {"imported_fixture_reviewed": {"reviewed_by": "attacker"}},
-            {"import_provenance": {}},
-            {"custom_fields": {"imported_fixture": False}},
-            {"importedFixture": False},
-        ):
-            response = writer.patch(
-                f"/api/v1/tickets/{ticket_id}/fields",
-                json={"fields": fields},
-            )
-            assert response.status_code == 422
-
-        response = writer.post(
-            f"/api/v1/tickets/{ticket_id}/claim",
-            json={"owner": "attacker", "duration_seconds": 300},
-        )
-        assert response.status_code == 403
-
-
 class TestLegacyMode:
     """When multi_user=False, all write gating is disabled."""
 
     @pytest.fixture()
     def legacy_client(self):
         app = (
-            create_app.__wrapped__(initialize_immediately=True)
+            create_app.__wrapped__()
             if hasattr(create_app, "__wrapped__")
-            else create_app(initialize_immediately=True)
+            else create_app()
         )
         token = app.state.api_token
         c = TestClient(app)

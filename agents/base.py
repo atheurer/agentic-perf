@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable
+
+import httpx
 
 from providers.events import EventBus
-from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import (
     LLMProvider,
     LLMRateLimitError,
@@ -21,21 +21,6 @@ from providers.llm.base import (
     ToolDefinition,
     ToolResult,
 )
-from providers.tracing import (
-    ActionType,
-    LifecycleState,
-    MonotonicTimer,
-    OperationOutcome,
-    RetryKind,
-    TraceContext,
-    TraceRecorder,
-    bind_trace_context,
-    child_context,
-    new_trace_context,
-    reset_trace_context,
-    trace_headers,
-)
-from state_store.models import VALID_TRANSITIONS, TicketStatus
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +112,7 @@ class AgentBase(ABC):
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = AuditedAsyncHTTPClient(timeout=30.0, headers=headers)
+        self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
         self._events = event_bus
         self._last_tool_call_time: float = 0.0
         self._tool_min_interval = self._load_tool_rate_limit()
@@ -146,30 +131,6 @@ class AgentBase(ABC):
             else self._load_tool_spill_threshold()
         )
         self._register_workspace_tools()
-        self.trace_context = None
-        self._trace = TraceRecorder()
-        self._trace_terminal_state = LifecycleState.COMPLETED
-
-    def set_fence_context(
-        self,
-        session_id: str | None,
-        epoch: int | None,
-        claim_id: str | None,
-    ) -> None:
-        """Bind immutable orchestrator fencing headers to agent state writes."""
-        if not session_id or epoch is None:
-            return
-        from agents.fencing import FenceContext, bind_fence_context
-
-        bind_fence_context(FenceContext(session_id, epoch, claim_id or ""))
-        self._client.headers.update(
-            {
-                "X-Agentic-Perf-Orchestrator-Session": session_id,
-                "X-Agentic-Perf-Orchestrator-Epoch": str(epoch),
-            }
-        )
-        if claim_id:
-            self._client.headers["X-Agentic-Perf-Claim-Id"] = claim_id
 
     def _register_workspace_tools(self) -> None:
         """Register native workspace tools on the agent."""
@@ -292,22 +253,6 @@ class AgentBase(ABC):
         self._stop_requested = True
 
     async def close(self) -> None:
-        if self.trace_context is not None:
-            self._trace.record(
-                self.trace_context,
-                ActionType.AGENT,
-                self._trace_terminal_state,
-                phase="run",
-                duration_ms=0,
-                outcome=(
-                    OperationOutcome.CANCELLED
-                    if self._trace_terminal_state == LifecycleState.CANCELLED
-                    else OperationOutcome.FAILURE
-                    if self._trace_terminal_state
-                    in {LifecycleState.ABORTED, LifecycleState.FAILED}
-                    else OperationOutcome.SUCCESS
-                ),
-            )
         await self._client.aclose()
 
     def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
@@ -318,27 +263,38 @@ class AgentBase(ABC):
         the per-agent budget each fleet iteration so agents
         don't exhaust their budget across the full fleet.
         """
-        from providers.events import EventBus
+        import json
 
-        events = self._events or EventBus()
+        log_dir = self._events._log_dir if self._events else None
+        if not log_dir:
+            from paths import LOG_DIR
+
+            log_dir = LOG_DIR
+        path = log_dir / f"{ticket_id}.jsonl"
+        if not path.exists():
+            return 0, 0
         agent_iters = 0
         global_iters = 0
         try:
-            for evt in events.get_events(ticket_id, since=0, limit=100_000):
-                if evt.get("event_type") == "fleet_iteration_epoch":
-                    agent_iters = 0
-                    global_iters = 0
-                elif evt.get("event_type") == "llm_request":
-                    global_iters += 1
-                    if evt.get("agent") == self.agent_name:
-                        agent_iters += 1
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if evt.get("event_type") == "fleet_iteration_epoch":
+                            # Reset counts — new fleet iteration
+                            agent_iters = 0
+                            global_iters = 0
+                        elif evt.get("event_type") == "llm_request":
+                            global_iters += 1
+                            if evt.get("agent") == self.agent_name:
+                                agent_iters += 1
+                    except Exception:
+                        continue
         except Exception as e:
-            logger.warning(
-                "Failed to read previous iteration counts for %s: %s", ticket_id, e
-            )
-        finally:
-            if self._events is None:
-                events.close()
+            logger.warning(f"Failed to read previous iteration counts from {path}: {e}")
         return agent_iters, global_iters
 
     def _emit(
@@ -349,33 +305,6 @@ class AgentBase(ABC):
 
     async def run(self, ticket_id: str) -> None:
         self._current_ticket_id = ticket_id
-        self._trace_terminal_state = LifecycleState.COMPLETED
-        # Dispatcher normally supplies this context.  Direct agent use (tests,
-        # CLI tools) still gets an isolated invocation rather than losing causality.
-        trace_context = getattr(self, "trace_context", None)
-        if trace_context is None:
-            trace_context = new_trace_context(
-                ticket_id=ticket_id, agent_id=self.agent_name
-            )
-            self.trace_context = trace_context
-        trace = getattr(self, "_trace", None)
-        if trace is None:
-            # Keep direct/minimal AgentBase use observable as well.  Production
-            # instances initialize this in __init__, while focused adapters may
-            # only supply the methods required for their agent loop.
-            trace = TraceRecorder()
-            self._trace = trace
-        trace.context = trace_context
-        trace_token = bind_trace_context(trace_context)
-        header_update = self._client.headers.update(trace_headers(trace_context))
-        if inspect.isawaitable(header_update):
-            await header_update
-        trace.record(
-            trace_context,
-            ActionType.AGENT,
-            LifecycleState.STARTED,
-            phase="run",
-        )
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
         self._dispatched_status = ticket.get("status", "")
@@ -397,11 +326,9 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
-            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
-            "to slice and return the exact data in a single turn without multi-step querying. When a tool "
-            "declares `jq_filter` in its schema, such as `generate_chart_from_workspace`, the tool applies "
-            "the filter to its own input instead."
+            "to slice and return the exact data in a single turn without multi-step querying."
         )
         try:
             from providers.workspace.manager import WorkspaceManager
@@ -506,32 +433,6 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
-            # --- Circuit breaker state (per-run) ---
-            from providers.circuit_breaker import (
-                _DEFAULTS as _CB_DEFAULTS,
-            )
-            from providers.circuit_breaker import (
-                CircuitBreakerState,
-                circuit_breaker_from_config,
-                circuit_breaker_from_custom_fields,
-                classify_result,
-            )
-
-            cb_state = CircuitBreakerState()
-            try:
-                from orchestrator.config import _load_config_file
-
-                cb_cfg = circuit_breaker_from_config(
-                    _load_config_file(),
-                )
-                cb_cfg = circuit_breaker_from_custom_fields(
-                    cf,
-                    cb_cfg,
-                )
-            except Exception:
-                cb_cfg = dict(_CB_DEFAULTS)
-            cb_enabled = cb_cfg.get("enabled", True)
-            self._context_truncated = False
             self._hitl_just_resumed = False
             self._post_hitl_nudge_used = False
             while (
@@ -567,9 +468,6 @@ class AgentBase(ABC):
                     )
 
                 iteration += 1
-                llm_context, llm_timer = self._trace.start(
-                    ActionType.LLM, phase="request", iteration=iteration
-                )
                 self._emit(
                     ticket_id,
                     "llm_request",
@@ -633,28 +531,7 @@ class AgentBase(ABC):
                         messages=messages,
                         tools=(self.tools if self.tools else None),
                     )
-                except asyncio.CancelledError:
-                    self._trace_terminal_state = LifecycleState.CANCELLED
-                    self._trace.record(
-                        llm_context,
-                        ActionType.LLM,
-                        LifecycleState.CANCELLED,
-                        phase="request",
-                        duration_ms=llm_timer.elapsed_ms(),
-                        outcome=OperationOutcome.CANCELLED,
-                    )
-                    raise
                 except LLMTimeoutError as e:
-                    self._trace.record(
-                        llm_context,
-                        ActionType.LLM,
-                        LifecycleState.TIMED_OUT,
-                        phase="request",
-                        duration_ms=llm_timer.elapsed_ms(),
-                        outcome=OperationOutcome.TIMED_OUT,
-                        error=e,
-                        retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
-                    )
                     if tok is not None:
                         context.detach(tok)
                         tok = None
@@ -723,16 +600,6 @@ class AgentBase(ABC):
                     )
                     break
                 except LLMRateLimitError as e:
-                    self._trace.record(
-                        llm_context,
-                        ActionType.LLM,
-                        LifecycleState.FAILED,
-                        phase="request",
-                        duration_ms=llm_timer.elapsed_ms(),
-                        outcome=OperationOutcome.FAILURE,
-                        error=e,
-                        retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
-                    )
                     if tok is not None:
                         context.detach(tok)
                         tok = None
@@ -795,27 +662,6 @@ class AgentBase(ABC):
                     if tok is not None:
                         context.detach(tok)
                 self._llm_rate_limit_retries = 0
-                self._trace.record(
-                    llm_context,
-                    ActionType.LLM,
-                    LifecycleState.COMPLETED,
-                    phase="response",
-                    duration_ms=llm_timer.elapsed_ms(),
-                    outcome=OperationOutcome.SUCCESS,
-                )
-                tool_contexts = {}
-                for proposed in response.tool_calls:
-                    tool_context = child_context(
-                        llm_context, iteration=iteration, tool_call_id=proposed.id
-                    )
-                    tool_contexts[proposed.id] = tool_context
-                    self._trace.record(
-                        tool_context,
-                        ActionType.TOOL,
-                        LifecycleState.PROPOSED,
-                        phase=proposed.name,
-                        attributes={"tool": proposed.name},
-                    )
                 self._emit(
                     ticket_id,
                     "llm_response",
@@ -863,57 +709,24 @@ class AgentBase(ABC):
                     )
                     if ctx_action == "pause":
                         if self._wrapup_reason is None:
-                            truncated = False
-                            if not self._context_truncated:
-                                self._context_truncated = True
-                                before = len(messages)
-                                try:
-                                    messages = self._truncate_context(messages)
-                                except Exception:
-                                    logger.exception(
-                                        "[%s] Context truncation failed on %s",
-                                        self.agent_name,
-                                        ticket_id,
-                                    )
-                                else:
-                                    after = len(messages)
-                                    if after < before:
-                                        truncated = True
-                                        logger.info(
-                                            "[%s] Context truncation: "
-                                            "%d → %d messages on %s",
-                                            self.agent_name,
-                                            before,
-                                            after,
-                                            ticket_id,
-                                        )
-                                        self._emit(
-                                            ticket_id,
-                                            "context_truncated",
-                                            {
-                                                "before": before,
-                                                "after": after,
-                                            },
-                                        )
-                            if not truncated:
-                                self._wrapup_reason = "context"
-                                messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": (
-                                            "[SYSTEM] Your context window "
-                                            "is nearly full. You MUST wrap "
-                                            "up immediately: submit your "
-                                            "best result now using your "
-                                            "submit_* tool, even if "
-                                            "incomplete. Raising the token "
-                                            "budget will NOT help — this "
-                                            "is a model input-size limit. "
-                                            "This is your final LLM call."
-                                        ),
-                                    }
-                                )
-                                continue
+                            self._wrapup_reason = "context"
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM] Your context window "
+                                        "is nearly full. You MUST wrap "
+                                        "up immediately: submit your "
+                                        "best result now using your "
+                                        "submit_* tool, even if "
+                                        "incomplete. Raising the token "
+                                        "budget will NOT help — this "
+                                        "is a model input-size limit. "
+                                        "This is your final LLM call."
+                                    ),
+                                }
+                            )
+                            continue
                     elif ctx_action == "warn":
                         if not getattr(self, "_context_warned", False):
                             self._context_warned = True
@@ -1137,10 +950,6 @@ class AgentBase(ABC):
                         f"{submit_call.name} (iter {iteration})"
                     )
                     block_msg = self._should_block_submit(ticket_id)
-                    if not block_msg:
-                        block_msg = await self._validate_submit_call(
-                            ticket_id, submit_call
-                        )
                     if block_msg:
                         self._emit(
                             ticket_id,
@@ -1150,15 +959,6 @@ class AgentBase(ABC):
                                 "input_keys": list(submit_call.input.keys()),
                                 "blocked": True,
                             },
-                        )
-                        rejected_context = tool_contexts[submit_call.id]
-                        self._trace.record(
-                            rejected_context,
-                            ActionType.TOOL,
-                            LifecycleState.REJECTED,
-                            phase=submit_call.name,
-                            duration_ms=0,
-                            outcome=OperationOutcome.REJECTED,
                         )
                         messages.append(
                             {"role": "assistant", "content": response.raw_content}
@@ -1186,58 +986,13 @@ class AgentBase(ABC):
                             "input": submit_call.input,
                         },
                     )
-                    # ``submit_*`` calls deliberately dispatch through the
-                    # agent's completion handler rather than ``_execute_tool``:
-                    # those handlers own the ticket mutation and next-state
-                    # transition.  They still are native tool invocations,
-                    # however, and therefore need the same durable lifecycle
-                    # record as every ordinary local handler.
-                    submit_context = tool_contexts[submit_call.id]
-                    submit_timer = MonotonicTimer()
-                    self._trace.record(
-                        submit_context,
-                        ActionType.TOOL,
-                        LifecycleState.STARTED,
-                        phase=submit_call.name,
-                    )
                     submit_response = LLMResponse(
                         text=None,
                         tool_calls=[submit_call],
                         stop_reason="tool_use",
                         raw_content=response.raw_content,
                     )
-                    try:
-                        await self._handle_completion(ticket_id, submit_response)
-                    except asyncio.CancelledError:
-                        self._trace_terminal_state = LifecycleState.CANCELLED
-                        self._trace.record(
-                            submit_context,
-                            ActionType.TOOL,
-                            LifecycleState.CANCELLED,
-                            phase=submit_call.name,
-                            duration_ms=submit_timer.elapsed_ms(),
-                            outcome=OperationOutcome.CANCELLED,
-                        )
-                        raise
-                    except Exception as exc:
-                        self._trace.record(
-                            submit_context,
-                            ActionType.TOOL,
-                            LifecycleState.FAILED,
-                            phase=submit_call.name,
-                            duration_ms=submit_timer.elapsed_ms(),
-                            outcome=OperationOutcome.FAILURE,
-                            error=exc,
-                        )
-                        raise
-                    self._trace.record(
-                        submit_context,
-                        ActionType.TOOL,
-                        LifecycleState.COMPLETED,
-                        phase=submit_call.name,
-                        duration_ms=submit_timer.elapsed_ms(),
-                        outcome=OperationOutcome.SUCCESS,
-                    )
+                    await self._handle_completion(ticket_id, submit_response)
                     break
 
                 messages.append({"role": "assistant", "content": response.raw_content})
@@ -1250,16 +1005,6 @@ class AgentBase(ABC):
                     if non_clarify:
                         skipped = [tc for tc in calls_to_run if tc not in non_clarify]
                         for tc in skipped:
-                            skipped_context = tool_contexts[tc.id]
-                            self._trace.record(
-                                skipped_context,
-                                ActionType.TOOL,
-                                LifecycleState.SHORT_CIRCUITED,
-                                phase=tc.name,
-                                duration_ms=0,
-                                outcome=OperationOutcome.SUCCESS,
-                                attributes={"reason": "other tools executed first"},
-                            )
                             self._emit(
                                 ticket_id,
                                 "tool_skipped",
@@ -1296,52 +1041,7 @@ class AgentBase(ABC):
                             "input": tc.input,
                         },
                     )
-                    tool_context = tool_contexts[tc.id]
-                    tool_timer = MonotonicTimer()
-                    self._trace.record(
-                        tool_context,
-                        ActionType.TOOL,
-                        LifecycleState.STARTED,
-                        phase=tc.name,
-                    )
-                    try:
-                        result = await self._execute_tool(
-                            tc, trace_context=tool_context
-                        )
-                    except asyncio.CancelledError:
-                        self._trace_terminal_state = LifecycleState.CANCELLED
-                        self._trace.record(
-                            tool_context,
-                            ActionType.TOOL,
-                            LifecycleState.CANCELLED,
-                            phase=tc.name,
-                            duration_ms=tool_timer.elapsed_ms(),
-                            outcome=OperationOutcome.CANCELLED,
-                        )
-                        raise
-                    except Exception as exc:
-                        self._trace.record(
-                            tool_context,
-                            ActionType.TOOL,
-                            LifecycleState.FAILED,
-                            phase=tc.name,
-                            duration_ms=tool_timer.elapsed_ms(),
-                            outcome=OperationOutcome.FAILURE,
-                            error=exc,
-                        )
-                        raise
-                    self._trace.record(
-                        tool_context,
-                        ActionType.TOOL,
-                        LifecycleState.FAILED
-                        if result.is_error
-                        else LifecycleState.COMPLETED,
-                        phase=tc.name,
-                        duration_ms=tool_timer.elapsed_ms(),
-                        outcome=OperationOutcome.FAILURE
-                        if result.is_error
-                        else OperationOutcome.SUCCESS,
-                    )
+                    result = await self._execute_tool(tc)
                     self._emit(
                         ticket_id,
                         "tool_result",
@@ -1360,13 +1060,6 @@ class AgentBase(ABC):
                             "is_error": result.is_error,
                         }
                     )
-                    if cb_enabled:
-                        is_failure = classify_result(
-                            tc.name,
-                            result.content,
-                            result.is_error,
-                        )
-                        cb_state.record(tc.name, is_failure)
                 for tc in response.tool_calls:
                     if tc not in calls_to_run:
                         tool_results_content.append(
@@ -1379,79 +1072,6 @@ class AgentBase(ABC):
                         )
 
                 messages.append({"role": "user", "content": tool_results_content})
-
-                # --- Circuit breaker: inject after tool results ---
-                if cb_enabled:
-                    cb_checked: set[str] = set()
-                    for tc in calls_to_run:
-                        if tc.name in cb_checked:
-                            continue
-                        cb_checked.add(tc.name)
-                        tripped, consec = cb_state.check(
-                            tc.name,
-                            cb_cfg.get("threshold", 3),
-                            cb_cfg.get("max_trips_per_tool", 2),
-                            cb_cfg.get("exempt_tools", []),
-                        )
-                        if tripped:
-                            excerpt = "(empty)"
-                            tc_ids = {c.id for c in calls_to_run if c.name == tc.name}
-                            for item in reversed(tool_results_content):
-                                if item.get("tool_use_id") in tc_ids:
-                                    raw = item.get("content", "")
-                                    excerpt = raw[:300] if raw else "(empty)"
-                                    break
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        f"[SYSTEM] Circuit breaker:"
-                                        f" tool '{tc.name}' has failed"
-                                        f" {consec} consecutive times."
-                                        f" Last result:\n"
-                                        f"<tool_output>\n"
-                                        f"{excerpt}\n"
-                                        f"</tool_output>\n\n"
-                                        f"You MUST try a fundamentally"
-                                        f" different approach. Do NOT"
-                                        f" call {tc.name} with the"
-                                        f" same or similar arguments."
-                                        f" Consider:\n"
-                                        f"- Use the information in"
-                                        f" the result above\n"
-                                        f"- Try a different tool or"
-                                        f" different arguments\n"
-                                        f"- Submit partial results if"
-                                        f" you have some data"
-                                    ),
-                                }
-                            )
-                            self._emit(
-                                ticket_id,
-                                "circuit_breaker",
-                                {
-                                    "tool": tc.name,
-                                    "consecutive": consec,
-                                    "trips": cb_state.trips.get(
-                                        tc.name,
-                                        0,
-                                    ),
-                                    "threshold": cb_cfg.get(
-                                        "threshold",
-                                        3,
-                                    ),
-                                },
-                            )
-                            logger.warning(
-                                "[%s] Circuit breaker tripped for"
-                                " tool '%s' (%d consecutive"
-                                " failures) on %s",
-                                self.agent_name,
-                                tc.name,
-                                consec,
-                                ticket_id,
-                            )
-
             else:
                 # while loop exhausted (max_iterations reached)
                 await self._save_messages(ticket_id, messages)
@@ -1464,32 +1084,22 @@ class AgentBase(ABC):
                     f"[{self.agent_name}] Hit max iterations"
                     f" ({self.max_iterations}) on {ticket_id}"
                 )
-                ticket = await self._get_ticket(ticket_id)
-                current_status = ticket.get("status", "")
-                if self._can_pause_for_guidance(current_status):
-                    await self._add_comment(
-                        ticket_id,
-                        f"**Agent {self.agent_name} reached maximum"
-                        f" iteration limit ({self.max_iterations}).**"
-                        f" The agent could not complete its work within"
-                        f" the iteration budget. You can reply to guide"
-                        f" next steps (e.g., retry, skip to review,"
-                        f" or abort).",
-                    )
-                    await self._transition_ticket(
-                        ticket_id,
-                        "awaiting_customer_guidance",
-                        comment=(
-                            f"{self.agent_name} hit max iterations"
-                            f" — pausing for guidance"
-                        ),
-                    )
-                else:
-                    await self._abort_unpausable(
-                        ticket_id,
-                        current_status,
-                        "max_iterations",
-                    )
+                await self._add_comment(
+                    ticket_id,
+                    f"**Agent {self.agent_name} reached maximum"
+                    f" iteration limit ({self.max_iterations}).**"
+                    f" The agent could not complete its work within"
+                    f" the iteration budget. You can reply to guide"
+                    f" next steps (e.g., retry, skip to review,"
+                    f" or abort).",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        f"{self.agent_name} hit max iterations — pausing for guidance"
+                    ),
+                )
         except (HITLDriftError, AgentAbortedError):
             raise
         except HITLTimeoutError as e:
@@ -1504,7 +1114,6 @@ class AgentBase(ABC):
         finally:
             self.max_iterations = configured_max
             self._max_iterations_is_override = False
-            reset_trace_context(trace_token)
 
         self._emit(ticket_id, "agent_finished")
         logger.info(f"[{self.agent_name}] Finished on ticket {ticket_id}")
@@ -1563,12 +1172,6 @@ class AgentBase(ABC):
     def _should_block_submit(self, ticket_id: str) -> str | None:
         """Override to block submit_* calls. Return a rejection message
         string to block, or None to allow the submit to proceed."""
-        return None
-
-    async def _validate_submit_call(
-        self, ticket_id: str, submit_call: ToolCall
-    ) -> str | None:
-        """Override to validate submit payloads before completing an agent run."""
         return None
 
     @staticmethod
@@ -1719,9 +1322,6 @@ class AgentBase(ABC):
             "list_files_from_workspace",
             "read_document_from_workspace",
             "search_documents_from_workspace",
-            # Chart responses are compact control-plane metadata whose
-            # chart_ref must remain directly visible to the caller.
-            "generate_chart_from_workspace",
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
@@ -1855,76 +1455,25 @@ class AgentBase(ABC):
             await asyncio.sleep(self._tool_min_interval - elapsed)
         self._last_tool_call_time = time.monotonic()
 
-    def _normalize_tool_input(
-        self, tool_call: ToolCall
-    ) -> tuple[dict[str, Any], str | None]:
-        """Separate in-flight jq filtering only when the selected schema omits it.
-
-        The advertised schema is the compatibility contract.  A handler failure
-        must not be used to decide whether a tool accepts ``jq_filter`` because
-        that would risk replaying a side-effecting call.
-        """
-        call_input = dict(tool_call.input) if tool_call.input else {}
-        if tool_call.name == "jq_file_from_workspace":
-            return call_input, None
-
-        tool_def = next(
-            (tool for tool in self.tools if tool.name == tool_call.name), None
-        )
-        properties = tool_def.input_schema.get("properties", {}) if tool_def else {}
-        if "jq_filter" in properties:
-            if "jq_filter" in call_input:
-                value = str(call_input["jq_filter"]).strip()
-                call_input["jq_filter"] = value or None
-            return call_input, None
-
-        jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
-            "jq_file_from_workspace", None
-        )
-        return call_input, str(
-            jq_filter
-        ).strip() or None if jq_filter is not None else None
-
-    @staticmethod
-    def _tool_error_content(
-        error: Exception | str,
-        retry_classification: Literal[
-            "validation",
-            "intentional_agent_retry",
-            "transport_before_send",
-            "ambiguous_after_send",
-        ],
-    ) -> str:
-        """Return retry context without scheduling an automatic retry."""
-        return json.dumps(
-            {
-                "error": str(error),
-                "retry_classification": retry_classification,
-            }
-        )
-
-    async def _execute_tool(
-        self,
-        tool_call: ToolCall,
-        trace_context: TraceContext | None = None,
-    ) -> ToolResult:
+    async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         await self._throttle_tool_call()
 
-        call_input, jq_filter = self._normalize_tool_input(tool_call)
+        call_input = dict(tool_call.input) if tool_call.input else {}
+        jq_filter = None
+        if tool_call.name != "jq_file_from_workspace":
+            jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
+                "jq_file_from_workspace", None
+            )
+            if jq_filter is not None:
+                jq_filter = str(jq_filter).strip() or None
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
             try:
                 try:
-                    inspect.signature(handler).bind(**call_input)
-                except TypeError as e:
-                    return ToolResult(
-                        tool_use_id=tool_call.id,
-                        content=self._tool_error_content(e, "validation"),
-                        is_error=True,
-                    )
-
-                result = await handler(**call_input)
+                    result = await handler(**call_input)
+                except TypeError:
+                    result = await handler(**tool_call.input)
 
                 if isinstance(result, str):
                     content = result
@@ -1940,17 +1489,16 @@ class AgentBase(ABC):
                 logger.exception(f"[{self.agent_name}] Tool {tool_call.name} failed")
                 return ToolResult(
                     tool_use_id=tool_call.id,
-                    content=self._tool_error_content(e, "ambiguous_after_send"),
+                    content=f"Tool error: {e}",
                     is_error=True,
                 )
 
         if self._mcp is not None:
             try:
-                content = await self._mcp.call_tool(
-                    tool_call.name,
-                    call_input,
-                    trace_context=trace_context or self._trace.context,
-                )
+                try:
+                    content = await self._mcp.call_tool(tool_call.name, call_input)
+                except Exception:
+                    content = await self._mcp.call_tool(tool_call.name, tool_call.input)
 
                 content = self._spill_tool_output(
                     tool_call.name, content, jq_filter=jq_filter
@@ -1959,15 +1507,12 @@ class AgentBase(ABC):
             except (HITLDriftError, HITLTimeoutError, AgentAbortedError):
                 raise
             except Exception as e:
-                retry_classification = getattr(
-                    e, "retry_classification", "ambiguous_after_send"
-                )
                 logger.exception(
                     f"[{self.agent_name}] MCP tool {tool_call.name} failed"
                 )
                 return ToolResult(
                     tool_use_id=tool_call.id,
-                    content=self._tool_error_content(e, retry_classification),
+                    content=f"Tool error: {e}",
                     is_error=True,
                 )
 
@@ -1997,54 +1542,6 @@ class AgentBase(ABC):
             "awaiting_customer_guidance",
             comment=(f"{self.agent_name} budget exhausted — pausing for guidance"),
         )
-
-    @staticmethod
-    def _truncate_context(
-        messages: list[dict[str, Any]],
-        keep_recent: int = 6,
-    ) -> list[dict[str, Any]]:
-        """Drop old tool exchanges to free context space.
-
-        Keeps the first message (ticket context) and the
-        last ``keep_recent`` messages (most recent tool
-        exchanges and agent reasoning). Ensures the result
-        maintains valid message alternation (user → assistant
-        → user) as required by LLM APIs.
-
-        Messages alternate assistant(tool_use) → user(tool_results),
-        so ``keep_recent=6`` preserves ~3 recent exchanges.
-        """
-        if len(messages) <= keep_recent + 1:
-            return messages
-
-        initial = messages[0]
-        recent = messages[-keep_recent:]
-
-        # Ensure recent starts with an assistant message
-        # to maintain valid alternation after the initial
-        # user message.
-        while recent and recent[0].get("role") == "user":
-            recent = recent[1:]
-
-        if not recent:
-            return messages
-
-        dropped = len(messages) - 1 - len(recent)
-
-        truncation_note: dict[str, Any] = {
-            "role": "user",
-            "content": (
-                f"[SYSTEM] Context was truncated to fit the "
-                f"model's context window. {dropped} earlier "
-                f"messages (tool calls and results) were "
-                f"removed. The initial ticket context and "
-                f"your {len(recent)} most recent messages "
-                f"are preserved. Continue your work with "
-                f"the available context — re-read artifacts "
-                f"if needed."
-            ),
-        }
-        return [initial, truncation_note] + recent
 
     async def _handle_context_pause(self, ticket_id: str) -> None:
         """Handle context-window pause during agent execution.
@@ -2337,48 +1834,6 @@ class AgentBase(ABC):
         r.raise_for_status()
         return r.json()
 
-    async def _resolve_referenced_artifacts(
-        self,
-        ticket: dict[str, Any],
-    ) -> None:
-        """Pre-fetch artifact paths from textual and structured ticket references.
-
-        Combines PERF-XXXXXXXX IDs from the description and hypothesis with
-        ``custom_fields.reference_tickets``, deduplicates them, and excludes
-        the current ticket. Fetches each reference's output_dir and run_id
-        for use in analyze and review ``_build_messages`` implementations.
-        """
-        from agents.server_utils import extract_ticket_references
-
-        cf = ticket.get("custom_fields", {})
-        ref_text = ticket.get("description", "") + " " + cf.get("hypothesis", "")
-        text_ids = set(extract_ticket_references(ref_text))
-        # Also include structured references stored by triage.
-        structured_ids = set(cf.get("reference_tickets", []))
-        ref_ids = [
-            rid
-            for rid in sorted(text_ids | structured_ids)
-            if rid != ticket.get("id", "")
-        ]
-        refs: dict[str, dict[str, str]] = {}
-        for rid in ref_ids:
-            try:
-                t = await self._get_ticket(rid)
-                rcf = t.get("custom_fields", {})
-                output_dir = rcf.get("output_dir", "")
-                if output_dir:
-                    refs[rid] = {
-                        "output_dir": output_dir,
-                        "run_id": rcf.get("run_id", ""),
-                    }
-            except Exception:
-                logger.debug(
-                    "[%s] Could not fetch referenced ticket %s",
-                    self.agent_name,
-                    rid,
-                )
-        self._referenced_artifacts = refs
-
     async def _transition_ticket(
         self, ticket_id: str, new_status: str, comment: str | None = None
     ) -> dict[str, Any]:
@@ -2472,7 +1927,6 @@ class AgentBase(ABC):
         Exempts awaiting_customer_guidance (budget-grace transitions there).
         """
         if self._aborted:
-            self._trace_terminal_state = LifecycleState.ABORTED
             raise AgentAbortedError("Agent already aborted")
         ticket = self._last_interject_ticket
         if ticket is None:
@@ -2483,7 +1937,6 @@ class AgentBase(ABC):
         if current_status == "awaiting_customer_guidance":
             return
         self._aborted = True
-        self._trace_terminal_state = LifecycleState.ABORTED
         self._emit(
             ticket.get("id", ""),
             "agent_aborted",
@@ -2535,77 +1988,6 @@ class AgentBase(ABC):
         }
     )
 
-    @staticmethod
-    def _can_pause_for_guidance(status: str) -> bool:
-        """Check if the ticket can enter or remain in the guidance pause."""
-        try:
-            current = TicketStatus(status)
-        except ValueError:
-            return False
-        if current is TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
-            return True
-        targets = VALID_TRANSITIONS.get(current, [])
-        return TicketStatus.AWAITING_CUSTOMER_GUIDANCE in targets
-
-    async def _abort_unpausable(
-        self,
-        ticket_id: str,
-        current_status: str,
-        trigger: str,
-    ) -> None:
-        """Handle escalation when the ticket cannot be paused.
-
-        Emits an escalation event, attempts to close the ticket
-        (the only safe fallback for terminal-adjacent statuses
-        like retrospective_pending), and raises AgentAbortedError
-        so the orchestrator skips further transitions.
-        """
-        self._emit(
-            ticket_id,
-            "escalation",
-            {
-                "reason": "pause_blocked",
-                "from_status": current_status,
-                "trigger": trigger,
-            },
-        )
-        try:
-            current = TicketStatus(current_status)
-        except ValueError:
-            current = None
-        targets = VALID_TRANSITIONS.get(current, []) if current else []
-        if TicketStatus.CLOSED in targets:
-            logger.info(
-                "[%s] Closing %s from %s (pause not available)",
-                self.agent_name,
-                ticket_id,
-                current_status,
-            )
-            await self._add_comment(
-                ticket_id,
-                f"**Agent {self.agent_name} could not complete"
-                f" its task and cannot pause for guidance from"
-                f" {current_status}.** Closing ticket.",
-            )
-            await self._transition_ticket(
-                ticket_id,
-                "closed",
-                comment=(
-                    f"{self.agent_name}: pause blocked from {current_status}, closing"
-                ),
-            )
-        else:
-            logger.warning(
-                "[%s] Cannot pause or close from %s on %s",
-                self.agent_name,
-                current_status,
-                ticket_id,
-            )
-        raise AgentAbortedError(
-            f"Cannot pause from {current_status} — "
-            f"ticket closed or left for orchestrator"
-        )
-
     async def _request_human_input(self, ticket_id: str, question: str) -> str:
         """Pause for human input and return the user's reply.
 
@@ -2614,19 +1996,6 @@ class AgentBase(ABC):
         reply text. The agent's LLM loop continues with full context.
         """
         ticket = await self._get_ticket(ticket_id)
-        current_status = ticket.get("status", "")
-        if not self._can_pause_for_guidance(current_status):
-            logger.warning(
-                "[%s] Cannot pause for guidance from %s — "
-                "awaiting_customer_guidance is not a valid transition",
-                self.agent_name,
-                current_status,
-            )
-            await self._abort_unpausable(
-                ticket_id,
-                current_status,
-                "escalation",
-            )
         comment_count = len(ticket.get("comments", []))
         await self._add_comment(ticket_id, f"**Input needed:** {question}")
         await self._transition_ticket(

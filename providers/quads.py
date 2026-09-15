@@ -8,8 +8,6 @@ from typing import Any
 
 import httpx
 
-from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +39,7 @@ class QuadsClient:
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
-        self._client = AuditedAsyncHTTPClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=30.0)
         if api_scheme == "http":
             logger.warning(
                 "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
@@ -295,20 +293,17 @@ class QuadsClient:
     async def setup_ssh(self, hosts: list[str]) -> dict[str, Any]:
         key_path = Path(self.ssh_key_path)
         if not key_path.exists():
-            proc = await AuditedSubprocessRunner().start(
-                [
-                    "ssh-keygen",
-                    "-t",
-                    "ed25519",
-                    "-f",
-                    str(key_path),
-                    "-N",
-                    "",
-                    "-q",
-                    "-C",
-                    "host-key-do-not-remove",
-                ],
-                mutating=True,
+            proc = await asyncio.create_subprocess_exec(
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-f",
+                str(key_path),
+                "-N",
+                "",
+                "-q",
+                "-C",
+                "host-key-do-not-remove",
             )
             await proc.wait()
 
@@ -321,9 +316,14 @@ class QuadsClient:
         pubkey = pubkey_path.read_text().strip()
 
         for host in hosts:
-            await AuditedSubprocessRunner().run(
-                ["ssh-keygen", "-R", host], mutating=True
+            proc = await asyncio.create_subprocess_exec(
+                "ssh-keygen",
+                "-R",
+                host,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
+            await proc.wait()
 
         results: dict[str, str] = {}
         for host in hosts:
@@ -348,23 +348,22 @@ class QuadsClient:
         results: dict[str, str] = {}
         for host in hosts:
             try:
-                ssh_result = await AuditedSubprocessRunner().run(
-                    [
-                        "ssh",
-                        "-o",
-                        "ConnectTimeout=10",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "StrictHostKeyChecking=accept-new",
-                        "-i",
-                        self.ssh_key_path,
-                        f"root@{host}",
-                        f"sed -i '/{self.PROVISIONING_KEY_COMMENT}/d' /root/.ssh/authorized_keys",
-                    ],
-                    mutating=True,
+                ssh_result = await asyncio.create_subprocess_exec(
+                    "ssh",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-i",
+                    self.ssh_key_path,
+                    f"root@{host}",
+                    f"sed -i '/{self.PROVISIONING_KEY_COMMENT}/d' /root/.ssh/authorized_keys",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                stderr = ssh_result.stderr
+                stdout, stderr = await ssh_result.communicate()
                 results[host] = (
                     "cleaned"
                     if ssh_result.returncode == 0
@@ -391,27 +390,28 @@ class QuadsClient:
             f'root@{host} "{remote_cmd}"'
         )
 
-        proc = await AuditedSubprocessRunner().run(
-            [
-                "python3",
-                "-c",
-                (
-                    "import pexpect, sys\n"
-                    "password = sys.stdin.readline().rstrip('\\n')\n"
-                    f"child = pexpect.spawn('/bin/bash', ['-c', {ssh_cmd!r}],"
-                    " timeout=30)\n"
-                    "child.expect('[Pp]assword')\n"
-                    "child.sendline(password)\n"
-                    "child.expect(pexpect.EOF)\n"
-                    "out = child.before.decode()\n"
-                    "print('ok' if 'KEY_COPIED' in out else"
-                    " f'unexpected: {out}')\n"
-                ),
-            ],
-            stdin=self.default_root_password.encode() + b"\n",
-            mutating=True,
+        proc = await asyncio.create_subprocess_exec(
+            "python3",
+            "-c",
+            (
+                "import pexpect, sys\n"
+                "password = sys.stdin.readline().rstrip('\\n')\n"
+                f"child = pexpect.spawn('/bin/bash', ['-c', {ssh_cmd!r}],"
+                " timeout=30)\n"
+                "child.expect('[Pp]assword')\n"
+                "child.sendline(password)\n"
+                "child.expect(pexpect.EOF)\n"
+                "out = child.before.decode()\n"
+                "print('ok' if 'KEY_COPIED' in out else"
+                " f'unexpected: {out}')\n"
+            ),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = proc.stdout, proc.stderr
+        stdout, stderr = await proc.communicate(
+            input=self.default_root_password.encode() + b"\n",
+        )
         output = stdout.decode().strip()
         if "ok" in output:
             return "ok"

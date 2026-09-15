@@ -932,7 +932,6 @@ async def test_crucible_context_gateway_persists_phase_owned_effective_manifest(
 
     monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
     monkeypatch.setattr(paths, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(paths, "TRACE_DB_PATH", tmp_path / "trace.db")
     _ = json.loads(
         await crucible_context_gateway(
             provider,
@@ -960,13 +959,10 @@ async def test_crucible_context_gateway_persists_phase_owned_effective_manifest(
     assert manifest["agent"] == "benchmark-agent"
     assert "effective_source" not in manifest
     assert "workspace_refs" not in manifest
-    from providers.events import EventBus
-
-    bus = EventBus(log_dir=tmp_path / "logs")
-    try:
-        events = bus.get_events("PERF-GATEWAY", limit=100)
-    finally:
-        bus.close()
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "PERF-GATEWAY.jsonl").read_text().splitlines()
+    ]
     resolution = next(
         event for event in events if event["event_type"] == "context_resolution"
     )

@@ -61,7 +61,7 @@ def artifact_app(tmp_path, monkeypatch):
 
     from state_store.main import create_app
 
-    app = create_app(initialize_immediately=True)
+    app = create_app()
     return app, tmp_path
 
 

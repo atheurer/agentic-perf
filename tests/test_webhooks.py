@@ -23,9 +23,7 @@ from state_store.webhooks.registry import get_translator, list_sources
 def _make_app(tmp_path, *, multi_user: bool = True):
     """Create a test app with optional multi-user mode."""
     app = (
-        create_app.__wrapped__(initialize_immediately=True)
-        if hasattr(create_app, "__wrapped__")
-        else create_app(initialize_immediately=True)
+        create_app.__wrapped__() if hasattr(create_app, "__wrapped__") else create_app()
     )
     deploy_token = app.state.api_token
 

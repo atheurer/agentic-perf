@@ -63,8 +63,6 @@ async def _make_crucible_ssh(
     async def _run(host, command, timeout=300):
         if "crucible-valkey" in command:
             return _FakeSSHResult(exit_code=0, stdout="OK")
-        if "crucible-opensearch" in command:
-            return _FakeSSHResult(exit_code=0, stdout="GONE")
         if "result-summary.json" in command:
             if summary_found:
                 return _FakeSSHResult(exit_code=0, stdout=summary_content)
@@ -79,8 +77,7 @@ async def _make_crucible_ssh(
             stdout=f"run directory: {RUN_DIR}\nrun complete",
         )
 
-    async def _copy_to(host, local_path, remote_path, timeout=60, mutating=False):
-        assert mutating is True
+    async def _copy_to(host, local_path, remote_path, timeout=60):
         return _FakeSSHResult(exit_code=0)
 
     class _Mock:

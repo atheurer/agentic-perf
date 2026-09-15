@@ -6,8 +6,7 @@ and _apply_step_overrides must use correct agent keys for later-step clearing.
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from orchestrator.main import _apply_step_overrides
 
@@ -219,7 +218,7 @@ def _make_client(cf: dict) -> MagicMock:
 
     client = MagicMock()
     client.get.return_value = mock_response
-    client.patch = AsyncMock(return_value=MagicMock(status_code=200))
+    client.patch.return_value = MagicMock(status_code=200)
     return client
 
 
@@ -239,9 +238,7 @@ class TestApplyStepOverridesScopedContext:
             "params": {},
         }
         client = _make_client(cf)
-        asyncio.run(
-            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-        )
+        _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
         patch_call = client.patch.call_args
         fields = patch_call.kwargs["json"]["fields"]
@@ -265,9 +262,7 @@ class TestApplyStepOverridesScopedContext:
             },
         }
         client = _make_client(cf)
-        asyncio.run(
-            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-        )
+        _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
         patch_call = client.patch.call_args
         fields = patch_call.kwargs["json"]["fields"]
@@ -289,9 +284,7 @@ class TestApplyStepOverridesScopedContext:
             "params": {},
         }
         client = _make_client(cf)
-        asyncio.run(
-            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-        )
+        _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
         patch_call = client.patch.call_args
         fields = patch_call.kwargs["json"]["fields"]
@@ -311,9 +304,7 @@ class TestApplyStepOverridesScopedContext:
             "params": {},
         }
         client = _make_client(cf)
-        asyncio.run(
-            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-        )
+        _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
         patch_call = client.patch.call_args
         fields = patch_call.kwargs["json"]["fields"]
@@ -332,9 +323,7 @@ class TestApplyStepOverridesScopedContext:
             }
             next_step = {"agent_type": agent_type, "params": {}}
             client = _make_client(cf)
-            asyncio.run(
-                _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-            )
+            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
             patch_call = client.patch.call_args
             fields = patch_call.kwargs["json"]["fields"]
@@ -347,9 +336,7 @@ class TestApplyStepOverridesScopedContext:
         cf = {}
         next_step = {"agent_type": "resource", "params": {}}
         client = _make_client(cf)
-        asyncio.run(
-            _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
-        )
+        _apply_step_overrides("http://localhost", client, "T-1", next_step, cf)
 
         # resource step still patches provisioning_complete etc.
         patch_call = client.patch.call_args
