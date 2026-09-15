@@ -1978,6 +1978,81 @@ class TestFreeFormExtraction:
         assert result["targets"] == ["worker.example.com"]
 
 
+class TestUnderscoreAdjacentRejection:
+    """Candidates adjacent to underscores are fragments of invalid tokens.
+
+    Underscores are not valid in hostnames, so ``bad_host.example.com``
+    must not yield ``host.example.com`` (or any other fragment) — the
+    whole surrounding token is rejected (#725 review follow-up).
+    """
+
+    @pytest.mark.asyncio
+    async def test_leading_underscore_token_rejected(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="bad_host.example.com",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_trailing_underscore_token_rejected(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host.example.com_backup",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_underscore_label_yields_no_fragment(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host_name.example.com",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_underscore_suffix_label_yields_no_fragment(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="host.example.com.bad_label",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_underscore_adjacent_ip_rejected(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="snapshot_10.1.2.3 10.1.2.3_old",
+        )
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_valid_hosts_alongside_underscore_tokens(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller: real.example.com log_host.example.com 10.2.3.4",
+        )
+        assert result["controller"] == "real.example.com"
+        assert result["targets"] == ["10.2.3.4"]
+
+
 class TestValidateHostKeyPassthrough:
     """validate_host must pass an explicitly-provided key through to ssh.run.
 
