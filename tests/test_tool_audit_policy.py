@@ -69,6 +69,28 @@ _PROTECTED_METHODS = {
     "write_bytes",
     "write_text",
 }
+_RESOURCE_HOST_PARSING_CALLS = {
+    "_DNS_LABEL.fullmatch",
+    "_FQDN_CANDIDATE.finditer",
+    "_IP_CANDIDATE.finditer",
+    "_is_fqdn",
+    "_is_valid_ip",
+    "all",
+    "any",
+    "dict.fromkeys",
+    "ipaddress.ip_address",
+    "isalpha",
+    "labels[-1].isalpha",
+    "len",
+    "list",
+    "m.end",
+    "m.group",
+    "m.start",
+    "split",
+    "sorted",
+    "token.rstrip",
+    "token.split",
+}
 
 
 @dataclass(frozen=True, order=True)
@@ -131,6 +153,15 @@ def _side_effect_category(path: str, call: str) -> str | None:
     """
     lowered = f"{path}:{call}".lower()
     leaf = call.rsplit(".", 1)[-1]
+    # These helpers parse text only.  ``agents/resource/`` is otherwise a
+    # useful capability boundary because the server owns provider lifecycle
+    # calls, but classifying every helper in that package as cloud access
+    # turns ordinary IP/FQDN validation into a false-positive inventory item.
+    # Keep the exemption to the exact resolved local calls, so a new provider,
+    # filesystem, SSH, or network call in one of these helpers is still
+    # surfaced by the scanner.
+    if path == "agents/resource/server.py" and call in _RESOURCE_HOST_PARSING_CALLS:
+        return None
     if "mcp" in lowered and ("call_tool" in lowered or "fastmcp" in lowered):
         return "mcp"
     if "ssh" in lowered and leaf in {"run", "copy_to", "copy_from", "connect"}:
@@ -1199,17 +1230,13 @@ async def test_real_registered_mcp_handler_runs_with_ticket_trace_context(
         def grep_file(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"matches": []}
 
-        def read_file_slice(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def read_file_slice(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"content": ""}
 
         def list_files(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"files": ["workspace://policy-proof.json"]}
 
-        def read_document(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def read_document(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"content": ""}
 
         def search_documents(
@@ -1217,9 +1244,7 @@ async def test_real_registered_mcp_handler_runs_with_ticket_trace_context(
         ) -> dict[str, object]:
             return {"results": []}
 
-        def generate_chart(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def generate_chart(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"status": "ok", "chart_ref": "workspace://policy-proof.json"}
 
     registrations = sorted(
@@ -1370,9 +1395,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
             calls.append("grep_file_from_workspace")
             return {"matches": []}
 
-        def read_file_slice(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def read_file_slice(self, *args: object, **kwargs: object) -> dict[str, object]:
             calls.append("read_file_from_workspace")
             return {"content": ""}
 
@@ -1380,9 +1403,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
             calls.append("list_files_from_workspace")
             return {"files": []}
 
-        def read_document(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def read_document(self, *args: object, **kwargs: object) -> dict[str, object]:
             calls.append("read_document_from_workspace")
             return {"content": ""}
 
@@ -1392,9 +1413,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
             calls.append("search_documents_from_workspace")
             return {"results": []}
 
-        def generate_chart(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def generate_chart(self, *args: object, **kwargs: object) -> dict[str, object]:
             calls.append("generate_chart_from_workspace")
             return {"status": "ok", "chart_ref": "workspace://policy-proof.json"}
 
@@ -1417,18 +1436,22 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
         LLMResponse(
             text=None,
             tool_calls=[
-                ToolCall(
-                    id=f"native-policy-{index}", name=name, input=arguments
-                )
+                ToolCall(id=f"native-policy-{index}", name=name, input=arguments)
                 for index, (name, arguments) in enumerate(
                     (
                         (
                             "jq_file_from_workspace",
-                            {"file_ref": "workspace://policy-proof.json", "filter": "."},
+                            {
+                                "file_ref": "workspace://policy-proof.json",
+                                "filter": ".",
+                            },
                         ),
                         (
                             "grep_file_from_workspace",
-                            {"file_ref": "workspace://policy-proof.json", "pattern": "proof"},
+                            {
+                                "file_ref": "workspace://policy-proof.json",
+                                "pattern": "proof",
+                            },
                         ),
                         (
                             "read_file_from_workspace",
@@ -1506,8 +1529,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
     tool_events = [
         event
         for event in events
-        if event.action.type == ActionType.TOOL
-        and event.action.phase in expected_names
+        if event.action.type == ActionType.TOOL and event.action.phase in expected_names
     ]
     for name in expected_names:
         name_events = [event for event in tool_events if event.action.phase == name]
@@ -1522,7 +1544,9 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
 
 
 @pytest.mark.asyncio
-async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair() -> None:
+async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair() -> (
+    None
+):
     """Exercise every agent-local tool through the canonical native dispatcher.
 
     These are production agent instances, not a synthetic ``AgentBase``
@@ -1627,9 +1651,7 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
             assert isinstance(argument, dict), name
             if name == "present_runfile_for_approval":
                 argument["validation_id"] = "policy-validation"
-            calls.append(
-                ToolCall(id=f"native-real-{index}", name=name, input=argument)
-            )
+            calls.append(ToolCall(id=f"native-real-{index}", name=name, input=argument))
         responses = [
             LLMResponse(
                 text=None,
@@ -1665,9 +1687,7 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
         async def add_comment(_ticket_id: str, comment: str) -> None:
             effects.append(("add_comment", comment))
 
-        async def transition(
-            _ticket_id: str, status: str, **_kwargs: object
-        ) -> None:
+        async def transition(_ticket_id: str, status: str, **_kwargs: object) -> None:
             effects.append(("transition", status))
 
         async def no_plan_control(_ticket_id: str) -> bool:
@@ -1713,11 +1733,17 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
     llm = SimpleNamespace(complete=AsyncMock())
     submitted = (
         (BenchmarkAgent(llm, "http://state-store.invalid"), "submit_benchmark_result"),
-        (ProvisioningAgent(llm, "http://state-store.invalid"), "submit_provisioning_result"),
+        (
+            ProvisioningAgent(llm, "http://state-store.invalid"),
+            "submit_provisioning_result",
+        ),
         (ResourceAgent(llm, "http://state-store.invalid"), "submit_resource_result"),
         (RetrospectiveAgent(llm, "http://state-store.invalid"), "submit_retrospective"),
         (ReviewAgent(llm, "http://state-store.invalid"), "submit_review_result"),
-        (TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()), "submit_triage_result"),
+        (
+            TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()),
+            "submit_triage_result",
+        ),
     )
     for agent, submit_name in submitted:
         _, effects = await exercise(agent, names=(submit_name,))
@@ -1726,13 +1752,17 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
 
     for agent, submit_name in (
         (BenchmarkAgent(llm, "http://state-store.invalid"), "submit_benchmark_result"),
-        (ProvisioningAgent(llm, "http://state-store.invalid"), "submit_provisioning_result"),
+        (
+            ProvisioningAgent(llm, "http://state-store.invalid"),
+            "submit_provisioning_result",
+        ),
         (ReviewAgent(llm, "http://state-store.invalid"), "submit_review_result"),
-        (TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()), "submit_triage_result"),
+        (
+            TriageAgent(llm, "http://state-store.invalid", SimpleNamespace()),
+            "submit_triage_result",
+        ),
     ):
-        _, effects = await exercise(
-            agent, names=("request_clarification", submit_name)
-        )
+        _, effects = await exercise(agent, names=("request_clarification", submit_name))
         assert any(effect[0] == "human_input" for effect in effects)
 
     _, effects = await exercise(
