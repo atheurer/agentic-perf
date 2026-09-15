@@ -141,6 +141,138 @@ class TestCheckAvailable:
         assert result["matching_devices"] == 0
 
 
+# --- Name selector ---
+
+
+class TestNameSelector:
+    """Tests for name= selector targeting a specific device."""
+
+    def _make_provider(self, exporters):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+            default_selector="board-type=qc8775",
+        )
+        mock_result = MagicMock()
+        mock_result.exporters = exporters
+        mock_svc = AsyncMock()
+        mock_svc.ListExporters = AsyncMock(return_value=mock_result)
+        provider._service = mock_svc
+        return provider
+
+    def _make_exporter(
+        self,
+        name,
+        board_type="qc8775",
+        online=True,
+        status="AVAILABLE",
+        enabled=True,
+        pool="open",
+    ):
+        e = MagicMock()
+        e.name = name
+        e.labels = {
+            "board-type": board_type,
+            "enabled": str(enabled).lower(),
+            "pool": pool,
+        }
+        e.online = online
+        e.status = status
+        return e
+
+    @pytest.mark.asyncio
+    async def test_available_by_name(self):
+        exp = self._make_exporter("board-01")
+        provider = self._make_provider([exp])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=board-01"}
+        )
+        assert result["available"] is True
+        assert result["exporter_name"] == "board-01"
+        assert result["matching_devices"] == 1
+
+    @pytest.mark.asyncio
+    async def test_not_found(self):
+        exp = self._make_exporter("board-01")
+        provider = self._make_provider([exp])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=no-such-board"}
+        )
+        assert result["available"] is False
+        assert "No device named" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_leased(self):
+        exp = self._make_exporter("board-01", status="LEASED")
+        provider = self._make_provider([exp])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=board-01"}
+        )
+        assert result["available"] is False
+        assert "LEASED" in result["unavailable_reason"]
+
+    @pytest.mark.asyncio
+    async def test_offline(self):
+        exp = self._make_exporter("board-01", online=False)
+        provider = self._make_provider([exp])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=board-01"}
+        )
+        assert result["available"] is False
+        assert "offline" in result["unavailable_reason"]
+
+    @pytest.mark.asyncio
+    async def test_disabled(self):
+        exp = self._make_exporter("board-01", enabled=False)
+        provider = self._make_provider([exp])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=board-01"}
+        )
+        assert result["available"] is False
+        assert "disabled" in result["unavailable_reason"]
+
+    @pytest.mark.asyncio
+    async def test_suggests_alternatives(self):
+        busy = self._make_exporter("board-01", status="LEASED")
+        free = self._make_exporter("board-02")
+        provider = self._make_provider([busy, free])
+        result = await provider.check_available(
+            {"jumpstarter_selector": "name=board-01"}
+        )
+        assert result["available"] is False
+        assert "board-02" in result["alternatives"]
+
+    @pytest.mark.asyncio
+    async def test_reserve_resolves_name_selector(self):
+        exp = self._make_exporter("board-01", board_type="qc8775")
+        provider = self._make_provider([exp])
+        # Mock CreateLease — use spec to avoid spurious attributes
+        mock_lease = MagicMock(spec=["name"])
+        mock_lease.name = "test-lease"
+        provider._service.CreateLease = AsyncMock(
+            return_value=mock_lease,
+        )
+        await provider.reserve(
+            {"jumpstarter_selector": "name=board-01"},
+            ticket_id="PERF-TEST",
+        )
+        # Should resolve to board-type selector + exporter_name
+        call_args = provider._service.CreateLease.call_args
+        assert call_args is not None
+        assert "board-type=qc8775" in call_args.kwargs["selector"]
+        assert call_args.kwargs["exporter_name"] == "board-01"
+
+    @pytest.mark.asyncio
+    async def test_reserve_name_not_found(self):
+        exp = self._make_exporter("board-01")
+        provider = self._make_provider([exp])
+        result = await provider.reserve(
+            {"jumpstarter_selector": "name=no-such-board"},
+            ticket_id="PERF-TEST",
+        )
+        assert result["status"] == "rejected"
+        assert "not found" in result["error"]
+
+
 # --- Reserve ---
 
 
@@ -378,3 +510,66 @@ class TestCheckAvailableRequiresSelector:
         assert "jumpstarter_selector" in result["error"]
         assert len(result["available_targets"]) == 1
         assert result["available_targets"][0]["selector"] == "board-type=x"
+
+
+class TestNamedDeviceEscalation:
+    """Verify auto-escalation to HITL for unavailable named devices."""
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_posts_transition(self):
+        from unittest.mock import patch
+
+        from agents.resource.server import _auto_escalate_named_device
+
+        result = {
+            "available": False,
+            "selector": "name=board-01",
+            "error": "Device 'board-01' exists but is unavailable (status: LEASED).",
+            "alternatives": ["board-02", "board-03"],
+        }
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TICKET_ID": "PERF-TEST",
+                    "STATE_STORE_URL": "http://localhost:8090",
+                    "AGENTIC_PERF_API_TOKEN": "test-token",
+                },
+            ),
+            patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
+        ):
+            mock_client = MagicMock()
+            mock_client.post = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(
+                return_value=mock_client,
+            )
+            mock_client_cls.return_value.__aexit__ = AsyncMock(
+                return_value=False,
+            )
+
+            await _auto_escalate_named_device(result)
+
+            mock_client.post.assert_awaited_once()
+            call_args = mock_client.post.call_args
+            assert "transition" in call_args[0][0]
+            body = call_args[1]["json"]
+            assert body["status"] == "awaiting_customer_guidance"
+            assert "board-01" in body["comment"]
+            assert "board-02" in body["comment"]
+
+    @pytest.mark.asyncio
+    async def test_no_escalate_without_ticket_id(self):
+        from unittest.mock import patch
+
+        from agents.resource.server import _auto_escalate_named_device
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
+        ):
+            await _auto_escalate_named_device({"selector": "name=x"})
+            mock_client_cls.assert_not_called()
