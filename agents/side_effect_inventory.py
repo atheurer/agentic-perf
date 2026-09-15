@@ -1283,7 +1283,7 @@ INVENTORY_DISPOSITIONS = {
         "mutating_http_state",
     ): (
         "audited",
-        "observability-maintainers",
+        "agents.resource.server.named_device_escalation",
         "agents/resource/server.py:_auto_escalate_named_device",
         "2027-12-31",
     ),

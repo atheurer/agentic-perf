@@ -970,6 +970,7 @@ def test_checked_in_side_effect_inventory_has_zero_unexplained_boundaries() -> N
 
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
+    used_owners = set()
     for policy in TOOL_AUDIT_POLICY:
         exemption = policy.fixture_exemption
         if exemption is not None:
@@ -981,27 +982,45 @@ def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
             )
         if policy.classification == "side_effecting":
             assert policy.operation_owner, policy.registration
-            contract = OPERATION_OWNER_CONTRACTS.get(policy.operation_owner)
-            assert contract, f"no concrete contract for {policy.operation_owner}"
-            path, symbol = contract.split(":", 1)
-            if path.endswith(".py"):
-                source = (ROOT / path).read_text(encoding="utf-8")
-            else:
-                source = "\n".join(
-                    candidate.read_text(encoding="utf-8")
-                    for candidate in (ROOT / path).rglob("*.py")
-                )
-            assert symbol in source, (
-                f"stale operation owner {policy.operation_owner}: {contract}"
-            )
+            used_owners.add(policy.operation_owner)
         else:
             assert policy.operation_owner is None, policy.registration
 
-    used_owners = {
-        policy.operation_owner
-        for policy in TOOL_AUDIT_POLICY
-        if policy.operation_owner is not None
-    }
+    # A conditional mutation is not a side-effecting *tool*: normal
+    # ``check_available_resources`` calls are read-only.  Its exact audited
+    # inventory boundary nevertheless consumes an operation owner contract,
+    # so the contract must be reviewed just as rigorously as one attached to
+    # an always-mutating registration.
+    used_owners.update(
+        owner
+        for (path, symbol, category), (
+            disposition,
+            owner,
+            _scope,
+            _expiry,
+        ) in INVENTORY_DISPOSITIONS.items()
+        if disposition == "audited"
+        and category == "mutating_http_state"
+        and owner in OPERATION_OWNER_CONTRACTS
+        and (path, symbol)
+        == (
+            "agents/resource/server.py",
+            "_auto_escalate_named_device",
+        )
+    )
+    for owner in used_owners:
+        contract = OPERATION_OWNER_CONTRACTS.get(owner)
+        assert contract, f"no concrete contract for {owner}"
+        path, symbol = contract.split(":", 1)
+        if path.endswith(".py"):
+            source = (ROOT / path).read_text(encoding="utf-8")
+        else:
+            source = "\n".join(
+                candidate.read_text(encoding="utf-8")
+                for candidate in (ROOT / path).rglob("*.py")
+            )
+        assert symbol in source, f"stale operation owner {owner}: {contract}"
+
     assert used_owners == set(OPERATION_OWNER_CONTRACTS), (
         "operation owner contracts must not become stale documentation; "
         f"unused={set(OPERATION_OWNER_CONTRACTS) - used_owners!r}"
