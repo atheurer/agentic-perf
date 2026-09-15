@@ -388,9 +388,30 @@ class GatheringContextAgent(AgentBase):
         await self._update_fields(ticket_id, fields)
 
         if decision == "MATCH_FOUND" and matched_id:
+            # Resolve the record URL from the provider
+            # rather than trusting LLM output.
+            record_url = ""
+            try:
+                from providers.investigation.registry import (
+                    create_record_provider,
+                )
+
+                provider = create_record_provider()
+                record = await provider.get(matched_id)
+                if record:
+                    record_url = record.record_url
+                    fields["dedup_result"]["record_url"] = record_url
+                    await self._update_fields(ticket_id, fields)
+            except Exception:
+                logger.debug(
+                    "[gathering-context] Could not resolve record URL for %s",
+                    matched_id,
+                )
+
+            record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
             summary = (
                 f"**Dedup Match Found**\n\n"
-                f"- **Matched Record:** {matched_id}\n"
+                f"- **Matched Record:** {record_label}\n"
                 f"- **Confidence:** {confidence}\n"
                 f"- **Rationale:** {rationale}\n\n"
                 f"Skipping full investigation — this anomaly "
