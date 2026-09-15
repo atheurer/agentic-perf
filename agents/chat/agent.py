@@ -17,9 +17,15 @@ from typing import Any
 import httpx
 
 from providers.llm.base import LLMProvider
+from providers.tracing import (
+    bind_trace_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 
 from .prompts import CHAT_SYSTEM_PROMPT
-from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, execute_tool
+from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, ChatToolAudit, execute_tool
 
 # Default fallback values if provider doesn't expose them
 _DEFAULT_MAX_TOKENS = 4096
@@ -186,12 +192,17 @@ class ChatAgent:
         store_url: str,
         session_store: ChatSessionStore | None = None,
         max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
+        audit_token: str | None = None,
     ) -> None:
         self._llm = llm
         self._store_url = store_url
         self._sessions = session_store or ChatSessionStore()
         self._client = httpx.AsyncClient(timeout=30.0)
         self._max_tool_rounds = max_tool_rounds
+        # The web caller's token may be a restricted user credential. Trace
+        # ingestion is intentionally service-only, so the embedded state-store
+        # supplies its deployment token instead.
+        self._audit_token = audit_token
 
     async def handle_message(
         self,
@@ -218,6 +229,32 @@ class ChatAgent:
             Optional ticket ID for context-aware chat on
             the ticket detail page.
         """
+        # Every web request has a root context before it can reach
+        # ChatToolAudit.  Destructive confirmation actions persist this root in
+        # the session so their later confirmation/cancellation is still a
+        # child of the original request rather than an unrelated trace.
+        root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
+        token = bind_trace_context(root)
+        try:
+            return await self._handle_message(
+                user,
+                message,
+                auth_token,
+                ticket_context=ticket_context,
+                readonly=readonly,
+            )
+        finally:
+            reset_trace_context(token)
+
+    async def _handle_message(
+        self,
+        user: str,
+        message: str,
+        auth_token: str,
+        ticket_context: str | None = None,
+        readonly: bool = False,
+    ) -> str:
+        """Handle one already-context-bound web chat request."""
         session = self._sessions.get_or_create(user)
 
         # Check for pending action confirmation
@@ -230,6 +267,11 @@ class ChatAgent:
                 self._client,
                 self._store_url,
                 auth_token,
+                audit=ChatToolAudit(
+                    self._client, self._store_url, self._audit_token or ""
+                ),
+                tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
             )
             parsed = json.loads(result)
             if "error" in parsed:
@@ -247,7 +289,16 @@ class ChatAgent:
             session.add_assistant_message(response_text)
             return response_text
         elif session.pending_action and _is_cancellation(message):
+            action = session.pending_action
             session.pending_action = None
+            await ChatToolAudit(
+                self._client, self._store_url, self._audit_token or ""
+            ).reject(
+                action["tool"],
+                action["input"],
+                tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
+            )
             # Remove the entire confirmation exchange (3 msgs)
             if len(session.messages) >= 3:
                 session.messages = session.messages[:-3]
@@ -256,7 +307,20 @@ class ChatAgent:
             session.add_assistant_message(cancel_msg)
             return cancel_msg
         elif session.pending_action:
-            # Any other message clears the pending action
+            # Treat an unrelated reply as an explicit invalidation, rather
+            # than silently discarding an agent-visible pending capability.
+            # Keep the pending action until the started/rejected pair is
+            # durable: if the audit service is down, do not continue this
+            # conversation as though no decision had been made.
+            action = session.pending_action
+            await ChatToolAudit(
+                self._client, self._store_url, self._audit_token or ""
+            ).reject(
+                action["tool"],
+                action["input"],
+                tool_call_id=action.get("tool_call_id"),
+                parent_context=action.get("trace_context"),
+            )
             session.pending_action = None
 
         # Add context prefix for ticket-scoped chat.
@@ -391,6 +455,8 @@ class ChatAgent:
                     session.pending_action = {
                         "tool": tc.name,
                         "input": tc.input,
+                        "tool_call_id": tc.id,
+                        "trace_context": current_trace_context(),
                     }
                     confirm_msg = (
                         "Here is the ticket I’m ready to create:\n\n"
@@ -420,6 +486,10 @@ class ChatAgent:
                     self._client,
                     self._store_url,
                     auth_token,
+                    audit=ChatToolAudit(
+                        self._client, self._store_url, self._audit_token or ""
+                    ),
+                    tool_call_id=tc.id,
                 )
                 tool_results.append(
                     {

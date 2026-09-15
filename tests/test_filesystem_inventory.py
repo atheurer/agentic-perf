@@ -24,6 +24,10 @@ MUTATING_ATTRIBUTES = {
 MUTATING_QUALIFIED = {
     "os.chmod",
     "os.chown",
+    "os.fchmod",
+    "os.fchown",
+    "os.ftruncate",
+    "os.open",
     "os.link",
     "os.makedirs",
     "os.mkdir",
@@ -33,6 +37,9 @@ MUTATING_QUALIFIED = {
     "os.remove",
     "os.rmdir",
     "os.symlink",
+    "os.truncate",
+    "os.utime",
+    "os.write",
     "shutil.move",
     "shutil.copy",
     "shutil.copy2",
@@ -61,6 +68,33 @@ def _call_name(node: ast.expr) -> str:
     return ""
 
 
+def _import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Map locally-spelled imports back to their protected API names."""
+    aliases: dict[str, str] = {}
+    protected_modules = {"os", "pathlib", "shutil", "tempfile", "tarfile"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name in protected_modules:
+                    aliases[imported.asname or imported.name] = imported.name
+        elif isinstance(node, ast.ImportFrom) and node.module in protected_modules:
+            for imported in node.names:
+                aliases[imported.asname or imported.name] = (
+                    f"{node.module}.{imported.name}"
+                )
+    return aliases
+
+
+def _resolved_call_name(node: ast.expr, aliases: dict[str, str]) -> str:
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Call):
+        constructor = _resolved_call_name(node.value.func, aliases)
+        if constructor == "pathlib.Path" and node.attr == "open":
+            return f"{constructor}.{node.attr}"
+    raw = _call_name(node)
+    root, dot, rest = raw.partition(".")
+    return f"{aliases.get(root, root)}{dot}{rest}" if raw else raw
+
+
 def _mode(node: ast.Call, call: str) -> str | None:
     # Path.open(name, mode) has its mode as the first positional argument,
     # while built-in open/tarfile.open and os.fdopen place mode second.
@@ -81,7 +115,41 @@ def _mode(node: ast.Call, call: str) -> str | None:
     )
 
 
+def _os_open_is_mutation(node: ast.Call) -> bool:
+    """Recognize os.open flags which can create or modify a file.
+
+    ``os.open`` is not mode-string based.  Treat an unknown flag expression as
+    reviewed rather than silently missing a write boundary; read-only constants
+    remain excluded to keep the manifest useful.
+    """
+    if len(node.args) < 2:
+        return True
+
+    def _has_mutating_flag(value: ast.expr) -> bool | None:
+        if isinstance(value, ast.Attribute):
+            return value.attr in {
+                "O_APPEND",
+                "O_CREAT",
+                "O_RDWR",
+                "O_TRUNC",
+                "O_WRONLY",
+            }
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
+            left = _has_mutating_flag(value.left)
+            right = _has_mutating_flag(value.right)
+            if left is None or right is None:
+                return None
+            return left or right
+        if isinstance(value, ast.Constant) and isinstance(value.value, int):
+            return value.value != 0
+        return None
+
+    return _has_mutating_flag(node.args[1]) is not False
+
+
 def _is_mutation(node: ast.Call, call: str) -> bool:
+    if call == "os.open":
+        return _os_open_is_mutation(node)
     if call in MUTATING_QUALIFIED:
         return True
     if call.rsplit(".", 1)[-1] in MUTATING_ATTRIBUTES:
@@ -106,10 +174,11 @@ def _inventory() -> list[Mutation]:
     for path in paths:
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        aliases = _import_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            call = _call_name(node.func)
+            call = _resolved_call_name(node.func, aliases)
             if _is_mutation(node, call):
                 found.append(Mutation(relative, node.lineno, call))
     return sorted(found, key=lambda item: (item.path, item.line, item.call))
@@ -136,8 +205,12 @@ agents/benchmark/server.py|4591|merged_file.write_bytes
 agents/infra/server.py|232|tempfile.NamedTemporaryFile
 agents/infra/server.py|240|staging.unlink
 agents/infra/server.py|242|unlink
-agents/infra/server.py|307|tempfile.mkdtemp
+agents/infra/server.py|318|filesystem.mkdir
+agents/infra/server.py|322|tempfile.mkdtemp
 orchestrator/main.py|1957|LOCK_FILE.parent.mkdir
+orchestrator/main.py|1958|os.open
+orchestrator/main.py|1973|os.ftruncate
+orchestrator/main.py|1974|os.write
 orchestrator/main.py|1989|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
@@ -185,6 +258,7 @@ providers/tracing/fingerprints.py|15|key_path.parent.mkdir
 providers/tracing/fingerprints.py|16|os.chmod
 providers/tracing/fingerprints.py|22|os.chmod
 providers/tracing/fingerprints.py|31|tempfile.mkstemp
+providers/tracing/fingerprints.py|35|os.fchmod
 providers/tracing/fingerprints.py|36|os.fdopen
 providers/tracing/fingerprints.py|42|os.link
 providers/tracing/fingerprints.py|50|os.unlink
@@ -192,20 +266,26 @@ providers/tracing/payloads.py|76|self.directory.mkdir
 providers/tracing/payloads.py|77|os.chmod
 providers/tracing/payloads.py|86|os.chmod
 providers/tracing/payloads.py|93|tempfile.mkstemp
+providers/tracing/payloads.py|95|os.fchmod
 providers/tracing/payloads.py|96|os.fdopen
 providers/tracing/payloads.py|102|os.replace
 providers/tracing/payloads.py|110|os.unlink
 providers/tracing/payloads.py|113|os.chmod
 providers/tracing/spool.py|59|self.directory.mkdir
 providers/tracing/spool.py|62|os.chmod
+providers/tracing/spool.py|73|os.open
+providers/tracing/spool.py|81|os.fchmod
 providers/tracing/spool.py|89|self.lock_path.unlink
+providers/tracing/spool.py|98|os.open
 providers/tracing/spool.py|103|os.chmod
 providers/tracing/spool.py|121|self.path.open
 providers/tracing/spool.py|138|tempfile.mkstemp
+providers/tracing/spool.py|140|os.fchmod
 providers/tracing/spool.py|141|os.fdopen
 providers/tracing/spool.py|145|os.replace
 providers/tracing/spool.py|149|os.unlink
 providers/tracing/spool.py|195|tempfile.mkstemp
+providers/tracing/spool.py|197|os.fchmod
 providers/tracing/spool.py|198|os.fdopen
 providers/tracing/spool.py|208|os.replace
 providers/tracing/spool.py|212|os.unlink
@@ -235,9 +315,14 @@ state_store/store.py|129|self._lease_path.unlink
 state_store/store.py|138|temporary.open
 state_store/store.py|142|os.replace
 state_store/process_lock.py|56|path.parent.mkdir
+state_store/process_lock.py|66|os.open
+state_store/process_lock.py|68|os.write
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
+state_store/process_lock.py|109|os.open
+state_store/process_lock.py|126|os.ftruncate
+state_store/process_lock.py|128|os.write
 state_store/store.py|1825|filesystem.mkdir
 state_store/store.py|1832|filesystem.mkdir
 state_store/store.py|1845|log_filesystem.rename
@@ -255,6 +340,21 @@ def _expected_manifest() -> frozenset[Mutation]:
 
 
 EXPECTED_MUTATIONS = _expected_manifest()
+
+
+def test_aliases_cannot_hide_os_open_mutations() -> None:
+    tree = ast.parse(
+        "from os import open as fd_open\nimport os as operating_system\n"
+        "from pathlib import Path as LocalPath\n"
+        "fd_open('created', operating_system.O_CREAT)\n"
+        "operating_system.open('written', operating_system.O_WRONLY)\n"
+        "LocalPath('written').open('w')\n"
+    )
+    aliases = _import_aliases(tree)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    resolved = [_resolved_call_name(node.func, aliases) for node in calls]
+    assert resolved == ["os.open", "os.open", "pathlib.Path.open", "pathlib.Path"]
+    assert all(_is_mutation(node, name) for node, name in zip(calls[:3], resolved[:3]))
 
 
 def test_full_production_mutation_inventory_has_reviewed_exclusions() -> None:
@@ -280,3 +380,18 @@ def test_leader_lease_temporary_write_is_inventoried() -> None:
         mutation.path == "state_store/store.py" and mutation.call == "temporary.open"
         for mutation in _inventory()
     )
+
+
+def test_os_open_and_bound_path_open_writes_are_inventoried() -> None:
+    """Regression coverage for the Wave 6 audit-inventory blind spots."""
+    write_open = (
+        ast.parse("os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)").body[0].value
+    )
+    read_open = ast.parse("os.open(path, os.O_RDONLY)").body[0].value
+    bound_open = ast.parse('self.path.open("ab")').body[0].value
+    assert isinstance(write_open, ast.Call)
+    assert isinstance(read_open, ast.Call)
+    assert isinstance(bound_open, ast.Call)
+    assert _is_mutation(write_open, "os.open")
+    assert not _is_mutation(read_open, "os.open")
+    assert _is_mutation(bound_open, "self.path.open")

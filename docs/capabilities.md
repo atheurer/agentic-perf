@@ -1,9 +1,12 @@
 # Capabilities and tool inventory
 
-Status: current implementation reference (audited against `origin/main`,
-commit `909f298`). The source of truth for registered MCP tools is each
-`agents/*/server.py` `@mcp.tool()` declaration plus the native workspace tools
-registered by `agents/base.py`.
+Status: current implementation reference. The source of truth for registered
+MCP tools is each `agents/*/server.py` `@mcp.tool()` declaration plus native
+agent tool definitions, the workspace tools registered by `agents/base.py`,
+and `agents/chat/tools.py` `CHAT_TOOLS`. CI compares that source inventory
+with `agents/tool_audit_policy.py`; every tool has an explicit
+read-only or side-effecting classification and must use the shared audit
+boundary. See [internal/tool-audit-policy.md](internal/tool-audit-policy.md).
 
 ## Dispatchers and agents
 
