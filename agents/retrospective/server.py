@@ -107,14 +107,16 @@ def _check_suspicious_tool_use(
     input_data = data.get("input", {})
 
     if tool == "execute_benchmark":
-        command = input_data.get("run_command", "")
-        command_lower = command.lower()
+        # The validation-ID execution path records run_command as null when the
+        # harness should construct its default command.  Transcript inspection
+        # must treat that the same as an omitted command.
+        run_cmd = str(input_data.get("run_command") or "")
+        command_lower = run_cmd.lower()
 
         for pattern in EGRESS_PATTERNS:
             if pattern.search(command_lower):
-                return f"Command contains network egress pattern: {command[:200]}"
+                return f"Command contains network egress pattern: {run_cmd[:200]}"
 
-        run_cmd = input_data.get("run_command", "")
         if run_cmd:
             first_word = run_cmd.strip().split()[0] if run_cmd.strip() else ""
             base = Path(first_word).name if first_word else ""

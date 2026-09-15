@@ -304,6 +304,39 @@ class TestMCPToolHandler:
                 assert len(result["signals"]) > 0
                 assert result["stats"]["total_events"] == len(SAMPLE_EVENTS)
 
+    def test_get_transcript_analysis_with_null_run_command(self):
+        from agents.retrospective.server import get_transcript_analysis
+
+        events = [
+            _make_event(
+                1,
+                "tool_called",
+                "benchmark-agent",
+                {
+                    "tool": "execute_benchmark",
+                    "input": {
+                        "controller": "10.0.0.1",
+                        "validation_id": "val-test",
+                        "harness": "crucible",
+                        "run_command": None,
+                    },
+                },
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "PERF-TEST.jsonl"
+            path.write_text(json.dumps(events[0]) + "\n", encoding="utf-8")
+
+            with patch(
+                "agents.retrospective.server.DEFAULT_LOG_DIR",
+                Path(tmpdir),
+            ):
+                result = get_transcript_analysis("PERF-TEST")
+
+        assert result["ticket_id"] == "PERF-TEST"
+        assert result["signals"] == []
+        assert result["stats"]["total_events"] == 1
+
 
 TICKET_CTX = {
     "harness": "crucible",
@@ -323,6 +356,37 @@ class TestMisuseDetection:
                 "input": {
                     "controller": "10.0.0.1",
                     "run_command": "crucible run",
+                    "harness": "crucible",
+                },
+            },
+        )
+        assert _check_suspicious_tool_use(evt, TICKET_CTX) is None
+
+    def test_null_run_command_uses_harness_default(self):
+        evt = _make_event(
+            1,
+            "tool_called",
+            "benchmark-agent",
+            {
+                "tool": "execute_benchmark",
+                "input": {
+                    "controller": "10.0.0.1",
+                    "run_command": None,
+                    "harness": "crucible",
+                },
+            },
+        )
+        assert _check_suspicious_tool_use(evt, TICKET_CTX) is None
+
+    def test_omitted_run_command_uses_harness_default(self):
+        evt = _make_event(
+            1,
+            "tool_called",
+            "benchmark-agent",
+            {
+                "tool": "execute_benchmark",
+                "input": {
+                    "controller": "10.0.0.1",
                     "harness": "crucible",
                 },
             },
