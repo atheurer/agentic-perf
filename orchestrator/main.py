@@ -1504,6 +1504,14 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         )
     )
 
+    # Expose store URL so the trace recorder and agent
+    # subprocesses can find the state store.  The audited
+    # execution layers (subprocess, HTTP) require this to
+    # initialise the central TraceClient.  Must be set
+    # before any AuditedSubprocessRunner calls (repo cache,
+    # skill providers, etc.).
+    _export_state_store_url(config)
+
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
@@ -2039,6 +2047,11 @@ def _sweep_trace_spools() -> None:
             client.close()
         except TraceDeliveryError:
             pass
+
+
+def _export_state_store_url(config: OrchestratorConfig) -> None:
+    """Make the orchestrator's resolved store endpoint available to children."""
+    os.environ["STATE_STORE_URL"] = config.state_store_url
 
 
 def main():
