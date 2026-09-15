@@ -1277,7 +1277,11 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/server.py:_infer_os_from_ticket",
         "2027-12-31",
     ),
-    ("agents/resource/server.py", "_auto_escalate_named_device", "mutating_http_state"): (
+    (
+        "agents/resource/server.py",
+        "_auto_escalate_named_device",
+        "mutating_http_state",
+    ): (
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_auto_escalate_named_device",

@@ -536,7 +536,8 @@ class TestNamedDeviceEscalation:
             "agents.resource.server._auto_escalate_named_device", new=AsyncMock()
         ) as escalate:
             result = await handlers["check_available_resources"](
-                provider="jumpstarter", requirements={"jumpstarter_selector": "board-type=arm"}
+                provider="jumpstarter",
+                requirements={"jumpstarter_selector": "board-type=arm"},
             )
 
         assert result["available"] is True
@@ -574,7 +575,9 @@ class TestNamedDeviceEscalation:
                 },
             ),
             patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
-            patch("agents.resource.server.asyncio.to_thread", new=immediate_thread_call),
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
         ):
             mock_response = MagicMock()
             mock_response.raise_for_status = MagicMock()
@@ -618,7 +621,9 @@ class TestNamedDeviceEscalation:
                 "named-device-escalation:PERF-TEST:name=board-01"
             )
             assert escalation_trace.parent_action_id is not None
-            assert [call.args[1] for call in registry.operation_transition.call_args_list] == [
+            assert [
+                call.args[1] for call in registry.operation_transition.call_args_list
+            ] == [
                 "prepared",
                 "side-effect-started",
                 "complete",
@@ -650,7 +655,9 @@ class TestNamedDeviceEscalation:
             ),
             patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
             patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
-            patch("agents.resource.server.asyncio.to_thread", new=immediate_thread_call),
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
         ):
             registry = mock_trace_client_cls.return_value
             registry.operation_acquire.return_value = {
@@ -704,7 +711,9 @@ class TestNamedDeviceEscalation:
                 "providers.execution.AuditedAsyncHTTPClient",
                 side_effect=lambda **_kwargs: CancelledHTTPClient(),
             ),
-            patch("agents.resource.server.asyncio.to_thread", new=immediate_thread_call),
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
             patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
         ):
             registry = mock_trace_client_cls.return_value

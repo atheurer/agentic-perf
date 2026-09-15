@@ -170,7 +170,12 @@ def _side_effect_category(path: str, call: str) -> str | None:
     # exact helper performs a state-store POST when a named device is
     # unavailable.  Keep the conditional mutation visible as such instead of
     # letting the package-level resource classification hide it.
-    if path == "agents/resource/server.py" and leaf in {"post", "put", "patch", "delete"}:
+    if path == "agents/resource/server.py" and leaf in {
+        "post",
+        "put",
+        "patch",
+        "delete",
+    }:
         return "mutating_http_state"
     if "image_build" in path or "image_builder" in path:
         return "image"
