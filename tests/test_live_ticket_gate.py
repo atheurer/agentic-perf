@@ -147,6 +147,25 @@ def test_policy_accepts_exact_one_client_sleep_run() -> None:
     gate.validate_run_file(safe_run_file(), config())
 
 
+@pytest.mark.parametrize("location", ["endpoint", "remote"])
+def test_policy_accepts_explicit_disable_tools_true(location: str) -> None:
+    run_file = safe_run_file()
+    if location == "endpoint":
+        run_file["endpoints"][0]["settings"] = {"disable-tools": True}
+    else:
+        remote_config = run_file["endpoints"][0]["remotes"][0]["config"]
+        remote_config["settings"] = {"disable-tools": True}
+    gate.validate_run_file(run_file, config())
+
+
+@pytest.mark.parametrize("value", [False, "true", 1, None])
+def test_policy_rejects_disable_tools_unless_boolean_true(value: object) -> None:
+    run_file = safe_run_file()
+    run_file["endpoints"][0]["settings"] = {"disable-tools": value}
+    with pytest.raises(gate.GateError, match="must be boolean true"):
+        gate.validate_run_file(run_file, config())
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

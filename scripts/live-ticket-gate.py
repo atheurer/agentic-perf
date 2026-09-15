@@ -112,6 +112,17 @@ def _benchmark_params(benchmark: dict[str, Any]) -> list[dict[str, Any]]:
     return params
 
 
+def _validate_endpoint_settings(settings: dict[str, Any], location: str) -> None:
+    allowed_settings = {"user", "userenv", "osruntime", "disable-tools"}
+    unknown_settings = set(settings) - allowed_settings
+    if unknown_settings:
+        raise GateError(f"unapproved {location} settings: {sorted(unknown_settings)}")
+    if settings.get("osruntime") not in (None, "podman", "chroot"):
+        raise GateError(f"{location} osruntime must be podman or chroot")
+    if "disable-tools" in settings and settings["disable-tools"] is not True:
+        raise GateError(f"{location} disable-tools must be boolean true")
+
+
 def validate_run_file(run_file: dict[str, Any], config: GateConfig) -> None:
     """Fail closed unless *run_file* is the approved one-client sleep run."""
 
@@ -144,13 +155,8 @@ def validate_run_file(run_file: dict[str, Any], config: GateConfig) -> None:
     group = endpoint_groups[0]
     if group.get("type") != "remotehosts":
         raise GateError("endpoint type must be remotehosts")
-    allowed_settings = {"user", "userenv", "osruntime"}
     for settings in (group.get("settings", {}),):
-        unknown_settings = set(settings) - allowed_settings
-        if unknown_settings:
-            raise GateError(f"unapproved endpoint settings: {sorted(unknown_settings)}")
-        if settings.get("osruntime") not in (None, "podman", "chroot"):
-            raise GateError("endpoint osruntime must be podman or chroot")
+        _validate_endpoint_settings(settings, "endpoint")
     remotes = group.get("remotes")
     if not isinstance(remotes, list) or len(remotes) != 1:
         raise GateError("run file must contain exactly one remote host")
@@ -163,11 +169,7 @@ def validate_run_file(run_file: dict[str, Any], config: GateConfig) -> None:
         if host not in expected:
             raise GateError(f"unapproved remote host: {host!r}")
         settings = remote_config.get("settings", {})
-        unknown_settings = set(settings) - allowed_settings
-        if unknown_settings:
-            raise GateError(f"unapproved remote settings: {sorted(unknown_settings)}")
-        if settings.get("osruntime") not in (None, "podman", "chroot"):
-            raise GateError("remote osruntime must be podman or chroot")
+        _validate_endpoint_settings(settings, "remote")
         engines = remote.get("engines")
         if not isinstance(engines, list) or len(engines) != 1:
             raise GateError("each host must have exactly one engine declaration")
@@ -229,7 +231,8 @@ Use resource provider user_provided, SSH user {config.ssh_user}, and SSH key
 {config.ssh_key_path}. Use Crucible with remotehosts. Run exactly one `sleep`
 benchmark with benchmark ID 1 bound only to the system under test. Set
 seconds={config.seconds} and
-num-samples={config.samples}. Disable every profiling and collection tool.
+num-samples={config.samples}. Disable every profiling and collection tool. You
+may set endpoint setting `disable-tools` only to the JSON boolean `true`.
 
 Do not modify network interfaces, addresses, MTUs, queues, IRQ affinity,
 irqbalance, firewall, sysctls, storage, packages, or operating-system settings.
