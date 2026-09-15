@@ -31,16 +31,31 @@ def _process_start_identity(pid: int | None = None) -> str:
         return str(pid)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Check if a process is still running."""
+def _holder_alive(holder: dict) -> bool:
+    """Check if the lock holder process is still the same incarnation.
+
+    In containers, PIDs are recycled across restarts.
+    Comparing the process_start_identity (kernel start-time
+    tick) ensures we don't mistake a new process at the
+    same PID for the original holder.
+    """
+    pid = holder.get("pid")
+    if not pid:
+        return False
+    pid = int(pid)
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Process exists but we can't signal it.
+        pass
+    # PID exists — verify it's the same incarnation.
+    holder_identity = holder.get("process_start_identity", "")
+    if not holder_identity:
+        # No identity recorded — can't verify, assume alive.
         return True
+    current_identity = _process_start_identity(pid)
+    return current_identity == holder_identity
 
 
 def _read_metadata(
@@ -123,16 +138,15 @@ class PersistenceRootLock:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             holder = _read_metadata(path=path)
-            holder_pid = holder.get("pid")
-            # If the holder PID is no longer alive, the lock
-            # is stale (e.g., container restart with PVC).
-            # Force-acquire by blocking briefly.
-            if holder_pid and not _pid_alive(int(holder_pid)):
+            # If the holder process is no longer the same
+            # incarnation, the lock is stale (e.g., container
+            # restart with PVC).  Force-acquire.
+            if not _holder_alive(holder):
                 import logging
 
                 logging.getLogger(__name__).warning(
-                    "Stale lock held by dead PID %s — force-acquiring",
-                    holder_pid,
+                    "Stale lock held by dead process %s — force-acquiring",
+                    holder.get("process_start_identity", holder.get("pid")),
                 )
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX)
