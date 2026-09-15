@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -15,6 +15,23 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from providers.llm.base import ToolDefinition
 
 logger = logging.getLogger(__name__)
+
+
+class MCPToolCallError(RuntimeError):
+    """An MCP failure annotated with whether the request may have reached it."""
+
+    def __init__(
+        self,
+        message: str,
+        retry_classification: Literal[
+            "validation",
+            "intentional_agent_retry",
+            "transport_before_send",
+            "ambiguous_after_send",
+        ],
+    ) -> None:
+        super().__init__(message)
+        self.retry_classification = retry_classification
 
 
 @dataclass
@@ -336,17 +353,36 @@ class AgentMCPClient:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
-            raise RuntimeError(f"No server provides tool {name!r}")
+            raise MCPToolCallError(f"No server provides tool {name!r}", "validation")
+
+        # A stale route without a connection is known to fail before either a
+        # provider hook or the session can dispatch a request.
+        conn = self._servers.get(server_name)
+        if conn is None:
+            raise MCPToolCallError(
+                f"No active connection for MCP server {server_name!r}",
+                "transport_before_send",
+            )
 
         # Pre-call hook: provider-specific guards
         # (e.g., Jumpstarter one-connect, timeout).
         if self.pre_call_hook is not None:
-            short_circuit = await self.pre_call_hook(name, arguments)
+            try:
+                short_circuit = await self.pre_call_hook(name, arguments)
+            except MCPToolCallError:
+                raise
+            except Exception as e:
+                # Hooks can dispatch themselves (for example, Jumpstarter's
+                # connection guard), so this boundary cannot prove no request
+                # was sent.  Preserve explicitly classified failures only.
+                raise MCPToolCallError(str(e), "ambiguous_after_send") from e
             if short_circuit is not None:
                 return short_circuit
 
-        conn = self._servers[server_name]
-        result = await conn.session.call_tool(name, arguments)
+        try:
+            result = await conn.session.call_tool(name, arguments)
+        except Exception as e:
+            raise MCPToolCallError(str(e), "ambiguous_after_send") from e
         parts = []
         for block in result.content:
             if hasattr(block, "text"):
@@ -355,7 +391,7 @@ class AgentMCPClient:
                 parts.append(str(block))
         content = "\n".join(parts) if parts else ""
         if result.isError:
-            raise RuntimeError(content)
+            raise MCPToolCallError(content, "intentional_agent_retry")
 
         # Post-call hook: provider-specific response
         # trimming (e.g., Jumpstarter verbose output).
