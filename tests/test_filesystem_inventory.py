@@ -327,7 +327,7 @@ state_store/store.py|1825|filesystem.mkdir
 state_store/store.py|1832|filesystem.mkdir
 state_store/store.py|1845|log_filesystem.rename
 state_store/store.py|1854|filesystem.rename
-state_store/trace_store.py|77|self.db_path.parent.mkdir
+state_store/trace_store.py|78|self.db_path.parent.mkdir
 """
 
 

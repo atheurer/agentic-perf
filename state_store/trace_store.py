@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -75,6 +76,12 @@ class TraceStore:
     def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5_000) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Serialize all transaction-bearing operations on the
+        # shared connection.  Multiple callers (audit log,
+        # store mutations, API handlers) access this store
+        # concurrently; without a lock the manual BEGIN/COMMIT
+        # calls collide.
+        self._lock = threading.Lock()
         try:
             self._connection = sqlite3.connect(
                 self.db_path,
@@ -169,6 +176,13 @@ class TraceStore:
 
     def insert_event_result(self, event: TraceEventV1) -> tuple[TraceEventV1, bool]:
         """Atomically insert or return ``(event, duplicate)`` for a replay."""
+        with self._lock:
+            return self._insert_event_locked(event)
+
+    def _insert_event_locked(
+        self,
+        event: TraceEventV1,
+    ) -> tuple[TraceEventV1, bool]:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -179,6 +193,11 @@ class TraceStore:
             connection.commit()
             return stored, False
         except TraceEventConflictError:
+            # Rollback before re-raising — the BEGIN IMMEDIATE
+            # opened a transaction that must be closed.
+            connection = getattr(self, "_connection", None)
+            if connection is not None and connection.in_transaction:
+                connection.rollback()
             raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             connection = getattr(self, "_connection", None)
@@ -259,6 +278,10 @@ class TraceStore:
         """Persist safe payload metadata only; payload bytes are never stored in SQLite."""
         if not descriptor.digest:
             raise TraceStoreWriteError("payload descriptor requires a digest")
+        with self._lock:
+            self._put_payload_locked(descriptor)
+
+    def _put_payload_locked(self, descriptor: PayloadDescriptor) -> None:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -280,6 +303,9 @@ class TraceStore:
             )
             connection.commit()
         except TracePayloadConflictError:
+            connection = getattr(self, "_connection", None)
+            if connection is not None and connection.in_transaction:
+                connection.rollback()
             raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             connection = getattr(self, "_connection", None)
@@ -316,6 +342,15 @@ class TraceStore:
 
     def _write_operation(
         self, operation: OperationRecord, *, insert: bool
+    ) -> OperationRecord:
+        with self._lock:
+            return self._write_operation_locked(operation, insert=insert)
+
+    def _write_operation_locked(
+        self,
+        operation: OperationRecord,
+        *,
+        insert: bool,
     ) -> OperationRecord:
         try:
             connection = self._open_connection()
@@ -498,6 +533,13 @@ class TraceStore:
             raise OperationTransitionError(
                 "operation key and request hash are required"
             )
+        with self._lock:
+            return self._register_or_get_locked(operation)
+
+    def _register_or_get_locked(
+        self,
+        operation: OperationRecord,
+    ) -> tuple[OperationRecord, bool]:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -556,9 +598,24 @@ class TraceStore:
         """Claim an unleased/expired pre-launch operation with a new fence."""
         if not owner or ttl_seconds <= 0:
             raise OperationTransitionError("owner and positive lease TTL are required")
-        record, _ = self.register_or_get(
-            OperationRecord(operation_key, request_hash, "registered")
-        )
+        with self._lock:
+            record, _ = self._register_or_get_locked(
+                OperationRecord(operation_key, request_hash, "registered")
+            )
+            return self._acquire_operation_locked(
+                operation_key,
+                request_hash,
+                owner,
+                ttl_seconds,
+            )
+
+    def _acquire_operation_locked(
+        self,
+        operation_key: str,
+        request_hash: str,
+        owner: str,
+        ttl_seconds: float,
+    ) -> tuple[OperationRecord, str]:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -654,6 +711,30 @@ class TraceStore:
         allow_expired_reconciliation: bool = False,
     ) -> OperationRecord:
         """Perform a fenced legal transition and append immutable history atomically."""
+        with self._lock:
+            return self._transition_operation_locked(
+                operation_key,
+                owner,
+                fencing_token,
+                state,
+                descriptor=descriptor,
+                external_ids=external_ids,
+                terminal_outcome=terminal_outcome,
+                allow_expired_reconciliation=allow_expired_reconciliation,
+            )
+
+    def _transition_operation_locked(
+        self,
+        operation_key: str,
+        owner: str,
+        fencing_token: int,
+        state: str,
+        *,
+        descriptor: dict[str, Any] | None = None,
+        external_ids: dict[str, Any] | None = None,
+        terminal_outcome: str | None = None,
+        allow_expired_reconciliation: bool = False,
+    ) -> OperationRecord:
         legal = {
             "lease_acquired": {"prepared", "terminal"},
             "prepared": {"side_effect_started", "terminal"},
@@ -733,6 +814,21 @@ class TraceStore:
     ) -> OperationRecord:
         if ttl_seconds <= 0:
             raise OperationTransitionError("lease TTL must be positive")
+        with self._lock:
+            return self._renew_operation_locked(
+                operation_key,
+                owner,
+                fencing_token,
+                ttl_seconds,
+            )
+
+    def _renew_operation_locked(
+        self,
+        operation_key: str,
+        owner: str,
+        fencing_token: int,
+        ttl_seconds: float,
+    ) -> OperationRecord:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -783,9 +879,13 @@ class TraceStore:
         fencing_token: int,
         external_ids: dict[str, Any],
     ) -> OperationRecord:
-        return self._fenced_update(
-            operation_key, owner, fencing_token, external_ids=external_ids
-        )
+        with self._lock:
+            return self._fenced_update(
+                operation_key,
+                owner,
+                fencing_token,
+                external_ids=external_ids,
+            )
 
     def _fenced_update(
         self,
@@ -935,6 +1035,10 @@ class TraceStore:
 
     def delete_operation(self, operation_key: str) -> None:
         """Delete an operation record; event rows intentionally have no equivalent API."""
+        with self._lock:
+            self._delete_operation_locked(operation_key)
+
+    def _delete_operation_locked(self, operation_key: str) -> None:
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
