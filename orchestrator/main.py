@@ -1520,7 +1520,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         if name == "crucible":
             continue
         try:
-            repo_cache.ensure_repo(name, url)
+            await repo_cache.ensure_repo(name, url)
         except Exception:
             logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 

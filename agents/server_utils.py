@@ -1061,7 +1061,7 @@ async def resolve_ssh_key(
 _ssh_key_stack: AsyncExitStack | None = None
 
 
-def build_repo_cache():
+async def build_repo_cache():
     """Construct a RepoCache with harness repos from environment variables."""
     import json
 
@@ -1094,7 +1094,7 @@ def build_repo_cache():
             # Crucible is never cloned or refreshed by agentic-perf.
             continue
         try:
-            cache.ensure_repo(name, url)
+            await cache.ensure_repo(name, url)
         except Exception:
             logger.warning("Failed to cache repo %s from %s", name, url, exc_info=True)
 
