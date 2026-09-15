@@ -512,6 +512,28 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                 (artifacts / source.name).write_bytes(source.read_bytes())
 
 
+_RECOVERABLE_SSH_CONTEXT_RETRY = re.compile(
+    r"Error calling tool '(?:verify_ssh_path|list_controller_userenvs)'.{0,6000}?"
+    r"MCPToolCallError: Error calling tool '(?:verify_ssh_path|list_controller_userenvs)': "
+    r"SSH context not set\. Call set_ssh_context\(\) first\."
+    r".*?intentional_agent_retry",
+    re.S,
+)
+
+
+def _fatal_log_signatures(text: str) -> list[str]:
+    """Return fatal signatures after removing the known retryable MCP sequence."""
+
+    text = _RECOVERABLE_SSH_CONTEXT_RETRY.sub("", text)
+    fatal_patterns = (
+        "Traceback (most recent call last):",
+        "TraceDeliveryError",
+        "cannot start a transaction within a transaction",
+        "Task was destroyed but it is pending",
+    )
+    return [pattern for pattern in fatal_patterns if pattern in text]
+
+
 def _validate_managed_service_shutdown(home: Path, repo: Path) -> None:
     status = subprocess.run(
         [str(repo / "scripts" / "start-bg.sh"), "status"],
@@ -522,18 +544,12 @@ def _validate_managed_service_shutdown(home: Path, repo: Path) -> None:
     ).stdout
     if "State store:  STOPPED" not in status or "Orchestrator: STOPPED" not in status:
         raise GateError(f"managed services did not stop cleanly:\n{status}")
-    fatal_patterns = (
-        "Traceback (most recent call last):",
-        "TraceDeliveryError",
-        "cannot start a transaction within a transaction",
-        "Task was destroyed but it is pending",
-    )
     for name in ("orchestrator.log", "state-store.log"):
         path = home / "logs" / name
         if not path.exists():
             raise GateError(f"expected service log is missing: {path}")
         text = path.read_text(errors="replace")
-        found = [pattern for pattern in fatal_patterns if pattern in text]
+        found = _fatal_log_signatures(text)
         if found:
             raise GateError(f"{name} contains fatal signatures: {found}")
 

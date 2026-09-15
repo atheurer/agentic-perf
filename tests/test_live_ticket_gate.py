@@ -185,6 +185,22 @@ def test_policy_rejects_cpu_partitioning_unless_boolean_false(value: object) -> 
         gate.validate_run_file(run_file, config())
 
 
+def test_log_scan_ignores_recoverable_ssh_context_retry() -> None:
+    log = """Error calling tool 'verify_ssh_path'
+Traceback (most recent call last):
+RuntimeError: SSH context not set. Call set_ssh_context() first.
+Traceback (most recent call last):
+MCPToolCallError: Error calling tool 'verify_ssh_path': SSH context not set. Call set_ssh_context() first.
+intentional_agent_retry"""
+    assert gate._fatal_log_signatures(log) == []
+
+
+def test_log_scan_keeps_unrelated_traceback_fatal() -> None:
+    assert gate._fatal_log_signatures("Traceback (most recent call last): boom") == [
+        "Traceback (most recent call last):"
+    ]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
