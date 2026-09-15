@@ -316,6 +316,111 @@ class OrchestratorConfig:
         return None
 
 
+def _sanitize_url(url: str) -> str:
+    """Strip credentials from a URL (userinfo, query, fragment)."""
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        parsed = urlparse(url)
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.hostname or "" + (f":{parsed.port}" if parsed.port else ""),
+                parsed.path,
+                "",
+                "",
+                "",
+            )
+        )
+    except Exception:
+        return "(invalid URL)"
+
+
+def build_redacted_config(config: OrchestratorConfig) -> dict:
+    """Build a diagnostic snapshot of the effective config.
+
+    Uses an allowlist — only known-safe fields are included.
+    Secret values (API keys, tokens, vault credentials) are
+    never present in the output, by construction. Values in
+    user-controlled fields are sanitized or type-validated.
+    """
+    from paths import (
+        AGENTIC_PERF_HOME,
+        ARTIFACT_DIR,
+        CONFIG_PATH,
+        PRIVATE_SKILLS_DIR,
+    )
+
+    safe_iterations: dict[str, int] = {}
+    for k, v in config._agent_iterations.items():
+        try:
+            safe_iterations[str(k)] = int(v)
+        except (ValueError, TypeError):
+            continue
+
+    safe_agent_models: dict[str, dict[str, str]] = {}
+    for k, v in config._agent_models.items():
+        if not isinstance(v, dict):
+            continue
+        safe_agent_models[str(k)] = {
+            "provider": str(v.get("provider", "")),
+            "model": str(v.get("model", "")),
+        }
+
+    snapshot: dict = {
+        "instance_name": config.instance_name,
+        "agentic_perf_home": str(AGENTIC_PERF_HOME),
+        "config_path": str(CONFIG_PATH),
+        "config_file_exists": CONFIG_PATH.exists(),
+        "paths": {
+            "private_skills_dir": str(PRIVATE_SKILLS_DIR),
+            "artifact_dir": str(ARTIFACT_DIR),
+        },
+        "state_store": {
+            "url": _sanitize_url(config.state_store_url),
+            "port": config.state_store_port,
+        },
+        "llm": {
+            "provider": config.llm_provider,
+            "model": config.llm_model,
+            "backend": config.llm_backend,
+            "region": config.llm_region,
+            "api": config.llm_api,
+            "timeout": config.llm_timeout,
+            "max_tokens": config.llm_max_tokens,
+            "reasoning_effort": config.llm_reasoning_effort,
+        },
+        "orchestrator": {
+            "poll_interval": config.poll_interval,
+            "global_max_iterations": config.global_max_iterations,
+            "agent_task_timeout": config.agent_task_timeout,
+            "stale_task_timeout": config.stale_task_timeout,
+            "max_concurrent_agents": config.max_concurrent_agents,
+            "skip_teardown": config.skip_teardown,
+            "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
+            "leader_lease_renew_interval": config.leader_lease_renew_interval,
+        },
+        "harness": {
+            "crucible_home": config.crucible_home,
+            "zathras_home": config.zathras_home,
+        },
+        "introspection": {
+            "enabled": config.introspection_enabled,
+            "llm": config.introspection_llm,
+        },
+        "budget": {
+            "session_cost_usd": config.budget_session_cost_usd,
+        },
+        "ssh": {
+            "key_configured": config.ssh_key is not None,
+            "vault_secret_configured": config.ssh_key_vault_secret is not None,
+        },
+        "agent_iterations": safe_iterations,
+        "agent_models": safe_agent_models,
+    }
+    return snapshot
+
+
 def _env_or_cfg(
     env_key: str,
     cfg: dict,
