@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import paths
 from cli import get_default_store_url
 from orchestrator.config import OrchestratorConfig
+from orchestrator.main import _export_state_store_url
 from paths import resolve_state_store
 
 
@@ -44,3 +46,12 @@ def test_environment_overrides_are_shared(monkeypatch):
     monkeypatch.setenv("STORE_PORT", "8093")
     assert resolve_state_store(cfg) == ("http://localhost:8093", 8093)
     assert get_default_store_url() == "http://localhost:8093"
+
+
+def test_orchestrator_export_prefers_explicit_config(monkeypatch):
+    monkeypatch.setenv("STATE_STORE_URL", "http://inherited:8090")
+    config = OrchestratorConfig(state_store_url="http://explicit:8091")
+
+    _export_state_store_url(config)
+
+    assert os.environ["STATE_STORE_URL"] == "http://explicit:8091"

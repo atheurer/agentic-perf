@@ -1510,7 +1510,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     # initialise the central TraceClient.  Must be set
     # before any AuditedSubprocessRunner calls (repo cache,
     # skill providers, etc.).
-    os.environ.setdefault("STATE_STORE_URL", config.state_store_url)
+    _export_state_store_url(config)
 
     await _validate_models(config)
 
@@ -2047,6 +2047,11 @@ def _sweep_trace_spools() -> None:
             client.close()
         except TraceDeliveryError:
             pass
+
+
+def _export_state_store_url(config: OrchestratorConfig) -> None:
+    """Make the orchestrator's resolved store endpoint available to children."""
+    os.environ["STATE_STORE_URL"] = config.state_store_url
 
 
 def main():
