@@ -2390,7 +2390,14 @@ async function loadArtifacts(ticketId) {
       });
     });
     html += '</details>';
+    // Snapshot open state before re-render
+    var wasOpen = false;
+    var existing = content.querySelector('details');
+    if (existing) wasOpen = existing.open;
     content.innerHTML = html;
+    // Restore open state after re-render
+    var restored = content.querySelector('details');
+    if (restored && wasOpen) restored.open = true;
   } catch (e) {
     // No artifacts or API error — hide section
   }
