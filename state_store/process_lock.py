@@ -31,6 +31,18 @@ def _process_start_identity(pid: int | None = None) -> str:
         return str(pid)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it.
+        return True
+
+
 def _read_metadata(
     fd: int | None = None, path: Path | None = None
 ) -> dict[str, object]:
@@ -111,11 +123,32 @@ class PersistenceRootLock:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             holder = _read_metadata(path=path)
-            os.close(fd)
-            detail = json.dumps(holder, sort_keys=True) if holder else "unavailable"
-            raise PersistenceRootLockedError(
-                f"state-store persistence root is locked: {self.root} (holder metadata: {detail})"
-            ) from exc
+            holder_pid = holder.get("pid")
+            # If the holder PID is no longer alive, the lock
+            # is stale (e.g., container restart with PVC).
+            # Force-acquire by blocking briefly.
+            if holder_pid and not _pid_alive(int(holder_pid)):
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Stale lock held by dead PID %s — force-acquiring",
+                    holder_pid,
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BlockingIOError:
+                    os.close(fd)
+                    raise PersistenceRootLockedError(
+                        f"state-store persistence root is locked: {self.root}"
+                    ) from exc
+            else:
+                os.close(fd)
+                detail = json.dumps(holder, sort_keys=True) if holder else "unavailable"
+                raise PersistenceRootLockedError(
+                    f"state-store persistence root is "
+                    f"locked: {self.root} "
+                    f"(holder metadata: {detail})"
+                ) from exc
         self.fd = fd
         try:
             self.session_id = str(uuid.uuid4())
