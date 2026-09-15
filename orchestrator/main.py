@@ -1504,6 +1504,14 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         )
     )
 
+    # Expose store URL so the trace recorder and agent
+    # subprocesses can find the state store.  The audited
+    # execution layers (subprocess, HTTP) require this to
+    # initialise the central TraceClient.  Must be set
+    # before any AuditedSubprocessRunner calls (repo cache,
+    # skill providers, etc.).
+    os.environ.setdefault("STATE_STORE_URL", config.state_store_url)
+
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
