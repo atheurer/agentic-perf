@@ -105,6 +105,9 @@ class HorreumRecordProvider(InvestigationRecordProvider):
         extractors pull queryable fields from it.
         """
         data = record.model_dump(mode="json")
+        # record_url is derived metadata — exclude from
+        # persistence to avoid stale URLs after run updates.
+        data.pop("record_url", None)
         # Add schema URI for Horreum label matching
         data["$schema"] = _SCHEMA_URI
         return data
