@@ -20,12 +20,14 @@ Use batch and discovery tools to minimize iterations:
   Tools that declare `jq_filter` consume it as their own input transformation.
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
   (not check_host per host)
-- **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**
-  — verify TCP port reachability between hosts. This tool actively starts a
-  listener (nc) on the specified port on the server, then attempts to connect
-  from the client. A failure means there is a real networking problem (firewall,
-  routing) on the exact path the benchmark will use. Read the
-  connectivity-diagnostic skill doc for details.
+- **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip,
+  port=N)** or **test_port_connectivity(..., ports=[N, N+1, ...])** — verify
+  TCP port reachability between hosts. Accepts a single ``port`` or a list of
+  ``ports`` (tested concurrently). When running N parallel benchmark instances
+  (e.g., 8 uperf pairs on ports 30002–30009), pass ``ports=[30002, ..., 30009]``
+  to verify ALL ports in one call. A failure means there is a real networking
+  problem (firewall, routing) on the exact path the benchmark will use. Read
+  the connectivity-diagnostic skill doc for details.
 
 ## Reading Harness Documentation
 
