@@ -1422,6 +1422,18 @@ def cmd_claim_ticket(args):
     print(f"Claimed ticket {ticket_id} as {me['username']}")
 
 
+def cmd_config(args):
+    """Show the effective runtime configuration (redacted)."""
+    from orchestrator.config import (
+        OrchestratorConfig,
+        build_redacted_config,
+    )
+
+    config = OrchestratorConfig()
+    snapshot = build_redacted_config(config)
+    print(json.dumps(snapshot, indent=2))
+
+
 def main():
     show_disclaimer()
 
@@ -1694,6 +1706,16 @@ def main():
     )
     p_archive.set_defaults(func=cmd_archive)
 
+    p_config = sub.add_parser(
+        "config", help="Show effective runtime configuration (redacted)"
+    )
+    config_sub = p_config.add_subparsers(dest="config_action")
+    config_sub.add_parser(
+        "show",
+        help="Print the effective config as JSON (secrets redacted)",
+    )
+    p_config.set_defaults(func=cmd_config)
+
     p_cleanup = sub.add_parser("cleanup", help="Find/terminate orphaned AWS instances")
     p_cleanup.add_argument(
         "--older-than",
@@ -1739,6 +1761,7 @@ def main():
         "whoami": cmd_whoami,
         "handoff": cmd_handoff,
         "claim": cmd_claim_ticket,
+        "config": cmd_config,
     }
     commands[args.command](args)
 
