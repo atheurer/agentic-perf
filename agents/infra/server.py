@@ -907,14 +907,20 @@ async def test_port_connectivity(
     server_ssh_host: str,
     client_ssh_host: str,
     server_test_ip: str,
-    port: int,
+    port: int | None = None,
+    ports: list[int] | None = None,
     client_test_ip: str = "",
     timeout: int = 10,
 ) -> str:
     """Test TCP port connectivity between two hosts.
 
     This is harness-agnostic — it works for any benchmark that needs to
-    verify that a client can reach a server on a specific TCP port.
+    verify that a client can reach a server on specific TCP port(s).
+
+    Accepts either a single ``port`` or a list of ``ports`` (exactly one
+    must be provided).  When ``ports`` is given, all ports are tested
+    concurrently and the response includes per-port results plus
+    ``failed_ports`` and ``all_ports_ok`` summaries.
 
     The SSH hosts are how we reach the machines (may be public IPs). The
     test IPs are what we actually test connectivity on (may be private IPs
@@ -924,22 +930,45 @@ async def test_port_connectivity(
         server_ssh_host: IP to SSH into the server machine
         client_ssh_host: IP to SSH into the client machine
         server_test_ip: IP the server listens on (the IP being tested)
-        port: TCP port to test
+        port: Single TCP port to test (mutually exclusive with ports)
+        ports: List of TCP ports to test concurrently (mutually exclusive
+            with port)
         client_test_ip: Optional — if provided, also tests reverse
-            connectivity (server connecting to client on the same port)
-        timeout: Seconds to wait for the connection test
+            connectivity (server connecting to client on the same port(s))
+        timeout: Seconds to wait for each connection test
     """
+    _MAX_PORTS = 64
+
+    if port is not None and ports is not None:
+        return json.dumps({"error": "Provide either 'port' or 'ports', not both."})
+    if port is None and ports is None:
+        return json.dumps(
+            {"error": "Provide either 'port' (int) or 'ports' (list[int])."}
+        )
+    if ports is not None and len(ports) == 0:
+        return json.dumps({"error": "'ports' must be a non-empty list."})
+    if ports is not None and len(ports) > _MAX_PORTS:
+        return json.dumps(
+            {"error": f"'ports' exceeds maximum of {_MAX_PORTS} entries."}
+        )
+
+    use_multi = ports is not None
+    if ports is not None:
+        port_list = list(dict.fromkeys(ports))
+    else:
+        port_list = [port]  # type: ignore[list-item]
     ssh = _get_ssh()
-    results = []
 
     async def _test_direction(
         listener_ssh: str,
         connector_ssh: str,
         listen_ip: str,
+        test_port: int,
         label: str,
     ) -> dict[str, Any]:
         bg_cmd = (
-            f"nohup nc -l {listen_ip} {port} > /dev/null 2>&1 & echo {_PID_SENTINEL}$!"
+            f"nohup nc -l {listen_ip} {test_port} > /dev/null 2>&1 &"
+            f" echo {_PID_SENTINEL}$!"
         )
         start = await ssh.run(listener_ssh, bg_cmd, timeout=10)
         pid = parse_pid_sentinel(start.stdout or "")
@@ -947,44 +976,81 @@ async def test_port_connectivity(
         if pid is None:
             return {
                 "direction": label,
-                "port": port,
+                "port": test_port,
                 "reachable": False,
                 "error": "Failed to start nc listener",
             }
         try:
-            test_cmd = f"nc -z -w {timeout} {listen_ip} {port}"
+            test_cmd = f"nc -z -w {timeout} {listen_ip} {test_port}"
             test = await ssh.run(connector_ssh, test_cmd, timeout=timeout + 5)
             return {
                 "direction": label,
-                "port": port,
+                "port": test_port,
                 "reachable": test.exit_code == 0,
-                "error": test.stderr.strip() if test.exit_code != 0 else "",
+                "error": (test.stderr.strip() if test.exit_code != 0 else ""),
             }
         finally:
             await ssh.run(listener_ssh, f"kill {pid} 2>/dev/null", timeout=5)
 
-    forward = await _test_direction(
-        server_ssh_host,
-        client_ssh_host,
-        server_test_ip,
-        f"client({client_ssh_host}) -> server({server_test_ip}:{port})",
-    )
-    results.append(forward)
-
-    if client_test_ip:
-        reverse = await _test_direction(
-            client_ssh_host,
+    async def _test_port(test_port: int) -> list[dict[str, Any]]:
+        port_results: list[dict[str, Any]] = []
+        forward = await _test_direction(
             server_ssh_host,
-            client_test_ip,
-            f"server({server_ssh_host}) -> client({client_test_ip}:{port})",
+            client_ssh_host,
+            server_test_ip,
+            test_port,
+            f"client({client_ssh_host}) -> server({server_test_ip}:{test_port})",
         )
-        results.append(reverse)
+        port_results.append(forward)
+        if client_test_ip:
+            reverse = await _test_direction(
+                client_ssh_host,
+                server_ssh_host,
+                client_test_ip,
+                test_port,
+                f"server({server_ssh_host}) -> client({client_test_ip}:{test_port})",
+            )
+            port_results.append(reverse)
+        return port_results
 
-    all_reachable = all(r["reachable"] for r in results)
+    if not use_multi:
+        results = await _test_port(port_list[0])
+        all_reachable = all(r["reachable"] for r in results)
+        return json.dumps(
+            {
+                "all_reachable": all_reachable,
+                "tests": results,
+            }
+        )
+
+    gathered = await asyncio.gather(
+        *[_test_port(p) for p in port_list],
+        return_exceptions=True,
+    )
+    per_port: dict[int, list[dict[str, Any]]] = {}
+    failed_ports: list[int] = []
+    for p, port_results in zip(port_list, gathered):
+        if isinstance(port_results, BaseException):
+            error_result = [
+                {
+                    "direction": "error",
+                    "port": p,
+                    "reachable": False,
+                    "error": str(port_results),
+                }
+            ]
+            per_port[p] = error_result
+            failed_ports.append(p)
+        else:
+            per_port[p] = port_results
+            if not all(r["reachable"] for r in port_results):
+                failed_ports.append(p)
+
     return json.dumps(
         {
-            "all_reachable": all_reachable,
-            "tests": results,
+            "all_ports_ok": len(failed_ports) == 0,
+            "failed_ports": failed_ports,
+            "results": {str(k): v for k, v in per_port.items()},
         }
     )
 
