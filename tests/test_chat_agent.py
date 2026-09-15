@@ -667,7 +667,6 @@ class TestBenchmarkCatalog:
 
     @pytest.mark.asyncio
     async def test_includes_standalone(self):
-
         from providers.skills.catalog import BenchmarkCatalog
 
         catalog = BenchmarkCatalog()

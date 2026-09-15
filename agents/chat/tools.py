@@ -729,7 +729,6 @@ async def execute_tool(
     """Execute a chat tool through its required audit boundary."""
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-<<<<<<< HEAD
     async def _dispatch() -> str:
         try:
             return await _dispatch_tool(
