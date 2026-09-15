@@ -260,28 +260,33 @@ class GatheringContextAgent(AgentBase):
                 f"build history to {matched_id}: {e}"
             )
 
+        record_url = matched.record_url
+
+        dedup_fields: dict[str, Any] = {
+            "decision": "MATCH_FOUND",
+            "matched_investigation_id": matched_id,
+            "match_confidence": match_confidence,
+            "match_rationale": (
+                "Deterministic match on "
+                f"metric='{dedup_metric}' "
+                f"platform='{dedup_platform}'.{age_note}"
+            ),
+            "match_method": "deterministic",
+            "record_age_days": age_days,
+        }
+        if record_url:
+            dedup_fields["record_url"] = record_url
+
         await self._update_fields(
             ticket_id,
-            {
-                "dedup_result": {
-                    "decision": "MATCH_FOUND",
-                    "matched_investigation_id": matched_id,
-                    "match_confidence": match_confidence,
-                    "match_rationale": (
-                        "Deterministic match on "
-                        f"metric='{dedup_metric}' "
-                        f"platform='{dedup_platform}'.{age_note}"
-                    ),
-                    "match_method": "deterministic",
-                    "record_age_days": age_days,
-                },
-            },
+            {"dedup_result": dedup_fields},
         )
 
+        record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
         summary = (
             "**Dedup Match Found** "
             "(deterministic)\n\n"
-            f"- **Matched Record:** {matched_id}\n"
+            f"- **Matched Record:** {record_label}\n"
             f"- **Metric:** {dedup_metric}\n"
             f"- **Platform:** {dedup_platform}\n"
             f"- **Record Age:** {age_days} days\n"
@@ -383,9 +388,30 @@ class GatheringContextAgent(AgentBase):
         await self._update_fields(ticket_id, fields)
 
         if decision == "MATCH_FOUND" and matched_id:
+            # Resolve the record URL from the provider
+            # rather than trusting LLM output.
+            record_url = ""
+            try:
+                from providers.investigation.registry import (
+                    create_record_provider,
+                )
+
+                provider = create_record_provider()
+                record = await provider.get(matched_id)
+                if record:
+                    record_url = record.record_url
+                    fields["dedup_result"]["record_url"] = record_url
+                    await self._update_fields(ticket_id, fields)
+            except Exception:
+                logger.debug(
+                    "[gathering-context] Could not resolve record URL for %s",
+                    matched_id,
+                )
+
+            record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
             summary = (
                 f"**Dedup Match Found**\n\n"
-                f"- **Matched Record:** {matched_id}\n"
+                f"- **Matched Record:** {record_label}\n"
                 f"- **Confidence:** {confidence}\n"
                 f"- **Rationale:** {rationale}\n\n"
                 f"Skipping full investigation — this anomaly "

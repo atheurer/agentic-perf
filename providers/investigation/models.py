@@ -139,6 +139,9 @@ class InvestigationRecord(BaseModel):
         default_factory=OperationalMetrics,
     )
 
+    # Direct URL to the record in the backend (if available)
+    record_url: str = ""
+
     # Build-level tracking
     build_history: list[BuildHistoryEntry] = Field(
         default_factory=list,
