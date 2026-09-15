@@ -1423,55 +1423,18 @@ async def _stop_ticket(
 
 # ── Benchmark catalog ────────────────────────────────
 
-# Module-level skill provider, lazily initialized.
-_skill_provider = None
-
-
-def _get_skill_provider():
-    """Lazily build a catalog-only skill provider."""
-    global _skill_provider
-    if _skill_provider is None:
-        try:
-            from agents.server_utils import build_skill_provider
-
-            _skill_provider = build_skill_provider(catalog_only=True)
-        except Exception:
-            logger.debug(
-                "Failed to build skill provider for chat",
-                exc_info=True,
-            )
-    return _skill_provider
-
 
 async def _list_available_benchmarks(
     params: dict[str, Any],
 ) -> str:
-    """List available benchmarks from the skill provider catalog."""
-    provider = _get_skill_provider()
-    if provider is None:
-        return json.dumps({"error": "Benchmark catalog not available"})
+    """List available benchmarks from the shared catalog."""
+    from providers.skills.catalog import get_benchmark_catalog
 
-    benchmarks = await provider.list_benchmarks()
-
-    harness_filter = params.get("harness", "").lower()
-    query = params.get("query", "").lower()
-
-    results = []
-    for b in benchmarks:
-        if harness_filter and b.harness.lower() != harness_filter:
-            continue
-        if query and query not in b.name.lower() and query not in b.description.lower():
-            continue
-        entry: dict[str, Any] = {
-            "name": b.name,
-            "harness": b.harness,
-            "description": b.description,
-        }
-        if b.endpoint_types:
-            entry["endpoint_types"] = b.endpoint_types
-        if b.roles:
-            entry["roles"] = b.roles
-        results.append(entry)
+    catalog = get_benchmark_catalog()
+    results = await catalog.list_benchmarks(
+        harness=params.get("harness", ""),
+        query=params.get("query", ""),
+    )
 
     # Group by harness for readability.
     harnesses: dict[str, list[dict[str, Any]]] = {}

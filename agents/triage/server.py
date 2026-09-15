@@ -54,28 +54,9 @@ def _get_crucible_catalog():
     return _crucible_catalog
 
 
-# Benchmarks provided by standalone tools on the benchmark
-# agent's MCP server, not by any harness skill provider.
-# Surfaced in list_benchmarks, resolve_benchmark, and
-# get_benchmark_details alongside harness-backed benchmarks.
-_STANDALONE_BENCHMARKS = [
-    {
-        "name": "boot-time",
-        "description": (
-            "Boot time analysis — reboots a remote system "
-            "multiple times and collects kernel, initrd, and "
-            "userspace timing metrics per cycle. Uses "
-            "boot-time-analysis-tools. NO provisioning "
-            "step — the benchmark tool installs "
-            "dependencies on the SUT automatically via SSH. "
-            "Do NOT tell provisioning to install any "
-            "boot-time packages."
-        ),
-        "roles": ["client"],
-        "min_hosts": 1,
-        "harness": "boot-time",
-    },
-]
+# Standalone benchmarks are defined in the shared catalog
+# (providers/skills/catalog.py). Triage uses the catalog
+# for list_benchmarks and get_benchmark_details.
 
 
 @mcp.tool()
@@ -87,50 +68,24 @@ async def read_skills(docs: list[dict]) -> str:
 @mcp.tool()
 async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
-    sp = _get_provider()
-    benchmarks = await sp.list_benchmarks()
-    crucible = await _get_crucible_catalog().list_benchmarks()
-    benchmarks.extend(crucible)
-    result = [
-        {
-            "name": b.name,
-            "description": b.description,
-            "supported_params": b.supported_params,
-            "roles": b.roles,
-            "min_hosts": b.min_hosts,
-            "harness": b.harness,
-            "source": b.source,
-        }
-        for b in benchmarks
-    ]
-    result.extend(_STANDALONE_BENCHMARKS)
+    from providers.skills.catalog import get_benchmark_catalog
+
+    catalog = get_benchmark_catalog()
+    result = await catalog.list_benchmarks()
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 async def get_benchmark_details(name: str) -> str:
     """Get detailed information about a specific benchmark suite including supported parameters and endpoint types."""
-    # Check standalone benchmarks first
-    for sb in _STANDALONE_BENCHMARKS:
-        if sb["name"] == name:
-            return json.dumps(sb, indent=2)
-    crucible = _get_crucible_catalog()
-    b = await crucible.get_benchmark(name)
-    if b is None:
-        b = await _get_provider().get_benchmark(name)
-    if b is None:
+    from providers.skills.catalog import get_benchmark_catalog
+
+    catalog = get_benchmark_catalog()
+    detail = await catalog.get_benchmark(name)
+    if detail is None:
         return json.dumps({"error": f"Benchmark '{name}' not found"})
-    detail: dict[str, Any] = {
-        "name": b.name,
-        "description": b.description,
-        "supported_params": b.supported_params,
-        "roles": b.roles,
-        "min_hosts": b.min_hosts,
-        "harness": b.harness,
-        "source": b.source,
-    }
     # Arcaflow plugins: include the container image ref
-    if b.harness == "arcaflow-plugins":
+    if detail.get("harness") == "arcaflow-plugins":
         repo_name = f"arcaflow-plugin-{name.replace('arcaflow-', '')}"
         detail["container_image"] = f"quay.io/arcalot/{repo_name}"
         detail["execution_note"] = (
@@ -150,15 +105,17 @@ async def resolve_benchmark(
 ) -> str:
     """Given a natural language description of what the user wants to test, find the best matching benchmark suite. Returns the suite name or null if no match."""
     # Check standalone benchmarks first
+    from providers.skills.catalog import _STANDALONE_BENCHMARKS
+
     desc_lower = description.lower()
     for sb in _STANDALONE_BENCHMARKS:
-        if sb["name"] in desc_lower or (harness and harness == sb["harness"]):
+        if sb.name in desc_lower or (harness and harness == sb.harness):
             return json.dumps(
                 {
-                    "matched_suite": sb["name"],
-                    "harness": sb["harness"],
-                    "harnesses": [sb["harness"]],
-                    "note": (f"Only '{sb['harness']}' provides this benchmark"),
+                    "matched_suite": sb.name,
+                    "harness": sb.harness,
+                    "harnesses": [sb.harness],
+                    "note": (f"Only '{sb.harness}' provides this benchmark"),
                 }
             )
 

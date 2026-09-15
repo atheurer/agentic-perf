@@ -582,33 +582,23 @@ class TestListAvailableBenchmarks:
         from unittest.mock import patch
 
         from agents.chat.tools import _list_available_benchmarks
-        from providers.skills.base import BenchmarkSuite
 
-        mock_provider = AsyncMock()
-        mock_provider.list_benchmarks = AsyncMock(
+        mock_catalog = AsyncMock()
+        mock_catalog.list_benchmarks = AsyncMock(
             return_value=[
-                BenchmarkSuite(
-                    name="uperf",
-                    description="Network throughput",
-                    harness="crucible",
-                    endpoint_types=["remotehosts"],
-                ),
-                BenchmarkSuite(
-                    name="fio",
-                    description="Storage I/O",
-                    harness="crucible",
-                ),
-                BenchmarkSuite(
-                    name="stress-ng",
-                    description="CPU stress",
-                    harness="arcaflow-plugins",
-                ),
+                {"name": "uperf", "harness": "crucible", "description": "Network"},
+                {"name": "fio", "harness": "crucible", "description": "Storage"},
+                {
+                    "name": "stress-ng",
+                    "harness": "arcaflow-plugins",
+                    "description": "CPU",
+                },
             ],
         )
 
         with patch(
-            "agents.chat.tools._get_skill_provider",
-            return_value=mock_provider,
+            "providers.skills.catalog.get_benchmark_catalog",
+            return_value=mock_catalog,
         ):
             result = json.loads(await _list_available_benchmarks({}))
             assert result["total"] == 3
@@ -620,79 +610,123 @@ class TestListAvailableBenchmarks:
         from unittest.mock import patch
 
         from agents.chat.tools import _list_available_benchmarks
-        from providers.skills.base import BenchmarkSuite
 
-        mock_provider = AsyncMock()
-        mock_provider.list_benchmarks = AsyncMock(
+        mock_catalog = AsyncMock()
+        mock_catalog.list_benchmarks = AsyncMock(
             return_value=[
-                BenchmarkSuite(
-                    name="uperf",
-                    description="Network",
-                    harness="crucible",
-                ),
-                BenchmarkSuite(
-                    name="fio",
-                    description="Storage",
-                    harness="arcaflow-plugins",
-                ),
+                {"name": "uperf", "harness": "crucible", "description": "Network"},
             ],
         )
 
         with patch(
-            "agents.chat.tools._get_skill_provider",
-            return_value=mock_provider,
+            "providers.skills.catalog.get_benchmark_catalog",
+            return_value=mock_catalog,
         ):
             result = json.loads(
                 await _list_available_benchmarks({"harness": "crucible"})
             )
             assert result["total"] == 1
-            assert result["benchmarks"]["crucible"][0]["name"] == "uperf"
+            # Verify harness filter was passed through
+            mock_catalog.list_benchmarks.assert_called_once_with(
+                harness="crucible",
+                query="",
+            )
 
     @pytest.mark.asyncio
     async def test_filters_by_query(self):
         from unittest.mock import patch
 
         from agents.chat.tools import _list_available_benchmarks
-        from providers.skills.base import BenchmarkSuite
 
-        mock_provider = AsyncMock()
-        mock_provider.list_benchmarks = AsyncMock(
+        mock_catalog = AsyncMock()
+        mock_catalog.list_benchmarks = AsyncMock(
             return_value=[
-                BenchmarkSuite(
-                    name="uperf",
-                    description="Network throughput",
-                    harness="crucible",
-                ),
-                BenchmarkSuite(
-                    name="fio",
-                    description="Storage I/O",
-                    harness="crucible",
-                ),
+                {"name": "fio", "harness": "crucible", "description": "Storage"},
             ],
         )
 
         with patch(
-            "agents.chat.tools._get_skill_provider",
-            return_value=mock_provider,
+            "providers.skills.catalog.get_benchmark_catalog",
+            return_value=mock_catalog,
         ):
             result = json.loads(await _list_available_benchmarks({"query": "storage"}))
             assert result["total"] == 1
-            assert result["benchmarks"]["crucible"][0]["name"] == "fio"
-
-    @pytest.mark.asyncio
-    async def test_no_provider(self):
-        from unittest.mock import patch
-
-        from agents.chat.tools import _list_available_benchmarks
-
-        with patch(
-            "agents.chat.tools._get_skill_provider",
-            return_value=None,
-        ):
-            result = json.loads(await _list_available_benchmarks({}))
-            assert "error" in result
+            mock_catalog.list_benchmarks.assert_called_once_with(
+                harness="",
+                query="storage",
+            )
 
     def test_tool_in_readonly(self):
         from agents.chat.tools import READONLY_TOOLS
 
         assert "list_available_benchmarks" in READONLY_TOOLS
+
+
+class TestBenchmarkCatalog:
+    """Tests for the shared BenchmarkCatalog."""
+
+    @pytest.mark.asyncio
+    async def test_includes_standalone(self):
+
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        # Skip provider init
+        catalog._initialized = True
+
+        results = await catalog.list_benchmarks()
+        names = [r["name"] for r in results]
+        assert "boot-time" in names
+
+    @pytest.mark.asyncio
+    async def test_filters_harness(self):
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        catalog._initialized = True
+
+        results = await catalog.list_benchmarks(harness="boot-time")
+        assert len(results) == 1
+        assert results[0]["name"] == "boot-time"
+
+    @pytest.mark.asyncio
+    async def test_filters_query(self):
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        catalog._initialized = True
+
+        results = await catalog.list_benchmarks(query="reboot")
+        assert len(results) == 1
+        assert results[0]["name"] == "boot-time"
+
+    @pytest.mark.asyncio
+    async def test_no_match(self):
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        catalog._initialized = True
+
+        results = await catalog.list_benchmarks(query="nonexistent")
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_benchmark_standalone(self):
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        catalog._initialized = True
+
+        result = await catalog.get_benchmark("boot-time")
+        assert result is not None
+        assert result["harness"] == "boot-time"
+
+    @pytest.mark.asyncio
+    async def test_get_benchmark_not_found(self):
+        from providers.skills.catalog import BenchmarkCatalog
+
+        catalog = BenchmarkCatalog()
+        catalog._initialized = True
+
+        result = await catalog.get_benchmark("nonexistent")
+        assert result is None
