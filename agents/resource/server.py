@@ -78,14 +78,17 @@ async def _ensure_init():
 # Do not accept an IPv4-looking substring from a larger hostname or dotted
 # sequence (``10.1.2.3.999`` must not yield ``10.1.2.3``).  A trailing dot is
 # still allowed when it is sentence punctuation rather than another label.
+# Underscores are invalid in hostnames, so a candidate adjacent to one is a
+# fragment of a larger invalid token (``bad_host.example.com`` must not yield
+# ``host.example.com``) — the boundary lookarounds reject it outright.
 _IP_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9.-])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9-])(?!\.[A-Za-z0-9-])"
+    r"(?<![A-Za-z0-9_.-])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])"
 )
 _FQDN_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9-])"
+    r"(?<![A-Za-z0-9_.-])"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)"
     r"+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?![A-Za-z0-9-])",
+    r"(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])",
 )
 
 # Stage-2 FQDN label validation
