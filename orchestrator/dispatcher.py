@@ -189,7 +189,7 @@ class Dispatcher:
             logger.exception(f"Failed to claim ticket {ticket_id}")
             return False
 
-    def release_claim(self, ticket_id: str) -> None:
+    async def release_claim(self, ticket_id: str) -> None:
         """Release our claim on a ticket."""
         try:
             headers = self._auth_headers() | (
@@ -197,10 +197,13 @@ class Dispatcher:
                 if ticket_id in self._trace_contexts
                 else {}
             )
-            from providers.execution import AuditedHTTPClient
+            from providers.execution import AuditedAsyncHTTPClient
 
-            with AuditedHTTPClient(timeout=10.0, headers=headers) as client:
-                client.request(
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=headers,
+            ) as client:
+                await client.request(
                     "DELETE",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
                     json={
@@ -213,7 +216,7 @@ class Dispatcher:
         except Exception:
             logger.exception(f"Failed to release claim on {ticket_id}")
 
-    def renew_claim(self, ticket_id: str) -> bool:
+    async def renew_claim(self, ticket_id: str) -> bool:
         """Renew our claim on a ticket. Returns True on success."""
         try:
             headers = self._auth_headers() | (
@@ -221,10 +224,14 @@ class Dispatcher:
                 if ticket_id in self._trace_contexts
                 else {}
             )
-            from providers.execution import AuditedHTTPClient
+            from providers.execution import AuditedAsyncHTTPClient
 
-            with AuditedHTTPClient(timeout=10.0, headers=headers) as client:
-                r = client.post(
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=headers,
+            ) as client:
+                r = await client.request(
+                    "POST",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim/renew",
                     json={
                         "owner": self._instance_name,
@@ -255,7 +262,7 @@ class Dispatcher:
         try:
             while True:
                 await asyncio.sleep(interval)
-                if not self.renew_claim(ticket_id):
+                if not await self.renew_claim(ticket_id):
                     logger.warning(f"Claim renewal failed for {ticket_id}")
                     context = self._trace_contexts.get(ticket_id)
                     if context is not None:
@@ -375,11 +382,11 @@ class Dispatcher:
             self._tasks.pop(tid, None)
         return dict(self._tasks)
 
-    def mark_done(self, ticket_id: str) -> None:
+    async def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
         self.stop_renewal(ticket_id)
-        self.release_claim(ticket_id)
+        await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:

@@ -1061,7 +1061,7 @@ async def resolve_ssh_key(
 _ssh_key_stack: AsyncExitStack | None = None
 
 
-def build_repo_cache():
+async def build_repo_cache():
     """Construct a RepoCache with harness repos from environment variables."""
     import json
 
@@ -1094,7 +1094,7 @@ def build_repo_cache():
             # Crucible is never cloned or refreshed by agentic-perf.
             continue
         try:
-            cache.ensure_repo(name, url)
+            await cache.ensure_repo(name, url)
         except Exception:
             logger.warning("Failed to cache repo %s from %s", name, url, exc_info=True)
 
@@ -1322,6 +1322,35 @@ async def build_ssh_from_ticket(
         ),
         trace_recorder=trace_recorder,
     ), ticket
+
+
+def make_traced_ssh(
+    user: str = "root",
+    key_path: str | None = None,
+    strict_host_key: str = "accept-new",
+) -> Any:
+    """Create an SSHExecutor with trace recorder.
+
+    Use this instead of bare SSHExecutor() for any
+    ticket-scoped SSH to satisfy the audited execution
+    trace readiness requirement.
+    """
+    from providers.ssh import SSHExecutor
+    from providers.tracing import current_trace_context
+    from providers.tracing.client import TraceClient
+
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    url = os.environ.get("STATE_STORE_URL", "")
+    recorder = TraceClient(url, token) if url and token else None
+    context = current_trace_context()
+
+    return SSHExecutor(
+        user=user,
+        key_path=key_path,
+        strict_host_key=strict_host_key,
+        trace_context=context,
+        trace_recorder=recorder,
+    )
 
 
 async def tool_progress(

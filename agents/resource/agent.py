@@ -375,7 +375,9 @@ class ResourceAgent(AgentBase):
                 self._secrets,
                 vault_secret,
             ) as resolved_key:
-                ssh = SSHExecutor(user="root", key_path=resolved_key)
+                from agents.server_utils import make_traced_ssh
+
+                ssh = make_traced_ssh(key_path=resolved_key)
                 cleanup_summary = []
                 if harness_name:
                     for host in teardown_hosts:
@@ -524,7 +526,9 @@ class ResourceAgent(AgentBase):
             self._secrets,
             vault_secret,
         ) as resolved_key:
-            ssh = SSHExecutor(user="root", key_path=resolved_key)
+            from agents.server_utils import make_traced_ssh
+
+            ssh = make_traced_ssh(key_path=resolved_key)
             cleanup_summary = []
 
             if controller and targets:

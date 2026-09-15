@@ -410,10 +410,13 @@ async def validate_host(
 ) -> str:
     """Validate that a host is reachable via SSH. Returns connectivity status, FQDN, basic system info (OS, CPU count, RAM), and NIC details (interface names and link speeds from ethtool). Pass ssh_key_path from the reserve_resources result to use the correct key."""
     await _ensure_init()
-    from providers.ssh import SSHExecutor
-
     if ssh_key_path:
-        ssh = SSHExecutor(user=ssh_user, key_path=ssh_key_path)
+        from agents.server_utils import make_traced_ssh
+
+        ssh = make_traced_ssh(
+            user=ssh_user,
+            key_path=ssh_key_path,
+        )
     else:
         ssh = _ssh
     result = await ssh.run(host, "echo SSH_OK", timeout=15)

@@ -741,6 +741,9 @@ class AgentMCPClient:
                     pass
         self._servers.clear()
         self._tool_routing.clear()
+        if self._trace_client is not None:
+            self._trace_client.close()
+            self._trace_client = None
         logger.info("MCP client disconnected all servers")
 
 

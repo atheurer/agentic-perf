@@ -990,7 +990,7 @@ async def run_agent_task(
                 logger.exception(f"stop_after_step triage check failed for {ticket_id}")
 
         dispatcher.clear_agent(ticket_id)
-        dispatcher.mark_done(ticket_id)
+        await dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
         if agent is not None:
             try:
@@ -1072,7 +1072,7 @@ async def _check_stale_tasks(
                         logger.info(
                             f"Cleaning up active_tasks entry for closed ticket {tid}"
                         )
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         task.cancel()
                         continue
                     updated_at = ticket_data.get("updated_at", "")
@@ -1303,7 +1303,7 @@ async def _process_stop_requests(
                     # running asyncio task.
                     if dispatcher.is_active(tid):
                         dispatcher.stop_agent(tid, "hard")
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         logger.info(f"Cancelled agent task for {tid}")
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/force-close",
@@ -1520,7 +1520,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         if name == "crucible":
             continue
         try:
-            repo_cache.ensure_repo(name, url)
+            await repo_cache.ensure_repo(name, url)
         except Exception:
             logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
@@ -1802,7 +1802,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                             )
                         except Exception:
                             logger.exception(f"Failed to redirect {tid}")
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         continue
 
                 # Jumpstarter: release any existing lease
