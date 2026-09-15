@@ -20,10 +20,14 @@ SKILL_CACHE_DIR = AGENTIC_PERF_HOME / "skill-cache"
 PLUGIN_SCHEMA_CACHE_DIR = AGENTIC_PERF_HOME / "plugin-schema-cache"
 INVESTIGATION_RECORDS_DIR = AGENTIC_PERF_HOME / "investigation-records"
 PRICING_PATH = AGENTIC_PERF_HOME / "pricing.yaml"
+TRACE_DB_PATH = AGENTIC_PERF_HOME / "trace.db"
+TRACE_PAYLOAD_DIR = AGENTIC_PERF_HOME / "trace-payloads"
+TRACE_SPOOL_DIR = AGENTIC_PERF_HOME / "trace-spool"
 
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")
 )
+TRACE_AUDIT_KEY_PATH = SECRETS_DIR / "trace-audit-key"
 ARTIFACT_DIR = Path(
     os.environ.get("AGENTIC_PERF_ARTIFACTS", AGENTIC_PERF_HOME / "artifacts")
 )
