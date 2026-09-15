@@ -515,7 +515,8 @@ class TestCheckAvailableRequiresSelector:
 class TestNamedDeviceEscalation:
     """Verify auto-escalation to HITL for unavailable named devices."""
 
-    def test_auto_escalate_posts_transition(self):
+    @pytest.mark.asyncio
+    async def test_auto_escalate_posts_transition(self):
         from unittest.mock import patch
 
         from agents.resource.server import _auto_escalate_named_device
@@ -536,19 +537,23 @@ class TestNamedDeviceEscalation:
                     "AGENTIC_PERF_API_TOKEN": "test-token",
                 },
             ),
-            patch("httpx.Client") as mock_client_cls,
+            patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
         ):
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(
+            mock_client.post = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(
                 return_value=mock_client,
             )
-            mock_client_cls.return_value.__exit__ = MagicMock(
+            mock_client_cls.return_value.__aexit__ = AsyncMock(
                 return_value=False,
             )
 
-            _auto_escalate_named_device(result)
+            await _auto_escalate_named_device(result)
 
-            mock_client.post.assert_called_once()
+            mock_client.post.assert_awaited_once()
             call_args = mock_client.post.call_args
             assert "transition" in call_args[0][0]
             body = call_args[1]["json"]
@@ -556,14 +561,15 @@ class TestNamedDeviceEscalation:
             assert "board-01" in body["comment"]
             assert "board-02" in body["comment"]
 
-    def test_no_escalate_without_ticket_id(self):
+    @pytest.mark.asyncio
+    async def test_no_escalate_without_ticket_id(self):
         from unittest.mock import patch
 
         from agents.resource.server import _auto_escalate_named_device
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("httpx.Client") as mock_client_cls,
+            patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
         ):
-            _auto_escalate_named_device({"selector": "name=x"})
+            await _auto_escalate_named_device({"selector": "name=x"})
             mock_client_cls.assert_not_called()

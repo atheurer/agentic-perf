@@ -289,7 +289,7 @@ async def check_available_resources(
     # doesn't exist.  The result includes the reason and any
     # alternatives of the same board type.
     if not result.get("available") and result.get("selector", "").startswith("name="):
-        _auto_escalate_named_device(result)
+        await _auto_escalate_named_device(result)
 
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
@@ -516,7 +516,7 @@ async def get_accumulated_metadata() -> str:
     return json.dumps(result)
 
 
-def _auto_escalate_named_device(result: dict) -> None:
+async def _auto_escalate_named_device(result: dict) -> None:
     """Transition ticket to HITL when a named device is unavailable.
 
     Called from check_available_resources when a name= selector
@@ -536,20 +536,21 @@ def _auto_escalate_named_device(result: dict) -> None:
     if alternatives:
         comment += f" Available alternatives: {', '.join(alternatives)}"
 
-    import httpx
-
     try:
+        from providers.execution import AuditedAsyncHTTPClient
+
         headers: dict[str, str] = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        with httpx.Client(timeout=10.0, headers=headers) as client:
-            client.post(
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+            response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={
                     "status": "awaiting_customer_guidance",
                     "comment": comment,
                 },
             )
+            response.raise_for_status()
     except Exception:
         logger.exception("Failed to escalate named device unavailability")
 
