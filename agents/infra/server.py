@@ -281,7 +281,22 @@ async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str
     Use for multi-file data like crucible tool-data directories.
     """
     ssh = _get_ssh()
-    local_dir = tempfile.mkdtemp(prefix="remote-dir-")
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        # A remote read still creates a local recursive tree.  Own its root
+        # through the ticket filesystem boundary so the transfer is traceable
+        # instead of leaving an uncorrelated /tmp directory behind.
+        filesystem = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        local_dir = str(filesystem.mkdir(f"remote-dir-{os.urandom(8).hex()}"))
+    else:
+        # Direct server invocation is a documented no-ticket compatibility
+        # mode; ticket-owned MCP connections always set TICKET_ID.
+        local_dir = tempfile.mkdtemp(prefix="remote-dir-")
     result = await ssh.copy_from(host, remote_path, local_dir)
     if result.exit_code != 0:
         return json.dumps(

@@ -1186,13 +1186,58 @@ class AgentBase(ABC):
                             "input": submit_call.input,
                         },
                     )
+                    # ``submit_*`` calls deliberately dispatch through the
+                    # agent's completion handler rather than ``_execute_tool``:
+                    # those handlers own the ticket mutation and next-state
+                    # transition.  They still are native tool invocations,
+                    # however, and therefore need the same durable lifecycle
+                    # record as every ordinary local handler.
+                    submit_context = tool_contexts[submit_call.id]
+                    submit_timer = MonotonicTimer()
+                    self._trace.record(
+                        submit_context,
+                        ActionType.TOOL,
+                        LifecycleState.STARTED,
+                        phase=submit_call.name,
+                    )
                     submit_response = LLMResponse(
                         text=None,
                         tool_calls=[submit_call],
                         stop_reason="tool_use",
                         raw_content=response.raw_content,
                     )
-                    await self._handle_completion(ticket_id, submit_response)
+                    try:
+                        await self._handle_completion(ticket_id, submit_response)
+                    except asyncio.CancelledError:
+                        self._trace_terminal_state = LifecycleState.CANCELLED
+                        self._trace.record(
+                            submit_context,
+                            ActionType.TOOL,
+                            LifecycleState.CANCELLED,
+                            phase=submit_call.name,
+                            duration_ms=submit_timer.elapsed_ms(),
+                            outcome=OperationOutcome.CANCELLED,
+                        )
+                        raise
+                    except Exception as exc:
+                        self._trace.record(
+                            submit_context,
+                            ActionType.TOOL,
+                            LifecycleState.FAILED,
+                            phase=submit_call.name,
+                            duration_ms=submit_timer.elapsed_ms(),
+                            outcome=OperationOutcome.FAILURE,
+                            error=exc,
+                        )
+                        raise
+                    self._trace.record(
+                        submit_context,
+                        ActionType.TOOL,
+                        LifecycleState.COMPLETED,
+                        phase=submit_call.name,
+                        duration_ms=submit_timer.elapsed_ms(),
+                        outcome=OperationOutcome.SUCCESS,
+                    )
                     break
 
                 messages.append({"role": "assistant", "content": response.raw_content})

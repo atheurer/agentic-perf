@@ -6,15 +6,83 @@ LLM calls these via tool_use to interact with tickets.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
 from providers.llm.base import ToolDefinition
+from providers.tracing import (
+    ActionType,
+    IdempotencyDescriptor,
+    LifecycleState,
+    MonotonicTimer,
+    OperationOutcome,
+    TraceEventV1,
+    TraceRecorder,
+    child_context,
+    current_trace_context,
+    new_trace_context,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class ChatAuditUnavailable(RuntimeError):
+    """The required durable audit entry could not be accepted.
+
+    Chat mutations must never be attempted without an audit entry.  This is
+    deliberately distinct from a handler error so callers can safely tell the
+    user that no action was attempted.
+    """
+
+
+# This maps the advertised chat capability to the concrete handler and the
+# state-store API domain it mutates.  It is intentionally local to the
+# dispatcher: the audit event records the same operation owner that executes
+# the request, rather than treating ChatToolAudit as the owner of every effect.
+_CHAT_MUTATION_CONTRACTS: dict[str, tuple[str, str]] = {
+    "create_ticket": ("agents.chat.tools._create_ticket", "/api/v1/tickets"),
+    "start_ticket": (
+        "agents.chat.tools._start_ticket",
+        "/api/v1/tickets/{ticket_id}/transition",
+    ),
+    "send_interjection": (
+        "agents.chat.tools._send_interjection",
+        "/api/v1/tickets/{ticket_id}/interject",
+    ),
+    "reply_to_guidance": (
+        "agents.chat.tools._reply_to_guidance",
+        "/api/v1/tickets/{ticket_id}/comments",
+    ),
+    "update_ticket_fields": (
+        "agents.chat.tools._update_ticket_fields",
+        "/api/v1/tickets/{ticket_id}/fields",
+    ),
+    "stop_ticket": (
+        "agents.chat.tools._stop_ticket",
+        "/api/v1/tickets/{ticket_id}/stop",
+    ),
+    "create_user": ("agents.chat.tools._create_user", "/api/v1/users"),
+    "rotate_user_token": (
+        "agents.chat.tools._rotate_user_token",
+        "/api/v1/users/{username}/rotate-token",
+    ),
+}
+
+
+def _chat_target(context: Any, tool_name: str) -> str | None:
+    """Return a redacted, stable external API target for a mutation event."""
+    contract = _CHAT_MUTATION_CONTRACTS.get(tool_name)
+    if not contract:
+        return None
+    _, route = contract
+    return f"state-store:{route.format(ticket_id=context.ticket_id or 'unknown', username='redacted')}"
+
 
 # High-impact actions that require code-level confirmation.
 # Low-risk transitions (start, reply, interject) rely on
@@ -40,6 +108,243 @@ DESTRUCTIVE_TOOLS = frozenset(
         "rotate_user_token",
     }
 )
+
+
+class ChatToolAudit:
+    """Durably pair every chat-tool dispatch with a trace lifecycle.
+
+    Chat tools do not inherit :class:`AgentBase`'s loop, so they must not rely
+    on its audit boundary.  This small adapter is the sole production entry
+    point for ``CHAT_TOOLS`` and writes the same trace envelope used by native
+    agents.  The entry event is a fail-closed authorization boundary: a tool
+    handler is not called until trace ingestion accepts it.  Terminal delivery
+    is always attempted, including cancellation, so a started operation has a
+    correlated outcome whenever the transport remains available.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        store_url: str,
+        auth_token: str,
+        *,
+        record: Callable[[TraceEventV1], Any] | None = None,
+    ) -> None:
+        if not auth_token:
+            raise ValueError("chat audit requires a service trace-ingestion token")
+        self._client = client
+        self._store_url = store_url.rstrip("/")
+        self._headers = {"Authorization": f"Bearer {auth_token}"}
+        self._record = record
+
+    async def _emit(
+        self,
+        context: Any,
+        state: LifecycleState,
+        *,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        timer: MonotonicTimer | None = None,
+        outcome: OperationOutcome | None = None,
+        error: BaseException | None = None,
+        required: bool = False,
+    ) -> None:
+        contract = _CHAT_MUTATION_CONTRACTS.get(tool_name)
+        target = _chat_target(context, tool_name)
+        attributes: dict[str, Any] = {"tool_surface": "chat"}
+        if contract:
+            owner, _ = contract
+            attributes.update(
+                operation_owner=owner,
+                operation_key=f"chat:{tool_name}:{context.tool_call_id or context.action_id}",
+            )
+        event = TraceRecorder().record(
+            context,
+            ActionType.TOOL,
+            state,
+            phase=tool_name,
+            target=target,
+            duration_ms=timer.elapsed_ms() if timer else None,
+            outcome=outcome,
+            error=error,
+            attributes=attributes,
+        )
+        if contract:
+            # Do not persist raw chat input in traces.  A stable digest links
+            # retries/replays while the per-call key identifies this operation
+            # lifecycle to the event consumer.
+            request_hash = hashlib.sha256(
+                json.dumps(tool_input, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            event = event.model_copy(
+                update={
+                    "idempotency": IdempotencyDescriptor(
+                        key=attributes["operation_key"], request_hash=request_hash
+                    )
+                }
+            )
+        try:
+            if self._record is not None:
+                result = self._record(event)
+                if hasattr(result, "__await__"):
+                    await result
+                return
+            response = await self._client.post(
+                f"{self._store_url}/api/v1/traces/events",
+                headers=self._headers,
+                json=event.model_dump(mode="json"),
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.exception("failed to record chat tool audit event")
+            if required:
+                raise ChatAuditUnavailable(
+                    "audit ingestion unavailable; chat tool was not attempted"
+                ) from exc
+
+    async def invoke(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        handler: Callable[[], Awaitable[str]],
+        *,
+        tool_call_id: str | None = None,
+        parent_context: Any | None = None,
+    ) -> str:
+        """Record ``STARTED`` and one terminal event around one named tool."""
+        ticket_id = tool_input.get("ticket_id")
+        root_context = (
+            parent_context
+            or current_trace_context()
+            or new_trace_context(
+                ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
+                agent_id="chat-agent",
+            )
+        )
+        context = child_context(
+            root_context,
+            tool_call_id=tool_call_id or f"chat-{root_context.action_id}",
+            **(
+                {"ticket_id": ticket_id}
+                if isinstance(ticket_id, str) and ticket_id
+                else {}
+            ),
+        )
+        timer = MonotonicTimer()
+        await self._emit(
+            context,
+            LifecycleState.STARTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            required=True,
+        )
+        try:
+            result = await handler()
+        except BaseException as exc:
+            state = (
+                LifecycleState.CANCELLED
+                if isinstance(exc, asyncio.CancelledError)
+                else LifecycleState.FAILED
+            )
+            outcome = (
+                OperationOutcome.CANCELLED
+                if state == LifecycleState.CANCELLED
+                else OperationOutcome.FAILURE
+            )
+            try:
+                # The handler has already crossed its effect boundary.  Never
+                # quietly return an ordinary handler failure when its terminal
+                # audit outcome could not be persisted: callers must treat the
+                # operation as indeterminate and reconcile it.
+                await self._emit(
+                    context,
+                    state,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=outcome,
+                    error=exc,
+                    required=True,
+                )
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
+            raise
+        failed = False
+        try:
+            payload = json.loads(result)
+            failed = isinstance(payload, dict) and "error" in payload
+        except (TypeError, json.JSONDecodeError):
+            pass
+        try:
+            await self._emit(
+                context,
+                LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                timer=timer,
+                outcome=(
+                    OperationOutcome.FAILURE if failed else OperationOutcome.SUCCESS
+                ),
+                required=True,
+            )
+        except ChatAuditUnavailable as audit_error:
+            raise ChatAuditUnavailable(
+                "chat tool outcome is indeterminate; audit terminal was not persisted"
+            ) from audit_error
+        return result
+
+    async def reject(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        tool_call_id: str | None = None,
+        parent_context: Any | None = None,
+    ) -> None:
+        """Record a user-rejected confirmation without running its handler.
+
+        A confirmation is an agent-visible capability invocation.  Recording a
+        started/rejected pair makes a later user cancellation causally visible
+        while preserving the original web-request root across the two HTTP
+        requests that make up the confirmation flow.
+        """
+        ticket_id = tool_input.get("ticket_id")
+        root_context = (
+            parent_context
+            or current_trace_context()
+            or new_trace_context(
+                ticket_id=ticket_id if isinstance(ticket_id, str) else "chat",
+                agent_id="chat-agent",
+            )
+        )
+        context = child_context(
+            root_context,
+            tool_call_id=tool_call_id or f"chat-{root_context.action_id}",
+            **(
+                {"ticket_id": ticket_id}
+                if isinstance(ticket_id, str) and ticket_id
+                else {}
+            ),
+        )
+        timer = MonotonicTimer()
+        await self._emit(
+            context,
+            LifecycleState.STARTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            required=True,
+        )
+        await self._emit(
+            context,
+            LifecycleState.REJECTED,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            timer=timer,
+            outcome=OperationOutcome.REJECTED,
+            required=True,
+        )
 
 
 def _require(params: dict[str, Any], *keys: str) -> str | None:
@@ -390,50 +695,79 @@ async def execute_tool(
     client: httpx.AsyncClient,
     store_url: str,
     auth_token: str,
+    *,
+    audit: ChatToolAudit | None = None,
+    tool_call_id: str | None = None,
+    parent_context: Any | None = None,
 ) -> str:
-    """Execute a chat tool and return the result as a string."""
+    """Execute a chat tool through its required audit boundary."""
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    try:
-        if tool_name == "search_tickets":
-            return await _search_tickets(client, store_url, headers, tool_input)
-        elif tool_name == "get_ticket":
-            return await _get_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "create_ticket":
-            return await _create_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "start_ticket":
-            return await _start_ticket(client, store_url, headers, tool_input)
-        elif tool_name == "send_interjection":
-            return await _send_interjection(client, store_url, headers, tool_input)
-        elif tool_name == "reply_to_guidance":
-            return await _reply_to_guidance(client, store_url, headers, tool_input)
-        elif tool_name == "list_skills":
-            return _list_skills(tool_input)
-        elif tool_name == "read_skill":
-            return _read_skill(tool_input)
-        elif tool_name == "read_doc":
-            return _read_doc(tool_input)
-        elif tool_name == "list_users":
-            return await _list_users(client, store_url, headers, tool_input)
-        elif tool_name == "create_user":
-            return await _create_user(client, store_url, headers, tool_input)
-        elif tool_name == "rotate_user_token":
-            return await _rotate_user_token(client, store_url, headers, tool_input)
-        elif tool_name == "list_field_options":
-            return await _list_field_options(client, store_url, headers, tool_input)
-        elif tool_name == "update_ticket_fields":
-            return await _update_ticket_fields(client, store_url, headers, tool_input)
-        elif tool_name == "stop_ticket":
-            return await _stop_ticket(client, store_url, headers, tool_input)
-        else:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
-    except Exception as exc:
-        # Sanitize: do not expose internal paths or stack traces
-        msg = str(exc)
-        # Strip file paths and module references
-        if "/" in msg or "\\" in msg:
-            msg = "An internal error occurred"
-        return json.dumps({"error": msg[:200]})
+    async def _dispatch() -> str:
+        try:
+            return await _dispatch_tool(
+                tool_name, tool_input, client, store_url, headers
+            )
+        except Exception as exc:
+            # Sanitize: do not expose internal paths or stack traces
+            msg = str(exc)
+            # Strip file paths and module references
+            if "/" in msg or "\\" in msg:
+                msg = "An internal error occurred"
+            return json.dumps({"error": msg[:200]})
+
+    # This is the sole production dispatcher.  A missing audit transport is a
+    # fail-closed error, never a convenience route around trace evidence.
+    if audit is None:
+        raise ChatAuditUnavailable("chat tool dispatch requires an audit boundary")
+    return await audit.invoke(
+        tool_name,
+        tool_input,
+        _dispatch,
+        tool_call_id=tool_call_id,
+        parent_context=parent_context,
+    )
+
+
+async def _dispatch_tool(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    client: httpx.AsyncClient,
+    store_url: str,
+    headers: dict[str, str],
+) -> str:
+    """Resolve one advertised chat name to its concrete implementation."""
+    if tool_name == "search_tickets":
+        return await _search_tickets(client, store_url, headers, tool_input)
+    elif tool_name == "get_ticket":
+        return await _get_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "create_ticket":
+        return await _create_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "start_ticket":
+        return await _start_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "send_interjection":
+        return await _send_interjection(client, store_url, headers, tool_input)
+    elif tool_name == "reply_to_guidance":
+        return await _reply_to_guidance(client, store_url, headers, tool_input)
+    elif tool_name == "list_skills":
+        return _list_skills(tool_input)
+    elif tool_name == "read_skill":
+        return _read_skill(tool_input)
+    elif tool_name == "read_doc":
+        return _read_doc(tool_input)
+    elif tool_name == "list_users":
+        return await _list_users(client, store_url, headers, tool_input)
+    elif tool_name == "create_user":
+        return await _create_user(client, store_url, headers, tool_input)
+    elif tool_name == "rotate_user_token":
+        return await _rotate_user_token(client, store_url, headers, tool_input)
+    elif tool_name == "list_field_options":
+        return await _list_field_options(client, store_url, headers, tool_input)
+    elif tool_name == "update_ticket_fields":
+        return await _update_ticket_fields(client, store_url, headers, tool_input)
+    elif tool_name == "stop_ticket":
+        return await _stop_ticket(client, store_url, headers, tool_input)
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
 async def _search_tickets(

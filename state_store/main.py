@@ -257,6 +257,7 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
                     llm=chat_llm,
                     store_url=f"http://localhost:{port}",
                     max_tool_rounds=int(chat_model_cfg.get("max_tool_rounds", 10)),
+                    audit_token=token,
                 )
                 logger.info("Chat agent enabled (model=%s)", model)
             else:
