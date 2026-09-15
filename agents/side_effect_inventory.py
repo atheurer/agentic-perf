@@ -142,6 +142,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "_ensure_init", "cloud_resource"),
     ("agents/resource/server.py", "_get_board_selector", "cloud_resource"),
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"),
+    ("agents/resource/server.py", "_auto_escalate_named_device", "cloud_resource"),
     ("agents/resource/server.py", "check_available_resources", "cloud_resource"),
     ("agents/resource/server.py", "get_accumulated_metadata", "cloud_resource"),
     ("agents/resource/server.py", "get_host_inventory", "cloud_resource"),
@@ -258,6 +259,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/jumpstarter.py", "<module>", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_ensure_connected", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_is_enabled", "cloud_resource"),
+    ("providers/resource/jumpstarter.py", "_check_named_device", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "check_available", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "close", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "from_secrets", "cloud_resource"),
@@ -1270,6 +1272,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/server.py:_infer_os_from_ticket",
         "2027-12-31",
     ),
+    ("agents/resource/server.py", "_auto_escalate_named_device", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_auto_escalate_named_device",
+        "2027-12-31",
+    ),
     ("agents/resource/server.py", "check_available_resources", "cloud_resource"): (
         "audited",
         "observability-maintainers",
@@ -1964,6 +1972,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter.py:_is_enabled",
+        "2027-12-31",
+    ),
+    ("providers/resource/jumpstarter.py", "_check_named_device", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter.py:_check_named_device",
         "2027-12-31",
     ),
     ("providers/resource/jumpstarter.py", "check_available", "cloud_resource"): (

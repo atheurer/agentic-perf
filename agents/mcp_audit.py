@@ -53,7 +53,7 @@ _MAX_REPLAY_CACHE = 1024
 # #788 owns each tool's durable operation semantics.  This boundary merely
 # refuses to dispatch a protected handler unless #787 has already accepted its
 # immutable idempotency identity.
-_PROTECTED_TOOLS = frozenset({"execute_benchmark"})
+_PROTECTED_TOOLS = frozenset({"check_available_resources", "execute_benchmark"})
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_REDACTED_KEY_BYTES = 4096
