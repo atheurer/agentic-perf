@@ -694,33 +694,46 @@ class AgentMCPClient:
             LifecycleState.CANCELLED,
             LifecycleState.RESPONSE_RECEIVED,
         }
-        event = TraceEventV1(
-            ticket_id=context.ticket_id,
-            agent_id=context.agent_id,
-            invocation_id=context.invocation_id,
-            trace_id=context.trace_id,
-            action_id=context.action_id,
-            parent_action_id=context.parent_action_id,
-            tool_call_id=context.tool_call_id,
-            producer=ProducerIdentity(component="mcp_client", pid=os.getpid()),
-            mcp=MCPIdentity(
-                server=conn.name,
-                transport=conn.transport,
-                session_id=conn.session_id,
-                correlation_request_id=context.mcp_correlation_request_id,
-                server_pid=conn.subprocess_pid,
-            ),
-            action=ActionDescriptor(type=ActionType.MCP, phase=tool_name),
-            lifecycle=LifecycleDescriptor(state=state),
-            duration_ms=0 if terminal else None,
-            outcome=outcome if terminal else None,
-            attributes={
-                "endpoint": conn.endpoint,
-                "reconnect_generation": conn.reconnect_generation,
-                "client_process_identity": conn.client_process_identity,
-                "subprocess_pid_capture": conn.subprocess_pid_capture,
-            },
-        )
+        try:
+            event = TraceEventV1(
+                ticket_id=context.ticket_id,
+                agent_id=context.agent_id,
+                invocation_id=context.invocation_id,
+                trace_id=context.trace_id,
+                action_id=context.action_id,
+                parent_action_id=context.parent_action_id,
+                tool_call_id=context.tool_call_id,
+                producer=ProducerIdentity(
+                    component="mcp_client",
+                    pid=os.getpid(),
+                ),
+                mcp=MCPIdentity(
+                    server=conn.name,
+                    transport=conn.transport,
+                    session_id=conn.session_id,
+                    correlation_request_id=(context.mcp_correlation_request_id),
+                    server_pid=conn.subprocess_pid,
+                ),
+                action=ActionDescriptor(
+                    type=ActionType.MCP,
+                    phase=tool_name,
+                ),
+                lifecycle=LifecycleDescriptor(state=state),
+                duration_ms=0 if terminal else None,
+                outcome=outcome if terminal else None,
+                attributes={
+                    "endpoint": conn.endpoint,
+                    "reconnect_generation": (conn.reconnect_generation),
+                    "client_process_identity": (conn.client_process_identity),
+                    "subprocess_pid_capture": (conn.subprocess_pid_capture),
+                },
+            )
+        except Exception:
+            # Trace context may lack MCP-required fields
+            # (session_id, correlation_request_id) during
+            # initial connection or non-ticket contexts.
+            # Audit is best-effort — do not crash the agent.
+            return
         self.audit_events.append(event)
         if self._audit_hook is not None:
             self._audit_hook(event)
