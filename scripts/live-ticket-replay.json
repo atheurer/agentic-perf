@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "control": {
+    "ref": "2eed4735b87e1ad7bad1cf75cf95314517c5b689",
+    "required_consecutive_passes": 3
+  },
+  "checkpoints": [
+    {"wave": "0", "issue": 780, "pr": 803, "ref": "cd0886b2e9ed9a2d82993d3e4a9ec6e5da14b1cd"},
+    {"wave": "0", "issue": 779, "pr": 804, "ref": "fd6692697c4f4720808f7cb677e56fb322346a00"},
+    {"wave": "1", "issue": 781, "pr": 806, "ref": "ac1381ac7295d5b28e6f2fdbed8ba65dd15f06b3"},
+    {"wave": "2", "issue": 782, "pr": 807, "ref": "d5d0225cea5ef3f1c5ec494198d064b06a9920f7"},
+    {"wave": "3", "issue": 783, "pr": 808, "ref": "247cbd6ac9e697dcf8caa0127d795b59fe2cf401"},
+    {"wave": "4", "issue": 784, "pr": 810, "ref": "2e985a694ac4a19763341f717dd256408d82f9c5"},
+    {"wave": "4", "issue": 787, "pr": 809, "ref": "9bc3247bc936af277b92950cca2b734165f0035d"},
+    {"wave": "5", "issue": 785, "pr": 812, "ref": "6d657a40a56200e085cf111c89f494b40b4f9c5c"},
+    {"wave": "5", "issue": 789, "pr": 815, "ref": "7c7c56cd3e6c64abd79e100131ce3a4ac34d6a25"},
+    {"wave": "5", "issue": 790, "pr": 813, "ref": "86e94666e68dabbd7a9abcbe3abdd593b92e806e"},
+    {"wave": "5", "issue": 791, "pr": 817, "ref": "7646973c8233adfde30392de9cba2b03b6b59003"},
+    {"wave": "5", "issue": 792, "pr": 818, "ref": "de5cd131ca44490ba8d9cbe1230a326dffaeb614"},
+    {"wave": "6", "issue": 799, "pr": 820, "ref": "c87e85b3c1b6db471a0d6718fc6b641e611384ed"},
+    {"wave": "6", "issue": 797, "pr": 821, "ref": "92455c93d1285b31fce7d804d18d986b92f759f8"},
+    {"wave": "6", "issue": 786, "pr": 819, "ref": "b5651f4656d920dde70674393c5bdf8d4bd5536d"},
+    {"wave": "6", "issue": 802, "pr": 823, "ref": "0f99b74da4c14e457d77ce141b8e0b4a3b3d93c5"},
+    {"wave": "6", "issue": 796, "pr": 822, "ref": "4ddcc65e26b7bcdda63b1cd78eb8a616b9aa8ebc"},
+    {"wave": "6", "issue": 800, "pr": 824, "ref": "576588ce6756b9cdfe927524694035d48d450fe6"},
+    {"wave": "6", "issue": 798, "pr": 825, "ref": "a24fd548522983d93bb62bb0216f42af66fe56dc"},
+    {"wave": "7", "issue": 794, "pr": 826, "ref": "180a6654cafe4c23565b0153caf70e52768de8d4"},
+    {"wave": "7", "issue": 788, "pr": 828, "ref": "d91dd8269512a32644c7bbd439c83abe9175e84f"},
+    {"wave": "7-followup", "issue": 830, "pr": 831, "ref": "009d2021e5bedae56cd9d4a8705c51214537df0f"},
+    {"wave": "7-proof", "issue": 801, "pr": 829, "ref": "4bfaf07efddc72b75f12ea5f5b79b15042ab4a03"},
+    {"wave": "8", "issue": 793, "pr": 840, "ref": "7dd41ee512aeee3c7a71e931881e2376d85b25ca"},
+    {"wave": "8-followup", "issue": 855, "pr": 856, "ref": "bf8b5ef33cc6bfd2e6f56fb4de6fdfae2649388e"}
+  ]
+}
