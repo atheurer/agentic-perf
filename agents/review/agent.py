@@ -8,7 +8,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
 
 from .prompts import REVIEW_SYSTEM_PROMPT
@@ -209,35 +209,12 @@ class ReviewAgent(AgentBase):
             "request_clarification now with your current findings."
         )
 
-    async def _validate_submit_call(
-        self, ticket_id: str, submit_call: ToolCall
-    ) -> str | None:
-        chart_ref = submit_call.input.get("chart_ref")
-        if not chart_ref:
-            return None
-
-        from providers.workspace.manager import WorkspaceManager
-
-        manager = WorkspaceManager(ticket_id=ticket_id, agent_name=self.agent_name)
-        chart = manager.read_chart(str(chart_ref))
-        if chart.get("status") == "ok":
-            return None
-        return (
-            f"REJECTED: chart_ref '{chart_ref}' is not a usable chart: "
-            f"{chart.get('error', 'unknown chart error')}. Regenerate the chart "
-            "and submit its returned chart_ref."
-        )
-
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
 
         # Block auto-submit only when the ticket
         # explicitly requests interactive review.
         ticket = await self._get_ticket(ticket_id)
-
-        # Pre-fetch artifact paths for referenced tickets
-        # so _build_messages can include them in context.
-        await self._resolve_referenced_artifacts(ticket)
         directives = ticket.get("custom_fields", {}).get("directives", {})
         if directives.get("review_mode") == "interactive":
             self._user_approved_submit = False
@@ -505,23 +482,6 @@ class ReviewAgent(AgentBase):
             for comment in user_comments:
                 content += f"\n**{comment['author']}:** {comment['body']}\n"
 
-        # Cross-ticket artifact resolution: include
-        # pre-fetched output_dirs for referenced tickets.
-        refs = getattr(self, "_referenced_artifacts", {})
-        if refs:
-            content += "\n## Referenced Ticket Artifacts\n"
-            for rid, rinfo in refs.items():
-                rdir = rinfo.get("output_dir", "")
-                rrun = rinfo.get("run_id", "")
-                if rdir:
-                    content += (
-                        f"\n**{rid}:**\n"
-                        f"- output_dir: `{rdir}`\n"
-                        f"- run_id: `{rrun}`\n"
-                        f"Use `read_benchmark_artifact` "
-                        f"with this output_dir.\n"
-                    )
-
         return [{"role": "user", "content": content}]
 
     async def _handle_completion(self, ticket_id: str, response: LLMResponse) -> None:
@@ -546,17 +506,20 @@ class ReviewAgent(AgentBase):
         }
         if result.get("chart_ref"):
             chart_ref = result["chart_ref"]
-            from providers.workspace.manager import WorkspaceManager
-
-            mgr = WorkspaceManager(ticket_id=ticket_id, agent_name=self.agent_name)
-            chart = mgr.read_chart(chart_ref)
-            if chart.get("status") != "ok":
-                raise ValueError(
-                    f"chart_ref '{chart_ref}' became invalid after validation: "
-                    f"{chart.get('error', 'unknown chart error')}"
-                )
             fields["chart_ref"] = chart_ref
-            fields["chart_data"] = chart["chart_data"]
+            try:
+                from providers.workspace.manager import WorkspaceManager
+
+                mgr = WorkspaceManager(ticket_id=ticket_id)
+                chart_path = mgr.resolve_path(chart_ref)
+                if chart_path.exists():
+                    fields["chart_data"] = json.loads(
+                        chart_path.read_text(encoding="utf-8")
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.agent_name}] Failed to load chart from {chart_ref}: {e}"
+                )
         elif result.get("chart_data"):
             fields["chart_data"] = result["chart_data"]
         if result.get("results_url"):

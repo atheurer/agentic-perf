@@ -20,12 +20,13 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from agents.mcp_audit import create_ticket_mcp
+from fastmcp import FastMCP
+
 from providers.llm.base import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
-mcp = create_ticket_mcp("platform-agent")
+mcp = FastMCP("platform-agent")
 
 # Module-level state — lazily initialized
 _ticket: dict[str, Any] = {}
@@ -141,11 +142,11 @@ async def _provision_jumpstarter(
             flash_url = flash_command.replace("j storage flash ", "").strip()
 
     ssh_public_key = flash_info.get("ssh_public_key", "")
-    ssh_key_path = flash_info.get("ssh_key_path", "") or cf.get("ssh_key_path", "")
+    ssh_key_path = flash_info.get("ssh_key_path", "")
 
     # Derive public key from private key path if not
     # explicitly provided — the resource agent sets
-    # ssh_key_path at the ticket level, not in flash_info.
+    # ssh_key_path but not ssh_public_key.
     if not ssh_public_key and ssh_key_path:
         pub_path = (
             Path(ssh_key_path)
@@ -184,7 +185,6 @@ async def _provision_jumpstarter(
         selector=selector,
         serial_capture=serial_enabled,
         artifact_dir=artifact_dir,
-        ticket_id=ticket_id,
     )
 
     return json.dumps(

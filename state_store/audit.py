@@ -4,13 +4,11 @@ import contextvars
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from paths import AUDIT_LOG
-from providers.event_projection import audit_to_trace, trace_to_audit
-
-from .trace_store import TraceStore, TraceStoreWriteError
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +32,12 @@ class AuditLog:
         self,
         path: Path | None = None,
         redactor: Any | None = None,
-        trace_store: TraceStore | None = None,
-        process_identity: dict[str, Any] | None = None,
     ) -> None:
         self._path = path or AUDIT_LOG
         self._redactor = redactor
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._trace_lock = threading.Lock()
-        self._trace_store = trace_store or TraceStore(self._path.parent / "trace.db")
-        self._owns_trace_store = trace_store is None
-        self._process_identity = dict(process_identity or {})
+        self._fh: IO[str] | None = None
         self._seq = self._recover_seq()
 
     def _recover_seq(self) -> int:
@@ -66,6 +59,11 @@ class AuditLog:
             logger.exception("Failed to recover audit seq from %s", self._path)
         return last_seq
 
+    def _ensure_fh(self) -> IO[str]:
+        if self._fh is None or self._fh.closed:
+            self._fh = open(self._path, "a", encoding="utf-8")
+        return self._fh
+
     def log(
         self,
         mutation: str,
@@ -75,15 +73,20 @@ class AuditLog:
         with self._lock:
             if self._redactor:
                 data = self._redactor.redact(ticket_id, data)
-            if self._process_identity:
-                data = {**data, "state_store": self._process_identity}
+            self._seq += 1
+            entry = {
+                "seq": self._seq,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mutation": mutation,
+                "ticket_id": ticket_id,
+                "actor": get_actor(),
+                "data": data,
+            }
             try:
-                with self._trace_lock:
-                    stored = self._trace_store.insert_event(
-                        audit_to_trace(ticket_id, mutation, get_actor(), data)
-                    )
-                self._seq = max(self._seq, stored.global_seq or 0)
-            except TraceStoreWriteError:
+                fh = self._ensure_fh()
+                fh.write(json.dumps(entry, default=str) + "\n")
+                fh.flush()
+            except OSError:
                 logger.exception(
                     "Failed to write audit entry for %s on %s",
                     mutation,
@@ -96,46 +99,37 @@ class AuditLog:
         since: int = 0,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
+        if not self._path.exists():
+            return []
         entries: list[dict[str, Any]] = []
-        if self._path.exists():
-            try:
-                with open(self._path, encoding="utf-8") as fh:
-                    for line in fh:
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if (
-                            ticket_id is not None
-                            and entry.get("ticket_id") != ticket_id
-                        ):
-                            continue
-                        entry["schema_version"] = "legacy_uncorrelated"
-                        entries.append(entry)
-            except OSError:
-                logger.exception("Failed to read audit log %s", self._path)
-        with self._trace_lock:
-            trace_events = self._trace_store.list_events(ticket_id)
-        for event in trace_events:
-            projected = trace_to_audit(event)
-            if projected is not None:
-                entries.append(projected)
-        entries.sort(
-            key=lambda entry: (
-                0 if entry.get("schema_version") == "legacy_uncorrelated" else 1,
-                entry.get("seq", 0),
-            )
-        )
-        for sequence, entry in enumerate(entries, start=1):
-            entry["seq"] = sequence
-        return [entry for entry in entries if entry["seq"] > since][:limit]
+        try:
+            with open(self._path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("seq", 0) <= since:
+                        continue
+                    if ticket_id and entry.get("ticket_id") != ticket_id:
+                        continue
+                    entries.append(entry)
+                    if len(entries) >= limit:
+                        break
+        except OSError:
+            logger.exception("Failed to read audit log %s", self._path)
+        return entries
 
     @property
     def latest_seq(self) -> int:
         with self._lock:
-            return max(self._seq, len(self.read(limit=1_000_000)))
+            return self._seq
 
     def close(self) -> None:
         with self._lock:
-            if self._owns_trace_store:
-                self._trace_store.close()
+            if self._fh and not self._fh.closed:
+                self._fh.close()
+                self._fh = None

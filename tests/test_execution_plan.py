@@ -6,19 +6,9 @@ generation, benchmark step params, review multi-run awareness.
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from state_store.models import VALID_TRANSITIONS, TicketStatus
-
-
-def _async_client() -> MagicMock:
-    client = MagicMock()
-    client.get = AsyncMock()
-    client.patch = AsyncMock()
-    client.post = AsyncMock()
-    return client
-
 
 # --- State machine ---
 
@@ -50,16 +40,11 @@ def test_advance_plan_no_plan_is_noop():
         "custom_fields": {"run_id": "RUN-001"},
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
@@ -89,16 +74,11 @@ def test_advance_plan_skips_non_plan_agent():
         "custom_fields": {"execution_plan": plan},
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_hardware")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_hardware")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
@@ -129,16 +109,11 @@ def test_advance_plan_skips_when_hitl_paused():
         "custom_fields": {"execution_plan": plan},
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         client.patch.assert_not_called()
         client.post.assert_not_called()
@@ -186,18 +161,13 @@ def test_advance_plan_completes_step_and_advances():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -254,18 +224,13 @@ def test_advance_plan_blocks_when_host_tuning_missing():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
 
         # Should redirect to guidance, not patch the plan forward.
         client.patch.assert_not_called()
@@ -291,18 +256,13 @@ def test_advance_plan_allows_when_host_tuning_applied():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -325,18 +285,13 @@ def test_advance_plan_allows_when_no_tuning_requested():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -369,17 +324,12 @@ def test_advance_plan_final_step_no_transition():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_review")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_review")
 
         client.patch.assert_called_once()
         transition_calls = [
@@ -430,18 +380,13 @@ def test_advance_plan_tracks_multiple_run_ids():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -754,18 +699,13 @@ def test_advance_plan_benchmark_to_teardown():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args_list[0]
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -828,18 +768,13 @@ def test_advance_plan_teardown_to_resource():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_teardown")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_teardown")
 
         transition_calls = [
             c for c in client.post.call_args_list if "transition" in str(c)
@@ -946,21 +881,16 @@ def test_advance_plan_full_six_step_cycle():
         mock_response.status_code = 200
         mock_response.json.return_value = {"custom_fields": dict(cf)}
 
-        client = _async_client()
+        client = MagicMock()
         client.get.return_value = mock_response
         client.patch.return_value = MagicMock(status_code=200)
         client.post.return_value = MagicMock(status_code=200)
 
-        with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-            factory.return_value.__aenter__ = AsyncMock(return_value=client)
-            factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-            asyncio.run(
-                _advance_plan(
-                    "http://localhost:8090",
-                    "PERF-TEST",
-                    completed_status,
-                )
+        with patch("httpx.Client", return_value=client):
+            _advance_plan(
+                "http://localhost:8090",
+                "PERF-TEST",
+                completed_status,
             )
 
             transition_calls = [
@@ -1018,18 +948,13 @@ def test_per_step_results_survive_teardown():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
         patch_call = client.patch.call_args_list[0]
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
@@ -1142,18 +1067,13 @@ def test_advance_plan_stop_after_step_closes_ticket():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
     # Plan should be persisted with step marked completed.
     patch_call = client.patch.call_args
@@ -1205,18 +1125,13 @@ def test_advance_plan_stop_after_step_no_match_advances_normally():
         },
     }
 
-    client = _async_client()
+    client = MagicMock()
     client.get.return_value = mock_response
     client.patch.return_value = MagicMock(status_code=200)
     client.post.return_value = MagicMock(status_code=200)
 
-    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
-        factory.return_value.__aenter__ = AsyncMock(return_value=client)
-        factory.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
-        )
+    with patch("httpx.Client", return_value=client):
+        _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
 
     # Ticket must NOT be force-closed; the normal transition runs.
     post_urls = [str(c) for c in client.post.call_args_list]

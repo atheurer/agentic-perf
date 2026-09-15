@@ -5,12 +5,7 @@ import re
 from typing import Any
 
 from providers.workspace.charts.base import BaseChartAdapter
-from providers.workspace.charts.models import (
-    ChartDataset,
-    ChartPanel,
-    ChartSpec,
-    ChartValidationError,
-)
+from providers.workspace.charts.models import ChartDataset, ChartPanel, ChartSpec
 
 
 class CdmChartAdapter(BaseChartAdapter):
@@ -92,14 +87,8 @@ class CdmChartAdapter(BaseChartAdapter):
                         for k, v in subqueries.items():
                             if tm_lower in k.lower() or k.lower() in tm_lower:
                                 matched_subqueries[k] = v
-                if target_metrics and not matched_subqueries:
-                    requested = ", ".join(target_metrics)
-                    available = ", ".join(sorted(subqueries))
-                    raise ChartValidationError(
-                        f"requested metrics did not match a CDM subquery: "
-                        f"{requested}; available: {available}"
-                    )
                 if not matched_subqueries:
+                    # If target metrics not specified or none matched, use all subqueries
                     matched_subqueries = subqueries
 
                 # If multiple subqueries matched, build a synchronized multi-panel chart

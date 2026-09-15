@@ -501,10 +501,9 @@ class TestSkippedPlanSteps:
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(
-                "orchestrator.main.AuditedAsyncHTTPClient",
-                lambda **kwargs: mock_client,
-            )
+            import httpx
+
+            mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
             await run_agent_task(
                 dispatcher,
                 "synthesizing_results",

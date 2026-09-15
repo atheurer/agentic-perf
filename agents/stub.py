@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Any
 
-from providers.execution import AuditedAsyncHTTPClient
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class StubAgent:
     async def run(self, ticket_id: str) -> None:
         logger.info(f"[{self.agent_name}] Processing ticket {ticket_id}")
 
-        async with AuditedAsyncHTTPClient(
+        async with httpx.AsyncClient(
             timeout=30.0, headers=self._auth_headers()
         ) as client:
             await asyncio.sleep(self.delay)

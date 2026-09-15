@@ -274,8 +274,7 @@ async def test_unlimited_iterations_no_error(tmp_path):
     assert len(error_events) == 0
 
     # Should have finished cleanly
-    finished = event_bus.get_terminal_events("PERF-TEST")
-    finished = [e for e in finished if e["event_type"] == "agent_finished"]
+    finished = [e for e in events if e["event_type"] == "agent_finished"]
     assert len(finished) == 1
 
 

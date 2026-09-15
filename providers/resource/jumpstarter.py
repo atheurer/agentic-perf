@@ -47,11 +47,6 @@ _BOARD_TYPE_KEYS = ("board-type", "target")
 _ENABLED_KEY = "enabled"
 _POOL_KEY = "pool"
 
-# Selector key that matches against exporter names
-# instead of labels.  Allows users to request a
-# specific board (e.g., name=renesas-rcar-s4-01).
-_NAME_SELECTOR_KEY = "name"
-
 
 def _get_board_type(labels: dict[str, str]) -> str:
     """Extract the board type from exporter labels.
@@ -311,15 +306,6 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         key, _, value = selector.partition("=")
 
-        # name= targets a specific exporter by name
-        # rather than matching against labels.
-        if key == _NAME_SELECTOR_KEY:
-            return self._check_named_device(
-                value,
-                all_devices,
-                requirements,
-            )
-
         matching = [
             d for d in all_devices if d["labels"].get(key) == value and d["available"]
         ]
@@ -379,103 +365,6 @@ class JumpstarterResourceProvider(ResourceProvider):
             ],
         }
 
-    def _check_named_device(
-        self,
-        device_name: str,
-        all_devices: list[dict[str, Any]],
-        requirements: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Check availability of a specific device by name.
-
-        Returns detailed status so the agent can give the
-        user actionable feedback when the board is
-        unavailable.
-        """
-        device = None
-        for d in all_devices:
-            if d["name"] == device_name:
-                device = d
-                break
-
-        if device is None:
-            # Device doesn't exist — list similar boards.
-            board_types: dict[str, list[str]] = {}
-            for d in all_devices:
-                bt = _get_board_type(d["labels"])
-                board_types.setdefault(bt, []).append(d["name"])
-            return {
-                "provider": "jumpstarter",
-                "available": False,
-                "matching_devices": 0,
-                "selector": f"{_NAME_SELECTOR_KEY}={device_name}",
-                "error": (
-                    f"No device named '{device_name}' exists. "
-                    f"Available devices by board type: "
-                    + ", ".join(
-                        f"{bt}: [{', '.join(names)}]"
-                        for bt, names in sorted(board_types.items())
-                    )
-                ),
-            }
-
-        if device["available"]:
-            # Board exists and is available.
-            board_type = _get_board_type(device["labels"])
-            return {
-                "provider": "jumpstarter",
-                "available": True,
-                "matching_devices": 1,
-                "requested": 1,
-                "selector": f"{_board_type_selector_key()}={board_type}",
-                "exporter_name": device_name,
-                "devices": [{"name": device["name"], "labels": device["labels"]}],
-            }
-
-        # Board exists but is NOT available — explain why.
-        reasons = []
-        if not device["online"]:
-            reasons.append("offline (exporter not connected)")
-        if not device["enabled"]:
-            reasons.append("disabled by admin")
-        if device["status"] not in ("AVAILABLE", "None", ""):
-            reasons.append(f"status: {device['status']}")
-        pool = device["labels"].get(_POOL_KEY, "open")
-        if pool not in ("open",):
-            reasons.append(f"pool: {pool} (not in open pool)")
-
-        reason_str = "; ".join(reasons) if reasons else "unknown"
-
-        # Suggest alternatives of the same board type.
-        board_type = _get_board_type(device["labels"])
-        alternatives = [
-            d["name"]
-            for d in all_devices
-            if d["available"]
-            and _get_board_type(d["labels"]) == board_type
-            and d["name"] != device_name
-        ]
-
-        result: dict[str, Any] = {
-            "provider": "jumpstarter",
-            "available": False,
-            "matching_devices": 0,
-            "requested": 1,
-            "selector": f"{_NAME_SELECTOR_KEY}={device_name}",
-            "device_name": device_name,
-            "unavailable_reason": reason_str,
-            "error": (
-                f"Device '{device_name}' exists but is unavailable ({reason_str})."
-            ),
-        }
-        if alternatives:
-            result["alternatives"] = alternatives
-            result["error"] += (
-                f" Available {board_type} boards: {', '.join(alternatives)}"
-            )
-        else:
-            result["error"] += f" No other {board_type} boards are available."
-        return result
-
     async def reserve(
         self,
         selection: dict[str, Any],
@@ -520,33 +409,11 @@ class JumpstarterResourceProvider(ResourceProvider):
             "jumpstarter_selector",
             self._default_selector,
         )
-
-        # Target a specific exporter by name when provided.
-        # Used by fleet investigations to deterministically
-        # select untested boards.
-        target_exporter = selection.get("exporter_name")
-
-        # Handle name= selector: resolve to board-type
-        # selector + exporter_name for the lease.
-        if selector:
-            key, _, value = selector.partition("=")
-            if key == _NAME_SELECTOR_KEY:
-                # Look up the device to find its board type.
-                exporters = await self._service.ListExporters()
-                board_type = None
-                for e in exporters.exporters:
-                    if e.name == value:
-                        board_type = _get_board_type(dict(e.labels))
-                        break
-                if board_type is None:
-                    return {
-                        "provider": "jumpstarter",
-                        "error": (f"Device '{value}' not found. Cannot create lease."),
-                        "status": "rejected",
-                    }
-                selector = f"{_board_type_selector_key()}={board_type}"
-                target_exporter = value
-
+        # Append availability labels to the selector
+        # so the controller only assigns devices we
+        # consider available. These labels are checked
+        # conditionally — enabled is becoming implicit
+        # in future Jumpstarter versions.
         # Append availability labels to the selector
         # so the controller only assigns devices we
         # consider available.
@@ -555,6 +422,11 @@ class JumpstarterResourceProvider(ResourceProvider):
                 selector = f"{selector},{_ENABLED_KEY}=true"
             if _POOL_KEY not in selector:
                 selector = f"{selector},{_POOL_KEY}=open"
+
+        # Target a specific exporter by name when provided.
+        # Used by fleet investigations to deterministically
+        # select untested boards.
+        target_exporter = selection.get("exporter_name")
 
         # Prefer explicit seconds from selection, else use
         # duration_hours converted, else default.

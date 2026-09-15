@@ -48,12 +48,12 @@ def ticket(store):
 
 
 def _read_entries(audit_path):
-    """Read the public compatibility projection, never its old backing file."""
-    log = AuditLog(path=audit_path)
-    try:
-        return log.read(limit=10_000)
-    finally:
-        log.close()
+    if not audit_path.exists():
+        return []
+    entries = []
+    for line in audit_path.read_text().strip().splitlines():
+        entries.append(json.loads(line))
+    return entries
 
 
 class TestTransitionAudit:
@@ -269,7 +269,7 @@ class TestAuditReload:
 class TestAuditEndpoint:
     @pytest.fixture
     def app_with_audit(self, tmp_path):
-        application = create_app(initialize_immediately=True)
+        application = create_app()
         audit = AuditLog(path=tmp_path / "audit.jsonl")
         store = TicketStore(
             persist_dir=tmp_path / "tickets",

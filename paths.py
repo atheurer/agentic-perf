@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import socket
@@ -21,16 +20,10 @@ SKILL_CACHE_DIR = AGENTIC_PERF_HOME / "skill-cache"
 PLUGIN_SCHEMA_CACHE_DIR = AGENTIC_PERF_HOME / "plugin-schema-cache"
 INVESTIGATION_RECORDS_DIR = AGENTIC_PERF_HOME / "investigation-records"
 PRICING_PATH = AGENTIC_PERF_HOME / "pricing.yaml"
-TRACE_DB_PATH = AGENTIC_PERF_HOME / "trace.db"
-TRACE_PAYLOAD_DIR = AGENTIC_PERF_HOME / "trace-payloads"
-TRACE_SPOOL_DIR = AGENTIC_PERF_HOME / "trace-spool"
-STATE_STORE_LOCK_PATH = AGENTIC_PERF_HOME / "state-store.lock"
-STATE_STORE_ID_PATH = AGENTIC_PERF_HOME / "state-store.id"
 
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")
 )
-TRACE_AUDIT_KEY_PATH = SECRETS_DIR / "trace-audit-key"
 ARTIFACT_DIR = Path(
     os.environ.get("AGENTIC_PERF_ARTIFACTS", AGENTIC_PERF_HOME / "artifacts")
 )
@@ -90,12 +83,6 @@ def get_instance_name() -> str:
     return socket.gethostname().split(".")[0]
 
 
-def persistence_root_fingerprint(root: Path | None = None) -> str:
-    """Return a non-reversible identifier for a state-store persistence root."""
-    resolved = (root or AGENTIC_PERF_HOME).resolve()
-    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
-
-
 def get_default_ssh_key() -> str:
     """Return the default SSH key path for this deployment.
 
@@ -135,19 +122,7 @@ def create_artifact_dir(
 
     if ticket_id:
         artifact_dir = ARTIFACT_DIR / ticket_id / run_id
-        # Import locally to avoid making paths.py depend on tracing at import time.
-        from providers.execution import (
-            AuditedFilesystem,
-            RootedPath,
-            durable_filesystem_emitter,
-        )
-
-        AuditedFilesystem(
-            RootedPath(ARTIFACT_DIR, "artifact"),
-            ticket_id=ticket_id,
-            emit=durable_filesystem_emitter(),
-            critical=True,
-        ).mkdir(f"{ticket_id}/{run_id}")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         return artifact_dir
     return Path(tempfile.mkdtemp(prefix=f"{run_id}-"))
 

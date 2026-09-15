@@ -7,7 +7,6 @@ and data-loss block removal.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,17 +19,6 @@ from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from state_store.main import create_app
 from state_store.models import CreateTicketRequest, TransitionRequest
 from state_store.store import TicketStore
-
-
-def _audited_client(client: MagicMock) -> MagicMock:
-    for method in ("get", "patch", "post"):
-        configured = getattr(client, method)
-        setattr(client, method, AsyncMock(return_value=configured.return_value))
-    wrapper = MagicMock()
-    wrapper.__aenter__ = AsyncMock(return_value=client)
-    wrapper.__aexit__ = AsyncMock(return_value=None)
-    return wrapper
-
 
 # ── Shared helpers ───────────────────────────────────────
 
@@ -80,7 +68,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def app(store):
-    application = create_app(initialize_immediately=True)
+    application = create_app()
     application.state.store = store
     return application
 
@@ -427,10 +415,7 @@ class TestAdvancePlanLogging:
         mock_client.get.return_value = mock_response
 
         with (
-            patch(
-                "orchestrator.main.AuditedAsyncHTTPClient",
-                return_value=_audited_client(mock_client),
-            ),
+            patch("httpx.Client", return_value=mock_client),
             patch(
                 "orchestrator.main._auth_headers",
                 return_value={},
@@ -440,12 +425,10 @@ class TestAdvancePlanLogging:
                 logger="orchestrator.main",
             ),
         ):
-            asyncio.run(
-                _advance_plan(
-                    "http://testserver",
-                    "PERF-PLAN01",
-                    "awaiting_review",
-                )
+            _advance_plan(
+                "http://testserver",
+                "PERF-PLAN01",
+                "awaiting_review",
             )
 
         assert any("not in_progress" in r.message for r in caplog.records)
@@ -497,21 +480,16 @@ class TestMarkerClearedOnAdvance:
         mock_client.post.return_value = MagicMock(status_code=200)
 
         with (
-            patch(
-                "orchestrator.main.AuditedAsyncHTTPClient",
-                return_value=_audited_client(mock_client),
-            ),
+            patch("httpx.Client", return_value=mock_client),
             patch(
                 "orchestrator.main._auth_headers",
                 return_value={},
             ),
         ):
-            asyncio.run(
-                _advance_plan(
-                    "http://testserver",
-                    "PERF-CLEAR01",
-                    "awaiting_review",
-                )
+            _advance_plan(
+                "http://testserver",
+                "PERF-CLEAR01",
+                "awaiting_review",
             )
 
         patch_calls = mock_client.patch.call_args_list
@@ -548,21 +526,16 @@ class TestMarkerClearedOnAdvance:
         mock_client.patch.return_value = MagicMock(status_code=200)
 
         with (
-            patch(
-                "orchestrator.main.AuditedAsyncHTTPClient",
-                return_value=_audited_client(mock_client),
-            ),
+            patch("httpx.Client", return_value=mock_client),
             patch(
                 "orchestrator.main._auth_headers",
                 return_value={},
             ),
         ):
-            asyncio.run(
-                _advance_plan(
-                    "http://testserver",
-                    "PERF-FINAL01",
-                    "awaiting_review",
-                )
+            _advance_plan(
+                "http://testserver",
+                "PERF-FINAL01",
+                "awaiting_review",
             )
 
         patch_calls = mock_client.patch.call_args_list

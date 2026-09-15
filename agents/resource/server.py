@@ -11,9 +11,6 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -26,23 +23,18 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from agents.mcp_audit import create_ticket_mcp
+from fastmcp import FastMCP
+
 from agents.server_utils import (
     build_secrets_provider,
     build_ssh_from_ticket,
     get_board_selector,
 )
 from paths import get_default_ssh_key
-from providers.tracing import (
-    bind_trace_context,
-    child_context,
-    current_trace_context,
-    reset_trace_context,
-)
 
 logger = logging.getLogger(__name__)
 
-mcp = create_ticket_mcp("resource-agent")
+mcp = FastMCP("resource-agent")
 
 # Module-level globals -- lazily initialized by _ensure_init()
 _initialized = False
@@ -77,78 +69,14 @@ async def _ensure_init():
 
 
 # ---------------------------------------------------------------------------
-# Regex helpers — two-stage scan + validate
+# Regex helpers
 # ---------------------------------------------------------------------------
 
-# Stage-1 candidate patterns: broad regexes that search within free-form
-# text (e.g. "controller=10.1.2.3", "root@host.example.com:22").
-# Candidates are validated in stage 2 before acceptance.
-# Do not accept an IPv4-looking substring from a larger hostname or dotted
-# sequence (``10.1.2.3.999`` must not yield ``10.1.2.3``).  A trailing dot is
-# still allowed when it is sentence punctuation rather than another label.
-_IP_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9.-])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9-])(?!\.[A-Za-z0-9-])"
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+FQDN_RE = re.compile(
+    r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z]{2,})+\b"
 )
-_FQDN_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9-])"
-    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)"
-    r"+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?![A-Za-z0-9-])",
-)
-
-# Stage-2 FQDN label validation
-_DNS_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
-
-
-def _is_valid_ip(candidate: str) -> bool:
-    try:
-        ipaddress.ip_address(candidate)
-        return True
-    except ValueError:
-        return False
-
-
-def _is_fqdn(token: str) -> bool:
-    if len(token) > 253 or "." not in token:
-        return False
-    labels = token.rstrip(".").split(".")
-    if len(labels) < 2:
-        return False
-    if not all(_DNS_LABEL.fullmatch(lb) for lb in labels):
-        return False
-    # Final label must be alphabetic — this naturally rejects bare IPs
-    # that _FQDN_CANDIDATE may surface (e.g. "10.1.2.3" has final label "3").
-    return labels[-1].isalpha() and len(labels[-1]) >= 2
-
-
-def _extract_hosts(line: str) -> list[str]:
-    """Extract IPs and FQDNs from a line via two-stage scan + validate.
-
-    Stage 1 finds candidates by scanning the raw text (handles
-    ``key=ip``, ``user@host``, ``host:port`` etc.).
-    Stage 2 validates each candidate before acceptance.
-    Overlapping matches are resolved by span containment: an IP
-    embedded inside a validated FQDN (e.g. ``10.1.2.3.example.com``)
-    is suppressed so only the FQDN is returned.
-    """
-    ip_hits = [
-        (m.group(), m.start(), m.end())
-        for m in _IP_CANDIDATE.finditer(line)
-        if _is_valid_ip(m.group())
-    ]
-    fqdn_hits = [
-        (m.group(), m.start(), m.end())
-        for m in _FQDN_CANDIDATE.finditer(line)
-        if _is_fqdn(m.group())
-    ]
-    fqdn_spans = [(s, e) for _, s, e in fqdn_hits]
-    filtered_ips = [
-        hit
-        for hit in ip_hits
-        if not any(fs <= hit[1] and hit[2] <= fe for fs, fe in fqdn_spans)
-    ]
-    all_hits = sorted(filtered_ips + fqdn_hits, key=lambda t: t[1])
-    return list(dict.fromkeys(text for text, _, _ in all_hits))
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +110,9 @@ async def parse_host_config(text: str) -> str:
         if key_match:
             result["ssh_key_path"] = key_match.group(1)
 
-        hosts_in_line = _extract_hosts(line)
+        ips = IP_RE.findall(line)
+        fqdns = FQDN_RE.findall(line)
+        hosts_in_line = ips + fqdns
 
         if hosts_in_line:
             if re.search(r"controller|server", lower):
@@ -194,14 +124,9 @@ async def parse_host_config(text: str) -> str:
             else:
                 all_hosts.extend(hosts_in_line)
 
-    if result["controller"]:
-        result["targets"] = [h for h in result["targets"] if h != result["controller"]]
-
     if not result["controller"] and all_hosts:
-        all_hosts = list(dict.fromkeys(all_hosts))
         result["controller"] = all_hosts[0]
         result["targets"] = all_hosts[1:]
-    result["targets"] = list(dict.fromkeys(result["targets"]))
 
     return json.dumps(result)
 
@@ -252,11 +177,12 @@ async def check_available_resources(
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     if ticket_id:
         try:
-            from providers.execution import AuditedAsyncHTTPClient
+            import httpx
+
             from state_store.auth import read_token_from_file
 
             token = read_token_from_file()
-            async with AuditedAsyncHTTPClient(
+            async with httpx.AsyncClient(
                 base_url=store_url,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10.0,
@@ -290,14 +216,6 @@ async def check_available_resources(
             }
         )
     result = await prov.check_available(requirements or {})
-
-    # Code-enforce: when a specific device was requested by
-    # name and is unavailable, escalate to HITL immediately.
-    # Retrying won't help — the board is leased, offline, or
-    # doesn't exist.  The result includes the reason and any
-    # alternatives of the same board type.
-    if not result.get("available") and result.get("selector", "").startswith("name="):
-        await _auto_escalate_named_device(result)
 
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
@@ -522,146 +440,6 @@ async def get_accumulated_metadata() -> str:
         if key in _last_reservation:
             result[key] = _last_reservation[key]
     return json.dumps(result)
-
-
-async def _auto_escalate_named_device(result: dict) -> None:
-    """Transition ticket to HITL when a named device is unavailable.
-
-    Called from check_available_resources when a name= selector
-    returns unavailable.  Retrying is pointless for a specific
-    device — escalate immediately so the user can choose an
-    alternative or wait.
-    """
-    ticket_id = os.environ.get("TICKET_ID", "")
-    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-    if not ticket_id:
-        return
-
-    # This is deliberately below the read-only MCP tool boundary.  A normal
-    # availability query has no operation identity; only the conditional
-    # ticket transition needs a durable fence and replay identity.
-    parent = current_trace_context()
-    if parent is None or parent.ticket_id != ticket_id:
-        raise RuntimeError("named-device escalation requires the MCP trace context")
-    if not token:
-        raise RuntimeError("named-device escalation requires operation registry access")
-
-    selector = str(result.get("selector", ""))
-    immutable = {
-        "ticket_id": ticket_id,
-        "selector": selector,
-        "transition": "awaiting_customer_guidance",
-    }
-    request_hash = hashlib.sha256(
-        json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    operation_key = f"named-device-escalation:{ticket_id}:{selector}"
-    from providers.tracing.client import TraceClient
-
-    registry = TraceClient(store_url, token)
-    try:
-        acquired = await asyncio.to_thread(
-            registry.operation_acquire, operation_key, request_hash, 300
-        )
-        status = acquired.get("status")
-        operation = acquired.get("operation", {})
-        if status == "terminal":
-            # The ticket transition was already durably acknowledged for this
-            # unavailable named selector; do not send it again on replay.
-            return
-        if status != "acquired" or not operation.get("fencing_generation"):
-            raise RuntimeError("named-device escalation is already in progress")
-        fencing_token = int(operation["fencing_generation"])
-        await asyncio.to_thread(
-            registry.operation_transition, operation_key, "prepared", fencing_token
-        )
-        await asyncio.to_thread(
-            registry.operation_transition,
-            operation_key,
-            "side-effect-started",
-            fencing_token,
-        )
-
-        escalation_trace = child_context(
-            parent,
-            idempotency_key=operation_key,
-            idempotency_request_hash=request_hash,
-        )
-        trace_token = bind_trace_context(escalation_trace)
-        try:
-            from providers.execution import AuditedAsyncHTTPClient
-
-            reason = result.get("error", "Device unavailable")
-            alternatives = result.get("alternatives", [])
-            comment = f"Requested device unavailable: {reason}"
-            if alternatives:
-                comment += f" Available alternatives: {', '.join(alternatives)}"
-            headers = {"Authorization": f"Bearer {token}"}
-            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-                response = await client.post(
-                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                    json={
-                        "status": "awaiting_customer_guidance",
-                        "comment": comment,
-                    },
-                )
-                response.raise_for_status()
-        except asyncio.CancelledError:
-            # Once the durable operation says its effect started, cancellation
-            # cannot safely be treated as a harmless retry: the transition may
-            # already have reached the state store.  Make reconciliation
-            # explicit before preserving the caller's cancellation signal.
-            try:
-                await asyncio.to_thread(
-                    registry.operation_transition,
-                    operation_key,
-                    "indeterminate",
-                    fencing_token,
-                    descriptor={"outcome": "cancelled_after_transition_start"},
-                )
-            except Exception:
-                logger.exception("Failed to mark cancelled named-device escalation")
-            raise
-        except Exception:
-            # A request may have reached the state store before its response
-            # was lost.  Preserve that ambiguity for reconciliation instead
-            # of issuing a second transition.
-            await asyncio.to_thread(
-                registry.operation_transition,
-                operation_key,
-                "indeterminate",
-                fencing_token,
-                descriptor={"outcome": "transition_request_failed"},
-            )
-            raise
-        finally:
-            reset_trace_context(trace_token)
-        try:
-            await asyncio.to_thread(
-                registry.operation_transition,
-                operation_key,
-                "complete",
-                fencing_token,
-                descriptor={"transition": "awaiting_customer_guidance"},
-            )
-        except Exception:
-            # The transition may have committed before its operation
-            # acknowledgement was lost.  Do not leave a replayable live lease
-            # in that ambiguity.
-            try:
-                await asyncio.to_thread(
-                    registry.operation_transition,
-                    operation_key,
-                    "indeterminate",
-                    fencing_token,
-                    descriptor={"outcome": "terminal_acknowledgement_failed"},
-                )
-            except Exception:
-                pass
-            raise
-    finally:
-        await asyncio.to_thread(registry.close)
 
 
 async def get_registered_tools():

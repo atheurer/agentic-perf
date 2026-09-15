@@ -4,13 +4,7 @@ from providers.workspace.charts.base import BaseChartAdapter
 from providers.workspace.charts.cdm import CdmChartAdapter
 from providers.workspace.charts.generic import CsvChartAdapter, GenericJsonChartAdapter
 from providers.workspace.charts.kubeburner import KubeBurnerChartAdapter
-from providers.workspace.charts.models import (
-    ChartDataset,
-    ChartPanel,
-    ChartSpec,
-    ChartValidationError,
-    validate_chart_spec,
-)
+from providers.workspace.charts.models import ChartDataset, ChartPanel, ChartSpec
 from providers.workspace.charts.registry import ChartAdapterRegistry, get_chart_registry
 
 __all__ = [
@@ -22,8 +16,6 @@ __all__ = [
     "ChartDataset",
     "ChartPanel",
     "ChartSpec",
-    "ChartValidationError",
-    "validate_chart_spec",
     "ChartAdapterRegistry",
     "get_chart_registry",
 ]

@@ -6,15 +6,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 from agents.chat.agent import ChatSession, ChatSessionStore
-from agents.chat.tools import CHAT_TOOLS, ChatToolAudit, execute_tool
-
-
-def _audit(client: AsyncMock) -> ChatToolAudit:
-    """Use the production audit boundary without a real trace service."""
-    return ChatToolAudit(
-        client, "http://localhost:8090", "service-token", record=lambda _: None
-    )
-
+from agents.chat.tools import CHAT_TOOLS, execute_tool
 
 # --- Session tests ---
 
@@ -100,25 +92,6 @@ class TestChatSessionStore:
         assert usage["llm_calls"] == 0
 
 
-class TestConfirmationReplies:
-    def test_accepts_conversational_confirmation(self):
-        from agents.chat.agent import _is_confirmation
-
-        assert _is_confirmation("yes, please submit it")
-        assert _is_confirmation("Go ahead and create it")
-        assert _is_confirmation("okay!")
-
-    def test_rejects_non_confirmation(self):
-        from agents.chat.agent import _is_confirmation
-
-        assert not _is_confirmation("change the board to qc8775")
-
-    def test_accepts_conversational_cancellation(self):
-        from agents.chat.agent import _is_cancellation
-
-        assert _is_cancellation("no, change the summary first")
-
-
 # --- Tool definition tests ---
 
 
@@ -167,7 +140,6 @@ class TestToolExecution:
             client,
             "http://localhost:8090",
             "token123",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert parsed["count"] == 1
@@ -201,7 +173,6 @@ class TestToolExecution:
             client,
             "http://localhost:8090",
             "token123",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert parsed["id"] == "PERF-123"
@@ -224,7 +195,6 @@ class TestToolExecution:
             client,
             "http://localhost:8090",
             "token123",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert parsed["id"] == "PERF-NEW"
@@ -237,7 +207,6 @@ class TestToolExecution:
             client,
             "http://localhost:8090",
             "token123",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert "error" in parsed
@@ -252,7 +221,6 @@ class TestToolExecution:
             client,
             "http://localhost:8090",
             "token123",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert "error" in parsed
@@ -281,7 +249,6 @@ class TestSearchFiltering:
             client,
             "http://localhost:8090",
             "token",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert parsed["count"] == 1
@@ -305,7 +272,6 @@ class TestSearchFiltering:
             client,
             "http://localhost:8090",
             "token",
-            audit=_audit(client),
         )
         parsed = json.loads(result)
         assert parsed["count"] == 1
@@ -331,12 +297,7 @@ class TestHandleMessage:
         response.usage = {"input_tokens": 100, "output_tokens": 20}
         llm.complete = AsyncMock(return_value=response)
 
-        agent = ChatAgent(
-            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
-        )
-        response = MagicMock()
-        response.raise_for_status = MagicMock()
-        agent._client.post = AsyncMock(return_value=response)
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
         result = await agent.handle_message(
             user="alice",
             message="hello",
@@ -367,12 +328,7 @@ class TestHandleMessage:
         response.usage = {"input_tokens": 100, "output_tokens": 50}
         llm.complete = AsyncMock(return_value=response)
 
-        agent = ChatAgent(
-            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
-        )
-        audit_response = MagicMock()
-        audit_response.raise_for_status = MagicMock()
-        agent._client.post = AsyncMock(return_value=audit_response)
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
 
         # First call should return confirmation prompt
         result = await agent.handle_message(
@@ -381,31 +337,12 @@ class TestHandleMessage:
             auth_token="token123",
         )
         assert "confirmation" in result.lower()
-        assert "ready to create" in result.lower()
+        assert "create_ticket" in result
 
         # Session should have pending action
         session = agent._sessions.get_or_create("alice")
         assert session.pending_action is not None
         assert session.pending_action["tool"] == "create_ticket"
-        original_root = session.pending_action["trace_context"]
-
-        # Confirmation arrives in a separate HTTP request.  It must retain the
-        # original root context and emit a real started/rejected pair instead
-        # of silently dropping the user cancellation.
-        assert (
-            await agent.handle_message("alice", "no", "token123") == "Action cancelled."
-        )
-        audit_events = [
-            call.kwargs["json"] for call in agent._client.post.await_args_list
-        ]
-        assert [event["lifecycle"]["state"] for event in audit_events] == [
-            "started",
-            "rejected",
-        ]
-        assert {event["trace_id"] for event in audit_events} == {original_root.trace_id}
-        assert {event["parent_action_id"] for event in audit_events} == {
-            original_root.action_id
-        }
 
     async def test_cancel_pending_action(self):
         from agents.chat.agent import ChatAgent
@@ -414,12 +351,7 @@ class TestHandleMessage:
         llm.max_tokens = 4096
         llm.timeout = 60
 
-        agent = ChatAgent(
-            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
-        )
-        response = MagicMock()
-        response.raise_for_status = MagicMock()
-        agent._client.post = AsyncMock(return_value=response)
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
         session = agent._sessions.get_or_create("alice")
         session.pending_action = {
             "tool": "create_ticket",
@@ -435,42 +367,6 @@ class TestHandleMessage:
         )
         assert result == "Action cancelled."
         assert session.pending_action is None
-        assert [
-            call.kwargs["json"]["lifecycle"]["state"]
-            for call in agent._client.post.await_args_list
-        ] == ["started", "rejected"]
-
-    async def test_unrelated_reply_invalidates_pending_action_with_audit_pair(self):
-        """A stale confirmation cannot disappear without a rejected lifecycle."""
-        from agents.chat.agent import ChatAgent
-
-        llm = AsyncMock()
-        llm.max_tokens = 4096
-        llm.timeout = 60
-        response = MagicMock()
-        response.raise_for_status = MagicMock()
-        agent = ChatAgent(
-            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
-        )
-        agent._client.post = AsyncMock(return_value=response)
-        session = agent._sessions.get_or_create("alice")
-        session.pending_action = {
-            "tool": "create_ticket",
-            "input": {"summary": "test"},
-            "tool_call_id": "tc-stale",
-        }
-        llm_response = MagicMock(text="fresh response", tool_calls=[], raw_content=[])
-        llm_response.usage = {}
-        llm.complete = AsyncMock(return_value=llm_response)
-
-        assert await agent.handle_message(
-            "alice", "tell me something else", "token"
-        ) == ("fresh response")
-        assert session.pending_action is None
-        assert [
-            call.kwargs["json"]["lifecycle"]["state"]
-            for call in agent._client.post.await_args_list
-        ] == ["started", "rejected"]
 
     async def test_ticket_context_only_first_message(self):
         from agents.chat.agent import ChatAgent

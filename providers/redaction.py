@@ -3,9 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import re
-import threading
 from urllib.parse import quote as url_quote
 
 logger = logging.getLogger(__name__)
@@ -27,13 +25,6 @@ _DENYLIST = frozenset(
 
 _MAX_DEPTH = 20
 _MAX_NODES = 10_000
-
-# Only bootstrap values whose names clearly identify credentials.  This keeps
-# process startup from treating arbitrary application configuration as secret.
-_SENSITIVE_ENV_NAME = re.compile(
-    r"(?:^AGENTIC_PERF_API_TOKEN$|(?:TOKEN|PASSWORD|SECRET|API_KEY|"
-    r"CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY)$)"
-)
 
 _SENSITIVE_JSON_KEYS = frozenset(
     {
@@ -132,12 +123,11 @@ class _TicketRegistry:
             self._compiled = None
             return
         # Longest-first so longer values match before substrings
-        escaped = [
-            re.escape(value)
-            for value in sorted(
-                set(self.values.values()), key=lambda value: (-len(value), value)
-            )
-        ]
+        escaped = sorted(
+            (re.escape(v) for v in self.values.values()),
+            key=len,
+            reverse=True,
+        )
         self._compiled = re.compile("|".join(escaped))
 
     @property
@@ -150,14 +140,14 @@ class Redactor:
 
     Standalone — does not wire into EventBus or SecretsProvider.
 
-    Registration and redaction take a small registry lock so producers can
-    safely register a value while another producer is emitting a trace.
+    Not thread-safe. Designed for single-threaded asyncio use.
+    Concurrent register() and redact() on the same ticket from
+    a ThreadPoolExecutor could observe inconsistent state.
     """
 
     def __init__(self) -> None:
         self._registries: dict[str, _TicketRegistry] = {}
         self._patterns: list[tuple[str, re.Pattern[str]]] = list(DEFAULT_PATTERNS)
-        self._lock = threading.RLock()
 
     def register(
         self,
@@ -187,18 +177,18 @@ class Redactor:
             )
             return
 
-        with self._lock:
-            registry = self._registries.setdefault(ticket_id, _TicketRegistry())
-            registry.add(path, value)
+        registry = self._registries.setdefault(ticket_id, _TicketRegistry())
+        registry.add(path, value)
 
-            b64_val = base64.b64encode(value.encode()).decode()
-            if b64_val != value:
-                registry.add(f"{path}#base64", b64_val)
+        b64_val = base64.b64encode(value.encode()).decode()
+        if b64_val != value:
+            registry.add(f"{path}#base64", b64_val)
 
-            url_val = url_quote(value, safe="")
-            if url_val != value:
-                registry.add(f"{path}#urlenc", url_val)
-            self._try_json_decompose(ticket_id, path, value)
+        url_val = url_quote(value, safe="")
+        if url_val != value:
+            registry.add(f"{path}#urlenc", url_val)
+
+        self._try_json_decompose(ticket_id, path, value)
 
     def _try_json_decompose(
         self,
@@ -227,20 +217,18 @@ class Redactor:
                 and inner.lower() not in _DENYLIST
             ):
                 inner_path = f"{path}.{key}"
-                with self._lock:
-                    registry = self._registries.setdefault(ticket_id, _TicketRegistry())
-                    registry.add(inner_path, inner)
-                    b64_val = base64.b64encode(inner.encode()).decode()
-                    if b64_val != inner:
-                        registry.add(f"{inner_path}#base64", b64_val)
-                    url_val = url_quote(inner, safe="")
-                    if url_val != inner:
-                        registry.add(f"{inner_path}#urlenc", url_val)
+                registry = self._registries.setdefault(ticket_id, _TicketRegistry())
+                registry.add(inner_path, inner)
+                b64_val = base64.b64encode(inner.encode()).decode()
+                if b64_val != inner:
+                    registry.add(f"{inner_path}#base64", b64_val)
+                url_val = url_quote(inner, safe="")
+                if url_val != inner:
+                    registry.add(f"{inner_path}#urlenc", url_val)
 
     def deregister_ticket(self, ticket_id: str) -> None:
         """Remove all registered values for a ticket."""
-        with self._lock:
-            self._registries.pop(ticket_id, None)
+        self._registries.pop(ticket_id, None)
 
     def redact(self, ticket_id: str, data: dict) -> dict:
         """Recursively redact registered values and pattern matches.
@@ -272,21 +260,16 @@ class Redactor:
             return "[REDACTED:redaction_error]"
 
     def _redact_string_inner(self, ticket_id: str, text: str) -> str:
-        with self._lock:
-            registry = self._registries.get(ticket_id)
-            compiled = registry.compiled if registry else None
-            reverse_map: dict[str, str] = {}
-            if registry:
-                for path, value in sorted(registry.values.items()):
-                    reverse_map.setdefault(value, path)
-        if compiled:
+        registry = self._registries.get(ticket_id)
+        if registry and registry.compiled:
+            reverse_map = {v: k for k, v in registry.values.items()}
 
             def _value_replacer(m: re.Match[str]) -> str:
                 matched = m.group(0)
                 field = reverse_map.get(matched, "value")
                 return f"[REDACTED:{field}]"
 
-            text = compiled.sub(_value_replacer, text)
+            text = registry.compiled.sub(_value_replacer, text)
 
         for name, pattern in self._patterns:
             text = pattern.sub(
@@ -322,11 +305,9 @@ class Redactor:
 
         if isinstance(data, dict):
             return {
-                (self.redact_string(ticket_id, k) if isinstance(k, str) else k): (
-                    "[REDACTED:sensitive_key]"
-                    if isinstance(k, str) and k.lower() in _SENSITIVE_JSON_KEYS
-                    else self._redact_recursive(ticket_id, v, depth + 1, counter)
-                )
+                (
+                    self.redact_string(ticket_id, k) if isinstance(k, str) else k
+                ): self._redact_recursive(ticket_id, v, depth + 1, counter)
                 for k, v in data.items()
             }
 
@@ -340,29 +321,3 @@ class Redactor:
             return self.redact_string(ticket_id, data)
 
         return data
-
-
-# Long-lived process registry shared by secret providers, progress reporting,
-# and ticket-local MCP payload capture.
-_shared_redactor = Redactor()
-
-
-def get_shared_redactor() -> Redactor:
-    return _shared_redactor
-
-
-def bootstrap_shared_redactor_from_environment(ticket_id: str | None = None) -> None:
-    """Register credential-shaped environment values in this process.
-
-    Stdio MCP children intentionally do not receive secrets through trace
-    metadata.  They inherit only the environment already required to run and
-    use this narrow name allowlist to make those values available to the same
-    redactor used by providers, progress, payloads, and errors.
-    """
-    scope = ticket_id or os.environ.get("TICKET_ID")
-    if not scope:
-        return
-    redactor = get_shared_redactor()
-    for name, value in os.environ.items():
-        if value and _SENSITIVE_ENV_NAME.search(name):
-            redactor.register(scope, f"env/{name}", value)

@@ -4,8 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..auth import Principal, require_write_access
 from ..models import TransitionRequest
-from ..store import ClaimFenceError, InvalidTransition, TicketNotFound
-from .fencing import mutation_fence
+from ..store import InvalidTransition, TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["transitions"])
 
@@ -26,32 +25,12 @@ def transition_ticket(ticket_id: str, body: TransitionRequest, request: Request)
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    principal = _get_principal(request)
-    require_write_access(principal, ticket, _is_multi_user(request))
-    if body.reviewed_resume and principal.kind != "service" and not principal.is_admin:
-        raise HTTPException(
-            status_code=403,
-            detail="Imported fixture resume requires an authorized reviewer",
-        )
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     try:
-        session_id, epoch, claim_id = mutation_fence(request)
-        result = store.transition_ticket(
-            ticket_id,
-            body,
-            triggered_by=principal.username,
-            reviewer_authorized=(principal.kind == "service" or principal.is_admin),
-            session_id=session_id,
-            epoch=epoch,
-            claim_id=claim_id,
-        )
+        result = store.transition_ticket(ticket_id, body)
     except TicketNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except InvalidTransition as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except ClaimFenceError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={"reason": e.reason, "message": str(e)},
-        ) from e
     return result
