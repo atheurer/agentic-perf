@@ -291,6 +291,37 @@ async def _install_packages_one(host: str, packages: list[str]) -> dict:
 
 BASE_HOST_PACKAGES = ["nmap-ncat"]
 
+CRUCIBLE_CONTAINER_TOOLS: frozenset[str] = frozenset(
+    {
+        "procstat",
+        "turbostat",
+        "bpf",
+        "kernel",
+        "mpstat",
+        "iostat",
+        "vmstat",
+        "pidstat",
+        "sar",
+        "oslat",
+        "rt-trace",
+        "forkstat",
+    }
+)
+
+
+def _filter_crucible_tools(
+    packages: list[str],
+) -> tuple[list[str], list[str]]:
+    """Separate valid OS packages from crucible container tool names."""
+    valid = []
+    skipped = []
+    for pkg in packages:
+        if pkg.lower().strip() in CRUCIBLE_CONTAINER_TOOLS:
+            skipped.append(pkg)
+        else:
+            valid.append(pkg)
+    return valid, skipped
+
 
 async def _ensure_prerequisites_one(
     host: str,
@@ -1137,15 +1168,39 @@ async def check_host_prerequisites(hosts: list[str], user: str = "root") -> str:
 async def install_packages(targets: list[dict], user: str = "root") -> str:
     """Install required packages on multiple hosts via the system package manager. Each target is {"host": "...", "packages": ["pkg1", "pkg2"]}."""
     await _ensure_init()
-    coros = [_install_packages_one(t["host"], t["packages"]) for t in targets]
+    filtered_targets = []
+    all_skipped: dict[str, list[str]] = {}
+    for t in targets:
+        valid, skipped = _filter_crucible_tools(t["packages"])
+        if skipped:
+            all_skipped[t["host"]] = skipped
+        filtered_targets.append({"host": t["host"], "packages": valid})
+
+    coros = [
+        _install_packages_one(t["host"], t["packages"])
+        for t in filtered_targets
+        if t["packages"]
+    ]
     raw = await asyncio.gather(*coros, return_exceptions=True)
     results: dict[str, dict] = {}
-    for target, result in zip(targets, raw):
-        host = target["host"]
+    installed_iter = iter(t for t in filtered_targets if t["packages"])
+    for result in raw:
+        t = next(installed_iter)
         if isinstance(result, Exception):
-            results[host] = {"status": "error", "message": str(result)}
+            results[t["host"]] = {"status": "error", "message": str(result)}
         else:
-            results[host] = result
+            results[t["host"]] = result
+
+    for t in filtered_targets:
+        if not t["packages"] and t["host"] not in results:
+            results[t["host"]] = {
+                "host": t["host"],
+                "packages": [],
+                "status": "success",
+            }
+        if t["host"] in all_skipped:
+            results[t["host"]]["skipped_crucible_tools"] = all_skipped[t["host"]]
+
     return json.dumps(_summarize(results))
 
 
@@ -1173,11 +1228,15 @@ async def ensure_prerequisites(
             all hosts (only extra_packages are installed).
     """
     await _ensure_init()
-    extras = extra_packages or []
+    raw_extras = extra_packages or []
+    extras, skipped = _filter_crucible_tools(raw_extras)
 
     async def _run_one(host: str) -> dict:
         is_controller = host == controller_host
-        return await _ensure_prerequisites_one(host, is_controller, extras)
+        result = await _ensure_prerequisites_one(host, is_controller, extras)
+        if skipped:
+            result["skipped_crucible_tools"] = skipped
+        return result
 
     results = await _gather_for_hosts(hosts, _run_one)
     return json.dumps(_summarize(results))

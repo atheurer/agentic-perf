@@ -936,3 +936,121 @@ async def test_all_install_tools_have_controller_host():
         assert "controller_host" in tool.input_schema["properties"], (
             f"Tool {name} missing controller_host property"
         )
+
+
+# --- Crucible container tool filtering tests ---
+
+
+class TestCrucibleToolFiltering:
+    """Crucible container tool names must never be passed to dnf install."""
+
+    def test_filter_removes_crucible_only_tools(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        packages = ["procstat", "turbostat", "nmap-ncat", "sysstat"]
+        valid, skipped = _filter_crucible_tools(packages)
+        assert valid == ["nmap-ncat", "sysstat"]
+        assert set(skipped) == {"procstat", "turbostat"}
+
+    def test_filter_preserves_sysstat(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        valid, skipped = _filter_crucible_tools(["sysstat", "ethtool"])
+        assert valid == ["sysstat", "ethtool"]
+        assert skipped == []
+
+    def test_filter_all_crucible_tools(self):
+        from agents.provisioning.server import (
+            CRUCIBLE_CONTAINER_TOOLS,
+            _filter_crucible_tools,
+        )
+
+        packages = list(CRUCIBLE_CONTAINER_TOOLS)
+        valid, skipped = _filter_crucible_tools(packages)
+        assert valid == []
+        assert set(skipped) == CRUCIBLE_CONTAINER_TOOLS
+
+    def test_filter_empty_list(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        valid, skipped = _filter_crucible_tools([])
+        assert valid == []
+        assert skipped == []
+
+    def test_filter_no_crucible_tools(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        packages = ["nmap-ncat", "sysstat", "ethtool", "git"]
+        valid, skipped = _filter_crucible_tools(packages)
+        assert valid == packages
+        assert skipped == []
+
+    def test_mixed_list_preserves_order(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        packages = ["git", "mpstat", "sysstat", "kernel", "curl"]
+        valid, skipped = _filter_crucible_tools(packages)
+        assert valid == ["git", "sysstat", "curl"]
+        assert skipped == ["mpstat", "kernel"]
+
+    def test_filter_case_insensitive(self):
+        from agents.provisioning.server import _filter_crucible_tools
+
+        packages = ["Procstat", "TURBOSTAT", " bpf ", "sysstat"]
+        valid, skipped = _filter_crucible_tools(packages)
+        assert valid == ["sysstat"]
+        assert len(skipped) == 3
+
+    @pytest.mark.asyncio
+    async def test_install_packages_filters_crucible_tools(self):
+        """install_packages tool silently drops crucible container tools."""
+        ssh = MockSSHExecutor(
+            results={
+                "dnf install": SSHResult(stdout="Complete!"),
+            }
+        )
+        handlers = make_provisioning_handlers(ssh)
+        result = await handlers["install_packages"](
+            targets=[
+                {"host": "h1", "packages": ["git", "procstat", "curl"]},
+                {"host": "h2", "packages": ["turbostat", "mpstat"]},
+            ],
+        )
+
+        h1 = result["results"]["h1"]
+        assert h1["skipped_crucible_tools"] == ["procstat"]
+        h2 = result["results"]["h2"]
+        assert set(h2["skipped_crucible_tools"]) == {"turbostat", "mpstat"}
+        assert h2["packages"] == []
+
+        dnf_calls = [c for c in ssh.calls if "dnf install" in c["command"]]
+        assert len(dnf_calls) == 1
+        assert "git" in dnf_calls[0]["command"]
+        assert "procstat" not in dnf_calls[0]["command"]
+
+    @pytest.mark.asyncio
+    async def test_ensure_prerequisites_filters_crucible_tools(self):
+        """ensure_prerequisites tool silently drops crucible container tools."""
+        ssh = MockSSHExecutor(
+            results={
+                "rpm -q": SSHResult(exit_code=1, stdout="", stderr=""),
+                "dnf install": SSHResult(stdout="Complete!"),
+            }
+        )
+        handlers = make_provisioning_handlers(ssh)
+        result = await handlers["ensure_prerequisites"](
+            hosts=["10.0.0.2"],
+            extra_packages=["sysstat", "procstat", "turbostat"],
+        )
+
+        host_result = result["results"]["10.0.0.2"]
+        assert host_result["status"] == "success"
+        assert host_result["skipped_crucible_tools"] == [
+            "procstat",
+            "turbostat",
+        ]
+        dnf_calls = [c["command"] for c in ssh.calls if "dnf install" in c["command"]]
+        assert len(dnf_calls) == 1
+        assert "sysstat" in dnf_calls[0]
+        assert "procstat" not in dnf_calls[0]
+        assert "turbostat" not in dnf_calls[0]
