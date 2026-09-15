@@ -209,6 +209,7 @@ TOOL_AUDIT_POLICY = (
     *_read_only(
         "agents/resource/server.py:parse_host_config",
         "agents/resource/server.py:list_resource_providers",
+        "agents/resource/server.py:check_available_resources",
         "agents/resource/server.py:get_reservation_status",
         "agents/resource/server.py:validate_host",
         "agents/resource/server.py:get_host_inventory",
@@ -218,10 +219,6 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "providers.resource.ResourceProvider.reserve",
         "agents/resource/server.py:reserve_resources",
-    ),
-    *_side_effecting(
-        "agents.resource.server.named_device_escalation",
-        "agents/resource/server.py:check_available_resources",
     ),
     *_read_only(
         "agents/retrospective/server.py:get_transcript_analysis",

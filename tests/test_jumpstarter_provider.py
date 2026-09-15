@@ -5,6 +5,7 @@ Tests with mocked Jumpstarter API — no controller required.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -516,10 +517,43 @@ class TestNamedDeviceEscalation:
     """Verify auto-escalation to HITL for unavailable named devices."""
 
     @pytest.mark.asyncio
+    async def test_regular_availability_query_does_not_create_an_escalation(self):
+        """Only an unavailable ``name=`` selector may mutate ticket state."""
+        from unittest.mock import patch
+
+        from tests.conftest import make_resource_handlers
+
+        provider = MagicMock()
+        provider.provider_name = "jumpstarter"
+        provider.check_available = AsyncMock(
+            return_value={"available": True, "selector": "board-type=arm"}
+        )
+        registry = MagicMock()
+        registry.get_provider = AsyncMock(return_value=provider)
+        handlers = make_resource_handlers(registry=registry)
+
+        with patch(
+            "agents.resource.server._auto_escalate_named_device", new=AsyncMock()
+        ) as escalate:
+            result = await handlers["check_available_resources"](
+                provider="jumpstarter",
+                requirements={"jumpstarter_selector": "board-type=arm"},
+            )
+
+        assert result["available"] is True
+        escalate.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_auto_escalate_posts_transition(self):
         from unittest.mock import patch
 
         from agents.resource.server import _auto_escalate_named_device
+        from providers.tracing import (
+            TraceContext,
+            bind_trace_context,
+            current_trace_context,
+            reset_trace_context,
+        )
 
         result = {
             "available": False,
@@ -527,6 +561,88 @@ class TestNamedDeviceEscalation:
             "error": "Device 'board-01' exists but is unavailable (status: LEASED).",
             "alternatives": ["board-02", "board-03"],
         }
+
+        async def immediate_thread_call(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TICKET_ID": "PERF-TEST",
+                    "STATE_STORE_URL": "http://localhost:8090",
+                    "AGENTIC_PERF_API_TOKEN": "test-token",
+                },
+            ),
+            patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
+        ):
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            observed: dict[str, object] = {}
+
+            class FakeHTTPClient:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return False
+
+                async def post(self, url, **kwargs):
+                    observed["url"] = url
+                    observed["body"] = kwargs["json"]
+                    observed["trace"] = current_trace_context()
+                    return mock_response
+
+            with patch(
+                "providers.execution.AuditedAsyncHTTPClient",
+                side_effect=lambda **_kwargs: FakeHTTPClient(),
+            ):
+                registry = mock_trace_client_cls.return_value
+                registry.operation_acquire.return_value = {
+                    "status": "acquired",
+                    "operation": {"fencing_generation": 7},
+                }
+                trace_token = bind_trace_context(TraceContext(ticket_id="PERF-TEST"))
+                try:
+                    await _auto_escalate_named_device(result)
+                finally:
+                    reset_trace_context(trace_token)
+
+            assert "transition" in str(observed["url"])
+            body = observed["body"]
+            assert body["status"] == "awaiting_customer_guidance"
+            assert "board-01" in body["comment"]
+            assert "board-02" in body["comment"]
+            escalation_trace = observed["trace"]
+            assert escalation_trace.idempotency_key == (
+                "named-device-escalation:PERF-TEST:name=board-01"
+            )
+            assert escalation_trace.parent_action_id is not None
+            assert [
+                call.args[1] for call in registry.operation_transition.call_args_list
+            ] == [
+                "prepared",
+                "side-effect-started",
+                "complete",
+            ]
+
+    @pytest.mark.asyncio
+    async def test_completed_escalation_is_not_reposted_on_replay(self):
+        """The operation registry, not the whole read-only tool, owns replay."""
+        from unittest.mock import patch
+
+        from agents.resource.server import _auto_escalate_named_device
+        from providers.tracing import (
+            TraceContext,
+            bind_trace_context,
+            reset_trace_context,
+        )
+
+        async def immediate_thread_call(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
         with (
             patch.dict(
@@ -538,28 +654,89 @@ class TestNamedDeviceEscalation:
                 },
             ),
             patch("providers.execution.AuditedAsyncHTTPClient") as mock_client_cls,
+            patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
         ):
-            mock_client = MagicMock()
-            mock_client.post = AsyncMock()
-            mock_response = MagicMock()
-            mock_response.raise_for_status = MagicMock()
-            mock_client.post.return_value = mock_response
-            mock_client_cls.return_value.__aenter__ = AsyncMock(
-                return_value=mock_client,
-            )
-            mock_client_cls.return_value.__aexit__ = AsyncMock(
-                return_value=False,
-            )
+            registry = mock_trace_client_cls.return_value
+            registry.operation_acquire.return_value = {
+                "status": "terminal",
+                "operation": {"fencing_generation": 7},
+            }
+            trace_token = bind_trace_context(TraceContext(ticket_id="PERF-TEST"))
+            try:
+                await _auto_escalate_named_device({"selector": "name=board-01"})
+            finally:
+                reset_trace_context(trace_token)
 
-            await _auto_escalate_named_device(result)
+        mock_client_cls.assert_not_called()
+        registry.operation_transition.assert_not_called()
 
-            mock_client.post.assert_awaited_once()
-            call_args = mock_client.post.call_args
-            assert "transition" in call_args[0][0]
-            body = call_args[1]["json"]
-            assert body["status"] == "awaiting_customer_guidance"
-            assert "board-01" in body["comment"]
-            assert "board-02" in body["comment"]
+    @pytest.mark.asyncio
+    async def test_cancelled_escalation_becomes_indeterminate(self):
+        """Cancellation after the POST starts must require reconciliation."""
+        from unittest.mock import patch
+
+        from agents.resource.server import _auto_escalate_named_device
+        from providers.tracing import (
+            TraceContext,
+            bind_trace_context,
+            reset_trace_context,
+        )
+
+        class CancelledHTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, _url, **_kwargs):
+                raise asyncio.CancelledError()
+
+        async def immediate_thread_call(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TICKET_ID": "PERF-TEST",
+                    "STATE_STORE_URL": "http://localhost:8090",
+                    "AGENTIC_PERF_API_TOKEN": "test-token",
+                },
+            ),
+            patch(
+                "providers.execution.AuditedAsyncHTTPClient",
+                side_effect=lambda **_kwargs: CancelledHTTPClient(),
+            ),
+            patch(
+                "agents.resource.server.asyncio.to_thread", new=immediate_thread_call
+            ),
+            patch("providers.tracing.client.TraceClient") as mock_trace_client_cls,
+        ):
+            registry = mock_trace_client_cls.return_value
+            registry.operation_acquire.return_value = {
+                "status": "acquired",
+                "operation": {"fencing_generation": 7},
+            }
+            trace_token = bind_trace_context(TraceContext(ticket_id="PERF-TEST"))
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await _auto_escalate_named_device({"selector": "name=board-01"})
+            finally:
+                reset_trace_context(trace_token)
+
+        transitions = registry.operation_transition.call_args_list
+        assert [call.args[1] for call in transitions] == [
+            "prepared",
+            "side-effect-started",
+            "indeterminate",
+        ]
+        assert transitions[-1].kwargs["descriptor"] == {
+            "outcome": "cancelled_after_transition_start"
+        }
 
     @pytest.mark.asyncio
     async def test_no_escalate_without_ticket_id(self):

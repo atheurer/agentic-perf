@@ -142,6 +142,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "_ensure_init", "cloud_resource"),
     ("agents/resource/server.py", "_get_board_selector", "cloud_resource"),
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"),
+    (
+        "agents/resource/server.py",
+        "_auto_escalate_named_device",
+        "mutating_http_state",
+    ),
     ("agents/resource/server.py", "_auto_escalate_named_device", "cloud_resource"),
     ("agents/resource/server.py", "check_available_resources", "cloud_resource"),
     ("agents/resource/server.py", "get_accumulated_metadata", "cloud_resource"),
@@ -1270,6 +1275,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_infer_os_from_ticket",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_auto_escalate_named_device",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "agents.resource.server.named_device_escalation",
+        "agents/resource/server.py:_auto_escalate_named_device",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "_auto_escalate_named_device", "cloud_resource"): (

@@ -11,6 +11,8 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -31,6 +33,12 @@ from agents.server_utils import (
     get_board_selector,
 )
 from paths import get_default_ssh_key
+from providers.tracing import (
+    bind_trace_context,
+    child_context,
+    current_trace_context,
+    reset_trace_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -530,29 +538,130 @@ async def _auto_escalate_named_device(result: dict) -> None:
     if not ticket_id:
         return
 
-    reason = result.get("error", "Device unavailable")
-    alternatives = result.get("alternatives", [])
-    comment = f"Requested device unavailable: {reason}"
-    if alternatives:
-        comment += f" Available alternatives: {', '.join(alternatives)}"
+    # This is deliberately below the read-only MCP tool boundary.  A normal
+    # availability query has no operation identity; only the conditional
+    # ticket transition needs a durable fence and replay identity.
+    parent = current_trace_context()
+    if parent is None or parent.ticket_id != ticket_id:
+        raise RuntimeError("named-device escalation requires the MCP trace context")
+    if not token:
+        raise RuntimeError("named-device escalation requires operation registry access")
 
+    selector = str(result.get("selector", ""))
+    immutable = {
+        "ticket_id": ticket_id,
+        "selector": selector,
+        "transition": "awaiting_customer_guidance",
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    operation_key = f"named-device-escalation:{ticket_id}:{selector}"
+    from providers.tracing.client import TraceClient
+
+    registry = TraceClient(store_url, token)
     try:
-        from providers.execution import AuditedAsyncHTTPClient
+        acquired = await asyncio.to_thread(
+            registry.operation_acquire, operation_key, request_hash, 300
+        )
+        status = acquired.get("status")
+        operation = acquired.get("operation", {})
+        if status == "terminal":
+            # The ticket transition was already durably acknowledged for this
+            # unavailable named selector; do not send it again on replay.
+            return
+        if status != "acquired" or not operation.get("fencing_generation"):
+            raise RuntimeError("named-device escalation is already in progress")
+        fencing_token = int(operation["fencing_generation"])
+        await asyncio.to_thread(
+            registry.operation_transition, operation_key, "prepared", fencing_token
+        )
+        await asyncio.to_thread(
+            registry.operation_transition,
+            operation_key,
+            "side-effect-started",
+            fencing_token,
+        )
 
-        headers: dict[str, str] = {}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-            response = await client.post(
-                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                json={
-                    "status": "awaiting_customer_guidance",
-                    "comment": comment,
-                },
+        escalation_trace = child_context(
+            parent,
+            idempotency_key=operation_key,
+            idempotency_request_hash=request_hash,
+        )
+        trace_token = bind_trace_context(escalation_trace)
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            reason = result.get("error", "Device unavailable")
+            alternatives = result.get("alternatives", [])
+            comment = f"Requested device unavailable: {reason}"
+            if alternatives:
+                comment += f" Available alternatives: {', '.join(alternatives)}"
+            headers = {"Authorization": f"Bearer {token}"}
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": comment,
+                    },
+                )
+                response.raise_for_status()
+        except asyncio.CancelledError:
+            # Once the durable operation says its effect started, cancellation
+            # cannot safely be treated as a harmless retry: the transition may
+            # already have reached the state store.  Make reconciliation
+            # explicit before preserving the caller's cancellation signal.
+            try:
+                await asyncio.to_thread(
+                    registry.operation_transition,
+                    operation_key,
+                    "indeterminate",
+                    fencing_token,
+                    descriptor={"outcome": "cancelled_after_transition_start"},
+                )
+            except Exception:
+                logger.exception("Failed to mark cancelled named-device escalation")
+            raise
+        except Exception:
+            # A request may have reached the state store before its response
+            # was lost.  Preserve that ambiguity for reconciliation instead
+            # of issuing a second transition.
+            await asyncio.to_thread(
+                registry.operation_transition,
+                operation_key,
+                "indeterminate",
+                fencing_token,
+                descriptor={"outcome": "transition_request_failed"},
             )
-            response.raise_for_status()
-    except Exception:
-        logger.exception("Failed to escalate named device unavailability")
+            raise
+        finally:
+            reset_trace_context(trace_token)
+        try:
+            await asyncio.to_thread(
+                registry.operation_transition,
+                operation_key,
+                "complete",
+                fencing_token,
+                descriptor={"transition": "awaiting_customer_guidance"},
+            )
+        except Exception:
+            # The transition may have committed before its operation
+            # acknowledgement was lost.  Do not leave a replayable live lease
+            # in that ambiguity.
+            try:
+                await asyncio.to_thread(
+                    registry.operation_transition,
+                    operation_key,
+                    "indeterminate",
+                    fencing_token,
+                    descriptor={"outcome": "terminal_acknowledgement_failed"},
+                )
+            except Exception:
+                pass
+            raise
+    finally:
+        await asyncio.to_thread(registry.close)
 
 
 async def get_registered_tools():
