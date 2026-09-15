@@ -166,6 +166,25 @@ def test_policy_rejects_disable_tools_unless_boolean_true(value: object) -> None
         gate.validate_run_file(run_file, config())
 
 
+@pytest.mark.parametrize("location", ["endpoint", "remote"])
+def test_policy_accepts_explicit_cpu_partitioning_false(location: str) -> None:
+    run_file = safe_run_file()
+    if location == "endpoint":
+        run_file["endpoints"][0]["settings"] = {"cpu-partitioning": False}
+    else:
+        remote_config = run_file["endpoints"][0]["remotes"][0]["config"]
+        remote_config["settings"] = {"cpu-partitioning": False}
+    gate.validate_run_file(run_file, config())
+
+
+@pytest.mark.parametrize("value", [True, "false", 0, None])
+def test_policy_rejects_cpu_partitioning_unless_boolean_false(value: object) -> None:
+    run_file = safe_run_file()
+    run_file["endpoints"][0]["settings"] = {"cpu-partitioning": value}
+    with pytest.raises(gate.GateError, match="must be boolean false"):
+        gate.validate_run_file(run_file, config())
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

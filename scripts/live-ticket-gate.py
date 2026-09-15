@@ -113,7 +113,13 @@ def _benchmark_params(benchmark: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _validate_endpoint_settings(settings: dict[str, Any], location: str) -> None:
-    allowed_settings = {"user", "userenv", "osruntime", "disable-tools"}
+    allowed_settings = {
+        "user",
+        "userenv",
+        "osruntime",
+        "disable-tools",
+        "cpu-partitioning",
+    }
     unknown_settings = set(settings) - allowed_settings
     if unknown_settings:
         raise GateError(f"unapproved {location} settings: {sorted(unknown_settings)}")
@@ -121,6 +127,8 @@ def _validate_endpoint_settings(settings: dict[str, Any], location: str) -> None
         raise GateError(f"{location} osruntime must be podman or chroot")
     if "disable-tools" in settings and settings["disable-tools"] is not True:
         raise GateError(f"{location} disable-tools must be boolean true")
+    if "cpu-partitioning" in settings and settings["cpu-partitioning"] is not False:
+        raise GateError(f"{location} cpu-partitioning must be boolean false")
 
 
 def validate_run_file(run_file: dict[str, Any], config: GateConfig) -> None:
