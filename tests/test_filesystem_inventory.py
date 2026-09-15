@@ -137,8 +137,8 @@ agents/infra/server.py|209|tempfile.NamedTemporaryFile
 agents/infra/server.py|217|staging.unlink
 agents/infra/server.py|219|unlink
 agents/infra/server.py|284|tempfile.mkdtemp
-orchestrator/main.py|1978|LOCK_FILE.parent.mkdir
-orchestrator/main.py|2010|LOCK_FILE.unlink
+orchestrator/main.py|2005|LOCK_FILE.parent.mkdir
+orchestrator/main.py|2037|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir

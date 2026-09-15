@@ -1531,6 +1531,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         instance_name=config.instance_name,
         ttl_seconds=config.leader_lease_ttl_seconds,
     )
+    # Lease acquisition is itself a mutating, audited control-plane request.
+    # Bind a durable control trace before using the audited HTTP client; ticket
+    # traces are created later by the dispatcher for individual work items.
+    bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
     await leader_lease.acquire()
     if leader_lease.epoch is None:
         raise RuntimeError("state store returned no leader fencing epoch")
