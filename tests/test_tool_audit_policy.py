@@ -166,6 +166,12 @@ def _side_effect_category(path: str, call: str) -> str | None:
         return "mcp"
     if "ssh" in lowered and leaf in {"run", "copy_to", "copy_from", "connect"}:
         return "ssh"
+    # Resource discovery is generally a cloud-resource boundary, but this
+    # exact helper performs a state-store POST when a named device is
+    # unavailable.  Keep the conditional mutation visible as such instead of
+    # letting the package-level resource classification hide it.
+    if path == "agents/resource/server.py" and leaf in {"post", "put", "patch", "delete"}:
+        return "mutating_http_state"
     if "image_build" in path or "image_builder" in path:
         return "image"
     if "resource/" in path or "boto3" in lowered or "ec2" in lowered:
@@ -1177,14 +1183,14 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             middleware.agent_id = original_agent_id
         expected_terminal = (
             LifecycleState.REJECTED
-            if tool_name in {"check_available_resources", "execute_benchmark"}
+            if tool_name in {"execute_benchmark"}
             else LifecycleState.RESPONSE_SENT
         )
         assert [event.lifecycle.state for event in events] == [
             LifecycleState.REQUEST_RECEIVED,
             expected_terminal,
         ], registration.key
-        if tool_name in {"check_available_resources", "execute_benchmark"}:
+        if tool_name in {"execute_benchmark"}:
             assert result.is_error
         else:
             assert result == {"policy_probe": tool_name}

@@ -53,7 +53,11 @@ _MAX_REPLAY_CACHE = 1024
 # #788 owns each tool's durable operation semantics.  This boundary merely
 # refuses to dispatch a protected handler unless #787 has already accepted its
 # immutable idempotency identity.
-_PROTECTED_TOOLS = frozenset({"check_available_resources", "execute_benchmark"})
+# Only tools whose *whole invocation* is a durable side effect belong here.
+# Resource availability normally reads provider state; its exceptional named
+# device escalation has its own, narrower operation boundary in
+# ``agents.resource.server``.
+_PROTECTED_TOOLS = frozenset({"execute_benchmark"})
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_REDACTED_KEY_BYTES = 4096
