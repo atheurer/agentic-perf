@@ -38,7 +38,9 @@ must contain none of the gate's fatal runtime signatures.
 Before approving the benchmark, the gate rejects any run file that is not
 exactly one `sleep` benchmark using client ID 1 bound to the configured system
 under test, one bounded sample, the configured duration, and no enabled
-collection tools. Any other human-guidance pause fails the run.
+collection tools. The endpoint setting `disable-tools` is accepted only when it
+is the JSON boolean `true`; `host-mounts` remains prohibited. Any other
+human-guidance pause fails the run.
 
 The artifact directory is created mode 0700 and contains the tested Git SHA,
 status trail, ticket, approved run file, service logs, and final result. Treat it
