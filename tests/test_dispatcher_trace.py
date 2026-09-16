@@ -38,6 +38,29 @@ def test_claim_rejection_is_a_durable_dispatch_outcome() -> None:
     assert sink.events[-1].lifecycle.state == LifecycleState.REJECTED
 
 
+def test_repo_cache_refresh_binds_the_claimed_ticket_context() -> None:
+    """Cache mutations are attributed to the ticket that triggered them."""
+    from orchestrator.main import _refresh_harness_repos
+
+    seen = []
+
+    class Cache:
+        def ensure_repo(self, name, url):
+            seen.append((name, url, current_trace_context()))
+
+    context = new_trace_context(ticket_id="PERF-1", agent_id="triage")
+    _refresh_harness_repos(
+        Cache(),
+        {
+            "crucible": "https://example.invalid/crucible.git",
+            "other": "https://example.invalid/other.git",
+        },
+        context,
+    )
+    assert seen == [("other", "https://example.invalid/other.git", context)]
+    assert current_trace_context() is None
+
+
 async def test_renewal_loss_records_claim_failure() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()

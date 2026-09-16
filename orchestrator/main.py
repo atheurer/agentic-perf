@@ -1402,6 +1402,27 @@ def _check_dispatch_quota(
         return None
 
 
+def _refresh_harness_repos(
+    repo_cache: RepoCache, harness_repos: dict[str, str], trace_context: Any
+) -> None:
+    """Refresh non-Crucible repos under the claimed ticket's trace context."""
+    cache_token = bind_trace_context(trace_context)
+    try:
+        for name, url in harness_repos.items():
+            # Crucible is never cloned or refreshed by agentic-perf; its source
+            # is controller-owned.
+            if name == "crucible":
+                continue
+            try:
+                repo_cache.ensure_repo(name, url)
+            except Exception:
+                logger.warning(
+                    "Failed to cache repo %s from %s", name, url, exc_info=True
+                )
+    finally:
+        reset_trace_context(cache_token)
+
+
 async def poll_loop(config: OrchestratorConfig) -> None:
     global _last_good_config, _last_good_digest
     _last_good_config = config
@@ -1419,15 +1440,6 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()
-    for name, url in config.harness_repos.items():
-        # Crucible is never cloned or refreshed by agentic-perf. Its source
-        # must already exist locally or on the designated controller.
-        if name == "crucible":
-            continue
-        try:
-            repo_cache.ensure_repo(name, url)
-        except Exception:
-            logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
     skills = build_skill_provider(
         crucible_home=config.crucible_home,
@@ -1559,6 +1571,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     was_at_capacity = False
     last_trace_sweep = 0.0
     trace_sweep_task: asyncio.Task | None = None
+    repos_refreshed = False
 
     while True:
         if time.monotonic() - last_trace_sweep >= 60.0 and (
@@ -1772,6 +1785,17 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     logger.info(f"Skipping {tid} at {status}: claim held")
                     continue
                 dispatcher.start_renewal(tid)
+
+                # Refreshing the shared repository cache mutates local state.
+                # Defer it until a ticket claim supplies its durable trace
+                # context, rather than doing unauditable work during process
+                # startup before any ticket exists.
+                cache_context = dispatcher._trace_contexts.get(tid)
+                if not repos_refreshed and cache_context is not None:
+                    _refresh_harness_repos(
+                        repo_cache, config.harness_repos, cache_context
+                    )
+                    repos_refreshed = True
 
                 # Register ticket owner for ledger attribution
                 # before any agent runs.
