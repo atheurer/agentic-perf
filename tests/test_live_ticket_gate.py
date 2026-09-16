@@ -166,6 +166,41 @@ def test_policy_rejects_disable_tools_unless_boolean_true(value: object) -> None
         gate.validate_run_file(run_file, config())
 
 
+@pytest.mark.parametrize("location", ["endpoint", "remote"])
+def test_policy_accepts_explicit_cpu_partitioning_false(location: str) -> None:
+    run_file = safe_run_file()
+    if location == "endpoint":
+        run_file["endpoints"][0]["settings"] = {"cpu-partitioning": False}
+    else:
+        remote_config = run_file["endpoints"][0]["remotes"][0]["config"]
+        remote_config["settings"] = {"cpu-partitioning": False}
+    gate.validate_run_file(run_file, config())
+
+
+@pytest.mark.parametrize("value", [True, "false", 0, None])
+def test_policy_rejects_cpu_partitioning_unless_boolean_false(value: object) -> None:
+    run_file = safe_run_file()
+    run_file["endpoints"][0]["settings"] = {"cpu-partitioning": value}
+    with pytest.raises(gate.GateError, match="must be boolean false"):
+        gate.validate_run_file(run_file, config())
+
+
+def test_log_scan_ignores_recoverable_ssh_context_retry() -> None:
+    log = """Error calling tool 'verify_ssh_path'
+Traceback (most recent call last):
+RuntimeError: SSH context not set. Call set_ssh_context() first.
+Traceback (most recent call last):
+MCPToolCallError: Error calling tool 'verify_ssh_path': SSH context not set. Call set_ssh_context() first.
+intentional_agent_retry"""
+    assert gate._fatal_log_signatures(log) == []
+
+
+def test_log_scan_keeps_unrelated_traceback_fatal() -> None:
+    assert gate._fatal_log_signatures("Traceback (most recent call last): boom") == [
+        "Traceback (most recent call last):"
+    ]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

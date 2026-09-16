@@ -45,7 +45,7 @@ def test_preceding_version_zero_is_migrated(tmp_path: Path) -> None:
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                == 1
+                == LATEST_SCHEMA_VERSION
             )
         finally:
             connection.close()

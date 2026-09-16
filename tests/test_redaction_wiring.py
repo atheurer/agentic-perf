@@ -100,11 +100,10 @@ class TestEventBusRedaction:
             "tool_result",
             {"output": f"Connected with {SECRET_VALUE}"},
         )
+        event = bus.get_events(TICKET_ID)[0]
         bus.close()
-
-        jsonl = (tmp_path / "logs" / f"{TICKET_ID}.jsonl").read_text()
-        assert SECRET_VALUE not in jsonl
-        assert "REDACTED" in jsonl
+        assert SECRET_VALUE not in json.dumps(event)
+        assert "REDACTED" in json.dumps(event)
 
     def test_no_redactor_passes_data_unchanged(self, tmp_path: Path) -> None:
         bus = EventBus(log_dir=tmp_path / "logs")
@@ -114,10 +113,9 @@ class TestEventBusRedaction:
             "tool_result",
             {"output": f"Connected with {SECRET_VALUE}"},
         )
+        event = bus.get_events(TICKET_ID)[0]
         bus.close()
-
-        jsonl = (tmp_path / "logs" / f"{TICKET_ID}.jsonl").read_text()
-        assert SECRET_VALUE in jsonl
+        assert SECRET_VALUE in json.dumps(event)
 
     def test_redacts_patterns_without_values(self, tmp_path: Path) -> None:
         redactor = Redactor()
@@ -129,11 +127,10 @@ class TestEventBusRedaction:
             "tool_result",
             {"output": "Authorization: Bearer eyJhbGciOiJIUzI1N"},
         )
+        event = bus.get_events(TICKET_ID)[0]
         bus.close()
-
-        jsonl = (tmp_path / "logs" / f"{TICKET_ID}.jsonl").read_text()
-        assert "eyJhbGciOiJIUzI1N" not in jsonl
-        assert "REDACTED" in jsonl
+        assert "eyJhbGciOiJIUzI1N" not in json.dumps(event)
+        assert "REDACTED" in json.dumps(event)
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +148,10 @@ class TestAuditLogRedaction:
             TICKET_ID,
             {"field": "Bearer sk-proj-abcdefghijklmnop1234"},
         )
+        entry = log.read()[0]
         log.close()
-
-        content = (tmp_path / "audit.jsonl").read_text()
-        assert "sk-proj-abcdefghijklmnop1234" not in content
-        assert "REDACTED" in content
+        assert "sk-proj-abcdefghijklmnop1234" not in json.dumps(entry)
+        assert "REDACTED" in json.dumps(entry)
 
     def test_redacts_registered_values(self, tmp_path: Path) -> None:
         redactor = Redactor()
@@ -163,19 +159,17 @@ class TestAuditLogRedaction:
         log = AuditLog(path=tmp_path / "audit.jsonl", redactor=redactor)
 
         log.log("create", TICKET_ID, {"key": SECRET_VALUE})
+        entry = log.read()[0]
         log.close()
-
-        content = (tmp_path / "audit.jsonl").read_text()
-        assert SECRET_VALUE not in content
-        assert "REDACTED" in content
+        assert SECRET_VALUE not in json.dumps(entry)
+        assert "REDACTED" in json.dumps(entry)
 
     def test_no_redactor_passes_data_unchanged(self, tmp_path: Path) -> None:
         log = AuditLog(path=tmp_path / "audit.jsonl")
         log.log("create", TICKET_ID, {"key": SECRET_VALUE})
+        entry = log.read()[0]
         log.close()
-
-        content = (tmp_path / "audit.jsonl").read_text()
-        assert SECRET_VALUE in content
+        assert SECRET_VALUE in json.dumps(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -192,29 +186,36 @@ class TestBypassPathRedaction:
 
         _get_progress_redactor()
 
-        with patch("paths.LOG_DIR", tmp_path):
+        with patch("paths.TRACE_DB_PATH", tmp_path / "trace.db"):
             _emit_tool_progress_event(
                 TICKET_ID,
                 "test-agent/tool",
                 "Using Bearer sk-ant-api03-supersecrettoken123",
             )
 
-        content = (tmp_path / f"{TICKET_ID}.jsonl").read_text()
-        assert "sk-ant-api03-supersecrettoken123" not in content
-        assert "REDACTED" in content
+        bus = EventBus(log_dir=tmp_path / "logs")
+        try:
+            event = bus.get_events(TICKET_ID)[0]
+        finally:
+            bus.close()
+        assert "sk-ant-api03-supersecrettoken123" not in json.dumps(event)
+        assert "REDACTED" in json.dumps(event)
 
     def test_clean_message_passes_through(self, tmp_path: Path) -> None:
         from agents.server_utils import _emit_tool_progress_event
 
-        with patch("paths.LOG_DIR", tmp_path):
+        with patch("paths.TRACE_DB_PATH", tmp_path / "trace.db"):
             _emit_tool_progress_event(
                 TICKET_ID,
                 "test-agent/tool",
                 "Running benchmark iteration 3 of 10",
             )
 
-        content = (tmp_path / f"{TICKET_ID}.jsonl").read_text()
-        event = json.loads(content.strip())
+        bus = EventBus(log_dir=tmp_path / "logs")
+        try:
+            event = bus.get_events(TICKET_ID)[0]
+        finally:
+            bus.close()
         assert event["data"]["body"] == "Running benchmark iteration 3 of 10"
 
 

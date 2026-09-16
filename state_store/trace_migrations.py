@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable
 
 Migration = Callable[[sqlite3.Connection], None]
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 4
 
 
 def _migration_1(connection: sqlite3.Connection) -> None:
@@ -60,7 +60,37 @@ def _migration_1(connection: sqlite3.Connection) -> None:
             connection.execute(statement)
 
 
-MIGRATIONS: dict[int, Migration] = {1: _migration_1}
+def _migration_2(connection: sqlite3.Connection) -> None:
+    """Add immutable operation history without changing the v1 operation row."""
+    connection.execute(
+        "CREATE TABLE operation_history ("
+        "history_id INTEGER PRIMARY KEY, operation_key TEXT NOT NULL, "
+        "state TEXT NOT NULL, owner TEXT, fencing_generation INTEGER NOT NULL, "
+        "reason TEXT, occurred_at TEXT NOT NULL, "
+        "FOREIGN KEY(operation_key) REFERENCES operations(operation_key))"
+    )
+    connection.execute(
+        "CREATE INDEX operation_history_key_idx "
+        "ON operation_history(operation_key, history_id)"
+    )
+
+
+def _migration_3(connection: sqlite3.Connection) -> None:
+    """Preserve the distinct terminal result under the fixed terminal state."""
+    connection.execute("ALTER TABLE operations ADD COLUMN terminal_outcome TEXT")
+
+
+def _migration_4(connection: sqlite3.Connection) -> None:
+    """Keep terminal/reconciliation conclusions in immutable history."""
+    connection.execute("ALTER TABLE operation_history ADD COLUMN terminal_outcome TEXT")
+
+
+MIGRATIONS: dict[int, Migration] = {
+    1: _migration_1,
+    2: _migration_2,
+    3: _migration_3,
+    4: _migration_4,
+}
 
 
 def migrate(connection: sqlite3.Connection) -> None:
