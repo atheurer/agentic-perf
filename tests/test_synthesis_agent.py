@@ -483,6 +483,7 @@ class TestSkippedPlanSteps:
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
+        dispatcher.mark_done = AsyncMock()
 
         mock_get = MagicMock()
         mock_get.status_code = 200
@@ -501,9 +502,10 @@ class TestSkippedPlanSteps:
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.MonkeyPatch.context() as mp:
-            import httpx
-
-            mp.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
+            mp.setattr(
+                "orchestrator.main.AuditedAsyncHTTPClient",
+                lambda **kwargs: mock_client,
+            )
             await run_agent_task(
                 dispatcher,
                 "synthesizing_results",
@@ -533,6 +535,7 @@ class TestSkippedPlanSteps:
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
+        dispatcher.mark_done = AsyncMock()
 
         mock_get = MagicMock()
         mock_get.status_code = 200

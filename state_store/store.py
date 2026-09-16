@@ -7,6 +7,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paths import TICKET_DIR as DEFAULT_PERSIST_DIR
+from providers.execution import (
+    AuditedFilesystem,
+    RootedPath,
+    durable_filesystem_emitter,
+)
+from providers.tracing import (
+    ActionDescriptor,
+    ActionType,
+    LifecycleDescriptor,
+    LifecycleState,
+    OperationOutcome,
+    TraceEventV1,
+    child_context,
+    current_trace_context,
+)
 
 from .audit import AuditLog
 from .directives import parse_verbatim_directives
@@ -37,6 +52,7 @@ class TicketStore:
         persist_dir: str | Path | None = None,
         audit_log: AuditLog | None = None,
         event_bus: object | None = None,
+        trace_store: object | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
         self._lock = threading.Lock()
@@ -45,11 +61,68 @@ class TicketStore:
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._audit = audit_log
         self._event_bus = event_bus
+        self._trace_store = trace_store
         self._load_from_disk()
 
     def _audit_log(self, mutation: str, ticket_id: str, data: dict) -> None:
         if self._audit is not None:
             self._audit.log(mutation, ticket_id, data)
+
+    def _filesystem(self, ticket_id: str) -> AuditedFilesystem:
+        """Return the ticket-owned mutation boundary without exposing host paths."""
+        emit = (
+            self._trace_store.insert_event_result
+            if self._trace_store is not None
+            else durable_filesystem_emitter()
+        )
+        return AuditedFilesystem(
+            RootedPath(
+                self._persist_dir.parent,
+                "ticket",
+                physical_prefix=self._persist_dir.name,
+            ),
+            ticket_id=ticket_id,
+            emit=emit,
+            critical=True,
+        )
+
+    def _trace_mutation(
+        self,
+        ticket_id: str,
+        mutation: str,
+        *,
+        rejected: bool = False,
+        attributes: dict | None = None,
+    ) -> None:
+        """Persist a state outcome under the request context when available."""
+        context = current_trace_context()
+        if self._trace_store is None or context is None:
+            return
+        child = child_context(context)
+        try:
+            self._trace_store.insert_event_result(
+                TraceEventV1(
+                    ticket_id=ticket_id,
+                    agent_id=context.agent_id,
+                    invocation_id=context.invocation_id,
+                    trace_id=child.trace_id,
+                    action_id=child.action_id,
+                    parent_action_id=child.parent_action_id,
+                    action=ActionDescriptor(type=ActionType.STATE, target=mutation),
+                    lifecycle=LifecycleDescriptor(
+                        state=LifecycleState.REJECTED
+                        if rejected
+                        else LifecycleState.COMPLETED
+                    ),
+                    duration_ms=0,
+                    outcome=OperationOutcome.REJECTED
+                    if rejected
+                    else OperationOutcome.SUCCESS,
+                    attributes=attributes,
+                )
+            )
+        except Exception:
+            logger.exception("failed to persist state mutation trace")
 
     def create_ticket(
         self,
@@ -81,6 +154,7 @@ class TicketStore:
                 ticket.id,
                 {"summary": ticket.summary[:200]},
             )
+            self._trace_mutation(ticket.id, "create_ticket")
             return ticket.model_copy()
 
     def get_ticket(self, ticket_id: str) -> Ticket:
@@ -158,6 +232,15 @@ class TicketStore:
                 allowed = VALID_TRANSITIONS.get(current, [])
 
             if new_status not in allowed:
+                self._trace_mutation(
+                    ticket_id,
+                    "transition_ticket",
+                    rejected=True,
+                    attributes={
+                        "old_state": current.value,
+                        "new_state": new_status.value,
+                    },
+                )
                 raise InvalidTransition(
                     f"Cannot transition from {current.value} to {new_status.value}. "
                     f"Allowed: {[s.value for s in allowed]}"
@@ -194,6 +277,11 @@ class TicketStore:
                     "new_status": new_status.value,
                     "comment": request.comment,
                 },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "transition_ticket",
+                attributes={"old_state": old_status, "new_state": new_status.value},
             )
 
             # Emit transition event so the dashboard
@@ -235,6 +323,7 @@ class TicketStore:
                 ticket_id,
                 {"field_names": sorted(fields.keys())},
             )
+            self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
 
     def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
@@ -271,6 +360,7 @@ class TicketStore:
                 ticket_id,
                 {"author": request.author, "comment_id": comment.id},
             )
+            self._trace_mutation(ticket_id, "add_comment")
             return comment.model_copy()
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
@@ -308,6 +398,7 @@ class TicketStore:
                             "held_by": existing["owner"],
                         },
                     )
+                    self._trace_mutation(ticket_id, "claim_ticket", rejected=True)
                     return None
 
             expires = now + timedelta(seconds=duration_seconds)
@@ -328,6 +419,7 @@ class TicketStore:
                     "result": "claimed",
                 },
             )
+            self._trace_mutation(ticket_id, "claim_ticket")
             return claim
 
     def release_claim(self, ticket_id: str, owner: str) -> bool:
@@ -372,6 +464,7 @@ class TicketStore:
                     ticket_id,
                     {"owner": owner, "result": "not_owner"},
                 )
+                self._trace_mutation(ticket_id, "renew_claim", rejected=True)
                 return None
 
             now = datetime.now(timezone.utc)
@@ -388,6 +481,7 @@ class TicketStore:
                     "result": "renewed",
                 },
             )
+            self._trace_mutation(ticket_id, "renew_claim")
             return existing
 
     def force_close(self, ticket_id: str, comment: str = "") -> Ticket:
@@ -449,37 +543,56 @@ class TicketStore:
                     f"Ticket {ticket_id} is {ticket.status.value}, not closed. "
                     "Only closed tickets can be archived."
                 )
-            del self._tickets[ticket_id]
-
-        archive_dir = self._persist_dir.parent / "archive" / "tickets"
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        filesystem = self._filesystem(ticket_id)
+        filesystem.mkdir("archive/tickets")
         archived = []
-
-        ticket_path = self._persist_dir / f"{ticket_id}.json"
-        if ticket_path.exists():
-            dest = archive_dir / f"{ticket_id}.json"
-            ticket_path.rename(dest)
-            archived.append(str(dest))
 
         from paths import LOG_DIR
 
         log_path = LOG_DIR / f"{ticket_id}.jsonl"
         if log_path.exists():
-            log_archive_dir = self._persist_dir.parent / "archive" / "logs"
-            log_archive_dir.mkdir(parents=True, exist_ok=True)
-            dest = log_archive_dir / f"{ticket_id}.jsonl"
-            log_path.rename(dest)
-            archived.append(str(dest))
+            filesystem.mkdir("archive/logs")
+            # Logs are outside the ticket persistence root.  Their move remains
+            # explicitly scoped and emits only ticket-owned logical references.
+            log_filesystem = AuditedFilesystem(
+                RootedPath(LOG_DIR.parent, "ticket"),
+                ticket_id=ticket_id,
+                emit=(
+                    self._trace_store.insert_event_result
+                    if self._trace_store
+                    else durable_filesystem_emitter()
+                ),
+                critical=True,
+            )
+            log_filesystem.rename(
+                f"logs/{ticket_id}.jsonl", f"archive/logs/{ticket_id}.jsonl"
+            )
+            archived.append(f"ticket://archive/logs/{ticket_id}.jsonl")
+
+        # Move the durable ticket record last.  If an earlier companion move
+        # fails, restart still loads the ticket and can safely retry archive.
+        ticket_path = self._persist_dir / f"{ticket_id}.json"
+        if ticket_path.exists():
+            filesystem.rename(
+                f"{self._persist_dir.name}/{ticket_id}.json",
+                f"archive/tickets/{ticket_id}.json",
+            )
+            archived.insert(0, f"ticket://archive/tickets/{ticket_id}.json")
+
+        # Keep the closed ticket reachable if any durable move fails.  This is
+        # intentionally after both moves, so a primary archive failure is not
+        # hidden by an in-memory deletion.
+        with self._lock:
+            self._tickets.pop(ticket_id, None)
 
         logger.info(f"Archived ticket {ticket_id}: {archived}")
         return {"ticket_id": ticket_id, "archived_files": archived}
 
     def _persist_ticket(self, ticket: Ticket) -> None:
-        path = self._persist_dir / f"{ticket.id}.json"
         try:
-            path.write_text(
+            self._filesystem(ticket.id).write(
+                f"{self._persist_dir.name}/{ticket.id}.json",
                 ticket.model_dump_json(indent=2),
-                encoding="utf-8",
             )
         except OSError:
             logger.exception(f"Failed to persist ticket {ticket.id}")

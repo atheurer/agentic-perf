@@ -67,6 +67,16 @@ def test_concurrent_writers_have_gap_free_sequences(tmp_path: Path) -> None:
     assert sorted(item.ticket_seq for item in stored) == list(range(1, 25))
 
 
+def test_shared_store_serializes_concurrent_event_transactions(tmp_path: Path) -> None:
+    """Concurrent ASGI handlers share a store instance without nested BEGINs."""
+    with TraceStore(tmp_path / "trace.db") as store:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            stored = list(
+                executor.map(lambda _: store.insert_event(event()), range(24))
+            )
+    assert sorted(item.global_seq for item in stored) == list(range(1, 25))
+
+
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:
     path = tmp_path / "trace.db"
     context = get_context("spawn")

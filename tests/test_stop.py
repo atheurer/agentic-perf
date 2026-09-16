@@ -6,11 +6,13 @@ abort drift guard, dispatcher stop_agent.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from providers.tracing import LifecycleState, TraceRecorder, new_trace_context
 from state_store.main import create_app
 from state_store.models import (
     CreateTicketRequest,
@@ -338,7 +340,39 @@ class TestDispatcherStop:
         result = dispatcher.stop_agent("PERF-nonexist", "graceful")
         assert result is False
 
-    def test_mark_done_clears_agent(self):
+    def test_stop_modes_emit_trace_lifecycle(self):
+        """Dispatcher emits concrete stop outcomes, not just EventBus text."""
+        from orchestrator.dispatcher import Dispatcher
+
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event):
+                self.events.append(event)
+
+        dispatcher = Dispatcher(
+            state_store_url="http://localhost:8090",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+        )
+        sink = Sink()
+        dispatcher._trace = TraceRecorder(client=sink)
+        dispatcher._trace_contexts["PERF-test"] = new_trace_context(
+            ticket_id="PERF-test", agent_id="triage"
+        )
+        agent = MagicMock()
+        dispatcher._agents["PERF-test"] = agent
+        assert dispatcher.stop_agent("PERF-test", "graceful")
+        assert sink.events[-1].lifecycle.state == LifecycleState.PAUSED
+
+        task = MagicMock()
+        task.done.return_value = False
+        dispatcher._tasks["PERF-test"] = task
+        assert dispatcher.stop_agent("PERF-test", "hard")
+        assert sink.events[-1].lifecycle.state == LifecycleState.CANCELLED
+
+    async def test_mark_done_clears_agent(self):
         from orchestrator.dispatcher import Dispatcher
 
         dispatcher = Dispatcher(
@@ -348,7 +382,8 @@ class TestDispatcherStop:
         )
         dispatcher._agents["PERF-test"] = MagicMock()
         dispatcher._tasks["PERF-test"] = MagicMock()
-        dispatcher.mark_done("PERF-test")
+        dispatcher.release_claim = AsyncMock()
+        await dispatcher.mark_done("PERF-test")
         assert "PERF-test" not in dispatcher._agents
         assert "PERF-test" not in dispatcher._tasks
 
@@ -404,36 +439,15 @@ class TestProcessStopRequests:
             },
         ):
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
+            audited = httpx.AsyncClient(
                 transport=transport,
                 base_url="http://testserver",
-            ) as _:
-                # _process_stop_requests creates its own client,
-                # so we need to monkeypatch httpx.AsyncClient
-                original_init = httpx.AsyncClient.__init__
-
-                def patched_init(self_client, **kwargs):
-                    kwargs.pop("timeout", None)
-                    kwargs.pop("headers", None)
-                    original_init(
-                        self_client,
-                        transport=transport,
-                        base_url="http://testserver",
-                        headers={
-                            "Authorization": (f"Bearer {app.state.api_token}"),
-                        },
-                        timeout=10.0,
-                    )
-
-                with patch.object(
-                    httpx.AsyncClient,
-                    "__init__",
-                    patched_init,
-                ):
-                    await _process_stop_requests(
-                        dispatcher,
-                        "http://testserver",
-                    )
+                headers={"Authorization": f"Bearer {app.state.api_token}"},
+            )
+            with patch(
+                "orchestrator.main.AuditedAsyncHTTPClient", return_value=audited
+            ):
+                await _process_stop_requests(dispatcher, "http://testserver")
 
         result = store.get_ticket(ticket.id)
         assert result.status.value == "closed"
@@ -483,30 +497,15 @@ class TestProcessStopRequests:
             },
         ):
             transport = httpx.ASGITransport(app=app)
-            original_init = httpx.AsyncClient.__init__
-
-            def patched_init(self_client, **kwargs):
-                kwargs.pop("timeout", None)
-                kwargs.pop("headers", None)
-                original_init(
-                    self_client,
-                    transport=transport,
-                    base_url="http://testserver",
-                    headers={
-                        "Authorization": (f"Bearer {app.state.api_token}"),
-                    },
-                    timeout=10.0,
-                )
-
-            with patch.object(
-                httpx.AsyncClient,
-                "__init__",
-                patched_init,
+            audited = httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                headers={"Authorization": f"Bearer {app.state.api_token}"},
+            )
+            with patch(
+                "orchestrator.main.AuditedAsyncHTTPClient", return_value=audited
             ):
-                await _process_stop_requests(
-                    dispatcher,
-                    "http://testserver",
-                )
+                await _process_stop_requests(dispatcher, "http://testserver")
 
         result = store.get_ticket(ticket.id)
         assert result.status.value == "awaiting_customer_guidance"
@@ -767,15 +766,19 @@ class TestAdvancePlanAbortGuard:
             },
         }
         mock_client = MagicMock()
-        mock_client.get.return_value = mock_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-
-        with patch("httpx.Client", return_value=mock_client):
-            _advance_plan(
-                "http://localhost:8090",
-                "PERF-TEST",
-                "executing_benchmark",
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.patch = AsyncMock()
+        mock_client.post = AsyncMock()
+        wrapper = MagicMock()
+        wrapper.__aenter__ = AsyncMock(return_value=mock_client)
+        wrapper.__aexit__ = AsyncMock(return_value=None)
+        with patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=wrapper):
+            asyncio.run(
+                _advance_plan(
+                    "http://localhost:8090",
+                    "PERF-TEST",
+                    "executing_benchmark",
+                )
             )
 
         mock_client.patch.assert_not_called()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -74,6 +75,9 @@ class TraceStore:
 
     def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5_000) -> None:
         self.db_path = Path(db_path)
+        # ASGI handlers may write concurrently while this store deliberately
+        # shares one SQLite connection. Serialize transaction ownership.
+        self._write_lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._connection = sqlite3.connect(
@@ -170,20 +174,22 @@ class TraceStore:
     def insert_event_result(self, event: TraceEventV1) -> tuple[TraceEventV1, bool]:
         """Atomically insert or return ``(event, duplicate)`` for a replay."""
         try:
-            connection = self._open_connection()
-            connection.execute("BEGIN IMMEDIATE")
-            stored, duplicate = self._insert_event_in_transaction(connection, event)
-            if duplicate:
-                connection.rollback()
-                return stored, True
-            connection.commit()
-            return stored, False
+            with self._write_lock:
+                connection = self._open_connection()
+                connection.execute("BEGIN IMMEDIATE")
+                stored, duplicate = self._insert_event_in_transaction(connection, event)
+                if duplicate:
+                    connection.rollback()
+                    return stored, True
+                connection.commit()
+                return stored, False
         except TraceEventConflictError:
             raise
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             connection = getattr(self, "_connection", None)
-            if connection is not None and connection.in_transaction:
-                connection.rollback()
+            with self._write_lock:
+                if connection is not None and connection.in_transaction:
+                    connection.rollback()
             raise TraceStoreWriteError("could not write trace event") from exc
 
     def _insert_event_in_transaction(

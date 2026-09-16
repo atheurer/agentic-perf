@@ -152,6 +152,8 @@ class AnalyzeAgent(AgentBase):
         self._prefetched_run_info = await self._prefetch_cited_runs(
             ticket,
         )
+        # Pre-fetch artifact paths for referenced tickets.
+        await self._resolve_referenced_artifacts(ticket)
 
         try:
             await super().run(ticket_id)
@@ -324,5 +326,24 @@ class AnalyzeAgent(AgentBase):
             "investigation records. Then submit your findings "
             "via submit_analysis_result."
         )
+
+        # Cross-ticket artifact resolution
+        refs = getattr(self, "_referenced_artifacts", {})
+        if refs:
+            parts.append("## Referenced Ticket Artifacts")
+            parts.append("")
+            for rid, rinfo in refs.items():
+                rdir = rinfo.get("output_dir", "")
+                rrun = rinfo.get("run_id", "")
+                if rdir:
+                    parts.append(
+                        f"**{rid}:**\n"
+                        f"- output_dir: `{rdir}`\n"
+                        f"- run_id: `{rrun}`\n"
+                        f"Use `list_benchmark_artifacts` + "
+                        f"`read_benchmark_artifact` with "
+                        f"this output_dir."
+                    )
+                    parts.append("")
 
         return "\n".join(parts)

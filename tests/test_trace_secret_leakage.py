@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import base64
+import tarfile
 from urllib.parse import quote
 
 import pytest
 
+from providers.execution import AuditedFilesystem, RootedPath
 from providers.redaction import Redactor
-from providers.tracing import PayloadBlobStore, PayloadBuilder
+from providers.tracing import (
+    PayloadBlobStore,
+    PayloadBuilder,
+    TraceSpool,
+)
 from state_store.trace_store import TracePayloadConflictError, TraceStore
 
 
@@ -118,6 +124,47 @@ def test_credentials_are_absent_from_descriptor_db_wal_blob_and_logs(
         surfaces.append(wal.read_text(errors="ignore"))
     surfaces.append(caplog.text)
     assert all(secret not in surface for surface in surfaces)
+
+
+def test_secret_is_absent_from_db_wal_spool_blob_and_export(tmp_path) -> None:
+    """Audit descriptors remain safe across every durable/re-exported surface."""
+    secret = "audit-storage-secret-12345"
+    builder = PayloadBuilder(
+        Redactor(),
+        blob_store=PayloadBlobStore(tmp_path / "blobs"),
+        audit_key_path=tmp_path / "secrets" / "audit-key",
+        inline_bytes=8,
+    )
+    descriptor = builder.build("PERF-1", {"password": secret})
+    events = []
+    filesystem = AuditedFilesystem(
+        RootedPath(tmp_path / "workspace", "workspace"),
+        ticket_id="PERF-1",
+        emit=events.append,
+        critical=True,
+    )
+    filesystem.write("secrets/secret-token.txt", secret)
+    with filesystem.open_stream("keys/private-key.pem") as stream:
+        stream.write(secret.encode())
+    assert events
+    spool = TraceSpool(tmp_path / "spool", name="filesystem")
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.put_payload_descriptor(descriptor)
+        for event in events:
+            store.insert_event(event)
+            spool.append(event)
+        export_source = tmp_path / "export.json"
+        export_source.write_text("\n".join(event.model_dump_json() for event in events))
+        with tarfile.open(tmp_path / "export.tar.gz", "w:gz") as archive:
+            archive.add(export_source, arcname="trace.json")
+        surfaces = [descriptor.model_dump_json()]
+        for path in tmp_path.rglob("*"):
+            if path.is_file() and "workspace" not in path.relative_to(tmp_path).parts:
+                surfaces.append(path.read_bytes().decode(errors="ignore"))
+        persisted = "".join(surfaces)
+        assert secret not in persisted
+        assert "secret-token.txt" not in persisted
+        assert "private-key.pem" not in persisted
 
 
 def test_redaction_failure_returns_only_a_safe_descriptor(

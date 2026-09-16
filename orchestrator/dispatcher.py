@@ -23,6 +23,15 @@ from providers.llm.base import LLMProvider
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
 from providers.skills.repo_cache import RepoCache
+from providers.tracing import (
+    ActionType,
+    LifecycleState,
+    TraceClient,
+    TraceRecorder,
+    child_context,
+    new_trace_context,
+    trace_headers,
+)
 
 if TYPE_CHECKING:
     from state_store.identity import UserStore
@@ -95,6 +104,15 @@ class Dispatcher:
         self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
+        self._trace_contexts: dict[str, Any] = {}
+        self._previous_invocations: dict[str, Any] = {}
+        trace_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        trace_client = (
+            TraceClient(self.store_url, trace_token, instance_id=self._instance_name)
+            if trace_token
+            else None
+        )
+        self._trace = TraceRecorder(client=trace_client)
 
     def is_active(self, ticket_id: str) -> bool:
         task = self._tasks.get(ticket_id)
@@ -122,16 +140,51 @@ class Dispatcher:
                         "duration_seconds": self.lease_seconds,
                     },
                 )
-                return r.status_code == 200
+                if r.status_code == 200:
+                    context = new_trace_context(ticket_id=ticket_id, agent_id=status)
+                    previous = self._previous_invocations.get(ticket_id)
+                    attributes = {}
+                    if previous is not None:
+                        # A resumed dispatch must not reuse the old invocation,
+                        # while its causal tree remains navigable.
+                        context = context.model_copy(
+                            update={"parent_action_id": previous.action_id}
+                        )
+                        attributes["prior_invocation_id"] = str(previous.invocation_id)
+                    self._trace_contexts[ticket_id] = context
+                    self._trace.record(
+                        context,
+                        ActionType.DISPATCH,
+                        LifecycleState.CLAIMED,
+                        phase=status,
+                        attributes=attributes or None,
+                    )
+                    return True
+                rejected = new_trace_context(ticket_id=ticket_id, agent_id=status)
+                self._trace.record(
+                    rejected,
+                    ActionType.DISPATCH,
+                    LifecycleState.REJECTED,
+                    phase=status,
+                    duration_ms=0,
+                )
+                return False
         except Exception:
             logger.exception(f"Failed to claim ticket {ticket_id}")
             return False
 
-    def release_claim(self, ticket_id: str) -> None:
+    async def release_claim(self, ticket_id: str) -> None:
         """Release our claim on a ticket."""
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
-                client.request(
+            headers = self._auth_headers() | (
+                trace_headers(self._trace_contexts[ticket_id])
+                if ticket_id in self._trace_contexts
+                else {}
+            )
+            from providers.execution import AuditedAsyncHTTPClient
+
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                await client.request(
                     "DELETE",
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
                     json={"owner": self._instance_name},
@@ -139,11 +192,18 @@ class Dispatcher:
         except Exception:
             logger.exception(f"Failed to release claim on {ticket_id}")
 
-    def renew_claim(self, ticket_id: str) -> bool:
+    async def renew_claim(self, ticket_id: str) -> bool:
         """Renew our claim on a ticket. Returns True on success."""
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
-                r = client.post(
+            headers = self._auth_headers() | (
+                trace_headers(self._trace_contexts[ticket_id])
+                if ticket_id in self._trace_contexts
+                else {}
+            )
+            from providers.execution import AuditedAsyncHTTPClient
+
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                r = await client.post(
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim/renew",
                     json={
                         "owner": self._instance_name,
@@ -151,8 +211,18 @@ class Dispatcher:
                     },
                 )
                 return r.status_code == 200
-        except Exception:
+        except Exception as exc:
             logger.exception(f"Failed to renew claim on {ticket_id}")
+            context = self._trace_contexts.get(ticket_id)
+            if context is not None:
+                self._trace.record(
+                    context,
+                    ActionType.DISPATCH,
+                    LifecycleState.FAILED,
+                    phase="claim_renewal",
+                    duration_ms=0,
+                    error=exc,
+                )
             return False
 
     async def _renewal_loop(self, ticket_id: str) -> None:
@@ -161,8 +231,17 @@ class Dispatcher:
         try:
             while True:
                 await asyncio.sleep(interval)
-                if not self.renew_claim(ticket_id):
+                if not await self.renew_claim(ticket_id):
                     logger.warning(f"Claim renewal failed for {ticket_id}")
+                    context = self._trace_contexts.get(ticket_id)
+                    if context is not None:
+                        self._trace.record(
+                            context,
+                            ActionType.DISPATCH,
+                            LifecycleState.FAILED,
+                            phase="claim_renewal",
+                            duration_ms=0,
+                        )
                     break
         except asyncio.CancelledError:
             pass
@@ -216,16 +295,34 @@ class Dispatcher:
 
     def stop_agent(self, ticket_id: str, mode: str = "graceful") -> bool:
         self.stop_introspection(ticket_id)
+        context = self._trace_contexts.get(ticket_id)
         if mode == "graceful":
             agent = self._agents.get(ticket_id)
             if agent is not None and hasattr(agent, "request_stop"):
                 agent.request_stop()
+                if context is not None:
+                    self._trace.record(
+                        context,
+                        ActionType.AGENT,
+                        LifecycleState.PAUSED,
+                        phase="graceful_stop",
+                        attributes={"mode": "graceful"},
+                    )
                 logger.info(f"Graceful stop requested for {ticket_id}")
                 return True
         elif mode == "hard":
             task = self._tasks.get(ticket_id)
             if task is not None and not task.done():
                 task.cancel()
+                if context is not None:
+                    self._trace.record(
+                        context,
+                        ActionType.AGENT,
+                        LifecycleState.CANCELLED,
+                        phase="hard_stop",
+                        duration_ms=0,
+                        attributes={"mode": "hard"},
+                    )
                 logger.info(f"Hard stop (task.cancel) for {ticket_id}")
                 return True
         return False
@@ -238,15 +335,27 @@ class Dispatcher:
             self._tasks.pop(tid, None)
         return dict(self._tasks)
 
-    def mark_done(self, ticket_id: str) -> None:
+    async def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
         self.stop_renewal(ticket_id)
-        self.release_claim(ticket_id)
+        await self.release_claim(ticket_id)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
         self.clear_quota_blocked(ticket_id)
+        # Some focused integrations construct a dispatcher without running
+        # __init__. Cleanup remains valid when tracing was not configured.
+        context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
+        if context is not None:
+            self._previous_invocations[ticket_id] = context
+            self._trace.record(
+                context,
+                ActionType.DISPATCH,
+                LifecycleState.COMPLETED,
+                phase="cleanup",
+                duration_ms=0,
+            )
         if self.events is not None:
             self.events.unregister_ticket_owner(ticket_id)
         # Note: introspection is NOT stopped here. It runs
@@ -279,6 +388,12 @@ class Dispatcher:
             event_bus=self.events,
             llm_provider=llm,
         )
+        dispatch_context = self._trace_contexts.get(ticket_id)
+        if dispatch_context is not None:
+            agent.trace_context = child_context(
+                dispatch_context, agent_id="introspection-agent"
+            )
+            agent._trace.client = self._trace.client
         self._introspection_agents[ticket_id] = agent
 
         task = asyncio.create_task(
@@ -534,5 +649,18 @@ class Dispatcher:
             resolved = iter_factory(agent_type) if iter_factory is not None else None
             if resolved is not None:
                 agent.max_iterations = resolved
+
+        if agent is not None:
+            # A successful claim is the invocation boundary.  Assigning the
+            # immutable context here keeps every agent class on one envelope.
+            dispatch_context = (
+                self._trace_contexts.get(ticket_data.get("id", ""))
+                if ticket_data
+                else None
+            )
+            if dispatch_context is not None:
+                agent.trace_context = child_context(
+                    dispatch_context, agent_id=getattr(agent, "agent_name", agent_type)
+                )
 
         return agent

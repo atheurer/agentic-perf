@@ -13,6 +13,16 @@ from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHKeyResolutionError
 
 
+def test_state_store_token_loads_the_instance_credential(monkeypatch):
+    import agents.server_utils as utils
+
+    monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
+    monkeypatch.setattr("state_store.auth.read_token_from_file", lambda: "token")
+
+    assert utils._state_store_token() == "token"
+    assert utils.os.environ["AGENTIC_PERF_API_TOKEN"] == "token"
+
+
 class FakeVaultProvider(SecretsProvider):
     """Vault-like provider that materializes secrets to temp files."""
 
@@ -198,3 +208,56 @@ class TestResolveVaultSecretName:
 
         result = _resolve_vault_secret_name(None)
         assert result == "env-secret"
+
+
+@pytest.mark.asyncio
+async def test_build_ssh_replaces_and_closes_owned_trace_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TraceClient is owned by the same stack as ticket SSH key resources."""
+    import agents.server_utils as utils
+
+    clients: list[object] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"custom_fields": {"ssh_key_path": "/tmp/key"}}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def get(self, _: str, **__: object) -> Response:
+            return Response()
+
+    class Recorder:
+        def __init__(self, *_: object) -> None:
+            self.closed = False
+            clients.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_: Client())
+    monkeypatch.setattr("providers.tracing.client.TraceClient", Recorder)
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "token")
+    if utils._ssh_key_stack is not None:
+        await utils._ssh_key_stack.aclose()
+    utils._ssh_key_stack = None
+    try:
+        first, _ = await utils.build_ssh_from_ticket("PERF-ONE")
+        second, _ = await utils.build_ssh_from_ticket("PERF-TWO")
+        assert first.trace_recorder is clients[0]
+        assert second.trace_recorder is clients[1]
+        assert clients[0].closed is True
+        assert clients[1].closed is False
+    finally:
+        if utils._ssh_key_stack is not None:
+            await utils._ssh_key_stack.aclose()
+        utils._ssh_key_stack = None

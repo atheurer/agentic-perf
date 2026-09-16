@@ -16,9 +16,17 @@ from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
+from providers.tracing import (
+    bind_trace_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+    trace_headers,
+)
 
 from .config import OrchestratorConfig
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -333,7 +341,7 @@ def _missing_host_tuning(cf: dict) -> str:
     return ""
 
 
-def _apply_step_overrides(
+async def _apply_step_overrides(
     store_url: str,
     client: object,
     ticket_id: str,
@@ -404,13 +412,13 @@ def _apply_step_overrides(
             override_fields["scoped_context"] = scoped
 
     if override_fields:
-        client.patch(
+        await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={"fields": override_fields},
         )
 
 
-def _advance_plan(
+async def _advance_plan(
     store_url: str,
     ticket_id: str,
     completed_status: str,
@@ -423,11 +431,12 @@ def _advance_plan(
     Only advances if the completed agent matches the current step's
     agent_type.
     """
-    import httpx
-
-    client = httpx.Client(timeout=10.0, headers=_auth_headers())
-    try:
-        r = client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+    context = current_trace_context() or new_trace_context(
+        ticket_id=ticket_id, agent_id="orchestrator"
+    )
+    headers = _auth_headers() | trace_headers(context)
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
             return
         ticket = r.json()
@@ -479,7 +488,7 @@ def _advance_plan(
                     f"tuning ({missing}) but configuration_applied is empty "
                     f"— blocking advance to benchmark"
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={
                         "status": "awaiting_customer_guidance",
@@ -514,11 +523,11 @@ def _advance_plan(
         # (the ticket may be in any status at this point).
         stop_after = cf.get("stop_after_step")
         if stop_after and step.get("agent_type") == stop_after:
-            client.patch(
+            await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={"fields": {"execution_plan": plan}},
             )
-            client.post(
+            await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={
                     "author": "orchestrator",
@@ -528,7 +537,7 @@ def _advance_plan(
                     ),
                 },
             )
-            client.post(
+            await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/force-close",
             )
             return
@@ -579,15 +588,8 @@ def _advance_plan(
                 # Apply step overrides BEFORE saving the plan
                 # so that mutations (e.g. analysis-informed
                 # benchmark params) are persisted.
-                _apply_step_overrides(
-                    store_url,
-                    client,
-                    ticket_id,
-                    next_step,
-                    cf,
-                )
-
-                client.patch(
+                await _apply_step_overrides(store_url, client, ticket_id, next_step, cf)
+                await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
                         "fields": {
@@ -601,7 +603,7 @@ def _advance_plan(
                     "label",
                     next_step["agent_type"],
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
                         "author": "orchestrator",
@@ -616,13 +618,13 @@ def _advance_plan(
                 comment = (
                     f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
                 )
-                client.post(
+                await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={"status": next_status, "comment": comment},
                 )
                 return
 
-        client.patch(
+        await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={
                 "fields": {
@@ -631,8 +633,6 @@ def _advance_plan(
                 },
             },
         )
-    finally:
-        client.close()
 
 
 async def run_agent_task(
@@ -658,6 +658,11 @@ async def run_agent_task(
         if agent is None:
             return
 
+        if getattr(agent, "trace_context", None) is None:
+            agent.trace_context = dispatcher._trace_contexts.get(ticket_id)
+        if hasattr(agent, "_trace"):
+            agent._trace.client = dispatcher._trace.client
+
         dispatcher.set_agent(ticket_id, agent)
 
         if config and hasattr(agent, "DEFAULT_GLOBAL_MAX_ITERATIONS"):
@@ -670,9 +675,7 @@ async def run_agent_task(
         # their default max_iterations re-reading skills and
         # host state on each investigation loop-back.
         try:
-            import httpx
-
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=_auth_headers()
             ) as client:
                 r = await client.get(
@@ -727,7 +730,7 @@ async def run_agent_task(
         # agent into thinking the investigation is incomplete.
         if status == "synthesizing_results":
             try:
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
                     r = await client.get(
@@ -768,42 +771,52 @@ async def run_agent_task(
                 image_config=_load_config_file().get("jumpstarter_images", {}),
             )
 
-        if agent_task_timeout > 0:
-            try:
-                await asyncio.wait_for(
-                    agent.run(ticket_id),
-                    timeout=agent_task_timeout,
-                )
-                success = True
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
-                )
-                if dispatcher.events:
-                    dispatcher.events.emit(
-                        ticket_id,
-                        "orchestrator",
-                        "agent_error",
-                        {
-                            "reason": "agent_task_timeout",
-                            "timeout_seconds": agent_task_timeout,
-                        },
+        context_token = (
+            bind_trace_context(agent.trace_context)
+            if getattr(agent, "trace_context", None) is not None
+            else None
+        )
+        try:
+            if agent_task_timeout > 0:
+                try:
+                    await asyncio.wait_for(
+                        agent.run(ticket_id), timeout=agent_task_timeout
                     )
-                await _transition_to_guidance(
-                    dispatcher.store_url,
-                    ticket_id,
-                    f"Agent task timed out after {agent_task_timeout}s",
-                    event_bus=dispatcher.events,
-                )
-        else:
-            await agent.run(ticket_id)
-            success = True
+                    success = True
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Agent task timed out for {ticket_id} after {agent_task_timeout}s"
+                    )
+                    # The timeout is an observed orchestration outcome even if the
+                    # follow-up state transition cannot reach the state store.
+                    # Record it first so the audit trail does not depend on that
+                    # separate network operation succeeding.
+                    if dispatcher.events:
+                        dispatcher.events.emit(
+                            ticket_id,
+                            "orchestrator",
+                            "agent_error",
+                            {
+                                "reason": "agent_task_timeout",
+                                "timeout_seconds": agent_task_timeout,
+                            },
+                        )
+                    await _transition_to_guidance(
+                        dispatcher.store_url,
+                        ticket_id,
+                        f"Agent task timed out after {agent_task_timeout}s",
+                        event_bus=dispatcher.events,
+                    )
+            else:
+                await agent.run(ticket_id)
+                success = True
+        finally:
+            if context_token is not None:
+                reset_trace_context(context_token)
 
         if config:
             try:
-                import httpx
-
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as client:
                     # Preserve max_iterations_override when the
@@ -828,9 +841,7 @@ async def run_agent_task(
     except asyncio.CancelledError:
         logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
         try:
-            import httpx
-
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=_auth_headers()
             ) as client:
                 # Check if ticket was already force-closed before
@@ -899,7 +910,7 @@ async def run_agent_task(
 
         if success and status in PLAN_AGENT_STATUS.values():
             try:
-                _advance_plan(
+                await _advance_plan(
                     dispatcher.store_url,
                     ticket_id,
                     status,
@@ -914,9 +925,7 @@ async def run_agent_task(
         # itself; we force-close here if stop_after_step == "triage".
         if success and status == "triage_pending":
             try:
-                import httpx
-
-                async with httpx.AsyncClient(
+                async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
                 ) as _stop_client:
                     r = await _stop_client.get(
@@ -947,7 +956,7 @@ async def run_agent_task(
                 logger.exception(f"stop_after_step triage check failed for {ticket_id}")
 
         dispatcher.clear_agent(ticket_id)
-        dispatcher.mark_done(ticket_id)
+        await dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
         if agent is not None:
             try:
@@ -967,10 +976,11 @@ async def _transition_to_guidance(
     Used by orchestrator-level error handlers (stale watchdog,
     task timeout) that operate outside an agent context.
     """
-    import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={
@@ -1010,10 +1020,8 @@ async def _check_stale_tasks(
     """
     from datetime import datetime
 
-    import httpx
-
     now = time.time()
-    async with httpx.AsyncClient(timeout=5.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=5.0, headers=_auth_headers()) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
             last_event_time = event_bus.last_event_time(tid)
             if last_event_time is None:
@@ -1030,7 +1038,7 @@ async def _check_stale_tasks(
                         logger.info(
                             f"Cleaning up active_tasks entry for closed ticket {tid}"
                         )
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         task.cancel()
                         continue
                     updated_at = ticket_data.get("updated_at", "")
@@ -1082,9 +1090,7 @@ async def _block_absent_suite(
     ticket_id: str,
     event_bus: EventBus | None = None,
 ) -> None:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         suite = ""
         try:
             r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
@@ -1137,9 +1143,8 @@ async def _redirect_to_investigation(
     on the investigation path. If triage routed to the ad-hoc
     path, the orchestrator corrects it here.
     """
-    import httpx
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -1191,11 +1196,9 @@ async def _block_handoff_failed(
     current_status: str = "",
     event_bus: EventBus | None = None,
 ) -> None:
-    import httpx
-
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
@@ -1233,9 +1236,9 @@ async def _process_stop_requests(
     dispatched_tickets: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
             if dispatched_tickets is not None:
                 tickets = dispatched_tickets
             else:
@@ -1250,6 +1253,13 @@ async def _process_stop_requests(
                 if not stop_req:
                     continue
                 tid = ticket["id"]
+                # Stop requests are ticket-scoped mutations even when no
+                # agent task is active, so establish a fresh causal root.
+                getattr(client, "_client", client).headers.update(
+                    trace_headers(
+                        new_trace_context(ticket_id=tid, agent_id="orchestrator")
+                    )
+                )
                 mode = stop_req.get("mode", "graceful")
                 if mode == "hard":
                     # Hard stop: cancel the agent task (if any) AND
@@ -1259,7 +1269,7 @@ async def _process_stop_requests(
                     # running asyncio task.
                     if dispatcher.is_active(tid):
                         dispatcher.stop_agent(tid, "hard")
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         logger.info(f"Cancelled agent task for {tid}")
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/force-close",
@@ -1339,10 +1349,9 @@ async def _add_comment(
     body: str,
 ) -> None:
     """Post a comment on a ticket (fire-and-forget)."""
-    import httpx
 
     try:
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=_auth_headers(),
         ) as client:
@@ -1393,6 +1402,27 @@ def _check_dispatch_quota(
         return None
 
 
+def _refresh_harness_repos(
+    repo_cache: RepoCache, harness_repos: dict[str, str], trace_context: Any
+) -> None:
+    """Refresh non-Crucible repos under the claimed ticket's trace context."""
+    cache_token = bind_trace_context(trace_context)
+    try:
+        for name, url in harness_repos.items():
+            # Crucible is never cloned or refreshed by agentic-perf; its source
+            # is controller-owned.
+            if name == "crucible":
+                continue
+            try:
+                repo_cache.ensure_repo(name, url)
+            except Exception:
+                logger.warning(
+                    "Failed to cache repo %s from %s", name, url, exc_info=True
+                )
+    finally:
+        reset_trace_context(cache_token)
+
+
 async def poll_loop(config: OrchestratorConfig) -> None:
     global _last_good_config, _last_good_digest
     _last_good_config = config
@@ -1410,15 +1440,6 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     llm_factory = _make_llm_factory(config)
 
     repo_cache = RepoCache()
-    for name, url in config.harness_repos.items():
-        # Crucible is never cloned or refreshed by agentic-perf. Its source
-        # must already exist locally or on the designated controller.
-        if name == "crucible":
-            continue
-        try:
-            repo_cache.ensure_repo(name, url)
-        except Exception:
-            logger.warning(f"Failed to cache repo {name} from {url}", exc_info=True)
 
     skills = build_skill_provider(
         crucible_home=config.crucible_home,
@@ -1550,6 +1571,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     was_at_capacity = False
     last_trace_sweep = 0.0
     trace_sweep_task: asyncio.Task | None = None
+    repos_refreshed = False
 
     while True:
         if time.monotonic() - last_trace_sweep >= 60.0 and (
@@ -1689,7 +1711,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                             )
                         except Exception:
                             logger.exception(f"Failed to redirect {tid}")
-                        dispatcher.mark_done(tid)
+                        await dispatcher.mark_done(tid)
                         continue
 
                 # Jumpstarter: release any existing lease
@@ -1763,6 +1785,17 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     logger.info(f"Skipping {tid} at {status}: claim held")
                     continue
                 dispatcher.start_renewal(tid)
+
+                # Refreshing the shared repository cache mutates local state.
+                # Defer it until a ticket claim supplies its durable trace
+                # context, rather than doing unauditable work during process
+                # startup before any ticket exists.
+                cache_context = dispatcher._trace_contexts.get(tid)
+                if not repos_refreshed and cache_context is not None:
+                    _refresh_harness_repos(
+                        repo_cache, config.harness_repos, cache_context
+                    )
+                    repos_refreshed = True
 
                 # Register ticket owner for ledger attribution
                 # before any agent runs.

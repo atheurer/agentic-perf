@@ -17,7 +17,27 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx  # noqa: F401 - retained as a stable test patch seam
+
+from providers.execution import AuditedAsyncHTTPClient
+
 logger = logging.getLogger(__name__)
+
+
+def _state_store_token() -> str:
+    """Return this instance's state-store token for ticket-owned MCP tools."""
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if token:
+        return token
+    from state_store.auth import read_token_from_file
+
+    token = read_token_from_file()
+    if token:
+        # Audited subprocess and HTTP adapters resolve their recorder lazily
+        # from the environment, so make the instance credential available for
+        # the rest of this ticket-owned MCP process.
+        os.environ["AGENTIC_PERF_API_TOKEN"] = token
+    return token
 
 
 def setup_project_path() -> str:
@@ -1095,8 +1115,6 @@ async def assert_ticket_active(
     drifted — the caller should return this to the LLM as a tool result
     instead of proceeding with the side-effecting operation.
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL", "http://localhost:8090"
@@ -1106,11 +1124,11 @@ async def assert_ticket_active(
         return {}
 
     headers = {}
-    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    api_token = _state_store_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
             f"{state_store_url}/api/v1/tickets/{ticket_id}",
         )
@@ -1146,9 +1164,13 @@ async def build_ssh_from_ticket(
     Returns (SSHExecutor, ticket_dict). If ticket_id is None, reads from
     TICKET_ID env var. If state_store_url is None, reads from STATE_STORE_URL.
     """
-    import httpx
-
     from providers.ssh import SSHExecutor
+    from providers.tracing import (
+        bind_trace_context,
+        new_trace_context,
+        trace_context_from_environment,
+    )
+    from providers.tracing.client import TraceClient
 
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
@@ -1159,11 +1181,11 @@ async def build_ssh_from_ticket(
         return SSHExecutor(user="root"), {}
 
     headers = {}
-    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    api_token = _state_store_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(f"{state_store_url}/api/v1/tickets/{ticket_id}")
         r.raise_for_status()
         ticket = r.json()
@@ -1180,20 +1202,40 @@ async def build_ssh_from_ticket(
     # checking to avoid stale key errors.
     strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
 
+    # This stack owns resources held by the process-global MCP SSH executor.
+    # Rebuilding the executor (for a new ticket or server reinitialization)
+    # closes its predecessor's key material and TraceClient transport first.
+    global _ssh_key_stack
+    if _ssh_key_stack is not None:
+        await _ssh_key_stack.aclose()
+    _ssh_key_stack = AsyncExitStack()
+
     vault_secret_name = _resolve_vault_secret_name(fields)
     resolved_key = ssh_key
     if vault_secret_name:
-        global _ssh_key_stack
-        if _ssh_key_stack is not None:
-            await _ssh_key_stack.aclose()
-        _ssh_key_stack = AsyncExitStack()
         sp = build_secrets_provider()
         resolved_key = await _ssh_key_stack.enter_async_context(
             resolve_ssh_key(ssh_key, sp, vault_secret_name),
         )
 
+    trace_recorder = TraceClient(state_store_url, api_token) if api_token else None
+    if trace_recorder is not None:
+        _ssh_key_stack.callback(trace_recorder.close)
+    trace_context = trace_context_from_environment(
+        ticket_id=ticket_id, agent_id=os.environ.get("AGENT_NAME")
+    ) or new_trace_context(
+        ticket_id=ticket_id,
+        agent_id=os.environ.get("AGENT_NAME"),
+    )
+    # A local MCP process is ticket-owned. Bind its inherited context before
+    # callers initialize caches or providers that may perform audited actions.
+    bind_trace_context(trace_context)
     return SSHExecutor(
-        user=ssh_user, key_path=resolved_key, strict_host_key=strict
+        user=ssh_user,
+        key_path=resolved_key,
+        strict_host_key=strict,
+        trace_context=trace_context,
+        trace_recorder=trace_recorder,
     ), ticket
 
 
@@ -1218,8 +1260,6 @@ async def tool_progress(
     Reads TICKET_ID and STATE_STORE_URL from env if not provided.
     Silently no-ops if ticket_id is unavailable (e.g., in tests).
     """
-    import httpx
-
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     state_store_url = state_store_url or os.environ.get(
         "STATE_STORE_URL",
@@ -1236,7 +1276,7 @@ async def tool_progress(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
             await client.post(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={"author": author, "body": message},
@@ -1420,3 +1460,20 @@ def get_board_selector(ticket: dict) -> str:
     cf = ticket.get("custom_fields", {})
     directives = cf.get("directives", {})
     return directives.get("board_selector", "") or cf.get("board_selector", "")
+
+
+def extract_ticket_references(text: str) -> list[str]:
+    """Extract PERF-XXXXXXXX ticket IDs from text.
+
+    Returns deduplicated list preserving first-seen order.
+    """
+    import re
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"PERF-[A-F0-9]{8}", text):
+        tid = match.group()
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids

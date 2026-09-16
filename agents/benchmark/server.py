@@ -40,6 +40,12 @@ from agents.server_utils import (
     read_skill_documents,
     tool_progress,
 )
+from providers.execution import (
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+    RootedPath,
+    durable_filesystem_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,20 @@ mcp = FastMCP("benchmark-agent")
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
+
+
+def _write_ticket_staging_file(
+    ticket_id: str, content: str
+) -> tuple[AuditedFilesystem, str, str]:
+    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
+    filesystem = AuditedFilesystem(
+        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+        ticket_id=ticket_id,
+        emit=durable_filesystem_emitter(),
+        critical=True,
+    )
+    name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
+    return filesystem, name, str(filesystem.write(name, content))
 
 
 def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -65,6 +85,32 @@ def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(mv_params, sort_keys=True).encode()).hexdigest()
 
 
+def _apply_runfile_safety_directives(run_file: dict[str, Any]) -> dict[str, Any]:
+    """Return a run-file that honours non-negotiable ticket safety directives.
+
+    Some Crucible schemas describe optional ``host-mounts`` as an array with a
+    minimum length.  An empty value is therefore invalid *and*, when the ticket
+    forbids host mounts, violates the request just as a populated value would.
+    Remove the key rather than relying on the model to infer that distinction.
+    """
+    directives = _ticket.get("custom_fields", {}).get("directives", {})
+    if not isinstance(directives, dict) or not directives.get("no_host_mounts"):
+        return run_file
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key != "host-mounts"
+            }
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    return sanitize(run_file)
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
@@ -77,7 +123,7 @@ async def _persist_validated_runfile(
     the ticket when running under an agentic-perf ticket.  Execution must use
     this ID rather than supplying an independent runfile.
     """
-    import httpx
+    from providers.execution import AuditedAsyncHTTPClient
 
     validation_id = f"val-{uuid.uuid4().hex}"
     record = {
@@ -102,7 +148,7 @@ async def _persist_validated_runfile(
         api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=headers,
         ) as client:
@@ -2704,21 +2750,20 @@ async def execute_benchmark(
                     }
                 )
 
-            proc = await _asyncio.create_subprocess_exec(
-                podman_path,
-                "run",
-                "-i",
-                "--rm",
-                "--network=host",
-                plugin_image,
-                *container_args,
-                stdin=_asyncio.subprocess.PIPE,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
+            proc = await AuditedSubprocessRunner().start(
+                [
+                    podman_path,
+                    "run",
+                    "-i",
+                    "--rm",
+                    "--network=host",
+                    plugin_image,
+                    *container_args,
+                ],
+                stdin=input_content.encode(),
+                mutating=True,
             )
-            stdout_bytes, stderr_bytes = await proc.communicate(
-                input=input_content.encode()
-            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
             stdout_str = stdout_bytes.decode(errors="replace")
             stderr_str = stderr_bytes.decode(errors="replace")
@@ -2791,13 +2836,28 @@ async def execute_benchmark(
     # Default: crucible (and any unknown harness that uses JSON run-files)
     remote_path = f"/tmp/run-file-{run_uuid}.json"
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(run_file, f, indent=2)
-        local_path = f.name
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
+    else:
+        staging = None
+        staging_name = ""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(run_file, f, indent=2)
+            local_path = f.name
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
-    scp_result = await _ssh.copy_to(controller, local_path, remote_path)
-    Path(local_path).unlink(missing_ok=True)
+    try:
+        scp_result = await _ssh.copy_to(
+            controller, local_path, remote_path, mutating=True
+        )
+    finally:
+        if staging:
+            staging.unlink(staging_name, missing_ok=True)
+        else:
+            Path(local_path).unlink(missing_ok=True)
 
     if scp_result.exit_code != 0:
         return json.dumps(
@@ -2933,6 +2993,7 @@ async def validate_benchmark(
     starts a benchmark, deploys endpoints, or starts supporting services.
     """
     await _ensure_init()
+    run_file = _apply_runfile_safety_directives(run_file)
 
     harness_name = harness or "crucible"
     if harness_name != "crucible":
@@ -2971,13 +3032,21 @@ async def validate_benchmark(
     remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
     local_path = ""
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as file:
-            json.dump(run_file, file, indent=2)
-            local_path = file.name
+        ticket_id = os.environ.get("TICKET_ID", "")
+        staging = None
+        staging_name = ""
+        if ticket_id:
+            staging, staging_name, local_path = _write_ticket_staging_file(
+                ticket_id, json.dumps(run_file, indent=2)
+            )
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as file:
+                json.dump(run_file, file, indent=2)
+                local_path = file.name
 
-        copied = await _ssh.copy_to(controller, local_path, remote_path)
+        copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
             return json.dumps(
                 {
@@ -3058,7 +3127,10 @@ async def validate_benchmark(
         )
     finally:
         if local_path:
-            Path(local_path).unlink(missing_ok=True)
+            if staging:
+                staging.unlink(staging_name, missing_ok=True)
+            else:
+                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -3238,14 +3310,15 @@ async def execute_boot_time_test(
         # Security: password on argv is visible in /proc/pid/cmdline.
         # The external scripts require --password= on the command line;
         # upstream fix: accept --password-file or SSHPASS env var.
-        install_proc = await _asyncio.create_subprocess_exec(
-            str(install_script),
-            sut_host,
-            f"--username={ssh_user}",
-            f"--password={ssh_password}",
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        install_proc = await AuditedSubprocessRunner().start(
+            [
+                str(install_script),
+                sut_host,
+                f"--username={ssh_user}",
+                f"--password={ssh_password}",
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         install_out, install_err = await install_proc.communicate()
         if install_proc.returncode != 0:
@@ -3273,6 +3346,18 @@ async def execute_boot_time_test(
 
     _ticket_id = os.environ.get("TICKET_ID", "")
     output_dir = create_artifact_dir(_ticket_id, run_uuid)
+    artifact_filesystem = (
+        AuditedFilesystem(
+            RootedPath(
+                output_dir, "artifact", logical_prefix=f"{_ticket_id}/{run_uuid}"
+            ),
+            ticket_id=_ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+        if _ticket_id
+        else None
+    )
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -3360,21 +3445,24 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = open(
-                    serial_log_path,
-                    "w",
-                    encoding="utf-8",
+                serial_log_fh = (
+                    artifact_filesystem.open_stream("serial-capture.log")
+                    if artifact_filesystem
+                    else open(serial_log_path, "wb")
                 )
-                serial_proc = await _asyncio.create_subprocess_exec(
-                    "jmp",
-                    "shell",
-                    f"--lease={_lease_id}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
+                serial_proc = await AuditedSubprocessRunner().start(
+                    [
+                        "jmp",
+                        "shell",
+                        f"--lease={_lease_id}",
+                        "--",
+                        "j",
+                        "serial",
+                        "pipe",
+                    ],
                     stdout=serial_log_fh,
                     stderr=_asyncio.subprocess.DEVNULL,
+                    mutating=True,
                 )
                 logger.info(
                     f"[boot-time] Passive serial capture "
@@ -3402,24 +3490,17 @@ async def execute_boot_time_test(
     # capture-boot timed out but jmp shell child lingered).
     benchmark_timeout = (samples * 90) + 900
 
-    proc = await _asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
+    proc = await AuditedSubprocessRunner().start(
+        cmd,
         cwd=str(output_dir),
         env=run_env,
+        mutating=True,
     )
     try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            proc.communicate(),
-            timeout=benchmark_timeout,
-        )
+        stdout_bytes, stderr_bytes = await proc.communicate(timeout=benchmark_timeout)
     except _asyncio.TimeoutError:
-        logger.warning(
-            f"[boot-time] Subprocess timed out after {benchmark_timeout}s, killing"
-        )
-        proc.kill()
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        logger.warning(f"[boot-time] Subprocess timed out after {benchmark_timeout}s")
+        stdout_bytes, stderr_bytes = b"", b""
 
     exit_code = proc.returncode or 0
     stdout_str = stdout_bytes.decode(errors="replace")
@@ -3430,21 +3511,15 @@ async def execute_boot_time_test(
         try:
             serial_proc.terminate()
             try:
-                await _asyncio.wait_for(
-                    serial_proc.wait(),
-                    timeout=10,
-                )
+                await serial_proc.wait(timeout=10)
             except _asyncio.TimeoutError:
-                serial_proc.kill()
-                await serial_proc.wait()
+                # The tracked wait has already escalated to kill.
+                pass
             logger.info("[boot-time] Passive serial capture stopped")
         except Exception as e:
             logger.warning(f"[boot-time] Error stopping serial capture: {e}")
     if serial_log_fh is not None:
-        try:
-            serial_log_fh.close()
-        except Exception:
-            pass
+        serial_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
@@ -3453,7 +3528,10 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            serial_log_path.unlink(missing_ok=True)
+            if artifact_filesystem:
+                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+            else:
+                serial_log_path.unlink(missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -3471,23 +3549,33 @@ async def execute_boot_time_test(
     collect_metadata = scripts_dir / "collect-system-metadata.sh"
     if collect_metadata.exists():
         logger.info(f"[boot-time] Collecting system metadata from {sut_host}")
-        meta_proc = await _asyncio.create_subprocess_exec(
-            str(collect_metadata),
-            sut_host,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        meta_proc = await AuditedSubprocessRunner().start(
+            [
+                str(collect_metadata),
+                sut_host,
+            ],
             cwd=str(scripts_dir),
+            mutating=True,
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            metadata_file.write_bytes(meta_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", meta_out)
+            else:
+                metadata_file.write_bytes(meta_out)
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            metadata_file.write_text("{}")
+            if artifact_filesystem:
+                artifact_filesystem.write("metadata.json", "{}")
+            else:
+                metadata_file.write_text("{}")
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        metadata_file.write_text("{}")
+        if artifact_filesystem:
+            artifact_filesystem.write("metadata.json", "{}")
+        else:
+            metadata_file.write_text("{}")
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -3532,15 +3620,17 @@ async def execute_boot_time_test(
                 break
         merge_cmd.extend(str(f) for f in boot_time_logs)
 
-        merge_proc = await _asyncio.create_subprocess_exec(
-            *merge_cmd,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        merge_proc = await AuditedSubprocessRunner().start(
+            merge_cmd,
             cwd=str(scripts_dir),
+            mutating=True,
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            merged_file.write_bytes(merge_out)
+            if artifact_filesystem:
+                artifact_filesystem.write("merged-results.json", merge_out)
+            else:
+                merged_file.write_bytes(merge_out)
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(
@@ -3678,14 +3768,16 @@ async def execute_boot_time_test(
     # runs so all artifacts remain accessible.
     if _ticket and response.get("output_dir"):
         try:
-            import httpx
+            from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
             token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             ticket_id = _ticket.get("id", "")
             if ticket_id:
-                async with httpx.AsyncClient(timeout=10.0, headers=headers) as _client:
+                async with AuditedAsyncHTTPClient(
+                    timeout=10.0, headers=headers
+                ) as _client:
                     # Fetch current list to append
                     r = await _client.get(
                         f"{store_url}/api/v1/tickets/{ticket_id}",

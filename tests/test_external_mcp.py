@@ -167,7 +167,12 @@ def test_connect_delegates_to_connect_command():
 
 @pytest.mark.asyncio
 async def test_ticket_server_connection_injects_required_context():
-    client = AgentMCPClient()
+    from providers.tracing import new_trace_context, trace_context_environment
+
+    trace_context = new_trace_context(
+        ticket_id="PERF-12345678", agent_id="triage-agent"
+    )
+    client = AgentMCPClient(trace_context=trace_context)
     client.connect = AsyncMock()
 
     await client.connect_ticket_server(
@@ -185,6 +190,7 @@ async def test_ticket_server_connection_injects_required_context():
             "TICKET_ID": "PERF-12345678",
             "STATE_STORE_URL": "http://state-store:8090",
             "AGENT_NAME": "triage-agent",
+            **trace_context_environment(trace_context),
         },
     )
 

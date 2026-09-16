@@ -185,6 +185,7 @@ async def _provision_jumpstarter(
         selector=selector,
         serial_capture=serial_enabled,
         artifact_dir=artifact_dir,
+        ticket_id=ticket_id,
     )
 
     return json.dumps(

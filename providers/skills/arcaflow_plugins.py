@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -13,6 +12,7 @@ from typing import Any
 import httpx
 
 from paths import PLUGIN_SCHEMA_CACHE_DIR as _DEFAULT_SCHEMA_CACHE_DIR
+from providers.execution import AuditedSubprocessRunner
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
@@ -88,16 +88,16 @@ async def discover_plugin_schema(
         return {"steps": [], "schemas": {}}
 
     # Try without -s first (works for single-step plugins)
-    proc = await asyncio.create_subprocess_exec(
-        podman,
-        "run",
-        "--rm",
-        "--network=host",
-        image_ref,
-        "--json-schema",
-        "input",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    proc = await AuditedSubprocessRunner().start(
+        [
+            podman,
+            "run",
+            "--rm",
+            "--network=host",
+            image_ref,
+            "--json-schema",
+            "input",
+        ],
     )
     stdout, stderr = await proc.communicate()
     combined = stdout.decode(errors="replace") + stderr.decode(errors="replace")
@@ -133,18 +133,18 @@ async def discover_plugin_schema(
     # Fetch schema for each step
     schemas: dict[str, Any] = {}
     for step in steps:
-        proc = await asyncio.create_subprocess_exec(
-            podman,
-            "run",
-            "--rm",
-            "--network=host",
-            image_ref,
-            "-s",
-            step,
-            "--json-schema",
-            "input",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await AuditedSubprocessRunner().start(
+            [
+                podman,
+                "run",
+                "--rm",
+                "--network=host",
+                image_ref,
+                "-s",
+                step,
+                "--json-schema",
+                "input",
+            ],
         )
         stdout, _ = await proc.communicate()
         if proc.returncode == 0 and stdout.strip():

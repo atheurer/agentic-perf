@@ -48,7 +48,16 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     description = gate._description(config())
     assert "Never include a `host-mounts` key" in description
     assert "including an empty" in description
+    assert "absence of the key is the only allowed representation" in description
     assert "Do not mount `/proc`, `/sys`" in description
+
+
+def test_ticket_direction_permits_only_required_prerequisite_packages() -> None:
+    description = gate._description(config())
+    assert (
+        "only prerequisite packages required for this Crucible benchmark" in description
+    )
+    assert "on either supplied host" in description
 
 
 def test_completed_ticket_requires_full_lifecycle_and_agents() -> None:

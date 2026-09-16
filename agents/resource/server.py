@@ -177,12 +177,11 @@ async def check_available_resources(
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     if ticket_id:
         try:
-            import httpx
-
+            from providers.execution import AuditedAsyncHTTPClient
             from state_store.auth import read_token_from_file
 
             token = read_token_from_file()
-            async with httpx.AsyncClient(
+            async with AuditedAsyncHTTPClient(
                 base_url=store_url,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10.0,
@@ -331,7 +330,12 @@ async def validate_host(
     from providers.ssh import SSHExecutor
 
     if ssh_key_path:
-        ssh = SSHExecutor(user=ssh_user, key_path=ssh_key_path)
+        ssh = SSHExecutor(
+            user=ssh_user,
+            key_path=ssh_key_path,
+            trace_context=getattr(_ssh, "trace_context", None),
+            trace_recorder=getattr(_ssh, "trace_recorder", None),
+        )
     else:
         ssh = _ssh
     result = await ssh.run(host, "echo SSH_OK", timeout=15)

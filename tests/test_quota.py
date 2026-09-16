@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -588,7 +589,7 @@ class TestDispatcherQuotaBlocking:
         d.clear_quota_blocked("T-001")
         assert not d.is_quota_warned("T-001")
 
-    def test_mark_done_clears_quota_blocked(self):
+    async def test_mark_done_clears_quota_blocked(self):
         from unittest.mock import MagicMock
 
         from orchestrator.dispatcher import Dispatcher
@@ -603,10 +604,10 @@ class TestDispatcherQuotaBlocking:
         d._redactor = None
         d._instance_name = "test"
         d.events = None
-        d.release_claim = MagicMock()
+        d.release_claim = AsyncMock()
         d.stop_renewal = MagicMock()
 
-        d.mark_done("T-001")
+        await d.mark_done("T-001")
         assert not d.is_quota_blocked("T-001")
         assert not d.is_quota_warned("T-001")
 

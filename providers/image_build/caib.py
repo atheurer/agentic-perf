@@ -8,13 +8,14 @@ in the cloud via the CAIB build service.
 """
 
 
-import asyncio
 import copy
 import json
 import logging
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 
 from .base import BuildResult, BuildSpec, ImageBuildProvider
 
@@ -283,24 +284,23 @@ class CAIBProvider(ImageBuildProvider):
                 "[caib] Building: %s", " ".join(a if a != token else "***" for a in cmd)
             )
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
+            process_result = await AuditedSubprocessRunner().run(
+                cmd,
                 timeout=spec.timeout_minutes * 60 + 120,
+                mutating=True,
             )
+            stdout, stderr = process_result.stdout, process_result.stderr
 
             stdout_str = stdout.decode(errors="replace")
             stderr_str = stderr.decode(errors="replace")
 
-            if proc.returncode != 0:
+            if process_result.returncode != 0:
                 return BuildResult(
                     success=False,
                     build_name=build_name,
-                    error=(f"caib exited {proc.returncode}: {stderr_str[:1000]}"),
+                    error=(
+                        f"caib exited {process_result.returncode}: {stderr_str[:1000]}"
+                    ),
                 )
 
             # Parse build output
@@ -376,9 +376,7 @@ class CAIBProvider(ImageBuildProvider):
 
             expiration = int(time.time()) + (days * 86400)
 
-            import httpx
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with AuditedAsyncHTTPClient(timeout=10.0) as client:
                 r = await client.put(
                     f"https://quay.io/api/v1/repository/{namespace}/{repo}/tag/{tag}",
                     json={"expiration": expiration},
