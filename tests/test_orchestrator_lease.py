@@ -9,12 +9,44 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
+from orchestrator.leader_lease import LeaderLeaseClient
 from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
 from state_store.models import AcquireOrchestratorLeaseRequest, CreateTicketRequest
 from state_store.store import OrchestratorLeaseHeld, TicketStore
+
+
+@pytest.mark.asyncio
+async def test_leader_lease_acquire_is_control_plane_not_ticket_audited(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Startup must acquire its lease before a ticket trace can exist."""
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            assert url.endswith("/orchestrator-lease/acquire")
+            assert json["instance_name"] == "test-instance"
+            return httpx.Response(
+                200,
+                json={"epoch": 7},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    client = LeaderLeaseClient("http://state-store", instance_name="test-instance")
+    assert (await client.acquire())["epoch"] == 7
+    assert client.epoch == 7
 
 
 def _request(session_id=None, *, instance_name="shared"):

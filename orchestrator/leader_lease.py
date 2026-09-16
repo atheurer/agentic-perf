@@ -5,7 +5,7 @@ import socket
 import uuid
 from pathlib import Path
 
-from providers.execution import AuditedAsyncHTTPClient
+import httpx
 
 
 def process_start_id() -> str:
@@ -44,9 +44,7 @@ class LeaderLeaseClient:
             "process_start_id": process_start_id(),
             "ttl_seconds": self.ttl_seconds,
         }
-        async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=self._headers()
-        ) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=self._headers()) as client:
             response = await client.post(
                 f"{self.store_url}/api/v1/control/orchestrator-lease/acquire",
                 json=body,
@@ -63,9 +61,7 @@ class LeaderLeaseClient:
     async def renew(self) -> dict:
         if self.epoch is None:
             raise RuntimeError("leader lease has not been acquired")
-        async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=self._headers()
-        ) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=self._headers()) as client:
             response = await client.post(
                 f"{self.store_url}/api/v1/control/orchestrator-lease/renew",
                 json={
@@ -81,7 +77,7 @@ class LeaderLeaseClient:
         if self.epoch is None:
             return False
         try:
-            async with AuditedAsyncHTTPClient(
+            async with httpx.AsyncClient(
                 timeout=5.0, headers=self._headers()
             ) as client:
                 response = await client.post(
