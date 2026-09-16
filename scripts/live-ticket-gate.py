@@ -245,7 +245,8 @@ may set endpoint setting `disable-tools` only to the JSON boolean `true`.
 Do not modify network interfaces, addresses, MTUs, queues, IRQ affinity,
 irqbalance, firewall, sysctls, storage, packages, or operating-system settings.
 Never include a `host-mounts` key anywhere in the run file, including an empty
-list. Do not mount `/proc`, `/sys`, or any other host path into the endpoint.
+list: absence of the key is the only allowed representation of no mounts.
+Do not mount `/proc`, `/sys`, or any other host path into the endpoint.
 The hosts and controller are already prepared; verify access without tuning or
 updating them. Require user approval of the validated run file before execution.
 Do not substitute hosts or add roles. Set skip_teardown=true.

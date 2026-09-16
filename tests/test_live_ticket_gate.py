@@ -48,6 +48,7 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     description = gate._description(config())
     assert "Never include a `host-mounts` key" in description
     assert "including an empty" in description
+    assert "absence of the key is the only allowed representation" in description
     assert "Do not mount `/proc`, `/sys`" in description
 
 
