@@ -13,6 +13,7 @@ from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.repo_cache import RepoCache
+from providers.tracing import current_trace_context
 
 from .prompts import BENCHMARK_BASE_PROMPT
 
@@ -220,6 +221,7 @@ class BenchmarkAgent(AgentBase):
             != digest
         ):
             return "Approval rejected: supplied run-file differs from immutable validation."
+        approval_context = current_trace_context() or self.trace_context
         fence_headers = {
             "X-Agentic-Perf-Orchestrator-Session": os.environ.get(
                 "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", ""
@@ -229,11 +231,11 @@ class BenchmarkAgent(AgentBase):
             ),
             "X-Agentic-Perf-Claim-Id": os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
             or (cf.get("claim") or {}).get("claim_id", ""),
-            "X-Agentic-Perf-Invocation-Id": str(self.trace_context.invocation_id)
-            if self.trace_context and self.trace_context.invocation_id
+            "X-Agentic-Perf-Invocation-Id": str(approval_context.invocation_id)
+            if approval_context and approval_context.invocation_id
             else "",
-            "X-Agentic-Perf-Tool-Call-Id": self.trace_context.tool_call_id
-            if self.trace_context and self.trace_context.tool_call_id
+            "X-Agentic-Perf-Tool-Call-Id": approval_context.tool_call_id
+            if approval_context and approval_context.tool_call_id
             else "",
         }
         request = await self._client.post(
@@ -244,17 +246,17 @@ class BenchmarkAgent(AgentBase):
                 "presented_run_file_digest": digest,
                 "execution_intent_digest": intent,
                 "summary": summary or benchmark or "Benchmark run-file approval",
-                "invocation_id": str(self.trace_context.invocation_id)
-                if self.trace_context and self.trace_context.invocation_id
+                "invocation_id": str(approval_context.invocation_id)
+                if approval_context and approval_context.invocation_id
                 else None,
-                "tool_call_id": self.trace_context.tool_call_id
-                if self.trace_context
+                "tool_call_id": approval_context.tool_call_id
+                if approval_context
                 else None,
                 "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
                 "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
                 "waiter_owner": (
-                    str(self.trace_context.invocation_id)
-                    if self.trace_context and self.trace_context.invocation_id
+                    str(approval_context.invocation_id)
+                    if approval_context and approval_context.invocation_id
                     else None
                 ),
                 "ticket_attempt": os.environ.get("AGENTIC_PERF_CLAIM_ID")

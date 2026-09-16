@@ -8,6 +8,7 @@ import pytest
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient, MCPToolCallError, _ServerConnection
 from providers.llm.base import ToolCall, ToolDefinition
+from providers.tracing import current_trace_context, new_trace_context
 
 
 class DummyAgent(AgentBase):
@@ -47,6 +48,27 @@ async def test_native_type_error_after_entry_is_not_replayed(agent):
     assert calls == 1
     assert result.is_error
     assert json.loads(result.content)["retry_classification"] == "ambiguous_after_send"
+
+
+async def test_local_handler_runs_under_supplied_tool_trace_context(agent):
+    observed = None
+
+    async def handler() -> str:
+        nonlocal observed
+        observed = current_trace_context()
+        return "ok"
+
+    agent._tool_handlers["observe"] = handler
+    context = new_trace_context(ticket_id="PERF-context", agent_id="test-agent")
+    context = context.model_copy(update={"tool_call_id": "call-context"})
+
+    result = await agent._execute_tool(
+        ToolCall(id="call-context", name="observe", input={}),
+        trace_context=context,
+    )
+
+    assert not result.is_error
+    assert observed == context
 
 
 async def test_mcp_failure_after_call_is_not_replayed(agent):

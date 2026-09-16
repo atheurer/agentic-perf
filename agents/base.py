@@ -1735,6 +1735,9 @@ class AgentBase(ABC):
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
+            trace_token = (
+                bind_trace_context(trace_context) if trace_context is not None else None
+            )
             try:
                 try:
                     inspect.signature(handler).bind(**call_input)
@@ -1764,6 +1767,9 @@ class AgentBase(ABC):
                     content=self._tool_error_content(e, "ambiguous_after_send"),
                     is_error=True,
                 )
+            finally:
+                if trace_token is not None:
+                    reset_trace_context(trace_token)
 
         if self._mcp is not None:
             try:
