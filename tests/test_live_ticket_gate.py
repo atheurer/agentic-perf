@@ -124,6 +124,27 @@ def test_completed_ticket_rejects_missing_review() -> None:
         gate._validate_completed_ticket(ticket)
 
 
+def test_pending_approval_requires_one_structured_request() -> None:
+    approval = {
+        "approval_request_id": "apr-1",
+        "status": "pending",
+    }
+    ticket = {
+        "custom_fields": {
+            "approval_requests": {
+                "apr-1": approval,
+                "apr-old": {"approval_request_id": "apr-old", "status": "cancelled"},
+            }
+        }
+    }
+    assert gate._pending_approval(ticket) == approval
+
+
+def test_pending_approval_rejects_missing_request() -> None:
+    with pytest.raises(gate.GateError, match="exactly one pending"):
+        gate._pending_approval({"custom_fields": {}})
+
+
 def safe_run_file() -> dict:
     return {
         "benchmarks": [

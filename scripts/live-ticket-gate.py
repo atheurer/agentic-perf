@@ -229,6 +229,24 @@ def _extract_run_file(ticket: dict[str, Any]) -> tuple[dict[str, Any], str] | No
     return None
 
 
+def _pending_approval(ticket: dict[str, Any]) -> dict[str, Any]:
+    raw = ticket.get("custom_fields", {}).get("approval_requests", {})
+    pending = (
+        [
+            value
+            for value in raw.values()
+            if isinstance(value, dict) and value.get("status") == "pending"
+        ]
+        if isinstance(raw, dict)
+        else []
+    )
+    if len(pending) != 1:
+        raise GateError(
+            f"approval pause must contain exactly one pending request, found {len(pending)}"
+        )
+    return pending[0]
+
+
 def _description(config: GateConfig) -> str:
     return f"""Live black-box agentic-perf gate.
 
@@ -474,7 +492,10 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                     return ticket_id
                 if status == "awaiting_customer_guidance":
                     validation = _extract_run_file(ticket)
-                    if approved or validation is None:
+                    if approved:
+                        time.sleep(config.poll_seconds)
+                        continue
+                    if validation is None:
                         raise GateError("ticket requested unrecognized human guidance")
                     run_file, controller = validation
                     if controller != config.controller:
@@ -483,25 +504,24 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                         )
                     validate_run_file(run_file, config)
                     _save_json(artifacts / "approved-run-file.json", run_file)
+                    approval = _pending_approval(ticket)
+                    approval_id = approval.get("approval_request_id")
+                    if not isinstance(approval_id, str) or not approval_id:
+                        raise GateError("pending approval has no approval_request_id")
                     _request(
                         client,
                         "POST",
-                        f"/api/v1/tickets/{ticket_id}/comments",
+                        f"/api/v1/tickets/{ticket_id}/approvals/{approval_id}/resolve",
                         json={
-                            "author": "user",
-                            "body": "Approved by live gate policy.",
-                        },
-                    )
-                    previous = ticket.get("previous_status")
-                    if not previous:
-                        raise GateError("approval pause did not record previous_status")
-                    _request(
-                        client,
-                        "POST",
-                        f"/api/v1/tickets/{ticket_id}/transition",
-                        json={
-                            "status": previous,
-                            "comment": "Live gate policy approved run",
+                            "decision": "approved",
+                            "comment": "Approved by live gate policy.",
+                            "validation_id": approval.get("validation_id"),
+                            "presented_run_file_digest": approval.get(
+                                "presented_run_file_digest"
+                            ),
+                            "execution_intent_digest": approval.get(
+                                "execution_intent_digest"
+                            ),
                         },
                     )
                     approved = True
