@@ -120,25 +120,25 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3162|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3173|staging.unlink
-agents/benchmark/server.py|3175|unlink
-agents/benchmark/server.py|3358|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3463|staging.unlink
-agents/benchmark/server.py|3465|unlink
-agents/benchmark/server.py|3783|open
-agents/benchmark/server.py|3864|artifact_filesystem.unlink
-agents/benchmark/server.py|3866|serial_log_path.unlink
-agents/benchmark/server.py|3897|metadata_file.write_bytes
-agents/benchmark/server.py|3904|metadata_file.write_text
-agents/benchmark/server.py|3910|metadata_file.write_text
-agents/benchmark/server.py|3965|merged_file.write_bytes
+agents/benchmark/server.py|3167|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3178|staging.unlink
+agents/benchmark/server.py|3180|unlink
+agents/benchmark/server.py|3363|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3468|staging.unlink
+agents/benchmark/server.py|3470|unlink
+agents/benchmark/server.py|3788|open
+agents/benchmark/server.py|3869|artifact_filesystem.unlink
+agents/benchmark/server.py|3871|serial_log_path.unlink
+agents/benchmark/server.py|3902|metadata_file.write_bytes
+agents/benchmark/server.py|3909|metadata_file.write_text
+agents/benchmark/server.py|3915|metadata_file.write_text
+agents/benchmark/server.py|3970|merged_file.write_bytes
 agents/infra/server.py|209|tempfile.NamedTemporaryFile
 agents/infra/server.py|217|staging.unlink
 agents/infra/server.py|219|unlink
 agents/infra/server.py|284|tempfile.mkdtemp
-orchestrator/main.py|1954|LOCK_FILE.parent.mkdir
-orchestrator/main.py|1986|LOCK_FILE.unlink
+orchestrator/main.py|1978|LOCK_FILE.parent.mkdir
+orchestrator/main.py|2010|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir
