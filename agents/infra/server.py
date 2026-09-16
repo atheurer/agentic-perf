@@ -31,11 +31,10 @@ from pydantic import BaseModel, ConfigDict
 
 from agents.infra.topology import discover_cache_topology
 from agents.server_utils import (
-    _resolve_vault_secret_name,
-    resolve_ssh_key,
+    build_secrets_provider as _build_secrets,
 )
 from agents.server_utils import (
-    build_secrets_provider as _build_secrets,
+    build_ssh_from_ticket,
 )
 from providers.execution import (
     AuditedFilesystem,
@@ -129,39 +128,17 @@ async def set_ssh_context(ticket_id: str) -> str:
     Must be called before any SSH operations. Resolves ssh_key_path and
     ssh_user from the ticket so credentials never appear in tool inputs.
     """
-    global _ssh, _ssh_key_stack, _state_store_url, _ticket_id
+    global _ssh, _state_store_url, _ticket_id
 
     _ticket_id = ticket_id
 
     _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    from providers.execution import AuditedAsyncHTTPClient
-
-    async with AuditedAsyncHTTPClient(timeout=15.0, headers=_store_headers()) as client:
-        r = await client.get(f"{_state_store_url}/api/v1/tickets/{ticket_id}")
-        r.raise_for_status()
-        ticket = r.json()
-
+    # Use the ticket-owned constructor so SSH operations preserve the same
+    # durable trace context and recorder as every other local MCP server.
+    _ssh, ticket = await build_ssh_from_ticket(ticket_id, _state_store_url)
     fields = ticket.get("custom_fields", {})
     ssh_key = fields.get("ssh_key_path")
-    ssh_user = fields.get("ssh_user", "root")
-
-    # Jumpstarter boards get reflashed — host keys
-    # change every time. Disable strict checking.
-    strict = "no" if fields.get("resource_provider") == "jumpstarter" else "accept-new"
-
-    vault_secret_name = _resolve_vault_secret_name(fields)
-    resolved_key = ssh_key
-    if vault_secret_name:
-        if _ssh_key_stack is not None:
-            await _ssh_key_stack.aclose()
-        _ssh_key_stack = AsyncExitStack()
-        sp = _get_secrets()
-        resolved_key = await _ssh_key_stack.enter_async_context(
-            resolve_ssh_key(ssh_key, sp, vault_secret_name),
-        )
-
-    _ssh = SSHExecutor(user=ssh_user, key_path=resolved_key, strict_host_key=strict)
-
+    ssh_user = _ssh.user
     return json.dumps(
         {
             "status": "ok",

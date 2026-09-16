@@ -330,7 +330,12 @@ async def validate_host(
     from providers.ssh import SSHExecutor
 
     if ssh_key_path:
-        ssh = SSHExecutor(user=ssh_user, key_path=ssh_key_path)
+        ssh = SSHExecutor(
+            user=ssh_user,
+            key_path=ssh_key_path,
+            trace_context=getattr(_ssh, "trace_context", None),
+            trace_recorder=getattr(_ssh, "trace_recorder", None),
+        )
     else:
         ssh = _ssh
     result = await ssh.run(host, "echo SSH_OK", timeout=15)
