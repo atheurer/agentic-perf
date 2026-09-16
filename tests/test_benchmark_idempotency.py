@@ -82,6 +82,7 @@ def _crucible_fixture(
 
     monkeypatch.setattr(benchmark_server, "_ensure_init", ensure_init)
     monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
+    monkeypatch.setattr(server_utils, "_state_store_token", lambda: "")
     monkeypatch.setattr(
         benchmark_server,
         "_get_validated_runfile",
