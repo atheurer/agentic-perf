@@ -92,8 +92,19 @@ def child_context(
 
 
 def current_trace_context() -> TraceContext | None:
-    """Return the context inherited by this async task, if one is bound."""
-    return _TRACE_CONTEXT.get()
+    """Return the task context, restoring ticket-child context when needed.
+
+    FastMCP invokes each tool in its own task. Those tasks do not inherit a
+    context bound while the server initialized, but ticket-owned MCP processes
+    receive a serialized causal context at launch.
+    """
+    context = _TRACE_CONTEXT.get()
+    if context is not None:
+        return context
+    return trace_context_from_environment(
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_id=os.environ.get("AGENT_NAME"),
+    )
 
 
 def bind_trace_context(context: TraceContext) -> Token[TraceContext | None]:
