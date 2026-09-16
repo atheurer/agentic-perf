@@ -37,16 +37,13 @@ _LOCAL_TOOLS = [
     ToolDefinition(
         name="present_runfile_for_approval",
         description=(
-            "Present the constructed run-file to the user for review and approval. "
-            "The user can approve, request changes, or reject. Returns a status string."
+            "Present the immutable run-file identified by a successful validation "
+            "to the user for review and approval. The user can approve, request "
+            "changes, or reject. Returns a status string."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "run_file": {
-                    "type": "object",
-                    "description": "The complete run-file to present",
-                },
                 "benchmark": {
                     "type": "string",
                     "description": "Benchmark name for context",
@@ -60,7 +57,7 @@ _LOCAL_TOOLS = [
                     "description": "Immutable validation record to approve",
                 },
             },
-            "required": ["run_file"],
+            "required": ["validation_id"],
         },
     ),
     ToolDefinition(
@@ -107,13 +104,11 @@ class BenchmarkAgent(AgentBase):
             return await self._do_request_clarification(question)
 
         async def _present_runfile_for_approval(
-            run_file: dict,
             benchmark: str | None = None,
             summary: str | None = None,
-            validation_id: str | None = None,
+            validation_id: str = "",
         ) -> str:
             return await self._request_benchmark_approval(
-                run_file,
                 benchmark=benchmark,
                 summary=summary,
                 validation_id=validation_id,
@@ -179,7 +174,6 @@ class BenchmarkAgent(AgentBase):
 
     async def _request_benchmark_approval(
         self,
-        run_file: dict[str, Any],
         *,
         benchmark: str | None,
         summary: str | None,
@@ -214,13 +208,6 @@ class BenchmarkAgent(AgentBase):
             return (
                 "Approval rejected: validation record has an invalid run-file digest."
             )
-        if (
-            hashlib.sha256(
-                json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            != digest
-        ):
-            return "Approval rejected: supplied run-file differs from immutable validation."
         approval_context = current_trace_context() or self.trace_context
         fence_headers = {
             "X-Agentic-Perf-Orchestrator-Session": os.environ.get(
