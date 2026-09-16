@@ -232,7 +232,7 @@ class _AuditedHTTPBase:
         if response is not None:
             try:
                 request_headers = response.request.headers
-            except RuntimeError:
+            except (AttributeError, RuntimeError):
                 # Lightweight provider test doubles may not attach a request.
                 pass
         attrs: dict[str, Any] = {
@@ -241,12 +241,14 @@ class _AuditedHTTPBase:
             "safe_headers": _safe_headers(request_headers),
         }
         if response is not None:
-            attrs["status_code"] = response.status_code
+            status_code = getattr(response, "status_code", None)
+            attrs["status_code"] = status_code
+            response_headers = getattr(response, "headers", {})
             attrs["provider_request_id"] = next(
                 (
-                    str(response.headers[h])[:256]
+                    str(response_headers[h])[:256]
                     for h in _REQUEST_ID_HEADERS
-                    if h in response.headers
+                    if h in response_headers
                 ),
                 None,
             )

@@ -676,7 +676,7 @@ class TestRunAgentTaskTimeout:
         dispatcher.events = events
         dispatcher._trace_contexts = {}
         dispatcher.clear_agent = MagicMock()
-        dispatcher.mark_done = MagicMock()
+        dispatcher.mark_done = AsyncMock()
 
         # Use a status not in PLAN_AGENT_STATUS to avoid
         # _advance_plan trying to reach the state store.
@@ -713,7 +713,7 @@ class TestRunAgentTaskTimeout:
         dispatcher.events = events
         dispatcher._trace_contexts = {}
         dispatcher.clear_agent = MagicMock()
-        dispatcher.mark_done = MagicMock()
+        dispatcher.mark_done = AsyncMock()
 
         async def transition(*_args, **_kwargs):
             ticket_events = events.get_events("SLOW-002", since=0, limit=100)
@@ -744,6 +744,7 @@ class TestRunAgentTaskTimeout:
         dispatcher.create_agent.return_value = agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = None
+        dispatcher.mark_done = AsyncMock()
 
         await run_agent_task(
             dispatcher, "executing_benchmark", "FAST-001", agent_task_timeout=0

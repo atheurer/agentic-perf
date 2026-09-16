@@ -483,6 +483,7 @@ class TestSkippedPlanSteps:
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
+        dispatcher.mark_done = AsyncMock()
 
         mock_get = MagicMock()
         mock_get.status_code = 200
@@ -534,6 +535,7 @@ class TestSkippedPlanSteps:
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
+        dispatcher.mark_done = AsyncMock()
 
         mock_get = MagicMock()
         mock_get.status_code = 200
