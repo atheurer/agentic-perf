@@ -12,6 +12,7 @@ from agents.benchmark.server import (
     _execution_intent_digest,
     _execution_plan_fingerprint,
     _get_validated_runfile,
+    _persist_validated_runfile,
     _runfile_fingerprint,
     _validation_creator,
     _validation_identity_headers,
@@ -32,7 +33,11 @@ from state_store.api.validations import (
 )
 from state_store.auth import Principal, make_auth_dependency
 from state_store.main import _set_audit_actor
-from state_store.models import CreateTicketRequest, CreateValidationRequest
+from state_store.models import (
+    CreateTicketRequest,
+    CreateValidationRequest,
+    ValidationRecordV1,
+)
 from state_store.store import TicketStore
 
 
@@ -453,6 +458,68 @@ async def test_audited_http_preserves_validation_capability_binding(tmp_path):
             assert create_response.status_code == 200
     finally:
         reset_trace_context(trace_token)
+
+
+async def test_validation_producer_sends_only_schema_owned_fields(monkeypatch):
+    posted: list[tuple[str, dict]] = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url):
+            return Response({"custom_fields": {"benchmark_validations": {}}})
+
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs))
+            if url.endswith("/capability"):
+                return Response({"capability": "capability-1"})
+            return Response({})
+
+    monkeypatch.setattr(
+        "providers.execution.AuditedAsyncHTTPClient", lambda **_kwargs: Client()
+    )
+    monkeypatch.setenv("TICKET_ID", "PERF-producer-schema")
+    monkeypatch.setenv("AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", "validator")
+    context = new_trace_context(
+        ticket_id="PERF-producer-schema", agent_id="benchmark-agent"
+    )
+    trace_token = bind_trace_context(context)
+    try:
+        validation_id = await _persist_validated_runfile(
+            {"benchmarks": [{"name": "sleep"}]},
+            "crucible",
+            "controller.example",
+            "params",
+            "a" * 64,
+            "crucible run",
+            "crucible validate",
+            "valid",
+            "1.0",
+        )
+    finally:
+        reset_trace_context(trace_token)
+
+    assert validation_id
+    create_payload = next(
+        kwargs["json"] for url, kwargs in posted if not url.endswith("/capability")
+    )
+    assert set(create_payload["record"]) == set(ValidationRecordV1.model_fields)
 
 
 async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_path):

@@ -249,12 +249,13 @@ async def _persist_validated_runfile(
         "validation_output": _validation_output_descriptor(
             ticket_id, validation_output
         ),
+    }
+    creator = _validation_creator()
+    _validation_records[validation_id] = record | {
         "state": "executable",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "creator": _validation_creator(),
+        "creator": creator,
     }
-    creator = record["creator"]
-    _validation_records[validation_id] = record
 
     state_store_url = os.environ.get(
         "STATE_STORE_URL",
