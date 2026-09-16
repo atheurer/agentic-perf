@@ -276,6 +276,15 @@ Do not substitute hosts or add roles. Set skip_teardown=true.
 """
 
 
+def _ticket_payload(config: GateConfig) -> dict[str, Any]:
+    """Build the ticket with gate-critical policy represented structurally."""
+    return {
+        "summary": "Live E2E gate: one-client Crucible sleep benchmark",
+        "description": _description(config),
+        "custom_fields": {"directives": {"no_host_mounts": True}},
+    }
+
+
 def _client(home: Path, store_url: str) -> httpx.Client:
     token_path = home / "secrets" / "api-token"
     deadline = time.monotonic() + 20
@@ -435,12 +444,11 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                 raise GateError(
                     f"isolated instance already has active tickets: {active}"
                 )
-            summary = "Live E2E gate: one-client Crucible sleep benchmark"
             ticket = _request(
                 client,
                 "POST",
                 "/api/v1/tickets",
-                json={"summary": summary, "description": _description(config)},
+                json=_ticket_payload(config),
             )
             ticket_id = ticket["id"]
             _request(

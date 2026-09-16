@@ -52,6 +52,11 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     assert "Do not mount `/proc`, `/sys`" in description
 
 
+def test_ticket_payload_structurally_forbids_host_mounts() -> None:
+    payload = gate._ticket_payload(config())
+    assert payload["custom_fields"]["directives"]["no_host_mounts"] is True
+
+
 def test_ticket_direction_distinguishes_ids_from_benchmark_params() -> None:
     description = gate._description(config())
     assert '`benchmarks[].ids: "1"`' in description
