@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 import pytest
 
-from agents.benchmark.server import _validate_run_command
+from agents.benchmark.server import (
+    _apply_runfile_safety_directives,
+    _validate_run_command,
+)
 from providers.skills.base import RunfileTemplate
 from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
 
@@ -52,6 +55,27 @@ def handlers(mock_provider):
         ssh=MockSSHExecutor(),
         skill_provider=mock_provider,
     )
+
+
+def test_no_host_mounts_directive_removes_the_key_from_nested_runfile(monkeypatch):
+    import agents.benchmark.server as srv
+
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {"custom_fields": {"directives": {"no_host_mounts": True}}},
+    )
+    original = {
+        "remotes": [
+            {"config": {"settings": {"host-mounts": [], "disable-tools": True}}}
+        ]
+    }
+
+    sanitized = _apply_runfile_safety_directives(original)
+
+    assert "host-mounts" not in sanitized["remotes"][0]["config"]["settings"]
+    assert sanitized["remotes"][0]["config"]["settings"]["disable-tools"] is True
+    assert original["remotes"][0]["config"]["settings"]["host-mounts"] == []
 
 
 @pytest.mark.asyncio

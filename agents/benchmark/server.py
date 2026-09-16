@@ -85,6 +85,32 @@ def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(mv_params, sort_keys=True).encode()).hexdigest()
 
 
+def _apply_runfile_safety_directives(run_file: dict[str, Any]) -> dict[str, Any]:
+    """Return a run-file that honours non-negotiable ticket safety directives.
+
+    Some Crucible schemas describe optional ``host-mounts`` as an array with a
+    minimum length.  An empty value is therefore invalid *and*, when the ticket
+    forbids host mounts, violates the request just as a populated value would.
+    Remove the key rather than relying on the model to infer that distinction.
+    """
+    directives = _ticket.get("custom_fields", {}).get("directives", {})
+    if not isinstance(directives, dict) or not directives.get("no_host_mounts"):
+        return run_file
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key != "host-mounts"
+            }
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    return sanitize(run_file)
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
@@ -2967,6 +2993,7 @@ async def validate_benchmark(
     starts a benchmark, deploys endpoints, or starts supporting services.
     """
     await _ensure_init()
+    run_file = _apply_runfile_safety_directives(run_file)
 
     harness_name = harness or "crucible"
     if harness_name != "crucible":
