@@ -242,8 +242,10 @@ seconds={config.seconds} and
 num-samples={config.samples}. Disable every profiling and collection tool. You
 may set endpoint setting `disable-tools` only to the JSON boolean `true`.
 
-Do not modify network interfaces, addresses, MTUs, queues, IRQ affinity,
-irqbalance, firewall, sysctls, storage, packages, or operating-system settings.
+You may install only prerequisite packages required for this Crucible benchmark
+on either supplied host. Do not modify network interfaces, addresses, MTUs,
+queues, IRQ affinity, irqbalance, firewall, sysctls, storage, or other
+operating-system settings.
 Never include a `host-mounts` key anywhere in the run file, including an empty
 list: absence of the key is the only allowed representation of no mounts.
 Do not mount `/proc`, `/sys`, or any other host path into the endpoint.

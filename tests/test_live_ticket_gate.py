@@ -52,6 +52,14 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     assert "Do not mount `/proc`, `/sys`" in description
 
 
+def test_ticket_direction_permits_only_required_prerequisite_packages() -> None:
+    description = gate._description(config())
+    assert (
+        "only prerequisite packages required for this Crucible benchmark" in description
+    )
+    assert "on either supplied host" in description
+
+
 def test_completed_ticket_requires_full_lifecycle_and_agents() -> None:
     ticket = {
         "status_trail": [
