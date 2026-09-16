@@ -988,6 +988,10 @@ async def _transition_to_guidance(
     task timeout) that operate outside an agent context.
     """
 
+    trace_context = current_trace_context() or new_trace_context(
+        ticket_id=ticket_id, agent_id="orchestrator"
+    )
+    context_token = bind_trace_context(trace_context)
     try:
         async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=_auth_headers()
@@ -1003,7 +1007,8 @@ async def _transition_to_guidance(
         logger.exception(
             f"Failed to transition {ticket_id} to awaiting_customer_guidance"
         )
-        return
+    finally:
+        reset_trace_context(context_token)
 
 
 async def _check_stale_tasks(

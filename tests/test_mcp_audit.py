@@ -21,7 +21,13 @@ from mcp.types import CallToolRequestParams, RequestParams
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
 from agents.mcp_client import AgentMCPClient, _ServerConnection
 from providers.redaction import get_shared_redactor
-from providers.tracing import LifecycleState, TraceContext
+from providers.tracing import (
+    LifecycleState,
+    TraceContext,
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 from providers.tracing.client import TraceClient
 from state_store.trace_store import TraceStore
 
@@ -45,6 +51,29 @@ def _terminate_process(process: subprocess.Popen[str], timeout: float = 5) -> st
         except subprocess.TimeoutExpired:
             output = expired.output or ""
     return output or ""
+
+
+def test_client_connection_audit_generates_correlation_from_ticket_context():
+    """Connection boundaries are valid before any tool-call context exists."""
+    events = []
+    client = AgentMCPClient(audit_hook=events.append)
+    connection = _ServerConnection(
+        name="ticket-server",
+        session=None,
+        transport="stdio",
+        ticket_id="PERF-connection",
+        agent_id="triage",
+    )
+    token = bind_trace_context(
+        new_trace_context(ticket_id="PERF-connection", agent_id="triage")
+    )
+    try:
+        client._record_boundary(connection, LifecycleState.CONNECTING)
+    finally:
+        reset_trace_context(token)
+
+    assert events[0].mcp.session_id == connection.session_id
+    assert events[0].mcp.correlation_request_id
 
 
 @pytest.mark.skipif(

@@ -690,11 +690,14 @@ class AgentMCPClient:
             or TraceContext(
                 ticket_id=conn.ticket_id,
                 agent_id=conn.agent_id,
-                mcp_correlation_request_id=uuid.uuid4().hex,
             )
         )
         if not context.ticket_id:
             return
+        if not context.mcp_correlation_request_id:
+            context = TraceContext.model_validate(
+                context.model_dump() | {"mcp_correlation_request_id": uuid.uuid4().hex}
+            )
         terminal = state in {
             LifecycleState.FAILED,
             LifecycleState.CANCELLED,
