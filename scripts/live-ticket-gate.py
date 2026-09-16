@@ -241,6 +241,9 @@ benchmark with benchmark ID 1 bound only to the system under test. Set
 seconds={config.seconds} and
 num-samples={config.samples}. Disable every profiling and collection tool. You
 may set endpoint setting `disable-tools` only to the JSON boolean `true`.
+Express benchmark ID 1 only as `benchmarks[].ids: "1"`, and express client ID 1
+only as the client engine's `ids: [1]`. Never add `benchmark-id` or `client-id`
+to `mv-params`; they are structural IDs, not sleep benchmark parameters.
 
 You may install only prerequisite packages required for this Crucible benchmark
 on either supplied host. Do not modify network interfaces, addresses, MTUs,

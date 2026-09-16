@@ -52,6 +52,13 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     assert "Do not mount `/proc`, `/sys`" in description
 
 
+def test_ticket_direction_distinguishes_ids_from_benchmark_params() -> None:
+    description = gate._description(config())
+    assert '`benchmarks[].ids: "1"`' in description
+    assert "client engine's `ids: [1]`" in description
+    assert "Never add `benchmark-id` or `client-id`" in description
+
+
 def test_ticket_direction_permits_only_required_prerequisite_packages() -> None:
     description = gate._description(config())
     assert (
