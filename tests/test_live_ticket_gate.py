@@ -129,6 +129,14 @@ def test_completed_ticket_rejects_missing_review() -> None:
         gate._validate_completed_ticket(ticket)
 
 
+def test_dispatch_claim_detection_covers_current_and_legacy_fields() -> None:
+    assert gate._has_dispatch_claim({"custom_fields": {"claim": {"id": "new"}}})
+    assert gate._has_dispatch_claim(
+        {"custom_fields": {"dispatch_claim": {"id": "legacy"}}}
+    )
+    assert not gate._has_dispatch_claim({"custom_fields": {"claim": None}})
+
+
 def test_pending_approval_requires_one_structured_request() -> None:
     approval = {
         "approval_request_id": "apr-1",
