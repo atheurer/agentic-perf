@@ -915,11 +915,17 @@ async def run_agent_task(
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        if (
-            success
-            and not dispatcher.is_deposed()
-            and status in PLAN_AGENT_STATUS.values()
-        ):
+        deposed = dispatcher.is_deposed()
+        plan_managed = status in PLAN_AGENT_STATUS.values()
+        logger.info(
+            "Completion gate for %s: success=%s deposed=%s plan_managed=%s status=%s",
+            ticket_id,
+            success,
+            deposed,
+            plan_managed,
+            status,
+        )
+        if success and not deposed and plan_managed:
             try:
                 await _advance_plan(
                     dispatcher.store_url,
@@ -934,7 +940,7 @@ async def run_agent_task(
         # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
         # The triage agent transitions the ticket to awaiting_hardware
         # itself; we force-close here if stop_after_step == "triage".
-        if success and not dispatcher.is_deposed() and status == "triage_pending":
+        if success and not deposed and status == "triage_pending":
             try:
                 async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
