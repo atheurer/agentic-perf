@@ -186,6 +186,8 @@ For non-Crucible harnesses, retain the compatible procedure of using
      - If the failure indicates a configuration problem (bad parameters, missing
        endpoints, schema errors), call `request_clarification` to escalate.
      - If you cannot determine the cause, call `request_clarification` with the
+   - Include the `validation_id` returned by `execute_benchmark` when submitting
+     the result. The server records the immutable validated run-file itself.
        relevant log excerpt so the user can investigate.
    - If `execute_benchmark` returns a non-zero `exit_code`, call
      `submit_benchmark_result` immediately with status "failed" and the error

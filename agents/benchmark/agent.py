@@ -69,6 +69,10 @@ _LOCAL_TOOLS = [
             "type": "object",
             "properties": {
                 "run_id": {"type": "string"},
+                "validation_id": {
+                    "type": "string",
+                    "description": "Validation identity returned by execute_benchmark",
+                },
                 "benchmark_status": {
                     "type": "string",
                     "enum": ["completed", "failed"],
@@ -97,6 +101,7 @@ class BenchmarkAgent(AgentBase):
         self._secrets_provider = secrets_provider
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
+        self._active_validation_id: str | None = None
 
         local_tools = list(_LOCAL_TOOLS)
 
@@ -195,6 +200,7 @@ class BenchmarkAgent(AgentBase):
         if not isinstance(validation, dict):
             validation = cf.get("validated_run_file") or {}
         validation_id = validation_id or validation.get("validation_id")
+        self._active_validation_id = validation_id
         intent = validation.get("execution_intent_digest")
         immutable_run_file = validation.get("run_file")
         if not validation_id or not intent or not isinstance(immutable_run_file, dict):
@@ -669,9 +675,23 @@ class BenchmarkAgent(AgentBase):
         fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
-            "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
         }
+        validation_id = result.get("validation_id") or self._active_validation_id
+        run_file_used = result.get("run_file_used", {})
+        if validation_id:
+            ticket = await self._get_ticket(ticket_id)
+            records = (
+                ticket.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+            )
+            validation = records.get(validation_id, {})
+            if isinstance(validation, dict) and isinstance(
+                validation.get("run_file"), dict
+            ):
+                run_file_used = validation["run_file"]
+        fields["run_file_used"] = run_file_used
         # Accumulate output_dirs across loop-back runs
         # so the evaluate agent can access all artifacts.
         if result.get("output_dir"):

@@ -3827,6 +3827,7 @@ async def execute_benchmark(
     response = {
         "status": "completed" if result.exit_code == 0 else "failed",
         "exit_code": result.exit_code,
+        "validation_id": validation_id,
         "run_dir": run_dir,
         "run_id": run_id or f"unknown-{run_uuid}",
         "harness": "crucible",
