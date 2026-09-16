@@ -291,6 +291,11 @@ def make_benchmark_handlers(
 
     import agents.benchmark.server as srv
 
+    # These handlers bypass normal MCP initialization and use in-process
+    # fakes.  Keep their operation registry local even when an earlier auth
+    # test populated the session sandbox's API-token file/environment.
+    _os.environ.pop("AGENTIC_PERF_API_TOKEN", None)
+
     srv._ssh = ssh
     srv._skill_provider = skill_provider or MockSkillProvider()
     srv._repo_cache = repo_cache

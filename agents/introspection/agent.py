@@ -1181,7 +1181,7 @@ class IntrospectionAgent:
                 "Suggest a specific action in 1-2 sentences."
             ),
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=1000,
         )
         try:
             self._record_usage(ticket_id, response)

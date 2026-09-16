@@ -375,6 +375,13 @@ def test_validation_route_constructs_server_authoritative_creator(tmp_path):
     record = _record("val-" + "c" * 32)
     record.pop("creator")
     record.pop("server_pid")
+    record.update(
+        {
+            "attempt_id": "attempt-1",
+            "execution_intent_id": "intent-1",
+            "execution_plan_step_id": "benchmark-step-1",
+        }
+    )
     body = CreateValidationRequest(record=record, expected_version=0)
     request.headers = headers | {"X-Agentic-Perf-Validation-Capability": capability}
     result = create_validation(ticket_id, body, request)
@@ -384,6 +391,9 @@ def test_validation_route_constructs_server_authoritative_creator(tmp_path):
         "action_id": "action-1",
         "request_id": "request-1",
     }
+    assert result["record"]["attempt_id"] == "attempt-1"
+    assert result["record"]["execution_intent_id"] == "intent-1"
+    assert result["record"]["execution_plan_step_id"] == "benchmark-step-1"
 
 
 def _app(tmp_path) -> FastAPI:
