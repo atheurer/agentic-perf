@@ -534,6 +534,50 @@ def cmd_reply(args):
         if _handle_cli_slash_command(args, client, t):
             return
 
+    # Benchmark approvals are durable capabilities, not generic guidance.
+    # Resolve the one pending request before any resume transition; the state
+    # store intentionally cancels unresolved approvals on a normal resume.
+    normalized = args.message.strip().lower()
+    decision = {
+        "approve": "approved",
+        "approved": "approved",
+        "reject": "rejected",
+        "rejected": "rejected",
+        "request changes": "changes_requested",
+        "changes_requested": "changes_requested",
+    }.get(normalized)
+    if decision and not args.abort:
+        approvals = client.get(f"/api/v1/tickets/{args.ticket_id}/approvals")
+        approvals.raise_for_status()
+        pending = [
+            item
+            for item in approvals.json().get("approvals", [])
+            if item.get("status") == "pending"
+        ]
+        if len(pending) > 1:
+            ids = ", ".join(item["approval_request_id"] for item in pending)
+            print(
+                "Multiple benchmark approvals are pending; "
+                f"specify one explicitly: {ids}",
+                file=sys.stderr,
+            )
+            return
+        if len(pending) == 1:
+            comment = client.post(
+                f"/api/v1/tickets/{args.ticket_id}/comments",
+                json={"author": "user", "body": args.message},
+            )
+            comment.raise_for_status()
+            comment_id = comment.json().get("id")
+            resolved = client.post(
+                f"/api/v1/tickets/{args.ticket_id}/approvals/"
+                f"{pending[0]['approval_request_id']}/resolve",
+                json={"decision": decision, "comment_id": comment_id},
+            )
+            resolved.raise_for_status()
+            print(f"Benchmark approval {pending[0]['approval_request_id']} {decision}.")
+            return
+
     r = client.post(
         f"/api/v1/tickets/{args.ticket_id}/comments",
         json={
