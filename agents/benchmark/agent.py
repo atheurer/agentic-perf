@@ -256,9 +256,6 @@ class BenchmarkAgent(AgentBase):
             "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",
-            # Arcaflow MCP tools for plugin schema discovery
-            "plugin_list",
-            "plugin_describe",
         },
     }
     _HARNESS_EXCLUDED_TOOLS: dict[str, set[str]] = {
