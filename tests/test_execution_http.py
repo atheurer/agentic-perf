@@ -338,7 +338,7 @@ async def test_http_error_status_is_terminal_without_secret_payload(
 
 
 @pytest.mark.asyncio
-async def test_mutation_without_audit_readiness_fails_before_send() -> None:
+async def test_mutation_without_audit_readiness_fails_before_send(monkeypatch) -> None:
     called = False
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -347,6 +347,9 @@ async def test_mutation_without_audit_readiness_fails_before_send() -> None:
         return httpx.Response(201)
 
     token = _context()
+    # The isolated dev-instance test runner exports the configured store URL;
+    # this test specifically exercises the missing-recorder contract.
+    monkeypatch.delenv("STATE_STORE_URL", raising=False)
     try:
         client = AuditedAsyncHTTPClient(
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
