@@ -71,7 +71,9 @@ def test_shared_store_serializes_concurrent_event_transactions(tmp_path: Path) -
     """Concurrent ASGI handlers share a store instance without nested BEGINs."""
     with TraceStore(tmp_path / "trace.db") as store:
         with ThreadPoolExecutor(max_workers=8) as executor:
-            stored = list(executor.map(lambda _: store.insert_event(event()), range(24)))
+            stored = list(
+                executor.map(lambda _: store.insert_event(event()), range(24))
+            )
     assert sorted(item.global_seq for item in stored) == list(range(1, 25))
 
 
