@@ -158,7 +158,9 @@ def _validation_creator() -> dict[str, Any]:
 
     context = current_trace_context()
     return {
-        "agent_id": context.agent_id if context else "",
+        # The capability contract uses the stable role name, while this MCP
+        # process is launched under the executable identity benchmark-agent.
+        "agent_id": "benchmark",
         "invocation_id": str(context.invocation_id) if context else "",
         "action_id": context.action_id if context else "",
         "request_id": (context.mcp_correlation_request_id if context else "")
@@ -260,10 +262,9 @@ async def _persist_validated_runfile(
         return validation_id
 
     try:
-        headers = {}
-        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-        if api_token:
-            headers["Authorization"] = f"Bearer {api_token}"
+        from agents.server_utils import ticket_state_headers
+
+        headers = ticket_state_headers()
         async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=headers,
@@ -2162,8 +2163,9 @@ async def execute_benchmark(
             from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            from agents.server_utils import ticket_state_headers
+
+            headers = ticket_state_headers()
             async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
                 consumed = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/approvals/{approval_request_id}/consume",
@@ -4103,8 +4105,9 @@ async def execute_boot_time_test(
             from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            from agents.server_utils import ticket_state_headers
+
+            headers = ticket_state_headers()
             ticket_id = _ticket.get("id", "")
             if ticket_id:
                 async with AuditedAsyncHTTPClient(
@@ -4118,7 +4121,7 @@ async def execute_boot_time_test(
                     new_dir = response["output_dir"]
                     if new_dir not in existing:
                         existing.append(new_dir)
-                    await _client.patch(
+                    update_response = await _client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                         json={
                             "fields": {
@@ -4127,6 +4130,7 @@ async def execute_boot_time_test(
                             }
                         },
                     )
+                    update_response.raise_for_status()
                 logger.info(
                     f"[boot-time] Saved output_dir to ticket"
                     f" {ticket_id} ({len(existing)} total)"

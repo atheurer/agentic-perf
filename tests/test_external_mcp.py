@@ -260,6 +260,27 @@ async def test_ticket_server_connection_injects_required_context():
 
 
 @pytest.mark.asyncio
+async def test_benchmark_ticket_server_alone_receives_validator_token(monkeypatch):
+    monkeypatch.setattr(
+        "state_store.auth.read_validator_token_from_file",
+        lambda: "validator-secret",
+    )
+    client = AgentMCPClient()
+    client.connect = AsyncMock()
+
+    await client.connect_ticket_server(
+        "/project/agents/benchmark/server.py",
+        name="benchmark",
+        ticket_id="PERF-12345678",
+        state_store_url="http://state-store:8090",
+        agent_name="benchmark-agent",
+    )
+
+    env = client.connect.await_args.kwargs["env"]
+    assert env["AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN"] == "validator-secret"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ticket_id", "state_store_url", "agent_name", "missing"),
     [

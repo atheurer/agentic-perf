@@ -164,6 +164,12 @@ class AgentMCPClient:
             "STATE_STORE_URL": state_store_url,
             "AGENT_NAME": agent_name,
         }
+        if agent_name == "benchmark-agent":
+            from state_store.auth import read_validator_token_from_file
+
+            validator_token = read_validator_token_from_file()
+            if validator_token:
+                required["AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN"] = validator_token
         session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
         epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
         if session_id and epoch:

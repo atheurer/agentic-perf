@@ -13,6 +13,7 @@ from agents.benchmark.server import (
     _execution_plan_fingerprint,
     _get_validated_runfile,
     _runfile_fingerprint,
+    _validation_creator,
     _validation_output_descriptor,
 )
 from providers.redaction import get_shared_redactor
@@ -85,6 +86,18 @@ def test_validation_output_uses_shared_redactor_for_all_persisted_surfaces():
 
     blob = TRACE_PAYLOAD_DIR / descriptor["blob_ref"].split(":", 1)[1]
     assert sentinel.encode() not in blob.read_bytes()
+
+
+def test_validation_creator_uses_capability_role_identity(monkeypatch):
+    context = SimpleNamespace(
+        agent_id="benchmark-agent",
+        invocation_id="invocation-1",
+        action_id="action-1",
+        mcp_correlation_request_id="request-1",
+    )
+    monkeypatch.setattr("providers.tracing.current_trace_context", lambda: context)
+
+    assert _validation_creator()["agent_id"] == "benchmark"
 
 
 def test_sequential_validations_are_immutable_and_exact_id_addressable(tmp_path):

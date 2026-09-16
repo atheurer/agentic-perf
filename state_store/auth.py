@@ -85,6 +85,16 @@ def load_or_generate_validator_token() -> str:
     return token
 
 
+def read_validator_token_from_file() -> str:
+    """Read the benchmark-validator token without creating one."""
+    env_token = os.environ.get(VALIDATOR_TOKEN_ENV_VAR)
+    if env_token:
+        return env_token
+    if VALIDATOR_TOKEN_FILE.exists():
+        return VALIDATOR_TOKEN_FILE.read_text().strip()
+    return ""
+
+
 def read_token_from_file() -> str:
     """Read the API token from the secrets file.
 

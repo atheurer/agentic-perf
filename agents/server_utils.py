@@ -41,6 +41,39 @@ def _state_store_token() -> str:
     return token
 
 
+def ticket_state_headers() -> dict[str, str]:
+    """Return state-store authentication and active ticket fence headers."""
+    headers: dict[str, str] = {}
+    api_token = _state_store_token()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    from agents.fencing import current_fence_context
+
+    fence = current_fence_context()
+    session_id = (
+        fence.session_id
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    )
+    epoch = (
+        str(fence.epoch)
+        if fence
+        else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    )
+    claim_id = fence.claim_id if fence else os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
+    if claim_id:
+        headers["X-Agentic-Perf-Claim-Id"] = claim_id
+    return headers
+
+
 def setup_project_path() -> str:
     """Add the project root to sys.path. Returns the project root path."""
     root = str(Path(__file__).resolve().parents[1])
@@ -1137,10 +1170,7 @@ async def assert_ticket_active(
     if not ticket_id:
         return {}
 
-    headers = {}
-    api_token = _state_store_token()
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
+    headers = ticket_state_headers()
     from agents.fencing import current_fence_context
 
     fence = current_fence_context()
@@ -1155,14 +1185,6 @@ async def assert_ticket_active(
         else os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
     )
     claim_id = fence.claim_id if fence else os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
-    if session_id and epoch:
-        headers.update(
-            {
-                "X-Agentic-Perf-Orchestrator-Session": session_id,
-                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
-            }
-        )
-
     async with AuditedAsyncHTTPClient(timeout=15.0, headers=headers) as client:
         r = await client.get(
             f"{state_store_url}/api/v1/tickets/{ticket_id}",

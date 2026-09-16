@@ -545,6 +545,23 @@ class TestBudgetGraceNonRegression:
 
 
 class TestAssertTicketActive:
+    def test_ticket_state_headers_include_claim_fence(self, monkeypatch):
+        from agents.fencing import bind_fence_context
+        from agents.server_utils import ticket_state_headers
+
+        bind_fence_context(None)
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "api-token")
+        monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "session-1")
+        monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "7")
+        monkeypatch.setenv("AGENTIC_PERF_CLAIM_ID", "claim-1")
+
+        assert ticket_state_headers() == {
+            "Authorization": "Bearer api-token",
+            "X-Agentic-Perf-Orchestrator-Session": "session-1",
+            "X-Agentic-Perf-Orchestrator-Epoch": "7",
+            "X-Agentic-Perf-Claim-Id": "claim-1",
+        }
+
     @pytest.mark.asyncio
     async def test_rejects_aborted_ticket(self):
         """assert_ticket_active returns rejection for aborted tickets."""
