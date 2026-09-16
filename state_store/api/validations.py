@@ -134,7 +134,7 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
         creator["session_id"] = grant["session"]
     if grant["epoch"]:
         creator["session_epoch"] = grant["epoch"]
-    record = body.record.model_dump(mode="json")
+    record = body.record.model_dump(mode="json", exclude_none=True)
     record["creator"] = creator
     canonical_runfile_digest = hashlib.sha256(
         json.dumps(body.record.run_file, sort_keys=True, separators=(",", ":")).encode()

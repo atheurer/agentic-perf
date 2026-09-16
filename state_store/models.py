@@ -385,6 +385,16 @@ class ValidationRecordV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     validation_id: str = Field(pattern=r"^val-[a-f0-9]{32}$")
+    # Wave-7 execution fencing binds a durable operation to the validation
+    # that authorized it.  Keep these optional so validation records created
+    # before that extension remain readable and addressable.
+    attempt_id: str | None = Field(default=None, min_length=1, max_length=128)
+    execution_intent_id: str | None = Field(default=None, min_length=1, max_length=128)
+    execution_plan_step_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
     run_file: dict[str, Any]
     runfile_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     harness: Literal["crucible"]
