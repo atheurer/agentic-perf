@@ -11,6 +11,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -68,14 +69,78 @@ async def _ensure_init():
 
 
 # ---------------------------------------------------------------------------
-# Regex helpers
+# Regex helpers — two-stage scan + validate
 # ---------------------------------------------------------------------------
 
-IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-FQDN_RE = re.compile(
-    r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
-    r"(?:\.[a-zA-Z]{2,})+\b"
+# Stage-1 candidate patterns: broad regexes that search within free-form
+# text (e.g. "controller=10.1.2.3", "root@host.example.com:22").
+# Candidates are validated in stage 2 before acceptance.
+# Do not accept an IPv4-looking substring from a larger hostname or dotted
+# sequence (``10.1.2.3.999`` must not yield ``10.1.2.3``).  A trailing dot is
+# still allowed when it is sentence punctuation rather than another label.
+_IP_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9.-])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9-])(?!\.[A-Za-z0-9-])"
 )
+_FQDN_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9-])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)"
+    r"+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?![A-Za-z0-9-])",
+)
+
+# Stage-2 FQDN label validation
+_DNS_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+
+def _is_valid_ip(candidate: str) -> bool:
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_fqdn(token: str) -> bool:
+    if len(token) > 253 or "." not in token:
+        return False
+    labels = token.rstrip(".").split(".")
+    if len(labels) < 2:
+        return False
+    if not all(_DNS_LABEL.fullmatch(lb) for lb in labels):
+        return False
+    # Final label must be alphabetic — this naturally rejects bare IPs
+    # that _FQDN_CANDIDATE may surface (e.g. "10.1.2.3" has final label "3").
+    return labels[-1].isalpha() and len(labels[-1]) >= 2
+
+
+def _extract_hosts(line: str) -> list[str]:
+    """Extract IPs and FQDNs from a line via two-stage scan + validate.
+
+    Stage 1 finds candidates by scanning the raw text (handles
+    ``key=ip``, ``user@host``, ``host:port`` etc.).
+    Stage 2 validates each candidate before acceptance.
+    Overlapping matches are resolved by span containment: an IP
+    embedded inside a validated FQDN (e.g. ``10.1.2.3.example.com``)
+    is suppressed so only the FQDN is returned.
+    """
+    ip_hits = [
+        (m.group(), m.start(), m.end())
+        for m in _IP_CANDIDATE.finditer(line)
+        if _is_valid_ip(m.group())
+    ]
+    fqdn_hits = [
+        (m.group(), m.start(), m.end())
+        for m in _FQDN_CANDIDATE.finditer(line)
+        if _is_fqdn(m.group())
+    ]
+    fqdn_spans = [(s, e) for _, s, e in fqdn_hits]
+    filtered_ips = [
+        hit
+        for hit in ip_hits
+        if not any(fs <= hit[1] and hit[2] <= fe for fs, fe in fqdn_spans)
+    ]
+    all_hits = sorted(filtered_ips + fqdn_hits, key=lambda t: t[1])
+    return list(dict.fromkeys(text for text, _, _ in all_hits))
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +174,7 @@ async def parse_host_config(text: str) -> str:
         if key_match:
             result["ssh_key_path"] = key_match.group(1)
 
-        ips = IP_RE.findall(line)
-        fqdns = FQDN_RE.findall(line)
-        hosts_in_line = ips + fqdns
+        hosts_in_line = _extract_hosts(line)
 
         if hosts_in_line:
             if re.search(r"controller|server", lower):
@@ -123,9 +186,14 @@ async def parse_host_config(text: str) -> str:
             else:
                 all_hosts.extend(hosts_in_line)
 
+    if result["controller"]:
+        result["targets"] = [h for h in result["targets"] if h != result["controller"]]
+
     if not result["controller"] and all_hosts:
+        all_hosts = list(dict.fromkeys(all_hosts))
         result["controller"] = all_hosts[0]
         result["targets"] = all_hosts[1:]
+    result["targets"] = list(dict.fromkeys(result["targets"]))
 
     return json.dumps(result)
 
@@ -214,6 +282,14 @@ async def check_available_resources(
             }
         )
     result = await prov.check_available(requirements or {})
+
+    # Code-enforce: when a specific device was requested by
+    # name and is unavailable, escalate to HITL immediately.
+    # Retrying won't help — the board is leased, offline, or
+    # doesn't exist.  The result includes the reason and any
+    # alternatives of the same board type.
+    if not result.get("available") and result.get("selector", "").startswith("name="):
+        await _auto_escalate_named_device(result)
 
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
@@ -443,6 +519,45 @@ async def get_accumulated_metadata() -> str:
         if key in _last_reservation:
             result[key] = _last_reservation[key]
     return json.dumps(result)
+
+
+async def _auto_escalate_named_device(result: dict) -> None:
+    """Transition ticket to HITL when a named device is unavailable.
+
+    Called from check_available_resources when a name= selector
+    returns unavailable.  Retrying is pointless for a specific
+    device — escalate immediately so the user can choose an
+    alternative or wait.
+    """
+    ticket_id = os.environ.get("TICKET_ID", "")
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if not ticket_id:
+        return
+
+    reason = result.get("error", "Device unavailable")
+    alternatives = result.get("alternatives", [])
+    comment = f"Requested device unavailable: {reason}"
+    if alternatives:
+        comment += f" Available alternatives: {', '.join(alternatives)}"
+
+    try:
+        from providers.execution import AuditedAsyncHTTPClient
+
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+            response = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": "awaiting_customer_guidance",
+                    "comment": comment,
+                },
+            )
+            response.raise_for_status()
+    except Exception:
+        logger.exception("Failed to escalate named device unavailability")
 
 
 async def get_registered_tools():

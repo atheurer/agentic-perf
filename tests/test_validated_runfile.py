@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -327,3 +327,67 @@ class TestBuildMessagesInjection:
         )
         content = _build_messages_from_ticket(ticket)
         assert "Previously Validated Run-File" in content
+
+
+def test_approval_tool_requires_validation_id_not_reconstructed_runfile():
+    tool = next(
+        tool
+        for tool in __import__(
+            "agents.benchmark.agent", fromlist=["_LOCAL_TOOLS"]
+        )._LOCAL_TOOLS
+        if tool.name == "present_runfile_for_approval"
+    )
+
+    assert tool.input_schema["required"] == ["validation_id"]
+    assert "run_file" not in tool.input_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_approval_presents_runfile_from_immutable_validation(monkeypatch):
+    run_file = {"benchmarks": [{"name": "sleep", "ids": "1"}]}
+    digest = hashlib.sha256(
+        json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    validation = {
+        "validation_id": "val-test",
+        "execution_intent_digest": "a" * 64,
+        "execution_intent_id": "val-test",
+        "attempt_id": "val-test",
+        "runfile_fingerprint": digest,
+        "run_file": run_file,
+    }
+    ticket = {
+        "custom_fields": {
+            "benchmark_validations": {"records": {"val-test": validation}},
+            "claim": {"claim_id": "claim-test"},
+        }
+    }
+    response = Mock()
+    response.raise_for_status = Mock()
+    response.json.return_value = {"approval_request_id": "apr-test"}
+
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    agent._ticket_id = "PERF-TEST"
+    agent.store_url = "http://state-store"
+    agent.trace_context = None
+    agent._get_ticket = AsyncMock(return_value=ticket)
+    agent._client = Mock(post=AsyncMock(return_value=response))
+    agent._add_comment = AsyncMock()
+    agent._transition_ticket = AsyncMock()
+    agent._wait_for_benchmark_approval = AsyncMock(return_value="approved")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "session-test")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "1")
+    monkeypatch.setenv("AGENTIC_PERF_CLAIM_ID", "claim-test")
+
+    result = await agent._request_benchmark_approval(
+        benchmark="sleep",
+        summary="five-second sleep",
+        validation_id="val-test",
+    )
+
+    assert result == "approved"
+    request_json = agent._client.post.await_args.kwargs["json"]
+    assert request_json["validation_id"] == "val-test"
+    assert request_json["presented_run_file_digest"] == digest
+    approval_comment = agent._add_comment.await_args.args[1]
+    assert json.dumps(run_file, indent=2) in approval_comment

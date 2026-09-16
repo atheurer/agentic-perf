@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -726,12 +727,34 @@ async def run_agent_task(
                             model=llm_override.get("model", ""),
                             api=llm_override.get("api", ""),
                         )
+                        override_llm.default_timeout = config.llm_timeout
                         override_effort = llm_override.get("reasoning_effort")
                         if override_effort:
                             override_llm.reasoning_effort = override_effort
                         override_max_tokens = llm_override.get("max_tokens")
                         if override_max_tokens:
                             override_llm.max_tokens = int(override_max_tokens)
+                        override_timeout = llm_override.get("timeout")
+                        if override_timeout is not None:
+                            try:
+                                if isinstance(override_timeout, bool):
+                                    raise TypeError("timeout must not be boolean")
+                                t = float(override_timeout)
+                                if math.isnan(t) or math.isinf(t) or t < 0:
+                                    raise ValueError(
+                                        f"timeout must be finite and"
+                                        f" non-negative, got {t}"
+                                    )
+                                override_llm.default_timeout = t
+                                logger.info(
+                                    f"Timeout override for {ticket_id}:"
+                                    f" {override_llm.default_timeout}s"
+                                )
+                            except (ValueError, TypeError, OverflowError):
+                                logger.warning(
+                                    f"Invalid timeout override for"
+                                    f" {ticket_id}: {override_timeout!r}"
+                                )
                         agent.llm = override_llm
                         logger.info(
                             f"LLM override for {ticket_id}:"
@@ -1508,6 +1531,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         instance_name=config.instance_name,
         ttl_seconds=config.leader_lease_ttl_seconds,
     )
+    # Lease acquisition is itself a mutating, audited control-plane request.
+    # Bind a durable control trace before using the audited HTTP client; ticket
+    # traces are created later by the dispatcher for individual work items.
+    bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
     await leader_lease.acquire()
     if leader_lease.epoch is None:
         raise RuntimeError("state store returned no leader fencing epoch")

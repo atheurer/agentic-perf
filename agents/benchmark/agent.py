@@ -37,16 +37,13 @@ _LOCAL_TOOLS = [
     ToolDefinition(
         name="present_runfile_for_approval",
         description=(
-            "Present the constructed run-file to the user for review and approval. "
-            "The user can approve, request changes, or reject. Returns a status string."
+            "Present the immutable run-file identified by a successful validation "
+            "to the user for review and approval. The user can approve, request "
+            "changes, or reject. Returns a status string."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "run_file": {
-                    "type": "object",
-                    "description": "The complete run-file to present",
-                },
                 "benchmark": {
                     "type": "string",
                     "description": "Benchmark name for context",
@@ -60,7 +57,7 @@ _LOCAL_TOOLS = [
                     "description": "Immutable validation record to approve",
                 },
             },
-            "required": ["run_file"],
+            "required": ["validation_id"],
         },
     ),
     ToolDefinition(
@@ -72,6 +69,10 @@ _LOCAL_TOOLS = [
             "type": "object",
             "properties": {
                 "run_id": {"type": "string"},
+                "validation_id": {
+                    "type": "string",
+                    "description": "Validation identity returned by execute_benchmark",
+                },
                 "benchmark_status": {
                     "type": "string",
                     "enum": ["completed", "failed"],
@@ -100,6 +101,7 @@ class BenchmarkAgent(AgentBase):
         self._secrets_provider = secrets_provider
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
+        self._active_validation_id: str | None = None
 
         local_tools = list(_LOCAL_TOOLS)
 
@@ -107,13 +109,11 @@ class BenchmarkAgent(AgentBase):
             return await self._do_request_clarification(question)
 
         async def _present_runfile_for_approval(
-            run_file: dict,
             benchmark: str | None = None,
             summary: str | None = None,
-            validation_id: str | None = None,
+            validation_id: str = "",
         ) -> str:
             return await self._request_benchmark_approval(
-                run_file,
                 benchmark=benchmark,
                 summary=summary,
                 validation_id=validation_id,
@@ -179,7 +179,6 @@ class BenchmarkAgent(AgentBase):
 
     async def _request_benchmark_approval(
         self,
-        run_file: dict[str, Any],
         *,
         benchmark: str | None,
         summary: str | None,
@@ -201,6 +200,7 @@ class BenchmarkAgent(AgentBase):
         if not isinstance(validation, dict):
             validation = cf.get("validated_run_file") or {}
         validation_id = validation_id or validation.get("validation_id")
+        self._active_validation_id = validation_id
         intent = validation.get("execution_intent_digest")
         immutable_run_file = validation.get("run_file")
         if not validation_id or not intent or not isinstance(immutable_run_file, dict):
@@ -214,13 +214,6 @@ class BenchmarkAgent(AgentBase):
             return (
                 "Approval rejected: validation record has an invalid run-file digest."
             )
-        if (
-            hashlib.sha256(
-                json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            != digest
-        ):
-            return "Approval rejected: supplied run-file differs from immutable validation."
         approval_context = current_trace_context() or self.trace_context
         fence_headers = {
             "X-Agentic-Perf-Orchestrator-Session": os.environ.get(
@@ -682,9 +675,23 @@ class BenchmarkAgent(AgentBase):
         fields: dict[str, Any] = {
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
-            "run_file_used": result.get("run_file_used", {}),
             "benchmark_duration": result.get("benchmark_duration"),
         }
+        validation_id = result.get("validation_id") or self._active_validation_id
+        run_file_used = result.get("run_file_used", {})
+        if validation_id:
+            ticket = await self._get_ticket(ticket_id)
+            records = (
+                ticket.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+            )
+            validation = records.get(validation_id, {})
+            if isinstance(validation, dict) and isinstance(
+                validation.get("run_file"), dict
+            ):
+                run_file_used = validation["run_file"]
+        fields["run_file_used"] = run_file_used
         # Accumulate output_dirs across loop-back runs
         # so the evaluate agent can access all artifacts.
         if result.get("output_dir"):

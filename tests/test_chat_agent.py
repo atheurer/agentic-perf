@@ -92,6 +92,25 @@ class TestChatSessionStore:
         assert usage["llm_calls"] == 0
 
 
+class TestConfirmationReplies:
+    def test_accepts_conversational_confirmation(self):
+        from agents.chat.agent import _is_confirmation
+
+        assert _is_confirmation("yes, please submit it")
+        assert _is_confirmation("Go ahead and create it")
+        assert _is_confirmation("okay!")
+
+    def test_rejects_non_confirmation(self):
+        from agents.chat.agent import _is_confirmation
+
+        assert not _is_confirmation("change the board to qc8775")
+
+    def test_accepts_conversational_cancellation(self):
+        from agents.chat.agent import _is_cancellation
+
+        assert _is_cancellation("no, change the summary first")
+
+
 # --- Tool definition tests ---
 
 
@@ -337,7 +356,7 @@ class TestHandleMessage:
             auth_token="token123",
         )
         assert "confirmation" in result.lower()
-        assert "create_ticket" in result
+        assert "ready to create" in result.lower()
 
         # Session should have pending action
         session = agent._sessions.get_or_create("alice")

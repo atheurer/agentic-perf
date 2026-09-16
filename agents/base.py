@@ -35,6 +35,7 @@ from providers.tracing import (
     reset_trace_context,
     trace_headers,
 )
+from state_store.models import VALID_TRANSITIONS, TicketStatus
 
 logger = logging.getLogger(__name__)
 
@@ -396,9 +397,11 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
-            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in ANY JSON-returning "
+            "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
-            "to slice and return the exact data in a single turn without multi-step querying."
+            "to slice and return the exact data in a single turn without multi-step querying. When a tool "
+            "declares `jq_filter` in its schema, such as `generate_chart_from_workspace`, the tool applies "
+            "the filter to its own input instead."
         )
         try:
             from providers.workspace.manager import WorkspaceManager
@@ -503,6 +506,31 @@ class AgentBase(ABC):
 
             self._wrapup_reason: str | None = None
             self._context_warned = False
+            # --- Circuit breaker state (per-run) ---
+            from providers.circuit_breaker import (
+                _DEFAULTS as _CB_DEFAULTS,
+            )
+            from providers.circuit_breaker import (
+                CircuitBreakerState,
+                circuit_breaker_from_config,
+                circuit_breaker_from_custom_fields,
+                classify_result,
+            )
+
+            cb_state = CircuitBreakerState()
+            try:
+                from orchestrator.config import _load_config_file
+
+                cb_cfg = circuit_breaker_from_config(
+                    _load_config_file(),
+                )
+                cb_cfg = circuit_breaker_from_custom_fields(
+                    cf,
+                    cb_cfg,
+                )
+            except Exception:
+                cb_cfg = dict(_CB_DEFAULTS)
+            cb_enabled = cb_cfg.get("enabled", True)
             self._context_truncated = False
             self._hitl_just_resumed = False
             self._post_hitl_nudge_used = False
@@ -1109,6 +1137,10 @@ class AgentBase(ABC):
                         f"{submit_call.name} (iter {iteration})"
                     )
                     block_msg = self._should_block_submit(ticket_id)
+                    if not block_msg:
+                        block_msg = await self._validate_submit_call(
+                            ticket_id, submit_call
+                        )
                     if block_msg:
                         self._emit(
                             ticket_id,
@@ -1283,6 +1315,13 @@ class AgentBase(ABC):
                             "is_error": result.is_error,
                         }
                     )
+                    if cb_enabled:
+                        is_failure = classify_result(
+                            tc.name,
+                            result.content,
+                            result.is_error,
+                        )
+                        cb_state.record(tc.name, is_failure)
                 for tc in response.tool_calls:
                     if tc not in calls_to_run:
                         tool_results_content.append(
@@ -1295,6 +1334,79 @@ class AgentBase(ABC):
                         )
 
                 messages.append({"role": "user", "content": tool_results_content})
+
+                # --- Circuit breaker: inject after tool results ---
+                if cb_enabled:
+                    cb_checked: set[str] = set()
+                    for tc in calls_to_run:
+                        if tc.name in cb_checked:
+                            continue
+                        cb_checked.add(tc.name)
+                        tripped, consec = cb_state.check(
+                            tc.name,
+                            cb_cfg.get("threshold", 3),
+                            cb_cfg.get("max_trips_per_tool", 2),
+                            cb_cfg.get("exempt_tools", []),
+                        )
+                        if tripped:
+                            excerpt = "(empty)"
+                            tc_ids = {c.id for c in calls_to_run if c.name == tc.name}
+                            for item in reversed(tool_results_content):
+                                if item.get("tool_use_id") in tc_ids:
+                                    raw = item.get("content", "")
+                                    excerpt = raw[:300] if raw else "(empty)"
+                                    break
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"[SYSTEM] Circuit breaker:"
+                                        f" tool '{tc.name}' has failed"
+                                        f" {consec} consecutive times."
+                                        f" Last result:\n"
+                                        f"<tool_output>\n"
+                                        f"{excerpt}\n"
+                                        f"</tool_output>\n\n"
+                                        f"You MUST try a fundamentally"
+                                        f" different approach. Do NOT"
+                                        f" call {tc.name} with the"
+                                        f" same or similar arguments."
+                                        f" Consider:\n"
+                                        f"- Use the information in"
+                                        f" the result above\n"
+                                        f"- Try a different tool or"
+                                        f" different arguments\n"
+                                        f"- Submit partial results if"
+                                        f" you have some data"
+                                    ),
+                                }
+                            )
+                            self._emit(
+                                ticket_id,
+                                "circuit_breaker",
+                                {
+                                    "tool": tc.name,
+                                    "consecutive": consec,
+                                    "trips": cb_state.trips.get(
+                                        tc.name,
+                                        0,
+                                    ),
+                                    "threshold": cb_cfg.get(
+                                        "threshold",
+                                        3,
+                                    ),
+                                },
+                            )
+                            logger.warning(
+                                "[%s] Circuit breaker tripped for"
+                                " tool '%s' (%d consecutive"
+                                " failures) on %s",
+                                self.agent_name,
+                                tc.name,
+                                consec,
+                                ticket_id,
+                            )
+
             else:
                 # while loop exhausted (max_iterations reached)
                 await self._save_messages(ticket_id, messages)
@@ -1307,22 +1419,32 @@ class AgentBase(ABC):
                     f"[{self.agent_name}] Hit max iterations"
                     f" ({self.max_iterations}) on {ticket_id}"
                 )
-                await self._add_comment(
-                    ticket_id,
-                    f"**Agent {self.agent_name} reached maximum"
-                    f" iteration limit ({self.max_iterations}).**"
-                    f" The agent could not complete its work within"
-                    f" the iteration budget. You can reply to guide"
-                    f" next steps (e.g., retry, skip to review,"
-                    f" or abort).",
-                )
-                await self._transition_ticket(
-                    ticket_id,
-                    "awaiting_customer_guidance",
-                    comment=(
-                        f"{self.agent_name} hit max iterations — pausing for guidance"
-                    ),
-                )
+                ticket = await self._get_ticket(ticket_id)
+                current_status = ticket.get("status", "")
+                if self._can_pause_for_guidance(current_status):
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Agent {self.agent_name} reached maximum"
+                        f" iteration limit ({self.max_iterations}).**"
+                        f" The agent could not complete its work within"
+                        f" the iteration budget. You can reply to guide"
+                        f" next steps (e.g., retry, skip to review,"
+                        f" or abort).",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment=(
+                            f"{self.agent_name} hit max iterations"
+                            f" — pausing for guidance"
+                        ),
+                    )
+                else:
+                    await self._abort_unpausable(
+                        ticket_id,
+                        current_status,
+                        "max_iterations",
+                    )
         except (HITLDriftError, AgentAbortedError):
             raise
         except HITLTimeoutError as e:
@@ -1396,6 +1518,12 @@ class AgentBase(ABC):
     def _should_block_submit(self, ticket_id: str) -> str | None:
         """Override to block submit_* calls. Return a rejection message
         string to block, or None to allow the submit to proceed."""
+        return None
+
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        """Override to validate submit payloads before completing an agent run."""
         return None
 
     @staticmethod
@@ -1546,6 +1674,9 @@ class AgentBase(ABC):
             "list_files_from_workspace",
             "read_document_from_workspace",
             "search_documents_from_workspace",
+            # Chart responses are compact control-plane metadata whose
+            # chart_ref must remain directly visible to the caller.
+            "generate_chart_from_workspace",
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
@@ -1697,6 +1828,9 @@ class AgentBase(ABC):
         )
         properties = tool_def.input_schema.get("properties", {}) if tool_def else {}
         if "jq_filter" in properties:
+            if "jq_filter" in call_input:
+                value = str(call_input["jq_filter"]).strip()
+                call_input["jq_filter"] = value or None
             return call_input, None
 
         jq_filter = call_input.pop("jq_filter", None) or call_input.pop(
@@ -2362,6 +2496,77 @@ class AgentBase(ABC):
         }
     )
 
+    @staticmethod
+    def _can_pause_for_guidance(status: str) -> bool:
+        """Check if the ticket can enter or remain in the guidance pause."""
+        try:
+            current = TicketStatus(status)
+        except ValueError:
+            return False
+        if current is TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
+            return True
+        targets = VALID_TRANSITIONS.get(current, [])
+        return TicketStatus.AWAITING_CUSTOMER_GUIDANCE in targets
+
+    async def _abort_unpausable(
+        self,
+        ticket_id: str,
+        current_status: str,
+        trigger: str,
+    ) -> None:
+        """Handle escalation when the ticket cannot be paused.
+
+        Emits an escalation event, attempts to close the ticket
+        (the only safe fallback for terminal-adjacent statuses
+        like retrospective_pending), and raises AgentAbortedError
+        so the orchestrator skips further transitions.
+        """
+        self._emit(
+            ticket_id,
+            "escalation",
+            {
+                "reason": "pause_blocked",
+                "from_status": current_status,
+                "trigger": trigger,
+            },
+        )
+        try:
+            current = TicketStatus(current_status)
+        except ValueError:
+            current = None
+        targets = VALID_TRANSITIONS.get(current, []) if current else []
+        if TicketStatus.CLOSED in targets:
+            logger.info(
+                "[%s] Closing %s from %s (pause not available)",
+                self.agent_name,
+                ticket_id,
+                current_status,
+            )
+            await self._add_comment(
+                ticket_id,
+                f"**Agent {self.agent_name} could not complete"
+                f" its task and cannot pause for guidance from"
+                f" {current_status}.** Closing ticket.",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "closed",
+                comment=(
+                    f"{self.agent_name}: pause blocked from {current_status}, closing"
+                ),
+            )
+        else:
+            logger.warning(
+                "[%s] Cannot pause or close from %s on %s",
+                self.agent_name,
+                current_status,
+                ticket_id,
+            )
+        raise AgentAbortedError(
+            f"Cannot pause from {current_status} — "
+            f"ticket closed or left for orchestrator"
+        )
+
     async def _request_human_input(self, ticket_id: str, question: str) -> str:
         """Pause for human input and return the user's reply.
 
@@ -2370,6 +2575,19 @@ class AgentBase(ABC):
         reply text. The agent's LLM loop continues with full context.
         """
         ticket = await self._get_ticket(ticket_id)
+        current_status = ticket.get("status", "")
+        if not self._can_pause_for_guidance(current_status):
+            logger.warning(
+                "[%s] Cannot pause for guidance from %s — "
+                "awaiting_customer_guidance is not a valid transition",
+                self.agent_name,
+                current_status,
+            )
+            await self._abort_unpausable(
+                ticket_id,
+                current_status,
+                "escalation",
+            )
         comment_count = len(ticket.get("comments", []))
         await self._add_comment(ticket_id, f"**Input needed:** {question}")
         await self._transition_ticket(

@@ -276,6 +276,15 @@ Do not substitute hosts or add roles. Set skip_teardown=true.
 """
 
 
+def _ticket_payload(config: GateConfig) -> dict[str, Any]:
+    """Build the ticket with gate-critical policy represented structurally."""
+    return {
+        "summary": "Live E2E gate: one-client Crucible sleep benchmark",
+        "description": _description(config),
+        "custom_fields": {"directives": {"no_host_mounts": True}},
+    }
+
+
 def _client(home: Path, store_url: str) -> httpx.Client:
     token_path = home / "secrets" / "api-token"
     deadline = time.monotonic() + 20
@@ -306,6 +315,11 @@ def _contains_in_order(values: list[str], required: tuple[str, ...]) -> bool:
     return all(any(value == expected for value in remaining) for expected in required)
 
 
+def _has_dispatch_claim(ticket: dict[str, Any]) -> bool:
+    fields = ticket.get("custom_fields", {})
+    return bool(fields.get("claim") or fields.get("dispatch_claim"))
+
+
 def _validate_completed_ticket(ticket: dict[str, Any]) -> tuple[str, list[str]]:
     trail = ticket.get("status_trail", [])
     required_trail = (
@@ -328,7 +342,7 @@ def _validate_completed_ticket(ticket: dict[str, Any]) -> tuple[str, list[str]]:
     run_id = str(fields.get("run_id", ""))
     if not run_id:
         raise GateError("ticket closed without a Crucible run ID")
-    if fields.get("claim") or fields.get("dispatch_claim"):
+    if _has_dispatch_claim(ticket):
         raise GateError("ticket closed with a stale dispatch claim")
     plan = fields.get("execution_plan", {})
     steps = plan.get("steps", [])
@@ -435,12 +449,11 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                 raise GateError(
                     f"isolated instance already has active tickets: {active}"
                 )
-            summary = "Live E2E gate: one-client Crucible sleep benchmark"
             ticket = _request(
                 client,
                 "POST",
                 "/api/v1/tickets",
-                json={"summary": summary, "description": _description(config)},
+                json=_ticket_payload(config),
             )
             ticket_id = ticket["id"]
             _request(
@@ -452,6 +465,7 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
             deadline = time.monotonic() + config.timeout_seconds
             approved = False
             statuses: list[str] = []
+            closed_with_claim = False
             while time.monotonic() < deadline:
                 ticket = _request(client, "GET", f"/api/v1/tickets/{ticket_id}")
                 status = ticket["status"]
@@ -460,6 +474,10 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                     _save_json(artifacts / "progress.json", {"statuses": statuses})
                 _save_json(artifacts / "ticket.json", ticket)
                 if status == "closed":
+                    if _has_dispatch_claim(ticket):
+                        closed_with_claim = True
+                        time.sleep(config.poll_seconds)
+                        continue
                     run_id, trail = _validate_completed_ticket(ticket)
                     runs_after = _controller_run_inventory(config)
                     new_runs = runs_after - runs_before
@@ -526,6 +544,8 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                     )
                     approved = True
                 time.sleep(config.poll_seconds)
+            if closed_with_claim:
+                raise GateError("ticket remained closed with a stale dispatch claim")
             raise GateError(f"ticket {ticket_id} exceeded the total timeout")
     finally:
         if manage_services:

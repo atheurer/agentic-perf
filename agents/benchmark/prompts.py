@@ -14,9 +14,10 @@ Use batch and discovery tools to minimize iterations:
   the complete hardware layout in a single call, including CCD domains, NUMA nodes, core counts,
   and exact `thread_siblings` SMT pairings (`{"0": [0, 384], ...}`). Do NOT read individual
   `/sys/devices/system/cpu/cpu*/topology/` files or sysfs paths one by one.
-- **In-flight `jq_filter` parameter** — you can pass `jq_filter` in ANY JSON-returning tool call
+- **In-flight `jq_filter` parameter** — you can pass `jq_filter` in JSON-returning tool calls
   (e.g., `get_hardware_topology(host=..., jq_filter=".domains[0:2]")`)
   to receive the exact filtered slice immediately in the same turn without multi-step querying.
+  Tools that declare `jq_filter` consume it as their own input transformation.
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in one call
   (not check_host per host)
 - **test_port_connectivity(server_ssh_host, client_ssh_host, server_test_ip, port)**
@@ -163,7 +164,10 @@ For non-Crucible harnesses, retain the compatible procedure of using
 8. **Present for approval** — Check directives for "user_pre_run_approval" (default: true).
    If `user_pre_run_approval` is false, skip this step entirely — go directly to execute.
    Do NOT ask for approval when the user explicitly said not to.
-   If approval is needed, call `present_runfile_for_approval(run_file, benchmark, summary)`.
+   If approval is needed, call
+   `present_runfile_for_approval(validation_id, benchmark, summary)`. The approval
+   tool loads and presents the exact immutable run-file stored by validation; do
+   not reconstruct or resubmit the run-file.
 
 9. **Execute** — For Crucible, call
    `execute_benchmark(controller, validation_id, harness, run_command)`. Do not pass
@@ -182,6 +186,8 @@ For non-Crucible harnesses, retain the compatible procedure of using
      - If the failure indicates a configuration problem (bad parameters, missing
        endpoints, schema errors), call `request_clarification` to escalate.
      - If you cannot determine the cause, call `request_clarification` with the
+   - Include the `validation_id` returned by `execute_benchmark` when submitting
+     the result. The server records the immutable validated run-file itself.
        relevant log excerpt so the user can investigate.
    - If `execute_benchmark` returns a non-zero `exit_code`, call
      `submit_benchmark_result` immediately with status "failed" and the error
@@ -255,7 +261,8 @@ a misunderstanding, or tell you to proceed anyway. Never assume the
 user wants you to skip something — ask.
 
 After answering a clarification, always follow up with a tool call —
-either `present_runfile_for_approval` to re-present the current runfile,
+either `present_runfile_for_approval` with its validation ID to re-present the
+immutable validated runfile,
 or `submit_benchmark_result` if the work is complete. Never end your
 turn with only prose after a clarification exchange.
 """

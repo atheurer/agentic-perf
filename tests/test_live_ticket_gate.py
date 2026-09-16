@@ -52,6 +52,11 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     assert "Do not mount `/proc`, `/sys`" in description
 
 
+def test_ticket_payload_structurally_forbids_host_mounts() -> None:
+    payload = gate._ticket_payload(config())
+    assert payload["custom_fields"]["directives"]["no_host_mounts"] is True
+
+
 def test_ticket_direction_distinguishes_ids_from_benchmark_params() -> None:
     description = gate._description(config())
     assert '`benchmarks[].ids: "1"`' in description
@@ -122,6 +127,14 @@ def test_completed_ticket_rejects_missing_review() -> None:
     }
     with pytest.raises(gate.GateError, match="required lifecycle"):
         gate._validate_completed_ticket(ticket)
+
+
+def test_dispatch_claim_detection_covers_current_and_legacy_fields() -> None:
+    assert gate._has_dispatch_claim({"custom_fields": {"claim": {"id": "new"}}})
+    assert gate._has_dispatch_claim(
+        {"custom_fields": {"dispatch_claim": {"id": "legacy"}}}
+    )
+    assert not gate._has_dispatch_claim({"custom_fields": {"claim": None}})
 
 
 def test_pending_approval_requires_one_structured_request() -> None:
