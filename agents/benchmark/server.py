@@ -158,9 +158,7 @@ def _validation_creator() -> dict[str, Any]:
 
     context = current_trace_context()
     return {
-        # The capability contract uses the stable role name, while this MCP
-        # process is launched under the executable identity benchmark-agent.
-        "agent_id": "benchmark",
+        "agent_id": context.agent_id if context else "",
         "invocation_id": str(context.invocation_id) if context else "",
         "action_id": context.action_id if context else "",
         "request_id": (context.mcp_correlation_request_id if context else "")
@@ -173,14 +171,18 @@ def _validation_creator() -> dict[str, Any]:
 def _validation_identity_headers(creator: dict[str, Any]) -> dict[str, str]:
     """Propagate the trace identity required to spend a validation capability."""
     headers = {
-        "X-Agentic-Perf-Agent-Id": str(creator.get("agent_id") or "benchmark"),
-        "X-Agentic-Perf-Invocation-Id": str(creator.get("invocation_id", "")),
-        "X-Agentic-Perf-Action-Id": str(creator.get("action_id", "")),
-        "X-Agentic-Perf-Request-Id": str(creator.get("request_id", "")),
+        "X-Agentic-Perf-Validation-Agent-Id": str(
+            creator.get("agent_id") or "benchmark-agent"
+        ),
+        "X-Agentic-Perf-Validation-Invocation-Id": str(
+            creator.get("invocation_id", "")
+        ),
+        "X-Agentic-Perf-Validation-Action-Id": str(creator.get("action_id", "")),
+        "X-Agentic-Perf-Validation-Request-Id": str(creator.get("request_id", "")),
     }
     for key, header in (
-        ("session_id", "X-Agentic-Perf-Session-Id"),
-        ("session_epoch", "X-Agentic-Perf-Session-Epoch"),
+        ("session_id", "X-Agentic-Perf-Validation-Session-Id"),
+        ("session_epoch", "X-Agentic-Perf-Validation-Session-Epoch"),
     ):
         if creator.get(key):
             headers[header] = str(creator[key])

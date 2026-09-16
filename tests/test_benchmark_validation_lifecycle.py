@@ -14,9 +14,16 @@ from agents.benchmark.server import (
     _get_validated_runfile,
     _runfile_fingerprint,
     _validation_creator,
+    _validation_identity_headers,
     _validation_output_descriptor,
 )
+from providers.execution import AuditedAsyncHTTPClient
 from providers.redaction import get_shared_redactor
+from providers.tracing import (
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 from state_store.api.router import api_router
 from state_store.api.validations import (
     create_validation,
@@ -97,7 +104,7 @@ def test_validation_creator_uses_capability_role_identity(monkeypatch):
     )
     monkeypatch.setattr("providers.tracing.current_trace_context", lambda: context)
 
-    assert _validation_creator()["agent_id"] == "benchmark"
+    assert _validation_creator()["agent_id"] == "benchmark-agent"
 
 
 def test_sequential_validations_are_immutable_and_exact_id_addressable(tmp_path):
@@ -349,10 +356,10 @@ def test_validation_route_constructs_server_authoritative_creator(tmp_path):
     ticket_id = _ticket(app.state.store)
     headers = {
         "X-Agentic-Perf-Benchmark-Validator": "validator",
-        "X-Agentic-Perf-Agent-Id": "benchmark",
-        "X-Agentic-Perf-Invocation-Id": "invocation",
-        "X-Agentic-Perf-Action-Id": "action-1",
-        "X-Agentic-Perf-Request-Id": "request-1",
+        "X-Agentic-Perf-Validation-Agent-Id": "benchmark-agent",
+        "X-Agentic-Perf-Validation-Invocation-Id": "invocation",
+        "X-Agentic-Perf-Validation-Action-Id": "action-1",
+        "X-Agentic-Perf-Validation-Request-Id": "request-1",
     }
     request = SimpleNamespace(
         state=SimpleNamespace(principal=Principal("service", "deployment", True)),
@@ -367,7 +374,7 @@ def test_validation_route_constructs_server_authoritative_creator(tmp_path):
     request.headers = headers | {"X-Agentic-Perf-Validation-Capability": capability}
     result = create_validation(ticket_id, body, request)
     assert result["record"]["creator"] == {
-        "agent_id": "benchmark",
+        "agent_id": "benchmark-agent",
         "invocation_id": "invocation",
         "action_id": "action-1",
         "request_id": "request-1",
@@ -400,6 +407,54 @@ def _app(tmp_path) -> FastAPI:
     return app
 
 
+async def test_audited_http_preserves_validation_capability_binding(tmp_path):
+    """Causal HTTP child headers must not replace the MCP capability identity."""
+    app = _app(tmp_path)
+    ticket_id = _ticket(app.state.store)
+    creator = {
+        "agent_id": "benchmark-agent",
+        "invocation_id": "invocation-1",
+        "action_id": "action-1",
+        "request_id": "request-1",
+    }
+
+    async def emit(_event):
+        return None
+
+    context = new_trace_context(ticket_id=ticket_id, agent_id="benchmark-agent")
+    trace_token = bind_trace_context(context)
+    try:
+        async with AuditedAsyncHTTPClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer service"},
+            emit=emit,
+        ) as client:
+            capability_response = await client.post(
+                f"/api/v1/tickets/{ticket_id}/validations/capability",
+                headers={
+                    "X-Agentic-Perf-Benchmark-Validator": "validator",
+                    **_validation_identity_headers(creator),
+                },
+            )
+            assert capability_response.status_code == 200
+            capability = capability_response.json()["capability"]
+            record = _record("val-" + "a" * 32)
+            record.pop("creator")
+            record.pop("server_pid")
+            create_response = await client.post(
+                f"/api/v1/tickets/{ticket_id}/validations",
+                json={"record": record, "expected_version": 0},
+                headers={
+                    "X-Agentic-Perf-Validation-Capability": capability,
+                    **_validation_identity_headers(creator),
+                },
+            )
+            assert create_response.status_code == 200
+    finally:
+        reset_trace_context(trace_token)
+
+
 async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_path):
     """Exercise real HTTP auth and capability binding without TestClient."""
     app = _app(tmp_path)
@@ -425,8 +480,8 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             headers=auth
             | {
                 "X-Agentic-Perf-Benchmark-Validator": "validator",
-                "X-Agentic-Perf-Agent-Id": "benchmark",
-                "X-Agentic-Perf-Invocation-Id": "invocation",
+                "X-Agentic-Perf-Validation-Agent-Id": "benchmark-agent",
+                "X-Agentic-Perf-Validation-Invocation-Id": "invocation",
             },
         )
         assert missing_action.status_code == 403
@@ -434,14 +489,14 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
         def headers(
             invocation: str = "invocation",
             action: str = "action-1",
-            agent: str = "benchmark",
+            agent: str = "benchmark-agent",
         ) -> dict[str, str]:
             return auth | {
                 "X-Agentic-Perf-Benchmark-Validator": "validator",
-                "X-Agentic-Perf-Agent-Id": agent,
-                "X-Agentic-Perf-Invocation-Id": invocation,
-                "X-Agentic-Perf-Action-Id": action,
-                "X-Agentic-Perf-Request-Id": "request-1",
+                "X-Agentic-Perf-Validation-Agent-Id": agent,
+                "X-Agentic-Perf-Validation-Invocation-Id": invocation,
+                "X-Agentic-Perf-Validation-Action-Id": action,
+                "X-Agentic-Perf-Validation-Request-Id": "request-1",
             }
 
         async def capability(ticket_id: str, invocation: str = "invocation") -> str:
@@ -457,7 +512,7 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             record: dict,
             cap: str,
             invocation: str = "invocation",
-            agent: str = "benchmark",
+            agent: str = "benchmark-agent",
             action: str = "action-1",
         ):
             client_record = dict(record)
@@ -491,7 +546,7 @@ async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_p
             )
         ).json()["record"]
         assert persisted["creator"] == {
-            "agent_id": "benchmark",
+            "agent_id": "benchmark-agent",
             "invocation_id": "invocation",
             "action_id": "action-1",
             "request_id": "request-1",

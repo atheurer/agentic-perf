@@ -30,10 +30,10 @@ def issue_capability(ticket_id: str, request: Request):
         raise HTTPException(
             status_code=403, detail="benchmark validator capability required"
         )
-    agent = request.headers.get("X-Agentic-Perf-Agent-Id", "")
-    invocation = request.headers.get("X-Agentic-Perf-Invocation-Id", "")
-    action = request.headers.get("X-Agentic-Perf-Action-Id", "")
-    if agent != "benchmark" or not invocation or not action:
+    agent = request.headers.get("X-Agentic-Perf-Validation-Agent-Id", "")
+    invocation = request.headers.get("X-Agentic-Perf-Validation-Invocation-Id", "")
+    action = request.headers.get("X-Agentic-Perf-Validation-Action-Id", "")
+    if agent != "benchmark-agent" or not invocation or not action:
         raise HTTPException(
             status_code=403, detail="benchmark invocation identity and action required"
         )
@@ -43,9 +43,9 @@ def issue_capability(ticket_id: str, request: Request):
         "agent": agent,
         "invocation": invocation,
         "action": action,
-        "session": request.headers.get("X-Agentic-Perf-Session-Id", ""),
-        "epoch": request.headers.get("X-Agentic-Perf-Session-Epoch", ""),
-        "request": request.headers.get("X-Agentic-Perf-Request-Id", ""),
+        "session": request.headers.get("X-Agentic-Perf-Validation-Session-Id", ""),
+        "epoch": request.headers.get("X-Agentic-Perf-Validation-Session-Epoch", ""),
+        "request": request.headers.get("X-Agentic-Perf-Validation-Request-Id", ""),
         "expires_at": time.monotonic() + 60,
     }
     _store(request)._audit_log(
@@ -100,18 +100,19 @@ def create_validation(ticket_id: str, body: CreateValidationRequest, request: Re
     grants = request.app.state.benchmark_validation_capabilities
     grant = grants.get(capability)
     identity = {
-        "action": request.headers.get("X-Agentic-Perf-Action-Id", ""),
-        "session": request.headers.get("X-Agentic-Perf-Session-Id", ""),
-        "epoch": request.headers.get("X-Agentic-Perf-Session-Epoch", ""),
-        "request": request.headers.get("X-Agentic-Perf-Request-Id", ""),
+        "action": request.headers.get("X-Agentic-Perf-Validation-Action-Id", ""),
+        "session": request.headers.get("X-Agentic-Perf-Validation-Session-Id", ""),
+        "epoch": request.headers.get("X-Agentic-Perf-Validation-Session-Epoch", ""),
+        "request": request.headers.get("X-Agentic-Perf-Validation-Request-Id", ""),
     }
     if (
         not grant
         or grant["expires_at"] < time.monotonic()
         or grant["ticket_id"] != ticket_id
-        or grant["agent"] != request.headers.get("X-Agentic-Perf-Agent-Id", "")
+        or grant["agent"]
+        != request.headers.get("X-Agentic-Perf-Validation-Agent-Id", "")
         or grant["invocation"]
-        != request.headers.get("X-Agentic-Perf-Invocation-Id", "")
+        != request.headers.get("X-Agentic-Perf-Validation-Invocation-Id", "")
         or not identity["action"]
         or grant["action"] != identity["action"]
         or any(grant[key] != value for key, value in identity.items())
