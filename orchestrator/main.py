@@ -412,10 +412,11 @@ async def _apply_step_overrides(
             override_fields["scoped_context"] = scoped
 
     if override_fields:
-        await client.patch(
+        response = await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={"fields": override_fields},
         )
+        response.raise_for_status()
 
 
 async def _advance_plan(
@@ -423,6 +424,7 @@ async def _advance_plan(
     ticket_id: str,
     completed_status: str,
     event_bus: EventBus | None = None,
+    claim_id: str | None = None,
 ) -> None:
     """Advance the execution plan after an agent completes a step.
 
@@ -435,6 +437,8 @@ async def _advance_plan(
         ticket_id=ticket_id, agent_id="orchestrator"
     )
     headers = _auth_headers() | trace_headers(context)
+    if claim_id:
+        headers["X-Agentic-Perf-Claim-Id"] = claim_id
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
         r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
@@ -488,7 +492,7 @@ async def _advance_plan(
                     f"tuning ({missing}) but configuration_applied is empty "
                     f"— blocking advance to benchmark"
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={
                         "status": "awaiting_customer_guidance",
@@ -504,6 +508,7 @@ async def _advance_plan(
                         ),
                     },
                 )
+                response.raise_for_status()
                 return
 
         step["status"] = "completed"
@@ -523,11 +528,12 @@ async def _advance_plan(
         # (the ticket may be in any status at this point).
         stop_after = cf.get("stop_after_step")
         if stop_after and step.get("agent_type") == stop_after:
-            await client.patch(
+            response = await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={"fields": {"execution_plan": plan}},
             )
-            await client.post(
+            response.raise_for_status()
+            response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={
                     "author": "orchestrator",
@@ -537,9 +543,11 @@ async def _advance_plan(
                     ),
                 },
             )
-            await client.post(
+            response.raise_for_status()
+            response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/force-close",
             )
+            response.raise_for_status()
             return
 
         next_idx = current + 1
@@ -589,7 +597,7 @@ async def _advance_plan(
                 # so that mutations (e.g. analysis-informed
                 # benchmark params) are persisted.
                 await _apply_step_overrides(store_url, client, ticket_id, next_step, cf)
-                await client.patch(
+                response = await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
                         "fields": {
@@ -598,12 +606,13 @@ async def _advance_plan(
                         },
                     },
                 )
+                response.raise_for_status()
 
                 label = next_step.get("params", {}).get(
                     "label",
                     next_step["agent_type"],
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
                         "author": "orchestrator",
@@ -614,17 +623,19 @@ async def _advance_plan(
                         ),
                     },
                 )
+                response.raise_for_status()
 
                 comment = (
                     f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={"status": next_status, "comment": comment},
                 )
+                response.raise_for_status()
                 return
 
-        await client.patch(
+        response = await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={
                 "fields": {
@@ -633,6 +644,7 @@ async def _advance_plan(
                 },
             },
         )
+        response.raise_for_status()
 
 
 async def run_agent_task(
@@ -932,6 +944,7 @@ async def run_agent_task(
                     ticket_id,
                     status,
                     event_bus=dispatcher.events,
+                    claim_id=dispatcher._claim_ids.get(ticket_id),
                 )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
