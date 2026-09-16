@@ -29,6 +29,7 @@ READONLY_TOOLS = frozenset(
         "list_skills",
         "read_skill",
         "read_doc",
+        "list_available_benchmarks",
     }
 )
 
@@ -377,6 +378,31 @@ CHAT_TOOLS: list[ToolDefinition] = [
             "required": ["username"],
         },
     ),
+    ToolDefinition(
+        name="list_available_benchmarks",
+        description=(
+            "List available benchmark suites with optional filtering. "
+            "Use this when users ask what benchmarks, harnesses, or "
+            "workloads are available."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "harness": {
+                    "type": "string",
+                    "description": (
+                        "Filter by harness name (e.g. crucible, arcaflow-plugins)"
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Search term to filter by benchmark name or description"
+                    ),
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -421,6 +447,8 @@ async def execute_tool(
             return await _update_ticket_fields(client, store_url, headers, tool_input)
         elif tool_name == "stop_ticket":
             return await _stop_ticket(client, store_url, headers, tool_input)
+        elif tool_name == "list_available_benchmarks":
+            return await _list_available_benchmarks(tool_input)
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     except Exception as exc:
@@ -996,3 +1024,33 @@ async def _stop_ticket(
     )
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
+
+
+# ── Benchmark catalog ────────────────────────────────
+
+
+async def _list_available_benchmarks(
+    params: dict[str, Any],
+) -> str:
+    """List available benchmarks from the shared catalog."""
+    from providers.skills.catalog import get_benchmark_catalog
+
+    catalog = get_benchmark_catalog()
+    results = await catalog.list_benchmarks(
+        harness=params.get("harness", ""),
+        query=params.get("query", ""),
+    )
+
+    # Group by harness for readability.
+    harnesses: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        h = r.get("harness", "unknown")
+        harnesses.setdefault(h, []).append(r)
+
+    return json.dumps(
+        {
+            "total": len(results),
+            "harnesses": list(harnesses.keys()),
+            "benchmarks": harnesses,
+        },
+    )
