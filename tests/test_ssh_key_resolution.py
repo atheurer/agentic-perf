@@ -13,6 +13,16 @@ from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHKeyResolutionError
 
 
+def test_state_store_token_loads_the_instance_credential(monkeypatch):
+    import agents.server_utils as utils
+
+    monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
+    monkeypatch.setattr("state_store.auth.read_token_from_file", lambda: "token")
+
+    assert utils._state_store_token() == "token"
+    assert utils.os.environ["AGENTIC_PERF_API_TOKEN"] == "token"
+
+
 class FakeVaultProvider(SecretsProvider):
     """Vault-like provider that materializes secrets to temp files."""
 

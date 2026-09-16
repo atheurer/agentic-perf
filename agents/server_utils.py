@@ -24,6 +24,22 @@ from providers.execution import AuditedAsyncHTTPClient
 logger = logging.getLogger(__name__)
 
 
+def _state_store_token() -> str:
+    """Return this instance's state-store token for ticket-owned MCP tools."""
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if token:
+        return token
+    from state_store.auth import read_token_from_file
+
+    token = read_token_from_file()
+    if token:
+        # Audited subprocess and HTTP adapters resolve their recorder lazily
+        # from the environment, so make the instance credential available for
+        # the rest of this ticket-owned MCP process.
+        os.environ["AGENTIC_PERF_API_TOKEN"] = token
+    return token
+
+
 def setup_project_path() -> str:
     """Add the project root to sys.path. Returns the project root path."""
     root = str(Path(__file__).resolve().parents[1])
@@ -1108,7 +1124,7 @@ async def assert_ticket_active(
         return {}
 
     headers = {}
-    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    api_token = _state_store_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
@@ -1165,7 +1181,7 @@ async def build_ssh_from_ticket(
         return SSHExecutor(user="root"), {}
 
     headers = {}
-    api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    api_token = _state_store_token()
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
