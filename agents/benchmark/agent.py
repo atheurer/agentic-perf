@@ -177,7 +177,7 @@ class BenchmarkAgent(AgentBase):
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
 
-        mcp = AgentMCPClient()
+        mcp = AgentMCPClient(trace_context=self.trace_context)
         await mcp.connect_ticket_server(
             bench_server,
             name="benchmark",

@@ -1149,7 +1149,11 @@ async def build_ssh_from_ticket(
     TICKET_ID env var. If state_store_url is None, reads from STATE_STORE_URL.
     """
     from providers.ssh import SSHExecutor
-    from providers.tracing import new_trace_context
+    from providers.tracing import (
+        bind_trace_context,
+        new_trace_context,
+        trace_context_from_environment,
+    )
     from providers.tracing.client import TraceClient
 
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
@@ -1201,14 +1205,20 @@ async def build_ssh_from_ticket(
     trace_recorder = TraceClient(state_store_url, api_token) if api_token else None
     if trace_recorder is not None:
         _ssh_key_stack.callback(trace_recorder.close)
+    trace_context = trace_context_from_environment(
+        ticket_id=ticket_id, agent_id=os.environ.get("AGENT_NAME")
+    ) or new_trace_context(
+        ticket_id=ticket_id,
+        agent_id=os.environ.get("AGENT_NAME"),
+    )
+    # A local MCP process is ticket-owned. Bind its inherited context before
+    # callers initialize caches or providers that may perform audited actions.
+    bind_trace_context(trace_context)
     return SSHExecutor(
         user=ssh_user,
         key_path=resolved_key,
         strict_host_key=strict,
-        trace_context=new_trace_context(
-            ticket_id=ticket_id,
-            agent_id=os.environ.get("AGENT_NAME"),
-        ),
+        trace_context=trace_context,
         trace_recorder=trace_recorder,
     ), ticket
 

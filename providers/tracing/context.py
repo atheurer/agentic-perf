@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from contextvars import ContextVar, Token
 
@@ -103,3 +104,41 @@ def bind_trace_context(context: TraceContext) -> Token[TraceContext | None]:
 def reset_trace_context(token: Token[TraceContext | None]) -> None:
     """Restore the previous task-local context."""
     _TRACE_CONTEXT.reset(token)
+
+
+def trace_context_environment(context: TraceContext) -> dict[str, str]:
+    """Serialize a causal context for a ticket-owned child process."""
+    return {
+        "AGENTIC_PERF_TRACE_ID": context.trace_id,
+        "AGENTIC_PERF_TRACE_INVOCATION_ID": str(context.invocation_id),
+        "AGENTIC_PERF_TRACE_ACTION_ID": context.action_id,
+        "AGENTIC_PERF_TRACE_PARENT_ACTION_ID": context.parent_action_id or "",
+        "AGENTIC_PERF_TRACE_ITERATION": ""
+        if context.iteration is None
+        else str(context.iteration),
+    }
+
+
+def trace_context_from_environment(
+    *, ticket_id: str, agent_id: str | None
+) -> TraceContext | None:
+    """Restore a causal context passed to a ticket-owned child process."""
+    trace_id = os.environ.get("AGENTIC_PERF_TRACE_ID", "")
+    invocation_id = os.environ.get("AGENTIC_PERF_TRACE_INVOCATION_ID", "")
+    action_id = os.environ.get("AGENTIC_PERF_TRACE_ACTION_ID", "")
+    if not (ticket_id and trace_id and invocation_id and action_id):
+        return None
+    try:
+        iteration_text = os.environ.get("AGENTIC_PERF_TRACE_ITERATION", "")
+        return TraceContext(
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            invocation_id=uuid.UUID(invocation_id),
+            trace_id=trace_id,
+            action_id=action_id,
+            parent_action_id=os.environ.get("AGENTIC_PERF_TRACE_PARENT_ACTION_ID")
+            or None,
+            iteration=int(iteration_text) if iteration_text else None,
+        )
+    except (TypeError, ValueError):
+        return None

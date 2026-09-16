@@ -13,6 +13,11 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from providers.llm.base import ToolDefinition
+from providers.tracing import (
+    TraceContext,
+    current_trace_context,
+    trace_context_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +62,10 @@ class AgentMCPClient:
     ValueError at connect time.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, trace_context: TraceContext | None = None) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
+        self.trace_context = trace_context
         # Optional hook for provider-specific call_tool
         # behavior (e.g., Jumpstarter connect guards).
         # Signature: async (name, arguments) -> str | None
@@ -114,6 +120,9 @@ class AgentMCPClient:
             raise ValueError(
                 "ticket-scoped MCP server requires non-empty " + ", ".join(missing)
             )
+        trace_context = self.trace_context or current_trace_context()
+        if trace_context is not None:
+            required.update(trace_context_environment(trace_context))
         await self.connect(server_script, name=name, env=required)
 
     async def connect_command(

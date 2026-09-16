@@ -8,6 +8,8 @@ from .context import (
     current_trace_context,
     new_trace_context,
     reset_trace_context,
+    trace_context_environment,
+    trace_context_from_environment,
 )
 from .models import (
     SCHEMA_VERSION,
@@ -67,6 +69,8 @@ __all__ = [
     "current_trace_context",
     "new_trace_context",
     "reset_trace_context",
+    "trace_context_environment",
+    "trace_context_from_environment",
     "TraceRecorder",
     "trace_headers",
     "canonicalize_payload",
