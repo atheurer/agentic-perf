@@ -372,7 +372,7 @@ class TestDispatcherStop:
         assert dispatcher.stop_agent("PERF-test", "hard")
         assert sink.events[-1].lifecycle.state == LifecycleState.CANCELLED
 
-    def test_mark_done_clears_agent(self):
+    async def test_mark_done_clears_agent(self):
         from orchestrator.dispatcher import Dispatcher
 
         dispatcher = Dispatcher(
@@ -382,7 +382,8 @@ class TestDispatcherStop:
         )
         dispatcher._agents["PERF-test"] = MagicMock()
         dispatcher._tasks["PERF-test"] = MagicMock()
-        dispatcher.mark_done("PERF-test")
+        dispatcher.release_claim = AsyncMock()
+        await dispatcher.mark_done("PERF-test")
         assert "PERF-test" not in dispatcher._agents
         assert "PERF-test" not in dispatcher._tasks
 

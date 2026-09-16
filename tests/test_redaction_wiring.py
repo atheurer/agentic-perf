@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from providers.events import EventBus
 from providers.redaction import Redactor
@@ -271,23 +271,25 @@ class TestDispatcherRedactorWiring:
         result = dispatcher._get_secrets_for_ticket({})
         assert result is secrets
 
-    def test_deregisters_on_mark_done(self) -> None:
+    async def test_deregisters_on_mark_done(self) -> None:
         redactor = Redactor()
         redactor.register(TICKET_ID, "ssh/key", SECRET_VALUE)
         dispatcher = self._make_dispatcher(redactor=redactor)
+        dispatcher.release_claim = AsyncMock()
 
         # Verify value is registered
         assert "REDACTED" in redactor.redact_string(TICKET_ID, SECRET_VALUE)
 
-        dispatcher.mark_done(TICKET_ID)
+        await dispatcher.mark_done(TICKET_ID)
 
         # After deregistration, value should pass through (only patterns fire)
         assert redactor.redact_string(TICKET_ID, SECRET_VALUE) == SECRET_VALUE
 
-    def test_mark_done_without_redactor(self) -> None:
+    async def test_mark_done_without_redactor(self) -> None:
         dispatcher = self._make_dispatcher(redactor=None)
+        dispatcher.release_claim = AsyncMock()
         # Should not raise
-        dispatcher.mark_done(TICKET_ID)
+        await dispatcher.mark_done(TICKET_ID)
 
 
 # ---------------------------------------------------------------------------
