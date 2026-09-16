@@ -120,25 +120,25 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3136|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3147|staging.unlink
-agents/benchmark/server.py|3149|unlink
-agents/benchmark/server.py|3331|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3436|staging.unlink
-agents/benchmark/server.py|3438|unlink
-agents/benchmark/server.py|3756|open
-agents/benchmark/server.py|3837|artifact_filesystem.unlink
-agents/benchmark/server.py|3839|serial_log_path.unlink
-agents/benchmark/server.py|3870|metadata_file.write_bytes
-agents/benchmark/server.py|3877|metadata_file.write_text
-agents/benchmark/server.py|3883|metadata_file.write_text
-agents/benchmark/server.py|3938|merged_file.write_bytes
-agents/infra/server.py|232|tempfile.NamedTemporaryFile
-agents/infra/server.py|240|staging.unlink
-agents/infra/server.py|242|unlink
-agents/infra/server.py|307|tempfile.mkdtemp
-orchestrator/main.py|1930|LOCK_FILE.parent.mkdir
-orchestrator/main.py|1962|LOCK_FILE.unlink
+agents/benchmark/server.py|3162|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3173|staging.unlink
+agents/benchmark/server.py|3175|unlink
+agents/benchmark/server.py|3358|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3463|staging.unlink
+agents/benchmark/server.py|3465|unlink
+agents/benchmark/server.py|3783|open
+agents/benchmark/server.py|3864|artifact_filesystem.unlink
+agents/benchmark/server.py|3866|serial_log_path.unlink
+agents/benchmark/server.py|3897|metadata_file.write_bytes
+agents/benchmark/server.py|3904|metadata_file.write_text
+agents/benchmark/server.py|3910|metadata_file.write_text
+agents/benchmark/server.py|3965|merged_file.write_bytes
+agents/infra/server.py|209|tempfile.NamedTemporaryFile
+agents/infra/server.py|217|staging.unlink
+agents/infra/server.py|219|unlink
+agents/infra/server.py|284|tempfile.mkdtemp
+orchestrator/main.py|1954|LOCK_FILE.parent.mkdir
+orchestrator/main.py|1986|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir
@@ -238,12 +238,11 @@ state_store/process_lock.py|56|path.parent.mkdir
 state_store/process_lock.py|72|os.replace
 state_store/process_lock.py|80|temporary.unlink
 state_store/process_lock.py|107|self.root.mkdir
-state_store/store.py|61|self._persist_dir.mkdir
 state_store/store.py|1825|filesystem.mkdir
 state_store/store.py|1832|filesystem.mkdir
 state_store/store.py|1845|log_filesystem.rename
 state_store/store.py|1854|filesystem.rename
-state_store/trace_store.py|77|self.db_path.parent.mkdir
+state_store/trace_store.py|81|self.db_path.parent.mkdir
 """
 
 
