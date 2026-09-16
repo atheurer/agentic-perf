@@ -143,7 +143,7 @@ async def test_partial_duplicate_batch_has_stable_acknowledgements(tmp_path) -> 
 
 
 async def test_invalid_trace_schema_increments_health_counter() -> None:
-    app = create_app()
+    app = create_app(initialize_immediately=True)
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     )

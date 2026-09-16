@@ -16,9 +16,11 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastmcp import FastMCP
-
+from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     _emit_context_audit_event,
     _public_context_document,
@@ -49,7 +50,7 @@ from providers.execution import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("benchmark-agent")
+mcp = create_ticket_mcp("benchmark-agent")
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
@@ -111,11 +112,114 @@ def _apply_runfile_safety_directives(run_file: dict[str, Any]) -> dict[str, Any]
     return sanitize(run_file)
 
 
+def _runfile_fingerprint(run_file: dict[str, Any]) -> str:
+    """Return the canonical digest that approval and execution bind to."""
+    encoded = json.dumps(run_file, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_plan_fingerprint(cf: dict[str, Any]) -> str:
+    """Digest every current-step parameter, not only mv_params."""
+    plan = cf.get("execution_plan", {})
+    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    index = plan.get("current_step", 0) if isinstance(plan, dict) else 0
+    params = (
+        steps[index].get("params", {})
+        if isinstance(index, int) and index < len(steps)
+        else {}
+    )
+    return hashlib.sha256(
+        json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _execution_intent_digest(
+    runfile_digest: str,
+    params_digest: str,
+    harness: str,
+    controller: str,
+    run_command: str,
+) -> str:
+    payload = {
+        "runfile": runfile_digest,
+        "params": params_digest,
+        "harness": harness,
+        "controller": controller,
+        "run_command": run_command,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validation_creator() -> dict[str, Any]:
+    """Capture the causal caller and MCP server identity with the record."""
+    from providers.tracing import current_trace_context
+
+    context = current_trace_context()
+    return {
+        "agent_id": context.agent_id if context else "",
+        "invocation_id": str(context.invocation_id) if context else "",
+        "action_id": context.action_id if context else "",
+        "request_id": (context.mcp_correlation_request_id if context else "")
+        or os.environ.get("AGENTIC_PERF_REQUEST_ID", ""),
+        "server_pid": os.getpid(),
+        "server_host": socket.gethostname(),
+    }
+
+
+def _validation_identity_headers(creator: dict[str, Any]) -> dict[str, str]:
+    """Propagate the trace identity required to spend a validation capability."""
+    headers = {
+        "X-Agentic-Perf-Validation-Agent-Id": str(
+            creator.get("agent_id") or "benchmark-agent"
+        ),
+        "X-Agentic-Perf-Validation-Invocation-Id": str(
+            creator.get("invocation_id", "")
+        ),
+        "X-Agentic-Perf-Validation-Action-Id": str(creator.get("action_id", "")),
+        "X-Agentic-Perf-Validation-Request-Id": str(creator.get("request_id", "")),
+    }
+    for key, header in (
+        ("session_id", "X-Agentic-Perf-Validation-Session-Id"),
+        ("session_epoch", "X-Agentic-Perf-Validation-Session-Epoch"),
+    ):
+        if creator.get(key):
+            headers[header] = str(creator[key])
+    return {key: value for key, value in headers.items() if value}
+
+
+def _validation_output_descriptor(ticket_id: str, output: str) -> dict[str, Any]:
+    """Return the only validation-output representation safe to persist.
+
+    Controller diagnostics can contain credentials and are often unbounded.
+    Keep their content behind the same redaction, size-bound, and
+    content-addressed-blob policy used by trace producers.
+    """
+    from providers.redaction import get_shared_redactor
+    from providers.tracing import PayloadBuilder
+
+    return (
+        PayloadBuilder(get_shared_redactor())
+        .build(
+            ticket_id,
+            output,
+            media_type="text/plain",
+        )
+        .model_dump(mode="json")
+    )
+
+
 async def _persist_validated_runfile(
     run_file: dict[str, Any],
     harness: str,
     controller: str,
     params_fingerprint: str,
+    execution_plan_fingerprint: str,
+    run_command: str,
+    validator_command: str,
+    validation_output: str,
+    validator_version: str,
 ) -> str | None:
     """Persist a runfile validation record and return its opaque ID.
 
@@ -125,17 +229,34 @@ async def _persist_validated_runfile(
     """
     from providers.execution import AuditedAsyncHTTPClient
 
+    ticket_id = os.environ.get("TICKET_ID", "")
     validation_id = f"val-{uuid.uuid4().hex}"
+    runfile_digest = _runfile_fingerprint(run_file)
     record = {
         "validation_id": validation_id,
         "run_file": run_file,
+        "runfile_fingerprint": runfile_digest,
         "harness": harness,
         "controller": controller,
         "params_fingerprint": params_fingerprint,
+        "execution_plan_fingerprint": execution_plan_fingerprint,
+        "execution_intent_digest": _execution_intent_digest(
+            runfile_digest, execution_plan_fingerprint, harness, controller, run_command
+        ),
+        "run_command": run_command,
+        "validator_command": validator_command,
+        "validator_version": validator_version,
+        "validation_output": _validation_output_descriptor(
+            ticket_id, validation_output
+        ),
     }
-    _validation_records[validation_id] = record
+    creator = _validation_creator()
+    _validation_records[validation_id] = record | {
+        "state": "executable",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "creator": creator,
+    }
 
-    ticket_id = os.environ.get("TICKET_ID", "")
     state_store_url = os.environ.get(
         "STATE_STORE_URL",
         "http://localhost:8090",
@@ -144,26 +265,54 @@ async def _persist_validated_runfile(
         return validation_id
 
     try:
-        headers = {}
-        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-        if api_token:
-            headers["Authorization"] = f"Bearer {api_token}"
+        from agents.server_utils import ticket_state_headers
+
+        headers = ticket_state_headers()
         async with AuditedAsyncHTTPClient(
             timeout=10.0,
             headers=headers,
         ) as client:
-            response = await client.patch(
-                f"{state_store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={
-                    "fields": {
-                        "benchmark_validation": record,
-                        # Keep this compatibility field for ticket context and
-                        # audit consumers that already display the runfile.
-                        "validated_run_file": record,
-                    }
+            ticket_response = await client.get(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}",
+            )
+            ticket_response.raise_for_status()
+            capability_response = await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/validations/capability",
+                headers={
+                    "X-Agentic-Perf-Benchmark-Validator": os.environ.get(
+                        "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", ""
+                    ),
+                    **_validation_identity_headers(creator),
                 },
             )
-            response.raise_for_status()
+            capability_response.raise_for_status()
+            capability = capability_response.json()["capability"]
+            for _ in range(3):
+                manifest = (
+                    ticket_response.json()
+                    .get("custom_fields", {})
+                    .get("benchmark_validations", {})
+                )
+                response = await client.post(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}/validations",
+                    json={
+                        "record": record,
+                        "expected_version": manifest.get("version", 0),
+                    },
+                    headers={
+                        "X-Agentic-Perf-Validation-Capability": capability,
+                        **_validation_identity_headers(creator),
+                    },
+                )
+                if response.status_code != 409:
+                    response.raise_for_status()
+                    break
+                ticket_response = await client.get(
+                    f"{state_store_url}/api/v1/tickets/{ticket_id}"
+                )
+                ticket_response.raise_for_status()
+            else:
+                response.raise_for_status()
         logger.info(
             "[benchmark] Persisted benchmark validation %s for %s (%s)",
             validation_id,
@@ -291,16 +440,50 @@ def _get_validated_runfile(
     ticket: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Resolve the exact runfile previously validated for this ticket."""
-    ticket_id = os.environ.get("TICKET_ID", "")
-    if ticket_id:
-        record = ticket.get("custom_fields", {}).get("benchmark_validation")
+    manifest = ticket.get("custom_fields", {}).get("benchmark_validations", {})
+    if isinstance(manifest, dict) and isinstance(manifest.get("records"), dict):
+        records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+        record = records.get(validation_id)
+        if isinstance(record, dict) and record.get("state") == "legacy_unapproved":
+            return None, "validation token is legacy/unapproved"
+        if (
+            not isinstance(record, dict)
+            or record.get("record_type", "validation") != "validation"
+        ):
+            return None, "unknown validation token"
+        if record.get("state") != "executable":
+            return None, "validation token is legacy/unapproved"
+        supersession = next(
+            (
+                item
+                for item in records.values()
+                if isinstance(item, dict)
+                and item.get("record_type") == "supersession"
+                and item.get("supersedes_validation_id") == validation_id
+            ),
+            None,
+        )
+        if supersession:
+            replacement = supersession.get("replacement_validation_id")
+            return None, (
+                "validation token is superseded"
+                + (f"; replacement_validation_id={replacement}" if replacement else "")
+            )
+        if record.get("params_fingerprint") != _compute_params_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is fingerprint-mismatched"
+        if record.get("execution_plan_fingerprint") != _execution_plan_fingerprint(
+            ticket.get("custom_fields", {})
+        ):
+            return None, "validation token is execution-intent-mismatched"
     else:
         record = _validation_records.get(validation_id)
 
     if not isinstance(record, dict):
-        return None, "No validation record exists for this ticket"
+        return None, "unknown validation token"
     if record.get("validation_id") != validation_id:
-        return None, "Validation ID does not match the ticket's latest validation"
+        return None, "unknown validation token"
     if record.get("harness") != harness:
         return None, "Validation was performed for a different harness"
     if record.get("controller") != controller:
@@ -308,6 +491,8 @@ def _get_validated_runfile(
     run_file = record.get("run_file")
     if not isinstance(run_file, dict):
         return None, "Validation record does not contain a runfile"
+    if record.get("runfile_fingerprint") != _runfile_fingerprint(run_file):
+        return None, "validation token has invalid runfile fingerprint"
     return run_file, None
 
 
@@ -1779,6 +1964,7 @@ async def setup_passwordless_ssh(
 async def execute_benchmark(
     controller: str,
     validation_id: str | None = None,
+    approval_request_id: str | None = None,
     harness: str | None = None,
     run_command: str | None = None,
     run_file: dict | None = None,
@@ -1800,6 +1986,16 @@ async def execute_benchmark(
     )
     if active_check.get("status") == "rejected":
         return json.dumps(active_check)
+    if (
+        active_check.get("id") or os.environ.get("TICKET_ID")
+    ) and not approval_request_id:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "approval_required",
+                "message": "ticket-scoped benchmark execution requires approval_request_id",
+            }
+        )
 
     run_uuid = uuid.uuid4().hex[:8]
     harness_name = harness or "crucible"
@@ -1834,14 +2030,73 @@ async def execute_benchmark(
             active_check,
         )
         if validation_error:
+            reason_code = (
+                "superseded"
+                if "superseded" in validation_error
+                else "legacy_unapproved"
+                if "legacy" in validation_error
+                else "fingerprint_mismatch"
+                if "mismatched" in validation_error
+                else "unknown"
+            )
+            rejection = {
+                "status": "rejected",
+                "harness": harness_name,
+                "validation_id": validation_id,
+                "reason_code": reason_code,
+                "message": validation_error,
+            }
+            records = (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+            )
+            supersession = next(
+                (
+                    item
+                    for item in records.values()
+                    if isinstance(item, dict)
+                    and item.get("supersedes_validation_id") == validation_id
+                ),
+                None,
+            )
+            if supersession:
+                replacement_id = supersession.get("replacement_validation_id")
+                replacement = records.get(replacement_id, {})
+                rejection.update(
+                    {
+                        "invalidated_at": supersession.get("created_at"),
+                        "invalidated_by": supersession.get("writer"),
+                        "invalidation_reason": supersession.get("reason"),
+                        "replacement_validation_id": replacement_id,
+                        "replacement": {
+                            key: replacement.get(key)
+                            for key in (
+                                "validation_id",
+                                "harness",
+                                "controller",
+                                "runfile_fingerprint",
+                            )
+                        },
+                    }
+                )
+            return json.dumps(rejection)
+        record = active_check.get("custom_fields", {}).get(
+            "benchmark_validations", {}
+        ).get("records", {}).get(validation_id) or _validation_records.get(
+            validation_id, {}
+        )
+        stored_command = record.get("run_command")
+        if run_command is not None and run_command != stored_command:
             return json.dumps(
                 {
                     "status": "rejected",
-                    "harness": harness_name,
                     "validation_id": validation_id,
-                    "message": validation_error,
+                    "reason_code": "execution_intent_mismatch",
+                    "message": "run_command differs from approved execution intent",
                 }
             )
+        run_command = stored_command
     elif _skill_provider:
         if run_file is None:
             return json.dumps(
@@ -1886,6 +2141,71 @@ async def execute_benchmark(
                         f"Only known harness binaries are allowed."
                     ),
                 }
+            )
+
+    if approval_request_id:
+        # #798 owns the approval capability boundary.  #788 may add richer
+        # operation claims later; this optional token is deliberately checked
+        # immediately before any benchmark-side effect.
+        ticket_id = active_check.get("id") or os.environ.get("TICKET_ID", "")
+        record = (
+            (
+                active_check.get("custom_fields", {})
+                .get("benchmark_validations", {})
+                .get("records", {})
+                .get(validation_id, {})
+            )
+            if validation_id
+            else {}
+        )
+        if not ticket_id or not validation_id or not isinstance(record, dict):
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_binding_missing"}
+            )
+        try:
+            from providers.execution import AuditedAsyncHTTPClient
+
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            from agents.server_utils import ticket_state_headers
+
+            headers = ticket_state_headers()
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                consumed = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/approvals/{approval_request_id}/consume",
+                    json={
+                        "validation_id": validation_id,
+                        "presented_run_file_digest": record.get("runfile_fingerprint"),
+                        "execution_intent_digest": record.get(
+                            "execution_intent_digest"
+                        ),
+                        "session_id": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
+                        ),
+                        "session_epoch": os.environ.get(
+                            "AGENTIC_PERF_ORCHESTRATOR_EPOCH"
+                        ),
+                        "ticket_attempt": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                        "claim_id": (
+                            os.environ.get("AGENTIC_PERF_CLAIM_ID")
+                            or (
+                                active_check.get("custom_fields", {}).get("claim") or {}
+                            ).get("claim_id")
+                        ),
+                    },
+                )
+            if consumed.status_code >= 300:
+                return json.dumps(
+                    {"status": "rejected", "reason_code": "approval_not_approved"}
+                )
+        except Exception:
+            logger.exception("[benchmark] approval capability consumption failed")
+            return json.dumps(
+                {"status": "rejected", "reason_code": "approval_check_failed"}
             )
 
     async def _benchmark_progress(output_line: str, elapsed: int) -> None:
@@ -3068,14 +3388,29 @@ async def validate_benchmark(
         )
         output = (result.stdout or "").strip()
         if result.exit_code == 0:
-            params_fingerprint = _compute_params_fingerprint(
-                _ticket.get("custom_fields", {}) if _ticket else {}
-            )
+            fields = _ticket.get("custom_fields", {}) if _ticket else {}
+            params_fingerprint = _compute_params_fingerprint(fields)
+            execution_plan_fingerprint = _execution_plan_fingerprint(fields)
+            run_command = execution.get("run_command", "crucible run")
+            command_valid, _ = _validate_run_command(run_command, harness_name)
+            if not command_valid:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "valid": False,
+                        "errors": ["Configured execution command rejected"],
+                    }
+                )
             validation_id = await _persist_validated_runfile(
                 run_file,
                 harness_name,
                 controller,
                 params_fingerprint,
+                execution_plan_fingerprint,
+                run_command,
+                validation_command,
+                output,
+                str(execution.get("validator_version", "unknown")),
             )
             if validation_id is None:
                 return json.dumps(
@@ -3097,7 +3432,9 @@ async def validate_benchmark(
                     "harness": harness_name,
                     "controller": controller,
                     "validation_id": validation_id,
-                    "validation_output": output,
+                    "validation_output": _validation_output_descriptor(
+                        ticket_id, output
+                    ),
                     "errors": [],
                 }
             )
@@ -3109,7 +3446,7 @@ async def validate_benchmark(
                 "valid": False,
                 "harness": harness_name,
                 "controller": controller,
-                "validation_output": output,
+                "validation_output": _validation_output_descriptor(ticket_id, output),
                 "errors": [details],
                 "exit_code": result.exit_code,
             }
@@ -3771,8 +4108,9 @@ async def execute_boot_time_test(
             from providers.execution import AuditedAsyncHTTPClient
 
             store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            from agents.server_utils import ticket_state_headers
+
+            headers = ticket_state_headers()
             ticket_id = _ticket.get("id", "")
             if ticket_id:
                 async with AuditedAsyncHTTPClient(
@@ -3786,7 +4124,7 @@ async def execute_boot_time_test(
                     new_dir = response["output_dir"]
                     if new_dir not in existing:
                         existing.append(new_dir)
-                    await _client.patch(
+                    update_response = await _client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                         json={
                             "fields": {
@@ -3795,6 +4133,7 @@ async def execute_boot_time_test(
                             }
                         },
                     )
+                    update_response.raise_for_status()
                 logger.info(
                     f"[boot-time] Saved output_dir to ticket"
                     f" {ticket_id} ({len(existing)} total)"

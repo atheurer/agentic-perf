@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from paths import TRACE_SPOOL_DIR
 
@@ -14,6 +14,7 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 def health(request: Request):
     store = request.app.state.store
+    lease = store.get_orchestrator_lease()
     all_tickets = store.list_tickets()
     counts = {}
     for status in TicketStatus:
@@ -46,4 +47,20 @@ def health(request: Request):
             "oldest_unacked_age_seconds": oldest,
             "quarantined_frames": quarantined,
         },
+        # Public health reports only liveness.  Holder identity and fencing
+        # metadata belong behind the authenticated control endpoint.
+        "orchestrator_lease": {"active": lease is not None},
     }
+
+
+async def _require_authenticated(request: Request):
+    principal = await request.app.state.auth_dependency(request)
+    if principal.kind == "anonymous":
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return principal
+
+
+@router.get("/diagnostics", dependencies=[Depends(_require_authenticated)])
+def diagnostics(request: Request):
+    """Authenticated operator diagnostics; do not add these fields to health."""
+    return dict(request.app.state.store_diagnostics)

@@ -7,13 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {
     "agents/chat/agent.py",
     "agents/mcp_client.py",
+    "orchestrator/leader_lease.py",
     "orchestrator/poller.py",
     "providers/execution/http.py",
     "providers/skills/arcaflow_plugins.py",
     "providers/skills/crucible.py",
     "providers/tracing/client.py",
 }
-EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {135}}
+EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {147}}
 
 
 def _direct_httpx_calls(path: Path) -> list[int]:

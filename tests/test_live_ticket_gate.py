@@ -52,6 +52,13 @@ def test_ticket_direction_forbids_host_mounts_entirely() -> None:
     assert "Do not mount `/proc`, `/sys`" in description
 
 
+def test_ticket_direction_distinguishes_ids_from_benchmark_params() -> None:
+    description = gate._description(config())
+    assert '`benchmarks[].ids: "1"`' in description
+    assert "client engine's `ids: [1]`" in description
+    assert "Never add `benchmark-id` or `client-id`" in description
+
+
 def test_ticket_direction_permits_only_required_prerequisite_packages() -> None:
     description = gate._description(config())
     assert (
@@ -115,6 +122,27 @@ def test_completed_ticket_rejects_missing_review() -> None:
     }
     with pytest.raises(gate.GateError, match="required lifecycle"):
         gate._validate_completed_ticket(ticket)
+
+
+def test_pending_approval_requires_one_structured_request() -> None:
+    approval = {
+        "approval_request_id": "apr-1",
+        "status": "pending",
+    }
+    ticket = {
+        "custom_fields": {
+            "approval_requests": {
+                "apr-1": approval,
+                "apr-old": {"approval_request_id": "apr-old", "status": "cancelled"},
+            }
+        }
+    }
+    assert gate._pending_approval(ticket) == approval
+
+
+def test_pending_approval_rejects_missing_request() -> None:
+    with pytest.raises(gate.GateError, match="exactly one pending"):
+        gate._pending_approval({"custom_fields": {}})
 
 
 def safe_run_file() -> dict:

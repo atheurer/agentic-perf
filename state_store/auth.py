@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 TOKEN_FILE = SECRETS_DIR / "api-token"
 TOKEN_ENV_VAR = "AGENTIC_PERF_API_TOKEN"
+VALIDATOR_TOKEN_FILE = SECRETS_DIR / "benchmark-validator-token"
+VALIDATOR_TOKEN_ENV_VAR = "AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,30 @@ def load_or_generate_token() -> str:
     TOKEN_FILE.chmod(0o600)
     logger.info("Generated new API token at %s", TOKEN_FILE)
     return token
+
+
+def load_or_generate_validator_token() -> str:
+    """Return the capability available only to the benchmark validator process."""
+    token = os.environ.get(VALIDATOR_TOKEN_ENV_VAR)
+    if token:
+        return token
+    if VALIDATOR_TOKEN_FILE.exists():
+        return VALIDATOR_TOKEN_FILE.read_text().strip()
+    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(32)
+    VALIDATOR_TOKEN_FILE.write_text(token + "\n")
+    VALIDATOR_TOKEN_FILE.chmod(0o600)
+    return token
+
+
+def read_validator_token_from_file() -> str:
+    """Read the benchmark-validator token without creating one."""
+    env_token = os.environ.get(VALIDATOR_TOKEN_ENV_VAR)
+    if env_token:
+        return env_token
+    if VALIDATOR_TOKEN_FILE.exists():
+        return VALIDATOR_TOKEN_FILE.read_text().strip()
+    return ""
 
 
 def read_token_from_file() -> str:

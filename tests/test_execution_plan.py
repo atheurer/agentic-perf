@@ -58,7 +58,17 @@ def test_advance_plan_no_plan_is_noop():
         factory.return_value.__aexit__ = AsyncMock(return_value=None)
 
         asyncio.run(
-            _advance_plan("http://localhost:8090", "PERF-TEST", "executing_benchmark")
+            _advance_plan(
+                "http://localhost:8090",
+                "PERF-TEST",
+                "executing_benchmark",
+                claim_id="claim-123",
+            )
+        )
+
+        assert (
+            factory.call_args.kwargs["headers"]["X-Agentic-Perf-Claim-Id"]
+            == "claim-123"
         )
 
         client.patch.assert_not_called()
@@ -214,6 +224,8 @@ def test_advance_plan_completes_step_and_advances():
                 transition_call = call
         assert transition_call is not None
         assert transition_call.kwargs["json"]["status"] == "executing_benchmark"
+        client.patch.return_value.raise_for_status.assert_called_once_with()
+        assert client.post.return_value.raise_for_status.call_count == 2
 
 
 def _provision_plan():

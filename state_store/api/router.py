@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from . import (
+    approvals,
     artifacts,
     audit,
     chat,
@@ -9,6 +10,7 @@ from . import (
     groups,
     health,
     interject,
+    orchestrator_lease,
     owners,
     stop,
     stream,
@@ -18,6 +20,7 @@ from . import (
     transitions,
     transitions_info,
     users,
+    validations,
     webhooks,
     whoami,
 )
@@ -25,6 +28,7 @@ from . import (
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(audit.router)
 api_router.include_router(artifacts.router)
+api_router.include_router(approvals.router)
 api_router.include_router(tickets.router)
 api_router.include_router(transitions.router)
 api_router.include_router(comments.router)
@@ -34,12 +38,14 @@ api_router.include_router(stop.router)
 api_router.include_router(stream.router)
 api_router.include_router(interject.router)
 api_router.include_router(owners.router)
+api_router.include_router(orchestrator_lease.router)
 api_router.include_router(transitions_info.router)
 api_router.include_router(users.router)
 api_router.include_router(groups.router)
 api_router.include_router(whoami.router)
 api_router.include_router(traces.router)
 api_router.include_router(trace_operations.router)
+api_router.include_router(validations.router)
 # Chat router handles its own auth (supports anonymous read-only)
 chat_router = APIRouter(prefix="/api/v1")
 chat_router.include_router(chat.router)

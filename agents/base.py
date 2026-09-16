@@ -27,6 +27,7 @@ from providers.tracing import (
     MonotonicTimer,
     OperationOutcome,
     RetryKind,
+    TraceContext,
     TraceRecorder,
     bind_trace_context,
     child_context,
@@ -147,6 +148,27 @@ class AgentBase(ABC):
         self.trace_context = None
         self._trace = TraceRecorder()
         self._trace_terminal_state = LifecycleState.COMPLETED
+
+    def set_fence_context(
+        self,
+        session_id: str | None,
+        epoch: int | None,
+        claim_id: str | None,
+    ) -> None:
+        """Bind immutable orchestrator fencing headers to agent state writes."""
+        if not session_id or epoch is None:
+            return
+        from agents.fencing import FenceContext, bind_fence_context
+
+        bind_fence_context(FenceContext(session_id, epoch, claim_id or ""))
+        self._client.headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": str(epoch),
+            }
+        )
+        if claim_id:
+            self._client.headers["X-Agentic-Perf-Claim-Id"] = claim_id
 
     def _register_workspace_tools(self) -> None:
         """Register native workspace tools on the agent."""
@@ -1206,7 +1228,9 @@ class AgentBase(ABC):
                         phase=tc.name,
                     )
                     try:
-                        result = await self._execute_tool(tc)
+                        result = await self._execute_tool(
+                            tc, trace_context=tool_context
+                        )
                     except asyncio.CancelledError:
                         self._trace_terminal_state = LifecycleState.CANCELLED
                         self._trace.record(
@@ -1700,13 +1724,20 @@ class AgentBase(ABC):
             }
         )
 
-    async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
+    async def _execute_tool(
+        self,
+        tool_call: ToolCall,
+        trace_context: TraceContext | None = None,
+    ) -> ToolResult:
         await self._throttle_tool_call()
 
         call_input, jq_filter = self._normalize_tool_input(tool_call)
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:
+            trace_token = (
+                bind_trace_context(trace_context) if trace_context is not None else None
+            )
             try:
                 try:
                     inspect.signature(handler).bind(**call_input)
@@ -1736,10 +1767,17 @@ class AgentBase(ABC):
                     content=self._tool_error_content(e, "ambiguous_after_send"),
                     is_error=True,
                 )
+            finally:
+                if trace_token is not None:
+                    reset_trace_context(trace_token)
 
         if self._mcp is not None:
             try:
-                content = await self._mcp.call_tool(tool_call.name, call_input)
+                content = await self._mcp.call_tool(
+                    tool_call.name,
+                    call_input,
+                    trace_context=trace_context or self._trace.context,
+                )
 
                 content = self._spill_tool_output(
                     tool_call.name, content, jq_filter=jq_filter

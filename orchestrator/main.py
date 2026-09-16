@@ -412,10 +412,11 @@ async def _apply_step_overrides(
             override_fields["scoped_context"] = scoped
 
     if override_fields:
-        await client.patch(
+        response = await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={"fields": override_fields},
         )
+        response.raise_for_status()
 
 
 async def _advance_plan(
@@ -423,6 +424,7 @@ async def _advance_plan(
     ticket_id: str,
     completed_status: str,
     event_bus: EventBus | None = None,
+    claim_id: str | None = None,
 ) -> None:
     """Advance the execution plan after an agent completes a step.
 
@@ -435,6 +437,8 @@ async def _advance_plan(
         ticket_id=ticket_id, agent_id="orchestrator"
     )
     headers = _auth_headers() | trace_headers(context)
+    if claim_id:
+        headers["X-Agentic-Perf-Claim-Id"] = claim_id
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
         r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
         if r.status_code != 200:
@@ -488,7 +492,7 @@ async def _advance_plan(
                     f"tuning ({missing}) but configuration_applied is empty "
                     f"— blocking advance to benchmark"
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={
                         "status": "awaiting_customer_guidance",
@@ -504,6 +508,7 @@ async def _advance_plan(
                         ),
                     },
                 )
+                response.raise_for_status()
                 return
 
         step["status"] = "completed"
@@ -523,11 +528,12 @@ async def _advance_plan(
         # (the ticket may be in any status at this point).
         stop_after = cf.get("stop_after_step")
         if stop_after and step.get("agent_type") == stop_after:
-            await client.patch(
+            response = await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json={"fields": {"execution_plan": plan}},
             )
-            await client.post(
+            response.raise_for_status()
+            response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={
                     "author": "orchestrator",
@@ -537,9 +543,11 @@ async def _advance_plan(
                     ),
                 },
             )
-            await client.post(
+            response.raise_for_status()
+            response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/force-close",
             )
+            response.raise_for_status()
             return
 
         next_idx = current + 1
@@ -589,7 +597,7 @@ async def _advance_plan(
                 # so that mutations (e.g. analysis-informed
                 # benchmark params) are persisted.
                 await _apply_step_overrides(store_url, client, ticket_id, next_step, cf)
-                await client.patch(
+                response = await client.patch(
                     f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                     json={
                         "fields": {
@@ -598,12 +606,13 @@ async def _advance_plan(
                         },
                     },
                 )
+                response.raise_for_status()
 
                 label = next_step.get("params", {}).get(
                     "label",
                     next_step["agent_type"],
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                     json={
                         "author": "orchestrator",
@@ -614,17 +623,19 @@ async def _advance_plan(
                         ),
                     },
                 )
+                response.raise_for_status()
 
                 comment = (
                     f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
                 )
-                await client.post(
+                response = await client.post(
                     f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                     json={"status": next_status, "comment": comment},
                 )
+                response.raise_for_status()
                 return
 
-        await client.patch(
+        response = await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
             json={
                 "fields": {
@@ -633,6 +644,7 @@ async def _advance_plan(
                 },
             },
         )
+        response.raise_for_status()
 
 
 async def run_agent_task(
@@ -657,6 +669,13 @@ async def run_agent_task(
         )
         if agent is None:
             return
+
+        if hasattr(agent, "set_fence_context"):
+            agent.set_fence_context(
+                dispatcher._session_id,
+                dispatcher._fencing_epoch,
+                dispatcher._claim_ids.get(ticket_id),
+            )
 
         if getattr(agent, "trace_context", None) is None:
             agent.trace_context = dispatcher._trace_contexts.get(ticket_id)
@@ -908,13 +927,24 @@ async def run_agent_task(
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        if success and status in PLAN_AGENT_STATUS.values():
+        deposed = dispatcher.is_deposed()
+        plan_managed = status in PLAN_AGENT_STATUS.values()
+        logger.info(
+            "Completion gate for %s: success=%s deposed=%s plan_managed=%s status=%s",
+            ticket_id,
+            success,
+            deposed,
+            plan_managed,
+            status,
+        )
+        if success and not deposed and plan_managed:
             try:
                 await _advance_plan(
                     dispatcher.store_url,
                     ticket_id,
                     status,
                     event_bus=dispatcher.events,
+                    claim_id=dispatcher._claim_ids.get(ticket_id),
                 )
             except Exception:
                 logger.exception(f"_advance_plan failed for {ticket_id}")
@@ -923,7 +953,7 @@ async def run_agent_task(
         # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
         # The triage agent transitions the ticket to awaiting_hardware
         # itself; we force-close here if stop_after_step == "triage".
-        if success and status == "triage_pending":
+        if success and not deposed and status == "triage_pending":
             try:
                 async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=_auth_headers()
@@ -977,6 +1007,10 @@ async def _transition_to_guidance(
     task timeout) that operate outside an agent context.
     """
 
+    trace_context = current_trace_context() or new_trace_context(
+        ticket_id=ticket_id, agent_id="orchestrator"
+    )
+    context_token = bind_trace_context(trace_context)
     try:
         async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=_auth_headers()
@@ -992,7 +1026,8 @@ async def _transition_to_guidance(
         logger.exception(
             f"Failed to transition {ticket_id} to awaiting_customer_guidance"
         )
-        return
+    finally:
+        reset_trace_context(context_token)
 
 
 async def _check_stale_tasks(
@@ -1363,6 +1398,42 @@ async def _add_comment(
         logger.exception("Failed to add comment on %s", ticket_id)
 
 
+async def _renew_leader_lease(
+    lease: Any, interval: float, on_lost: Any | None = None
+) -> None:
+    """Keep the control-plane lease fenced while the poll loop is active."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await lease.renew()
+            except Exception as exc:
+                logger.critical("Orchestrator leader lease renewal failed: %s", exc)
+                if on_lost is not None:
+                    on_lost()
+                raise RuntimeError("orchestrator leader lease lost") from exc
+    finally:
+        await lease.release()
+
+
+class _LeaseLossGate:
+    """Bind lease loss to a dispatcher without an initialization-time race."""
+
+    def __init__(self) -> None:
+        self.dispatcher: Any | None = None
+        self.lost = False
+
+    def mark_deposed(self) -> None:
+        self.lost = True
+        if self.dispatcher is not None:
+            self.dispatcher.mark_deposed()
+
+    def bind(self, dispatcher: Any) -> None:
+        self.dispatcher = dispatcher
+        if self.lost:
+            dispatcher.mark_deposed()
+
+
 def _check_dispatch_quota(
     ticket: dict[str, Any],
     user_store: Any,
@@ -1430,6 +1501,27 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         json.dumps(config.raw, sort_keys=True).encode()
     ).hexdigest()[:12]
 
+    from .leader_lease import LeaderLeaseClient
+
+    leader_lease = LeaderLeaseClient(
+        config.state_store_url,
+        instance_name=config.instance_name,
+        ttl_seconds=config.leader_lease_ttl_seconds,
+    )
+    await leader_lease.acquire()
+    if leader_lease.epoch is None:
+        raise RuntimeError("state store returned no leader fencing epoch")
+    os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
+    os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+    lease_loss_gate = _LeaseLossGate()
+    lease_renew_task: asyncio.Task | None = asyncio.create_task(
+        _renew_leader_lease(
+            leader_lease,
+            config.leader_lease_renew_interval,
+            lease_loss_gate.mark_deposed,
+        )
+    )
+
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
@@ -1494,9 +1586,13 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     else:
         secrets = local_secrets
 
-    from providers.redaction import Redactor
+    from providers.redaction import get_shared_redactor
 
-    redactor = Redactor()
+    # Secret providers, progress reporting, and MCP payload capture must share
+    # the live registry so values registered during a ticket cannot leak via a
+    # later large-result replay.
+    # (The registry is the process-wide equivalent of the old Redactor().)
+    redactor = get_shared_redactor()
 
     usage_ledger = None
     if config.raw.get("auth", {}).get("multi_user", False):
@@ -1548,7 +1644,10 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         vault_config=vault_config,
         redactor=redactor,
         introspection_llm=config.introspection_llm,
+        session_id=str(leader_lease.session_id),
+        fencing_epoch=leader_lease.epoch,
     )
+    lease_loss_gate.bind(dispatcher)
 
     logger.info(
         f"Orchestrator started (store={config.state_store_url}, "
@@ -1574,6 +1673,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     repos_refreshed = False
 
     while True:
+        if lease_renew_task is not None and lease_renew_task.done():
+            lease_renew_task.result()
         if time.monotonic() - last_trace_sweep >= 60.0 and (
             trace_sweep_task is None or trace_sweep_task.done()
         ):
@@ -1926,9 +2027,17 @@ def _setup_api_token() -> None:
 
 def _auth_headers() -> dict[str, str]:
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    if session_id and epoch:
+        headers.update(
+            {
+                "X-Agentic-Perf-Orchestrator-Session": session_id,
+                "X-Agentic-Perf-Orchestrator-Epoch": epoch,
+            }
+        )
+    return headers
 
 
 def _sweep_trace_spools() -> None:
