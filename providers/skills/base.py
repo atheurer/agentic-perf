@@ -16,6 +16,7 @@ class BenchmarkSuite:
     min_hosts: int = 1
     harness: str = ""
     source: dict[str, Any] = field(default_factory=dict)
+    architectures: list[str] = field(default_factory=list)
 
 
 @dataclass
