@@ -49,10 +49,10 @@ def test_environment_overrides_are_shared(monkeypatch):
 
 
 def test_orchestrator_exports_resolved_store_url_for_audited_execution(monkeypatch):
+    monkeypatch.delenv("STATE_STORE_URL", raising=False)
     config = OrchestratorConfig(
         raw_config={"state_store": {"url": "http://localhost:8095", "port": 8095}}
     )
-    monkeypatch.delenv("STATE_STORE_URL", raising=False)
 
     _ensure_state_store_environment(config)
 
