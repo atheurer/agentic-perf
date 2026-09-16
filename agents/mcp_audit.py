@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -52,6 +53,10 @@ _MAX_REPLAY_CACHE = 1024
 # #788 owns each tool's durable operation semantics.  This boundary merely
 # refuses to dispatch a protected handler unless #787 has already accepted its
 # immutable idempotency identity.
+# Only tools whose *whole invocation* is a durable side effect belong here.
+# Resource availability normally reads provider state; its exceptional named
+# device escalation has its own, narrower operation boundary in
+# ``agents.resource.server``.
 _PROTECTED_TOOLS = frozenset({"execute_benchmark"})
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 _MAX_ERROR_MESSAGE_BYTES = 4096
@@ -115,6 +120,7 @@ class MCPAuditMiddleware(Middleware):
         ticket_id: str | None = None,
         agent_id: str | None = None,
         record: Callable[[TraceEventV1], None] | None = None,
+        registration_path: str | None = None,
     ) -> None:
         self.server_name = server_name
         self.ticket_id = (
@@ -124,6 +130,7 @@ class MCPAuditMiddleware(Middleware):
             agent_id if agent_id is not None else os.environ.get("AGENT_NAME")
         )
         self._record = record
+        self.registration_path = registration_path
         self._client: TraceClient | None = None
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         url = os.environ.get("STATE_STORE_URL", "")
@@ -159,6 +166,20 @@ class MCPAuditMiddleware(Middleware):
             session_id = context.mcp_session_id or "unknown"
         if not context.ticket_id:
             return
+        policy_attributes: dict[str, Any] = {}
+        if self.registration_path:
+            # The policy is resolved at the real FastMCP boundary, not from a
+            # test-only symbol lookup.  A new registered tool therefore cannot
+            # emit an apparently valid audit pair without its declared owner.
+            from agents.tool_audit_policy import POLICY_BY_REGISTRATION
+
+            policy = POLICY_BY_REGISTRATION.get(f"{self.registration_path}:{tool_name}")
+            if policy is not None:
+                policy_attributes = {
+                    "policy_registration": policy.registration,
+                    "policy_classification": policy.classification,
+                    "operation_owner": policy.operation_owner,
+                }
         event = TraceEventV1(
             ticket_id=context.ticket_id,
             agent_id=context.agent_id,
@@ -197,7 +218,15 @@ class MCPAuditMiddleware(Middleware):
                 if error is not None
                 else None
             ),
-            attributes=attributes,
+            attributes={
+                # These fields make the runtime proof inspect the same
+                # production boundary that the AST inventory permits.
+                "audit_boundary": "MCPAuditMiddleware.on_call_tool",
+                "audit_transport": "local",
+                "causal_ancestor": context.parent_action_id,
+                **policy_attributes,
+                **(attributes or {}),
+            },
         )
         if self._record is not None:
             self._record(event)
@@ -409,6 +438,55 @@ class MCPAuditMiddleware(Middleware):
             )
         return acquired.get("operation", {}), None
 
+    def _emit_terminal(
+        self,
+        trace: TraceContext,
+        fastmcp_context: Any,
+        state: LifecycleState,
+        *,
+        tool_name: str,
+        duration_ms: float,
+        outcome: OperationOutcome,
+        lease: dict[str, Any] | None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Persist a terminal audit event or make a protected effect explicit.
+
+        A started protected operation cannot safely be presented as completed
+        when the terminal trace acknowledgement is lost.  Mark the operation
+        indeterminate when possible and fail the MCP request so reconciliation
+        is required instead of silently losing the audit pair.
+        """
+        try:
+            self._emit(
+                trace,
+                fastmcp_context,
+                state,
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                error=error,
+            )
+        except Exception as audit_error:
+            if lease is not None and self._client is not None:
+                try:
+                    self._client.operation_transition(
+                        trace.idempotency_key or "",
+                        "indeterminate",
+                        int(lease["fencing_generation"]),
+                        descriptor={"outcome": "terminal_audit_delivery_failed"},
+                    )
+                except Exception:
+                    # The failed response below is deliberately the visible
+                    # signal even if the operation registry is unavailable too.
+                    pass
+            raise McpError(
+                ErrorData(
+                    code=-32000,
+                    message="MCP tool outcome is indeterminate; audit terminal was not persisted",
+                )
+            ) from audit_error
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[Any],
@@ -458,6 +536,15 @@ class MCPAuditMiddleware(Middleware):
                 error=exc,
             )
             raise
+
+        # A ticket-owned MCP process may not execute a tool with no durable
+        # audit transport.  Unit-only servers without ticket identity retain
+        # their in-memory recorder behaviour, but production callers fail
+        # before the handler can cause an effect.
+        if self.ticket_id and self._record is None and self._client is None:
+            raise McpError(
+                ErrorData(code=-32000, message="MCP audit transport is unavailable")
+            )
 
         self._emit(
             trace,
@@ -526,13 +613,14 @@ class MCPAuditMiddleware(Middleware):
                     int(lease["fencing_generation"]),
                     descriptor={"outcome": "cancelled_after_start"},
                 )
-            self._emit(
+            self._emit_terminal(
                 trace,
                 context.fastmcp_context,
                 LifecycleState.CANCELLED,
                 tool_name=tool_name,
                 duration_ms=(time.monotonic() - started) * 1000,
                 outcome=OperationOutcome.CANCELLED,
+                lease=lease,
             )
             raise
         except Exception as exc:
@@ -546,33 +634,26 @@ class MCPAuditMiddleware(Middleware):
                         "type": type(exc).__name__,
                     },
                 )
-            self._emit(
+            self._emit_terminal(
                 trace,
                 context.fastmcp_context,
                 LifecycleState.FAILED,
                 tool_name=tool_name,
                 duration_ms=(time.monotonic() - started) * 1000,
                 outcome=OperationOutcome.FAILURE,
+                lease=lease,
                 error=exc,
             )
             raise self._redacted_exception(trace.ticket_id or "unknown", exc) from exc
         finally:
             reset_trace_context(token)
         result = self._sanitize_result(trace, result)
-        if lease is not None:
-            descriptor = self._result_descriptor(trace, result)
-            self._client.operation_transition(
-                trace.idempotency_key or "",
-                "fail" if getattr(result, "is_error", False) else "complete",
-                int(lease["fencing_generation"]),
-                descriptor=descriptor,
-            )
         terminal_state = (
             LifecycleState.FAILED
             if getattr(result, "is_error", False)
             else LifecycleState.RESPONSE_SENT
         )
-        self._emit(
+        self._emit_terminal(
             trace,
             context.fastmcp_context,
             terminal_state,
@@ -583,14 +664,53 @@ class MCPAuditMiddleware(Middleware):
                 if getattr(result, "is_error", False)
                 else OperationOutcome.SUCCESS
             ),
+            lease=lease,
         )
+        # A protected operation must not become a durable success/failure
+        # before its correlated terminal audit has been acknowledged.  If the
+        # audit write above fails, ``_emit_terminal`` can still transition the
+        # live side-effect-started operation to indeterminate.  Reversing this
+        # order would leave an immutable terminal success behind after a lost
+        # terminal trace and make the loss invisible to replay/reconciliation.
+        if lease is not None:
+            descriptor = self._result_descriptor(trace, result)
+            try:
+                self._client.operation_transition(
+                    trace.idempotency_key or "",
+                    "fail" if getattr(result, "is_error", False) else "complete",
+                    int(lease["fencing_generation"]),
+                    descriptor=descriptor,
+                )
+            except Exception as operation_error:
+                # The trace is durable but we do not know whether the terminal
+                # operation acknowledgement was lost before or after commit.
+                # Do not return a success/failure result in that ambiguity;
+                # preserve the side-effect-started record for reconciliation.
+                raise McpError(
+                    ErrorData(
+                        code=-32000,
+                        message=(
+                            "MCP tool outcome is indeterminate; operation terminal "
+                            "was not acknowledged"
+                        ),
+                    )
+                ) from operation_error
         return result
 
 
 def create_ticket_mcp(server_name: str) -> FastMCP:
     """Create the required audited FastMCP instance for a local ticket server."""
     bootstrap_shared_redactor_from_environment()
-    middleware = MCPAuditMiddleware(server_name)
+    caller = Path(inspect.stack()[1].filename).resolve()
+    project_root = Path(__file__).resolve().parents[1]
+    try:
+        registration_path = caller.relative_to(project_root).as_posix()
+    except ValueError:
+        # External integration fixtures may create a private server script;
+        # production package servers are always project-relative and enforced
+        # below by the registration inventory test.
+        registration_path = None
+    middleware = MCPAuditMiddleware(server_name, registration_path=registration_path)
 
     @asynccontextmanager
     async def lifespan(_: FastMCP):

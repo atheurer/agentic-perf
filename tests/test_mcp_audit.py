@@ -310,6 +310,8 @@ async def test_server_records_metadata_and_detects_same_session_replay():
     ]
     assert events[0].mcp.protocol_request_id == "rpc-1"
     assert events[0].mcp.correlation_request_id == "correlation-1"
+    assert events[0].attributes["audit_boundary"] == "MCPAuditMiddleware.on_call_tool"
+    assert events[0].attributes["audit_transport"] == "local"
 
 
 @pytest.mark.asyncio
@@ -450,6 +452,96 @@ async def test_server_rejects_mismatched_ticket_before_handler():
         LifecycleState.REQUEST_RECEIVED,
         LifecycleState.REJECTED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_ticket_mcp_fails_closed_without_audit_transport():
+    """A real ticket server cannot use a no-op audit configuration."""
+    middleware = MCPAuditMiddleware(
+        "benchmark-agent", ticket_id="PERF-1", agent_id="benchmark"
+    )
+    handler = AsyncMock(return_value="unexpected")
+    with pytest.raises(McpError, match="audit transport is unavailable"):
+        await middleware.on_call_tool(_request("no-audit"), handler)
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protected_terminal_audit_failure_marks_real_operation_indeterminate(
+    tmp_path,
+):
+    """A lost terminal trace cannot leave a real operation terminal-success."""
+
+    class StoreBackedRegistry:
+        """Minimal service-client facade backed by the production TraceStore."""
+
+        def __init__(self, store: TraceStore) -> None:
+            self.store = store
+            self.owner = "test-service"
+
+        def operation_acquire(self, key: str, request_hash: str, ttl: float) -> dict:
+            operation, status = self.store.acquire_operation_result(
+                key, request_hash, self.owner, ttl
+            )
+            return {"status": status, "operation": operation.__dict__}
+
+        def operation_transition(
+            self, key: str, action: str, token: int, **kwargs
+        ) -> dict:
+            descriptor = kwargs.get("descriptor") or {}
+            operation = {
+                "prepared": self.store.mark_prepared,
+                "side-effect-started": self.store.mark_side_effect_started,
+                "complete": lambda *args: self.store.complete(*args, descriptor),
+                "fail": lambda *args: self.store.fail(*args, descriptor),
+                "indeterminate": lambda *args: self.store.mark_indeterminate(
+                    *args, descriptor
+                ),
+            }[action](key, self.owner, token)
+            return {"operation": operation.__dict__}
+
+    event_count = 0
+
+    def record(_event):
+        nonlocal event_count
+        event_count += 1
+        if event_count == 2:
+            raise OSError("trace service unavailable")
+
+    with TraceStore(tmp_path / "trace.db") as store:
+        middleware = MCPAuditMiddleware(
+            "benchmark-agent",
+            ticket_id="PERF-1",
+            agent_id="benchmark",
+            record=record,
+        )
+        middleware._client = StoreBackedRegistry(store)
+        request = _request("terminal-loss")
+        request.message.meta.model_extra["agentic-perf"].update(
+            {"idempotency_key": "terminal-loss", "idempotency_request_hash": "hash"}
+        )
+        with pytest.raises(McpError, match="outcome is indeterminate"):
+            await middleware.on_call_tool(
+                request.copy(
+                    message=request.message.model_copy(
+                        update={"name": "execute_benchmark"}
+                    )
+                ),
+                AsyncMock(return_value=ToolResult(content="effect happened")),
+            )
+        operation = store.get_operation("terminal-loss")
+        assert operation is not None
+        assert operation.state == "terminal"
+        assert operation.terminal_outcome == "indeterminate"
+        assert [
+            entry["reason"] for entry in store.operation_history("terminal-loss")
+        ] == [
+            "registered",
+            "lease_acquired",
+            "prepared",
+            "side_effect_started",
+            "terminal",
+        ]
 
 
 @pytest.mark.asyncio
