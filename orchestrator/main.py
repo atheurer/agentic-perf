@@ -41,6 +41,19 @@ logger = logging.getLogger(__name__)
 MODEL_CHECK_MAX_TOKENS = 1024
 
 
+def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
+    """Expose the resolved store URL to audited execution providers.
+
+    The audited HTTP and subprocess clients use this environment variable to
+    initialize their central trace recorder.  The orchestrator also supports
+    resolving the store URL from config.json, so relying on the caller to set
+    the environment would leave mutating agent operations without tracing.
+    Preserve an explicit environment override for operators and test
+    instances.
+    """
+    os.environ.setdefault("STATE_STORE_URL", config.state_store_url)
+
+
 def _make_llm_provider(
     config: OrchestratorConfig, provider: str = "", model: str = "", api: str = ""
 ):
@@ -1523,6 +1536,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     _last_good_digest = hashlib.sha256(
         json.dumps(config.raw, sort_keys=True).encode()
     ).hexdigest()[:12]
+    _ensure_state_store_environment(config)
 
     from .leader_lease import LeaderLeaseClient
 
