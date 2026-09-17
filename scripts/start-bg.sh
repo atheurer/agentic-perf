@@ -120,6 +120,15 @@ raise SystemExit(1)
 PY
 }
 
+wait_for_lock_release() {
+    local path="$1" label="$2" deadline=$((SECONDS + STORE_START_TIMEOUT))
+    echo "$label lock is held by an unverifiable process; waiting up to ${STORE_START_TIMEOUT}s for it to release..."
+    while [ "$SECONDS" -lt "$deadline" ] && lock_is_held "$path"; do
+        sleep 0.2
+    done
+    ! lock_is_held "$path"
+}
+
 json_field() {
     python3 - "$1" "$2" <<'PY'
 import json
@@ -277,27 +286,33 @@ start_store() {
     if lock_is_held "$STORE_LOCK"; then
         pid="$(store_lock_pid || true)"
         expected="$(store_lock_start_identity || true)"
-        store_owner_valid "$pid" "$expected" || {
-            error "state-store lock is held by an unverifiable process (PID ${pid:-unknown})"
-            return 1
-        }
-        write_pid_file "$STORE_PID_FILE" "$pid"
-        echo "State store already owns the persistence lock (PID $pid); waiting up to ${STORE_START_TIMEOUT}s for readiness..."
-        wait_for_store "$pid" || {
-            if ! lock_is_held "$STORE_LOCK"; then
-                echo "Previous state store PID $pid exited and released the lock; starting a fresh state store."
+        if ! store_owner_valid "$pid" "$expected"; then
+            if wait_for_lock_release "$STORE_LOCK" "State store"; then
+                echo "Previous state-store lock owner released the lock; starting a fresh state store."
                 rm -f "$STORE_PID_FILE"
             else
-                error "state-store lock owner PID $pid is not responding as this instance; see $STORE_LOG"
+                error "state-store lock is held by an unverifiable process (PID ${pid:-unknown}); see $STORE_LOG"
                 return 1
             fi
-        }
-        if lock_is_held "$STORE_LOCK" && [ "$(store_lock_pid || true)" = "$pid" ] \
-            && [ "$(endpoint_identity || true)" = "this-store" ]; then
-            echo "State store already running (PID $pid); did not start a new service."
-            echo "  Repaired PID metadata: $STORE_PID_FILE"
-            echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
-            return 2
+        else
+            write_pid_file "$STORE_PID_FILE" "$pid"
+            echo "State store already owns the persistence lock (PID $pid); waiting up to ${STORE_START_TIMEOUT}s for readiness..."
+            wait_for_store "$pid" || {
+                if ! lock_is_held "$STORE_LOCK"; then
+                    echo "Previous state store PID $pid exited and released the lock; starting a fresh state store."
+                    rm -f "$STORE_PID_FILE"
+                else
+                    error "state-store lock owner PID $pid is not responding as this instance; see $STORE_LOG"
+                    return 1
+                fi
+            }
+            if lock_is_held "$STORE_LOCK" && [ "$(store_lock_pid || true)" = "$pid" ] \
+                && [ "$(endpoint_identity || true)" = "this-store" ]; then
+                echo "State store already running (PID $pid); did not start a new service."
+                echo "  Repaired PID metadata: $STORE_PID_FILE"
+                echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
+                return 2
+            fi
         fi
     fi
     case "$(endpoint_identity || true)" in
@@ -314,7 +329,10 @@ start_store() {
         return 0
     fi
     error "state store failed to become ready; see $STORE_LOG"
-    store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)" && terminate_process "$pid" store || true
+    if store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)"; then
+        echo "Cleaning up failed state-store startup (PID $pid)..."
+        terminate_process "$pid" store || true
+    fi
     rm -f "$STORE_PID_FILE"
     return 1
 }
@@ -323,13 +341,19 @@ start_orchestrator() {
     local pid="" deadline=$((SECONDS + ORCH_START_TIMEOUT))
     if lock_is_held "$ORCH_LOCK"; then
         pid="$(orchestrator_pid || true)"
-        orchestrator_owner_valid "$pid" || {
-            error "orchestrator lock is held by an unverifiable process (PID ${pid:-unknown})"
-            return 1
-        }
-        echo "Orchestrator already running (PID $pid); did not start a new service."
-        echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
-        return 2
+        if ! orchestrator_owner_valid "$pid"; then
+            if wait_for_lock_release "$ORCH_LOCK" "Orchestrator"; then
+                echo "Previous orchestrator lock owner released the lock; continuing with a fresh orchestrator start."
+                rm -f "$ORCH_LOCK"
+            else
+                error "orchestrator lock is held by an unverifiable process (PID ${pid:-unknown}); see $ORCH_LOG"
+                return 1
+            fi
+        else
+            echo "Orchestrator already running (PID $pid); did not start a new service."
+            echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
+            return 2
+        fi
     fi
     rm -f "$ORCH_LOCK"
     while [ "$SECONDS" -lt "$deadline" ]; do

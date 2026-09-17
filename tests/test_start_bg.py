@@ -18,8 +18,12 @@ SCRIPT = REPO / "scripts" / "start-bg.sh"
 
 
 def _holder(path: Path, *, role: str, lock_path: Path, store_id: str) -> None:
-    if role == "store":
-        argv0 = "python3 -m uvicorn state_store.main:app"
+    if role in {"store", "unverifiable-store"}:
+        argv0 = (
+            "python3 -m uvicorn state_store.main:app"
+            if role == "store"
+            else "python3 -m unrelated.service"
+        )
         code = """
 import fcntl, json, os, sys, time
 lock_path, store_id = sys.argv[1:]
@@ -232,3 +236,53 @@ exec \"$@\"
     assert "State store started" in result.stdout
     assert "Orchestrator started" in result.stdout
     assert "Services stopped" in result.stdout
+
+
+def test_start_waits_for_unverifiable_lock_owner_to_release(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+    holder = tmp_path / "unverifiable-holder"
+    _holder(
+        holder,
+        role="unverifiable-store",
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    env = os.environ.copy()
+    env.update({"AGENTIC_PERF_HOME": str(home), "START_BG_STORE_TIMEOUT": "1"})
+    process = subprocess.Popen(
+        [str(holder), str(home / "state-store.lock"), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                ready = (home / "state-store.lock").stat().st_size > 0
+            except FileNotFoundError:
+                ready = False
+            if ready:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("unverifiable holder did not acquire its lock")
+        result = subprocess.run(
+            [str(SCRIPT), "start"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        assert result.returncode != 0
+        assert "lock is held by an unverifiable process" in result.stdout
+        assert "waiting up to" in result.stdout
+    finally:
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=5)
