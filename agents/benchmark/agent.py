@@ -317,6 +317,25 @@ class BenchmarkAgent(AgentBase):
             "Review the immutable run-file above and reply naturally with your "
             "decision. I will interpret your response before execution.",
         )
+        approvals_response = await self._client.get(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals"
+        )
+        approvals_response.raise_for_status()
+        record = next(
+            (
+                item
+                for item in approvals_response.json().get("approvals", [])
+                if item.get("approval_request_id") == approval_id
+            ),
+            None,
+        )
+        if record and record.get("status") == "approved":
+            return (
+                f"Approval already granted for request {approval_id}; pass "
+                f"approval request ID {approval_id} to execute_benchmark."
+            )
+        if record and record.get("status") != "pending":
+            return f"Approval {record.get('status')} for request {approval_id}."
         return (
             f"The user replied: {reply}\n\n"
             f"Interpret this response. If it clearly authorizes the benchmark, "
