@@ -210,15 +210,24 @@ wait_for_orchestrator() {
 }
 
 terminate_process() {
-    local pid="$1" kind="$2" deadline lock_path=""
+    local pid="$1" kind="$2" deadline lock_path="" label="state store"
     [ "$kind" = store ] && lock_path="$STORE_LOCK"
     [ "$kind" = orchestrator ] && lock_path="$ORCH_LOCK"
+    [ "$kind" = orchestrator ] && label="orchestrator"
+    echo "$label received SIGTERM; waiting up to ${STOP_TIMEOUT}s for graceful shutdown..."
     kill "$pid" 2>/dev/null || true
     deadline=$((SECONDS + STOP_TIMEOUT))
     while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.2; done
-    process_alive "$pid" && kill -KILL "$pid" 2>/dev/null || true
+    if process_alive "$pid"; then
+        echo "$label did not stop after ${STOP_TIMEOUT}s; sending SIGKILL (PID $pid)."
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
     sleep 0.2
-    [ -z "$lock_path" ] || ! lock_is_held "$lock_path"
+    if [ -n "$lock_path" ] && lock_is_held "$lock_path"; then
+        error "$label PID $pid was signalled but still owns its lock"
+        return 1
+    fi
+    echo "$label stopped (PID $pid)."
 }
 
 stop_orchestrator() {
@@ -232,7 +241,12 @@ stop_orchestrator() {
         echo "Stopping orchestrator (PID $pid)..."
         terminate_process "$pid" orchestrator || { error "orchestrator did not release its lock"; return 1; }
     else
-        [ -f "$ORCH_LOCK" ] && rm -f "$ORCH_LOCK"
+        if [ -f "$ORCH_LOCK" ]; then
+            rm -f "$ORCH_LOCK"
+            echo "Orchestrator already stopped (removed stale lock metadata)."
+        else
+            echo "Orchestrator already stopped."
+        fi
     fi
 }
 
@@ -247,6 +261,11 @@ stop_store() {
         }
         echo "Stopping state store (PID $pid)..."
         terminate_process "$pid" store || { error "state store did not release its persistence lock"; return 1; }
+    elif [ -f "$STORE_LOCK" ]; then
+        rm -f "$STORE_LOCK"
+        echo "State store already stopped (removed stale lock metadata)."
+    else
+        echo "State store already stopped."
     fi
     rm -f "$STORE_PID_FILE"
 }
@@ -347,12 +366,15 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local failures=0
+    local -a failed_services=()
     echo "Launcher checkout revision: $(revision)"
     echo "Stopping services..."
-    stop_orchestrator || failures=$((failures + 1))
-    stop_store || failures=$((failures + 1))
-    if [ "$failures" -ne 0 ]; then error "$failures service(s) could not be stopped safely"; return 1; fi
+    stop_orchestrator || failed_services+=(orchestrator)
+    stop_store || failed_services+=(state-store)
+    if [ "${#failed_services[@]}" -ne 0 ]; then
+        error "could not stop service(s): ${failed_services[*]}"
+        return 1
+    fi
     echo "Services stopped."
 }
 

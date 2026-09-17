@@ -144,3 +144,22 @@ def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None
             if process.poll() is None:
                 process.send_signal(signal.SIGKILL)
                 process.wait(timeout=5)
+
+
+def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    result = subprocess.run(
+        [str(SCRIPT), "stop"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Orchestrator already stopped" in result.stdout
+    assert "State store already stopped" in result.stdout
+    assert "Services stopped" in result.stdout
