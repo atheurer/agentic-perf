@@ -323,10 +323,10 @@ state_store/process_lock.py|107|self.root.mkdir
 state_store/process_lock.py|109|os.open
 state_store/process_lock.py|126|os.ftruncate
 state_store/process_lock.py|128|os.write
-state_store/store.py|1865|filesystem.mkdir
-state_store/store.py|1872|filesystem.mkdir
-state_store/store.py|1885|log_filesystem.rename
-state_store/store.py|1894|filesystem.rename
+state_store/store.py|1889|filesystem.mkdir
+state_store/store.py|1896|filesystem.mkdir
+state_store/store.py|1909|log_filesystem.rename
+state_store/store.py|1918|filesystem.rename
 state_store/trace_store.py|82|self.db_path.parent.mkdir
 """
 

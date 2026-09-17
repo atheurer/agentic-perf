@@ -274,7 +274,20 @@ class TicketStore:
     def _cancel_pending_approvals_unlocked_all(self, *, reason: str) -> None:
         for ticket in self._tickets.values():
             self._cancel_pending_approvals_unlocked(ticket, reason=reason)
-            self._persist_ticket(ticket)
+
+    def _pending_approval_requests_unlocked(
+        self, ticket: Ticket
+    ) -> list[ApprovalRequest]:
+        raw = ticket.custom_fields.get("approval_requests", {})
+        if not isinstance(raw, dict):
+            return []
+        pending: list[ApprovalRequest] = []
+        for value in raw.values():
+            if isinstance(value, dict):
+                approval = ApprovalRequest.model_validate(value)
+                if approval.status == "pending":
+                    pending.append(approval)
+        return pending
 
     def renew_orchestrator_lease(
         self, session_id: uuid.UUID, epoch: int, ttl_seconds: float
@@ -597,11 +610,22 @@ class TicketStore:
                 if current != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                     ticket.previous_status = current
             else:
-                ticket.previous_status = None
-                self._cancel_pending_approvals_unlocked(
-                    ticket,
-                    reason="ticket resumed without resolving approval",
+                # A benchmark agent may be waiting for a natural-language
+                # response to an approval request.  Resuming the agent to
+                # deliver that response must not cancel the pending immutable
+                # capability; the agent will interpret the reply and resolve
+                # it through the approval API.  Other transitions (including
+                # abort/teardown) still retire pending approvals.
+                preserve_pending_approval = (
+                    new_status == ticket.previous_status
+                    and bool(self._pending_approval_requests_unlocked(ticket))
                 )
+                ticket.previous_status = None
+                if not preserve_pending_approval:
+                    self._cancel_pending_approvals_unlocked(
+                        ticket,
+                        reason="ticket resumed without resolving approval",
+                    )
 
             old_status = current.value
             ticket.status = new_status

@@ -8,10 +8,13 @@ import pytest
 
 from state_store.models import (
     AcquireOrchestratorLeaseRequest,
+    ApprovalRequest,
     ConsumeApprovalRequest,
     CreateApprovalRequest,
     CreateTicketRequest,
     ResolveApprovalRequest,
+    TicketStatus,
+    TransitionRequest,
 )
 from state_store.store import TicketStore
 
@@ -145,6 +148,32 @@ def test_approval_resolution_rejects_intent_mismatch(tmp_path):
             ),
             resolved_by="alice",
         )
+
+
+def test_resuming_to_previous_status_preserves_pending_approval(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+    stored_ticket = store._tickets[ticket.id]
+    stored_ticket.status = TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+    stored_ticket.previous_status = TicketStatus.EXECUTING_BENCHMARK
+    approval = ApprovalRequest(
+        approval_request_id="apr-" + "a" * 32,
+        ticket_id=ticket.id,
+        validation_id="val-1",
+        presented_run_file_digest="a" * 64,
+        execution_intent_digest="b" * 64,
+    )
+    stored_ticket.custom_fields["approval_requests"] = {
+        approval.approval_request_id: approval.model_dump(mode="json")
+    }
+    store._persist_ticket(stored_ticket)
+
+    store.transition_ticket(
+        ticket.id,
+        TransitionRequest(status=TicketStatus.EXECUTING_BENCHMARK),
+    )
+
+    assert store.list_approval_requests(ticket.id)[0].status == "pending"
 
 
 def test_approval_creation_is_idempotent_and_expiry_is_durable(tmp_path):

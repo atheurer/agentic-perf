@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -61,6 +60,29 @@ _LOCAL_TOOLS = [
         },
     ),
     ToolDefinition(
+        name="resolve_benchmark_approval",
+        description=(
+            "Resolve the active immutable benchmark approval after interpreting "
+            "the user's natural-language reply. Use approved only when the user "
+            "clearly authorizes execution; use changes_requested or rejected "
+            "otherwise. Never execute a benchmark while approval is pending."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["approved", "changes_requested", "rejected"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation for a non-approval decision",
+                },
+            },
+            "required": ["decision"],
+        },
+    ),
+    ToolDefinition(
         name="submit_benchmark_result",
         description=(
             "Submit the benchmark execution result when the run completes or fails."
@@ -102,6 +124,8 @@ class BenchmarkAgent(AgentBase):
         self._repo_cache = repo_cache
         self._ticket_id: str | None = None
         self._active_validation_id: str | None = None
+        self._active_approval_request_id: str | None = None
+        self._active_approval: dict[str, Any] | None = None
 
         local_tools = list(_LOCAL_TOOLS)
 
@@ -119,9 +143,19 @@ class BenchmarkAgent(AgentBase):
                 validation_id=validation_id,
             )
 
+        async def _resolve_benchmark_approval(
+            decision: str,
+            reason: str | None = None,
+        ) -> str:
+            return await self._resolve_benchmark_approval(
+                decision=decision,
+                reason=reason,
+            )
+
         local_handlers = {
             "request_clarification": _request_clarification,
             "present_runfile_for_approval": _present_runfile_for_approval,
+            "resolve_benchmark_approval": _resolve_benchmark_approval,
         }
 
         super().__init__(
@@ -263,6 +297,8 @@ class BenchmarkAgent(AgentBase):
         request.raise_for_status()
         approval = request.json()
         approval_id = approval["approval_request_id"]
+        self._active_approval_request_id = approval_id
+        self._active_approval = approval
         bench_label = f" for {benchmark}" if benchmark else ""
         question = (
             f"Approval request {approval_id} for run-file{bench_label}.\n"
@@ -273,57 +309,71 @@ class BenchmarkAgent(AgentBase):
             "Reply approve / request changes / reject, or use the structured approval action."
         )
         await self._add_comment(self._ticket_id, f"**Approval requested:**\n{question}")
-        await self._transition_ticket(
-            self._ticket_id,
-            "awaiting_customer_guidance",
-            comment=f"Approval request {approval_id} pending",
-        )
         return await self._wait_for_benchmark_approval(approval_id)
 
     async def _wait_for_benchmark_approval(self, approval_id: str) -> str:
-        while True:
-            await asyncio.sleep(self._HITL_POLL_INTERVAL)
-            response = await self._client.get(
-                f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals"
+        reply = await self._request_human_input(
+            self._ticket_id,
+            "Review the immutable run-file above and reply naturally with your "
+            "decision. I will interpret your response before execution.",
+        )
+        approvals_response = await self._client.get(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals"
+        )
+        approvals_response.raise_for_status()
+        record = next(
+            (
+                item
+                for item in approvals_response.json().get("approvals", [])
+                if item.get("approval_request_id") == approval_id
+            ),
+            None,
+        )
+        if record and record.get("status") == "approved":
+            return (
+                f"Approval already granted for request {approval_id}; pass "
+                f"approval request ID {approval_id} to execute_benchmark."
             )
-            response.raise_for_status()
-            records = response.json().get("approvals", [])
-            record = next(
-                (
-                    item
-                    for item in records
-                    if item["approval_request_id"] == approval_id
-                ),
-                None,
+        if record and record.get("status") != "pending":
+            return f"Approval {record.get('status')} for request {approval_id}."
+        return (
+            f"The user replied: {reply}\n\n"
+            f"Interpret this response. If it clearly authorizes the benchmark, "
+            f"call resolve_benchmark_approval(decision='approved') for request "
+            f"{approval_id}; otherwise resolve it as changes_requested or rejected. "
+            "Do not call execute_benchmark while approval remains pending."
+        )
+
+    async def _resolve_benchmark_approval(
+        self,
+        *,
+        decision: str,
+        reason: str | None = None,
+    ) -> str:
+        if decision not in {"approved", "changes_requested", "rejected"}:
+            return f"Unsupported approval decision: {decision}"
+        approval_id = self._active_approval_request_id
+        approval = self._active_approval or {}
+        if not approval_id:
+            return "No active benchmark approval request is awaiting a decision."
+        response = await self._client.post(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals/"
+            f"{approval_id}/resolve",
+            json={
+                "decision": decision,
+                "reason": reason,
+                "validation_id": approval.get("validation_id"),
+                "presented_run_file_digest": approval.get("presented_run_file_digest"),
+                "execution_intent_digest": approval.get("execution_intent_digest"),
+            },
+        )
+        response.raise_for_status()
+        if decision == "approved":
+            return (
+                f"Approval granted for request {approval_id}; pass approval "
+                f"request ID {approval_id} to execute_benchmark."
             )
-            if record is None:
-                return "Approval request is no longer available."
-            expected_owner = (
-                str(self.trace_context.invocation_id)
-                if self.trace_context and self.trace_context.invocation_id
-                else None
-            )
-            if record.get("waiter_owner") and expected_owner != record["waiter_owner"]:
-                return "Approval request is owned by another active waiter."
-            if record["status"] == "approved":
-                ticket = await self._get_ticket(self._ticket_id)
-                previous = ticket.get("previous_status")
-                if previous:
-                    await self._transition_ticket(self._ticket_id, previous)
-                return (
-                    f"Approval granted for request {approval_id}; pass "
-                    f"approval_request_id={approval_id} to execute_benchmark."
-                )
-            if record["status"] in {
-                "changes_requested",
-                "rejected",
-                "cancelled",
-                "expired",
-            }:
-                return f"Approval {record['status']} for request {approval_id}."
-            ticket = await self._get_ticket(self._ticket_id)
-            if ticket.get("custom_fields", {}).get("abort_requested"):
-                return f"Approval request {approval_id} cancelled because the ticket was aborted."
+        return f"Approval {decision} for request {approval_id}. Do not execute the benchmark."
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
@@ -392,6 +442,7 @@ class BenchmarkAgent(AgentBase):
             "get_run_logs",
             "submit_benchmark_result",
             "present_runfile_for_approval",
+            "resolve_benchmark_approval",
             "request_clarification",
         },
         "boot-time": {

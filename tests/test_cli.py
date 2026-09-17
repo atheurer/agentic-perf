@@ -60,6 +60,7 @@ def test_reply_resolves_pending_benchmark_approval(monkeypatch, capsys):
         ("GET", "/api/v1/tickets/PERF-TEST/approvals"),
         ("POST", "/api/v1/tickets/PERF-TEST/comments"),
         ("POST", f"/api/v1/tickets/PERF-TEST/approvals/{approval_id}/resolve"),
+        ("POST", "/api/v1/tickets/PERF-TEST/transition"),
     ]
     assert "approved" in capsys.readouterr().out
 
