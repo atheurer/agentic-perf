@@ -65,6 +65,10 @@ The controller remains authoritative for installed-runtime facts.
    trafficgen) need to be installed on the host. Check the harness's skill
    configuration first — some harnesses (e.g., crucible) run benchmark tools
    inside containers and do not require host-level installation.
+   Tool-params entries (procstat, turbostat, mpstat, iostat, pidstat, sar, bpf,
+   kernel, forkstat, etc.) are crucible container profilers resolved at benchmark
+   time — never pass them to ensure_prerequisites or install_packages. Host
+   prereqs are OS utilities like sysstat, ethtool, or nmap-ncat.
 
 4. Do NOT set up SSH keys between the controller and endpoints. That is the
    benchmark agent's responsibility (it runs as a pre-run step). Do NOT use
