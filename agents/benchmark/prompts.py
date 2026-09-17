@@ -253,6 +253,16 @@ For non-Crucible harnesses, retain the compatible procedure of using
 
 ### When to ask for guidance
 
+### Run-file approval replies
+
+`present_runfile_for_approval` pauses and returns the user's reply as text.
+Interpret that reply semantically. Do not require exact words such as
+"approve": natural approvals include phrases such as "go for it" or "looks
+good, proceed". If the reply clearly authorizes execution, call
+`resolve_benchmark_approval` with `decision="approved"`; if it asks for edits
+or declines, resolve it as `changes_requested` or `rejected`. Never call
+`execute_benchmark` while the approval is still pending.
+
 Before submitting your result, verify you completed everything the user
 asked for. If anything is incomplete, unclear, or failed in a way you
 cannot resolve, call request_clarification instead of submitting an

@@ -27,51 +27,6 @@ _AGENT_AUTHORS = frozenset(
 )
 
 
-def approval_decision(message: str) -> str | None:
-    """Recognize an unambiguous natural-language approval response.
-
-    This is intentionally conservative.  A comment is treated as an approval
-    only when it clearly refers to approving/rejecting the pending action;
-    arbitrary guidance must continue through the normal resume path.
-    """
-    normalized = " ".join(message.lower().strip().split()).rstrip(".!?")
-    if not normalized:
-        return None
-    if normalized in {
-        "reject",
-        "rejected",
-        "i reject",
-        "no, reject",
-        "no reject",
-        "do not approve",
-        "don't approve",
-        "do not approve this",
-        "don't approve this",
-    }:
-        return "rejected"
-    if normalized in {
-        "request changes",
-        "changes requested",
-        "please request changes",
-    }:
-        return "changes_requested"
-    if normalized in {
-        "approve",
-        "approved",
-        "i approve",
-        "i approve this",
-        "yes, approve",
-        "yes approve",
-        "yes, i approve",
-        "yes i approve",
-        "please approve",
-        "please approve this",
-        "go ahead and approve",
-    }:
-        return "approved"
-    return None
-
-
 def after_create(ticket: Ticket) -> dict[str, Any] | None:
     """Hint after ticket creation (status=new)."""
     if ticket.status != TicketStatus.NEW:

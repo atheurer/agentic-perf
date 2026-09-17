@@ -391,3 +391,34 @@ async def test_approval_presents_runfile_from_immutable_validation(monkeypatch):
     assert request_json["presented_run_file_digest"] == digest
     approval_comment = agent._add_comment.await_args.args[1]
     assert json.dumps(run_file, indent=2) in approval_comment
+
+
+@pytest.mark.asyncio
+async def test_benchmark_agent_resolves_interpreted_natural_language_approval():
+    response = Mock()
+    response.raise_for_status = Mock()
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    agent._ticket_id = "PERF-TEST"
+    agent.store_url = "http://state-store"
+    agent._active_approval_request_id = "apr-" + "a" * 32
+    agent._active_approval = {
+        "validation_id": "val-test",
+        "presented_run_file_digest": "b" * 64,
+        "execution_intent_digest": "c" * 64,
+    }
+    agent._client = Mock(post=AsyncMock(return_value=response))
+
+    result = await agent._resolve_benchmark_approval(
+        decision="approved",
+        reason="User said go for it",
+    )
+
+    assert "Approval granted" in result
+    request = agent._client.post.await_args
+    assert request.kwargs["json"] == {
+        "decision": "approved",
+        "reason": "User said go for it",
+        "validation_id": "val-test",
+        "presented_run_file_digest": "b" * 64,
+        "execution_intent_digest": "c" * 64,
+    }

@@ -1003,6 +1003,22 @@ async def _reply_to_guidance(
             json={"decision": decision, "comment": message},
         )
         resolved.raise_for_status()
+        ticket_response = await client.get(
+            f"{store_url}/api/v1/tickets/{ticket_id}",
+            headers=headers,
+        )
+        ticket_response.raise_for_status()
+        previous = ticket_response.json().get("previous_status")
+        if previous:
+            resumed = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                headers=headers,
+                json={
+                    "status": previous,
+                    "comment": "Benchmark approval resolved; resuming pipeline",
+                },
+            )
+            resumed.raise_for_status()
         if decision != "approved":
             return json.dumps({"status": "approval_resolved", "decision": decision})
         return json.dumps({"status": "approval_resolved", "decision": decision})

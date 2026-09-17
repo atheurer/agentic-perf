@@ -576,6 +576,16 @@ def cmd_reply(args):
             )
             resolved.raise_for_status()
             print(f"Benchmark approval {pending[0]['approval_request_id']} {decision}.")
+            previous = t.get("previous_status")
+            if previous:
+                resumed = client.post(
+                    f"/api/v1/tickets/{args.ticket_id}/transition",
+                    json={
+                        "status": previous,
+                        "comment": "Benchmark approval resolved; resuming pipeline",
+                    },
+                )
+                resumed.raise_for_status()
             return
 
     r = client.post(
