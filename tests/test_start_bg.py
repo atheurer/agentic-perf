@@ -224,7 +224,11 @@ exec \"$@\"
         }
     )
     result = subprocess.run(
-        ["bash", "-c", f"{SCRIPT} start; {SCRIPT} stop"],
+        [
+            "bash",
+            "-c",
+            f"{SCRIPT} start; {SCRIPT} start; {SCRIPT} restart; {SCRIPT} stop",
+        ],
         cwd=REPO,
         env=env,
         text=True,
@@ -235,6 +239,8 @@ exec \"$@\"
     assert result.returncode == 0, result.stdout + result.stderr
     assert "State store started" in result.stdout
     assert "Orchestrator started" in result.stdout
+    assert "Orchestrator already running" in result.stdout
+    assert "Restarting services" in result.stdout
     assert "Services stopped" in result.stdout
 
 

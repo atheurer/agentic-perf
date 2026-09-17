@@ -7,6 +7,7 @@
 #
 # Usage:
 #   ./scripts/start-bg.sh          # start both services
+#   ./scripts/start-bg.sh restart  # stop, then start both services
 #   ./scripts/start-bg.sh stop     # stop both services
 #   ./scripts/start-bg.sh status   # inspect ownership and readiness
 #
@@ -357,10 +358,15 @@ start_orchestrator() {
     fi
     rm -f "$ORCH_LOCK"
     while [ "$SECONDS" -lt "$deadline" ]; do
+        # The orchestrator owns this file after launch.  Never replace a
+        # pathname that may still be locked by a process exiting between
+        # retries.
+        if ! lock_is_held "$ORCH_LOCK"; then
+            rm -f "$ORCH_LOCK"
+        fi
         echo "Starting orchestrator..."
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
-        write_pid_file "$ORCH_LOCK" "$pid"
         if wait_for_orchestrator "$pid"; then
             echo "Orchestrator started (PID $pid)."
             return 0
@@ -371,11 +377,15 @@ start_orchestrator() {
             continue
         fi
         error "orchestrator failed to become ready; see $ORCH_LOG"
-        rm -f "$ORCH_LOCK"
+        if ! lock_is_held "$ORCH_LOCK"; then
+            rm -f "$ORCH_LOCK"
+        fi
         return 1
     done
     error "orchestrator did not become ready within ${ORCH_START_TIMEOUT}s; see $ORCH_LOG"
-    rm -f "$ORCH_LOCK"
+    if ! lock_is_held "$ORCH_LOCK"; then
+        rm -f "$ORCH_LOCK"
+    fi
     return 1
 }
 
@@ -402,6 +412,12 @@ cmd_stop() {
         return 1
     fi
     echo "Services stopped."
+}
+
+cmd_restart() {
+    echo "Restarting services..."
+    cmd_stop
+    cmd_start
 }
 
 cmd_status() {
@@ -433,7 +449,8 @@ cmd_status() {
 
 case "${1:-start}" in
     start) cmd_start ;;
+    restart) cmd_restart ;;
     stop) cmd_stop ;;
     status) cmd_status ;;
-    *) error "usage: $0 {start|stop|status}"; exit 2 ;;
+    *) error "usage: $0 {start|restart|stop|status}"; exit 2 ;;
 esac

@@ -2012,10 +2012,11 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
 
 _lock_fd: int | None = None
+_lock_file_identity: tuple[int, int] | None = None
 
 
 def _acquire_lock() -> None:
-    global _lock_fd
+    global _lock_fd, _lock_file_identity
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o644)
     try:
@@ -2035,22 +2036,34 @@ def _acquire_lock() -> None:
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     _lock_fd = fd
+    lock_stat = os.fstat(fd)
+    _lock_file_identity = (lock_stat.st_dev, lock_stat.st_ino)
     atexit.register(_release_lock)
 
 
 def _release_lock() -> None:
-    global _lock_fd
+    global _lock_fd, _lock_file_identity
     if _lock_fd is not None:
+        # Remove only the pathname that this process actually opened, and do
+        # so while still holding the flock.  A replacement orchestrator cannot
+        # acquire the lock or race the pathname check until after this point.
+        try:
+            lock_stat = os.stat(LOCK_FILE)
+            current_pid = LOCK_FILE.read_text().strip()
+            if _lock_file_identity == (
+                lock_stat.st_dev,
+                lock_stat.st_ino,
+            ) and current_pid == str(os.getpid()):
+                LOCK_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             fcntl.flock(_lock_fd, fcntl.LOCK_UN)
             os.close(_lock_fd)
         except OSError:
             pass
         _lock_fd = None
-    try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
+        _lock_file_identity = None
 
 
 def _setup_api_token() -> None:
