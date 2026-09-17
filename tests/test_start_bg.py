@@ -18,8 +18,12 @@ SCRIPT = REPO / "scripts" / "start-bg.sh"
 
 
 def _holder(path: Path, *, role: str, lock_path: Path, store_id: str) -> None:
-    if role == "store":
-        argv0 = "python3 -m uvicorn state_store.main:app"
+    if role in {"store", "unverifiable-store"}:
+        argv0 = (
+            "python3 -m uvicorn state_store.main:app"
+            if role == "store"
+            else "python3 -m unrelated.service"
+        )
         code = """
 import fcntl, json, os, sys, time
 lock_path, store_id = sys.argv[1:]
@@ -133,6 +137,7 @@ def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "State store already running" in result.stdout
+        assert "waiting up to" in result.stdout
         assert "did not start a new service" in result.stdout
         assert "Orchestrator already running" in result.stdout
         assert "Services stopped" in result.stdout
@@ -143,3 +148,147 @@ def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None
             if process.poll() is None:
                 process.send_signal(signal.SIGKILL)
                 process.wait(timeout=5)
+
+
+def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    result = subprocess.run(
+        [str(SCRIPT), "stop"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Orchestrator already stopped" in result.stdout
+    assert "State store already stopped" in result.stdout
+    assert "Services stopped" in result.stdout
+
+
+def test_fresh_start_waits_for_lock_creation(tmp_path: Path) -> None:
+    """A new process may exist briefly before it creates its persistence lock."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        'exec 9>>"$AGENTIC_PERF_HOME/state-store.lock"\n'
+        "if flock -n 9; then flock -u 9; exit 7; fi\n"
+        f"printf '%s\\n' '{{\"store_id\":\"{store_id}\"}}'\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    store_holder = tmp_path / "store-holder"
+    orch_holder = tmp_path / "orch-holder"
+    _holder(
+        store_holder,
+        role="store",
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    _holder(
+        orch_holder,
+        role="orchestrator",
+        lock_path=home / "orchestrator.pid",
+        store_id=store_id,
+    )
+    nohup = fake_bin / "nohup"
+    nohup.write_text(
+        f"""#!/usr/bin/env bash
+if [ \"$1\" = python3 ] && [ \"$2\" = -m ] && [ \"$3\" = uvicorn ]; then
+    exec {store_holder} \"$AGENTIC_PERF_HOME/state-store.lock\" \"$TEST_STORE_ID\"
+elif [ \"$1\" = python3 ] && [ \"$2\" = -m ] && [ \"$3\" = orchestrator.main ]; then
+    exec {orch_holder} \"$AGENTIC_PERF_HOME/orchestrator.pid\"
+fi
+exec \"$@\"
+"""
+    )
+    nohup.chmod(nohup.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "TEST_STORE_ID": store_id,
+            "START_BG_STORE_TIMEOUT": "2",
+            "START_BG_ORCH_TIMEOUT": "2",
+        }
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"{SCRIPT} start; {SCRIPT} start; {SCRIPT} restart; {SCRIPT} stop",
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "State store started" in result.stdout
+    assert "Orchestrator started" in result.stdout
+    assert "Orchestrator already running" in result.stdout
+    assert "Restarting services" in result.stdout
+    assert "Services stopped" in result.stdout
+
+
+def test_start_waits_for_unverifiable_lock_owner_to_release(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+    holder = tmp_path / "unverifiable-holder"
+    _holder(
+        holder,
+        role="unverifiable-store",
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    env = os.environ.copy()
+    env.update({"AGENTIC_PERF_HOME": str(home), "START_BG_STORE_TIMEOUT": "1"})
+    process = subprocess.Popen(
+        [str(holder), str(home / "state-store.lock"), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                ready = (home / "state-store.lock").stat().st_size > 0
+            except FileNotFoundError:
+                ready = False
+            if ready:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("unverifiable holder did not acquire its lock")
+        result = subprocess.run(
+            [str(SCRIPT), "start"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        assert result.returncode != 0
+        assert "lock is held by an unverifiable process" in result.stdout
+        assert "waiting up to" in result.stdout
+    finally:
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=5)
