@@ -23,7 +23,8 @@ from typing import Any
 
 import httpx  # noqa: F401 - retained as a stable test patch seam
 
-from agents.mcp_client import AgentMCPClient
+from agents.mcp_client import AgentMCPClient, MCPHookResult
+from providers.tracing import current_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -100,65 +101,65 @@ class _JmpCallHook:
         self,
         name: str,
         arguments: dict[str, Any],
-    ) -> str | None:
-        """Return a string to short-circuit; None to proceed."""
+    ) -> str | MCPHookResult | None:
+        """Return a compatible short-circuit or audited internal result."""
         if name != "jmp_connect":
             return None
 
         if self._connected:
-            return json.dumps(
-                {
-                    "error": (
-                        "Already connected to a "
-                        "Jumpstarter device in this "
-                        "session. You are provisioning "
-                        "ONE board. Submit your result."
-                    ),
-                }
+            return MCPHookResult(
+                content=json.dumps(
+                    {
+                        "error": (
+                            "Already connected to a "
+                            "Jumpstarter device in this "
+                            "session. You are provisioning "
+                            "ONE board. Submit your result."
+                        ),
+                    }
+                ),
+                is_error=True,
+                retry_classification="intentional_agent_retry",
             )
-
-        # Execute jmp_connect with a timeout and track
-        # connection state. Returns the result directly
-        # so AgentMCPClient.call_tool skips its normal
-        # session.call_tool path.
-        server_name = self._mcp._tool_routing.get(name)
-        if server_name is None:
-            return None
-        conn = self._mcp._servers[server_name]
 
         try:
             result = await asyncio.wait_for(
-                conn.session.call_tool(name, arguments),
+                self._mcp.dispatch_internal_tool(
+                    name,
+                    arguments,
+                    current_trace_context(),
+                ),
                 timeout=_JMP_CONNECT_TIMEOUT,
             )
-            # Extract content.
-            parts = []
-            for block in result.content:
-                if hasattr(block, "text"):
-                    parts.append(block.text)
-                else:
-                    parts.append(str(block))
-            content = "\n".join(parts) if parts else ""
-
-            if result.isError:
-                return content  # Error but don't set connected
-
-            self._connected = True
-            return trim_response(name, content)
         except asyncio.TimeoutError:
-            return json.dumps(
-                {
-                    "error": (
-                        f"Failed to connect: lease "
-                        f"acquisition timed out after "
-                        f"{_JMP_CONNECT_TIMEOUT} "
-                        f"seconds. No exporter was "
-                        f"assigned — the board may be "
-                        f"offline or leased by another "
-                        f"user."
-                    ),
-                }
+            return MCPHookResult(
+                content=json.dumps(
+                    {
+                        "error": (
+                            f"Failed to connect: lease "
+                            f"acquisition timed out after "
+                            f"{_JMP_CONNECT_TIMEOUT} "
+                            f"seconds. No exporter was "
+                            f"assigned — the board may be "
+                            f"offline or leased by another "
+                            f"user."
+                        ),
+                    }
+                ),
+                is_error=True,
+                request_sent=True,
+                retry_classification="ambiguous_after_send",
             )
+        except asyncio.CancelledError:
+            raise
+        if result.is_error:
+            return result
+
+        self._connected = True
+        return MCPHookResult(
+            content=trim_response(name, result.content),
+            request_sent=result.request_sent,
+        )
 
 
 async def attach_jumpstarter_mcp(
