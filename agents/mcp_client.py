@@ -690,26 +690,27 @@ class AgentMCPClient:
         tool_name: str | None = None,
         outcome: OperationOutcome | None = None,
     ) -> None:
-        context = (
-            context
-            or current_trace_context()
-            or TraceContext(
-                ticket_id=conn.ticket_id,
-                agent_id=conn.agent_id,
-            )
-        )
-        if not context.ticket_id:
-            return
-        if not context.mcp_correlation_request_id:
-            context = TraceContext.model_validate(
-                context.model_dump() | {"mcp_correlation_request_id": uuid.uuid4().hex}
-            )
-        terminal = state in {
-            LifecycleState.FAILED,
-            LifecycleState.CANCELLED,
-            LifecycleState.RESPONSE_RECEIVED,
-        }
         try:
+            context = (
+                context
+                or current_trace_context()
+                or TraceContext(
+                    ticket_id=conn.ticket_id,
+                    agent_id=conn.agent_id,
+                )
+            )
+            if not context.ticket_id:
+                return
+            if not context.mcp_correlation_request_id:
+                context = TraceContext.model_validate(
+                    context.model_dump()
+                    | {"mcp_correlation_request_id": uuid.uuid4().hex}
+                )
+            terminal = state in {
+                LifecycleState.FAILED,
+                LifecycleState.CANCELLED,
+                LifecycleState.RESPONSE_RECEIVED,
+            }
             event = TraceEventV1(
                 ticket_id=context.ticket_id,
                 agent_id=context.agent_id,
@@ -743,11 +744,19 @@ class AgentMCPClient:
                     "subprocess_pid_capture": (conn.subprocess_pid_capture),
                 },
             )
-        except Exception:
-            # Trace context may lack MCP-required fields
-            # (session_id, correlation_request_id) during
-            # initial connection or non-ticket contexts.
-            # Audit is best-effort — do not crash the agent.
+        except Exception as exc:
+            # Trace context can be incomplete during connection setup or
+            # malformed at an integration boundary. Audit is best-effort for
+            # the client, but the failure must remain visible.
+            logger.warning(
+                "MCP audit event validation failed; dispatch continues "
+                "(server=%s, state=%s, tool=%s): %s",
+                conn.name,
+                getattr(state, "value", state),
+                tool_name,
+                exc,
+                exc_info=True,
+            )
             return
         self.audit_events.append(event)
         if self._audit_hook is not None:

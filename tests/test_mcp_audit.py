@@ -20,7 +20,7 @@ from mcp.types import CallToolRequestParams, RequestParams
 
 import agents.mcp_audit as mcp_audit
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
-from agents.mcp_client import AgentMCPClient, _ServerConnection
+from agents.mcp_client import AgentMCPClient, MCPToolCallError, _ServerConnection
 from providers.redaction import get_shared_redactor
 from providers.tracing import (
     LifecycleState,
@@ -581,6 +581,129 @@ async def test_client_sends_trace_metadata_without_changing_tool_arguments():
     assert [event.lifecycle.state for event in client.audit_events] == [
         LifecycleState.REQUEST_SENT,
         LifecycleState.RESPONSE_RECEIVED,
+    ]
+
+
+def test_client_missing_correlation_is_generated_for_boundary_event():
+    client = AgentMCPClient()
+    connection = _ServerConnection(
+        name="local",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    client._record_boundary(
+        connection,
+        LifecycleState.CONNECTING,
+        context=TraceContext(ticket_id="PERF-1"),
+    )
+
+    assert len(client.audit_events) == 1
+    assert client.audit_events[0].mcp.correlation_request_id
+
+
+def test_client_invalid_mcp_audit_context_is_fail_open_and_visible(caplog):
+    client = AgentMCPClient()
+    connection = _ServerConnection(
+        name="local",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    malformed = TraceContext.model_construct(
+        ticket_id="PERF-1",
+        trace_id="malformed",
+        action_id="malformed",
+    )
+
+    with caplog.at_level("WARNING", logger="agents.mcp_client"):
+        client._record_boundary(
+            connection,
+            LifecycleState.CONNECTING,
+            context=malformed,
+        )
+
+    assert client.audit_events == []
+    assert "MCP audit event validation failed" in caplog.text
+    assert "dispatch continues" in caplog.text
+
+
+def test_client_missing_session_is_fail_open_and_visible(caplog):
+    client = AgentMCPClient()
+    connection = _ServerConnection(
+        name="local",
+        session=None,
+        transport="stdio",
+        session_id=None,
+        ticket_id="PERF-1",
+    )
+
+    with caplog.at_level("WARNING", logger="agents.mcp_client"):
+        client._record_boundary(
+            connection,
+            LifecycleState.CONNECTING,
+            context=TraceContext(ticket_id="PERF-1"),
+        )
+
+    assert client.audit_events == []
+    assert "MCP audit event validation failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_client_records_retry_failure_and_disconnect_boundaries():
+    session = AsyncMock()
+    session.call_tool = AsyncMock(
+        return_value=SimpleNamespace(
+            content=[SimpleNamespace(text="rejected")], isError=True
+        )
+    )
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+    connection = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    client._servers["local"] = connection
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+    assert exc_info.value.retry_classification == "intentional_agent_retry"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.FAILED,
+    ]
+
+    await client.disconnect()
+    assert client.audit_events[-1].lifecycle.state == LifecycleState.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_client_records_exception_failure_boundary():
+    session = AsyncMock()
+    session.call_tool = AsyncMock(side_effect=RuntimeError("connection lost"))
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.FAILED,
     ]
 
 
