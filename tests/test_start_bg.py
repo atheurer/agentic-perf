@@ -163,3 +163,72 @@ def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
     assert "Orchestrator already stopped" in result.stdout
     assert "State store already stopped" in result.stdout
     assert "Services stopped" in result.stdout
+
+
+def test_fresh_start_waits_for_lock_creation(tmp_path: Path) -> None:
+    """A new process may exist briefly before it creates its persistence lock."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        'exec 9>>"$AGENTIC_PERF_HOME/state-store.lock"\n'
+        "if flock -n 9; then flock -u 9; exit 7; fi\n"
+        f"printf '%s\\n' '{{\"store_id\":\"{store_id}\"}}'\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    store_holder = tmp_path / "store-holder"
+    orch_holder = tmp_path / "orch-holder"
+    _holder(
+        store_holder,
+        role="store",
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    _holder(
+        orch_holder,
+        role="orchestrator",
+        lock_path=home / "orchestrator.pid",
+        store_id=store_id,
+    )
+    nohup = fake_bin / "nohup"
+    nohup.write_text(
+        f"""#!/usr/bin/env bash
+if [ \"$1\" = python3 ] && [ \"$2\" = -m ] && [ \"$3\" = uvicorn ]; then
+    exec {store_holder} \"$AGENTIC_PERF_HOME/state-store.lock\" \"$TEST_STORE_ID\"
+elif [ \"$1\" = python3 ] && [ \"$2\" = -m ] && [ \"$3\" = orchestrator.main ]; then
+    exec {orch_holder} \"$AGENTIC_PERF_HOME/orchestrator.pid\"
+fi
+exec \"$@\"
+"""
+    )
+    nohup.chmod(nohup.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "TEST_STORE_ID": store_id,
+            "START_BG_STORE_TIMEOUT": "2",
+            "START_BG_ORCH_TIMEOUT": "2",
+        }
+    )
+    result = subprocess.run(
+        ["bash", "-c", f"{SCRIPT} start; {SCRIPT} stop"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "State store started" in result.stdout
+    assert "Orchestrator started" in result.stdout
+    assert "Services stopped" in result.stdout
