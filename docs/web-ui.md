@@ -8,9 +8,14 @@ not in a compatible state.
 
 The list view shows ticket id, summary, status, owner, outcome, and progress.
 The detail view shows the status trail, custom fields, token/cost/cache usage,
-comments, live events, transcript, guidance/introspection summary, artifacts,
+comments, activity events, the status trail, guidance/introspection summary, artifacts,
 and results. Polling/event refresh supports pause/scroll and progress views;
-the SSE stream and event rendering are best-effort views of persisted events.
+the activity view suppresses successful low-level audit telemetry (filesystem,
+SSH, API, MCP, and subprocess boundaries) while retaining audit failures. Use
+the event view selector to inspect audit telemetry, search the visible records,
+or use **Raw trace** to inspect the immutable trace returned by
+`/api/v1/traces/tickets/{ticket_id}`. The SSE stream and event rendering are
+best-effort views of persisted events.
 
 Available actions include reply/resume, graceful stop, hard stop, abort,
 stop-all (admin), interject, claim/ownership operations, and artifact download.

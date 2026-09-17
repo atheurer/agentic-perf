@@ -32,7 +32,19 @@ def legacy_to_trace(
 
 def trace_to_legacy(event: TraceEventV1) -> dict[str, Any]:
     """Project a v1 trace record into the established EventBus response shape."""
-    legacy = (event.attributes or {}).get("legacy_event", {})
+    attributes = event.attributes or {}
+    legacy = attributes.get("legacy_event", {})
+    is_activity = isinstance(legacy, dict) and "event_type" in legacy
+    audit = None
+    if not is_activity:
+        audit = {
+            "action_type": event.action.type.value,
+            "phase": event.action.phase,
+            "target": event.action.target,
+            "lifecycle_state": event.lifecycle.state.value,
+            "outcome": event.outcome.value if event.outcome else None,
+            "producer": event.producer.component,
+        }
     return {
         "seq": event.ticket_seq or 0,
         "timestamp": event.occurred_at.astimezone(timezone.utc).isoformat(),
@@ -43,6 +55,8 @@ def trace_to_legacy(event: TraceEventV1) -> dict[str, Any]:
         ),
         "data": legacy.get("data", {}),
         "schema_version": "v1",
+        "event_source": "activity" if is_activity else "audit",
+        "audit": audit,
         "trace_id": event.trace_id,
         "action_id": event.action_id,
     }
@@ -53,6 +67,8 @@ def legacy_record(record: dict[str, Any], line: int) -> dict[str, Any]:
     projected = dict(record)
     projected["seq"] = line
     projected["schema_version"] = "legacy_uncorrelated"
+    projected["event_source"] = "activity"
+    projected.setdefault("audit", None)
     return projected
 
 

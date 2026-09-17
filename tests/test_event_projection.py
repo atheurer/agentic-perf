@@ -9,8 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from providers.event_projection import legacy_to_trace
+from providers.event_projection import legacy_to_trace, trace_to_legacy
 from providers.events import EventBus
+from providers.tracing import (
+    ActionDescriptor,
+    ActionType,
+    LifecycleDescriptor,
+    LifecycleState,
+    OperationOutcome,
+)
 from state_store.audit import AuditLog
 from state_store.trace_store import TraceStoreWriteError
 
@@ -45,6 +52,35 @@ def test_mixed_history_is_labeled_and_has_stable_cursors(tmp_path: Path) -> None
         assert bus.get_events(ticket_id, since=1, limit=100) == [first[1]]
     finally:
         bus.close()
+
+
+def test_projection_distinguishes_activity_from_audit_records() -> None:
+    activity = legacy_to_trace("PERF-PROJECTION", "agent", "tool_called", {})
+    projected_activity = trace_to_legacy(activity)
+    assert projected_activity["event_source"] == "activity"
+    assert projected_activity["audit"] is None
+
+    audit = activity.model_copy(
+        update={
+            "action": ActionDescriptor(
+                type=ActionType.FILESYSTEM,
+                target="workspace://result.json",
+            ),
+            "lifecycle": LifecycleDescriptor(state=LifecycleState.COMPLETED),
+            "outcome": OperationOutcome.SUCCESS,
+            "attributes": {"operation": "replace"},
+        }
+    )
+    projected_audit = trace_to_legacy(audit)
+    assert projected_audit["event_source"] == "audit"
+    assert projected_audit["audit"] == {
+        "action_type": "filesystem",
+        "phase": None,
+        "target": "workspace://result.json",
+        "lifecycle_state": "completed",
+        "outcome": "success",
+        "producer": "legacy-event-adapter",
+    }
 
 
 def test_backdated_trace_cannot_reorder_consumed_mixed_cursor(tmp_path: Path) -> None:
