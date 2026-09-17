@@ -183,8 +183,10 @@ wait_for_store() {
     while [ "$SECONDS" -lt "$deadline" ]; do
         # A forced or graceful stop may leave the lock held briefly while the
         # old process unwinds.  Return immediately once that owner is gone so
-        # the caller can start a replacement instead of waiting blindly.
-        if ! lock_is_held "$STORE_LOCK" || ! process_alive "$pid"; then
+        # the caller can start a replacement instead of waiting blindly.  A
+        # newly launched process is expected not to have created its lock yet,
+        # so lock absence alone is not a readiness failure here.
+        if ! process_alive "$pid"; then
             return 2
         fi
         if store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)" \
