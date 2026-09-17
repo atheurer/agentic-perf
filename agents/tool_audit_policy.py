@@ -278,6 +278,7 @@ TOOL_AUDIT_POLICY = (
         "state_store.ticket_transition",
         "agents/benchmark/agent.py:submit_benchmark_result",
         "agents/benchmark/agent.py:present_runfile_for_approval",
+        "agents/benchmark/agent.py:resolve_benchmark_approval",
         "agents/benchmark/agent.py:request_clarification",
         "agents/provisioning/agent.py:request_clarification",
         "agents/provisioning/agent.py:submit_provisioning_result",
