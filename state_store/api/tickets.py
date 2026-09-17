@@ -72,6 +72,7 @@ _HEAVY_FIELDS = {
     "key_metrics",
     "configuration_applied",
     "follow_up_needed",
+    "_usage_summary",
 }
 
 

@@ -182,6 +182,45 @@ class TestGetUsageSummary:
         assert len(result["by_ticket"]) == 1
         assert t1.id in result["by_ticket"]
 
+    def test_closed_ticket_usage_is_snapshotted_on_close_and_reused(
+        self, tmp_path: Path, event_bus: EventBus
+    ):
+        store = TicketStore(
+            persist_dir=tmp_path / "tickets",
+            event_bus=event_bus,
+        )
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="closed", description="d")
+        )
+        _emit_usage(event_bus, ticket.id, 100, 50, 500)
+        store.force_close(ticket.id)
+        request = _make_request(store, event_bus)
+
+        assert store.get_cached_usage_summary(ticket.id)["total_tokens"] == 150
+        event_bus.get_usage_events = MagicMock(
+            side_effect=AssertionError("closed-ticket usage should be cached")
+        )
+        result = get_usage_summary(request)
+        assert result["by_ticket"][ticket.id]["total_tokens"] == 150
+
+    def test_summary_does_not_persist_a_historical_closed_ticket_snapshot(
+        self, tmp_path: Path, event_bus: EventBus
+    ):
+        store = TicketStore(persist_dir=tmp_path / "tickets")
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="historical", description="d")
+        )
+        store.force_close(ticket.id)
+        ticket_path = tmp_path / "tickets" / f"{ticket.id}.json"
+        persisted_before = ticket_path.read_text()
+        _emit_usage(event_bus, ticket.id, 100, 50, 500)
+
+        result = get_usage_summary(_make_request(store, event_bus))
+
+        assert result["by_ticket"][ticket.id]["total_tokens"] == 150
+        assert store.get_cached_usage_summary(ticket.id) is None
+        assert ticket_path.read_text() == persisted_before
+
 
 class TestMultiModelCost:
     """Regression tests for #327: total cost must equal sum of per-agent costs.

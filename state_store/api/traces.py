@@ -23,6 +23,7 @@ from providers.tracing.query import (
 
 from ..auth import Principal
 from ..trace_store import TraceEventConflictError, TraceStoreWriteError
+from .events import invalidate_closed_ticket_usage_cache
 
 router = APIRouter(prefix="/traces/events", tags=["traces"])
 query_router = APIRouter(prefix="/traces", tags=["traces"])
@@ -516,6 +517,14 @@ def _insert(
             _bound(event, principal, request)
         )
         request.app.state.trace_health["ingested"] += 1
+        legacy_event = (stored.attributes or {}).get("legacy_event", {})
+        if (
+            not duplicate
+            and isinstance(legacy_event, dict)
+            and legacy_event.get("event_type") == "llm_usage"
+        ):
+            request.app.state.store.invalidate_cached_usage_summary(stored.ticket_id)
+            invalidate_closed_ticket_usage_cache(stored.ticket_id)
         return stored, duplicate
     except TraceEventConflictError as exc:
         request.app.state.trace_health["ingestion_failures"] += 1
