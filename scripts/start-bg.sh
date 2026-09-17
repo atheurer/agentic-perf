@@ -222,16 +222,19 @@ wait_for_orchestrator() {
 }
 
 terminate_process() {
-    local pid="$1" kind="$2" deadline lock_path="" label="state store"
+    local pid="$1" kind="$2" deadline lock_path="" label="state store" port_detail="port $STORE_PORT"
     [ "$kind" = store ] && lock_path="$STORE_LOCK"
-    [ "$kind" = orchestrator ] && lock_path="$ORCH_LOCK"
-    [ "$kind" = orchestrator ] && label="orchestrator"
-    echo "$label received SIGTERM; waiting up to ${STOP_TIMEOUT}s for graceful shutdown..."
+    if [ "$kind" = orchestrator ]; then
+        lock_path="$ORCH_LOCK"
+        label="orchestrator"
+        port_detail="state-store port $STORE_PORT"
+    fi
+    echo "$label received SIGTERM (PID $pid; $port_detail); waiting up to ${STOP_TIMEOUT}s for graceful shutdown..."
     kill "$pid" 2>/dev/null || true
     deadline=$((SECONDS + STOP_TIMEOUT))
     while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.2; done
     if process_alive "$pid"; then
-        echo "$label did not stop after ${STOP_TIMEOUT}s; sending SIGKILL (PID $pid)."
+        echo "$label did not stop after ${STOP_TIMEOUT}s; sending SIGKILL (PID $pid; $port_detail)."
         kill -KILL "$pid" 2>/dev/null || true
     fi
     sleep 0.2
@@ -239,7 +242,7 @@ terminate_process() {
         error "$label PID $pid was signalled but still owns its lock"
         return 1
     fi
-    echo "$label stopped (PID $pid)."
+    echo "$label stopped (PID $pid; $port_detail)."
 }
 
 stop_orchestrator() {
@@ -250,7 +253,7 @@ stop_orchestrator() {
             error "orchestrator lock is held by an unverifiable process (PID ${pid:-unknown}); refusing to signal it"
             return 1
         }
-        echo "Stopping orchestrator (PID $pid)..."
+        echo "Stopping orchestrator (PID $pid; state-store port $STORE_PORT)..."
         terminate_process "$pid" orchestrator || { error "orchestrator did not release its lock"; return 1; }
     else
         if [ -f "$ORCH_LOCK" ]; then
@@ -271,7 +274,7 @@ stop_store() {
             error "state-store lock is held by an unverifiable process (PID ${pid:-unknown}); refusing to signal it"
             return 1
         }
-        echo "Stopping state store (PID $pid)..."
+        echo "Stopping state store (PID $pid; port $STORE_PORT)..."
         terminate_process "$pid" store || { error "state store did not release its persistence lock"; return 1; }
     elif [ -f "$STORE_LOCK" ]; then
         rm -f "$STORE_LOCK"
@@ -309,7 +312,7 @@ start_store() {
             }
             if lock_is_held "$STORE_LOCK" && [ "$(store_lock_pid || true)" = "$pid" ] \
                 && [ "$(endpoint_identity || true)" = "this-store" ]; then
-                echo "State store already running (PID $pid); did not start a new service."
+                echo "State store already running (PID $pid; port $STORE_PORT); did not start a new service."
                 echo "  Repaired PID metadata: $STORE_PID_FILE"
                 echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
                 return 2
@@ -326,7 +329,7 @@ start_store() {
     pid=$!
     write_pid_file "$STORE_PID_FILE" "$pid"
     if wait_for_store "$pid"; then
-        echo "State store started (PID $pid)."
+        echo "State store started (PID $pid; port $STORE_PORT)."
         return 0
     fi
     error "state store failed to become ready; see $STORE_LOG"
@@ -351,7 +354,7 @@ start_orchestrator() {
                 return 1
             fi
         else
-            echo "Orchestrator already running (PID $pid); did not start a new service."
+            echo "Orchestrator already running (PID $pid; state-store port $STORE_PORT); did not start a new service."
             echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
             return 2
         fi
@@ -368,7 +371,7 @@ start_orchestrator() {
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
         if wait_for_orchestrator "$pid"; then
-            echo "Orchestrator started (PID $pid)."
+            echo "Orchestrator started (PID $pid; state-store port $STORE_PORT)."
             return 0
         fi
         if grep -q "leader lease unavailable" "$ORCH_LOG" 2>/dev/null; then
@@ -426,7 +429,7 @@ cmd_status() {
     if lock_is_held "$STORE_LOCK"; then
         store_pid="$(store_lock_pid || true)"
         if store_owner_valid "$store_pid" "$(store_lock_start_identity 2>/dev/null || true)"; then
-            echo "State store:  RUNNING (PID $store_pid; endpoint $(endpoint_identity || echo unavailable))"
+            echo "State store:  RUNNING (PID $store_pid; port $STORE_PORT; endpoint $(endpoint_identity || echo unavailable))"
         else
             echo "State store:  LOCK HELD BY UNKNOWN OWNER (PID ${store_pid:-unknown})"
         fi
@@ -438,7 +441,7 @@ cmd_status() {
     if lock_is_held "$ORCH_LOCK"; then
         orch_pid="$(orchestrator_pid || true)"
         if orchestrator_owner_valid "$orch_pid"; then
-            echo "Orchestrator: RUNNING (PID $orch_pid)"
+            echo "Orchestrator: RUNNING (PID $orch_pid; state-store port $STORE_PORT)"
         else
             echo "Orchestrator: LOCK HELD BY UNKNOWN OWNER (PID ${orch_pid:-unknown})"
         fi
