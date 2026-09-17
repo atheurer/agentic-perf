@@ -422,3 +422,23 @@ async def test_benchmark_agent_resolves_interpreted_natural_language_approval():
         "presented_run_file_digest": "b" * 64,
         "execution_intent_digest": "c" * 64,
     }
+
+
+@pytest.mark.asyncio
+async def test_benchmark_agent_returns_natural_language_reply_to_llm():
+    approval_id = "apr-" + "a" * 32
+    response = Mock()
+    response.raise_for_status = Mock()
+    response.json.return_value = {
+        "approvals": [{"approval_request_id": approval_id, "status": "pending"}]
+    }
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    agent._ticket_id = "PERF-TEST"
+    agent.store_url = "http://state-store"
+    agent._request_human_input = AsyncMock(return_value="go for it")
+    agent._client = Mock(get=AsyncMock(return_value=response))
+
+    result = await agent._wait_for_benchmark_approval(approval_id)
+
+    assert "go for it" in result
+    assert "resolve_benchmark_approval" in result
