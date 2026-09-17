@@ -72,6 +72,115 @@ class TestGetEthtoolInfo:
         # No SSH calls should have been made.
         assert patch_ssh.calls == []
 
+    @pytest.mark.asyncio
+    async def test_features_no_raw_field(self, patch_ssh):
+        """Features output should not include the redundant 'raw' field."""
+        patch_ssh._results["ethtool -k"] = SSHResult(
+            exit_code=0,
+            stdout="rx-checksumming: on\ntx-checksumming: off [fixed]\n",
+        )
+        result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="features")
+        data = json.loads(result)
+        for val in data["data"].values():
+            assert "raw" not in val
+
+    @pytest.mark.asyncio
+    async def test_pattern_filter_features(self, patch_ssh):
+        patch_ssh._results["ethtool -k"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "rx-checksumming: on\n"
+                "tx-checksumming: on\n"
+                "scatter-gather: on\n"
+                "tcp-segmentation-offload: on\n"
+            ),
+        )
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="features", pattern="checksum"
+        )
+        data = json.loads(result)
+        assert "rx-checksumming" in data["data"]
+        assert "tx-checksumming" in data["data"]
+        assert "scatter-gather" not in data["data"]
+        assert data["pattern"] == "checksum"
+        assert data["total_keys"] == 4
+        assert data["matched_keys"] == 2
+
+    @pytest.mark.asyncio
+    async def test_pattern_filter_stats(self, patch_ssh):
+        patch_ssh._results["ethtool -S"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "NIC statistics:\n"
+                "     rx_packets: 100\n"
+                "     tx_packets: 200\n"
+                "     rx_errors: 0\n"
+                "     tx_errors: 5\n"
+            ),
+        )
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="stats", pattern="error"
+        )
+        data = json.loads(result)
+        assert "rx_errors" in data["data"]
+        assert "tx_errors" in data["data"]
+        assert "rx_packets" not in data["data"]
+
+    @pytest.mark.asyncio
+    async def test_active_only_features(self, patch_ssh):
+        patch_ssh._results["ethtool -k"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "rx-checksumming: on\n"
+                "tx-checksumming: on [fixed]\n"
+                "scatter-gather: off\n"
+                "generic-receive-offload: on\n"
+            ),
+        )
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="features", active_only=True
+        )
+        data = json.loads(result)
+        assert "rx-checksumming" in data["data"]
+        assert "generic-receive-offload" in data["data"]
+        assert "tx-checksumming" not in data["data"]
+        assert "scatter-gather" not in data["data"]
+        assert data["active_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_bad_regex_pattern(self, patch_ssh):
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="features", pattern="[invalid"
+        )
+        data = json.loads(result)
+        assert data["success"] is False
+        assert "Invalid regex" in data["error"]
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    async def test_pattern_and_active_only_combined(self, patch_ssh):
+        patch_ssh._results["ethtool -k"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "rx-checksumming: on\n"
+                "rx-vlan-offload: off\n"
+                "rx-hash-offload: on [fixed]\n"
+                "tx-checksumming: on\n"
+            ),
+        )
+        result = await srv.get_ethtool_info(
+            "10.0.0.1",
+            "eth0",
+            mode="features",
+            pattern="^rx",
+            active_only=True,
+        )
+        data = json.loads(result)
+        assert "rx-checksumming" in data["data"]
+        assert "rx-vlan-offload" not in data["data"]
+        assert "rx-hash-offload" not in data["data"]
+        assert "tx-checksumming" not in data["data"]
+
 
 # ---------------------------------------------------------------------------
 # run_crucible_command
