@@ -18,6 +18,7 @@ from fastmcp.tools.base import ToolResult
 from mcp import McpError
 from mcp.types import CallToolRequestParams, RequestParams
 
+import agents.mcp_audit as mcp_audit
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
 from agents.mcp_client import AgentMCPClient, _ServerConnection
 from providers.redaction import get_shared_redactor
@@ -684,6 +685,156 @@ async def test_acquired_protected_tool_transitions_legally_and_invokes_once():
         transitions[-1][3]["descriptor"]["tool_result"]["content"][0]["text"]
         == "actual response"
     )
+
+
+@pytest.mark.asyncio
+async def test_protected_call_renews_lease_until_unbounded_handler_returns(
+    tmp_path, monkeypatch
+):
+    """A call longer than its initial lease remains terminally acknowledgeable."""
+
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.05)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+
+    class StoreBackedRegistry:
+        def __init__(self, store: TraceStore) -> None:
+            self.store = store
+            self.owner = "test-service"
+
+        def operation_acquire(self, key: str, request_hash: str, ttl: float) -> dict:
+            operation, status = self.store.acquire_operation_result(
+                key, request_hash, self.owner, ttl
+            )
+            return {"status": status, "operation": operation.__dict__}
+
+        def operation_transition(
+            self, key: str, action: str, token: int, **kwargs
+        ) -> dict:
+            if action == "renew":
+                operation = self.store.renew_operation(
+                    key, self.owner, token, kwargs["ttl_seconds"]
+                )
+            else:
+                operation = {
+                    "prepared": self.store.mark_prepared,
+                    "side-effect-started": self.store.mark_side_effect_started,
+                    "complete": lambda *args: self.store.complete(
+                        *args, kwargs.get("descriptor") or {}
+                    ),
+                    "fail": lambda *args: self.store.fail(
+                        *args, kwargs.get("descriptor") or {}
+                    ),
+                    "indeterminate": lambda *args: self.store.mark_indeterminate(
+                        *args, kwargs.get("descriptor") or {}
+                    ),
+                }[action](key, self.owner, token)
+            return {"operation": operation.__dict__}
+
+    with TraceStore(tmp_path / "trace.db") as store:
+        middleware = MCPAuditMiddleware(
+            "benchmark-agent",
+            ticket_id="PERF-1",
+            agent_id="benchmark",
+            record=lambda _: None,
+        )
+        middleware._client = StoreBackedRegistry(store)
+        request = _request("long-running")
+        request.message.meta.model_extra["agentic-perf"].update(
+            {"idempotency_key": "long-running", "idempotency_request_hash": "hash"}
+        )
+
+        async def slow_handler(_):
+            await asyncio.sleep(0.14)
+            return ToolResult(content="completed")
+
+        result = await middleware.on_call_tool(
+            request.copy(
+                message=request.message.model_copy(update={"name": "execute_benchmark"})
+            ),
+            slow_handler,
+        )
+
+        assert result.content[0].text == "completed"
+        operation = store.get_operation("long-running")
+        assert operation is not None
+        assert operation.terminal_outcome == "success"
+        reasons = [entry["reason"] for entry in store.operation_history("long-running")]
+        assert "renewed" in reasons
+        assert reasons[-1] == "terminal"
+        assert "rejected:expired_lease" not in reasons
+
+
+@pytest.mark.asyncio
+async def test_lost_lease_renewal_acknowledgement_is_indeterminate(
+    tmp_path, monkeypatch
+):
+    """A failed heartbeat cannot be returned as a protected success."""
+
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.05)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    events = []
+
+    class Registry:
+        def __init__(self, store: TraceStore) -> None:
+            self.store = store
+            self.owner = "test-service"
+
+        def operation_acquire(self, key: str, request_hash: str, ttl: float) -> dict:
+            operation, status = self.store.acquire_operation_result(
+                key, request_hash, self.owner, ttl
+            )
+            return {"status": status, "operation": operation.__dict__}
+
+        def operation_transition(
+            self, key: str, action: str, token: int, **kwargs
+        ) -> dict:
+            if action == "renew":
+                raise OSError("renewal acknowledgement lost")
+            method = {
+                "prepared": self.store.mark_prepared,
+                "side-effect-started": self.store.mark_side_effect_started,
+                "indeterminate": self.store.mark_indeterminate,
+            }[action]
+            descriptor = kwargs.get("descriptor") or {}
+            operation = (
+                method(key, self.owner, token)
+                if action in {"prepared", "side-effect-started"}
+                else method(key, self.owner, token, descriptor)
+            )
+            return {"operation": operation.__dict__}
+
+    with TraceStore(tmp_path / "trace.db") as store:
+        middleware = MCPAuditMiddleware(
+            "benchmark-agent",
+            ticket_id="PERF-1",
+            agent_id="benchmark",
+            record=events.append,
+        )
+        middleware._client = Registry(store)
+        request = _request("renewal-loss")
+        request.message.meta.model_extra["agentic-perf"].update(
+            {"idempotency_key": "renewal-loss", "idempotency_request_hash": "hash"}
+        )
+
+        async def slow_handler(_):
+            await asyncio.sleep(0.03)
+            return ToolResult(content="completed")
+
+        with pytest.raises(McpError, match="lease renewal"):
+            await middleware.on_call_tool(
+                request.copy(
+                    message=request.message.model_copy(
+                        update={"name": "execute_benchmark"}
+                    )
+                ),
+                slow_handler,
+            )
+
+        operation = store.get_operation("renewal-loss")
+        assert operation is not None
+        assert operation.terminal_outcome == "indeterminate"
+        assert store.operation_history("renewal-loss")[-1]["reason"] == "terminal"
+        assert events[-1].lifecycle.state == LifecycleState.INDETERMINATE
 
 
 def test_every_local_fastmcp_server_uses_the_shared_factory():

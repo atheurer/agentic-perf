@@ -58,6 +58,8 @@ _MAX_REPLAY_CACHE = 1024
 # device escalation has its own, narrower operation boundary in
 # ``agents.resource.server``.
 _PROTECTED_TOOLS = frozenset({"execute_benchmark"})
+_OPERATION_LEASE_TTL_SECONDS = 300.0
+_OPERATION_LEASE_RENEW_INTERVAL_SECONDS = 100.0
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_REDACTED_KEY_BYTES = 4096
@@ -380,7 +382,9 @@ class MCPAuditMiddleware(Middleware):
             )
         try:
             acquired = self._client.operation_acquire(
-                trace.idempotency_key, trace.idempotency_request_hash, 300
+                trace.idempotency_key,
+                trace.idempotency_request_hash,
+                _OPERATION_LEASE_TTL_SECONDS,
             )
         except Exception:
             return None, self._protected_result(
@@ -437,6 +441,110 @@ class MCPAuditMiddleware(Middleware):
                 is_error=True,
             )
         return acquired.get("operation", {}), None
+
+    async def _renew_operation_lease(
+        self,
+        trace: TraceContext,
+        lease: dict[str, Any],
+        stop: asyncio.Event,
+    ) -> BaseException | None:
+        """Renew a protected operation until its handler has returned.
+
+        The registry client is synchronous, so renewal runs in a worker thread
+        and cannot block the MCP event loop that is waiting for the benchmark.
+        A failed acknowledgement stops the loop and is returned to the caller;
+        the caller then records the completed handler as indeterminate rather
+        than claiming a terminal success with an unconfirmed lease.
+        """
+        if self._client is None:
+            return RuntimeError("operation registry unavailable")
+        interval = min(
+            _OPERATION_LEASE_RENEW_INTERVAL_SECONDS,
+            _OPERATION_LEASE_TTL_SECONDS / 3,
+        )
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return None
+            except asyncio.TimeoutError:
+                try:
+                    await asyncio.to_thread(
+                        self._client.operation_transition,
+                        trace.idempotency_key or "",
+                        "renew",
+                        int(lease["fencing_generation"]),
+                        ttl_seconds=_OPERATION_LEASE_TTL_SECONDS,
+                    )
+                except Exception as exc:
+                    return exc
+
+    @staticmethod
+    async def _stop_operation_lease_renewal(
+        task: asyncio.Task[BaseException | None] | None,
+        stop: asyncio.Event | None,
+    ) -> BaseException | None:
+        """Stop a lease heartbeat and collect its explicit failure, if any."""
+        if task is None or stop is None:
+            return None
+        stop.set()
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # A cancelled MCP call is already indeterminate after the side
+            # effect boundary.  Do not let heartbeat cleanup mask that result.
+            return None
+
+    def _mark_renewal_failure(
+        self,
+        trace: TraceContext,
+        fastmcp_context: Any,
+        *,
+        tool_name: str,
+        duration_ms: float,
+        lease: dict[str, Any],
+        failure: BaseException,
+    ) -> None:
+        """Persist a known renewal loss and fail closed for the MCP caller."""
+        renewal_error = RuntimeError("protected operation lease renewal failed")
+        self._emit_terminal(
+            trace,
+            fastmcp_context,
+            LifecycleState.INDETERMINATE,
+            tool_name=tool_name,
+            duration_ms=duration_ms,
+            outcome=OperationOutcome.INDETERMINATE,
+            lease=lease,
+            error=renewal_error,
+        )
+        try:
+            self._client.operation_transition(
+                trace.idempotency_key or "",
+                "indeterminate",
+                int(lease["fencing_generation"]),
+                descriptor={
+                    "outcome": "lease_renewal_failed",
+                    "type": type(failure).__name__,
+                },
+            )
+        except Exception as operation_error:
+            raise McpError(
+                ErrorData(
+                    code=-32000,
+                    message=(
+                        "MCP tool outcome is indeterminate; operation lease "
+                        "renewal was not acknowledged"
+                    ),
+                )
+            ) from operation_error
+        raise McpError(
+            ErrorData(
+                code=-32000,
+                message=(
+                    "MCP tool outcome is indeterminate; operation lease renewal "
+                    "was not acknowledged"
+                ),
+            )
+        ) from failure
 
     def _emit_terminal(
         self,
@@ -592,6 +700,8 @@ class MCPAuditMiddleware(Middleware):
             self._seen.popitem(last=False)
 
         token = bind_trace_context(trace)
+        renewal_stop: asyncio.Event | None = None
+        renewal_task: asyncio.Task[BaseException | None] | None = None
         try:
             if lease is not None:
                 self._client.operation_transition(
@@ -604,8 +714,17 @@ class MCPAuditMiddleware(Middleware):
                     "side-effect-started",
                     int(lease["fencing_generation"]),
                 )
+                renewal_stop = asyncio.Event()
+                renewal_task = asyncio.create_task(
+                    self._renew_operation_lease(trace, lease, renewal_stop),
+                    name=f"mcp-operation-renew:{trace.idempotency_key}",
+                )
             result = await call_next(context)
+            renewal_failure = await self._stop_operation_lease_renewal(
+                renewal_task, renewal_stop
+            )
         except asyncio.CancelledError:
+            await self._stop_operation_lease_renewal(renewal_task, renewal_stop)
             if lease is not None:
                 self._client.operation_transition(
                     trace.idempotency_key or "",
@@ -624,6 +743,7 @@ class MCPAuditMiddleware(Middleware):
             )
             raise
         except Exception as exc:
+            await self._stop_operation_lease_renewal(renewal_task, renewal_stop)
             if lease is not None:
                 self._client.operation_transition(
                     trace.idempotency_key or "",
@@ -648,6 +768,15 @@ class MCPAuditMiddleware(Middleware):
         finally:
             reset_trace_context(token)
         result = self._sanitize_result(trace, result)
+        if lease is not None and renewal_failure is not None:
+            self._mark_renewal_failure(
+                trace,
+                context.fastmcp_context,
+                tool_name=tool_name,
+                duration_ms=(time.monotonic() - started) * 1000,
+                lease=lease,
+                failure=renewal_failure,
+            )
         terminal_state = (
             LifecycleState.FAILED
             if getattr(result, "is_error", False)
