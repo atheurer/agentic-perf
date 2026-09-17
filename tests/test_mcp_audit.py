@@ -693,8 +693,10 @@ async def test_protected_call_renews_lease_until_unbounded_handler_returns(
 ):
     """A call longer than its initial lease remains terminally acknowledgeable."""
 
-    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.05)
-    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    # Leave enough margin for the first asyncio.to_thread heartbeat to start
+    # on a busy CI runner while still making the handler outlive its lease.
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.05)
 
     class StoreBackedRegistry:
         def __init__(self, store: TraceStore) -> None:
@@ -744,7 +746,7 @@ async def test_protected_call_renews_lease_until_unbounded_handler_returns(
         )
 
         async def slow_handler(_):
-            await asyncio.sleep(0.14)
+            await asyncio.sleep(1.2)
             return ToolResult(content="completed")
 
         result = await middleware.on_call_tool(
@@ -770,8 +772,8 @@ async def test_lost_lease_renewal_acknowledgement_is_indeterminate(
 ):
     """A failed heartbeat cannot be returned as a protected success."""
 
-    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.05)
-    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.05)
     events = []
 
     class Registry:
@@ -817,7 +819,7 @@ async def test_lost_lease_renewal_acknowledgement_is_indeterminate(
         )
 
         async def slow_handler(_):
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.2)
             return ToolResult(content="completed")
 
         with pytest.raises(McpError, match="lease renewal"):
