@@ -29,6 +29,21 @@ private IPs the hosts use to talk to each other). This distinction
 matters for cloud providers where SSH uses public IPs but benchmark
 traffic uses private IPs.
 
+For multi-instance benchmarks (e.g., 8 uperf pairs on ports
+30002–30009), pass a ``ports`` list to verify all ports concurrently:
+
+```
+test_port_connectivity(
+    server_ssh_host="3.1.2.3",
+    client_ssh_host="3.4.5.6",
+    server_test_ip="172.31.1.10",
+    ports=[30002, 30003, 30004, 30005, 30006, 30007, 30008, 30009],
+)
+```
+
+The response includes ``all_ports_ok``, ``failed_ports``, and
+per-port results.
+
 If the tool is not available or you need more control, use the
 manual steps below.
 
