@@ -39,22 +39,36 @@ def _holder_alive(holder: dict) -> bool:
     tick) ensures we don't mistake a new process at the
     same PID for the original holder.
     """
-    pid = holder.get("pid")
-    if not pid:
-        return False
-    pid = int(pid)
+    pid_value = holder.get("pid")
+    if pid_value is None:
+        # Unknown metadata must fail closed.  It is not evidence that the
+        # kernel lock is stale.
+        return True
+    try:
+        pid = int(pid_value)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         pass
+    except OSError:
+        # An inability to inspect the process is not proof that it is dead.
+        return True
     # PID exists — verify it's the same incarnation.
     holder_identity = holder.get("process_start_identity", "")
     if not holder_identity:
         # No identity recorded — can't verify, assume alive.
         return True
     current_identity = _process_start_identity(pid)
+    if current_identity == str(pid) and holder_identity != str(pid):
+        # The platform-specific identity was unavailable, so do not treat a
+        # live lock holder as stale merely because verification was degraded.
+        return True
     return current_identity == holder_identity
 
 
@@ -149,11 +163,18 @@ class PersistenceRootLock:
                     holder.get("process_start_identity", holder.get("pid")),
                 )
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    # A kernel flock is released when its owning process dies;
+                    # retry non-blocking so a stale metadata file can never
+                    # make a contender hang behind a live lock.
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     os.close(fd)
+                    detail = (
+                        json.dumps(holder, sort_keys=True) if holder else "unavailable"
+                    )
                     raise PersistenceRootLockedError(
-                        f"state-store persistence root is locked: {self.root}"
+                        f"state-store persistence root is locked: {self.root} "
+                        f"(holder metadata: {detail})"
                     ) from exc
             else:
                 os.close(fd)

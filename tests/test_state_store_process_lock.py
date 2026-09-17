@@ -14,7 +14,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from state_store.process_lock import PersistenceRootLock, PersistenceRootLockedError
+from state_store.process_lock import (
+    PersistenceRootLock,
+    PersistenceRootLockedError,
+    _holder_alive,
+)
 
 
 def _port() -> int:
@@ -179,6 +183,21 @@ def test_stale_pid_file_does_not_block_and_store_id_survives_restart(
         assert (tmp_path / "state-store.id").read_text().strip() == first_id
     finally:
         _stop(second)
+
+
+def test_unknown_holder_metadata_fails_closed() -> None:
+    assert _holder_alive({}) is True
+    assert _holder_alive({"pid": "not-a-pid"}) is True
+
+
+def test_process_identity_detects_pid_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(
+        "state_store.process_lock._process_start_identity",
+        lambda pid: f"{pid}:new",
+    )
+    assert _holder_alive({"pid": 123, "process_start_identity": "123:old"}) is False
+    assert _holder_alive({"pid": 123, "process_start_identity": "123:new"}) is True
 
 
 def test_authenticated_diagnostics_expose_stable_store_identity(tmp_path: Path) -> None:

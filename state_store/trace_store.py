@@ -85,7 +85,7 @@ class TraceStore:
         # store mutations, API handlers) access this store
         # concurrently; without a lock the manual BEGIN/COMMIT
         # calls collide.
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         try:
             self._connection = sqlite3.connect(
                 self.db_path,
@@ -141,10 +141,11 @@ class TraceStore:
 
     def close(self) -> None:
         """Close the connection; safe to call after a failed initialization."""
-        connection = getattr(self, "_connection", None)
-        if connection is not None:
-            connection.close()
-            self._connection = None
+        with self._lock:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+                self._connection = None
 
     def _open_connection(self) -> sqlite3.Connection:
         if self._connection is None:
@@ -273,37 +274,38 @@ class TraceStore:
         legacy_event_type: str | None = None,
     ) -> list[TraceEventV1]:
         """Return immutable events in their authoritative insertion order."""
-        try:
-            query = "SELECT event_json FROM trace_events"
-            predicates: list[str] = []
-            values: list[str] = []
-            if ticket_id is not None:
-                predicates.append("ticket_id = ?")
-                values.append(ticket_id)
-            if ticket_ids is not None:
-                if not ticket_ids:
-                    return []
-                placeholders = ", ".join("?" for _ in ticket_ids)
-                predicates.append(f"ticket_id IN ({placeholders})")
-                values.extend(ticket_ids)
-            if action_type is not None:
-                predicates.append("action_type = ?")
-                values.append(action_type)
-            if legacy_event_type is not None:
-                predicates.append(
-                    "json_extract(event_json, "
-                    "'$.attributes.legacy_event.event_type') = ?"
-                )
-                values.append(legacy_event_type)
-            if predicates:
-                query += " WHERE " + " AND ".join(predicates)
-            query += " ORDER BY global_seq"
-            return [
-                TraceEventV1.model_validate_json(row["event_json"])
-                for row in self._open_connection().execute(query, tuple(values))
-            ]
-        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-            raise TraceStoreWriteError("could not read trace events") from exc
+        with self._lock:
+            try:
+                query = "SELECT event_json FROM trace_events"
+                predicates: list[str] = []
+                values: list[str] = []
+                if ticket_id is not None:
+                    predicates.append("ticket_id = ?")
+                    values.append(ticket_id)
+                if ticket_ids is not None:
+                    if not ticket_ids:
+                        return []
+                    placeholders = ", ".join("?" for _ in ticket_ids)
+                    predicates.append(f"ticket_id IN ({placeholders})")
+                    values.extend(ticket_ids)
+                if action_type is not None:
+                    predicates.append("action_type = ?")
+                    values.append(action_type)
+                if legacy_event_type is not None:
+                    predicates.append(
+                        "json_extract(event_json, "
+                        "'$.attributes.legacy_event.event_type') = ?"
+                    )
+                    values.append(legacy_event_type)
+                if predicates:
+                    query += " WHERE " + " AND ".join(predicates)
+                query += " ORDER BY global_seq"
+                return [
+                    TraceEventV1.model_validate_json(row["event_json"])
+                    for row in self._open_connection().execute(query, tuple(values))
+                ]
+            except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+                raise TraceStoreWriteError("could not read trace events") from exc
 
     def put_payload_descriptor(self, descriptor: PayloadDescriptor) -> None:
         """Persist safe payload metadata only; payload bytes are never stored in SQLite."""
@@ -346,22 +348,23 @@ class TraceStore:
 
     def get_payload_descriptor(self, digest: str) -> PayloadDescriptor | None:
         """Return a safe descriptor; this API intentionally cannot retrieve blobs."""
-        try:
-            row = (
-                self._open_connection()
-                .execute(
-                    "SELECT descriptor_json FROM trace_payloads WHERE digest = ?",
-                    (digest,),
+        with self._lock:
+            try:
+                row = (
+                    self._open_connection()
+                    .execute(
+                        "SELECT descriptor_json FROM trace_payloads WHERE digest = ?",
+                        (digest,),
+                    )
+                    .fetchone()
                 )
-                .fetchone()
-            )
-            return (
-                PayloadDescriptor.model_validate_json(row["descriptor_json"])
-                if row is not None
-                else None
-            )
-        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-            raise TraceStoreWriteError("could not read payload metadata") from exc
+                return (
+                    PayloadDescriptor.model_validate_json(row["descriptor_json"])
+                    if row is not None
+                    else None
+                )
+            except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+                raise TraceStoreWriteError("could not read payload metadata") from exc
 
     def create_operation(self, operation: OperationRecord) -> OperationRecord:
         """Persist an operation record; operation lifecycle policy lives elsewhere."""
@@ -433,30 +436,32 @@ class TraceStore:
             raise TraceStoreWriteError("could not write operation") from exc
 
     def get_operation(self, operation_key: str) -> OperationRecord | None:
-        try:
-            row = (
-                self._open_connection()
-                .execute(
-                    "SELECT * FROM operations WHERE operation_key = ?", (operation_key,)
+        with self._lock:
+            try:
+                row = (
+                    self._open_connection()
+                    .execute(
+                        "SELECT * FROM operations WHERE operation_key = ?",
+                        (operation_key,),
+                    )
+                    .fetchone()
                 )
-                .fetchone()
-            )
-            if row is None:
-                return None
-            values = dict(row)
-            values["result_descriptor"] = (
-                json.loads(values["result_descriptor"])
-                if values["result_descriptor"] is not None
-                else None
-            )
-            values["external_ids"] = (
-                json.loads(values["external_ids"])
-                if values["external_ids"] is not None
-                else None
-            )
-            return OperationRecord(**values)
-        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-            raise TraceStoreWriteError("could not read operation") from exc
+                if row is None:
+                    return None
+                values = dict(row)
+                values["result_descriptor"] = (
+                    json.loads(values["result_descriptor"])
+                    if values["result_descriptor"] is not None
+                    else None
+                )
+                values["external_ids"] = (
+                    json.loads(values["external_ids"])
+                    if values["external_ids"] is not None
+                    else None
+                )
+                return OperationRecord(**values)
+            except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+                raise TraceStoreWriteError("could not read operation") from exc
 
     @staticmethod
     def _lease_time(value: datetime | None = None) -> str:
@@ -539,22 +544,27 @@ class TraceStore:
                 else None
             ),
             duration_ms=0 if rejected or terminal else None,
-            attributes={"operation_state": operation.state, "reason": reason},
+            attributes={
+                "operation_owner": operation.owner,
+                "operation_state": operation.state,
+                "reason": reason,
+            },
         )
         self._insert_event_in_transaction(connection, event)
 
     def operation_history(self, operation_key: str) -> list[dict[str, Any]]:
-        try:
-            return [
-                dict(row)
-                for row in self._open_connection().execute(
-                    "SELECT state, owner, fencing_generation, reason, occurred_at, terminal_outcome "
-                    "FROM operation_history WHERE operation_key=? ORDER BY history_id",
-                    (operation_key,),
-                )
-            ]
-        except sqlite3.Error as exc:
-            raise TraceStoreWriteError("could not read operation history") from exc
+        with self._lock:
+            try:
+                return [
+                    dict(row)
+                    for row in self._open_connection().execute(
+                        "SELECT state, owner, fencing_generation, reason, occurred_at, terminal_outcome "
+                        "FROM operation_history WHERE operation_key=? ORDER BY history_id",
+                        (operation_key,),
+                    )
+                ]
+            except sqlite3.Error as exc:
+                raise TraceStoreWriteError("could not read operation history") from exc
 
     def register_or_get(
         self, operation: OperationRecord
