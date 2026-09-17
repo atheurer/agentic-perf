@@ -764,6 +764,14 @@ async def test_protected_call_renews_lease_until_unbounded_handler_returns(
         assert "renewed" in reasons
         assert reasons[-1] == "terminal"
         assert "rejected:expired_lease" not in reasons
+        renewal_events = [
+            event
+            for event in store.list_events("long-running")
+            if event.attributes.get("reason") == "renewed"
+        ]
+        assert renewal_events
+        assert renewal_events[-1].attributes["operation_owner"] == "test-service"
+        assert renewal_events[-1].idempotency.fencing_token == 1
 
 
 @pytest.mark.asyncio

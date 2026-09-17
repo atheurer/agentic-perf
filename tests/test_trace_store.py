@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
@@ -75,6 +76,34 @@ def test_shared_store_serializes_concurrent_event_transactions(tmp_path: Path) -
                 executor.map(lambda _: store.insert_event(event()), range(24))
             )
     assert sorted(item.global_seq for item in stored) == list(range(1, 25))
+
+
+def test_shared_store_serializes_reads_with_write_transactions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        lease = store.acquire_operation("key", "hash", "owner", 60)
+        entered = threading.Event()
+        release = threading.Event()
+        original_audit = store._audit
+
+        def blocking_audit(connection, operation, reason):
+            if reason == "prepared":
+                entered.set()
+                assert release.wait(5)
+            return original_audit(connection, operation, reason)
+
+        monkeypatch.setattr(store, "_audit", blocking_audit)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            writer = executor.submit(
+                store.mark_prepared, "key", "owner", lease.fencing_generation
+            )
+            assert entered.wait(5)
+            reader = executor.submit(store.get_operation, "key")
+            assert not reader.done()
+            release.set()
+            assert writer.result().state == "prepared"
+            assert reader.result().state == "prepared"
 
 
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:
