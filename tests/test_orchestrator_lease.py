@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 from fastapi import Depends, FastAPI
 
 from orchestrator.leader_lease import LeaderLeaseClient
+from orchestrator.main import _handle_shutdown_signal, _renew_leader_lease
 from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
@@ -47,6 +49,31 @@ async def test_leader_lease_acquire_is_control_plane_not_ticket_audited(
     client = LeaderLeaseClient("http://state-store", instance_name="test-instance")
     assert (await client.acquire())["epoch"] == 7
     assert client.epoch == 7
+
+
+def test_sigterm_uses_asyncio_shutdown_path():
+    with pytest.raises(KeyboardInterrupt):
+        _handle_shutdown_signal(15, None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_lease_renewal_releases_leader_lease():
+    class Lease:
+        released = False
+
+        async def renew(self):
+            await asyncio.sleep(60)
+
+        async def release(self):
+            self.released = True
+
+    lease = Lease()
+    task = asyncio.create_task(_renew_leader_lease(lease, 60))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lease.released
 
 
 def _request(session_id=None, *, instance_name="shared"):

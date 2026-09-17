@@ -2103,11 +2103,21 @@ def _sweep_trace_spools() -> None:
             pass
 
 
+def _handle_shutdown_signal(_signum: int, _frame: Any) -> None:
+    """Route SIGTERM through asyncio's normal cancellation cleanup."""
+    raise KeyboardInterrupt
+
+
 def main():
     # Ignore SIGPIPE so broken stderr (e.g., parent shell exited)
     # doesn't kill the orchestrator. Python's logging handles the
     # resulting BrokenPipeError internally.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    # asyncio.run() cancels outstanding tasks when KeyboardInterrupt escapes;
+    # that runs the leader lease renewal task's finally block and releases
+    # the lease immediately on a clean stop.  The lease TTL remains the
+    # fallback for crashes, SIGKILL, and host failures.
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
     import faulthandler
 
