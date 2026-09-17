@@ -133,6 +133,7 @@ def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "State store already running" in result.stdout
+        assert "waiting up to" in result.stdout
         assert "did not start a new service" in result.stdout
         assert "Orchestrator already running" in result.stdout
         assert "Services stopped" in result.stdout

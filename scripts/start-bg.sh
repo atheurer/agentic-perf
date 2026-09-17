@@ -181,6 +181,12 @@ endpoint_identity() {
 wait_for_store() {
     local pid="$1" deadline=$((SECONDS + STORE_START_TIMEOUT))
     while [ "$SECONDS" -lt "$deadline" ]; do
+        # A forced or graceful stop may leave the lock held briefly while the
+        # old process unwinds.  Return immediately once that owner is gone so
+        # the caller can start a replacement instead of waiting blindly.
+        if ! lock_is_held "$STORE_LOCK" || ! process_alive "$pid"; then
+            return 2
+        fi
         if store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)" \
             && [ "$(endpoint_identity || true)" = "this-store" ] \
             && [ "$(store_lock_pid || true)" = "$pid" ]; then
@@ -255,11 +261,23 @@ start_store() {
             return 1
         }
         write_pid_file "$STORE_PID_FILE" "$pid"
-        wait_for_store "$pid" || { error "state-store lock owner PID $pid is not responding as this instance"; return 1; }
-        echo "State store already running (PID $pid); did not start a new service."
-        echo "  Repaired PID metadata: $STORE_PID_FILE"
-        echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
-        return 2
+        echo "State store already owns the persistence lock (PID $pid); waiting up to ${STORE_START_TIMEOUT}s for readiness..."
+        wait_for_store "$pid" || {
+            if ! lock_is_held "$STORE_LOCK"; then
+                echo "Previous state store PID $pid exited and released the lock; starting a fresh state store."
+                rm -f "$STORE_PID_FILE"
+            else
+                error "state-store lock owner PID $pid is not responding as this instance; see $STORE_LOG"
+                return 1
+            fi
+        }
+        if lock_is_held "$STORE_LOCK" && [ "$(store_lock_pid || true)" = "$pid" ] \
+            && [ "$(endpoint_identity || true)" = "this-store" ]; then
+            echo "State store already running (PID $pid); did not start a new service."
+            echo "  Repaired PID metadata: $STORE_PID_FILE"
+            echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
+            return 2
+        fi
     fi
     case "$(endpoint_identity || true)" in
         different-store) error "port $STORE_PORT is occupied by a different state store"; return 1 ;;
