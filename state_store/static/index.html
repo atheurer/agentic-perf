@@ -618,6 +618,118 @@ details > .content { padding: 12px 16px; }
 
 .event-text.short { max-height: none; }
 
+.event-group {
+  margin: 4px 0;
+}
+
+.event-group > summary {
+  padding: 7px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  list-style: none;
+}
+
+.event-group > summary::-webkit-details-marker { display: none; }
+
+.event-group > summary::before {
+  content: '\25B6';
+  display: inline-block;
+  font-size: 9px;
+  margin-right: 7px;
+  transition: transform 0.2s;
+}
+
+.event-group[open] > summary::before { transform: rotate(90deg); }
+.event-group > .content { padding: 2px 0 2px 8px; }
+
+.audit-event {
+  opacity: 0.72;
+  border-left: 3px solid var(--text-muted);
+  padding-left: 8px;
+}
+
+.audit-event.audit-failure {
+  opacity: 1;
+  border-left-color: var(--red);
+}
+
+.event-filter-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex-shrink: 1;
+}
+
+.event-filter-controls input,
+.event-filter-controls select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  min-width: 110px;
+}
+
+.event-filter-controls input { min-width: 150px; }
+.event-filter-controls input:focus,
+.event-filter-controls select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.raw-trace-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 24px;
+}
+
+.raw-trace-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: min(1100px, 96vw);
+  height: min(800px, 92vh);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.raw-trace-dialog h3 {
+  color: var(--text-bright);
+  margin-bottom: 8px;
+}
+
+.raw-trace-dialog pre {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 12px;
+  color: var(--text);
+  font: 12px/1.45 var(--font-mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.raw-trace-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .expandable-text {
   position: relative;
 }
@@ -1652,6 +1764,10 @@ let lastSeq = 0;
 let autoScroll = true;
 let maxRenderedSeq = 0;
 let renderedEventCount = 0;
+var eventRecords = [];
+var eventView = 'activity';
+var eventSearch = '';
+var condenseEvents = true;
 var _chartInstances = {};
 
 const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
@@ -2181,6 +2297,9 @@ async function renderDetail(ticketId) {
     lastSeq = 0;
     maxRenderedSeq = 0;
     renderedEventCount = 0;
+    eventRecords = [];
+    eventView = 'activity';
+    eventSearch = '';
     _lastResultHash = '';
     // Seed the trail from the ticket's authoritative
     // status_trail — the store appends on every transition.
@@ -2224,6 +2343,17 @@ async function renderDetail(ticketId) {
             '<button class="toolbar-btn" id="btn-top">&uarr; Top</button>' +
             '<button class="toolbar-btn" id="btn-bottom">&darr; Bottom</button>' +
             '<button class="toolbar-btn active" id="btn-progress-toggle">Progress</button>' +
+            '<span class="event-filter-controls" aria-label="Event stream filters">' +
+              '<select id="event-view-select" title="Choose which event records to show">' +
+                '<option value="activity">Activity</option>' +
+                '<option value="all">Activity + audit failures</option>' +
+                '<option value="audit">Audit telemetry</option>' +
+              '</select>' +
+              '<input id="event-search" type="search" placeholder="Search activity..." ' +
+                'aria-label="Search event activity">' +
+            '</span>' +
+            '<button class="toolbar-btn active" id="btn-condense" title="Collapse identical adjacent records">Condense</button>' +
+            '<button class="toolbar-btn" id="btn-raw-trace">Raw trace</button>' +
             '<button class="toolbar-btn" id="btn-collapse-all">Collapse</button>' +
             '<button class="toolbar-btn" id="btn-expand-all">Expand</button>' +
             '<span id="action-buttons">' + actionButtonsHtml(ticket.status, ticket) + '</span>' +
@@ -2251,7 +2381,8 @@ async function renderDetail(ticketId) {
             '<div class="left-panel-section">' +
               '<h4>Events</h4>' +
               '<div class="sidebar-event-count" id="event-count">0</div>' +
-              '<div class="sidebar-event-label">events loaded</div>' +
+              '<div class="sidebar-event-label" id="event-count-label">activity entries shown</div>' +
+              '<div class="sidebar-event-label" id="raw-event-count">0 raw records loaded</div>' +
             '</div>' +
             '<div class="left-panel-section">' +
               '<h4>LLM Usage</h4>' +
@@ -2287,6 +2418,22 @@ async function renderDetail(ticketId) {
       if (stream) stream.classList.toggle('hide-progress');
       this.classList.toggle('active');
     });
+    document.getElementById('event-view-select').addEventListener('change', function() {
+      eventView = this.value;
+      renderEventStream();
+    });
+    document.getElementById('event-search').addEventListener('input', function() {
+      eventSearch = this.value || '';
+      renderEventStream();
+    });
+    document.getElementById('btn-condense').addEventListener('click', function() {
+      condenseEvents = !condenseEvents;
+      this.classList.toggle('active', condenseEvents);
+      renderEventStream();
+    });
+    document.getElementById('btn-raw-trace').addEventListener('click', function() {
+      showRawTrace(ticketId);
+    });
     document.getElementById('btn-collapse-all').addEventListener('click', function() {
       document.querySelectorAll('#event-stream details[open]').forEach(function(d) { d.open = false; });
     });
@@ -2299,10 +2446,10 @@ async function renderDetail(ticketId) {
     // Initial load: fetch ALL events at once for complete
     // breadcrumbs and history. Only poll for NEW events after.
     try {
-      var initData = await api('/tickets/' + ticketId + '/events?since=0&limit=10000');
+      var initData = await api('/tickets/' + ticketId + '/transcript');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
-        lastSeq = initData.latest_seq;
+        lastSeq = initEvents[initEvents.length - 1].seq || 0;
         renderNewEvents(initEvents);
       }
     } catch (e) {
@@ -3382,35 +3529,225 @@ async function updateUsageSidebar(ticketId) {
   } catch {}
 }
 
-function renderNewEvents(events) {
+function isAuditEvent(evt) {
+  return evt && evt.event_source === 'audit';
+}
+
+function isAuditFailure(evt) {
+  var audit = (evt && evt.audit) || {};
+  var failedStates = new Set([
+    'failed', 'cancelled', 'timed_out', 'rejected', 'indeterminate'
+  ]);
+  return failedStates.has(audit.lifecycle_state) ||
+    failedStates.has(audit.outcome);
+}
+
+function isLowValueActivity(evt) {
+  return evt && evt.event_type === 'context_resolution';
+}
+
+function isRenderableEvent(evt) {
+  if (!evt) return false;
+  if (evt.event_type === 'transition' || evt.event_type === 'status_change') {
+    return false;
+  }
+  if (evt.agent === 'introspection-agent' && evt.event_type !== 'guidance_summary') {
+    return false;
+  }
+  return true;
+}
+
+function eventMatchesView(evt) {
+  if (!isRenderableEvent(evt) || isLowValueActivity(evt)) return false;
+  if (eventView === 'audit') return isAuditEvent(evt);
+  if (eventView === 'activity') return !isAuditEvent(evt) || isAuditFailure(evt);
+  return !isAuditEvent(evt) || isAuditFailure(evt);
+}
+
+function stableEventValue(value) {
+  if (Array.isArray(value)) return value.map(stableEventValue);
+  if (value && typeof value === 'object') {
+    var sorted = {};
+    Object.keys(value).sort().forEach(function(key) {
+      sorted[key] = stableEventValue(value[key]);
+    });
+    return sorted;
+  }
+  return value;
+}
+
+function eventSearchText(evt) {
+  var audit = evt.audit || {};
+  return [
+    evt.event_type, evt.agent, audit.action_type, audit.phase,
+    audit.lifecycle_state, audit.outcome, audit.target,
+    JSON.stringify(evt.data || {})
+  ].join(' ').toLowerCase();
+}
+
+function eventMatchesSearch(evt) {
+  var query = eventSearch.trim().toLowerCase();
+  return !query || eventSearchText(evt).indexOf(query) !== -1;
+}
+
+function eventGroupKey(evt) {
+  if (!condenseEvents) return null;
+  // Exact adjacent audit records and progress messages are safe to collapse.
+  // Lifecycle/activity records retain their individual detail by default.
+  if (!isAuditEvent(evt) && evt.event_type !== 'tool_progress') return null;
+  return JSON.stringify([
+    evt.event_type,
+    evt.agent,
+    stableEventValue(evt.data || {}),
+    stableEventValue(evt.audit || {})
+  ]);
+}
+
+function captureOpenDetails(container) {
+  var open = {};
+  if (!container) return open;
+  container.querySelectorAll('details').forEach(function(details) {
+    if (!details.open) return;
+    var key = details.dataset.stateKey;
+    if (!key) {
+      var summary = details.querySelector('summary');
+      key = summary ? summary.textContent.trim() : '';
+    }
+    if (key) open[key] = true;
+  });
+  return open;
+}
+
+function restoreOpenDetails(container, open) {
+  if (!container) return;
+  container.querySelectorAll('details').forEach(function(details) {
+    var key = details.dataset.stateKey;
+    if (!key) {
+      var summary = details.querySelector('summary');
+      key = summary ? summary.textContent.trim() : '';
+    }
+    if (key && Object.prototype.hasOwnProperty.call(open, key)) {
+      details.open = true;
+    }
+  });
+}
+
+function renderEventGroup(group) {
+  if (group.events.length === 1) return renderEvent(group.events[0]);
+  var first = group.events[0];
+  var audit = first.audit || {};
+  var label = isAuditEvent(first)
+    ? (audit.action_type || first.event_type || 'audit').toUpperCase()
+    : (first.event_type || 'event').toUpperCase();
+  var detail = isAuditEvent(first)
+    ? (audit.lifecycle_state || '')
+    : (first.agent || '');
+  var body = group.events.map(renderEvent).join('');
+  return '<details class="event-group" data-state-key="event-group-' + first.seq + '">' +
+    '<summary><strong>' + escHtml(label) + '</strong> &times; ' + group.events.length +
+    (detail ? ' <span style="margin-left:8px">' + escHtml(detail) + '</span>' : '') +
+    '<span style="float:right">' + fmtTimeShort(first.timestamp) +
+    ' &rarr; ' + fmtTimeShort(group.events[group.events.length - 1].timestamp) +
+    '</span></summary>' +
+    '<div class="content">' + body + '</div>' +
+  '</details>';
+}
+
+function renderEventStream() {
   var container = document.getElementById('event-stream');
   if (!container) return;
+  var open = captureOpenDetails(container);
+  var visible = eventRecords.filter(function(evt) {
+    return eventMatchesView(evt) && eventMatchesSearch(evt);
+  });
+  var groups = [];
+  visible.forEach(function(evt) {
+    var key = eventGroupKey(evt);
+    var previous = groups[groups.length - 1];
+    if (key && previous && previous.key === key) {
+      previous.events.push(evt);
+    } else {
+      groups.push({key: key, events: [evt]});
+    }
+  });
+  container.innerHTML = groups.map(renderEventGroup).join('');
+  restoreOpenDetails(container, open);
 
+  renderedEventCount = visible.length;
+  var countEl = document.getElementById('event-count');
+  if (countEl) countEl.textContent = renderedEventCount;
+  var rawCountEl = document.getElementById('raw-event-count');
+  if (rawCountEl) rawCountEl.textContent = eventRecords.length + ' raw records loaded';
+  var countLabel = document.getElementById('event-count-label');
+  if (countLabel) {
+    countLabel.textContent = eventView === 'audit'
+      ? 'audit records shown'
+      : 'activity records shown';
+  }
+  if (autoScroll) container.scrollTop = container.scrollHeight;
+}
+
+function renderNewEvents(events) {
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
     if (evt.seq <= maxRenderedSeq) continue;
     maxRenderedSeq = evt.seq;
-    renderedEventCount++;
-    // Cap DOM nodes to prevent memory leak from accumulated
-    // event elements. Remove oldest DOM children when over limit.
-    // Tradeoff: oldest events become unviewable without a page
-    // refresh. Scroll position may shift if the user is reading
-    // older events. A virtualized scroll approach would be ideal
-    // but requires a significant JS refactor.
-    if (container.children.length > 2000) {
-      while (container.children.length > 1500) {
-        container.removeChild(container.firstChild);
-      }
-    }
-    var html = renderEvent(evt);
-    if (html) container.insertAdjacentHTML('beforeend', html);
+    eventRecords.push(evt);
   }
+  // Keep the browser-side projection bounded. Raw forensic records remain
+  // available through the trace endpoint and are never deleted here.
+  if (eventRecords.length > 10000) {
+    eventRecords = eventRecords.slice(eventRecords.length - 10000);
+  }
+  renderEventStream();
+}
 
-  var countEl = document.getElementById('event-count');
-  if (countEl) countEl.textContent = renderedEventCount;
+function renderAuditEvent(evt) {
+  var audit = evt.audit || {};
+  var failure = isAuditFailure(evt);
+  var state = audit.lifecycle_state || 'recorded';
+  var action = audit.action_type || evt.event_type || 'audit';
+  var phase = audit.phase ? ' &middot; ' + escHtml(audit.phase) : '';
+  var target = audit.target
+    ? '<span style="color:var(--text-muted)">' + escHtml(audit.target) + '</span>'
+    : '';
+  var outcome = audit.outcome ? ' &middot; ' + escHtml(audit.outcome) : '';
+  return '<div class="event audit-event ' + (failure ? 'audit-failure' : '') + '">' +
+    '<span class="event-ts">' + fmtTimeShort(evt.timestamp) + '</span>' +
+    '<span class="event-label ' + (failure ? 'label-error' : 'label-progress') + '">' +
+      (failure ? 'AUDIT FAILURE' : 'AUDIT') + '</span>' +
+    '<span class="tool-name">' + escHtml(action) + '</span>' +
+    '<span style="color:var(--text-muted)"> &middot; ' + escHtml(state) + phase + outcome +
+      (target ? ' &middot; ' + target : '') + '</span>' +
+  '</div>';
+}
 
-  if (autoScroll) {
-    container.scrollTop = container.scrollHeight;
+async function showRawTrace(ticketId) {
+  var overlay = document.createElement('div');
+  overlay.className = 'raw-trace-overlay';
+  overlay.innerHTML =
+    '<div class="raw-trace-dialog">' +
+      '<h3>Raw trace &mdash; ' + escHtml(ticketId) + '</h3>' +
+      '<pre id="raw-trace-content"><span class="spinner"></span> Loading immutable trace...</pre>' +
+      '<div class="raw-trace-actions">' +
+        '<button class="toolbar-btn" id="raw-trace-close">Close</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.getElementById('raw-trace-close').addEventListener('click', function() {
+    overlay.remove();
+  });
+  try {
+    var data = await api('/traces/tickets/' + encodeURIComponent(ticketId) +
+      '?include_payloads=false&limit=10000');
+    var content = document.getElementById('raw-trace-content');
+    if (content) content.textContent = JSON.stringify(data.events || [], null, 2);
+  } catch (err) {
+    var error = document.getElementById('raw-trace-content');
+    if (error) error.textContent = 'Unable to load raw trace: ' + err.message;
   }
 }
 
@@ -3487,6 +3824,8 @@ function renderEvent(evt) {
   var data = evt.data || {};
   var ts = fmtTimeShort(evt.timestamp);
   var agent = evt.agent || '';
+
+  if (isAuditEvent(evt)) return renderAuditEvent(evt);
 
   // Introspection agent events are shown in the dedicated
   // introspection card, not in the main event stream.
