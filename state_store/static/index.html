@@ -1760,6 +1760,13 @@ let statusFilter = '';
 let pollTimer = null;
 let artifactTimer = null;
 let pollPaused = false;
+let healthPollInFlight = false;
+let ticketsPollInFlight = false;
+let eventPollInFlight = false;
+let artifactPollInFlight = false;
+let resultPollInFlight = false;
+let usageSidebarPollInFlight = false;
+let introspectionPollInFlight = false;
 let lastSeq = 0;
 let autoScroll = true;
 let maxRenderedSeq = 0;
@@ -2120,6 +2127,8 @@ function fmtCachePct(usage) {
 }
 
 async function refreshHealth() {
+  if (healthPollInFlight) return;
+  healthPollInFlight = true;
   try {
     var results = await Promise.all([
       api('/health'),
@@ -2159,7 +2168,9 @@ async function refreshHealth() {
           fmtCost(g.estimated_cost_usd) + '</span></span>';
     }
     el.innerHTML = html;
-  } catch {}
+  } catch {} finally {
+    healthPollInFlight = false;
+  }
 }
 
 setInterval(refreshHealth, 10000);
@@ -2210,6 +2221,8 @@ async function renderList() {
 }
 
 async function loadTickets() {
+  if (ticketsPollInFlight) return;
+  ticketsPollInFlight = true;
   try {
     var params = [];
     if (statusFilter) params.push('status=' + statusFilter);
@@ -2283,6 +2296,8 @@ async function loadTickets() {
   } catch (err) {
     var el = document.getElementById('ticket-table');
     if (el) el.innerHTML = '<p style="color:var(--red)">Error loading tickets: ' + escHtml(err.message) + '</p>';
+  } finally {
+    ticketsPollInFlight = false;
   }
 }
 
@@ -2504,6 +2519,8 @@ async function loadArtifacts(ticketId) {
   var card = document.getElementById('artifacts-card');
   var content = document.getElementById('artifacts-content');
   if (!card || !content) return;
+  if (artifactPollInFlight) return;
+  artifactPollInFlight = true;
   try {
     var data = await api('/tickets/' + ticketId + '/artifacts');
     var artifacts = data.artifacts || [];
@@ -2547,6 +2564,8 @@ async function loadArtifacts(ticketId) {
     if (restored && wasOpen) restored.open = true;
   } catch (e) {
     // No artifacts or API error — hide section
+  } finally {
+    artifactPollInFlight = false;
   }
 }
 
@@ -3069,6 +3088,8 @@ var _lastResultHash = '';
 
 async function refreshResultSection(ticketId) {
   if (!ticketId) return;
+  if (resultPollInFlight) return;
+  resultPollInFlight = true;
   try {
     var ticket = await api('/tickets/' + ticketId);
     // Skip rebuild if ticket data hasn't changed.
@@ -3140,11 +3161,15 @@ async function refreshResultSection(ticketId) {
       _restoreNarrativeScroll(introContent, savedScroll);
       _attachNarrativeOpenClick(introContent);
     }
-  } catch {}
+  } catch {} finally {
+    resultPollInFlight = false;
+  }
 }
 
 async function pollEvents(ticketId) {
   if (pollPaused) return;
+  if (eventPollInFlight) return;
+  eventPollInFlight = true;
   try {
     var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
     var newEvents = data.events || [];
@@ -3197,7 +3222,9 @@ async function pollEvents(ticketId) {
         }
       }
     }
-  } catch {}
+  } catch {} finally {
+    eventPollInFlight = false;
+  }
 }
 
 function updateIntrospectionCard(ticketId) {
@@ -3205,6 +3232,8 @@ function updateIntrospectionCard(ticketId) {
   var card = document.getElementById('introspection-card');
   var content = document.getElementById('introspection-content');
   if (!card || !content) return;
+  if (introspectionPollInFlight) return;
+  introspectionPollInFlight = true;
 
   api('/tickets/' + ticketId).then(function(ticket) {
     var cf = ticket.custom_fields || {};
@@ -3252,7 +3281,9 @@ function updateIntrospectionCard(ticketId) {
     }
     _restoreNarrativeScroll(content, savedScroll);
     _attachNarrativeOpenClick(content);
-  }).catch(function() {});
+  }).catch(function() {}).finally(function() {
+    introspectionPollInFlight = false;
+  });
 }
 
 function renderIntrospectionContent(intro) {
@@ -3456,6 +3487,8 @@ function _attachNarrativeOpenClick(container) {
 }
 
 async function updateUsageSidebar(ticketId) {
+  if (usageSidebarPollInFlight) return;
+  usageSidebarPollInFlight = true;
   try {
     var data = await api('/tickets/' + ticketId + '/usage');
     var el = document.getElementById('llm-usage');
@@ -3526,7 +3559,9 @@ async function updateUsageSidebar(ticketId) {
       agentHtml += '</div>';
       el.innerHTML += agentHtml;
     }
-  } catch {}
+  } catch {} finally {
+    usageSidebarPollInFlight = false;
+  }
 }
 
 function isAuditEvent(evt) {

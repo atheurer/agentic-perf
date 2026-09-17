@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -171,6 +171,8 @@ class EventBus:
         self._last_event_time: dict[str, float] = {}
         self._usage_ledger = usage_ledger
         self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
+        self._legacy_usage_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
+        self._legacy_usage_cache_lock = threading.Lock()
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
@@ -469,6 +471,93 @@ class EventBus:
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
         return [item for item in merged if item["seq"] > since][:limit]
+
+    def get_usage_events(
+        self,
+        ticket_id: str | None = None,
+        *,
+        ticket_ids: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only usage events without reconstructing each ticket history.
+
+        Legacy JSONL is retained as a compatibility source, but its usage
+        records are cached per file because those files are append-only from
+        the perspective of the state store. Canonical trace events are
+        selected in SQLite before Pydantic validation, avoiding a full event
+        projection for every ticket on each usage-summary request.
+        """
+        if ticket_id is not None and ticket_ids is not None:
+            raise ValueError("ticket_id and ticket_ids are mutually exclusive")
+        legacy = self._legacy_usage_events(ticket_id, ticket_ids)
+        traces = [
+            trace_to_legacy(event)
+            for event in self._trace_store.list_events(
+                ticket_id=ticket_id,
+                ticket_ids=ticket_ids,
+                action_type="state",
+                legacy_event_type="llm_usage",
+            )
+        ]
+        return legacy + traces
+
+    def _legacy_usage_events(
+        self,
+        ticket_id: str | None,
+        ticket_ids: Collection[str] | None,
+    ) -> list[dict[str, Any]]:
+        if ticket_id is not None:
+            paths = [self._log_dir / f"{ticket_id}.jsonl"]
+        elif ticket_ids is not None:
+            paths = [self._log_dir / f"{ticket}.jsonl" for ticket in ticket_ids]
+        else:
+            paths = sorted(self._log_dir.glob("*.jsonl"))
+
+        events: list[dict[str, Any]] = []
+        for path in paths:
+            events.extend(self._read_legacy_usage_file(path))
+        return events
+
+    def _read_legacy_usage_file(self, path: Path) -> list[dict[str, Any]]:
+        cache_key = str(path)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            with self._legacy_usage_cache_lock:
+                self._legacy_usage_cache.pop(cache_key, None)
+            return []
+
+        signature = (stat.st_mtime_ns, stat.st_size)
+        with self._legacy_usage_cache_lock:
+            cached = self._legacy_usage_cache.get(cache_key)
+            if cached is not None and cached[:2] == signature:
+                return list(cached[2])
+
+        usage_events: list[dict[str, Any]] = []
+        try:
+            line_num = 0
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    line_num += 1
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("event_type") == "llm_usage":
+                        usage_events.append(legacy_record(event, line_num))
+        except OSError:
+            logger.exception("Failed to read legacy usage events from %s", path)
+            return []
+
+        with self._legacy_usage_cache_lock:
+            self._legacy_usage_cache[cache_key] = (
+                signature[0],
+                signature[1],
+                usage_events,
+            )
+        return list(usage_events)
 
     def get_terminal_events(
         self,

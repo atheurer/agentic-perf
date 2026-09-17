@@ -205,6 +205,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/events.py", "__init__", "filesystem"),
     ("providers/events.py", "_ensure_loaded_locked", "filesystem"),
     ("providers/events.py", "_read_from_file", "filesystem"),
+    ("providers/events.py", "_read_legacy_usage_file", "filesystem"),
     ("providers/execution/filesystem.py", "create_archive", "filesystem"),
     ("providers/execution/filesystem.py", "mkdir", "filesystem"),
     ("providers/execution/filesystem.py", "open_stream", "filesystem"),
@@ -1633,6 +1634,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/events.py:_read_from_file",
+        "2027-12-31",
+    ),
+    ("providers/events.py", "_read_legacy_usage_file", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/events.py:_read_legacy_usage_file",
         "2027-12-31",
     ),
     ("providers/execution/filesystem.py", "create_archive", "filesystem"): (

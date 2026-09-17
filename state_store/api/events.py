@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import defaultdict
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from providers.cost import estimate_cost
+from providers.usage import summarize_usage_events
 
+from ..models import TicketStatus
 from ..store import TicketNotFound
 
 logger = logging.getLogger(__name__)
@@ -199,122 +203,124 @@ def _compute_ticket_usage(
     ticket_id: str,
 ) -> dict:
     """Compute lightweight usage summary for a single ticket."""
-    events = event_bus.get_events(ticket_id, since=0, limit=10000)
+    events = event_bus.get_usage_events(ticket_id)
 
-    total_in = 0
-    total_out = 0
-    total_cache_read = 0
-    total_cache_create = 0
-    total_cost = 0.0
-    llm_calls = 0
-    models_seen: set[str] = set()
+    return _summarize_usage_events(events)
 
-    for evt in events:
-        if evt.get("event_type") != "llm_usage":
-            continue
-        data = evt.get("data", {})
-        in_tok = data.get("input_tokens", 0) or 0
-        out_tok = data.get("output_tokens", 0) or 0
-        if not in_tok and not out_tok:
-            continue
-        cr = data.get("cache_read_input_tokens", 0) or 0
-        cc = data.get("cache_creation_input_tokens", 0) or 0
-        model = data.get("model", "")
-        total_in += in_tok
-        total_out += out_tok
-        total_cache_read += cr
-        total_cache_create += cc
-        llm_calls += 1
-        if model:
-            models_seen.add(model)
-        total_cost += estimate_cost(
-            model,
-            in_tok,
-            out_tok,
-            cache_read_input_tokens=cr,
-            cache_creation_input_tokens=cc,
-        )
 
-    usage = {
-        "input_tokens": total_in,
-        "output_tokens": total_out,
-        "cache_read_input_tokens": total_cache_read,
-        "cache_creation_input_tokens": total_cache_create,
-        "total_tokens": total_in + total_out + total_cache_read + total_cache_create,
-        "llm_calls": llm_calls,
-        "models_used": sorted(models_seen),
-    }
-    return {
-        **usage,
-        "estimated_cost_usd": round(total_cost, 6),
-    }
+def _summarize_usage_events(events: list[dict]) -> dict:
+    """Aggregate already-filtered usage events for one ticket."""
+    return summarize_usage_events(events)
 
 
 _summary_cache: dict = {}
 _summary_cache_ts: float = 0.0
+_closed_ticket_usage_cache: dict[str, dict] = {}
 _SUMMARY_TTL: float = 5.0
+_summary_compute_lock = threading.Lock()
 
 
 def invalidate_summary_cache() -> None:
     """Reset the usage-summary cache (called by tests)."""
-    global _summary_cache, _summary_cache_ts
-    _summary_cache = {}
-    _summary_cache_ts = 0.0
+    global _closed_ticket_usage_cache, _summary_cache, _summary_cache_ts
+    with _summary_compute_lock:
+        _summary_cache = {}
+        _summary_cache_ts = 0.0
+        _closed_ticket_usage_cache = {}
+
+
+def invalidate_closed_ticket_usage_cache(ticket_id: str) -> None:
+    """Forget a derived fallback after late usage is persisted."""
+    global _closed_ticket_usage_cache, _summary_cache, _summary_cache_ts
+    with _summary_compute_lock:
+        _closed_ticket_usage_cache.pop(ticket_id, None)
+        _summary_cache = {}
+        _summary_cache_ts = 0.0
 
 
 @usage_router.get("/summary")
 def get_usage_summary(request: Request):
     """Get usage summary across all tickets.
 
-    Results are cached for 5 s to avoid repeated full JSONL
-    scans — the dashboard polls this every 5 s AND 10 s.
+    Active tickets are read from the filtered usage-event stream. Closed
+    tickets use a snapshot persisted when they close. Historical tickets
+    without one are cached in memory, so this GET endpoint stays read-only.
     """
-    global _summary_cache, _summary_cache_ts
+    global _closed_ticket_usage_cache, _summary_cache, _summary_cache_ts
 
-    now = time.monotonic()
-    if _summary_cache and (now - _summary_cache_ts) < _SUMMARY_TTL:
-        return _summary_cache
+    with _summary_compute_lock:
+        now = time.monotonic()
+        if _summary_cache and (now - _summary_cache_ts) < _SUMMARY_TTL:
+            return _summary_cache
 
-    event_bus = getattr(request.app.state, "event_bus", None)
-    store = request.app.state.store
-    tickets = store.list_tickets()
+        event_bus = getattr(request.app.state, "event_bus", None)
+        store = request.app.state.store
+        tickets = store.list_tickets()
 
-    empty_global = {
-        "total_tokens": 0,
-        "llm_calls": 0,
-        "estimated_cost_usd": 0.0,
-    }
+        empty_global = {
+            "total_tokens": 0,
+            "llm_calls": 0,
+            "estimated_cost_usd": 0.0,
+        }
 
-    if event_bus is None:
-        result = {"global": empty_global, "by_ticket": {}}
+        if event_bus is None:
+            result = {"global": empty_global, "by_ticket": {}}
+            _summary_cache = result
+            _summary_cache_ts = now
+            return result
+
+        usage_by_ticket: dict[str, list[dict]] = defaultdict(list)
+        uncached_closed: set[str] = set()
+        active_ticket_ids: set[str] = set()
+        cached_by_ticket: dict[str, dict] = {}
+        for ticket in tickets:
+            if ticket.status == TicketStatus.CLOSED:
+                cached = store.get_cached_usage_summary(ticket.id)
+                if cached is None:
+                    cached = _closed_ticket_usage_cache.get(ticket.id)
+                if cached is not None:
+                    cached_by_ticket[ticket.id] = cached
+                else:
+                    uncached_closed.add(ticket.id)
+            else:
+                active_ticket_ids.add(ticket.id)
+
+        live_ticket_ids = active_ticket_ids | uncached_closed
+        for event in (
+            event_bus.get_usage_events(ticket_ids=live_ticket_ids)
+            if live_ticket_ids
+            else []
+        ):
+            usage_by_ticket[event.get("ticket_id", "")].append(event)
+
+        by_ticket = {}
+        g_tokens = 0
+        g_calls = 0
+        g_cost = 0.0
+
+        for ticket in tickets:
+            tu = cached_by_ticket.get(ticket.id)
+            if tu is None:
+                tu = _summarize_usage_events(usage_by_ticket.get(ticket.id, []))
+                if ticket.id in uncached_closed:
+                    _closed_ticket_usage_cache[ticket.id] = tu
+            if tu["llm_calls"] > 0:
+                by_ticket[ticket.id] = tu
+                g_tokens += tu["total_tokens"]
+                g_calls += tu["llm_calls"]
+                g_cost += tu["estimated_cost_usd"]
+
+        result = {
+            "global": {
+                "total_tokens": g_tokens,
+                "llm_calls": g_calls,
+                "estimated_cost_usd": round(g_cost, 6),
+            },
+            "by_ticket": by_ticket,
+        }
         _summary_cache = result
         _summary_cache_ts = now
         return result
-
-    by_ticket = {}
-    g_tokens = 0
-    g_calls = 0
-    g_cost = 0.0
-
-    for ticket in tickets:
-        tu = _compute_ticket_usage(event_bus, ticket.id)
-        if tu["llm_calls"] > 0:
-            by_ticket[ticket.id] = tu
-            g_tokens += tu["total_tokens"]
-            g_calls += tu["llm_calls"]
-            g_cost += tu["estimated_cost_usd"]
-
-    result = {
-        "global": {
-            "total_tokens": g_tokens,
-            "llm_calls": g_calls,
-            "estimated_cost_usd": round(g_cost, 6),
-        },
-        "by_ticket": by_ticket,
-    }
-    _summary_cache = result
-    _summary_cache_ts = now
-    return result
 
 
 @usage_router.get("/by-user")

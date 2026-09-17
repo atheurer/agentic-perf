@@ -27,6 +27,7 @@ from providers.tracing import (
     child_context,
     current_trace_context,
 )
+from providers.usage import summarize_usage_events
 
 from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
@@ -438,6 +439,42 @@ class TicketStore:
                 tickets = [t for t in tickets if t.status == status]
             return [t.model_copy() for t in tickets]
 
+    def get_cached_usage_summary(self, ticket_id: str) -> dict | None:
+        """Return the persisted usage snapshot for a closed ticket, if present."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            cached = ticket.custom_fields.get("_usage_summary")
+            return dict(cached) if isinstance(cached, dict) else None
+
+    def invalidate_cached_usage_summary(self, ticket_id: str) -> None:
+        """Drop a closed-ticket snapshot when late usage arrives."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None or "_usage_summary" not in ticket.custom_fields:
+                return
+            ticket.custom_fields.pop("_usage_summary", None)
+            self._persist_ticket(ticket)
+
+    def _snapshot_closed_ticket_usage(self, ticket: Ticket) -> None:
+        """Add a derived usage snapshot to the terminal ticket write.
+
+        This runs only as part of a real close mutation. Dashboard reads must
+        never create ticket writes or filesystem trace records.
+        """
+        if self._event_bus is None:
+            return
+        get_usage_events = getattr(self._event_bus, "get_usage_events", None)
+        if not callable(get_usage_events):
+            return
+        try:
+            ticket.custom_fields["_usage_summary"] = summarize_usage_events(
+                get_usage_events(ticket.id)
+            )
+        except Exception:
+            logger.exception("Failed to snapshot usage for closed ticket %s", ticket.id)
+
     def transition_ticket(
         self,
         ticket_id: str,
@@ -572,6 +609,8 @@ class TicketStore:
             ticket.updated_at = datetime.now(timezone.utc)
             self._global_seq += 1
             ticket.transition_seq = self._global_seq
+            if new_status == TicketStatus.CLOSED:
+                self._snapshot_closed_ticket_usage(ticket)
 
             if request.comment:
                 ticket.comments.append(
@@ -1790,6 +1829,7 @@ class TicketStore:
             ticket.updated_at = datetime.now(timezone.utc)
             self._global_seq += 1
             ticket.transition_seq = self._global_seq
+            self._snapshot_closed_ticket_usage(ticket)
             ticket.custom_fields.pop("claim", None)
             ticket.custom_fields.pop("stop_requested", None)
 
