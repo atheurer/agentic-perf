@@ -1574,7 +1574,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
         await leader_lease.acquire()
         if leader_lease.epoch is None:
             raise RuntimeError("state store returned no leader fencing epoch")
-        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
+            leader_lease.session_id
+        )
         os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
         lease_loss_gate = _LeaseLossGate()
         lease_renew_task = asyncio.create_task(
@@ -1932,7 +1934,11 @@ async def _poll_loop_after_lease(
                     # Skip over-quota tickets without blocking or
                     # transitioning — they auto-resume when the
                     # rolling window advances.
-                    if multi_user and usage_ledger is not None and user_store is not None:
+                    if (
+                        multi_user
+                        and usage_ledger is not None
+                        and user_store is not None
+                    ):
                         quota_status = _check_dispatch_quota(
                             ticket,
                             user_store,
@@ -1943,7 +1949,9 @@ async def _poll_loop_after_lease(
                             if quota_status.warn_only:
                                 if not dispatcher.is_quota_warned(tid):
                                     reason_text = "; ".join(quota_status.reasons)
-                                    logger.info(f"Quota warning for {tid}: {reason_text}")
+                                    logger.info(
+                                        f"Quota warning for {tid}: {reason_text}"
+                                    )
                                     await _add_comment(
                                         config.state_store_url,
                                         tid,
@@ -2061,6 +2069,8 @@ async def _poll_loop_after_lease(
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)
         events.close()
+
+
 _lock_fd: int | None = None
 _lock_file_identity: tuple[int, int] | None = None
 

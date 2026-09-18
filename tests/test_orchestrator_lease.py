@@ -103,7 +103,9 @@ async def test_poll_loop_releases_lease_when_initialization_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):
     lease = _PollLoopLease()
-    monkeypatch.setattr("orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease)
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease
+    )
 
     async def fail_initialization(*_args, **_kwargs):
         raise RuntimeError("initialization failed")
@@ -121,7 +123,9 @@ async def test_poll_loop_cancellation_releases_lease(
     monkeypatch: pytest.MonkeyPatch,
 ):
     lease = _PollLoopLease()
-    monkeypatch.setattr("orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease)
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease
+    )
     started = asyncio.Event()
 
     async def run_until_cancelled(*_args, **_kwargs):
