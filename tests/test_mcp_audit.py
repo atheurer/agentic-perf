@@ -19,9 +19,9 @@ from fastmcp.tools.base import ToolResult
 from mcp import McpError
 from mcp.types import CallToolRequestParams, RequestParams
 
+import agents.jumpstarter_mcp as jumpstarter_mcp
 import agents.mcp_audit as mcp_audit
 import agents.mcp_client as mcp_client_module
-import agents.jumpstarter_mcp as jumpstarter_mcp
 from agents.jumpstarter_mcp import _JmpCallHook
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
 from agents.mcp_client import (
@@ -743,9 +743,7 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
 @pytest.mark.asyncio
 async def test_jumpstarter_immediate_dispatch_cancellation_gets_fallback_boundary():
     async def cancel_before_dispatch(*args, **kwargs):
-        raise asyncio.CancelledError(
-            mcp_client_module._MCP_PROVIDER_CANCELLATION
-        )
+        raise asyncio.CancelledError(mcp_client_module._MCP_PROVIDER_CANCELLATION)
 
     client = AgentMCPClient()
     client._tool_routing["jmp_connect"] = "jumpstarter"
@@ -848,8 +846,7 @@ async def test_jumpstarter_connect_timeout_has_one_timed_out_boundary(monkeypatc
     ]
     assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
     assert (
-        client.audit_events[-1].lifecycle.retry_kind
-        == RetryKind.AMBIGUOUS_AFTER_SEND
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
     )
 
 
@@ -906,8 +903,7 @@ async def test_client_preserves_provider_hook_transport_failure_classification()
     ]
     assert client.audit_events[0].outcome == OperationOutcome.FAILURE
     assert (
-        client.audit_events[0].lifecycle.retry_kind
-        == RetryKind.TRANSPORT_BEFORE_SEND
+        client.audit_events[0].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
     )
 
 
@@ -925,8 +921,7 @@ async def test_client_audits_missing_connection_as_transport_failure():
     ]
     assert client.audit_events[0].outcome == OperationOutcome.FAILURE
     assert (
-        client.audit_events[0].lifecycle.retry_kind
-        == RetryKind.TRANSPORT_BEFORE_SEND
+        client.audit_events[0].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
     )
 
 
@@ -1288,9 +1283,7 @@ async def test_client_redacts_hook_validation_errors_in_result_and_audit():
         session_id="session-1",
         ticket_id="hook-error",
     )
-    client.pre_call_hook = AsyncMock(
-        side_effect=MCPToolCallError(secret, "validation")
-    )
+    client.pre_call_hook = AsyncMock(side_effect=MCPToolCallError(secret, "validation"))
 
     with pytest.raises(MCPToolCallError) as exc_info:
         await client.call_tool("tool", {}, TraceContext(ticket_id="hook-error"))
@@ -1379,8 +1372,7 @@ async def test_client_records_exception_failure_boundary():
         LifecycleState.FAILED,
     ]
     assert (
-        client.audit_events[-1].lifecycle.retry_kind
-        == RetryKind.AMBIGUOUS_AFTER_SEND
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
     )
 
 
