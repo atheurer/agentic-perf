@@ -234,7 +234,7 @@ class TestAgentTimeoutHandling:
             async def _handle_completion(self, ticket_id, response):
                 pass
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         agent = TestAgent(
             agent_name="test-agent",
             llm_provider=TimeoutTestLLMProvider(),
@@ -390,7 +390,7 @@ class TestAgentTimeoutHandling:
             async def _handle_completion(self, ticket_id, response):
                 pass
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         agent = TestAgent(
             agent_name="test-agent",
             llm_provider=TransientTimeoutProvider(),
@@ -428,11 +428,11 @@ class TestEventBusLastEventTime:
     """Test EventBus.last_event_time tracking."""
 
     def test_no_events_returns_none(self, tmp_path):
-        bus = EventBus(log_dir=str(tmp_path))
+        bus = EventBus(log_dir=str(tmp_path / "logs"))
         assert bus.last_event_time("NONEXISTENT") is None
 
     def test_tracks_last_event(self, tmp_path):
-        bus = EventBus(log_dir=str(tmp_path))
+        bus = EventBus(log_dir=str(tmp_path / "logs"))
         before = time.time()
         bus.emit("TRACK-001", "test-agent", "test_event", {"key": "val"})
         after = time.time()
@@ -442,7 +442,7 @@ class TestEventBusLastEventTime:
         assert before <= last <= after
 
     def test_updates_on_new_events(self, tmp_path):
-        bus = EventBus(log_dir=str(tmp_path))
+        bus = EventBus(log_dir=str(tmp_path / "logs"))
         bus.emit("TRACK-002", "agent", "event1")
         t1 = bus.last_event_time("TRACK-002")
 
@@ -460,7 +460,7 @@ class TestStaleTaskWatchdog:
     async def test_cancels_stale_task(self, tmp_path):
         from orchestrator.main import _check_stale_tasks
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         dispatcher = MagicMock()
 
         # Simulate a task that's been idle for a long time
@@ -488,7 +488,7 @@ class TestStaleTaskWatchdog:
     async def test_does_not_cancel_active_task(self, tmp_path):
         from orchestrator.main import _check_stale_tasks
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         dispatcher = MagicMock()
 
         active_task = MagicMock()
@@ -514,7 +514,7 @@ class TestStaleTaskWatchdog:
         """Done tasks are filtered by active_tasks(), not seen."""
         from orchestrator.main import _check_stale_tasks
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         dispatcher = MagicMock()
         # active_tasks() returns empty — done tasks are pruned
         dispatcher.active_tasks.return_value = {}
@@ -534,7 +534,7 @@ class TestStaleTaskWatchdog:
     async def test_ignores_unknown_tickets(self, tmp_path):
         from orchestrator.main import _check_stale_tasks
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         dispatcher = MagicMock()
 
         task = MagicMock()
@@ -660,7 +660,7 @@ class TestRunAgentTaskTimeout:
         """Agent task that exceeds timeout should emit error event."""
         from orchestrator.main import run_agent_task
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
 
         # Create a slow agent using a real coroutine
         async def slow_run(tid):
@@ -699,7 +699,7 @@ class TestRunAgentTaskTimeout:
         """The timeout audit event is recorded before the state-store operation."""
         from orchestrator.main import run_agent_task
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
 
         async def slow_run(tid):
             await asyncio.sleep(10)
@@ -807,7 +807,7 @@ class TestAgentRateLimitHandling:
             async def _handle_completion(self, ticket_id, response):
                 pass
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         agent = TestAgent(
             agent_name="test-agent",
             llm_provider=RateLimitTestLLMProvider(),
@@ -882,7 +882,7 @@ class TestAgentRateLimitHandling:
             async def _handle_completion(self, ticket_id, response):
                 pass
 
-        events = EventBus(log_dir=str(tmp_path))
+        events = EventBus(log_dir=str(tmp_path / "logs"))
         agent = TestAgent(
             agent_name="test-agent",
             llm_provider=TransientRateLimitProvider(),

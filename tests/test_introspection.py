@@ -1098,7 +1098,7 @@ class TestLLMIntegration:
     async def test_usage_recording(self, tmp_path) -> None:
         from providers.events import EventBus
 
-        bus = EventBus(log_dir=tmp_path)
+        bus = EventBus(log_dir=tmp_path / "logs")
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
             event_bus=bus,
@@ -1122,7 +1122,7 @@ class TestLLMIntegration:
         """_record_usage handles usage as an object with attributes."""
         from providers.events import EventBus
 
-        bus = EventBus(log_dir=tmp_path)
+        bus = EventBus(log_dir=tmp_path / "logs")
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
             event_bus=bus,

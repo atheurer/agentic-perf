@@ -119,7 +119,7 @@ class TestOperationalMetrics:
         from providers.llm.mock import MockLLMProvider
 
         tmp = Path(tempfile.mkdtemp(prefix="test-synth-"))
-        event_bus = EventBus(log_dir=tmp)
+        event_bus = EventBus(log_dir=tmp / "logs")
 
         # Emit transition events for provision cycle counting
         event_bus.emit(
@@ -165,7 +165,7 @@ class TestOperationalMetrics:
         from providers.llm.mock import MockLLMProvider
 
         tmp = tempfile.mkdtemp()
-        event_bus = EventBus(log_dir=tmp)
+        event_bus = EventBus(log_dir=Path(tmp) / "logs")
         event_bus.record_llm_usage("PERF-TEST", 5000, 2000, 3000, "claude-sonnet-4-6")
 
         agent = SynthesisAgent(

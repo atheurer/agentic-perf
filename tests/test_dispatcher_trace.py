@@ -137,6 +137,37 @@ async def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> Non
     assert sink.events[-1].attributes["prior_invocation_id"] == str(first.invocation_id)
 
 
+async def test_shutdown_cancels_and_awaits_all_dispatcher_background_work() -> None:
+    dispatcher, _ = _dispatcher()
+    stopped = []
+
+    async def blocked() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.append(True)
+
+    task = asyncio.create_task(blocked())
+    await asyncio.sleep(0)
+    dispatcher._tasks["PERF-1"] = task
+    dispatcher._renewal_tasks["PERF-1"] = task
+    dispatcher._introspection_tasks["PERF-1"] = task
+    introspection_agent = MagicMock()
+    dispatcher._introspection_agents["PERF-1"] = introspection_agent
+    dispatcher._claim_ids["PERF-1"] = "claim-1"
+    dispatcher.release_claim = AsyncMock()
+
+    await dispatcher.shutdown()
+
+    assert task.done()
+    assert stopped == [True]
+    introspection_agent.request_stop.assert_called_once()
+    dispatcher.release_claim.assert_awaited_once_with("PERF-1")
+    assert not dispatcher._tasks
+    assert not dispatcher._renewal_tasks
+    assert not dispatcher._introspection_tasks
+
+
 def test_constructed_agent_is_a_distinct_child_of_dispatch() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()

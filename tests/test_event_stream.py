@@ -28,7 +28,11 @@ def store(tmp_path):
 
 @pytest.fixture
 def event_bus(tmp_path):
-    return EventBus(log_dir=tmp_path / "events")
+    bus = EventBus(log_dir=tmp_path / "events")
+    try:
+        yield bus
+    finally:
+        bus.close()
 
 
 @pytest.fixture
@@ -36,7 +40,10 @@ def app(store, event_bus):
     application = create_app(initialize_immediately=True)
     application.state.store = store
     application.state.event_bus = event_bus
-    return application
+    try:
+        yield application
+    finally:
+        application.router.on_shutdown[0]()
 
 
 @pytest.fixture
@@ -251,7 +258,10 @@ class TestTranscriptEndpoint:
 
         c = TestClient(app)
         c.headers["Authorization"] = f"Bearer {app.state.api_token}"
-        return c
+        try:
+            yield c
+        finally:
+            c.close()
 
     def test_transcript_returns_ticket_and_events(
         self,
@@ -304,24 +314,24 @@ class TestTranscriptEndpoint:
         ticket = store.create_ticket(
             CreateTicketRequest(summary="no-bus", description="no-bus"),
         )
-        c = TestClient(application)
-        c.headers["Authorization"] = f"Bearer {application.state.api_token}"
-        r = c.get(f"/api/v1/tickets/{ticket.id}/transcript")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["events"] == []
-        assert data["ticket"]["summary"] == "no-bus"
-        assert data["ticket"]["status"] == "new"
+        with TestClient(application) as c:
+            c.headers["Authorization"] = f"Bearer {application.state.api_token}"
+            r = c.get(f"/api/v1/tickets/{ticket.id}/transcript")
+            assert r.status_code == 200
+            data = r.json()
+            assert data["events"] == []
+            assert data["ticket"]["summary"] == "no-bus"
+            assert data["ticket"]["status"] == "new"
 
     def test_transcript_no_event_bus_nonexistent_returns_404(self, store):
         from fastapi.testclient import TestClient
 
         application = create_app(initialize_immediately=True)
         application.state.store = store
-        c = TestClient(application)
-        c.headers["Authorization"] = f"Bearer {application.state.api_token}"
-        r = c.get("/api/v1/tickets/PERF-NOTREAL/transcript")
-        assert r.status_code == 404
+        with TestClient(application) as c:
+            c.headers["Authorization"] = f"Bearer {application.state.api_token}"
+            r = c.get("/api/v1/tickets/PERF-NOTREAL/transcript")
+            assert r.status_code == 404
 
     def test_transcript_existing_ticket_zero_events(
         self,

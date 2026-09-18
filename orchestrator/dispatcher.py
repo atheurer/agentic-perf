@@ -297,6 +297,56 @@ class Dispatcher:
                 task.cancel()
         self._renewal_tasks.clear()
 
+    async def shutdown(self) -> None:
+        """Cancel and await dispatcher work before its EventBus is closed."""
+        self._deposed = True
+
+        for agent in list(self._introspection_agents.values()):
+            try:
+                agent.request_stop()
+            except Exception:
+                logger.exception("Failed to request introspection shutdown")
+
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in (
+                list(self._tasks.values())
+                + list(self._renewal_tasks.values())
+                + list(self._introspection_tasks.values())
+            )
+            if task is not current and not task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("Dispatcher task failed during shutdown: %s", result)
+
+        for ticket_id in list(self._claim_ids):
+            await self.release_claim(ticket_id)
+
+        self._tasks.clear()
+        self._renewal_tasks.clear()
+        self._introspection_tasks.clear()
+        self._agents.clear()
+        self._introspection_agents.clear()
+        self._claim_ids.clear()
+        self._trace_contexts.clear()
+        self._previous_invocations.clear()
+        self._quota_blocked.clear()
+        self._quota_warned.clear()
+
+        client = self._trace.client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.exception("Failed to close dispatcher trace client")
+            self._trace.client = None
+
     def is_deposed(self) -> bool:
         return self._deposed
 

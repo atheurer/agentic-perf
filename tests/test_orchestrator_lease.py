@@ -10,8 +10,9 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.leader_lease import LeaderLeaseClient
-from orchestrator.main import _handle_shutdown_signal, _renew_leader_lease
+from orchestrator.main import _handle_shutdown_signal, _renew_leader_lease, poll_loop
 from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
@@ -74,6 +75,71 @@ async def test_cancelled_lease_renewal_releases_leader_lease():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert lease.released
+
+
+class _PollLoopLease:
+    def __init__(self, *_args, **_kwargs):
+        self.epoch = None
+        self.session_id = uuid4()
+        self.release_count = 0
+
+    async def acquire(self):
+        self.epoch = 7
+        return {"epoch": self.epoch}
+
+    async def release(self):
+        self.release_count += 1
+
+
+def _poll_config() -> OrchestratorConfig:
+    return OrchestratorConfig(
+        state_store_url="http://state-store",
+        raw_config={"llm": {"provider": "mock"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_releases_lease_when_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    lease = _PollLoopLease()
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease
+    )
+
+    async def fail_initialization(*_args, **_kwargs):
+        raise RuntimeError("initialization failed")
+
+    monkeypatch.setattr("orchestrator.main._poll_loop_after_lease", fail_initialization)
+
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        await poll_loop(_poll_config())
+
+    assert lease.release_count == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_cancellation_releases_lease(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    lease = _PollLoopLease()
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *a, **k: lease
+    )
+    started = asyncio.Event()
+
+    async def run_until_cancelled(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("orchestrator.main._poll_loop_after_lease", run_until_cancelled)
+    task = asyncio.create_task(poll_loop(_poll_config()))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lease.release_count == 1
 
 
 def _request(session_id=None, *, instance_name="shared"):

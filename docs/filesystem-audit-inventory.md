@@ -40,6 +40,12 @@ The manifest entries fall into these reviewed classes:
 * `orchestrator/main.py` and `state_store/process_lock.py` lock mutations,
   including write-creating `os.open` calls, and remaining agent scratch-directory
   constructors are process coordination/bootstrap operations without a ticket.
+  The orchestrator's poll-loop lifecycle cleanup is intentionally structured
+  around initialization and shutdown, so this code's reviewed mutation line
+  numbers may move when resource-teardown logic changes. The current reviewed
+  lock mutations are at lines 2080, 2081, 2096, 2097, and 2117; the fixed
+  manifest in `tests/test_filesystem_inventory.py` must follow such moves
+  without changing the reviewed mutation set.
 
 Operator diagnostics may retain physical paths only in local process logs.  Trace
 events, spool frames, payload blobs, exports, and state-store rows contain only

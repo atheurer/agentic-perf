@@ -1435,9 +1435,14 @@ async def _add_comment(
 
 
 async def _renew_leader_lease(
-    lease: Any, interval: float, on_lost: Any | None = None
+    lease: Any,
+    interval: float,
+    on_lost: Any | None = None,
+    started: asyncio.Event | None = None,
 ) -> None:
     """Keep the control-plane lease fenced while the poll loop is active."""
+    if started is not None:
+        started.set()
     try:
         while True:
             await asyncio.sleep(interval)
@@ -1450,6 +1455,20 @@ async def _renew_leader_lease(
                 raise RuntimeError("orchestrator leader lease lost") from exc
     finally:
         await lease.release()
+
+
+async def _cancel_and_await(task: asyncio.Task | None) -> None:
+    """Stop a background task and observe its result during shutdown."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Background task failed during shutdown")
 
 
 class _LeaseLossGate:
@@ -1549,20 +1568,48 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     # Bind a durable control trace before using the audited HTTP client; ticket
     # traces are created later by the dispatcher for individual work items.
     bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
-    await leader_lease.acquire()
-    if leader_lease.epoch is None:
-        raise RuntimeError("state store returned no leader fencing epoch")
-    os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
-    os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
-    lease_loss_gate = _LeaseLossGate()
-    lease_renew_task: asyncio.Task | None = asyncio.create_task(
-        _renew_leader_lease(
-            leader_lease,
-            config.leader_lease_renew_interval,
-            lease_loss_gate.mark_deposed,
+    lease_renew_task: asyncio.Task | None = None
+    lease_renewal_started = asyncio.Event()
+    try:
+        await leader_lease.acquire()
+        if leader_lease.epoch is None:
+            raise RuntimeError("state store returned no leader fencing epoch")
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
+            leader_lease.session_id
         )
-    )
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        lease_loss_gate = _LeaseLossGate()
+        lease_renew_task = asyncio.create_task(
+            _renew_leader_lease(
+                leader_lease,
+                config.leader_lease_renew_interval,
+                lease_loss_gate.mark_deposed,
+                lease_renewal_started,
+            )
+        )
+        await _poll_loop_after_lease(
+            config,
+            leader_lease,
+            lease_renew_task,
+            lease_loss_gate,
+        )
+    finally:
+        if lease_renew_task is None:
+            await leader_lease.release()
+        else:
+            await _cancel_and_await(lease_renew_task)
+            if not lease_renewal_started.is_set():
+                await leader_lease.release()
 
+
+async def _poll_loop_after_lease(
+    config: OrchestratorConfig,
+    leader_lease: Any,
+    lease_renew_task: asyncio.Task,
+    lease_loss_gate: _LeaseLossGate,
+) -> None:
+    dispatcher: Dispatcher | None = None
+    trace_sweep_task: asyncio.Task | None = None
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
@@ -1643,372 +1690,385 @@ async def poll_loop(config: OrchestratorConfig) -> None:
 
     events = EventBus(redactor=redactor, usage_ledger=usage_ledger)
 
-    # Initialize OpenTelemetry LLM instrumentation.
-    # Spans from the Anthropic/OpenAI SDKs are captured
-    # and fed into the EventBus for per-ticket token
-    # accumulation.
     try:
-        from providers.telemetry import setup_telemetry
+        # Initialize OpenTelemetry LLM instrumentation.
+        # Spans from the Anthropic/OpenAI SDKs are captured
+        # and fed into the EventBus for per-ticket token
+        # accumulation.
+        try:
+            from providers.telemetry import setup_telemetry
 
-        telemetry_config = config.raw.get("telemetry", {})
-        setup_telemetry(
-            event_bus=events,
-            otlp_endpoint=telemetry_config.get("otlp_endpoint"),
-            enabled=telemetry_config.get("enabled", True),
+            telemetry_config = config.raw.get("telemetry", {})
+            setup_telemetry(
+                event_bus=events,
+                otlp_endpoint=telemetry_config.get("otlp_endpoint"),
+                enabled=telemetry_config.get("enabled", True),
+            )
+        except ImportError:
+            logger.info("OpenTelemetry not installed — LLM token tracking disabled")
+
+        multi_user = config.raw.get("auth", {}).get("multi_user", False)
+        user_store = None
+        secrets_root = None
+        if multi_user:
+            from state_store.identity import UserStore
+
+            user_store = UserStore()
+            from paths import SECRETS_DIR
+
+            secrets_root = SECRETS_DIR
+
+        dispatcher = Dispatcher(
+            config.state_store_url,
+            llm,
+            skills,
+            secrets,
+            events,
+            repo_cache=repo_cache,
+            llm_factory=llm_factory,
+            iterations_factory=config.get_agent_max_iterations,
+            instance_name=config.instance_name,
+            user_store=user_store,
+            secrets_root=secrets_root,
+            vault_config=vault_config,
+            redactor=redactor,
+            introspection_llm=config.introspection_llm,
+            session_id=str(leader_lease.session_id),
+            fencing_epoch=leader_lease.epoch,
         )
-    except ImportError:
-        logger.info("OpenTelemetry not installed — LLM token tracking disabled")
+        lease_loss_gate.bind(dispatcher)
 
-    multi_user = config.raw.get("auth", {}).get("multi_user", False)
-    user_store = None
-    secrets_root = None
-    if multi_user:
-        from state_store.identity import UserStore
-
-        user_store = UserStore()
-        from paths import SECRETS_DIR
-
-        secrets_root = SECRETS_DIR
-
-    dispatcher = Dispatcher(
-        config.state_store_url,
-        llm,
-        skills,
-        secrets,
-        events,
-        repo_cache=repo_cache,
-        llm_factory=llm_factory,
-        iterations_factory=config.get_agent_max_iterations,
-        instance_name=config.instance_name,
-        user_store=user_store,
-        secrets_root=secrets_root,
-        vault_config=vault_config,
-        redactor=redactor,
-        introspection_llm=config.introspection_llm,
-        session_id=str(leader_lease.session_id),
-        fencing_epoch=leader_lease.epoch,
-    )
-    lease_loss_gate.bind(dispatcher)
-
-    logger.info(
-        f"Orchestrator started (store={config.state_store_url}, "
-        f"poll={config.poll_interval}s, llm={config.llm_provider}, "
-        f"max_agents={config.max_concurrent_agents})"
-    )
-
-    # System-wide budget check (per orchestrator session)
-    system_budget = None
-    if config.budget_session_cost_usd > 0:
-        from providers.budget import SystemBudget
-
-        system_budget = SystemBudget(
-            session_cost_usd=config.budget_session_cost_usd,
+        logger.info(
+            f"Orchestrator started (store={config.state_store_url}, "
+            f"poll={config.poll_interval}s, llm={config.llm_provider}, "
+            f"max_agents={config.max_concurrent_agents})"
         )
-        logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
 
-    status_names = list(STATUS_AGENT_MAP)
-    status_offset = 0
-    was_at_capacity = False
-    last_trace_sweep = 0.0
-    trace_sweep_task: asyncio.Task | None = None
-    repos_refreshed = False
+        # System-wide budget check (per orchestrator session)
+        system_budget = None
+        if config.budget_session_cost_usd > 0:
+            from providers.budget import SystemBudget
 
-    while True:
-        if lease_renew_task is not None and lease_renew_task.done():
-            lease_renew_task.result()
-        if time.monotonic() - last_trace_sweep >= 60.0 and (
-            trace_sweep_task is None or trace_sweep_task.done()
-        ):
-            if trace_sweep_task is not None:
-                try:
-                    trace_sweep_task.result()
-                except Exception:
-                    logger.exception("Trace spool sweep failed")
-            # Network delivery may wait through an outage; never block ticket
-            # dispatch on orphan recovery.
-            trace_sweep_task = asyncio.create_task(
-                asyncio.to_thread(_sweep_trace_spools)
+            system_budget = SystemBudget(
+                session_cost_usd=config.budget_session_cost_usd,
             )
-            last_trace_sweep = time.monotonic()
-        # Check system-wide budget before dispatching
-        if system_budget is not None and events is not None:
-            from providers.budget import (
-                BudgetAction,
-                check_system_budget,
-            )
-            from providers.cost import estimate_cumulative_cost
+            logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
 
-            global_usage = events.get_global_usage()
-            global_cost = estimate_cumulative_cost(global_usage)
-            sys_status = check_system_budget(
-                system_budget,
-                global_usage,
-                global_cost,
-            )
-            if sys_status.action == BudgetAction.PAUSE:
-                logger.warning(
-                    f"System budget exceeded: {sys_status.reason}"
-                    f" — skipping dispatch cycle"
+        status_names = list(STATUS_AGENT_MAP)
+        status_offset = 0
+        was_at_capacity = False
+        last_trace_sweep = 0.0
+        trace_sweep_task: asyncio.Task | None = None
+        repos_refreshed = False
+
+        while True:
+            if lease_renew_task is not None and lease_renew_task.done():
+                lease_renew_task.result()
+            if time.monotonic() - last_trace_sweep >= 60.0 and (
+                trace_sweep_task is None or trace_sweep_task.done()
+            ):
+                if trace_sweep_task is not None:
+                    try:
+                        trace_sweep_task.result()
+                    except Exception:
+                        logger.exception("Trace spool sweep failed")
+                # Network delivery may wait through an outage; never block ticket
+                # dispatch on orphan recovery.
+                trace_sweep_task = asyncio.create_task(
+                    asyncio.to_thread(_sweep_trace_spools)
                 )
+                last_trace_sweep = time.monotonic()
+            # Check system-wide budget before dispatching
+            if system_budget is not None and events is not None:
+                from providers.budget import (
+                    BudgetAction,
+                    check_system_budget,
+                )
+                from providers.cost import estimate_cumulative_cost
+
+                global_usage = events.get_global_usage()
+                global_cost = estimate_cumulative_cost(global_usage)
+                sys_status = check_system_budget(
+                    system_budget,
+                    global_usage,
+                    global_cost,
+                )
+                if sys_status.action == BudgetAction.PAUSE:
+                    logger.warning(
+                        f"System budget exceeded: {sys_status.reason}"
+                        f" — skipping dispatch cycle"
+                    )
+                    await asyncio.sleep(config.poll_interval)
+                    continue
+
+            try:
+                all_fetched = await fetch_all_tickets(config.state_store_url)
+            except Exception:
+                logger.exception("Failed to fetch tickets")
                 await asyncio.sleep(config.poll_interval)
                 continue
 
-        try:
-            all_fetched = await fetch_all_tickets(config.state_store_url)
-        except Exception:
-            logger.exception("Failed to fetch tickets")
-            await asyncio.sleep(config.poll_interval)
-            continue
+            tickets_by_status: dict[str, list[dict[str, Any]]] = {}
+            for t in all_fetched:
+                tickets_by_status.setdefault(t.get("status", ""), []).append(t)
 
-        tickets_by_status: dict[str, list[dict[str, Any]]] = {}
-        for t in all_fetched:
-            tickets_by_status.setdefault(t.get("status", ""), []).append(t)
+            at_capacity = False
+            rotated = status_names[status_offset:] + status_names[:status_offset]
+            status_offset = (status_offset + 1) % len(status_names)
 
-        at_capacity = False
-        rotated = status_names[status_offset:] + status_names[:status_offset]
-        status_offset = (status_offset + 1) % len(status_names)
-
-        for status in rotated:
-            if at_capacity:
-                break
-
-            tickets = tickets_by_status.get(status, [])
-            for ticket in tickets:
-                active_count = len(dispatcher.active_tasks())
-                if active_count >= config.max_concurrent_agents:
-                    if not was_at_capacity:
-                        logger.info(
-                            f"At capacity ({active_count}/"
-                            f"{config.max_concurrent_agents})"
-                            f" — deferring remaining tickets"
-                        )
-                    at_capacity = True
+            for status in rotated:
+                if at_capacity:
                     break
 
-                tid = ticket["id"]
-                if dispatcher.is_active(tid):
-                    logger.info(f"Skipping {tid} at {status}: is_active")
-                    continue
-
-                cf = ticket.get("custom_fields", {})
-                if status == "awaiting_review" and cf.get("review_submitted"):
-                    logger.info(f"Skipping {tid}: review already submitted")
-                    continue
-
-                # Deterministic enrichment for webhook tickets.
-                # Resolve directives from run metadata before
-                # any agent sees the ticket. Best-effort —
-                # agents handle gaps if enrichment fails.
-                if status == "triage_pending":
-                    cf = ticket.get("custom_fields", {})
-                    if cf.get("trigger_source"):
-                        try:
-                            from providers.webhook_enrichment import (
-                                enrich_webhook_ticket,
+                tickets = tickets_by_status.get(status, [])
+                for ticket in tickets:
+                    active_count = len(dispatcher.active_tasks())
+                    if active_count >= config.max_concurrent_agents:
+                        if not was_at_capacity:
+                            logger.info(
+                                f"At capacity ({active_count}/"
+                                f"{config.max_concurrent_agents})"
+                                f" — deferring remaining tickets"
                             )
+                        at_capacity = True
+                        break
 
-                            await enrich_webhook_ticket(
-                                config.state_store_url,
-                                tid,
-                                ticket,
-                            )
-                        except Exception:
-                            logger.warning(
-                                f"Webhook enrichment failed for {tid}",
-                                exc_info=True,
-                            )
-
-                if status == "awaiting_hardware" and ticket.get(
-                    "custom_fields", {}
-                ).get("absent_suite"):
-                    logger.warning(
-                        f"Ticket {tid} has absent_suite=True, pausing for human input"
-                    )
-                    await _block_absent_suite(
-                        config.state_store_url, tid, event_bus=dispatcher.events
-                    )
-                    continue
-
-                # Code-enforce investigation routing.
-                # If triage routed to awaiting_hardware but
-                # the ticket has anomaly_context, redirect
-                # to gathering_context (investigation path).
-                # LLM decides intent; code enforces invariants.
-                # Skip if gathering_context already ran ---
-                # prevents loop when planning_investigation
-                # stub transitions back to awaiting_hardware.
-                if status == "awaiting_hardware":
-                    cf = ticket.get("custom_fields", {})
-                    if cf.get("anomaly_context") and not cf.get("dedup_result"):
-                        logger.info(
-                            f"Redirecting {tid} to "
-                            f"gathering_context "
-                            f"(anomaly_context present)"
-                        )
-                        try:
-                            await _redirect_to_investigation(
-                                config.state_store_url,
-                                tid,
-                                event_bus=dispatcher.events,
-                            )
-                        except Exception:
-                            logger.exception(f"Failed to redirect {tid}")
-                        await dispatcher.mark_done(tid)
+                    tid = ticket["id"]
+                    if dispatcher.is_active(tid):
+                        logger.info(f"Skipping {tid} at {status}: is_active")
                         continue
 
-                # Jumpstarter: release any existing lease
-                # before acquiring a new board. This
-                # handles the case where a user sends a
-                # ticket back to awaiting_hardware after
-                # a provisioning failure.
-                if status == "awaiting_hardware":
-                    await _release_jumpstarter_lease(
-                        ticket,
-                    )
+                    cf = ticket.get("custom_fields", {})
+                    if status == "awaiting_review" and cf.get("review_submitted"):
+                        logger.info(f"Skipping {tid}: review already submitted")
+                        continue
 
-                ok, reason = check_handoff(status, ticket)
-                if not ok:
-                    if not dispatcher.is_handoff_blocked(tid, status):
-                        logger.warning(
-                            f"Handoff blocked for {tid} at {status}: {reason}"
-                        )
-                        dispatcher.mark_handoff_blocked(tid, status)
-                        await _block_handoff_failed(
-                            config.state_store_url,
-                            tid,
-                            reason,
-                            status,
-                            event_bus=dispatcher.events,
-                        )
-                    continue
+                    # Deterministic enrichment for webhook tickets.
+                    # Resolve directives from run metadata before
+                    # any agent sees the ticket. Best-effort —
+                    # agents handle gaps if enrichment fails.
+                    if status == "triage_pending":
+                        cf = ticket.get("custom_fields", {})
+                        if cf.get("trigger_source"):
+                            try:
+                                from providers.webhook_enrichment import (
+                                    enrich_webhook_ticket,
+                                )
 
-                # Per-user/group quota check (multi-user only).
-                # Skip over-quota tickets without blocking or
-                # transitioning — they auto-resume when the
-                # rolling window advances.
-                if multi_user and usage_ledger is not None and user_store is not None:
-                    quota_status = _check_dispatch_quota(
-                        ticket,
-                        user_store,
-                        usage_ledger,
-                        config,
-                    )
-                    if quota_status is not None and quota_status.exceeded:
-                        if quota_status.warn_only:
-                            if not dispatcher.is_quota_warned(tid):
-                                reason_text = "; ".join(quota_status.reasons)
-                                logger.info(f"Quota warning for {tid}: {reason_text}")
-                                await _add_comment(
+                                await enrich_webhook_ticket(
                                     config.state_store_url,
                                     tid,
-                                    f"**Quota warning:** {reason_text}\n\n"
-                                    f"Dispatch continues (warn-only mode).",
+                                    ticket,
                                 )
-                                dispatcher.mark_quota_warned(tid)
-                        else:
-                            if not dispatcher.is_quota_blocked(tid):
-                                reason_text = "; ".join(quota_status.reasons)
+                            except Exception:
                                 logger.warning(
-                                    f"Quota exceeded for {tid}: {reason_text}"
+                                    f"Webhook enrichment failed for {tid}",
+                                    exc_info=True,
                                 )
-                                await _add_comment(
+
+                    if status == "awaiting_hardware" and ticket.get(
+                        "custom_fields", {}
+                    ).get("absent_suite"):
+                        logger.warning(
+                            f"Ticket {tid} has absent_suite=True, pausing for human input"
+                        )
+                        await _block_absent_suite(
+                            config.state_store_url, tid, event_bus=dispatcher.events
+                        )
+                        continue
+
+                    # Code-enforce investigation routing.
+                    # If triage routed to awaiting_hardware but
+                    # the ticket has anomaly_context, redirect
+                    # to gathering_context (investigation path).
+                    # LLM decides intent; code enforces invariants.
+                    # Skip if gathering_context already ran ---
+                    # prevents loop when planning_investigation
+                    # stub transitions back to awaiting_hardware.
+                    if status == "awaiting_hardware":
+                        cf = ticket.get("custom_fields", {})
+                        if cf.get("anomaly_context") and not cf.get("dedup_result"):
+                            logger.info(
+                                f"Redirecting {tid} to "
+                                f"gathering_context "
+                                f"(anomaly_context present)"
+                            )
+                            try:
+                                await _redirect_to_investigation(
                                     config.state_store_url,
                                     tid,
-                                    f"**Quota exceeded:** {reason_text}\n\n"
-                                    f"Ticket paused until the rolling "
-                                    f"window resets.",
+                                    event_bus=dispatcher.events,
                                 )
-                                dispatcher.mark_quota_blocked(tid)
+                            except Exception:
+                                logger.exception(f"Failed to redirect {tid}")
+                            await dispatcher.mark_done(tid)
                             continue
-                    else:
-                        dispatcher.clear_quota_blocked(tid)
 
-                if not dispatcher.try_claim(tid, status):
-                    logger.info(f"Skipping {tid} at {status}: claim held")
-                    continue
-                dispatcher.start_renewal(tid)
+                    # Jumpstarter: release any existing lease
+                    # before acquiring a new board. This
+                    # handles the case where a user sends a
+                    # ticket back to awaiting_hardware after
+                    # a provisioning failure.
+                    if status == "awaiting_hardware":
+                        await _release_jumpstarter_lease(
+                            ticket,
+                        )
 
-                # Refreshing the shared repository cache mutates local state.
-                # Defer it until a ticket claim supplies its durable trace
-                # context, rather than doing unauditable work during process
-                # startup before any ticket exists.
-                cache_context = dispatcher._trace_contexts.get(tid)
-                if not repos_refreshed and cache_context is not None:
-                    _refresh_harness_repos(
-                        repo_cache, config.harness_repos, cache_context
-                    )
-                    repos_refreshed = True
-
-                # Register ticket owner for ledger attribution
-                # before any agent runs.
-                if multi_user and events is not None:
-                    created_by = ticket.get("created_by", "")
-                    if created_by and user_store is not None:
-                        try:
-                            u = user_store.get_user(created_by)
-                            events.register_ticket_owner(
-                                tid,
-                                created_by,
-                                u.groups,
+                    ok, reason = check_handoff(status, ticket)
+                    if not ok:
+                        if not dispatcher.is_handoff_blocked(tid, status):
+                            logger.warning(
+                                f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                        except Exception:
-                            events.register_ticket_owner(
+                            dispatcher.mark_handoff_blocked(tid, status)
+                            await _block_handoff_failed(
+                                config.state_store_url,
                                 tid,
-                                created_by,
-                                [],
+                                reason,
+                                status,
+                                event_bus=dispatcher.events,
                             )
+                        continue
 
-                # Start introspection BEFORE the pipeline agent
-                # so no events are missed in a startup race.
-                _maybe_start_introspection(
-                    dispatcher,
-                    config,
-                    ticket,
-                    tid,
-                )
+                    # Per-user/group quota check (multi-user only).
+                    # Skip over-quota tickets without blocking or
+                    # transitioning — they auto-resume when the
+                    # rolling window advances.
+                    if (
+                        multi_user
+                        and usage_ledger is not None
+                        and user_store is not None
+                    ):
+                        quota_status = _check_dispatch_quota(
+                            ticket,
+                            user_store,
+                            usage_ledger,
+                            config,
+                        )
+                        if quota_status is not None and quota_status.exceeded:
+                            if quota_status.warn_only:
+                                if not dispatcher.is_quota_warned(tid):
+                                    reason_text = "; ".join(quota_status.reasons)
+                                    logger.info(
+                                        f"Quota warning for {tid}: {reason_text}"
+                                    )
+                                    await _add_comment(
+                                        config.state_store_url,
+                                        tid,
+                                        f"**Quota warning:** {reason_text}\n\n"
+                                        f"Dispatch continues (warn-only mode).",
+                                    )
+                                    dispatcher.mark_quota_warned(tid)
+                            else:
+                                if not dispatcher.is_quota_blocked(tid):
+                                    reason_text = "; ".join(quota_status.reasons)
+                                    logger.warning(
+                                        f"Quota exceeded for {tid}: {reason_text}"
+                                    )
+                                    await _add_comment(
+                                        config.state_store_url,
+                                        tid,
+                                        f"**Quota exceeded:** {reason_text}\n\n"
+                                        f"Ticket paused until the rolling "
+                                        f"window resets.",
+                                    )
+                                    dispatcher.mark_quota_blocked(tid)
+                                continue
+                        else:
+                            dispatcher.clear_quota_blocked(tid)
 
-                snapshot = _fresh_config(config)
-                logger.info(f"Dispatching {status} agent for ticket {tid}")
-                task = asyncio.create_task(
-                    run_agent_task(
+                    if not dispatcher.try_claim(tid, status):
+                        logger.info(f"Skipping {tid} at {status}: claim held")
+                        continue
+                    dispatcher.start_renewal(tid)
+
+                    # Refreshing the shared repository cache mutates local state.
+                    # Defer it until a ticket claim supplies its durable trace
+                    # context, rather than doing unauditable work during process
+                    # startup before any ticket exists.
+                    cache_context = dispatcher._trace_contexts.get(tid)
+                    if not repos_refreshed and cache_context is not None:
+                        _refresh_harness_repos(
+                            repo_cache, config.harness_repos, cache_context
+                        )
+                        repos_refreshed = True
+
+                    # Register ticket owner for ledger attribution
+                    # before any agent runs.
+                    if multi_user and events is not None:
+                        created_by = ticket.get("created_by", "")
+                        if created_by and user_store is not None:
+                            try:
+                                u = user_store.get_user(created_by)
+                                events.register_ticket_owner(
+                                    tid,
+                                    created_by,
+                                    u.groups,
+                                )
+                            except Exception:
+                                events.register_ticket_owner(
+                                    tid,
+                                    created_by,
+                                    [],
+                                )
+
+                    # Start introspection BEFORE the pipeline agent
+                    # so no events are missed in a startup race.
+                    _maybe_start_introspection(
                         dispatcher,
-                        status,
+                        config,
+                        ticket,
                         tid,
-                        config=snapshot,
-                        agent_task_timeout=snapshot.agent_task_timeout,
-                        ticket_data=ticket,
                     )
-                )
-                dispatcher.set_task(tid, task)
 
-        await _process_stop_requests(
-            dispatcher,
-            config.state_store_url,
-            dispatched_tickets=all_fetched,
-        )
+                    snapshot = _fresh_config(config)
+                    logger.info(f"Dispatching {status} agent for ticket {tid}")
+                    task = asyncio.create_task(
+                        run_agent_task(
+                            dispatcher,
+                            status,
+                            tid,
+                            config=snapshot,
+                            agent_task_timeout=snapshot.agent_task_timeout,
+                            ticket_data=ticket,
+                        )
+                    )
+                    dispatcher.set_task(tid, task)
 
-        # Jumpstarter: release orphaned leases whose
-        # tickets are closed or no longer active.
-        await _sweep_orphaned_leases(
-            config.state_store_url,
-            auth_headers=_auth_headers(),
-        )
-
-        # Stale-task watchdog: cancel tasks with no events
-        # for longer than the configured threshold.
-        if config.stale_task_timeout > 0 and events is not None:
-            await _check_stale_tasks(
+            await _process_stop_requests(
                 dispatcher,
-                events,
-                config.stale_task_timeout,
-                store_url=config.state_store_url,
+                config.state_store_url,
+                dispatched_tickets=all_fetched,
             )
 
-        if was_at_capacity and not at_capacity:
-            logger.info("Below capacity — resuming normal dispatch")
-        was_at_capacity = at_capacity
+            # Jumpstarter: release orphaned leases whose
+            # tickets are closed or no longer active.
+            await _sweep_orphaned_leases(
+                config.state_store_url,
+                auth_headers=_auth_headers(),
+            )
 
-        await asyncio.sleep(config.poll_interval)
+            # Stale-task watchdog: cancel tasks with no events
+            # for longer than the configured threshold.
+            if config.stale_task_timeout > 0 and events is not None:
+                await _check_stale_tasks(
+                    dispatcher,
+                    events,
+                    config.stale_task_timeout,
+                    store_url=config.state_store_url,
+                )
+
+            if was_at_capacity and not at_capacity:
+                logger.info("Below capacity — resuming normal dispatch")
+            was_at_capacity = at_capacity
+
+            await asyncio.sleep(config.poll_interval)
+    finally:
+        await _cancel_and_await(trace_sweep_task)
+        if dispatcher is not None:
+            await dispatcher.shutdown()
+        await _cancel_and_await(lease_renew_task)
+        events.close()
 
 
 _lock_fd: int | None = None
