@@ -27,9 +27,9 @@ import httpx  # noqa: F401 - retained as a stable test patch seam
 from agents.mcp_client import (
     _MCP_PROVIDER_CANCELLATION,
     _MCP_TIMEOUT_CANCELLATION,
-    _MCPDispatchAuditState,
     AgentMCPClient,
     MCPHookResult,
+    _MCPDispatchAuditState,
 )
 from providers.tracing import current_trace_context
 
