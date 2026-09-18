@@ -38,7 +38,7 @@ jobs:
         run: pip install -r requirements-dev.lock && pip install -e . --no-deps
 
       - name: Test with coverage
-        run: ./scripts/test.sh
+        run: ./scripts/test-parallel.sh
         env:
           COVERAGE_DIR: coverage/agentic-perf
 

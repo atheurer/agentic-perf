@@ -19,8 +19,13 @@ def test_state_store_token_loads_the_instance_credential(monkeypatch):
     monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
     monkeypatch.setattr("state_store.auth.read_token_from_file", lambda: "token")
 
-    assert utils._state_store_token() == "token"
-    assert utils.os.environ["AGENTIC_PERF_API_TOKEN"] == "token"
+    try:
+        assert utils._state_store_token() == "token"
+        assert utils.os.environ["AGENTIC_PERF_API_TOKEN"] == "token"
+    finally:
+        # _state_store_token intentionally exports the credential for the
+        # lifetime of the process; remove the test value before the next test.
+        monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
 
 
 class FakeVaultProvider(SecretsProvider):

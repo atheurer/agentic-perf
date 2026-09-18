@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib as _hashlib
 import os as _os
 import shutil as _shutil
 import tempfile as _tempfile
@@ -77,6 +78,18 @@ def tmp_zathras_repo(tmp_path: Path) -> Path:
     config_dir.mkdir()
     (config_dir / "test_defs.yml").write_text(TEST_DEFS_YAML)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def isolate_trace_store(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+):
+    """Give each test one shared trace database without sharing across tests."""
+    import paths
+
+    digest = _hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
+    trace_path = Path(_TEST_HOME) / "trace-tests" / digest / "trace.db"
+    monkeypatch.setattr(paths, "TRACE_DB_PATH", trace_path)
 
 
 class MockSecretsProvider(SecretsProvider):
