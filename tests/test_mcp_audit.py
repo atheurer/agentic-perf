@@ -695,7 +695,7 @@ async def test_protected_call_renews_lease_until_unbounded_handler_returns(
 
     # Leave enough margin for the first asyncio.to_thread heartbeat to start
     # on a busy CI runner while still making the handler outlive its lease.
-    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_TTL_SECONDS", 2.0)
     monkeypatch.setattr(mcp_audit, "_OPERATION_LEASE_RENEW_INTERVAL_SECONDS", 0.05)
 
     class StoreBackedRegistry:
@@ -746,7 +746,7 @@ async def test_protected_call_renews_lease_until_unbounded_handler_returns(
         )
 
         async def slow_handler(_):
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(2.5)
             return ToolResult(content="completed")
 
         result = await middleware.on_call_tool(
