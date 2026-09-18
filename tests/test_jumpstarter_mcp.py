@@ -60,7 +60,7 @@ class TestAttachment:
         mcp = AsyncMock(spec=AgentMCPClient)
         mcp.connect_command = AsyncMock()
 
-        with patch("agents.jumpstarter_mcp.httpx.AsyncClient") as MockClient:
+        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
             MockClient.return_value = _make_mock_httpx(
                 {"resource_provider": "jumpstarter"}
             )
@@ -82,7 +82,7 @@ class TestAttachment:
         mcp = AsyncMock(spec=AgentMCPClient)
         mcp.connect_command = AsyncMock()
 
-        with patch("agents.jumpstarter_mcp.httpx.AsyncClient") as MockClient:
+        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
             MockClient.return_value = _make_mock_httpx({"resource_provider": "aws"})
 
             result = await attach_jumpstarter_mcp(
@@ -97,7 +97,7 @@ class TestAttachment:
         """Does not attach when no resource_provider is set."""
         mcp = AsyncMock(spec=AgentMCPClient)
 
-        with patch("agents.jumpstarter_mcp.httpx.AsyncClient") as MockClient:
+        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
             MockClient.return_value = _make_mock_httpx({})
 
             result = await attach_jumpstarter_mcp(
@@ -111,7 +111,7 @@ class TestAttachment:
         """Returns False when ticket lookup fails."""
         mcp = AsyncMock(spec=AgentMCPClient)
 
-        with patch("agents.jumpstarter_mcp.httpx.AsyncClient") as MockClient:
+        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
             MockClient.return_value = _make_mock_httpx({}, status_code=404)
 
             result = await attach_jumpstarter_mcp(
