@@ -1435,9 +1435,14 @@ async def _add_comment(
 
 
 async def _renew_leader_lease(
-    lease: Any, interval: float, on_lost: Any | None = None
+    lease: Any,
+    interval: float,
+    on_lost: Any | None = None,
+    started: asyncio.Event | None = None,
 ) -> None:
     """Keep the control-plane lease fenced while the poll loop is active."""
+    if started is not None:
+        started.set()
     try:
         while True:
             await asyncio.sleep(interval)
@@ -1450,6 +1455,20 @@ async def _renew_leader_lease(
                 raise RuntimeError("orchestrator leader lease lost") from exc
     finally:
         await lease.release()
+
+
+async def _cancel_and_await(task: asyncio.Task | None) -> None:
+    """Stop a background task and observe its result during shutdown."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Background task failed during shutdown")
 
 
 class _LeaseLossGate:
@@ -1549,20 +1568,46 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     # Bind a durable control trace before using the audited HTTP client; ticket
     # traces are created later by the dispatcher for individual work items.
     bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
-    await leader_lease.acquire()
-    if leader_lease.epoch is None:
-        raise RuntimeError("state store returned no leader fencing epoch")
-    os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
-    os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
-    lease_loss_gate = _LeaseLossGate()
-    lease_renew_task: asyncio.Task | None = asyncio.create_task(
-        _renew_leader_lease(
-            leader_lease,
-            config.leader_lease_renew_interval,
-            lease_loss_gate.mark_deposed,
+    lease_renew_task: asyncio.Task | None = None
+    lease_renewal_started = asyncio.Event()
+    try:
+        await leader_lease.acquire()
+        if leader_lease.epoch is None:
+            raise RuntimeError("state store returned no leader fencing epoch")
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(leader_lease.session_id)
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        lease_loss_gate = _LeaseLossGate()
+        lease_renew_task = asyncio.create_task(
+            _renew_leader_lease(
+                leader_lease,
+                config.leader_lease_renew_interval,
+                lease_loss_gate.mark_deposed,
+                lease_renewal_started,
+            )
         )
-    )
+        await _poll_loop_after_lease(
+            config,
+            leader_lease,
+            lease_renew_task,
+            lease_loss_gate,
+        )
+    finally:
+        if lease_renew_task is None:
+            await leader_lease.release()
+        else:
+            await _cancel_and_await(lease_renew_task)
+            if not lease_renewal_started.is_set():
+                await leader_lease.release()
 
+
+async def _poll_loop_after_lease(
+    config: OrchestratorConfig,
+    leader_lease: Any,
+    lease_renew_task: asyncio.Task,
+    lease_loss_gate: _LeaseLossGate,
+) -> None:
+    dispatcher: Dispatcher | None = None
+    trace_sweep_task: asyncio.Task | None = None
     await _validate_models(config)
 
     llm = _make_llm_provider(config)
@@ -1887,11 +1932,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                     # Skip over-quota tickets without blocking or
                     # transitioning — they auto-resume when the
                     # rolling window advances.
-                    if (
-                        multi_user
-                        and usage_ledger is not None
-                        and user_store is not None
-                    ):
+                    if multi_user and usage_ledger is not None and user_store is not None:
                         quota_status = _check_dispatch_quota(
                             ticket,
                             user_store,
@@ -1902,9 +1943,7 @@ async def poll_loop(config: OrchestratorConfig) -> None:
                             if quota_status.warn_only:
                                 if not dispatcher.is_quota_warned(tid):
                                     reason_text = "; ".join(quota_status.reasons)
-                                    logger.info(
-                                        f"Quota warning for {tid}: {reason_text}"
-                                    )
+                                    logger.info(f"Quota warning for {tid}: {reason_text}")
                                     await _add_comment(
                                         config.state_store_url,
                                         tid,
@@ -2016,11 +2055,12 @@ async def poll_loop(config: OrchestratorConfig) -> None:
             was_at_capacity = at_capacity
 
             await asyncio.sleep(config.poll_interval)
-
     finally:
+        await _cancel_and_await(trace_sweep_task)
+        if dispatcher is not None:
+            await dispatcher.shutdown()
+        await _cancel_and_await(lease_renew_task)
         events.close()
-
-
 _lock_fd: int | None = None
 _lock_file_identity: tuple[int, int] | None = None
 

@@ -23,6 +23,7 @@ import pytest
 from providers.events import EventBus
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from state_store.trace_store import TraceStore
 
 TEST_DEFS_YAML = textwrap.dedent("""\
     test_defs:
@@ -241,7 +242,7 @@ class MockSSHExecutor:
 
 @pytest.fixture(autouse=True)
 def _close_event_buses(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Close every EventBus created during a test before its sandbox is reused.
+    """Close test-created event and trace resources before sandbox reuse.
 
     EventBus owns the TraceStore it creates, so leaving a bus for garbage
     collection leaves a SQLite connection (and, in WAL mode, companion files)
@@ -249,24 +250,38 @@ def _close_event_buses(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     a fixture-local finalizer incomplete.  Track construction for the duration
     of each test and invoke the normal production close contract in reverse
     creation order.  Injected TraceStores remain caller-owned because
-    EventBus.close() already honors that ownership boundary.
+    EventBus.close() already honors that ownership boundary; this fixture
+    separately closes injected and application-owned TraceStores after buses.
     """
     buses: list[EventBus] = []
-    original_init = EventBus.__init__
+    stores: list[TraceStore] = []
+    original_bus_init = EventBus.__init__
+    original_store_init = TraceStore.__init__
 
     def tracking_init(
         bus: EventBus,
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        original_init(bus, *args, **kwargs)
+        original_bus_init(bus, *args, **kwargs)
         buses.append(bus)
 
+    def tracking_store_init(
+        store: TraceStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        original_store_init(store, *args, **kwargs)
+        stores.append(store)
+
     monkeypatch.setattr(EventBus, "__init__", tracking_init)
+    monkeypatch.setattr(TraceStore, "__init__", tracking_store_init)
     yield
 
     for bus in reversed(buses):
         bus.close()
+    for store in reversed(stores):
+        store.close()
 
 
 def make_provisioning_handlers(
