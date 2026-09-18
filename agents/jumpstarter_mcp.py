@@ -27,6 +27,7 @@ import httpx  # noqa: F401 - retained as a stable test patch seam
 from agents.mcp_client import (
     _MCP_PROVIDER_CANCELLATION,
     _MCP_TIMEOUT_CANCELLATION,
+    _MCPDispatchAuditState,
     AgentMCPClient,
     MCPHookResult,
 )
@@ -129,11 +130,13 @@ class _JmpCallHook:
             )
 
         try:
+            audit_state = _MCPDispatchAuditState()
             dispatch_task = asyncio.create_task(
                 self._mcp.dispatch_internal_tool(
                     name,
                     arguments,
                     current_trace_context(),
+                    audit_state=audit_state,
                 )
             )
             result = await asyncio.wait_for(
@@ -169,15 +172,12 @@ class _JmpCallHook:
                     dispatch_task.cancel(_MCP_PROVIDER_CANCELLATION)
                 try:
                     await dispatch_task
-                except asyncio.CancelledError as inner_exc:
+                except asyncio.CancelledError:
                     # _dispatch_mcp_request owns the terminal audit event.
                     # Preserve that ownership marker on the cancellation that
                     # escapes this provider wrapper, so call_tool() does not
                     # record the same CANCELLED boundary a second time.
-                    if (
-                        getattr(inner_exc, "mcp_audit_recorded", False)
-                        or inner_exc.args == (_MCP_PROVIDER_CANCELLATION,)
-                    ):
+                    if audit_state.terminal_recorded:
                         setattr(outer_exc, "mcp_audit_recorded", True)
             raise
         if result.is_error:

@@ -150,11 +150,14 @@ class TestInternalDispatch:
             reset_trace_context(token)
 
         assert result == MCPHookResult(content="connected", request_sent=True)
-        mcp.dispatch_internal_tool.assert_awaited_once_with(
+        mcp.dispatch_internal_tool.assert_awaited_once()
+        dispatch_call = mcp.dispatch_internal_tool.await_args
+        assert dispatch_call.args == (
             "jmp_connect",
             {"lease_id": "lease-1"},
             context,
         )
+        assert dispatch_call.kwargs["audit_state"].terminal_recorded is False
 
     @pytest.mark.asyncio
     async def test_jmp_connect_error_does_not_mark_hook_connected(self):
