@@ -104,6 +104,7 @@ instance_paths() {
     worktree="${worktree:-$dev_root/agentic-perf-$name}"
     config="$instance_home/config.json"
     store_url="http://localhost:${port:-0}"
+    instance_tmp="$instance_home/tmp"
 }
 
 read_issue() {
@@ -360,6 +361,7 @@ run_instance_command() {
     [ -f "$config" ] || die "instance config not found: $config"
     identity_validate
     if [ "$1" = "start" ]; then
+        mkdir -p "$instance_tmp"
         require_cmd ss
         local configured_port
         configured_port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["port"])' "$config")"
@@ -376,7 +378,7 @@ run_instance_command() {
         sync_capabilities
     fi
     instance_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")"
-    AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$instance_url" \
+    AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$instance_url" \
         "$worktree/scripts/start-bg.sh" "$@"
 }
 
@@ -448,7 +450,9 @@ open_shell() {
     else
         prompt_name="${prompt_name:0:24}"
     fi
+    mkdir -p "$instance_tmp"
     export AGENTIC_PERF_HOME="$instance_home"
+    export TMPDIR="$instance_tmp"
     export STATE_STORE_URL="$instance_url"
     export AP_INSTANCE_NAME="$name"
     export PS1="[ap:$prompt_name] $ "
@@ -592,14 +596,16 @@ case "$command_name" in
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
         identity_validate
-        AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
+        mkdir -p "$instance_tmp"
+        AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/test.sh" "${extra_args[@]}"
         ;;
     validate)
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
         identity_validate
-        AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
+        mkdir -p "$instance_tmp"
+        AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/validate.sh"
         ;;
     commit)
