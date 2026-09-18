@@ -25,6 +25,7 @@ from typing import Any
 import httpx  # noqa: F401 - retained as a stable test patch seam
 
 from agents.mcp_client import (
+    _MCP_PROVIDER_CANCELLATION,
     _MCP_TIMEOUT_CANCELLATION,
     AgentMCPClient,
     MCPHookResult,
@@ -162,11 +163,22 @@ class _JmpCallHook:
                 retry_classification="ambiguous_after_send",
                 audit_recorded=True,
             )
-        except asyncio.CancelledError:
-            if "dispatch_task" in locals() and not dispatch_task.done():
-                dispatch_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+        except asyncio.CancelledError as outer_exc:
+            if "dispatch_task" in locals():
+                if not dispatch_task.done():
+                    dispatch_task.cancel(_MCP_PROVIDER_CANCELLATION)
+                try:
                     await dispatch_task
+                except asyncio.CancelledError as inner_exc:
+                    # _dispatch_mcp_request owns the terminal audit event.
+                    # Preserve that ownership marker on the cancellation that
+                    # escapes this provider wrapper, so call_tool() does not
+                    # record the same CANCELLED boundary a second time.
+                    if (
+                        getattr(inner_exc, "mcp_audit_recorded", False)
+                        or inner_exc.args == (_MCP_PROVIDER_CANCELLATION,)
+                    ):
+                        setattr(outer_exc, "mcp_audit_recorded", True)
             raise
         if result.is_error:
             return result
