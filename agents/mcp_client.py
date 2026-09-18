@@ -21,6 +21,7 @@ from providers.redaction import get_shared_redactor
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
+    ErrorDescriptor,
     LifecycleDescriptor,
     LifecycleState,
     MCPIdentity,
@@ -123,10 +124,9 @@ class AgentMCPClient:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
         self.trace_context = trace_context
-        # Optional hook for provider-specific call_tool
-        # behavior (e.g., Jumpstarter connect guards).
-        # Signature: async (name, arguments) -> str | None
-        # Return a string to short-circuit; None to proceed.
+        # Optional hook for provider-specific call_tool behavior (e.g.,
+        # Jumpstarter connect guards). It may return a string for a local
+        # short-circuit or MCPHookResult for an audited internal dispatch.
         self.pre_call_hook: Any = None
         # Optional hook for post-processing tool results.
         # Signature: (name, content) -> str
@@ -467,6 +467,7 @@ class AgentMCPClient:
                         LifecycleState.CANCELLED,
                         tool_name="initialize",
                         outcome=OperationOutcome.CANCELLED,
+                        error=asyncio.CancelledError(),
                     )
                     ready.cancel()
                 elif self._servers.get(name) is conn:
@@ -476,6 +477,7 @@ class AgentMCPClient:
                         LifecycleState.CANCELLED,
                         outcome=OperationOutcome.CANCELLED,
                         tool_name="server_exit",
+                        error=asyncio.CancelledError(),
                     )
                 raise
             except Exception as exc:
@@ -486,6 +488,7 @@ class AgentMCPClient:
                         LifecycleState.FAILED,
                         outcome=OperationOutcome.FAILURE,
                         tool_name="initialize",
+                        error=exc,
                     )
                     ready.set_exception(exc)
                 elif self._servers.get(name) is conn:
@@ -495,6 +498,7 @@ class AgentMCPClient:
                         LifecycleState.FAILED,
                         outcome=OperationOutcome.FAILURE,
                         tool_name="server_exit",
+                        error=exc,
                     )
                 raise
 
@@ -527,6 +531,7 @@ class AgentMCPClient:
                     LifecycleState.CANCELLED,
                     tool_name="initialize",
                     outcome=OperationOutcome.CANCELLED,
+                    error=asyncio.CancelledError(),
                 )
             await _cleanup_connection()
             raise
@@ -554,15 +559,17 @@ class AgentMCPClient:
                 LifecycleState.CANCELLED,
                 tool_name="list_tools",
                 outcome=OperationOutcome.CANCELLED,
+                error=asyncio.CancelledError(),
             )
             await _cleanup_connection()
             raise
-        except Exception:
+        except Exception as exc:
             self._record_boundary(
                 conn,
                 LifecycleState.FAILED,
                 tool_name="list_tools",
                 outcome=OperationOutcome.FAILURE,
+                error=exc,
             )
             await _cleanup_connection()
             raise
@@ -654,6 +661,60 @@ class AgentMCPClient:
                 parts.append(str(block))
         return "\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _context_ticket_id(context: TraceContext | None) -> str | None:
+        ticket_id = getattr(context, "ticket_id", None)
+        return ticket_id if isinstance(ticket_id, str) and ticket_id else None
+
+    def _redact_client_message(
+        self,
+        conn: _ServerConnection,
+        context: TraceContext | None,
+        message: str,
+    ) -> str:
+        return get_shared_redactor().redact_string(
+            self._context_ticket_id(context) or conn.ticket_id or "unknown",
+            message,
+        )[:4096]
+
+    def _redact_unscoped_message(
+        self,
+        context: TraceContext | None,
+        message: str,
+    ) -> str:
+        return get_shared_redactor().redact_string(
+            self._context_ticket_id(context) or "unknown",
+            message,
+        )[:4096]
+
+    def _record_pre_dispatch_rejection(
+        self,
+        name: str,
+        message: str,
+        trace_context: TraceContext | None,
+    ) -> None:
+        context = trace_context or self.trace_context or current_trace_context()
+        ticket_id = self._context_ticket_id(context)
+        if not ticket_id:
+            return
+        server_name = self._tool_routing.get(name) or "unrouted"
+        conn = self._servers.get(server_name)
+        if conn is None:
+            conn = _ServerConnection(
+                name=server_name,
+                session=None,
+                ticket_id=ticket_id,
+                agent_id=getattr(context, "agent_id", None),
+            )
+        self._record_boundary(
+            conn,
+            LifecycleState.REJECTED,
+            context=context,
+            tool_name=name,
+            outcome=OperationOutcome.REJECTED,
+            error=message,
+        )
+
     async def dispatch_internal_tool(
         self,
         name: str,
@@ -668,19 +729,42 @@ class AgentMCPClient:
         """
         server_name = self._tool_routing.get(name)
         if server_name is None:
+            message = self._redact_unscoped_message(
+                trace_context,
+                f"No server provides tool {name!r}",
+            )
+            self._record_pre_dispatch_rejection(
+                name,
+                message,
+                trace_context,
+            )
             return MCPHookResult(
-                content=f"No server provides tool {name!r}",
+                content=message,
                 is_error=True,
                 retry_classification="validation",
             )
         conn = self._servers.get(server_name)
         if conn is None:
+            message = self._redact_unscoped_message(
+                trace_context,
+                f"No active connection for MCP server {server_name!r}",
+            )
+            self._record_pre_dispatch_rejection(
+                name,
+                message,
+                trace_context,
+            )
             return MCPHookResult(
-                content=f"No active connection for MCP server {server_name!r}",
+                content=message,
                 is_error=True,
                 retry_classification="transport_before_send",
             )
         if trace_context is None:
+            self._record_pre_dispatch_rejection(
+                name,
+                "internal MCP dispatch requires trace context",
+                None,
+            )
             return MCPHookResult(
                 content="internal MCP dispatch requires trace context",
                 is_error=True,
@@ -713,6 +797,7 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.CANCELLED,
+                error=exc,
             )
             # An internal provider dispatch is awaited inside the pre-call
             # hook. Mark the cancellation so call_tool does not record the
@@ -726,11 +811,10 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
+                error=exc,
             )
             return MCPHookResult(
-                content=get_shared_redactor().redact_string(
-                    context.ticket_id or conn.ticket_id or "unknown", str(exc)
-                )[:4096],
+                content=self._redact_client_message(conn, context, str(exc)),
                 is_error=True,
                 request_sent=True,
                 retry_classification="ambiguous_after_send",
@@ -744,11 +828,10 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
+                error=content,
             )
             return MCPHookResult(
-                content=get_shared_redactor().redact_string(
-                    context.ticket_id or conn.ticket_id or "unknown", content
-                )[:4096],
+                content=self._redact_client_message(conn, context, content),
                 is_error=True,
                 request_sent=True,
                 retry_classification="intentional_agent_retry",
@@ -771,19 +854,39 @@ class AgentMCPClient:
     ) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
-            raise MCPToolCallError(f"No server provides tool {name!r}", "validation")
+            message = self._redact_unscoped_message(
+                trace_context,
+                f"No server provides tool {name!r}",
+            )
+            self._record_pre_dispatch_rejection(
+                name,
+                message,
+                trace_context,
+            )
+            raise MCPToolCallError(message, "validation")
 
         # A stale route without a connection is known to fail before either a
         # provider hook or the session can dispatch a request.
         conn = self._servers.get(server_name)
         if conn is None:
-            raise MCPToolCallError(
+            message = self._redact_unscoped_message(
+                trace_context,
                 f"No active connection for MCP server {server_name!r}",
+            )
+            self._record_pre_dispatch_rejection(
+                name,
+                message,
+                trace_context,
+            )
+            raise MCPToolCallError(
+                message,
                 "transport_before_send",
             )
-        context = trace_context or TraceContext(
-            ticket_id=conn.ticket_id,
-            agent_id=conn.agent_id,
+        context = (
+            trace_context
+            or self.trace_context
+            or current_trace_context()
+            or TraceContext(ticket_id=conn.ticket_id, agent_id=conn.agent_id)
         )
         correlation_id = context.mcp_correlation_request_id or uuid.uuid4().hex
         request_hash = (
@@ -800,16 +903,28 @@ class AgentMCPClient:
         operation_key = context.idempotency_key or (
             f"mcp-delivery:{context.ticket_id or 'external'}:{conn.name}:{context.action_id}"
         )
-        context = TraceContext.model_validate(
-            context.model_dump()
-            | {
-                "mcp_server": conn.name,
-                "mcp_session_id": conn.session_id,
-                "mcp_correlation_request_id": correlation_id,
-                "idempotency_key": operation_key,
-                "idempotency_request_hash": request_hash,
-            }
-        )
+        try:
+            context = TraceContext.model_validate(
+                context.model_dump()
+                | {
+                    "mcp_server": conn.name,
+                    "mcp_session_id": conn.session_id,
+                    "mcp_correlation_request_id": correlation_id,
+                    "idempotency_key": operation_key,
+                    "idempotency_request_hash": request_hash,
+                }
+            )
+        except Exception as exc:
+            message = self._redact_client_message(conn, context, str(exc))
+            self._record_boundary(
+                conn,
+                LifecycleState.REJECTED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.REJECTED,
+                error=message,
+            )
+            raise MCPToolCallError(message, "validation") from exc
 
         # Pre-call hook: provider-specific guards
         # (e.g., Jumpstarter one-connect, timeout).
@@ -825,10 +940,12 @@ class AgentMCPClient:
                         context=context,
                         tool_name=name,
                         outcome=OperationOutcome.CANCELLED,
+                        error=exc,
                     )
                 raise
             except MCPToolCallError as exc:
                 rejected = exc.retry_classification == "validation"
+                message = self._redact_client_message(conn, context, str(exc))
                 self._record_boundary(
                     conn,
                     LifecycleState.REJECTED if rejected else LifecycleState.FAILED,
@@ -839,7 +956,10 @@ class AgentMCPClient:
                         if rejected
                         else OperationOutcome.FAILURE
                     ),
+                    error=exc,
                 )
+                if message != str(exc):
+                    raise MCPToolCallError(message, exc.retry_classification) from exc
                 raise
             except Exception as e:
                 # Ordinary hooks do not have an audited dispatch contract. If
@@ -850,8 +970,10 @@ class AgentMCPClient:
                     context=context,
                     tool_name=name,
                     outcome=OperationOutcome.FAILURE,
+                    error=e,
                 )
-                raise MCPToolCallError(str(e), "ambiguous_after_send") from e
+                message = self._redact_client_message(conn, context, str(e))
+                raise MCPToolCallError(message, "ambiguous_after_send") from e
             finally:
                 reset_trace_context(hook_token)
 
@@ -870,9 +992,12 @@ class AgentMCPClient:
                         context=context,
                         tool_name=name,
                         outcome=OperationOutcome.REJECTED,
+                        error=short_circuit.content,
                     )
                     raise MCPToolCallError(
-                        short_circuit.content,
+                        self._redact_client_message(
+                            conn, context, short_circuit.content
+                        ),
                         short_circuit.retry_classification,
                     )
                 self._record_boundary(
@@ -912,7 +1037,73 @@ class AgentMCPClient:
         context: TraceContext | None = None,
         tool_name: str | None = None,
         outcome: OperationOutcome | None = None,
+        error: BaseException | str | None = None,
     ) -> None:
+        terminal = state in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+            LifecycleState.RESPONSE_RECEIVED,
+        }
+
+        def build_event(
+            event_context: TraceContext,
+            *,
+            session_id: str,
+            extra_attributes: dict[str, Any] | None = None,
+        ) -> TraceEventV1:
+            error_descriptor = None
+            if error is not None:
+                error_descriptor = ErrorDescriptor(
+                    type=(
+                        type(error).__name__
+                        if not isinstance(error, str)
+                        else "MCPError"
+                    ),
+                    message=self._redact_client_message(
+                        conn, event_context, str(error)
+                    ),
+                    retryable=False,
+                )
+            attributes = {
+                "endpoint": conn.endpoint,
+                "reconnect_generation": conn.reconnect_generation,
+                "client_process_identity": conn.client_process_identity,
+                "subprocess_pid_capture": conn.subprocess_pid_capture,
+            }
+            if extra_attributes:
+                attributes.update(extra_attributes)
+            return TraceEventV1(
+                ticket_id=event_context.ticket_id,
+                agent_id=event_context.agent_id,
+                invocation_id=event_context.invocation_id,
+                trace_id=event_context.trace_id,
+                action_id=event_context.action_id,
+                parent_action_id=event_context.parent_action_id,
+                tool_call_id=event_context.tool_call_id,
+                producer=ProducerIdentity(
+                    component="mcp_client",
+                    pid=os.getpid(),
+                ),
+                mcp=MCPIdentity(
+                    server=conn.name,
+                    transport=conn.transport,
+                    session_id=session_id,
+                    correlation_request_id=event_context.mcp_correlation_request_id,
+                    server_pid=conn.subprocess_pid,
+                ),
+                action=ActionDescriptor(
+                    type=ActionType.MCP,
+                    phase=tool_name,
+                ),
+                lifecycle=LifecycleDescriptor(state=state),
+                duration_ms=0 if terminal else None,
+                outcome=outcome if terminal else None,
+                error=error_descriptor,
+                attributes=attributes,
+            )
+
         try:
             context = (
                 context
@@ -929,50 +1120,15 @@ class AgentMCPClient:
                     context.model_dump()
                     | {"mcp_correlation_request_id": uuid.uuid4().hex}
                 )
-            terminal = state in {
-                LifecycleState.FAILED,
-                LifecycleState.CANCELLED,
-                LifecycleState.REJECTED,
-                LifecycleState.SHORT_CIRCUITED,
-                LifecycleState.RESPONSE_RECEIVED,
-            }
-            event = TraceEventV1(
-                ticket_id=context.ticket_id,
-                agent_id=context.agent_id,
-                invocation_id=context.invocation_id,
-                trace_id=context.trace_id,
-                action_id=context.action_id,
-                parent_action_id=context.parent_action_id,
-                tool_call_id=context.tool_call_id,
-                producer=ProducerIdentity(
-                    component="mcp_client",
-                    pid=os.getpid(),
-                ),
-                mcp=MCPIdentity(
-                    server=conn.name,
-                    transport=conn.transport,
-                    session_id=conn.session_id,
-                    correlation_request_id=(context.mcp_correlation_request_id),
-                    server_pid=conn.subprocess_pid,
-                ),
-                action=ActionDescriptor(
-                    type=ActionType.MCP,
-                    phase=tool_name,
-                ),
-                lifecycle=LifecycleDescriptor(state=state),
-                duration_ms=0 if terminal else None,
-                outcome=outcome if terminal else None,
-                attributes={
-                    "endpoint": conn.endpoint,
-                    "reconnect_generation": (conn.reconnect_generation),
-                    "client_process_identity": (conn.client_process_identity),
-                    "subprocess_pid_capture": (conn.subprocess_pid_capture),
-                },
+            event = build_event(
+                context,
+                session_id=conn.session_id,
             )
         except Exception as exc:
-            # Trace context can be incomplete during connection setup or
-            # malformed at an integration boundary. Audit is best-effort for
-            # the client, but the failure must remain visible.
+            # Never let malformed producer context abort MCP dispatch. Preserve
+            # the ticket-scoped boundary with fresh correlation identifiers so
+            # the validation failure remains visible without trusting malformed
+            # trace identity or connection metadata.
             logger.warning(
                 "MCP audit event validation failed; dispatch continues "
                 "(server=%s, state=%s, tool=%s): %s",
@@ -982,7 +1138,41 @@ class AgentMCPClient:
                 exc,
                 exc_info=True,
             )
-            return
+            ticket_id = self._context_ticket_id(context) or conn.ticket_id
+            if not ticket_id:
+                return
+            fallback_context = TraceContext(
+                ticket_id=ticket_id,
+                agent_id=(
+                    context.agent_id
+                    if isinstance(getattr(context, "agent_id", None), str)
+                    else conn.agent_id
+                ),
+                mcp_correlation_request_id=uuid.uuid4().hex,
+            )
+            try:
+                event = build_event(
+                    fallback_context,
+                    session_id=(
+                        conn.session_id
+                        if isinstance(conn.session_id, str) and conn.session_id
+                        else uuid.uuid4().hex
+                    ),
+                    extra_attributes={
+                        "audit_context_fallback": True,
+                        "audit_validation_error": type(exc).__name__,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "MCP audit fallback validation failed; dispatch continues "
+                    "(server=%s, state=%s, tool=%s)",
+                    conn.name,
+                    getattr(state, "value", state),
+                    tool_name,
+                    exc_info=True,
+                )
+                return
         self.audit_events.append(event)
         if self._audit_hook is not None:
             self._audit_hook(event)

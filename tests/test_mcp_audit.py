@@ -1006,7 +1006,9 @@ def test_client_invalid_mcp_audit_context_is_fail_open_and_visible(caplog):
             context=malformed,
         )
 
-    assert client.audit_events == []
+    assert len(client.audit_events) == 1
+    assert client.audit_events[0].attributes["audit_context_fallback"] is True
+    assert client.audit_events[0].lifecycle.state == LifecycleState.CONNECTING
     assert "MCP audit event validation failed" in caplog.text
     assert "dispatch continues" in caplog.text
 
@@ -1028,8 +1030,82 @@ def test_client_missing_session_is_fail_open_and_visible(caplog):
             context=TraceContext(ticket_id="PERF-1"),
         )
 
-    assert client.audit_events == []
+    assert len(client.audit_events) == 1
+    assert client.audit_events[0].attributes["audit_context_fallback"] is True
+    assert client.audit_events[0].mcp.session_id
     assert "MCP audit event validation failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_malformed_call_context_before_dispatch():
+    session = AsyncMock()
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    malformed = TraceContext.model_construct(
+        ticket_id="PERF-1",
+        trace_id="malformed",
+        action_id="malformed",
+    )
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, malformed)
+
+    assert exc_info.value.retry_classification == "validation"
+    assert session.call_tool.await_count == 0
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REJECTED,
+    ]
+    assert client.audit_events[0].attributes["audit_context_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_client_redacts_hook_validation_errors_in_result_and_audit():
+    secret = "mcp-hook-validation-secret-844"
+    get_shared_redactor().register("hook-error", "secret", secret)
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=AsyncMock(),
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="hook-error",
+    )
+    client.pre_call_hook = AsyncMock(
+        side_effect=MCPToolCallError(secret, "validation")
+    )
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, TraceContext(ticket_id="hook-error"))
+
+    assert secret not in str(exc_info.value)
+    assert secret not in (client.audit_events[0].error.message or "")
+    assert client.audit_events[0].lifecycle.state == LifecycleState.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_client_audits_ticket_scoped_unrouted_validation_failure():
+    client = AgentMCPClient()
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool(
+            "missing-tool",
+            {},
+            TraceContext(ticket_id="PERF-unrouted"),
+        )
+
+    assert exc_info.value.retry_classification == "validation"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REJECTED,
+    ]
+    assert client.audit_events[0].mcp.server == "unrouted"
 
 
 @pytest.mark.asyncio
