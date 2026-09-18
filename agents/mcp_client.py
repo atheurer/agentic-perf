@@ -86,6 +86,13 @@ class MCPHookResult:
 
 
 @dataclass
+class _MCPDispatchAuditState:
+    """Mutable ownership handoff for a provider-owned dispatch task."""
+
+    terminal_recorded: bool = False
+
+
+@dataclass
 class _ServerConnection:
     name: str
     session: ClientSession | None
@@ -758,6 +765,7 @@ class AgentMCPClient:
         name: str,
         arguments: dict[str, Any],
         trace_context: TraceContext | None,
+        audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
         """Dispatch one provider-owned MCP call through audited client boundaries.
 
@@ -817,6 +825,7 @@ class AgentMCPClient:
             name,
             arguments,
             trace_context,
+            audit_state=audit_state,
         )
 
     async def _dispatch_mcp_request(
@@ -825,6 +834,7 @@ class AgentMCPClient:
         name: str,
         arguments: dict[str, Any],
         context: TraceContext,
+        audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
         try:
             self._record_boundary(
@@ -843,7 +853,7 @@ class AgentMCPClient:
                 if exc.args == (_MCP_TIMEOUT_CANCELLATION,)
                 else LifecycleState.CANCELLED
             )
-            self._record_boundary(
+            terminal_recorded = self._record_boundary(
                 conn,
                 cancellation_state,
                 context=context,
@@ -860,6 +870,8 @@ class AgentMCPClient:
                 ),
                 error=exc,
             )
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
             # An internal provider dispatch is awaited inside the pre-call
             # hook. Mark the cancellation so call_tool does not record the
             # same terminal boundary again in its hook wrapper.
@@ -1118,7 +1130,7 @@ class AgentMCPClient:
         outcome: OperationOutcome | None = None,
         retry_kind: RetryKind = RetryKind.NONE,
         error: BaseException | str | None = None,
-    ) -> None:
+    ) -> bool:
         terminal = state in {
             LifecycleState.FAILED,
             LifecycleState.CANCELLED,
@@ -1195,7 +1207,7 @@ class AgentMCPClient:
                 )
             )
             if not context.ticket_id:
-                return
+                return False
             if not context.mcp_correlation_request_id:
                 context = TraceContext.model_validate(
                     context.model_dump()
@@ -1220,7 +1232,7 @@ class AgentMCPClient:
             )
             ticket_id = self._context_ticket_id(context) or conn.ticket_id
             if not ticket_id:
-                return
+                return False
             fallback_context = TraceContext(
                 ticket_id=ticket_id,
                 agent_id=(
@@ -1251,12 +1263,13 @@ class AgentMCPClient:
                     getattr(state, "value", state),
                     tool_name,
                 )
-                return
+                return False
         self.audit_events.append(event)
         if self._audit_hook is not None:
             self._audit_hook(event)
         if self._trace_client is not None:
             self._trace_client.record(event)
+        return True
 
     async def disconnect(self) -> None:
         for conn in list(self._servers.values()):

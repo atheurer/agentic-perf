@@ -741,6 +741,38 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_immediate_dispatch_cancellation_gets_fallback_boundary():
+    async def cancel_before_dispatch(*args, **kwargs):
+        raise asyncio.CancelledError(
+            mcp_client_module._MCP_PROVIDER_CANCELLATION
+        )
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=AsyncMock(),
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    client.dispatch_internal_tool = cancel_before_dispatch
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.call_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.CANCELLED,
+    ]
+    assert client.audit_events[0].outcome == OperationOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_internal_dispatch_timeout_has_one_timed_out_boundary():
     started = asyncio.Event()
 
