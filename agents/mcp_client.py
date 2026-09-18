@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # transport.
 _SDK_STDIO_CLIENT = stdio_client
 _MCP_TIMEOUT_CANCELLATION = "agentic-perf-mcp-timeout"
+_MCP_PROVIDER_CANCELLATION = "agentic-perf-mcp-provider-cancellation"
 
 
 class MCPToolCallError(RuntimeError):

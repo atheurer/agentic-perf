@@ -730,9 +730,10 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
     await started.wait()
     task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as exc_info:
         await task
 
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
     assert [event.lifecycle.state for event in client.audit_events] == [
         LifecycleState.REQUEST_SENT,
         LifecycleState.CANCELLED,
