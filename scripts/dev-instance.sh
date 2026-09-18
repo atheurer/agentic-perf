@@ -21,6 +21,7 @@ set -euo pipefail
 script_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dev_root="${AGENTIC_PERF_DEV_ROOT:-$(dirname "$script_repo")}"
 home_root="${AGENTIC_PERF_INSTANCE_ROOT:-$HOME/.agentic-perf-instances}"
+capability_source_home="${AGENTIC_PERF_CAPABILITY_SOURCE:-$HOME/.agentic-perf}"
 
 usage() {
     sed -n '1,23p' "${BASH_SOURCE[0]}"
@@ -49,6 +50,8 @@ Prepare options:
   --source-config PATH Config to copy (default: ~/.agentic-perf/config.json)
   --provider NAME      LLM provider for the generated config
   --model NAME         LLM model for the generated config
+  Capability data      private-skills, skill-cache, and secrets are refreshed
+                       from $HOME/.agentic-perf (or AGENTIC_PERF_CAPABILITY_SOURCE)
   --clone              Clone instead of using git worktree
   --delete-state       Delete the isolated runtime directory during cleanup
   --delete-branch      Delete the local branch during cleanup
@@ -101,6 +104,7 @@ instance_paths() {
     worktree="${worktree:-$dev_root/agentic-perf-$name}"
     config="$instance_home/config.json"
     store_url="http://localhost:${port:-0}"
+    instance_tmp="$instance_home/tmp"
 }
 
 read_issue() {
@@ -151,6 +155,7 @@ credential_keys = {
     "gemini_api_key",
     "openai_api_key",
 }
+
 for key in credential_keys:
     source.pop(key, None)
 
@@ -170,6 +175,36 @@ source["state_store"] = {
 
 Path(os.environ["DEST_CONFIG"]).write_text(json.dumps(source, indent=4) + "\n")
 PY
+}
+
+sync_capabilities() {
+    require_cmd rsync
+    instance_paths
+    [ -d "$instance_home" ] || die "instance home not found: $instance_home"
+
+    local source_real destination_real
+    source_real="$(readlink -f "$capability_source_home")"
+    destination_real="$(readlink -f "$instance_home")"
+    [ "$source_real" != "$destination_real" ] \
+        || die "capability source must not be the target instance home"
+
+    local capability
+    for capability in private-skills skill-cache secrets; do
+        local source_dir="$capability_source_home/$capability"
+        local destination_dir="$instance_home/$capability"
+        if [ -d "$source_dir" ]; then
+            mkdir -p "$destination_dir"
+            rsync -a --delete "$source_dir/" "$destination_dir/"
+        else
+            rm -rf -- "$destination_dir"
+            printf 'Capability source missing; cleared %s\n' "$capability"
+        fi
+    done
+
+    for capability in private-skills secrets; do
+        [ -d "$instance_home/$capability" ] || continue
+        chmod -R u=rwX,go= "$instance_home/$capability"
+    done
 }
 
 prepare() {
@@ -207,6 +242,7 @@ prepare() {
     printf '%s\n' "$clone_mode" > "$instance_home/clone.mode"
     python3 "$identity_helper" create --home "$instance_home" \
         --worktree "$worktree" --name "$name" --port "$port"
+    sync_capabilities
 
     cat <<EOF
 Prepared isolated instance.
@@ -219,7 +255,8 @@ Prepared isolated instance.
   Store URL:   $store_url
   Config:      $config
 
-API keys are not copied. Export the desired provider key before 'start'.
+Private skills, skill cache, and local secrets are refreshed during prepare and start.
+Runtime state and the generated instance config remain isolated.
 EOF
 }
 
@@ -323,8 +360,25 @@ run_instance_command() {
     [ -d "$worktree" ] || die "worktree not found: $worktree"
     [ -f "$config" ] || die "instance config not found: $config"
     identity_validate
+    if [ "$1" = "start" ]; then
+        mkdir -p "$instance_tmp"
+        require_cmd ss
+        local configured_port
+        configured_port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["port"])' "$config")"
+        local listeners
+        if ! listeners="$(ss -H -ltn "sport = :$configured_port" 2>&1)"; then
+            die "could not inspect state-store port $configured_port before starting '$name'"
+        fi
+        if [[ "$listeners" == *"Cannot open netlink socket"* ]]; then
+            die "could not inspect state-store port $configured_port before starting '$name'"
+        fi
+        if [ -n "$listeners" ]; then
+            die "state-store port $configured_port is already in use; stop the conflicting instance before starting '$name'"
+        fi
+        sync_capabilities
+    fi
     instance_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")"
-    AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$instance_url" \
+    AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$instance_url" \
         "$worktree/scripts/start-bg.sh" "$@"
 }
 
@@ -396,7 +450,9 @@ open_shell() {
     else
         prompt_name="${prompt_name:0:24}"
     fi
+    mkdir -p "$instance_tmp"
     export AGENTIC_PERF_HOME="$instance_home"
+    export TMPDIR="$instance_tmp"
     export STATE_STORE_URL="$instance_url"
     export AP_INSTANCE_NAME="$name"
     export PS1="[ap:$prompt_name] $ "
@@ -540,14 +596,16 @@ case "$command_name" in
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
         identity_validate
-        AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
+        mkdir -p "$instance_tmp"
+        AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/test.sh" "${extra_args[@]}"
         ;;
     validate)
         instance_paths
         [ -d "$worktree" ] || die "worktree not found: $worktree"
         identity_validate
-        AGENTIC_PERF_HOME="$instance_home" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
+        mkdir -p "$instance_tmp"
+        AGENTIC_PERF_HOME="$instance_home" TMPDIR="$instance_tmp" STATE_STORE_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_store"]["url"])' "$config")" \
             "$worktree/scripts/validate.sh"
         ;;
     commit)
