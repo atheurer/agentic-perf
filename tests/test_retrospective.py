@@ -251,14 +251,16 @@ class TestStats:
 class TestTranscriptReader:
     def test_read_transcript(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "PERF-TEST.jsonl"
+            log_dir = Path(tmpdir) / "logs"
+            log_dir.mkdir()
+            path = log_dir / "PERF-TEST.jsonl"
             with open(path, "w") as f:
                 for evt in SAMPLE_EVENTS[:3]:
                     f.write(json.dumps(evt) + "\n")
 
             with patch(
                 "agents.retrospective.server.DEFAULT_LOG_DIR",
-                Path(tmpdir),
+                log_dir,
             ):
                 events = _read_transcript("PERF-TEST")
                 assert len(events) == 3
@@ -290,14 +292,16 @@ class TestMCPToolHandler:
         from agents.retrospective.server import get_transcript_analysis
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "PERF-TEST.jsonl"
+            log_dir = Path(tmpdir) / "logs"
+            log_dir.mkdir()
+            path = log_dir / "PERF-TEST.jsonl"
             with open(path, "w") as f:
                 for evt in SAMPLE_EVENTS:
                     f.write(json.dumps(evt) + "\n")
 
             with patch(
                 "agents.retrospective.server.DEFAULT_LOG_DIR",
-                Path(tmpdir),
+                log_dir,
             ):
                 result = get_transcript_analysis("PERF-TEST")
                 assert result["ticket_id"] == "PERF-TEST"
@@ -324,12 +328,14 @@ class TestMCPToolHandler:
             )
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "PERF-TEST.jsonl"
+            log_dir = Path(tmpdir) / "logs"
+            log_dir.mkdir()
+            path = log_dir / "PERF-TEST.jsonl"
             path.write_text(json.dumps(events[0]) + "\n", encoding="utf-8")
 
             with patch(
                 "agents.retrospective.server.DEFAULT_LOG_DIR",
-                Path(tmpdir),
+                log_dir,
             ):
                 result = get_transcript_analysis("PERF-TEST")
 

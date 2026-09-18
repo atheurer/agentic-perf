@@ -6,6 +6,7 @@ and tickets with no LLM usage.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -30,8 +31,12 @@ def _clear_summary_cache():
 
 
 @pytest.fixture
-def event_bus(tmp_path: Path) -> EventBus:
-    return EventBus(log_dir=tmp_path / "logs")
+def event_bus(tmp_path: Path) -> Iterator[EventBus]:
+    bus = EventBus(log_dir=tmp_path / "logs")
+    try:
+        yield bus
+    finally:
+        bus.close()
 
 
 @pytest.fixture

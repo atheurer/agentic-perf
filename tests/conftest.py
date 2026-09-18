@@ -13,12 +13,14 @@ _os.environ["AGENTIC_PERF_SKILLS"] = _os.path.join(_TEST_HOME, "private-skills")
 _os.environ["AGENTIC_PERF_ARTIFACTS"] = _os.path.join(_TEST_HOME, "artifacts")
 
 import textwrap
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from providers.events import EventBus
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import BenchmarkSuite, RunfileTemplate, SkillProvider
 
@@ -235,6 +237,36 @@ class MockSSHExecutor:
             if pattern in command:
                 return result
         return self._default
+
+
+@pytest.fixture(autouse=True)
+def _close_event_buses(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Close every EventBus created during a test before its sandbox is reused.
+
+    EventBus owns the TraceStore it creates, so leaving a bus for garbage
+    collection leaves a SQLite connection (and, in WAL mode, companion files)
+    open.  The suite has many local fixtures and direct constructions, making
+    a fixture-local finalizer incomplete.  Track construction for the duration
+    of each test and invoke the normal production close contract in reverse
+    creation order.  Injected TraceStores remain caller-owned because
+    EventBus.close() already honors that ownership boundary.
+    """
+    buses: list[EventBus] = []
+    original_init = EventBus.__init__
+
+    def tracking_init(
+        bus: EventBus,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        original_init(bus, *args, **kwargs)
+        buses.append(bus)
+
+    monkeypatch.setattr(EventBus, "__init__", tracking_init)
+    yield
+
+    for bus in reversed(buses):
+        bus.close()
 
 
 def make_provisioning_handlers(
