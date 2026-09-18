@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from providers.events import EventBus
 from providers.redaction import Redactor
@@ -186,12 +186,11 @@ class TestBypassPathRedaction:
 
         _get_progress_redactor()
 
-        with patch("paths.TRACE_DB_PATH", tmp_path / "trace.db"):
-            _emit_tool_progress_event(
-                TICKET_ID,
-                "test-agent/tool",
-                "Using Bearer sk-ant-api03-supersecrettoken123",
-            )
+        _emit_tool_progress_event(
+            TICKET_ID,
+            "test-agent/tool",
+            "Using Bearer sk-ant-api03-supersecrettoken123",
+        )
 
         bus = EventBus(log_dir=tmp_path / "logs")
         try:
@@ -204,12 +203,11 @@ class TestBypassPathRedaction:
     def test_clean_message_passes_through(self, tmp_path: Path) -> None:
         from agents.server_utils import _emit_tool_progress_event
 
-        with patch("paths.TRACE_DB_PATH", tmp_path / "trace.db"):
-            _emit_tool_progress_event(
-                TICKET_ID,
-                "test-agent/tool",
-                "Running benchmark iteration 3 of 10",
-            )
+        _emit_tool_progress_event(
+            TICKET_ID,
+            "test-agent/tool",
+            "Running benchmark iteration 3 of 10",
+        )
 
         bus = EventBus(log_dir=tmp_path / "logs")
         try:

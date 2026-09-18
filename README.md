@@ -307,6 +307,16 @@ rationale behind each principle.
 python3 -m pytest tests/ -v
 ```
 
+The full suite can run in parallel with four isolated workers (and still
+produces the normal coverage reports):
+
+```bash
+./scripts/test-parallel.sh
+```
+
+Set `PYTEST_WORKERS` to adjust the worker count. Use the serial command when
+debugging order-dependent failures or collecting a single test's output.
+
 Unit tests use a mock LLM provider and don't require SSH or API keys.
 
 For end-to-end testing with real infrastructure, see

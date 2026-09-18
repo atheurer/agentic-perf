@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from paths import LOG_DIR as DEFAULT_LOG_DIR
+import paths
 from providers.event_projection import (
     event_order_key,
     legacy_record,
@@ -155,7 +155,7 @@ class EventBus:
             raise ValueError(
                 "trace dual-write comparison mode requires a comparison sink"
             )
-        self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
+        self._log_dir = Path(log_dir) if log_dir is not None else paths.LOG_DIR
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor
         self._events: dict[str, list[Event]] = {}
@@ -163,7 +163,7 @@ class EventBus:
         self._lock = threading.Lock()
         # JSONL is strictly a read-only schema-0 compatibility source.  SQLite
         # serializes producers, avoiding the former independent append handles.
-        self._trace_store = trace_store or TraceStore(self._log_dir.parent / "trace.db")
+        self._trace_store = trace_store or TraceStore(paths.TRACE_DB_PATH)
         self._owns_trace_store = trace_store is None
         self._comparison_mode = comparison_mode
         self._comparison_writer = comparison_writer

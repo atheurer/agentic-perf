@@ -19,7 +19,7 @@ from providers.tracing import (
     OperationOutcome,
 )
 from state_store.audit import AuditLog
-from state_store.trace_store import TraceStoreWriteError
+from state_store.trace_store import TraceStore, TraceStoreWriteError
 
 
 def _legacy(path: Path, ticket_id: str, timestamp: str) -> None:
@@ -119,6 +119,25 @@ def test_persistence_failure_does_not_publish_event_or_cursor(
     bus.close()
 
 
+def test_explicit_log_dirs_share_configured_trace_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    trace_path = tmp_path / "trace.db"
+    monkeypatch.setattr(paths, "TRACE_DB_PATH", trace_path)
+    first = EventBus(log_dir=tmp_path / "first" / "logs")
+    second = EventBus(log_dir=tmp_path / "second" / "logs")
+    try:
+        assert first._trace_store.db_path == trace_path
+        assert second._trace_store.db_path == trace_path
+        first.emit("PERF-SHARED", "agent", "tool_called", {})
+        assert len(second.get_events("PERF-SHARED")) == 1
+    finally:
+        first.close()
+        second.close()
+
+
 def test_tests_only_comparison_sink_does_not_double_count(tmp_path: Path) -> None:
     compared: list[dict[str, object]] = []
     bus = EventBus(
@@ -151,9 +170,12 @@ def test_comparison_mode_requires_a_sink(tmp_path: Path) -> None:
 def test_event_and_audit_adapters_use_independent_trace_connections(
     tmp_path: Path,
 ) -> None:
+    import paths
+
     logs = tmp_path / "logs"
     bus = EventBus(log_dir=logs)
-    audit = AuditLog(path=tmp_path / "audit.jsonl")
+    audit_store = TraceStore(paths.TRACE_DB_PATH)
+    audit = AuditLog(path=tmp_path / "audit.jsonl", trace_store=audit_store)
     try:
         assert bus._trace_store is not audit._trace_store
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -170,6 +192,7 @@ def test_event_and_audit_adapters_use_independent_trace_connections(
     finally:
         bus.close()
         audit.close()
+        audit_store.close()
 
 
 def test_restart_preserves_usage_and_iteration_records_once(tmp_path: Path) -> None:
