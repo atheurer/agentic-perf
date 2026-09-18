@@ -21,13 +21,20 @@ from mcp.types import CallToolRequestParams, RequestParams
 
 import agents.mcp_audit as mcp_audit
 import agents.mcp_client as mcp_client_module
+import agents.jumpstarter_mcp as jumpstarter_mcp
 from agents.jumpstarter_mcp import _JmpCallHook
 from agents.mcp_audit import MCPAuditMiddleware, assert_fastmcp_audit_compatibility
-from agents.mcp_client import AgentMCPClient, MCPToolCallError, _ServerConnection
+from agents.mcp_client import (
+    AgentMCPClient,
+    MCPHookResult,
+    MCPToolCallError,
+    _ServerConnection,
+)
 from providers.redaction import get_shared_redactor
 from providers.tracing import (
     LifecycleState,
     OperationOutcome,
+    RetryKind,
     TraceContext,
     bind_trace_context,
     new_trace_context,
@@ -684,6 +691,11 @@ async def test_jumpstarter_internal_mcp_error_is_not_a_success_short_circuit():
         LifecycleState.REQUEST_SENT,
         LifecycleState.FAILED,
     ]
+    assert len(client.audit_events) == 2
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind
+        == RetryKind.INTENTIONAL_AGENT_RETRY
+    )
     assert session.call_tool.await_count == 1
 
 
@@ -768,6 +780,47 @@ async def test_internal_dispatch_timeout_has_one_timed_out_boundary():
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_connect_timeout_has_one_timed_out_boundary(monkeypatch):
+    started = asyncio.Event()
+
+    async def block_call(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    session = AsyncMock()
+    session.call_tool = block_call
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+    monkeypatch.setattr(jumpstarter_mcp, "_JMP_CONNECT_TIMEOUT", 0.01)
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.TIMED_OUT,
+    ]
+    assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind
+        == RetryKind.AMBIGUOUS_AFTER_SEND
+    )
+
+
+@pytest.mark.asyncio
 async def test_client_audits_hook_rejection_without_request():
     client = AgentMCPClient()
     client._tool_routing["tool"] = "local"
@@ -790,6 +843,58 @@ async def test_client_audits_hook_rejection_without_request():
     ]
     assert client.audit_events[0].outcome == OperationOutcome.REJECTED
     client._servers["local"].session.call_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_preserves_provider_hook_transport_failure_classification():
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=AsyncMock(),
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    client.pre_call_hook = AsyncMock(
+        return_value=MCPHookResult(
+            content="transport unavailable",
+            is_error=True,
+            retry_classification="transport_before_send",
+        )
+    )
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert exc_info.value.retry_classification == "transport_before_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.FAILED,
+    ]
+    assert client.audit_events[0].outcome == OperationOutcome.FAILURE
+    assert (
+        client.audit_events[0].lifecycle.retry_kind
+        == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_audits_missing_connection_as_transport_failure():
+    client = AgentMCPClient()
+    client._tool_routing["tool"] = "local"
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert exc_info.value.retry_classification == "transport_before_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.FAILED,
+    ]
+    assert client.audit_events[0].outcome == OperationOutcome.FAILURE
+    assert (
+        client.audit_events[0].lifecycle.retry_kind
+        == RetryKind.TRANSPORT_BEFORE_SEND
+    )
 
 
 class _BlockingTransport:
@@ -872,6 +977,35 @@ async def test_client_cancellation_during_connect_cleans_up_task():
         child.get_name() == "mcp:local" and not child.done()
         for child in asyncio.all_tasks()
     )
+
+
+@pytest.mark.asyncio
+async def test_client_timeout_during_connect_is_audited_as_timed_out():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    client = AgentMCPClient()
+    task = asyncio.create_task(
+        client._connect_transport(
+            "local",
+            _BlockingTransport(entered, release),
+            transport="stdio",
+            endpoint="server.py",
+            ticket_id="PERF-1",
+        )
+    )
+    await entered.wait()
+    task.cancel(mcp_client_module._MCP_TIMEOUT_CANCELLATION)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.CONNECTING,
+        LifecycleState.TIMED_OUT,
+    ]
+    assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
 
 
 @pytest.mark.asyncio
@@ -1033,10 +1167,11 @@ def test_client_invalid_mcp_audit_context_is_fail_open_and_visible(caplog):
         session_id="session-1",
         ticket_id="PERF-1",
     )
+    secret = "fallback-validation-secret-844"
     malformed = TraceContext.model_construct(
         ticket_id="PERF-1",
-        trace_id="malformed",
-        action_id="malformed",
+        trace_id=secret,
+        action_id=secret,
     )
 
     with caplog.at_level("WARNING", logger="agents.mcp_client"):
@@ -1051,6 +1186,8 @@ def test_client_invalid_mcp_audit_context_is_fail_open_and_visible(caplog):
     assert client.audit_events[0].lifecycle.state == LifecycleState.CONNECTING
     assert "MCP audit event validation failed" in caplog.text
     assert "dispatch continues" in caplog.text
+    assert "error_type=ValidationError" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_client_missing_session_is_fail_open_and_visible(caplog):
@@ -1208,6 +1345,10 @@ async def test_client_records_exception_failure_boundary():
         LifecycleState.REQUEST_SENT,
         LifecycleState.FAILED,
     ]
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind
+        == RetryKind.AMBIGUOUS_AFTER_SEND
+    )
 
 
 @pytest.mark.asyncio

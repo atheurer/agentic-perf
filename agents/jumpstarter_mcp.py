@@ -160,6 +160,7 @@ class _JmpCallHook:
                 is_error=True,
                 request_sent=True,
                 retry_classification="ambiguous_after_send",
+                audit_recorded=True,
             )
         except asyncio.CancelledError:
             if "dispatch_task" in locals() and not dispatch_task.done():
@@ -174,6 +175,7 @@ class _JmpCallHook:
         return MCPHookResult(
             content=trim_response(name, result.content),
             request_sent=result.request_sent,
+            audit_recorded=result.audit_recorded,
         )
 
 
@@ -243,7 +245,7 @@ async def attach_jumpstarter_mcp(
                     jmp_env["PATH"] = f"{venv_bin}{os.pathsep}{current_path}"
 
             trace_context = current_trace_context()
-            await asyncio.wait_for(
+            connect_task = asyncio.create_task(
                 mcp_client.connect_command(
                     command="jmp",
                     args=["mcp", "serve"],
@@ -251,16 +253,28 @@ async def attach_jumpstarter_mcp(
                     env=jmp_env,
                     ticket_id=ticket_id,
                     agent_id=trace_context.agent_id if trace_context else None,
-                ),
+                )
+            )
+            await asyncio.wait_for(
+                asyncio.shield(connect_task),
                 timeout=120,  # 2 min to connect
             )
         except asyncio.TimeoutError:
+            connect_task.cancel(_MCP_TIMEOUT_CANCELLATION)
+            with contextlib.suppress(asyncio.CancelledError):
+                await connect_task
             logger.warning(
-                f"[jumpstarter-mcp] Connection timed "
-                f"out for {ticket_id} — all exporters "
-                f"may be leased"
+                "[jumpstarter-mcp] Connection timed out for %s — "
+                "all exporters may be leased",
+                ticket_id,
             )
             return False
+        except asyncio.CancelledError:
+            if "connect_task" in locals() and not connect_task.done():
+                connect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await connect_task
+            raise
         logger.info(f"[jumpstarter-mcp] Attached to agent for ticket {ticket_id}")
 
         # Install Jumpstarter-specific call_tool hooks.
