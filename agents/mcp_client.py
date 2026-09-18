@@ -27,6 +27,7 @@ from providers.tracing import (
     MCPIdentity,
     OperationOutcome,
     ProducerIdentity,
+    RetryKind,
     TraceContext,
     TraceEventV1,
     bind_trace_context,
@@ -80,6 +81,7 @@ class MCPHookResult:
         "transport_before_send",
         "ambiguous_after_send",
     ] = "intentional_agent_retry"
+    audit_recorded: bool = False
 
 
 @dataclass
@@ -437,6 +439,14 @@ class AgentMCPClient:
         )
         self._record_boundary(conn, LifecycleState.CONNECTING)
         startup_terminal_recorded = False
+        startup_cancellation_state = LifecycleState.CANCELLED
+
+        def _cancellation_state(exc: asyncio.CancelledError) -> LifecycleState:
+            return (
+                LifecycleState.TIMED_OUT
+                if exc.args == (_MCP_TIMEOUT_CANCELLATION,)
+                else LifecycleState.CANCELLED
+            )
 
         async def _hold_connection() -> None:
             nonlocal startup_terminal_recorded
@@ -465,9 +475,13 @@ class AgentMCPClient:
                     startup_terminal_recorded = True
                     self._record_boundary(
                         conn,
-                        LifecycleState.CANCELLED,
+                        startup_cancellation_state,
                         tool_name="initialize",
-                        outcome=OperationOutcome.CANCELLED,
+                        outcome=(
+                            OperationOutcome.TIMED_OUT
+                            if startup_cancellation_state == LifecycleState.TIMED_OUT
+                            else OperationOutcome.CANCELLED
+                        ),
                         error=asyncio.CancelledError(),
                     )
                     ready.cancel()
@@ -475,7 +489,7 @@ class AgentMCPClient:
                     startup_terminal_recorded = True
                     self._record_boundary(
                         conn,
-                        LifecycleState.CANCELLED,
+                        startup_cancellation_state,
                         outcome=OperationOutcome.CANCELLED,
                         tool_name="server_exit",
                         error=asyncio.CancelledError(),
@@ -524,15 +538,20 @@ class AgentMCPClient:
 
         try:
             session = await ready
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            startup_cancellation_state = _cancellation_state(exc)
             if not startup_terminal_recorded:
                 startup_terminal_recorded = True
                 self._record_boundary(
                     conn,
-                    LifecycleState.CANCELLED,
+                    startup_cancellation_state,
                     tool_name="initialize",
-                    outcome=OperationOutcome.CANCELLED,
-                    error=asyncio.CancelledError(),
+                    outcome=(
+                        OperationOutcome.TIMED_OUT
+                        if startup_cancellation_state == LifecycleState.TIMED_OUT
+                        else OperationOutcome.CANCELLED
+                    ),
+                    error=exc,
                 )
             await _cleanup_connection()
             raise
@@ -554,13 +573,18 @@ class AgentMCPClient:
                 conn, LifecycleState.REQUEST_SENT, tool_name="list_tools"
             )
             result = await session.list_tools()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            cancellation_state = _cancellation_state(exc)
             self._record_boundary(
                 conn,
-                LifecycleState.CANCELLED,
+                cancellation_state,
                 tool_name="list_tools",
-                outcome=OperationOutcome.CANCELLED,
-                error=asyncio.CancelledError(),
+                outcome=(
+                    OperationOutcome.TIMED_OUT
+                    if cancellation_state == LifecycleState.TIMED_OUT
+                    else OperationOutcome.CANCELLED
+                ),
+                error=exc,
             )
             await _cleanup_connection()
             raise
@@ -693,6 +717,7 @@ class AgentMCPClient:
         name: str,
         message: str,
         trace_context: TraceContext | None,
+        retry_classification: str = "validation",
     ) -> None:
         context = trace_context or self.trace_context or current_trace_context()
         ticket_id = self._context_ticket_id(context)
@@ -707,12 +732,23 @@ class AgentMCPClient:
                 ticket_id=ticket_id,
                 agent_id=getattr(context, "agent_id", None),
             )
+        state = (
+            LifecycleState.REJECTED
+            if retry_classification == "validation"
+            else LifecycleState.FAILED
+        )
+        outcome = (
+            OperationOutcome.REJECTED
+            if state == LifecycleState.REJECTED
+            else OperationOutcome.FAILURE
+        )
         self._record_boundary(
             conn,
-            LifecycleState.REJECTED,
+            state,
             context=context,
             tool_name=name,
-            outcome=OperationOutcome.REJECTED,
+            outcome=outcome,
+            retry_kind=RetryKind(retry_classification),
             error=message,
         )
 
@@ -743,6 +779,7 @@ class AgentMCPClient:
                 content=message,
                 is_error=True,
                 retry_classification="validation",
+                audit_recorded=True,
             )
         conn = self._servers.get(server_name)
         if conn is None:
@@ -754,11 +791,13 @@ class AgentMCPClient:
                 name,
                 message,
                 trace_context,
+                "transport_before_send",
             )
             return MCPHookResult(
                 content=message,
                 is_error=True,
                 retry_classification="transport_before_send",
+                audit_recorded=True,
             )
         if trace_context is None:
             self._record_pre_dispatch_rejection(
@@ -770,6 +809,7 @@ class AgentMCPClient:
                 content="internal MCP dispatch requires trace context",
                 is_error=True,
                 retry_classification="validation",
+                audit_recorded=True,
             )
         return await self._dispatch_mcp_request(
             conn,
@@ -812,6 +852,11 @@ class AgentMCPClient:
                     if cancellation_state == LifecycleState.TIMED_OUT
                     else OperationOutcome.CANCELLED
                 ),
+                retry_kind=(
+                    RetryKind.AMBIGUOUS_AFTER_SEND
+                    if cancellation_state == LifecycleState.TIMED_OUT
+                    else RetryKind.NONE
+                ),
                 error=exc,
             )
             # An internal provider dispatch is awaited inside the pre-call
@@ -826,6 +871,7 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
+                retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
                 error=exc,
             )
             return MCPHookResult(
@@ -833,6 +879,7 @@ class AgentMCPClient:
                 is_error=True,
                 request_sent=True,
                 retry_classification="ambiguous_after_send",
+                audit_recorded=True,
             )
 
         content = self._mcp_result_content(result)
@@ -843,6 +890,7 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.FAILURE,
+                retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
                 error=content,
             )
             return MCPHookResult(
@@ -850,6 +898,7 @@ class AgentMCPClient:
                 is_error=True,
                 request_sent=True,
                 retry_classification="intentional_agent_retry",
+                audit_recorded=True,
             )
 
         self._record_boundary(
@@ -859,7 +908,11 @@ class AgentMCPClient:
             tool_name=name,
             outcome=OperationOutcome.SUCCESS,
         )
-        return MCPHookResult(content=content, request_sent=True)
+        return MCPHookResult(
+            content=content,
+            request_sent=True,
+            audit_recorded=True,
+        )
 
     async def call_tool(
         self,
@@ -892,6 +945,7 @@ class AgentMCPClient:
                 name,
                 message,
                 trace_context,
+                "transport_before_send",
             )
             raise MCPToolCallError(
                 message,
@@ -937,6 +991,7 @@ class AgentMCPClient:
                 context=context,
                 tool_name=name,
                 outcome=OperationOutcome.REJECTED,
+                retry_kind=RetryKind.VALIDATION,
                 error=message,
             )
             raise MCPToolCallError(message, "validation") from exc
@@ -971,6 +1026,7 @@ class AgentMCPClient:
                         if rejected
                         else OperationOutcome.FAILURE
                     ),
+                    retry_kind=RetryKind(exc.retry_classification),
                     error=exc,
                 )
                 if message != str(exc):
@@ -985,6 +1041,7 @@ class AgentMCPClient:
                     context=context,
                     tool_name=name,
                     outcome=OperationOutcome.FAILURE,
+                    retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
                     error=e,
                 )
                 message = self._redact_client_message(conn, context, str(e))
@@ -993,28 +1050,34 @@ class AgentMCPClient:
                 reset_trace_context(hook_token)
 
             if isinstance(short_circuit, MCPHookResult):
-                if short_circuit.request_sent:
-                    if short_circuit.is_error:
-                        raise MCPToolCallError(
-                            short_circuit.content,
-                            short_circuit.retry_classification,
-                        )
-                    return short_circuit.content
                 if short_circuit.is_error:
-                    self._record_boundary(
-                        conn,
-                        LifecycleState.REJECTED,
-                        context=context,
-                        tool_name=name,
-                        outcome=OperationOutcome.REJECTED,
-                        error=short_circuit.content,
-                    )
+                    if not short_circuit.audit_recorded:
+                        hook_state = (
+                            LifecycleState.REJECTED
+                            if short_circuit.retry_classification == "validation"
+                            else LifecycleState.FAILED
+                        )
+                        self._record_boundary(
+                            conn,
+                            hook_state,
+                            context=context,
+                            tool_name=name,
+                            outcome=(
+                                OperationOutcome.REJECTED
+                                if hook_state == LifecycleState.REJECTED
+                                else OperationOutcome.FAILURE
+                            ),
+                            retry_kind=RetryKind(short_circuit.retry_classification),
+                            error=short_circuit.content,
+                        )
                     raise MCPToolCallError(
                         self._redact_client_message(
                             conn, context, short_circuit.content
                         ),
                         short_circuit.retry_classification,
                     )
+                if short_circuit.request_sent:
+                    return short_circuit.content
                 self._record_boundary(
                     conn,
                     LifecycleState.SHORT_CIRCUITED,
@@ -1052,6 +1115,7 @@ class AgentMCPClient:
         context: TraceContext | None = None,
         tool_name: str | None = None,
         outcome: OperationOutcome | None = None,
+        retry_kind: RetryKind = RetryKind.NONE,
         error: BaseException | str | None = None,
     ) -> None:
         terminal = state in {
@@ -1113,7 +1177,7 @@ class AgentMCPClient:
                     type=ActionType.MCP,
                     phase=tool_name,
                 ),
-                lifecycle=LifecycleDescriptor(state=state),
+                lifecycle=LifecycleDescriptor(state=state, retry_kind=retry_kind),
                 duration_ms=0 if terminal else None,
                 outcome=outcome if terminal else None,
                 error=error_descriptor,
@@ -1147,12 +1211,11 @@ class AgentMCPClient:
             # trace identity or connection metadata.
             logger.warning(
                 "MCP audit event validation failed; dispatch continues "
-                "(server=%s, state=%s, tool=%s): %s",
+                "(server=%s, state=%s, tool=%s, error_type=%s)",
                 conn.name,
                 getattr(state, "value", state),
                 tool_name,
-                exc,
-                exc_info=True,
+                type(exc).__name__,
             )
             ticket_id = self._context_ticket_id(context) or conn.ticket_id
             if not ticket_id:
@@ -1186,7 +1249,6 @@ class AgentMCPClient:
                     conn.name,
                     getattr(state, "value", state),
                     tool_name,
-                    exc_info=True,
                 )
                 return
         self.audit_events.append(event)
