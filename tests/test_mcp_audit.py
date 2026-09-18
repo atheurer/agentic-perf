@@ -728,6 +728,46 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
 
 
 @pytest.mark.asyncio
+async def test_internal_dispatch_timeout_has_one_timed_out_boundary():
+    started = asyncio.Event()
+
+    async def block_call(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    session = AsyncMock()
+    session.call_tool = block_call
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    task = asyncio.create_task(
+        client.dispatch_internal_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+    )
+    await started.wait()
+    task.cancel(mcp_client_module._MCP_TIMEOUT_CANCELLATION)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.TIMED_OUT,
+    ]
+    assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
+
+
+@pytest.mark.asyncio
 async def test_client_audits_hook_rejection_without_request():
     client = AgentMCPClient()
     client._tool_routing["tool"] = "local"

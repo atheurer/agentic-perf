@@ -151,7 +151,9 @@ class TestInternalDispatch:
 
         assert result == MCPHookResult(content="connected", request_sent=True)
         mcp.dispatch_internal_tool.assert_awaited_once_with(
-            "jmp_connect", {"lease_id": "lease-1"}, context
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            context,
         )
 
     @pytest.mark.asyncio

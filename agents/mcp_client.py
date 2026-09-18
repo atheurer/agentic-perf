@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # always use the agent-owned transport below, never the SDK's hidden-factory
 # transport.
 _SDK_STDIO_CLIENT = stdio_client
+_MCP_TIMEOUT_CANCELLATION = "agentic-perf-mcp-timeout"
 
 
 class MCPToolCallError(RuntimeError):
@@ -770,7 +771,12 @@ class AgentMCPClient:
                 is_error=True,
                 retry_classification="validation",
             )
-        return await self._dispatch_mcp_request(conn, name, arguments, trace_context)
+        return await self._dispatch_mcp_request(
+            conn,
+            name,
+            arguments,
+            trace_context,
+        )
 
     async def _dispatch_mcp_request(
         self,
@@ -791,12 +797,21 @@ class AgentMCPClient:
                 meta=self._mcp_metadata(conn, context),
             )
         except asyncio.CancelledError as exc:
+            cancellation_state = (
+                LifecycleState.TIMED_OUT
+                if exc.args == (_MCP_TIMEOUT_CANCELLATION,)
+                else LifecycleState.CANCELLED
+            )
             self._record_boundary(
                 conn,
-                LifecycleState.CANCELLED,
+                cancellation_state,
                 context=context,
                 tool_name=name,
-                outcome=OperationOutcome.CANCELLED,
+                outcome=(
+                    OperationOutcome.TIMED_OUT
+                    if cancellation_state == LifecycleState.TIMED_OUT
+                    else OperationOutcome.CANCELLED
+                ),
                 error=exc,
             )
             # An internal provider dispatch is awaited inside the pre-call
@@ -1042,6 +1057,7 @@ class AgentMCPClient:
         terminal = state in {
             LifecycleState.FAILED,
             LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
             LifecycleState.REJECTED,
             LifecycleState.SHORT_CIRCUITED,
             LifecycleState.RESPONSE_RECEIVED,

@@ -15,6 +15,7 @@ Usage in an agent's run() method:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -23,7 +24,11 @@ from typing import Any
 
 import httpx  # noqa: F401 - retained as a stable test patch seam
 
-from agents.mcp_client import AgentMCPClient, MCPHookResult
+from agents.mcp_client import (
+    _MCP_TIMEOUT_CANCELLATION,
+    AgentMCPClient,
+    MCPHookResult,
+)
 from providers.tracing import current_trace_context
 
 logger = logging.getLogger(__name__)
@@ -123,15 +128,21 @@ class _JmpCallHook:
             )
 
         try:
-            result = await asyncio.wait_for(
+            dispatch_task = asyncio.create_task(
                 self._mcp.dispatch_internal_tool(
                     name,
                     arguments,
                     current_trace_context(),
-                ),
+                )
+            )
+            result = await asyncio.wait_for(
+                asyncio.shield(dispatch_task),
                 timeout=_JMP_CONNECT_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            dispatch_task.cancel(_MCP_TIMEOUT_CANCELLATION)
+            with contextlib.suppress(asyncio.CancelledError):
+                await dispatch_task
             return MCPHookResult(
                 content=json.dumps(
                     {
@@ -151,6 +162,10 @@ class _JmpCallHook:
                 retry_classification="ambiguous_after_send",
             )
         except asyncio.CancelledError:
+            if "dispatch_task" in locals() and not dispatch_task.done():
+                dispatch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatch_task
             raise
         if result.is_error:
             return result
