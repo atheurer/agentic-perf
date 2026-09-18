@@ -61,15 +61,20 @@ class TestAttachment:
         """Attaches MCP when resource_provider is jumpstarter."""
         mcp = AsyncMock(spec=AgentMCPClient)
         mcp.connect_command = AsyncMock()
+        context = TraceContext(ticket_id="PERF-TEST", agent_id="platform-agent")
+        token = bind_trace_context(context)
 
-        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
-            MockClient.return_value = _make_mock_httpx(
-                {"resource_provider": "jumpstarter"}
-            )
+        try:
+            with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
+                MockClient.return_value = _make_mock_httpx(
+                    {"resource_provider": "jumpstarter"}
+                )
 
-            result = await attach_jumpstarter_mcp(
-                mcp, "PERF-TEST", "http://localhost:8090"
-            )
+                result = await attach_jumpstarter_mcp(
+                    mcp, "PERF-TEST", "http://localhost:8090"
+                )
+        finally:
+            reset_trace_context(token)
 
         assert result is True
         mcp.connect_command.assert_called_once()
@@ -77,6 +82,8 @@ class TestAttachment:
         assert call_kwargs["command"] == "jmp"
         assert call_kwargs["args"] == ["mcp", "serve"]
         assert call_kwargs["name"] == "jumpstarter"
+        assert call_kwargs["ticket_id"] == "PERF-TEST"
+        assert call_kwargs["agent_id"] == "platform-agent"
 
     @pytest.mark.asyncio
     async def test_skips_when_not_jumpstarter(self):

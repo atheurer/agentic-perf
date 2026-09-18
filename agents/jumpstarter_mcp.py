@@ -227,12 +227,15 @@ async def attach_jumpstarter_mcp(
                 if venv_bin not in current_path:
                     jmp_env["PATH"] = f"{venv_bin}{os.pathsep}{current_path}"
 
+            trace_context = current_trace_context()
             await asyncio.wait_for(
                 mcp_client.connect_command(
                     command="jmp",
                     args=["mcp", "serve"],
                     name="jumpstarter",
                     env=jmp_env,
+                    ticket_id=ticket_id,
+                    agent_id=trace_context.agent_id if trace_context else None,
                 ),
                 timeout=120,  # 2 min to connect
             )
