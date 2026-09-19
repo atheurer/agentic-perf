@@ -12,9 +12,11 @@ import pytest
 
 from agents.jumpstarter_mcp import (
     AGENT_DEVICE_TOOLS,
+    _JmpCallHook,
     attach_jumpstarter_mcp,
 )
-from agents.mcp_client import AgentMCPClient
+from agents.mcp_client import AgentMCPClient, MCPHookResult
+from providers.tracing import TraceContext, bind_trace_context, reset_trace_context
 
 
 class TestToolSets:
@@ -59,15 +61,20 @@ class TestAttachment:
         """Attaches MCP when resource_provider is jumpstarter."""
         mcp = AsyncMock(spec=AgentMCPClient)
         mcp.connect_command = AsyncMock()
+        context = TraceContext(ticket_id="PERF-TEST", agent_id="platform-agent")
+        token = bind_trace_context(context)
 
-        with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
-            MockClient.return_value = _make_mock_httpx(
-                {"resource_provider": "jumpstarter"}
-            )
+        try:
+            with patch("providers.execution.AuditedAsyncHTTPClient") as MockClient:
+                MockClient.return_value = _make_mock_httpx(
+                    {"resource_provider": "jumpstarter"}
+                )
 
-            result = await attach_jumpstarter_mcp(
-                mcp, "PERF-TEST", "http://localhost:8090"
-            )
+                result = await attach_jumpstarter_mcp(
+                    mcp, "PERF-TEST", "http://localhost:8090"
+                )
+        finally:
+            reset_trace_context(token)
 
         assert result is True
         mcp.connect_command.assert_called_once()
@@ -75,6 +82,8 @@ class TestAttachment:
         assert call_kwargs["command"] == "jmp"
         assert call_kwargs["args"] == ["mcp", "serve"]
         assert call_kwargs["name"] == "jumpstarter"
+        assert call_kwargs["ticket_id"] == "PERF-TEST"
+        assert call_kwargs["agent_id"] == "platform-agent"
 
     @pytest.mark.asyncio
     async def test_skips_when_not_jumpstarter(self):
@@ -119,3 +128,60 @@ class TestAttachment:
             )
 
         assert result is False
+
+
+class TestInternalDispatch:
+    @pytest.mark.asyncio
+    async def test_jmp_connect_uses_explicit_internal_dispatch_contract(self):
+        mcp = MagicMock(spec=AgentMCPClient)
+        mcp.dispatch_internal_tool = AsyncMock(
+            return_value=MCPHookResult(content="connected", request_sent=True)
+        )
+        hook = _JmpCallHook(mcp)
+        context = TraceContext(
+            ticket_id="PERF-TEST",
+            agent_id="benchmark",
+            mcp_correlation_request_id="corr-1",
+        )
+        token = bind_trace_context(context)
+        try:
+            result = await hook.pre_call("jmp_connect", {"lease_id": "lease-1"})
+        finally:
+            reset_trace_context(token)
+
+        assert result == MCPHookResult(content="connected", request_sent=True)
+        mcp.dispatch_internal_tool.assert_awaited_once()
+        dispatch_call = mcp.dispatch_internal_tool.await_args
+        assert dispatch_call.args == (
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            context,
+        )
+        assert dispatch_call.kwargs["audit_state"].terminal_recorded is False
+
+    @pytest.mark.asyncio
+    async def test_jmp_connect_error_does_not_mark_hook_connected(self):
+        mcp = MagicMock(spec=AgentMCPClient)
+        mcp.dispatch_internal_tool = AsyncMock(
+            return_value=MCPHookResult(
+                content="MCP rejected",
+                is_error=True,
+                request_sent=True,
+                retry_classification="intentional_agent_retry",
+            )
+        )
+        hook = _JmpCallHook(mcp)
+        token = bind_trace_context(
+            TraceContext(
+                ticket_id="PERF-TEST",
+                agent_id="benchmark",
+                mcp_correlation_request_id="corr-1",
+            )
+        )
+        try:
+            result = await hook.pre_call("jmp_connect", {})
+        finally:
+            reset_trace_context(token)
+
+        assert result.is_error is True
+        assert hook._connected is False
