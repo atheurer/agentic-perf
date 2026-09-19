@@ -836,12 +836,31 @@ class AgentMCPClient:
         context: TraceContext,
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
+        if conn.session is None:
+            error = RuntimeError("MCP session closed before tool dispatch")
+            terminal_recorded = self._record_boundary(
+                conn,
+                LifecycleState.FAILED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.FAILURE,
+                retry_kind=RetryKind.TRANSPORT_BEFORE_SEND,
+                error=error,
+            )
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
+            return MCPHookResult(
+                content=self._redact_client_message(conn, context, str(error)),
+                is_error=True,
+                request_sent=False,
+                retry_classification="transport_before_send",
+                audit_recorded=terminal_recorded,
+            )
+
         try:
             self._record_boundary(
                 conn, LifecycleState.REQUEST_SENT, context=context, tool_name=name
             )
-            if conn.session is None:
-                raise RuntimeError("MCP session closed before tool dispatch")
             result = await conn.session.call_tool(
                 name,
                 arguments,
@@ -870,15 +889,16 @@ class AgentMCPClient:
                 ),
                 error=exc,
             )
-            if audit_state is not None:
+            if audit_state is not None and terminal_recorded:
                 audit_state.terminal_recorded = terminal_recorded
             # An internal provider dispatch is awaited inside the pre-call
             # hook. Mark the cancellation so call_tool does not record the
             # same terminal boundary again in its hook wrapper.
-            setattr(exc, "mcp_audit_recorded", True)
+            if terminal_recorded:
+                setattr(exc, "mcp_audit_recorded", True)
             raise
         except Exception as exc:
-            self._record_boundary(
+            terminal_recorded = self._record_boundary(
                 conn,
                 LifecycleState.FAILED,
                 context=context,
@@ -887,17 +907,19 @@ class AgentMCPClient:
                 retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
                 error=exc,
             )
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
             return MCPHookResult(
                 content=self._redact_client_message(conn, context, str(exc)),
                 is_error=True,
                 request_sent=True,
                 retry_classification="ambiguous_after_send",
-                audit_recorded=True,
+                audit_recorded=terminal_recorded,
             )
 
         content = self._mcp_result_content(result)
         if result.isError:
-            self._record_boundary(
+            terminal_recorded = self._record_boundary(
                 conn,
                 LifecycleState.FAILED,
                 context=context,
@@ -906,25 +928,29 @@ class AgentMCPClient:
                 retry_kind=RetryKind.INTENTIONAL_AGENT_RETRY,
                 error=content,
             )
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
             return MCPHookResult(
                 content=self._redact_client_message(conn, context, content),
                 is_error=True,
                 request_sent=True,
                 retry_classification="intentional_agent_retry",
-                audit_recorded=True,
+                audit_recorded=terminal_recorded,
             )
 
-        self._record_boundary(
+        terminal_recorded = self._record_boundary(
             conn,
             LifecycleState.RESPONSE_RECEIVED,
             context=context,
             tool_name=name,
             outcome=OperationOutcome.SUCCESS,
         )
+        if audit_state is not None:
+            audit_state.terminal_recorded = terminal_recorded
         return MCPHookResult(
             content=content,
             request_sent=True,
-            audit_recorded=True,
+            audit_recorded=terminal_recorded,
         )
 
     async def call_tool(

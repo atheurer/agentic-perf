@@ -741,6 +741,84 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_completed_dispatch_is_not_reclassified_as_cancelled(
+    monkeypatch,
+):
+    dispatch_complete = asyncio.Event()
+    session = AsyncMock()
+    session.call_tool = AsyncMock(
+        return_value=SimpleNamespace(
+            content=[SimpleNamespace(text="connected")],
+            isError=False,
+        )
+    )
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    async def hold_wait_for(awaitable, timeout):
+        result = await awaitable
+        dispatch_complete.set()
+        await asyncio.Event().wait()
+        return result
+
+    monkeypatch.setattr(jumpstarter_mcp.asyncio, "wait_for", hold_wait_for)
+    task = asyncio.create_task(
+        client.call_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+    )
+    await dispatch_complete.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internal_dispatch_closed_session_is_pre_send_transport_failure():
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    result = await client.dispatch_internal_tool(
+        "jmp_connect",
+        {"lease_id": "lease-1"},
+        TraceContext(ticket_id="PERF-1"),
+    )
+
+    assert result.is_error is True
+    assert result.request_sent is False
+    assert result.retry_classification == "transport_before_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.FAILED,
+    ]
+    assert (
+        client.audit_events[0].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
 async def test_jumpstarter_immediate_dispatch_cancellation_gets_fallback_boundary():
     async def cancel_before_dispatch(*args, **kwargs):
         raise asyncio.CancelledError(mcp_client_module._MCP_PROVIDER_CANCELLATION)

@@ -173,10 +173,13 @@ class _JmpCallHook:
                 try:
                     await dispatch_task
                 except asyncio.CancelledError:
-                    # _dispatch_mcp_request owns the terminal audit event.
+                    pass
+                finally:
+                    # _dispatch_mcp_request owns the terminal audit event for
+                    # every completed dispatch, including success and failure.
                     # Preserve that ownership marker on the cancellation that
                     # escapes this provider wrapper, so call_tool() does not
-                    # record the same CANCELLED boundary a second time.
+                    # misclassify the completed dispatch as CANCELLED.
                     if audit_state.terminal_recorded:
                         setattr(outer_exc, "mcp_audit_recorded", True)
             raise
