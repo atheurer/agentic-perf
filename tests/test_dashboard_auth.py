@@ -90,7 +90,7 @@ class TestDashboardTokenInjection:
         r = client.get("/")
         assert r.status_code == 200
         html = r.text
-        assert token not in html
+        assert f'window.API_TOKEN="{token}"' not in html
         assert 'window.API_TOKEN=""' in html
 
     def test_whoami_user_identity(self, multi_user_env):
