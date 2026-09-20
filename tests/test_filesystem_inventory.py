@@ -253,7 +253,7 @@ providers/secrets/bitwarden.py|227|child.unlink
 providers/secrets/bitwarden.py|228|tmp_dir.rmdir
 providers/skills/arcaflow_plugins.py|37|self._cache_dir.mkdir
 providers/skills/arcaflow_plugins.py|70|path.write_text
-providers/skills/repo_cache.py|34|repo_path.parent.mkdir
+providers/skills/repo_cache.py|35|repo_path.parent.mkdir
 providers/tracing/fingerprints.py|15|key_path.parent.mkdir
 providers/tracing/fingerprints.py|16|os.chmod
 providers/tracing/fingerprints.py|22|os.chmod

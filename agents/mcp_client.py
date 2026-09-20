@@ -145,11 +145,13 @@ class AgentMCPClient:
         self.audit_events: list[TraceEventV1] = []
         self._audit_hook = audit_hook
         self._trace_client = trace_client
+        self._owns_trace_client = False
         if self._trace_client is None:
             token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
             url = os.environ.get("STATE_STORE_URL", "")
             if token and url:
                 self._trace_client = TraceClient(url, token)
+                self._owns_trace_client = True
         from agents.fencing import current_fence_context
 
         self._fence_context = current_fence_context()
@@ -1312,6 +1314,10 @@ class AgentMCPClient:
                     pass
         self._servers.clear()
         self._tool_routing.clear()
+        if self._trace_client is not None and self._owns_trace_client:
+            self._trace_client.close()
+        self._trace_client = None
+        self._owns_trace_client = False
         logger.info("MCP client disconnected all servers")
 
 

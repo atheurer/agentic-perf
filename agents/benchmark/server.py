@@ -588,7 +588,7 @@ async def _ensure_init():
     _skill_provider = build_skill_provider()
     _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
-        _repo_cache = build_repo_cache()
+        _repo_cache = await build_repo_cache()
     except Exception:
         _repo_cache = None
     _initialized = True

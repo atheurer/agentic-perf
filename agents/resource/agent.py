@@ -10,7 +10,11 @@ from agents.base import AgentBase
 from agents.infra.server import cleanup_passwordless_ssh
 from agents.mcp_client import AgentMCPClient
 from agents.provisioning.server import cleanup_harness
-from agents.server_utils import _resolve_vault_secret_name, resolve_ssh_key
+from agents.server_utils import (
+    _resolve_vault_secret_name,
+    make_traced_ssh,
+    resolve_ssh_key,
+)
 from paths import get_default_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
@@ -375,7 +379,7 @@ class ResourceAgent(AgentBase):
                 self._secrets,
                 vault_secret,
             ) as resolved_key:
-                ssh = SSHExecutor(user="root", key_path=resolved_key)
+                ssh = make_traced_ssh(key_path=resolved_key)
                 cleanup_summary = []
                 if harness_name:
                     for host in teardown_hosts:
@@ -524,7 +528,7 @@ class ResourceAgent(AgentBase):
             self._secrets,
             vault_secret,
         ) as resolved_key:
-            ssh = SSHExecutor(user="root", key_path=resolved_key)
+            ssh = make_traced_ssh(key_path=resolved_key)
             cleanup_summary = []
 
             if controller and targets:

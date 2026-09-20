@@ -77,13 +77,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/infra/server.py", "write_remote_file", "ssh"),
     ("agents/infra/topology.py", "discover_cache_topology", "ssh"),
     ("agents/infra/topology.py", "parse_cpu_mask", "filesystem"),
-    (
-        "agents/introspection/agent.py",
-        "_produce_guidance_summary",
-        "mutating_http_state",
-    ),
-    ("agents/introspection/agent.py", "_update_observation", "mutating_http_state"),
-    ("agents/introspection/agent.py", "_write_final_summary", "mutating_http_state"),
+    ("agents/introspection/agent.py", "_patch_fields", "mutating_http_state"),
     ("agents/introspection/server.py", "_detect_stale_progress", "filesystem"),
     ("agents/jumpstarter_mcp.py", "_preflight_check", "mcp"),
     ("agents/jumpstarter_mcp.py", "collect_diagnostics", "mcp"),
@@ -912,26 +906,10 @@ INVENTORY_DISPOSITIONS = {
         "agents/infra/topology.py:parse_cpu_mask",
         "2027-12-31",
     ),
-    (
-        "agents/introspection/agent.py",
-        "_produce_guidance_summary",
-        "mutating_http_state",
-    ): (
+    ("agents/introspection/agent.py", "_patch_fields", "mutating_http_state"): (
         "audited",
         "observability-maintainers",
-        "agents/introspection/agent.py:_produce_guidance_summary",
-        "2027-12-31",
-    ),
-    ("agents/introspection/agent.py", "_update_observation", "mutating_http_state"): (
-        "audited",
-        "observability-maintainers",
-        "agents/introspection/agent.py:_update_observation",
-        "2027-12-31",
-    ),
-    ("agents/introspection/agent.py", "_write_final_summary", "mutating_http_state"): (
-        "audited",
-        "observability-maintainers",
-        "agents/introspection/agent.py:_write_final_summary",
+        "agents/introspection/agent.py:_patch_fields",
         "2027-12-31",
     ),
     ("agents/introspection/server.py", "_detect_stale_progress", "filesystem"): (

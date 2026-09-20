@@ -12,6 +12,7 @@ import logging
 import os
 import shlex
 import sys
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
@@ -1110,7 +1111,7 @@ async def resolve_ssh_key(
 _ssh_key_stack: AsyncExitStack | None = None
 
 
-def build_repo_cache():
+async def build_repo_cache():
     """Construct a RepoCache with harness repos from environment variables."""
     import json
 
@@ -1143,11 +1144,39 @@ def build_repo_cache():
             # Crucible is never cloned or refreshed by agentic-perf.
             continue
         try:
-            cache.ensure_repo(name, url)
+            await cache.ensure_repo(name, url)
         except Exception:
             logger.warning("Failed to cache repo %s from %s", name, url, exc_info=True)
 
     return cache
+
+
+def make_traced_ssh(
+    user: str = "root",
+    key_path: str | None = None,
+    strict_host_key: str = "accept-new",
+) -> Any:
+    """Create an SSH executor that can persist ticket-scoped audit events."""
+    from providers.ssh import SSHExecutor
+    from providers.tracing import current_trace_context
+    from providers.tracing.client import TraceClient
+
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    url = os.environ.get("STATE_STORE_URL", "")
+    recorder = TraceClient(url, token) if url and token else None
+    ssh = SSHExecutor(
+        user=user,
+        key_path=key_path,
+        strict_host_key=strict_host_key,
+        trace_context=current_trace_context(),
+        trace_recorder=recorder,
+    )
+    if recorder is not None:
+        # Cleanup SSH executors are short-lived. Tie the recorder's spool lock
+        # to the executor so each temporary traced client is released even if
+        # a cleanup operation raises before its normal completion path.
+        weakref.finalize(ssh, recorder.close)
+    return ssh
 
 
 async def assert_ticket_active(
