@@ -377,7 +377,17 @@ class AuditedSubprocessRunner:
         except asyncio.TimeoutError:
             timed_out = True
             process.kill()
-            stdout, stderr = await task
+            # A daemon child can inherit the pipes and retain them after its
+            # parent is killed, so communicate() must not wait indefinitely.
+            try:
+                stdout, stderr = await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.TimeoutError:
+                stdout, stderr = b"", b""
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
             await process._finish(
                 LifecycleState.TIMED_OUT,
                 timed_out=True,
@@ -386,8 +396,11 @@ class AuditedSubprocessRunner:
             outcome = "timed_out"
         except asyncio.CancelledError:
             process.terminate()
-            await asyncio.shield(task)
-            stdout, stderr = task.result()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except asyncio.TimeoutError:
+                process.kill()
+            stdout, stderr = task.result() if task.done() else (b"", b"")
             await process._finish(
                 LifecycleState.CANCELLED,
                 **self._output_descriptors(stdout, stderr),

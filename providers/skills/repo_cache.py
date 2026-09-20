@@ -13,15 +13,16 @@ class RepoCache:
     def __init__(self, cache_dir: str | Path | None = None) -> None:
         self._dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
 
-    def ensure_repo(self, name: str, url: str) -> Path:
+    async def ensure_repo(self, name: str, url: str) -> Path:
         repo_path = self._dir / name
+        runner = AuditedSubprocessRunner()
         if repo_path.exists() and (repo_path / ".git").exists():
             logger.info(f"[repo-cache] Updating {name} from {url}")
-            result = AuditedSubprocessRunner().run_sync(
+            result = await runner.run(
                 ["git", "pull", "--ff-only"],
                 cwd=repo_path,
                 timeout=60,
-                mutating=True,
+                system_context=True,
             )
             if result.returncode != 0:
                 stderr = (
@@ -33,10 +34,10 @@ class RepoCache:
         else:
             repo_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"[repo-cache] Cloning {name} from {url}")
-            result = AuditedSubprocessRunner().run_sync(
+            result = await runner.run(
                 ["git", "clone", "--depth", "1", url, str(repo_path)],
                 timeout=120,
-                mutating=True,
+                system_context=True,
             )
             if result.returncode != 0:
                 stderr = (

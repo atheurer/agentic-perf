@@ -1528,7 +1528,7 @@ def _check_dispatch_quota(
         return None
 
 
-def _refresh_harness_repos(
+async def _refresh_harness_repos(
     repo_cache: RepoCache, harness_repos: dict[str, str], trace_context: Any
 ) -> None:
     """Refresh non-Crucible repos under the claimed ticket's trace context."""
@@ -1540,7 +1540,7 @@ def _refresh_harness_repos(
             if name == "crucible":
                 continue
             try:
-                repo_cache.ensure_repo(name, url)
+                await repo_cache.ensure_repo(name, url)
             except Exception:
                 logger.warning(
                     "Failed to cache repo %s from %s", name, url, exc_info=True
@@ -1988,7 +1988,7 @@ async def _poll_loop_after_lease(
                     # startup before any ticket exists.
                     cache_context = dispatcher._trace_contexts.get(tid)
                     if not repos_refreshed and cache_context is not None:
-                        _refresh_harness_repos(
+                        await _refresh_harness_repos(
                             repo_cache, config.harness_repos, cache_context
                         )
                         repos_refreshed = True
