@@ -15,6 +15,7 @@ Usage in an agent's run() method:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -23,7 +24,14 @@ from typing import Any
 
 import httpx  # noqa: F401 - retained as a stable test patch seam
 
-from agents.mcp_client import AgentMCPClient
+from agents.mcp_client import (
+    _MCP_PROVIDER_CANCELLATION,
+    _MCP_TIMEOUT_CANCELLATION,
+    AgentMCPClient,
+    MCPHookResult,
+    _MCPDispatchAuditState,
+)
+from providers.tracing import current_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -100,65 +108,90 @@ class _JmpCallHook:
         self,
         name: str,
         arguments: dict[str, Any],
-    ) -> str | None:
-        """Return a string to short-circuit; None to proceed."""
+    ) -> str | MCPHookResult | None:
+        """Return a compatible short-circuit or audited internal result."""
         if name != "jmp_connect":
             return None
 
         if self._connected:
-            return json.dumps(
-                {
-                    "error": (
-                        "Already connected to a "
-                        "Jumpstarter device in this "
-                        "session. You are provisioning "
-                        "ONE board. Submit your result."
-                    ),
-                }
+            return MCPHookResult(
+                content=json.dumps(
+                    {
+                        "error": (
+                            "Already connected to a "
+                            "Jumpstarter device in this "
+                            "session. You are provisioning "
+                            "ONE board. Submit your result."
+                        ),
+                    }
+                ),
+                is_error=True,
+                retry_classification="intentional_agent_retry",
             )
-
-        # Execute jmp_connect with a timeout and track
-        # connection state. Returns the result directly
-        # so AgentMCPClient.call_tool skips its normal
-        # session.call_tool path.
-        server_name = self._mcp._tool_routing.get(name)
-        if server_name is None:
-            return None
-        conn = self._mcp._servers[server_name]
 
         try:
+            audit_state = _MCPDispatchAuditState()
+            dispatch_task = asyncio.create_task(
+                self._mcp.dispatch_internal_tool(
+                    name,
+                    arguments,
+                    current_trace_context(),
+                    audit_state=audit_state,
+                )
+            )
             result = await asyncio.wait_for(
-                conn.session.call_tool(name, arguments),
+                asyncio.shield(dispatch_task),
                 timeout=_JMP_CONNECT_TIMEOUT,
             )
-            # Extract content.
-            parts = []
-            for block in result.content:
-                if hasattr(block, "text"):
-                    parts.append(block.text)
-                else:
-                    parts.append(str(block))
-            content = "\n".join(parts) if parts else ""
-
-            if result.isError:
-                return content  # Error but don't set connected
-
-            self._connected = True
-            return trim_response(name, content)
         except asyncio.TimeoutError:
-            return json.dumps(
-                {
-                    "error": (
-                        f"Failed to connect: lease "
-                        f"acquisition timed out after "
-                        f"{_JMP_CONNECT_TIMEOUT} "
-                        f"seconds. No exporter was "
-                        f"assigned — the board may be "
-                        f"offline or leased by another "
-                        f"user."
-                    ),
-                }
+            dispatch_task.cancel(_MCP_TIMEOUT_CANCELLATION)
+            with contextlib.suppress(asyncio.CancelledError):
+                await dispatch_task
+            return MCPHookResult(
+                content=json.dumps(
+                    {
+                        "error": (
+                            f"Failed to connect: lease "
+                            f"acquisition timed out after "
+                            f"{_JMP_CONNECT_TIMEOUT} "
+                            f"seconds. No exporter was "
+                            f"assigned — the board may be "
+                            f"offline or leased by another "
+                            f"user."
+                        ),
+                    }
+                ),
+                is_error=True,
+                request_sent=True,
+                retry_classification="ambiguous_after_send",
+                audit_recorded=True,
             )
+        except asyncio.CancelledError as outer_exc:
+            if "dispatch_task" in locals():
+                if not dispatch_task.done():
+                    dispatch_task.cancel(_MCP_PROVIDER_CANCELLATION)
+                try:
+                    await dispatch_task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    # _dispatch_mcp_request owns the terminal audit event for
+                    # every completed dispatch, including success and failure.
+                    # Preserve that ownership marker on the cancellation that
+                    # escapes this provider wrapper, so call_tool() does not
+                    # misclassify the completed dispatch as CANCELLED.
+                    if audit_state.terminal_recorded:
+                        setattr(outer_exc, "mcp_audit_recorded", True)
+            raise
+        if result.is_error:
+            return result
+
+        self._connected = True
+        return MCPHookResult(
+            content=trim_response(name, result.content),
+            request_sent=result.request_sent,
+            audit_recorded=result.audit_recorded,
+        )
 
 
 async def attach_jumpstarter_mcp(
@@ -226,22 +259,37 @@ async def attach_jumpstarter_mcp(
                 if venv_bin not in current_path:
                     jmp_env["PATH"] = f"{venv_bin}{os.pathsep}{current_path}"
 
-            await asyncio.wait_for(
+            trace_context = current_trace_context()
+            connect_task = asyncio.create_task(
                 mcp_client.connect_command(
                     command="jmp",
                     args=["mcp", "serve"],
                     name="jumpstarter",
                     env=jmp_env,
-                ),
+                    ticket_id=ticket_id,
+                    agent_id=trace_context.agent_id if trace_context else None,
+                )
+            )
+            await asyncio.wait_for(
+                asyncio.shield(connect_task),
                 timeout=120,  # 2 min to connect
             )
         except asyncio.TimeoutError:
+            connect_task.cancel(_MCP_TIMEOUT_CANCELLATION)
+            with contextlib.suppress(asyncio.CancelledError):
+                await connect_task
             logger.warning(
-                f"[jumpstarter-mcp] Connection timed "
-                f"out for {ticket_id} — all exporters "
-                f"may be leased"
+                "[jumpstarter-mcp] Connection timed out for %s — "
+                "all exporters may be leased",
+                ticket_id,
             )
             return False
+        except asyncio.CancelledError:
+            if "connect_task" in locals() and not connect_task.done():
+                connect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await connect_task
+            raise
         logger.info(f"[jumpstarter-mcp] Attached to agent for ticket {ticket_id}")
 
         # Install Jumpstarter-specific call_tool hooks.

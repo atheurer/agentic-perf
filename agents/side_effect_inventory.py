@@ -87,11 +87,10 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/introspection/server.py", "_detect_stale_progress", "filesystem"),
     ("agents/jumpstarter_mcp.py", "_preflight_check", "mcp"),
     ("agents/jumpstarter_mcp.py", "collect_diagnostics", "mcp"),
-    ("agents/jumpstarter_mcp.py", "pre_call", "mcp"),
     ("agents/mcp_audit.py", "_protect_operation", "mcp"),
     ("agents/mcp_audit.py", "_protected_result", "mcp"),
     ("agents/mcp_audit.py", "create_ticket_mcp", "mcp"),
-    ("agents/mcp_client.py", "call_tool", "mcp"),
+    ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"),
     ("agents/platform/server.py", "_provision_jumpstarter", "filesystem"),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"),
     ("agents/provisioning/agent.py", "_ssh_run", "subprocess"),
@@ -953,12 +952,6 @@ INVENTORY_DISPOSITIONS = {
         "agents/jumpstarter_mcp.py:collect_diagnostics",
         "2027-12-31",
     ),
-    ("agents/jumpstarter_mcp.py", "pre_call", "mcp"): (
-        "audited",
-        "observability-maintainers",
-        "agents/jumpstarter_mcp.py:pre_call",
-        "2027-12-31",
-    ),
     ("agents/mcp_audit.py", "_protect_operation", "mcp"): (
         "audited",
         "observability-maintainers",
@@ -977,10 +970,10 @@ INVENTORY_DISPOSITIONS = {
         "agents/mcp_audit.py:create_ticket_mcp",
         "2027-12-31",
     ),
-    ("agents/mcp_client.py", "call_tool", "mcp"): (
+    ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"): (
         "audited",
         "observability-maintainers",
-        "agents/mcp_client.py:call_tool",
+        "agents/mcp_client.py:_dispatch_mcp_request",
         "2027-12-31",
     ),
     ("agents/platform/server.py", "_provision_jumpstarter", "filesystem"): (
