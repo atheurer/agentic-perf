@@ -271,6 +271,18 @@ async def test_ticket_stdio_protected_replay_is_durable_and_exact(
         _terminate_process(server, timeout=10)
 
 
+@pytest.mark.asyncio
+async def test_disconnect_keeps_injected_trace_client_open():
+    """Callers, rather than a client borrowing their recorder, own its lifetime."""
+    recorder = SimpleNamespace(record=MagicMock(), close=MagicMock())
+    client = AgentMCPClient(trace_client=recorder)
+
+    await client.disconnect()
+
+    recorder.close.assert_not_called()
+    assert client._trace_client is None
+
+
 def _request(
     correlation_id: str, *, ticket: str = "PERF-1", session_id: str = "session-1"
 ) -> MiddlewareContext:
