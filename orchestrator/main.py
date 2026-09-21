@@ -843,10 +843,18 @@ async def run_agent_task(
         if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 
+            # Lifecycle writes must carry the complete claim fence.
+            # Session/epoch without the ticket claim ID are rejected,
+            # while omitting all fencing headers would permit a
+            # deposed worker to update the ticket.
+            _lifecycle_headers = dispatcher._auth_headers()
+            _claim_id = dispatcher._claim_ids.get(ticket_id)
+            if _claim_id:
+                _lifecycle_headers["X-Agentic-Perf-Claim-Id"] = _claim_id
             await _resolve_jumpstarter_images(
                 dispatcher.store_url,
                 ticket_id,
-                auth_headers=_auth_headers(),
+                auth_headers=_lifecycle_headers,
                 image_config=_load_config_file().get("jumpstarter_images", {}),
             )
 

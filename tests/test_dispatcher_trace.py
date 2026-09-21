@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from orchestrator.dispatcher import Dispatcher
 from providers.tracing import (
     LifecycleState,
@@ -118,6 +120,62 @@ async def test_run_agent_task_binds_and_resets_agent_context() -> None:
     await run_agent_task(dispatcher, "test_status", "PERF-1")
     assert seen == [agent_context]
     assert current_trace_context() is None
+
+
+@pytest.mark.parametrize("status", ("preparing_platform", "awaiting_provision"))
+async def test_lifecycle_image_resolution_uses_complete_claim_fence(
+    monkeypatch, status: str
+) -> None:
+    """Image resolution keeps the dispatcher's ticket claim fence."""
+    import orchestrator.main as mod
+
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "api-token")
+    dispatcher = Dispatcher(
+        "http://store",
+        MagicMock(),
+        MagicMock(),
+        session_id="session-1",
+        fencing_epoch=7,
+    )
+    dispatcher._claim_ids["PERF-1"] = "claim-1"
+    dispatcher.events = None
+    dispatcher.mark_done = AsyncMock()
+
+    class Agent:
+        trace_context = None
+
+        async def run(self, ticket_id: str) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    dispatcher.create_agent = MagicMock(return_value=Agent())
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    resolve_images = AsyncMock()
+
+    with (
+        patch.object(mod, "AuditedAsyncHTTPClient", lambda **kwargs: mock_client),
+        patch.object(mod, "_resolve_jumpstarter_images", resolve_images),
+        patch("orchestrator.config._load_config_file", return_value={}),
+    ):
+        await mod.run_agent_task(dispatcher, status, "PERF-1")
+
+    resolve_images.assert_awaited_once_with(
+        "http://store",
+        "PERF-1",
+        auth_headers={
+            "Authorization": "Bearer api-token",
+            "X-Agentic-Perf-Orchestrator-Session": "session-1",
+            "X-Agentic-Perf-Orchestrator-Epoch": "7",
+            "X-Agentic-Perf-Claim-Id": "claim-1",
+        },
+        image_config={},
+    )
 
 
 async def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
