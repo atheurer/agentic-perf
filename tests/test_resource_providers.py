@@ -1298,8 +1298,8 @@ class TestHandleCompletionIPSplit:
         }
 
     @pytest.mark.asyncio
-    async def test_reservation_metadata_overrides_conflicting_llm_values(self):
-        """Provider metadata is authoritative over an LLM-provided lease."""
+    async def test_reservation_metadata_merges_with_llm_values(self):
+        """LLM metadata is kept; reservation fills in missing keys only."""
         from agents.resource.agent import ResourceAgent
         from providers.llm.base import LLMResponse, ToolCall
 
@@ -1366,9 +1366,13 @@ class TestHandleCompletionIPSplit:
         await agent._handle_completion("PERF-TEST", response)
 
         fields = agent._client.patch.call_args_list[0].kwargs["json"]["fields"]
+        # merge-all: LLM-provided keys are kept; reservation metadata
+        # fills in only keys the LLM omitted.  LLM-only keys like
+        # llm_note survive because we no longer whitelist.
         assert fields["resource_provider_metadata"] == {
-            "lease_id": "provider-lease",
-            "selector": "board-type=ride4",
+            "lease_id": "hallucinated-lease",
+            "selector": "board-type=wrong",
+            "llm_note": "must not be persisted",
         }
 
     @pytest.mark.asyncio
