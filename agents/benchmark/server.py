@@ -4305,16 +4305,28 @@ async def execute_boot_time_test(
         lease_id = metadata.get("lease_id", "")
         directives = fields.get("directives", {})
         serial_enabled = directives.get("jumpstarter_serial", False)
-        if (
-            lease_id
-            and fields.get("resource_provider") == "jumpstarter"
-            and serial_enabled
-        ):
+        is_jumpstarter = lease_id and fields.get("resource_provider") == "jumpstarter"
+        if is_jumpstarter and serial_enabled:
             cmd.append("--jumpstarter-serial")
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
             logger.info(
                 f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
             )
+        elif is_jumpstarter:
+            # Enable Jumpstarter power control even without
+            # serial capture so cold boots use hardware
+            # power cycling instead of SSH reboots.
+            cmd.append(f"--jumpstarter-lease-name={lease_id}")
+            logger.info(
+                f"[boot-time] Using Jumpstarter lease {lease_id} for power control"
+            )
+
+        # Pass power-off delay from directives
+        power_off_delay = directives.get("power_off_delay") or directives.get(
+            "jumpstarter_power_off_delay"
+        )
+        if power_off_delay is not None:
+            cmd.append(f"--power-off-delay={power_off_delay}")
 
     # Separator for boot-time-analysis-tools arguments
     cmd.append("--")
