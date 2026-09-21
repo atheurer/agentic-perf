@@ -1133,6 +1133,13 @@ class IntrospectionAgent:
                 "Check if the execution plan matches the ticket's intent",
                 "Transition manually to the appropriate status",
             ]
+        elif reason == "resource_exhaustion":
+            suggested_actions = [
+                "Retry — the board may have recovered from a transient failure",
+                "Try a different board of the same type",
+                "Check board status in the Jumpstarter dashboard",
+                "Abort if the board is consistently failing",
+            ]
         else:
             suggested_actions = [
                 "Review the last agent comment for context",
