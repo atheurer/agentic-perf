@@ -1221,6 +1221,155 @@ class TestHandleCompletionIPSplit:
         assert fields["ssh_key_path"] == "/home/user/.ssh/provider.pem"
 
     @pytest.mark.asyncio
+    async def test_reservation_metadata_is_set_when_llm_omits_it(self):
+        """Persist provider metadata even when the LLM omits the field."""
+        from agents.resource.agent import ResourceAgent
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._mcp = AsyncMock()
+        agent._mcp.call_tool = AsyncMock(
+            side_effect=[
+                json.dumps(
+                    {
+                        "lease_id": "provider-lease",
+                        "exporter_name": "board-01",
+                        "board_target": "ride4",
+                        "selector": "board-type=ride4",
+                        "duration_seconds": 14400,
+                    }
+                ),
+                "{}",
+            ]
+        )
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {"controller": "", "targets": []},
+                        "ssh_user": "root",
+                        "resource_provider": "jumpstarter",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        fields = agent._client.patch.call_args_list[0].kwargs["json"]["fields"]
+        assert fields["resource_provider_metadata"] == {
+            "lease_id": "provider-lease",
+            "exporter_name": "board-01",
+            "board_target": "ride4",
+            "selector": "board-type=ride4",
+            "duration_seconds": 14400,
+        }
+
+    @pytest.mark.asyncio
+    async def test_reservation_metadata_overrides_conflicting_llm_values(self):
+        """Provider metadata is authoritative over an LLM-provided lease."""
+        from agents.resource.agent import ResourceAgent
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._mcp = AsyncMock()
+        agent._mcp.call_tool = AsyncMock(
+            side_effect=[
+                json.dumps(
+                    {
+                        "lease_id": "provider-lease",
+                        "selector": "board-type=ride4",
+                    }
+                ),
+                "{}",
+            ]
+        )
+        agent._client = AsyncMock()
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {"controller": "", "targets": []},
+                        "ssh_user": "root",
+                        "resource_provider": "jumpstarter",
+                        "resource_provider_metadata": {
+                            "lease_id": "hallucinated-lease",
+                            "selector": "board-type=wrong",
+                            "llm_note": "must not be persisted",
+                        },
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        fields = agent._client.patch.call_args_list[0].kwargs["json"]["fields"]
+        assert fields["resource_provider_metadata"] == {
+            "lease_id": "provider-lease",
+            "selector": "board-type=ride4",
+        }
+
+    @pytest.mark.asyncio
     async def test_no_mcp_falls_back_to_llm_metadata(self):
         """Without MCP, uses whatever the LLM passed in provider_metadata."""
         from agents.resource.agent import ResourceAgent
