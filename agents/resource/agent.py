@@ -746,13 +746,11 @@ class ResourceAgent(AgentBase):
                 reservation_metadata = json.loads(raw) if raw else {}
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
-        # Merge reservation metadata into provider_metadata.
-        # The LLM may omit fields that the provider returned
-        # — code-enforce them from the accumulated metadata.
-        # Provider-agnostic: merge all fields, not a whitelist.
-        for key, val in reservation_metadata.items():
-            if key not in provider_metadata:
-                provider_metadata[key] = val
+        # The reservation server is the source of truth for metadata it
+        # received from the provider. Do not let LLM-supplied lease or
+        # selector values redirect later provisioning or teardown actions.
+        if reservation_metadata:
+            provider_metadata = reservation_metadata
         # Always set provider_metadata when we have a
         # reservation — downstream agents (platform,
         # provisioning) require it for lease operations.
