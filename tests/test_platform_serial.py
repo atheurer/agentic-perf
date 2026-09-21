@@ -202,6 +202,7 @@ class TestPlatformServerSerialPassthrough:
                 "lease_id": "test-lease-123",
                 "exporter_name": "board-1",
                 "selector": "board-type=test",
+                "duration_seconds": 28_800,
             },
             "directives": {"serial_capture": True},
             "jumpstarter_flash": {
@@ -245,3 +246,38 @@ class TestPlatformServerSerialPassthrough:
             assert kwargs.kwargs.get("serial_capture") is True or (
                 len(kwargs.args) > 7 and kwargs.args[7] is True
             )
+            assert kwargs.kwargs["lease_duration_seconds"] == 28_800
+
+    @pytest.mark.asyncio
+    async def test_server_uses_provisioning_default_without_metadata_duration(self):
+        """Older tickets fall back to the provisioning default duration."""
+        from agents.platform import server
+
+        cf = {
+            "resource_provider": "jumpstarter",
+            "resource_provider_metadata": {
+                "lease_id": "test-lease-123",
+                "exporter_name": "board-1",
+            },
+            "jumpstarter_flash": {
+                "flash_targets": [{"url": "http://example.com/image.raw.xz"}],
+            },
+        }
+        fake_result = FakeProvisionResult(success=True, ip="10.0.0.1")
+
+        with (
+            patch(
+                "providers.resource.jumpstarter_provision.provision_jumpstarter",
+                new_callable=AsyncMock,
+                return_value=fake_result,
+            ) as mock_provision,
+            patch.object(
+                server,
+                "_ticket",
+                {"id": "PERF-TEST123", "custom_fields": cf},
+            ),
+            patch.object(server, "_ensure_init", new_callable=AsyncMock),
+        ):
+            await server.provision_platform()
+
+        assert "lease_duration_seconds" not in mock_provision.call_args.kwargs

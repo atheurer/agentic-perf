@@ -157,6 +157,7 @@ async def _provision_jumpstarter(
     board_name = metadata.get("exporter_name", "")
     lease_id = metadata.get("lease_id", "")
     selector = metadata.get("selector", "")
+    lease_duration_seconds = metadata.get("duration_seconds")
 
     from providers.resource.jumpstarter_provision import (
         provision_jumpstarter,
@@ -175,17 +176,24 @@ async def _provision_jumpstarter(
 
             artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
 
-    result = await provision_jumpstarter(
-        lease_name=lease_id,
-        flash_url=flash_url,
-        ssh_public_key=ssh_public_key,
-        ssh_key_path=ssh_key_path,
-        board_name=board_name,
-        selector=selector,
-        serial_capture=serial_enabled,
-        artifact_dir=artifact_dir,
-        ticket_id=ticket_id,
-    )
+    provision_kwargs: dict[str, Any] = {
+        "lease_name": lease_id,
+        "flash_url": flash_url,
+        "ssh_public_key": ssh_public_key,
+        "ssh_key_path": ssh_key_path,
+        "board_name": board_name,
+        "selector": selector,
+        "serial_capture": serial_enabled,
+        "artifact_dir": artifact_dir,
+        "ticket_id": ticket_id,
+    }
+    # The resource agent owns the requested lease duration. Preserve it when
+    # reopening the lease for provisioning instead of letting a local default
+    # shorten a long-running benchmark reservation.
+    if isinstance(lease_duration_seconds, int) and lease_duration_seconds > 0:
+        provision_kwargs["lease_duration_seconds"] = lease_duration_seconds
+
+    result = await provision_jumpstarter(**provision_kwargs)
 
     return json.dumps(
         {

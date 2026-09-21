@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from datetime import timedelta
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -222,6 +225,83 @@ class TestProvisionJumpstarter:
         assert r.success
         assert r.ip == "10.0.0.1"
         assert r.flash_duration_s == 120.5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requested_duration_seconds", "expected_duration_seconds"),
+        [(None, 14_400), (28_800, 28_800)],
+    )
+    async def test_async_provision_uses_requested_lease_duration(
+        self,
+        requested_duration_seconds: int | None,
+        expected_duration_seconds: int,
+    ):
+        """The lease context retains the resource agent's allocation."""
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _provision_async,
+        )
+
+        class AsyncContext:
+            def __init__(self, value):
+                self.value = value
+
+            async def __aenter__(self):
+                return self.value
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        portal = MagicMock()
+        lease = MagicMock(name="lease-123", exporter_name="board-1")
+        lease.serve_unix_async.return_value = AsyncContext("/tmp/jumpstarter.sock")
+        client = MagicMock()
+        config = MagicMock()
+        config.lease_async.return_value = AsyncContext(lease)
+
+        client_module = ModuleType("jumpstarter.client.client")
+        client_module.client_from_path = MagicMock(return_value=AsyncContext(client))
+        config_module = ModuleType("jumpstarter.config.client")
+        config_module.ClientConfigV1Alpha1 = MagicMock()
+        config_module.ClientConfigV1Alpha1.from_file.return_value = config
+
+        with (
+            patch(
+                "anyio.from_thread.BlockingPortal", return_value=AsyncContext(portal)
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    "jumpstarter": ModuleType("jumpstarter"),
+                    "jumpstarter.client": ModuleType("jumpstarter.client"),
+                    "jumpstarter.client.client": client_module,
+                    "jumpstarter.config": ModuleType("jumpstarter.config"),
+                    "jumpstarter.config.client": config_module,
+                },
+            ),
+            patch(
+                "providers.resource.jumpstarter_provision._run_provision_steps",
+                new_callable=AsyncMock,
+                return_value=ProvisionResult(success=True),
+            ),
+        ):
+            args = (
+                "lease-123",
+                "https://example.test/image.xz",
+                "ssh-rsa AAAA",
+                "board-1",
+                "/tmp/client.yaml",
+            )
+            kwargs = (
+                {"lease_duration_seconds": requested_duration_seconds}
+                if requested_duration_seconds is not None
+                else {}
+            )
+            await _provision_async(*args, **kwargs)
+
+        assert config.lease_async.call_args.kwargs["duration"] == timedelta(
+            seconds=expected_duration_seconds
+        )
 
 
 class TestProvisionJumpstarterSDK:

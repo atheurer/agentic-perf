@@ -15,7 +15,7 @@ Configuration via ~/.agentic-perf/secrets/jumpstarter/config.json:
         "token": "...",
         "namespace": "jumpstarter-lab",
         "default_selector": "",
-        "default_lease_duration_seconds": 7200,
+        "default_lease_duration_seconds": 14400,
         "ssh_user": "root",
         "tls_insecure": true
     }
@@ -35,6 +35,8 @@ from typing import Any
 from .base import ResourceProvider
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_LEASE_DURATION_SECONDS = 14_400
 
 # Label keys used by Jumpstarter exporters.
 # These are changing:
@@ -89,7 +91,7 @@ class JumpstarterResourceProvider(ResourceProvider):
         config_path: Path | None = None,
         namespace: str = "",
         default_selector: str = "",
-        default_lease_duration: int = 7200,
+        default_lease_duration: int = _DEFAULT_LEASE_DURATION_SECONDS,
         ssh_user: str = "root",
     ) -> None:
         self._client_name = client_name
@@ -154,7 +156,9 @@ class JumpstarterResourceProvider(ResourceProvider):
             config_path=config_path,
             namespace=cfg.get("namespace", ""),
             default_selector=cfg.get("default_selector", ""),
-            default_lease_duration=cfg.get("default_lease_duration_seconds", 7200),
+            default_lease_duration=cfg.get(
+                "default_lease_duration_seconds", _DEFAULT_LEASE_DURATION_SECONDS
+            ),
             ssh_user=cfg.get("ssh_user", "root"),
         )
 
