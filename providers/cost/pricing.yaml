@@ -292,6 +292,12 @@ models:
   # --- Google ---
   # Source: https://ai.google.dev/pricing
   # Cache: ~90% discount on reads
+  gemini-3.8-flash:
+    input_per_token: 0.00000075       # $0.75 / 1M tokens
+    cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
+    output_per_token: 0.00000375      # $3.75 / 1M tokens
+    context_window: 1048576
+
   gemini-3.7-flash:
     input_per_token: 0.00000075       # $0.75 / 1M tokens
     cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
@@ -311,6 +317,14 @@ models:
 
   gemini-3.1-pro:
     input_per_token: 0.000002         # $2.00 / 1M tokens (<= 200k)
+    cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
+    output_per_token: 0.000012        # $12.00 / 1M tokens
+    context_window: 2097152
+
+  # Preview matches the base model pricing.
+  # Prefix matching: gemini-3.1-pro-preview matches this entry.
+  gemini-3.1-pro-preview:
+    input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
     context_window: 2097152
