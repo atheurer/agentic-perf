@@ -784,61 +784,63 @@ class WorkspaceManager:
                 if len(parsed) > limit:
                     parsed = parsed[:limit]
                     truncated = True
-            # Enforce byte budget on the serialized result.
-            # Prevents large single objects or lists of big
-            # items from blowing up the LLM context.
-            result_json = json.dumps(parsed)
-            if len(result_json) > max_bytes:
-                truncated = True
-                # For lists, reduce items until under budget
-                if isinstance(parsed, list):
-                    while len(parsed) > 1:
-                        parsed.pop()
-                        result_json = json.dumps(parsed)
-                        if len(result_json) <= max_bytes:
-                            break
-                else:
-                    # For objects, return keys + size hint
-                    keys = list(parsed.keys()) if isinstance(parsed, dict) else []
-                    parsed = {
-                        "_truncated": True,
-                        "_original_size": len(result_json),
-                        "_keys": keys[:50],
-                        "_hint": (
-                            "Result too large. Use a more "
-                            "specific jq filter to extract "
-                            "only the fields you need."
-                        ),
-                    }
 
+            parsed, byte_truncated = self._bound_jq_result(parsed, max_bytes)
             return {
                 "status": "ok",
                 "file_ref": file_ref,
                 "query": query,
                 "result": parsed,
-                "truncated": truncated,
+                "truncated": truncated or byte_truncated,
                 "total_items": total_count,
             }
         except json.JSONDecodeError:
             # Could be stream of objects or scalar values
             lines = raw_out.splitlines()
-            if len(lines) > limit:
-                return {
-                    "status": "ok",
-                    "file_ref": file_ref,
-                    "query": query,
-                    "result": "\n".join(lines[:limit]),
-                    "truncated": True,
-                    "total_items": len(lines),
-                }
+            truncated = len(lines) > limit
+            result, byte_truncated = self._bound_jq_result(
+                "\n".join(lines[:limit]), max_bytes
+            )
             return {
                 "status": "ok",
                 "file_ref": file_ref,
                 "query": query,
-                "result": raw_out,
-                "truncated": False,
+                "result": result,
+                "truncated": truncated or byte_truncated,
                 "total_items": len(lines),
             }
+
+    @staticmethod
+    def _bound_jq_result(result: Any, max_bytes: int) -> tuple[Any, bool]:
+        """Return a JSON-serializable jq result within its byte budget."""
+        serialized = json.dumps(result)
+        original_size = len(serialized.encode("utf-8"))
+        if original_size <= max_bytes:
+            return result, False
+
+        if isinstance(result, list):
+            bounded: list[Any] = []
+            for item in result:
+                candidate = [*bounded, item]
+                if len(json.dumps(candidate).encode("utf-8")) > max_bytes:
+                    break
+                bounded.append(item)
+            if bounded:
+                return bounded, True
+
+        summary: dict[str, Any] = {
+            "_truncated": True,
+            "_original_size_bytes": original_size,
+            "_hint": (
+                "Result too large. Use a more specific jq filter to extract "
+                "only the fields you need."
+            ),
+        }
+        # A caller can request a budget smaller than the explanatory summary.
+        # Preserve the byte limit even then, rather than returning an oversized hint.
+        if len(json.dumps(summary).encode("utf-8")) <= max_bytes:
+            return summary, True
+        return None, True
 
     # Maximum characters per matched line in grep output.
     # Prevents single-line JSON files from returning the

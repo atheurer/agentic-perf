@@ -215,6 +215,36 @@ def test_jq_query_cdm_dataset(workspace):
     assert res["total_items"] == 100
 
 
+def test_jq_query_bounds_oversized_single_list_item_by_bytes(workspace):
+    workspace.save_file("large.json", json.dumps({"items": ["é" * 5000]}))
+
+    res = workspace.jq_query("workspace://large.json", ".items", max_bytes=100)
+
+    assert res["truncated"] is True
+    assert res["total_items"] == 1
+    assert res["result"] is None
+
+
+def test_jq_query_bounds_oversized_object_by_bytes(workspace):
+    workspace.save_file("large.json", json.dumps({"payload": "x" * 5000}))
+
+    res = workspace.jq_query("workspace://large.json", ".", max_bytes=256)
+
+    assert res["truncated"] is True
+    assert res["result"]["_truncated"] is True
+    assert len(json.dumps(res["result"]).encode("utf-8")) <= 256
+
+
+def test_jq_query_bounds_multidocument_stream_by_bytes(workspace):
+    workspace.save_file("large.json", json.dumps({"items": ["x" * 5000, "y" * 5000]}))
+
+    res = workspace.jq_query("workspace://large.json", ".items[]", max_bytes=100)
+
+    assert res["truncated"] is True
+    assert res["total_items"] == 2
+    assert res["result"] is None
+
+
 def test_grep_file_ethtool_dump(workspace):
     ethtool_content = (
         "NIC statistics for eth0:\n"
