@@ -326,6 +326,106 @@ class TestHandleCompletion:
         assert dedup["matched_investigation_id"] == "RCA-998"
         assert dedup["match_confidence"] == 0.92
 
+    @pytest.mark.asyncio
+    async def test_llm_match_persists_provider_record_url(self):
+        """A provider URL is persisted and rendered without trusting the LLM."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_gathering_context_result",
+                    input={
+                        "decision": "MATCH_FOUND",
+                        "matched_investigation_id": "RCA-998",
+                        "match_confidence": 0.92,
+                        "match_rationale": "Same regression",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+        provider = SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    record_url="https://horreum.example.com/run/101",
+                )
+            )
+        )
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+            return_value=provider,
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+        dedup = agent._update_fields.await_args_list[-1].args[1]["dedup_result"]
+        assert dedup["record_url"] == "https://horreum.example.com/run/101"
+        assert (
+            "[RCA-998](https://horreum.example.com/run/101)"
+            in (agent._add_comment.await_args.args[1])
+        )
+
+    @pytest.mark.asyncio
+    async def test_llm_match_omits_unavailable_provider_record_url(self):
+        """A provider without a URL leaves the dedup result and comment unlinked."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_gathering_context_result",
+                    input={
+                        "decision": "MATCH_FOUND",
+                        "matched_investigation_id": "RCA-998",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+        provider = SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(record_url=""))
+        )
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+            return_value=provider,
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+        assert agent._update_fields.await_count == 1
+        dedup = agent._update_fields.await_args.args[1]["dedup_result"]
+        assert "record_url" not in dedup
+        assert "[RCA-998](" not in agent._add_comment.await_args.args[1]
+
 
 # --- Triage routing ---
 
@@ -616,6 +716,7 @@ class TestDedupTemporalDecay:
         ts = datetime.now(timezone.utc) - timedelta(days=age_days)
         record.created_at = ts
         record.updated_at = ts
+        record.record_url = ""
         return record
 
     def _make_ticket(self):
@@ -654,6 +755,33 @@ class TestDedupTemporalDecay:
         dedup_result = update_call[0][1]["dedup_result"]
         assert dedup_result["match_confidence"] == 1.0
         assert dedup_result["record_age_days"] == 5
+
+    @pytest.mark.asyncio
+    async def test_deterministic_match_persists_provider_record_url(self):
+        """Deterministic matches preserve provider URLs in fields and comments."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(age_days=5)
+        record.record_url = "https://horreum.example.com/run/101"
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST8", self._make_ticket())
+
+        assert result is True
+        dedup = agent._update_fields.await_args.args[1]["dedup_result"]
+        assert dedup["record_url"] == "https://horreum.example.com/run/101"
+        assert (
+            "[RCA-AGE5](https://horreum.example.com/run/101)"
+            in (agent._add_comment.await_args.args[1])
+        )
 
     @pytest.mark.asyncio
     async def test_aging_record_reduced_confidence(self):
