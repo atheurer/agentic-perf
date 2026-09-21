@@ -784,8 +784,32 @@ class WorkspaceManager:
                 if len(parsed) > limit:
                     parsed = parsed[:limit]
                     truncated = True
-            elif isinstance(parsed, dict) and len(raw_out) > max_bytes:
+            # Enforce byte budget on the serialized result.
+            # Prevents large single objects or lists of big
+            # items from blowing up the LLM context.
+            result_json = json.dumps(parsed)
+            if len(result_json) > max_bytes:
                 truncated = True
+                # For lists, reduce items until under budget
+                if isinstance(parsed, list):
+                    while len(parsed) > 1:
+                        parsed.pop()
+                        result_json = json.dumps(parsed)
+                        if len(result_json) <= max_bytes:
+                            break
+                else:
+                    # For objects, return keys + size hint
+                    keys = list(parsed.keys()) if isinstance(parsed, dict) else []
+                    parsed = {
+                        "_truncated": True,
+                        "_original_size": len(result_json),
+                        "_keys": keys[:50],
+                        "_hint": (
+                            "Result too large. Use a more "
+                            "specific jq filter to extract "
+                            "only the fields you need."
+                        ),
+                    }
 
             return {
                 "status": "ok",
@@ -815,6 +839,13 @@ class WorkspaceManager:
                 "truncated": False,
                 "total_items": len(lines),
             }
+
+    # Maximum characters per matched line in grep output.
+    # Prevents single-line JSON files from returning the
+    # entire file as one match.
+    _GREP_LINE_LIMIT = 1000
+    # Maximum total size of grep output in characters.
+    _GREP_OUTPUT_LIMIT = 16_000
 
     def grep_file(
         self,
@@ -857,19 +888,37 @@ class WorkspaceManager:
         total_matches = len(matching_indices)
 
         emitted_indices = set()
+        output_chars = 0
+        output_truncated = False
         for idx in matching_indices[:max_lines]:
             start = max(0, idx - context_lines)
             end = min(len(lines), idx + context_lines + 1)
             for i in range(start, end):
                 if i not in emitted_indices:
                     emitted_indices.add(i)
+                    content = lines[i].rstrip("\r\n")
+                    line_truncated = False
+                    if len(content) > self._GREP_LINE_LIMIT:
+                        content = content[: self._GREP_LINE_LIMIT]
+                        line_truncated = True
+                    output_chars += len(content)
                     matches.append(
                         {
                             "line_number": i + 1,
-                            "content": lines[i].rstrip("\r\n"),
+                            "content": content,
                             "is_match": i == idx,
+                            **(
+                                {
+                                    "truncated": True,
+                                }
+                                if line_truncated
+                                else {}
+                            ),
                         }
                     )
+            if output_chars >= self._GREP_OUTPUT_LIMIT:
+                output_truncated = True
+                break
 
         matches.sort(key=lambda x: x["line_number"])
 
@@ -880,7 +929,7 @@ class WorkspaceManager:
             "total_matches": total_matches,
             "matches_returned": len([m for m in matches if m["is_match"]]),
             "lines": matches,
-            "truncated": total_matches > max_lines,
+            "truncated": total_matches > max_lines or output_truncated,
         }
 
     def read_file_slice(

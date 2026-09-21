@@ -1919,11 +1919,33 @@ class AgentBase(ABC):
             )
             try:
                 try:
-                    inspect.signature(handler).bind(**call_input)
+                    sig = inspect.signature(handler)
+                    sig.bind(**call_input)
                 except TypeError as e:
+                    # Wrong parameter names — show the correct ones.
+                    try:
+                        params = [
+                            (
+                                f"{p.name} ({p.annotation.__name__})"
+                                if p.annotation != inspect.Parameter.empty
+                                else p.name
+                            )
+                            for p in sig.parameters.values()
+                        ]
+                        hint = (
+                            f"Tool error: {e}. Expected parameters: {', '.join(params)}"
+                        )
+                    except Exception:
+                        hint = f"Tool error: {e}"
+                    logger.warning(
+                        "[%s] Tool %s parameter error: %s",
+                        self.agent_name,
+                        tool_call.name,
+                        e,
+                    )
                     return ToolResult(
                         tool_use_id=tool_call.id,
-                        content=self._tool_error_content(e, "validation"),
+                        content=hint,
                         is_error=True,
                     )
 
