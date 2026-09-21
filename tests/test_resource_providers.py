@@ -2127,6 +2127,41 @@ class TestFreeFormExtraction:
         assert result["targets"] == ["worker.example.com"]
 
 
+class TestUnderscoreAdjacentHostRejection:
+    """Host-like substrings in underscore-delimited tokens are not hosts."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "controller: bad_host.example.com",
+            "controller: host.example.com_backup",
+            "controller: host_name.example.com",
+            "controller: host.example.com.bad_label",
+            "controller: snapshot_10.1.2.3",
+            "controller: 10.1.2.3_old",
+        ],
+    )
+    async def test_underscore_adjacent_candidates_are_rejected(self, no_secrets, text):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](text=text)
+        assert result["controller"] is None
+        assert result["targets"] == []
+
+    @pytest.mark.asyncio
+    async def test_free_form_delimiters_remain_valid(self, no_secrets):
+        from tests.conftest import make_resource_handlers
+
+        handlers = make_resource_handlers(secrets_provider=no_secrets)
+        result = await handlers["parse_host_config"](
+            text="controller: root@ctrl.example.com:22 target=10.2.3.4",
+        )
+        assert result["controller"] == "ctrl.example.com"
+        assert result["targets"] == ["10.2.3.4"]
+
+
 class TestValidateHostKeyPassthrough:
     """validate_host must pass an explicitly-provided key through to ssh.run.
 
