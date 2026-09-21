@@ -179,13 +179,21 @@ _IMAGE_SERVERS: dict[str, str] = {
 def _derive_image_server(
     labels: dict[str, Any],
     os_id: str,
+    image_version: str = "",
 ) -> str:
-    """Derive image server URL from run metadata."""
+    """Derive image server URL from run metadata or image version."""
     if os_id and os_id in _IMAGE_SERVERS:
         return _IMAGE_SERVERS[os_id]
     label_os = labels.get("RHIVOS OS ID", "")
     if label_os and label_os in _IMAGE_SERVERS:
         return _IMAGE_SERVERS[label_os]
+    # For manual tickets without run metadata, derive
+    # the server from image_version (e.g., RHIVOS-2 → rhivos).
+    if image_version:
+        version_lower = image_version.lower()
+        for key in _IMAGE_SERVERS:
+            if version_lower.startswith(key):
+                return _IMAGE_SERVERS[key]
     return ""
 
 
@@ -330,21 +338,22 @@ async def resolve_images(
         # 2. Run metadata (knows which OS produced the alert)
         # 3. Config default (jumpstarter_images.server)
         # 4. Hardcoded AutoSD fallback
+        image_version = directives.get(
+            "image_version",
+            img_cfg.get("image_version", ""),
+        )
+
         base_url = directives.get("image_server", "")
         if not base_url:
             base_url = _derive_image_server(
                 run_labels,
                 run_meta.get("os_id", ""),
+                image_version=image_version,
             )
         if not base_url:
             base_url = img_cfg.get("server", "")
         if not base_url:
             base_url = "https://autosd.sig.centos.org/"
-
-        image_version = directives.get(
-            "image_version",
-            img_cfg.get("image_version", ""),
-        )
 
         # Fall back to run_metadata from webhook enrichment.
         # Derive image parameters from the run that triggered
