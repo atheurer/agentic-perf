@@ -843,14 +843,14 @@ async def run_agent_task(
         if status in ("preparing_platform", "awaiting_provision"):
             from orchestrator.config import _load_config_file
 
-            # Pass only the Bearer token — not the
-            # fencing headers (session/epoch).  The fence
-            # requires all three (session+epoch+claim_id)
-            # or none; lifecycle hooks run outside a claim
-            # so including session+epoch without claim_id
-            # causes a silent 409.
-            _token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            _lifecycle_headers = {"Authorization": f"Bearer {_token}"} if _token else {}
+            # Lifecycle writes must carry the complete claim fence.
+            # Session/epoch without the ticket claim ID are rejected,
+            # while omitting all fencing headers would permit a
+            # deposed worker to update the ticket.
+            _lifecycle_headers = dispatcher._auth_headers()
+            _claim_id = dispatcher._claim_ids.get(ticket_id)
+            if _claim_id:
+                _lifecycle_headers["X-Agentic-Perf-Claim-Id"] = _claim_id
             await _resolve_jumpstarter_images(
                 dispatcher.store_url,
                 ticket_id,
