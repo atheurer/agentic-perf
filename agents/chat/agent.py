@@ -420,12 +420,95 @@ class ChatAgent:
         else:
             available_tools = CHAT_TOOLS
 
+        # Deadline-aware execution: always respond before
+        # the HTTP timeout.  Reserve time for a final LLM
+        # call to summarize what was found.
+        llm_timeout = getattr(self._llm, "timeout", None) or 60
+        deadline = time.monotonic() + llm_timeout
+        _WRAP_UP_RESERVE = 15  # seconds for final response
+        _MIN_ROUND_TIME = 10  # minimum for a tool round
+
         for _round in range(self._max_tool_rounds):
-            response = await self._llm.complete(
-                system_prompt=system_prompt,
-                messages=session.messages,
-                tools=available_tools,
-            )
+            remaining = deadline - time.monotonic()
+
+            # Not enough time for another tool round —
+            # ask the LLM to respond with what it has.
+            if remaining < _WRAP_UP_RESERVE + _MIN_ROUND_TIME:
+                wrap_prompt = (
+                    system_prompt + "\n\n**IMPORTANT: You are almost out of "
+                    "time. Respond NOW with the best answer "
+                    "you can from the information you already "
+                    "have. Do NOT call any more tools.**"
+                )
+                try:
+                    response = await self._llm.complete(
+                        system_prompt=wrap_prompt,
+                        messages=session.messages,
+                        tools=[],
+                    )
+                    session.record_usage(response.usage)
+                    text = response.text or (
+                        "I wasn't able to fully complete your "
+                        "request in time, but here's what I "
+                        "found so far. Try asking a follow-up "
+                        "for more details."
+                    )
+                except Exception:
+                    text = (
+                        "I ran out of time processing your "
+                        "request. Here's a tip: for ticket "
+                        "creation, just describe what you want "
+                        "and I'll create it directly."
+                    )
+                session.add_assistant_message(text)
+                return text
+
+            try:
+                response = await self._llm.complete(
+                    system_prompt=system_prompt,
+                    messages=session.messages,
+                    tools=available_tools,
+                )
+            except Exception as exc:
+                # LLM call failed (timeout, rate limit, etc.)
+                logger.warning(
+                    "Chat LLM call failed on round %d: %s",
+                    _round + 1,
+                    exc,
+                )
+                if _round > 0:
+                    # Later rounds: return partial results.
+                    text = (
+                        "I encountered an issue while processing "
+                        "your request. Here's what I found so "
+                        "far — try asking a follow-up for more "
+                        "details."
+                    )
+                    session.add_assistant_message(text)
+                    return text
+
+                # Round 0: retry once without tools for a
+                # direct answer instead of giving up.
+                logger.info("Chat retrying round 0 without tools")
+                try:
+                    response = await self._llm.complete(
+                        system_prompt=system_prompt,
+                        messages=session.messages,
+                        tools=[],
+                    )
+                    session.record_usage(response.usage)
+                    text = response.text or (
+                        "I wasn't able to use my tools for "
+                        "this request. Could you try rephrasing?"
+                    )
+                except Exception:
+                    text = (
+                        "I'm having trouble processing your "
+                        "request right now. Please try again."
+                    )
+                session.add_assistant_message(text)
+                return text
+
             session.record_usage(response.usage)
 
             # No tool calls — return the text response
@@ -503,8 +586,8 @@ class ChatAgent:
 
         # Exhausted tool rounds
         fallback = (
-            "I've reached my tool call limit for this message. "
-            "Please try rephrasing your request."
+            "I've used all my available steps for this message. "
+            "If you need more detail, try a follow-up question."
         )
         session.add_assistant_message(fallback)
         return fallback
