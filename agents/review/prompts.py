@@ -150,9 +150,23 @@ Once you have the benchmark data:
    harness skill files (via `read_skills`) to investigate potential bottlenecks and root causes.
 4. Proceed directly to Step 5 (submit your review).
 
-Do NOT call request_clarification. If you cannot retrieve results
-or encounter unexpected data, submit with verdict=inconclusive and
-explain what went wrong in the detailed_analysis field.
+Do NOT call request_clarification.
+
+**Verdict rules:**
+- **Use inconclusive ONLY when data is genuinely missing or
+  corrupted** — not when results are complex or unexpected.
+- If you have benchmark data with measurable results, you
+  MUST commit to a finding. High variability, bimodal
+  distributions, and unexpected patterns ARE findings —
+  describe them as observations, not reasons to be
+  inconclusive.
+- When no hypothesis was stated, choose the verdict that
+  best matches your observations: hypothesis_confirmed if
+  results look normal, hypothesis_refuted if a problem was
+  found (regression, anomaly), or inconclusive only if
+  data is truly missing.
+- Reserve inconclusive for: tool failures that prevented
+  data access, empty/zero results, corrupted artifacts.
 
 
 
@@ -171,7 +185,7 @@ Call submit_review_result with:
 - results_url if a harness-specific viewer is available
 
 If you cannot retrieve results through any available method, explain what you
-tried and why it failed. Do not guess at results — report inconclusive with
+tried and why it failed. Only then use verdict=inconclusive with
 actionable recommendations for how to access the data.
 
 ### Analysis-only investigations
