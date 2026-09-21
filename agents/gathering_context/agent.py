@@ -398,7 +398,7 @@ class GatheringContextAgent(AgentBase):
 
                 provider = create_record_provider()
                 record = await provider.get(matched_id)
-                if record:
+                if record and record.record_url:
                     record_url = record.record_url
                     fields["dedup_result"]["record_url"] = record_url
                     await self._update_fields(ticket_id, fields)

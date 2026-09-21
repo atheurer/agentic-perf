@@ -98,11 +98,13 @@ async def test_create_uploads_run():
     p._client.post = mock_post
 
     record = _make_record()
+    record.record_url = "https://horreum.example.com/run/101"
     rid = await p.create(record)
 
     assert rid == "RCA-TEST0001"
     assert posted_payload.get("$schema") == _SCHEMA_URI
     assert posted_payload.get("investigation_id") == "RCA-TEST0001"
+    assert "record_url" not in posted_payload
 
 
 # --- Get ---
@@ -149,6 +151,32 @@ async def test_get_finds_record():
     assert result is not None
     assert result.investigation_id == "RCA-TEST0001"
     assert result.anomaly_context.subsystem == "storage_io"
+    assert result.record_url == "https://horreum.example.com/run/101"
+
+
+@pytest.mark.asyncio
+async def test_query_populates_direct_run_url():
+    """Query derives the direct Horreum URL rather than persisting it."""
+    p = HorreumRecordProvider(
+        url="https://horreum.example.com/",
+        test_id=42,
+    )
+    record = _make_record()
+    payload = record.model_dump(mode="json")
+    payload["$schema"] = _SCHEMA_URI
+
+    async def mock_get(*args, **kwargs):
+        url = args[0] if args else kwargs.get("url", "")
+        if "list" in str(url):
+            return _mock_response(json_data={"runs": [{"id": 101}]})
+        return _mock_response(json_data={"data": payload})
+
+    p._client.get = mock_get
+
+    result = await p.query(metric="iops_4k_randread")
+
+    assert len(result) == 1
+    assert result[0].record_url == "https://horreum.example.com/run/101"
 
 
 @pytest.mark.asyncio
