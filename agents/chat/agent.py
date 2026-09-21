@@ -370,21 +370,24 @@ class ChatAgent:
             except Exception:
                 pass
 
-            # Only prepend full context on first message in
-            # this ticket view to avoid token waste on repeats.
-            has_context = any(
+            # Always prefix with the current ticket so the
+            # LLM knows which ticket "this" refers to, even
+            # when the user switches between ticket views.
+            # Full ticket data is fetched once per ticket;
+            # subsequent messages get just the identity prefix.
+            has_full_context = any(
                 f"[Context: viewing ticket {ticket_context}]"
                 in str(m.get("content", ""))
                 for m in session.messages
             )
-            if has_context:
-                session.add_user_message(message)
+            if has_full_context:
+                prefixed = f"[You are viewing ticket {ticket_context}]\nUser: {message}"
             else:
                 prefixed = (
                     f"[Context: viewing ticket {ticket_context}]"
                     f"{ticket_info}\n\nUser: {message}"
                 )
-                session.add_user_message(prefixed)
+            session.add_user_message(prefixed)
         else:
             session.add_user_message(message)
 

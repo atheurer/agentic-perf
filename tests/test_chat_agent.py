@@ -569,7 +569,8 @@ class TestHandleMessage:
         first_msg = session.messages[0]["content"]
         assert "[Context: viewing ticket PERF-TEST]" in first_msg
 
-        # Second message should NOT repeat context
+        # Second message gets identity prefix but not
+        # full ticket data.
         await agent.handle_message(
             user="alice",
             message="tell me more",
@@ -582,6 +583,7 @@ class TestHandleMessage:
             if m["role"] == "user" and "tell me more" in str(m["content"])
         ]
         assert len(second_user_msgs) == 1
+        assert "[You are viewing ticket PERF-TEST]" in second_user_msgs[0]["content"]
         assert "[Context:" not in second_user_msgs[0]["content"]
 
 
