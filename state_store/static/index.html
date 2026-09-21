@@ -2021,7 +2021,11 @@ function ticketOutcome(ticket) {
   // Dedup match
   if (dedup && dedup.decision === 'MATCH_FOUND') {
     return '<span class="outcome outcome-pass">DEDUP \u2014 ' +
-      escHtml(String(dedup.matched_investigation_id)) + '</span>';
+      renderRecordLink(
+        dedup.record_url,
+        dedup.matched_investigation_id,
+        'color:inherit'
+      ) + '</span>';
   }
 
   // Synthesis outcome
@@ -2067,6 +2071,22 @@ function ticketOutcome(ticket) {
 function escHtml(s) {
   if (typeof s !== 'string') s = String(s);
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Investigation record URLs come from provider metadata but are persisted in
+// ticket fields. Only render navigable http(s) URLs; all other values remain
+// visible as plain, escaped record IDs.
+function renderRecordLink(recordUrl, recordId, style) {
+  var label = escHtml(String(recordId));
+  if (!recordUrl) return label;
+  try {
+    var url = new URL(String(recordUrl));
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return label;
+    return '<a href="' + escHtml(url.href) + '" target="_blank" ' +
+      'rel="noopener noreferrer" style="' + style + '">' + label + '</a>';
+  } catch (e) {
+    return label;
+  }
 }
 
 function renderMarkdown(s) {
@@ -2676,7 +2696,11 @@ function renderHypothesisCard(ticket) {
   // Investigation pipeline outcomes
   if (!verdict && dedupResult && dedupResult.decision === 'MATCH_FOUND') {
     html += '<div class="result-verdict pass" style="margin-top:12px">' +
-      'DEDUP MATCH \u2014 ' + escHtml(String(dedupResult.matched_investigation_id)) + '</div>';
+      'DEDUP MATCH \u2014 ' + renderRecordLink(
+        dedupResult.record_url,
+        dedupResult.matched_investigation_id,
+        'color:inherit; text-decoration:underline'
+      ) + '</div>';
     html += '<div class="result-summary">' +
       'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
       expandableText(String(dedupResult.match_rationale || ''), 200) + '</div>';
