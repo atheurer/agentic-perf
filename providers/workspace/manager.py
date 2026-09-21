@@ -784,37 +784,70 @@ class WorkspaceManager:
                 if len(parsed) > limit:
                     parsed = parsed[:limit]
                     truncated = True
-            elif isinstance(parsed, dict) and len(raw_out) > max_bytes:
-                truncated = True
 
+            parsed, byte_truncated = self._bound_jq_result(parsed, max_bytes)
             return {
                 "status": "ok",
                 "file_ref": file_ref,
                 "query": query,
                 "result": parsed,
-                "truncated": truncated,
+                "truncated": truncated or byte_truncated,
                 "total_items": total_count,
             }
         except json.JSONDecodeError:
             # Could be stream of objects or scalar values
             lines = raw_out.splitlines()
-            if len(lines) > limit:
-                return {
-                    "status": "ok",
-                    "file_ref": file_ref,
-                    "query": query,
-                    "result": "\n".join(lines[:limit]),
-                    "truncated": True,
-                    "total_items": len(lines),
-                }
+            truncated = len(lines) > limit
+            result, byte_truncated = self._bound_jq_result(
+                "\n".join(lines[:limit]), max_bytes
+            )
             return {
                 "status": "ok",
                 "file_ref": file_ref,
                 "query": query,
-                "result": raw_out,
-                "truncated": False,
+                "result": result,
+                "truncated": truncated or byte_truncated,
                 "total_items": len(lines),
             }
+
+    @staticmethod
+    def _bound_jq_result(result: Any, max_bytes: int) -> tuple[Any, bool]:
+        """Return a JSON-serializable jq result within its byte budget."""
+        serialized = json.dumps(result)
+        original_size = len(serialized.encode("utf-8"))
+        if original_size <= max_bytes:
+            return result, False
+
+        if isinstance(result, list):
+            bounded: list[Any] = []
+            for item in result:
+                candidate = [*bounded, item]
+                if len(json.dumps(candidate).encode("utf-8")) > max_bytes:
+                    break
+                bounded.append(item)
+            if bounded:
+                return bounded, True
+
+        summary: dict[str, Any] = {
+            "_truncated": True,
+            "_original_size_bytes": original_size,
+            "_hint": (
+                "Result too large. Use a more specific jq filter to extract "
+                "only the fields you need."
+            ),
+        }
+        # A caller can request a budget smaller than the explanatory summary.
+        # Preserve the byte limit even then, rather than returning an oversized hint.
+        if len(json.dumps(summary).encode("utf-8")) <= max_bytes:
+            return summary, True
+        return None, True
+
+    # Maximum characters per matched line in grep output.
+    # Prevents single-line JSON files from returning the
+    # entire file as one match.
+    _GREP_LINE_LIMIT = 1000
+    # Maximum total size of grep output in characters.
+    _GREP_OUTPUT_LIMIT = 16_000
 
     def grep_file(
         self,
@@ -857,19 +890,37 @@ class WorkspaceManager:
         total_matches = len(matching_indices)
 
         emitted_indices = set()
+        output_chars = 0
+        output_truncated = False
         for idx in matching_indices[:max_lines]:
             start = max(0, idx - context_lines)
             end = min(len(lines), idx + context_lines + 1)
             for i in range(start, end):
                 if i not in emitted_indices:
                     emitted_indices.add(i)
+                    content = lines[i].rstrip("\r\n")
+                    line_truncated = False
+                    if len(content) > self._GREP_LINE_LIMIT:
+                        content = content[: self._GREP_LINE_LIMIT]
+                        line_truncated = True
+                    output_chars += len(content)
                     matches.append(
                         {
                             "line_number": i + 1,
-                            "content": lines[i].rstrip("\r\n"),
+                            "content": content,
                             "is_match": i == idx,
+                            **(
+                                {
+                                    "truncated": True,
+                                }
+                                if line_truncated
+                                else {}
+                            ),
                         }
                     )
+            if output_chars >= self._GREP_OUTPUT_LIMIT:
+                output_truncated = True
+                break
 
         matches.sort(key=lambda x: x["line_number"])
 
@@ -880,7 +931,7 @@ class WorkspaceManager:
             "total_matches": total_matches,
             "matches_returned": len([m for m in matches if m["is_match"]]),
             "lines": matches,
-            "truncated": total_matches > max_lines,
+            "truncated": total_matches > max_lines or output_truncated,
         }
 
     def read_file_slice(

@@ -122,6 +122,22 @@ When tools return large outputs (> 4 KB by default, configurable via `custom_fie
 - **Searching**: Use `grep_file_from_workspace` to jump directly to errors, drops, or specific pattern matches in large log files.
 - **Listing**: Use `list_files_from_workspace` to see all saved files in the ticket workspace.
 
+**IMPORTANT — efficient workspace queries:**
+Workspace files can be very large (100KB+). Every tool result
+accumulates in your context and is re-sent with every LLM call.
+Inefficient queries waste tokens exponentially.
+
+- **Use specific jq filters.** NEVER use `.` on large files.
+  Extract only the fields you need:
+  `.results[] | {metric, value}` not `.results`
+- **Use narrow grep patterns.** Grep returns full matching
+  lines. On single-line JSON files, one match returns the
+  entire file. Use jq instead of grep for JSON files.
+- **Don't re-read artifacts.** Read each file once, extract
+  what you need with jq, then work from the extracted data.
+- **Use jq_filter in tool calls.** Pass the filter inline
+  instead of spilling then querying — saves a round trip.
+
 ## Step 4: Analysis
 
 Once you have the benchmark data:
