@@ -738,7 +738,7 @@ class ResourceAgent(AgentBase):
         if reservation_id:
             fields["resource_reservation_id"] = reservation_id
 
-        provider_metadata = result.get("resource_provider_metadata") or {}
+        provider_metadata = dict(result.get("resource_provider_metadata") or {})
         reservation_metadata: dict[str, Any] = {}
         if self._mcp:
             try:
@@ -746,15 +746,12 @@ class ResourceAgent(AgentBase):
                 reservation_metadata = json.loads(raw) if raw else {}
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
-        for key in (
-            "public_ips",
-            "private_ips",
-            "ip_mapping",
-            "ami",
-            "cloud_login_user",
-        ):
-            if key in reservation_metadata and key not in provider_metadata:
-                provider_metadata[key] = reservation_metadata[key]
+        # The reservation server is the source of truth for metadata it
+        # received from the provider.  Once it returned metadata, retain
+        # only that authoritative record rather than accepting arbitrary
+        # LLM-supplied provider fields.
+        if reservation_metadata:
+            provider_metadata = reservation_metadata
         if provider_metadata:
             fields["resource_provider_metadata"] = provider_metadata
 

@@ -305,6 +305,13 @@ class TestReserve:
         assert result["board_target"] == "ride4_sa8775p_sx_r3"
         assert result["status"] == "active"
         assert result["ssh_user"] == "root"
+        assert result["provider_metadata"] == {
+            "lease_id": "lease-abc123",
+            "exporter_name": "device-01",
+            "board_target": "ride4_sa8775p_sx_r3",
+            "selector": "target=myboard,enabled=true,pool=open",
+            "duration_seconds": 3600,
+        }
 
         # Verify CreateLease was called correctly
         mock_svc.CreateLease.assert_called_once()

@@ -676,6 +676,13 @@ class JumpstarterResourceProvider(ResourceProvider):
                     exc_info=True,
                 )
 
+        provider_metadata = {
+            "lease_id": lease_name,
+            "exporter_name": exporter_name,
+            "board_target": board_target,
+            "selector": selector,
+            "duration_seconds": duration_sec,
+        }
         return {
             "provider": "jumpstarter",
             "lease_id": lease_name,
@@ -685,6 +692,7 @@ class JumpstarterResourceProvider(ResourceProvider):
             "duration_seconds": duration_sec,
             "ssh_user": self._ssh_user,
             "status": "active",
+            "provider_metadata": provider_metadata,
         }
 
     async def get_reservation_status(
