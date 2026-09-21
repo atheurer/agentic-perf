@@ -625,3 +625,52 @@ class TestChatAPI:
             json={"message": "hello"},
         )
         assert r.status_code == 401
+
+
+class TestBenchmarkCatalog:
+    """Tests for the shared benchmark catalog helpers."""
+
+    async def test_includes_standalone(self):
+        from providers.skills.catalog import STANDALONE_BENCHMARKS, benchmark_entry
+
+        entries = [benchmark_entry(s) for s in STANDALONE_BENCHMARKS]
+        names = [e["name"] for e in entries]
+        assert "boot-time" in names
+
+    async def test_catalog_filters_harness(self):
+        from providers.skills.catalog import (
+            list_benchmark_catalog,
+        )
+
+        class StubProvider:
+            def list_harnesses(self):
+                return []
+
+            def get_provider(self, harness):
+                return None
+
+        entries, _ = await list_benchmark_catalog(StubProvider())
+        boot = [e for e in entries if e["harness"] == "boot-time"]
+        assert len(boot) == 1
+        assert boot[0]["name"] == "boot-time"
+
+    async def test_get_catalog_benchmark_standalone(self):
+        from providers.skills.catalog import get_catalog_benchmark
+
+        class StubProvider:
+            async def get_benchmark(self, name):
+                return None
+
+        result = await get_catalog_benchmark(StubProvider(), "boot-time")
+        assert result is not None
+        assert result["harness"] == "boot-time"
+
+    async def test_get_catalog_benchmark_not_found(self):
+        from providers.skills.catalog import get_catalog_benchmark
+
+        class StubProvider:
+            async def get_benchmark(self, name):
+                return None
+
+        result = await get_catalog_benchmark(StubProvider(), "nonexistent")
+        assert result is None
