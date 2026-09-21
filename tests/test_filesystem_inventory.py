@@ -207,11 +207,11 @@ agents/infra/server.py|217|staging.unlink
 agents/infra/server.py|219|unlink
 agents/infra/server.py|295|filesystem.mkdir
 agents/infra/server.py|299|tempfile.mkdtemp
-orchestrator/main.py|2080|LOCK_FILE.parent.mkdir
-orchestrator/main.py|2081|os.open
-orchestrator/main.py|2096|os.ftruncate
-orchestrator/main.py|2097|os.write
-orchestrator/main.py|2117|LOCK_FILE.unlink
+orchestrator/main.py|2104|LOCK_FILE.parent.mkdir
+orchestrator/main.py|2105|os.open
+orchestrator/main.py|2120|os.ftruncate
+orchestrator/main.py|2121|os.write
+orchestrator/main.py|2141|LOCK_FILE.unlink
 paths.py|145|mkdir
 paths.py|152|tempfile.mkdtemp
 paths.py|170|ws_dir.mkdir
