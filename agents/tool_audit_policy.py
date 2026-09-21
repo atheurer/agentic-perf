@@ -299,6 +299,7 @@ TOOL_AUDIT_POLICY = (
         "agents/chat/tools.py:list_skills",
         "agents/chat/tools.py:read_skill",
         "agents/chat/tools.py:read_doc",
+        "agents/chat/tools.py:list_available_benchmarks",
         "agents/chat/tools.py:list_users",
         chat=True,
     ),

@@ -132,6 +132,7 @@ class TestToolDefinitions:
         assert "send_interjection" in names
         assert "reply_to_guidance" in names
         assert "stop_ticket" in names
+        assert "list_available_benchmarks" in names
 
     def test_all_tools_have_schemas(self):
         for tool in CHAT_TOOLS:
@@ -150,6 +151,60 @@ class TestToolDefinitions:
 
 
 class TestToolExecution:
+    async def test_list_available_benchmarks_is_read_only_and_filterable(
+        self, monkeypatch
+    ):
+        from agents.chat import tools
+        from providers.skills.base import BenchmarkSuite
+
+        class Provider:
+            def list_harnesses(self):
+                return ["crucible", "offline"]
+
+            def get_provider(self, harness):
+                if harness == "offline":
+                    return OfflineProvider()
+                return CrucibleProvider()
+
+        class CrucibleProvider:
+            async def list_benchmarks(self):
+                return [
+                    BenchmarkSuite(
+                        name="fio",
+                        description="Storage I/O",
+                        harness="crucible",
+                        roles=["client"],
+                        min_hosts=1,
+                    )
+                ]
+
+        class OfflineProvider:
+            async def list_benchmarks(self):
+                raise RuntimeError("catalog unavailable")
+
+        monkeypatch.setattr(
+            tools, "_get_benchmark_catalog_provider", lambda: Provider()
+        )
+        client = AsyncMock()
+        result = json.loads(
+            await execute_tool(
+                "list_available_benchmarks",
+                {"query": "storage"},
+                client,
+                "http://localhost:8090",
+                "token123",
+                audit=_audit(client),
+            )
+        )
+
+        assert result["total"] == 1
+        assert result["harnesses"] == ["crucible"]
+        assert result["benchmarks"]["crucible"][0]["name"] == "fio"
+        assert result["unavailable_harnesses"] == ["offline"]
+        client.get.assert_not_awaited()
+        client.patch.assert_not_awaited()
+        client.post.assert_not_awaited()
+
     async def test_search_tickets(self):
         client = AsyncMock()
         response = AsyncMock()
