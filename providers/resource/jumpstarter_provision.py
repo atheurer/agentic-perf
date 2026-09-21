@@ -176,7 +176,11 @@ async def provision_jumpstarter(
             lease_duration_seconds,
         )
         result = prov_result
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        # Cancellation is a control-flow signal.  The finally block still
+        # stops serial capture, but the caller must observe cancellation.
+        raise
+    except Exception as exc:
         # Unwrap ExceptionGroup/TaskGroup to expose the
         # real error (e.g., 'Failed to get U-Boot prompt')
         # instead of the generic wrapper message.

@@ -179,6 +179,26 @@ class TestProvisionSerialCapture:
             assert not result.success
             assert any("exception" in d.lower() for d in result.diagnostics)
 
+    @pytest.mark.asyncio
+    async def test_provisioning_cancellation_propagates(self):
+        """Cancellation must not be converted to a failed provision result."""
+        import asyncio
+
+        from providers.resource.jumpstarter_provision import (
+            provision_jumpstarter,
+        )
+
+        with patch(
+            "providers.resource.jumpstarter_provision._provision_sync",
+            side_effect=asyncio.CancelledError(),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await provision_jumpstarter(
+                    lease_name="test-lease-cancelled",
+                    flash_url="http://example.com/image.raw.xz",
+                    ssh_public_key="ssh-rsa AAAA",
+                )
+
     def test_provision_result_has_serial_field(self):
         """ProvisionResult dataclass includes serial_log_path."""
         from providers.resource.jumpstarter_provision import (
