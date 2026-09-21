@@ -464,6 +464,8 @@ class BenchmarkAgent(AgentBase):
             "get_runfile_schema",
             "get_benchmark_params",
             "get_plugin_schema",
+            "plugin_list",
+            "plugin_describe",
             "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",
