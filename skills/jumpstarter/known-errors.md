@@ -67,3 +67,21 @@ or disabled.
 
 **Fix:** Wait for a device to become available, or check
 if the selector is correct via `list_jumpstarter_targets`.
+
+## Exporter Disconnect During Provisioning
+
+**Error:** `gRPC UNAVAILABLE: Stream removed (Socket closed)`
+or `Connection to exporter lost: exporter is offline`
+
+**Cause:** The Jumpstarter exporter's gRPC session drops
+during or after a board reboot. This is a transient
+condition — the exporter typically reconnects within
+30-60 seconds.
+
+**Recovery:** The provisioning code automatically retries
+TCP address resolution with backoff (30s, 45s, 60s waits).
+If all retries fail, the platform agent escalates to HITL.
+
+**User action if HITL:** Retry — the exporter usually
+recovers. If the board consistently fails, try a different
+board of the same type.
