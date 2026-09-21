@@ -206,4 +206,5 @@ async def test_signature_mismatch_is_rejected_before_handler_entry(agent):
 
     assert calls == 0
     assert result.is_error
-    assert json.loads(result.content)["retry_classification"] == "validation"
+    assert "missing a required argument" in result.content
+    assert "required (str)" in result.content

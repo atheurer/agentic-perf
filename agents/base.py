@@ -1926,7 +1926,7 @@ class AgentBase(ABC):
                     try:
                         params = [
                             (
-                                f"{p.name} ({p.annotation.__name__})"
+                                f"{p.name} ({p.annotation.__name__ if hasattr(p.annotation, '__name__') else p.annotation})"
                                 if p.annotation != inspect.Parameter.empty
                                 else p.name
                             )
