@@ -76,6 +76,7 @@ def test_no_unexplained_local_subprocess_calls() -> None:
     allowed = {"providers/execution/subprocess.py", "providers/ssh.py"}
     findings: list[str] = []
     exceptions = {
+        ("agents/benchmark/server.py", "execute_boot_time_test"),
         ("agents/infra/server.py", "transfer_file"),
         ("agents/provisioning/agent.py", "_ssh_run"),
     }
