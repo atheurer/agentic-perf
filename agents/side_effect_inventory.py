@@ -26,6 +26,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/server.py", "execute_benchmark", "ssh"),
     ("agents/benchmark/server.py", "execute_boot_time_test", "filesystem"),
     ("agents/benchmark/server.py", "execute_boot_time_test", "mutating_http_state"),
+    ("agents/benchmark/server.py", "execute_boot_time_test", "ssh"),
+    ("agents/benchmark/server.py", "execute_boot_time_test", "subprocess"),
     ("agents/benchmark/server.py", "get_run_logs", "ssh"),
     ("agents/benchmark/server.py", "guarded_maintenance", "ssh"),
     ("agents/benchmark/server.py", "pause_for_reconciliation", "mutating_http_state"),
@@ -600,6 +602,18 @@ INVENTORY_DISPOSITIONS = {
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "execute_boot_time_test", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:execute_boot_time_test",
+        "2027-12-31",
+    ),
+    ("agents/benchmark/server.py", "execute_boot_time_test", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:execute_boot_time_test",
+        "2027-12-31",
+    ),
+    ("agents/benchmark/server.py", "execute_boot_time_test", "subprocess"): (
         "audited",
         "observability-maintainers",
         "agents/benchmark/server.py:execute_boot_time_test",

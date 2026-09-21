@@ -232,6 +232,21 @@ Samples that required power cycle fallback are tracked:
 Uses `reboot` command via SSH. Requires the SUT to have a
 stable IP across reboots.
 
+## Host Requirements
+
+Boot-time requires exactly ONE host — the System Under Test
+(SUT). There is NO controller host. The orchestrator pod
+runs the boot-time scripts locally and connects to the SUT
+via SSH.
+
+For triage: set `required_hosts` to a single entry with
+role `client` only. Do NOT add a controller role — the
+pod IS the controller.
+
+```json
+"required_hosts": [{"roles": ["client"]}]
+```
+
 ## Provisioning Scope
 
 The boot-time harness has NO provisioning step. The

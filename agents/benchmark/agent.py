@@ -450,6 +450,11 @@ class BenchmarkAgent(AgentBase):
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",
+            # Workspace tools needed when execute_boot_time_test
+            # spills its output to a workspace file.
+            "jq_file_from_workspace",
+            "read_file_from_workspace",
+            "list_files_from_workspace",
         },
         "arcaflow-plugins": {
             "read_skills",
