@@ -176,8 +176,30 @@ async def provision_jumpstarter(
             lease_duration_seconds,
         )
         result = prov_result
+    except asyncio.CancelledError:
+        # Cancellation is a control-flow signal.  The finally block still
+        # stops serial capture, but the caller must observe cancellation.
+        raise
     except Exception as exc:
-        diag.append(f"Provisioning exception: {exc}")
+        # Unwrap ExceptionGroup/TaskGroup to expose the
+        # real error (e.g., 'Failed to get U-Boot prompt')
+        # instead of the generic wrapper message.
+        real_errors = []
+        if hasattr(exc, "exceptions"):
+            for sub in exc.exceptions:
+                real_errors.append(str(sub))
+                if hasattr(sub, "exceptions"):
+                    for nested in sub.exceptions:
+                        real_errors.append(str(nested))
+        if real_errors:
+            diag.append(f"Provisioning failed: {'; '.join(real_errors)}")
+        else:
+            diag.append(f"Provisioning exception: {exc}")
+        logger.error(
+            "[platform] Provisioning failed: %s",
+            exc,
+            exc_info=True,
+        )
     finally:
         # ── Stop serial capture ──────────────────────
         if serial_proc:
@@ -245,6 +267,22 @@ def _provision_sync(
         selector,
         lease_duration_seconds,
     )
+
+
+def _parse_exporter_address(addr: Any) -> str:
+    """Extract IP from an exporter address string.
+
+    Handles formats: 'host:port', 'tcp://host:port', bare IP.
+    """
+    from urllib.parse import urlparse
+
+    addr_str = str(addr)
+    if "://" in addr_str:
+        parsed = urlparse(addr_str)
+        return parsed.hostname or ""
+    if ":" in addr_str:
+        return addr_str.split(":")[0]
+    return addr_str
 
 
 async def _provision_async(
@@ -386,37 +424,33 @@ async def _run_provision_steps(
     ip = ""
     try:
         addr = await to_thread.run_sync(client.tcp.address)
-        # Format: "host:port" or "tcp://host:port"
-        addr_str = str(addr)
-        if "://" in addr_str:
-            from urllib.parse import urlparse
-
-            parsed = urlparse(addr_str)
-            ip = parsed.hostname or ""
-        elif ":" in addr_str:
-            ip = addr_str.split(":")[0]
-        else:
-            ip = addr_str
+        ip = _parse_exporter_address(addr)
         diag.append(f"IP discovered: {ip}")
     except Exception as exc:
         diag.append(f"TCP address failed: {exc}")
-        # Power cycle and retry
-        diag.append("Power cycling and retrying...")
-        try:
-            await to_thread.run_sync(lambda: client.power.cycle())
-        except Exception:
-            pass
-        await asyncio.sleep(_BOOT_WAIT)
-        try:
-            addr = await to_thread.run_sync(client.tcp.address)
-            addr_str = str(addr)
-            if ":" in addr_str:
-                ip = addr_str.split(":")[0]
-            else:
-                ip = addr_str
-            diag.append(f"IP discovered on retry: {ip}")
-        except Exception as exc2:
-            diag.append(f"TCP address retry failed: {exc2}")
+        # The exporter may have temporarily disconnected
+        # during reboot. Retry with backoff — the gRPC
+        # session often recovers after 30-60s.
+        _ADDR_RETRIES = 3
+        _ADDR_BACKOFF = [30, 45, 60]  # seconds between retries
+        for attempt in range(_ADDR_RETRIES):
+            wait = _ADDR_BACKOFF[attempt]
+            diag.append(
+                f"Retry {attempt + 1}/{_ADDR_RETRIES}: "
+                f"waiting {wait}s for exporter recovery..."
+            )
+            try:
+                await to_thread.run_sync(lambda: client.power.cycle())
+            except Exception:
+                pass
+            await asyncio.sleep(wait)
+            try:
+                addr = await to_thread.run_sync(client.tcp.address)
+                ip = _parse_exporter_address(addr)
+                diag.append(f"IP discovered on retry {attempt + 1}: {ip}")
+                break
+            except Exception as exc2:
+                diag.append(f"Retry {attempt + 1} failed: {exc2}")
 
     if not ip:
         diag.append("IP discovery failed")

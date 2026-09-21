@@ -430,7 +430,7 @@ class TestProvisionJumpstarterSDK:
 
         assert not r.success
         assert client.tcp.address.call_count >= 2
-        client.power.cycle.assert_called_once()
+        assert client.power.cycle.call_count == 3
 
     @pytest.mark.asyncio
     async def test_invalid_ip_rejected(self):
