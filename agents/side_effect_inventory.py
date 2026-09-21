@@ -326,6 +326,11 @@ INVENTORIED_SIDE_EFFECTS = (
         "_run_provision_steps",
         "cloud_resource",
     ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_parse_exporter_address",
+        "cloud_resource",
+    ),
     ("providers/resource/jumpstarter_provision.py", "_run_provision_steps", "ssh"),
     (
         "providers/resource/jumpstarter_provision.py",
@@ -2162,6 +2167,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_provision.py:_run_provision_steps",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_parse_exporter_address",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_parse_exporter_address",
         "2027-12-31",
     ),
     ("providers/resource/jumpstarter_provision.py", "_run_provision_steps", "ssh"): (
