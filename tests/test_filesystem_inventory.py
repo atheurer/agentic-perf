@@ -241,10 +241,10 @@ providers/investigation/file.py|42|self._dir.mkdir
 providers/investigation/file.py|52|path.write_text
 providers/quota.py|113|self._log_dir.mkdir
 providers/quota.py|131|open
-providers/resource/jumpstarter.py|143|user_config.parent.mkdir
-providers/resource/jumpstarter.py|144|user_config.write_text
-providers/resource/jumpstarter_provision.py|121|tempfile.mktemp
-providers/resource/jumpstarter_provision.py|126|open
+providers/resource/jumpstarter.py|145|user_config.parent.mkdir
+providers/resource/jumpstarter.py|146|user_config.write_text
+providers/resource/jumpstarter_provision.py|127|tempfile.mktemp
+providers/resource/jumpstarter_provision.py|132|open
 providers/secrets/bitwarden.py|217|tempfile.mkdtemp
 providers/secrets/bitwarden.py|219|tmp_dir.chmod
 providers/secrets/bitwarden.py|221|tmp_file.write_text

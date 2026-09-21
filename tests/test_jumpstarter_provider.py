@@ -35,6 +35,11 @@ class TestConstruction:
         assert provider._default_selector == "target=myboard"
         assert provider._default_duration == 3600
 
+    def test_default_lease_duration_matches_resource_agent_guidance(self):
+        provider = JumpstarterResourceProvider(client_name="test")
+
+        assert provider._default_duration == 14_400
+
     @pytest.mark.asyncio
     async def test_from_secrets(self, tmp_path: Path):
         secrets_data = {

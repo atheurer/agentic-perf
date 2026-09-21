@@ -2,9 +2,10 @@
 
 ## Lease Duration
 
-Jumpstarter leases have a maximum duration set by the controller
-(typically 2 hours). Plan benchmark sample counts to fit within
-the available lease time.
+The resource agent requests a lease duration based on the expected workload
+(four hours by default). Provisioning reuses that allocation rather than
+shortening it. The controller may still enforce a deployment-specific maximum,
+so plan benchmark sample counts to fit within the allocated lease time.
 
 ### Boot-time harness timing
 
@@ -18,17 +19,18 @@ Each boot-time sample cycle includes:
 
 **Estimated per-sample time: 45-75 seconds**
 
-### Sample count guidelines for 2-hour leases
+### Sample count guidelines
 
-| Board type | Est. per-sample | Max samples in 2hr | Recommended |
+| Board type | Est. per-sample | Samples in 2hr | Recommended |
 |---|---|---|---|
 | R-Car S4 | ~45s | ~150 | 50 (default) |
 | NXP S32G | ~60s | ~110 | 50 (default) |
 | SA8775P | ~75s | ~90 | 40 |
 
 Add ~15 minutes overhead for flash, boot, harness install,
-and metadata collection. For a 2-hour lease, plan for at
-most 100 minutes of reboot cycles.
+and metadata collection. Increase the requested duration for
+longer investigations rather than assuming the platform agent
+will apply a separate limit.
 
 ### When samples are lost to lease expiry
 
