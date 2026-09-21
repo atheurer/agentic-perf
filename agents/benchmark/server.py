@@ -1185,7 +1185,7 @@ async def get_execution_config(harness_name: str) -> str:
                     "may use different registries)"
                 ),
                 "workflow": [
-                    "1. Call get_runfile_schema to discover the plugin's input schema",
+                    "1. Call get_plugin_schema with the plugin image to discover available steps and input parameters",
                     "2. Build the input YAML based on the schema and ticket parameters",
                     "3. Call execute_benchmark with "
                     "run_file containing: plugin_image, "
@@ -1284,6 +1284,71 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
             }
         )
     return json.dumps({"found": True, "harness": harness_name, "schema": schema})
+
+
+@mcp.tool()
+async def get_plugin_schema(
+    plugin_image: str,
+    host: str = "",
+) -> str:
+    """Query an Arcaflow plugin container for its input schema.
+
+    Runs the plugin with --json-schema input on the target host
+    via podman. Returns the JSON schema describing the plugin's
+    available steps and their input parameters.
+
+    Args:
+        plugin_image: Full container image ref
+            (e.g., quay.io/arcalot/arcaflow-plugin-fio:0.5.0)
+        host: Target host IP. Uses the ticket's controller
+            if not specified.
+    """
+    await _ensure_init()
+    if _ssh is None:
+        return json.dumps({"error": "SSH not initialized"})
+
+    cf = _ticket.get("custom_fields", {}) if _ticket else {}
+    target = host or (cf.get("assigned_hardware_ips", {}).get("controller", ""))
+    if not target:
+        return json.dumps({"error": "No target host available"})
+
+    cmd = f"podman run --rm {plugin_image} --json-schema input"
+    result = await _ssh.run(target, cmd, timeout=60)
+
+    if result.exit_code != 0:
+        # Try --schema as fallback (returns full schema)
+        cmd_full = f"podman run --rm {plugin_image} --schema"
+        result = await _ssh.run(target, cmd_full, timeout=60)
+
+    if result.exit_code != 0:
+        return json.dumps(
+            {
+                "error": f"Failed to query plugin schema (exit {result.exit_code})",
+                "stderr": result.stderr[:500] if result.stderr else "",
+                "hint": (
+                    "The plugin image may not exist or may not "
+                    "support --json-schema. Check the image ref."
+                ),
+            }
+        )
+
+    # Parse and return the schema
+    try:
+        schema = json.loads(result.stdout)
+        return json.dumps(
+            {
+                "plugin_image": plugin_image,
+                "schema": schema,
+            }
+        )
+    except json.JSONDecodeError:
+        return json.dumps(
+            {
+                "plugin_image": plugin_image,
+                "raw_output": result.stdout[:2000],
+                "note": "Output was not valid JSON",
+            }
+        )
 
 
 @mcp.tool()
