@@ -85,3 +85,46 @@ If all retries fail, the platform agent escalates to HITL.
 **User action if HITL:** Retry — the exporter usually
 recovers. If the board consistently fails, try a different
 board of the same type.
+
+## Failed to Get U-Boot Prompt
+
+**Error:** `RuntimeError: Failed to get U-Boot prompt`
+(often wrapped in `ExceptionGroup: unhandled errors in
+a TaskGroup`)
+
+**Cause:** The board did not reach the U-Boot bootloader
+prompt after power cycle. This typically indicates a power
+sequencing issue — the board needs a longer delay between
+power off and power on to fully discharge capacitors and
+reset the boot ROM.
+
+**Fix:** Power cycle with a longer wait before retrying:
+```
+j power cycle --wait 180
+```
+
+The 180-second wait allows the board's power subsystem to
+fully reset. After this extended power cycle, retry the
+flash operation. This is a known issue with some NXP S32G
+boards and Qualcomm SA8775P boards.
+
+**For the platform agent:** When provisioning fails with
+a U-Boot prompt error, retry with an extended power-off
+delay (180s) before the next flash attempt. Do not
+immediately retry with the default short delay.
+
+## ExceptionGroup / TaskGroup Errors
+
+**Error:** `ExceptionGroup: unhandled errors in a TaskGroup
+(1 sub-exception)`
+
+**Cause:** This is a Python wrapper around the real error.
+The actual cause is in the sub-exception. Common wrapped
+errors include:
+- `Failed to get U-Boot prompt` — power sequencing issue
+- `Stream removed (Socket closed)` — exporter disconnect
+- `Connection to exporter lost` — board went offline
+
+**Diagnosis:** Check the full exception chain in the pod
+logs or diagnostics. The sub-exception contains the
+actionable information.

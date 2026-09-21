@@ -176,8 +176,26 @@ async def provision_jumpstarter(
             lease_duration_seconds,
         )
         result = prov_result
-    except Exception as exc:
-        diag.append(f"Provisioning exception: {exc}")
+    except BaseException as exc:
+        # Unwrap ExceptionGroup/TaskGroup to expose the
+        # real error (e.g., 'Failed to get U-Boot prompt')
+        # instead of the generic wrapper message.
+        real_errors = []
+        if hasattr(exc, "exceptions"):
+            for sub in exc.exceptions:
+                real_errors.append(str(sub))
+                if hasattr(sub, "exceptions"):
+                    for nested in sub.exceptions:
+                        real_errors.append(str(nested))
+        if real_errors:
+            diag.append(f"Provisioning failed: {'; '.join(real_errors)}")
+        else:
+            diag.append(f"Provisioning exception: {exc}")
+        logger.error(
+            "[platform] Provisioning failed: %s",
+            exc,
+            exc_info=True,
+        )
     finally:
         # ── Stop serial capture ──────────────────────
         if serial_proc:
