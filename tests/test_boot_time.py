@@ -300,6 +300,21 @@ class TestBootTimeKPIExtraction:
         assert kpis["avg_total_boot_s"] == 10.51
 
 
+class TestBootTimeDiagnostics:
+    """Stall diagnostics must report actual boot samples, not all artifacts."""
+
+    def test_counts_only_boot_time_log_artifacts(self, tmp_path):
+        from agents.benchmark.server import _count_boot_time_samples
+
+        results_dir = tmp_path / "results-2026-09-21"
+        results_dir.mkdir()
+        (tmp_path / "serial-capture.log").write_text("serial output")
+        (tmp_path / "metadata.json").write_text("{}")
+        (results_dir / "host_boot_time_logs.json").write_text("{}")
+
+        assert _count_boot_time_samples(tmp_path) == 1
+
+
 class TestRepoRegistration:
     """boot-time-analysis-scripts must be in default repo lists."""
 

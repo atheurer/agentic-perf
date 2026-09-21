@@ -4525,8 +4525,8 @@ async def execute_boot_time_test(
     # failure) before the stall detector triggers.
     # Check for boot sample files (boot_time_logs.json), not
     # raw file count — serial/metadata files are always present.
-    sample_files = list(output_dir.glob("**/*boot_time_logs.json"))
-    run_diag = stall_killed or (exit_code != 0 and len(sample_files) == 0)
+    sample_count = _count_boot_time_samples(output_dir)
+    run_diag = stall_killed or (exit_code != 0 and sample_count == 0)
     if run_diag and _ssh is not None and sut_host:
         logger.info("[boot-time] Capturing stall diagnostics for %s", sut_host)
         try:
@@ -4555,7 +4555,7 @@ async def execute_boot_time_test(
             except Exception:
                 stall_diag["pingable"] = False
 
-        stall_diag["samples_before_stall"] = last_file_count
+        stall_diag["samples_before_stall"] = sample_count
         stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
         # Write diagnostics to artifact file
@@ -4888,6 +4888,11 @@ async def execute_boot_time_test(
             )
 
     return json.dumps(response)
+
+
+def _count_boot_time_samples(output_dir: Path) -> int:
+    """Return the number of boot-time sample artifacts in an output directory."""
+    return sum(1 for _ in output_dir.glob("**/*boot_time_logs.json"))
 
 
 async def get_registered_tools():
