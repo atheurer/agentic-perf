@@ -747,13 +747,17 @@ class ResourceAgent(AgentBase):
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
         # The reservation server is the source of truth for metadata it
-        # received from the provider.  Once it returned metadata, retain
-        # only that authoritative record rather than accepting arbitrary
-        # LLM-supplied provider fields.
+        # received from the provider. Do not let LLM-supplied lease or
+        # selector values redirect later provisioning or teardown actions.
         if reservation_metadata:
             provider_metadata = reservation_metadata
-        if provider_metadata:
-            fields["resource_provider_metadata"] = provider_metadata
+        # Always set provider_metadata when we have a
+        # reservation — downstream agents (platform,
+        # provisioning) require it for lease operations.
+        if provider_metadata or reservation_metadata:
+            fields["resource_provider_metadata"] = (
+                provider_metadata or reservation_metadata
+            )
 
         if reservation_metadata.get("ssh_user"):
             fields["ssh_user"] = reservation_metadata["ssh_user"]
