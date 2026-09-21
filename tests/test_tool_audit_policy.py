@@ -1335,11 +1335,40 @@ async def test_real_registered_mcp_handler_runs_with_ticket_trace_context(
 
 
 @pytest.mark.asyncio
-async def test_each_registered_chat_name_gets_a_correlated_audit_pair() -> None:
+async def test_each_registered_chat_name_gets_a_correlated_audit_pair(
+    monkeypatch,
+) -> None:
     """Run every real CHAT_TOOLS dispatcher branch through ChatToolAudit."""
     from unittest.mock import AsyncMock, MagicMock
 
+    from agents.chat import tools as chat_tools
     from agents.chat.tools import ChatToolAudit, execute_tool
+    from providers.skills.base import BenchmarkSuite
+
+    class CatalogHarness:
+        async def list_benchmarks(self):
+            return [
+                BenchmarkSuite(
+                    name="policy-benchmark",
+                    description="safe catalog fixture",
+                    harness="policy",
+                    roles=["client"],
+                    min_hosts=1,
+                )
+            ]
+
+    class CatalogProvider:
+        def list_harnesses(self):
+            return ["policy"]
+
+        def get_provider(self, harness):
+            return CatalogHarness() if harness == "policy" else None
+
+    monkeypatch.setattr(
+        chat_tools,
+        "_get_benchmark_catalog_provider",
+        lambda: CatalogProvider(),
+    )
 
     registrations = _chat_registrations()
     for registration in registrations:

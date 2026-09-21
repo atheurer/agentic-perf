@@ -97,6 +97,7 @@ READONLY_TOOLS = frozenset(
         "list_skills",
         "read_skill",
         "read_doc",
+        "list_available_benchmarks",
     }
 )
 
@@ -358,6 +359,26 @@ def _require(params: dict[str, Any], *keys: str) -> str | None:
 
 
 CHAT_TOOLS: list[ToolDefinition] = [
+    ToolDefinition(
+        name="list_available_benchmarks",
+        description=(
+            "List benchmarks currently discoverable from configured harness "
+            "catalogs. Use for questions about supported benchmarks or harnesses."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "harness": {
+                    "type": "string",
+                    "description": "Optional exact harness filter.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive name or description filter.",
+                },
+            },
+        },
+    ),
     ToolDefinition(
         name="search_tickets",
         description=(
@@ -767,6 +788,8 @@ async def _dispatch_tool(
         return await _update_ticket_fields(client, store_url, headers, tool_input)
     elif tool_name == "stop_ticket":
         return await _stop_ticket(client, store_url, headers, tool_input)
+    elif tool_name == "list_available_benchmarks":
+        return await _list_available_benchmarks(tool_input)
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
@@ -1406,3 +1429,51 @@ async def _stop_ticket(
     )
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
+
+
+_benchmark_catalog_provider: Any | None = None
+
+
+def _get_benchmark_catalog_provider() -> Any:
+    """Build the read-only capability provider lazily for chat discovery."""
+    global _benchmark_catalog_provider
+    if _benchmark_catalog_provider is None:
+        from agents.server_utils import build_skill_provider
+
+        _benchmark_catalog_provider = build_skill_provider(
+            resolve_source=False,
+            catalog_only=True,
+        )
+    return _benchmark_catalog_provider
+
+
+async def _list_available_benchmarks(params: dict[str, Any]) -> str:
+    """List discoverable benchmark capabilities without mutating ticket state."""
+    from providers.skills.catalog import list_benchmark_catalog
+
+    entries, unavailable = await list_benchmark_catalog(
+        _get_benchmark_catalog_provider()
+    )
+    harness = str(params.get("harness", "")).casefold()
+    query = str(params.get("query", "")).casefold()
+    filtered = [
+        entry
+        for entry in entries
+        if (not harness or entry["harness"].casefold() == harness)
+        and (
+            not query
+            or query in entry["name"].casefold()
+            or query in entry["description"].casefold()
+        )
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in filtered:
+        grouped.setdefault(entry["harness"], []).append(entry)
+    return json.dumps(
+        {
+            "total": len(filtered),
+            "harnesses": sorted(grouped),
+            "benchmarks": grouped,
+            "unavailable_harnesses": sorted(unavailable),
+        }
+    )
