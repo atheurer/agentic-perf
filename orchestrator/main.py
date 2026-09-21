@@ -566,6 +566,30 @@ async def _advance_plan(
 
         next_idx = current + 1
 
+        # Inject provision step when the resource agent
+        # completed but the LLM-generated plan omitted
+        # the provision step.  Provisioning is part of
+        # the standard lifecycle for any hardware-backed
+        # ticket (board flashing, OS kickstart, etc.).
+        if (
+            step.get("agent_type") == "resource"
+            and next_idx < len(steps)
+            and steps[next_idx]["agent_type"] != "provision"
+        ):
+            steps.insert(
+                next_idx,
+                {
+                    "id": next_idx,
+                    "agent_type": "provision",
+                    "status": "pending",
+                    "params": {},
+                    "results": {},
+                },
+            )
+            # Re-index subsequent steps
+            for i in range(next_idx + 1, len(steps)):
+                steps[i]["id"] = i
+
         # Conclusive analysis: skip hardware/benchmark steps.
         # Triggers after analyze completes (skip to review) and
         # after synthesis completes (skip remaining hardware
