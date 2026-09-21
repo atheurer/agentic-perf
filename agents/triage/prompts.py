@@ -101,8 +101,11 @@ Your job is to analyze a performance test request ticket and:
 
    **Echoing directives:** When the user provides explicit directives in
    custom_fields, confirm them in your triage result notes (e.g., "Using
-   user-specified board_selector: device=nxp-s32g-vnp-rdb3-01"). Do not
+   user-specified board_selector: board-type=qc8775"). Do not
    narrate a deduction process for values the user already provided.
+   Board selectors use label matching (e.g., board-type=qc8775) or
+   name matching for specific devices (e.g., name=device-01).
+   Both formats are valid — pass them through as-is.
 
    The directives object also accepts arbitrary keys for future extensibility. If the
    user gives an operational instruction that doesn't fit the known fields, include it

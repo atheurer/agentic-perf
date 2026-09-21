@@ -53,6 +53,8 @@ _POOL_KEY = "pool"
 # instead of labels.  Allows users to request a
 # specific board (e.g., name=renesas-rcar-s4-01).
 _NAME_SELECTOR_KEY = "name"
+# Legacy selector key — auto-translated to name=.
+_DEVICE_SELECTOR_KEY = "device"
 
 
 def _get_board_type(labels: dict[str, str]) -> str:
@@ -315,6 +317,12 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         key, _, value = selector.partition("=")
 
+        # Backward compat: device= was a previous
+        # Jumpstarter label, now removed. Translate
+        # to name= for specific device targeting.
+        if key == _DEVICE_SELECTOR_KEY:
+            key = _NAME_SELECTOR_KEY
+
         # name= targets a specific exporter by name
         # rather than matching against labels.
         if key == _NAME_SELECTOR_KEY:
@@ -534,6 +542,8 @@ class JumpstarterResourceProvider(ResourceProvider):
         # selector + exporter_name for the lease.
         if selector:
             key, _, value = selector.partition("=")
+            if key == _DEVICE_SELECTOR_KEY:
+                key = _NAME_SELECTOR_KEY
             if key == _NAME_SELECTOR_KEY:
                 # Look up the device to find its board type.
                 exporters = await self._service.ListExporters()
