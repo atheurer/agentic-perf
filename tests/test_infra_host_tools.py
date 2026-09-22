@@ -30,12 +30,31 @@ class TestGetEthtoolInfo:
             exit_code=0,
             stdout="rx-checksumming: on\ntx-checksumming: on\n",
         )
-        result = await srv.get_ethtool_info("10.0.0.1", "eth0", mode="features")
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="features", active_only=False
+        )
         data = json.loads(result)
         assert data["exit_code"] == 0
         assert "rx-checksumming" in data["stdout"]
         assert data["data"]["rx-checksumming"]["active"] is True
         assert any("ethtool -k" in c["command"] for c in patch_ssh.calls)
+
+    @pytest.mark.asyncio
+    async def test_features_default_is_compact(self, patch_ssh):
+        patch_ssh._results["ethtool -k"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "rx-checksumming: on\n"
+                "tx-checksumming: off\n"
+                "scatter-gather: on [fixed]\n"
+            ),
+        )
+        result = await srv.get_ethtool_info("10.0.0.1", "eth0")
+        data = json.loads(result)
+
+        assert data["active_only"] is True
+        assert set(data["data"]) == {"rx-checksumming"}
+        assert "stdout" not in data
 
     @pytest.mark.asyncio
     async def test_native_json_mode(self, patch_ssh):
@@ -48,6 +67,51 @@ class TestGetEthtoolInfo:
         assert data["exit_code"] == 0
         assert data["data"]["rx_packets"] == 100000
         assert data["data"]["tx_packets"] == 200000
+
+    @pytest.mark.asyncio
+    async def test_native_json_features_respect_default_filter(self, patch_ssh):
+        patch_ssh._results["ethtool --json -k"] = SSHResult(
+            exit_code=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "ifname": "eth0",
+                        "rx-checksumming": {"active": True, "fixed": False},
+                        "tx-checksumming": {"active": False, "fixed": False},
+                        "scatter-gather": {"active": True, "fixed": True},
+                    }
+                ]
+            ),
+        )
+
+        result = await srv.get_ethtool_info("10.0.0.1", "eth0")
+        data = json.loads(result)
+
+        assert set(data["data"]) == {"rx-checksumming"}
+        assert "stdout" not in data
+
+    @pytest.mark.asyncio
+    async def test_native_json_pattern_omits_unfiltered_stdout(self, patch_ssh):
+        counters = {
+            **{f"rx_packets_{idx}": idx for idx in range(40)},
+            **{f"tx_packets_{idx}": idx for idx in range(40)},
+        }
+        native_stdout = json.dumps([counters])
+        patch_ssh._results["ethtool --json -S"] = SSHResult(
+            exit_code=0,
+            stdout=native_stdout,
+        )
+
+        result = await srv.get_ethtool_info(
+            "10.0.0.1", "eth0", mode="stats", pattern=r"^rx_packets_[01]$"
+        )
+        data = json.loads(result)
+
+        assert set(data["data"]) == {"rx_packets_0", "rx_packets_1"}
+        assert data["total_keys"] == 80
+        assert data["matched_keys"] == 2
+        assert "stdout" not in data
+        assert len(result) < len(native_stdout)
 
     @pytest.mark.asyncio
     async def test_stats_mode_fallback_parsing(self, patch_ssh):

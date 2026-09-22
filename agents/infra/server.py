@@ -312,13 +312,17 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
     """Parse ethtool output (either native JSON or text format) into structured dict."""
     try:
         parsed = json.loads(stdout)
-        if (
-            isinstance(parsed, list)
-            and len(parsed) == 1
-            and isinstance(parsed[0], dict)
-        ):
-            return parsed[0]
-        return parsed
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            # ethtool emits a one-element list for native JSON output.  Keep
+            # this tolerant of versions that emit multiple records by
+            # merging their object members before applying key filters.
+            merged: dict[str, Any] = {}
+            for item in parsed:
+                if isinstance(item, dict):
+                    merged.update(item)
+            return merged
     except Exception:
         pass
 
@@ -381,7 +385,7 @@ async def get_ethtool_info(
     iface: str,
     mode: str = "features",
     pattern: str = "",
-    active_only: bool = False,
+    active_only: bool = True,
 ) -> str:
     """Get ethtool information for a network interface as structured JSON.
 
@@ -394,9 +398,10 @@ async def get_ethtool_info(
         mode: 'features' or 'stats'
         pattern: Case-insensitive regex to filter keys (e.g. 'rx|tx'
             returns only keys matching that pattern). Empty = all keys.
-        active_only: (features mode only) When True, return only
-            non-fixed active features — the subset the agent reasons
-            about. Ignored in stats mode.
+        active_only: (features mode only) When True (the default), return
+            only non-fixed active features — the subset the agent reasons
+            about. Set False to include all feature flags. Ignored in stats
+            mode.
     """
     compiled = None
     if pattern:
@@ -444,8 +449,12 @@ async def get_ethtool_info(
         "mode": mode,
         "exit_code": result.exit_code,
         "data": filtered_data,
-        "stdout": result.stdout,
     }
+    # stdout is useful for backwards-compatible unfiltered responses, but it
+    # defeats the purpose of server-side filtering by retaining the complete
+    # raw dump in the tool result.  Keep it only when no filter was requested.
+    if not pattern and not (active_only and mode == "features"):
+        response["stdout"] = result.stdout
     if pattern:
         response["pattern"] = pattern
         response["total_keys"] = len(parsed_data)
