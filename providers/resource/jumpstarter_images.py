@@ -22,11 +22,40 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from providers.execution import AuditedAsyncHTTPClient
 
+if TYPE_CHECKING:
+    import httpx
+
 logger = logging.getLogger(__name__)
+
+
+async def _audited_get_follow_redirects(
+    client: AuditedAsyncHTTPClient,
+    url: str,
+    *,
+    max_redirects: int = 5,
+) -> "httpx.Response":
+    """GET with redirect following via the audited client.
+
+    The audited client disables automatic redirects so each
+    hop gets its own audit event.  This helper follows 3xx
+    responses manually, issuing a separately audited request
+    for each redirect.
+    """
+
+    for _ in range(max_redirects):
+        r = await client.get(url)
+        if r.status_code in (301, 302, 303, 307, 308):
+            location = r.headers.get("location", "")
+            if not location:
+                return r
+            url = location
+            continue
+        return r
+    return r
 
 
 async def _resolve_latest_monthly(
