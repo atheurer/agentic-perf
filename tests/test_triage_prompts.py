@@ -32,6 +32,18 @@ def _resource_section(prompt: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _provision_section(prompt: str) -> str:
+    """Extract the provision bullet from the scoped_context section."""
+    lines = prompt.splitlines()
+    start = next(i for i, line in enumerate(lines) if '"provision":' in line)
+    end = next(
+        i
+        for i, line in enumerate(lines[start + 1 :], start + 1)
+        if line.strip().startswith('- "benchmark":')
+    )
+    return "\n".join(lines[start:end])
+
+
 class TestTriagePromptVerbatimFQDN:
     """Prompt-contract tests: triage must instruct verbatim host preservation."""
 
@@ -78,3 +90,24 @@ class TestTriagePromptVerbatimFQDN:
         assert "character-for-character" in shared_text or "verbatim" in shared_text, (
             "shared section must instruct exact host identifier preservation"
         )
+
+
+class TestTriagePackageRequirementBoundary:
+    """Triage must not create provisioning package requests from tool-params."""
+
+    def test_provision_section_requires_an_explicit_user_or_contract_source(self):
+        section = _provision_section(TRIAGE_SYSTEM_PROMPT).lower()
+        assert "only" in section
+        assert "explicitly requests" in section
+        assert "platform" in section and "contract" in section
+
+    def test_provision_section_separates_tool_params_from_host_packages(self):
+        section = _provision_section(TRIAGE_SYSTEM_PROMPT).lower()
+        assert "tool-params" in section
+        assert "no implied relationship" in section
+        assert '"benchmark"' in section
+
+    def test_provision_section_preserves_explicit_kernel_package_request(self):
+        section = _provision_section(TRIAGE_SYSTEM_PROMPT).lower()
+        assert "install `kernel`" in section
+        assert '`{"tool": "kernel"}`' in section

@@ -340,7 +340,11 @@ _LOCAL_TOOLS = [
                             "description": (
                                 "Supplemental context for the provision "
                                 "agent — only if genuinely additive beyond "
-                                "any verbatim agent:provision block."
+                                "any verbatim agent:provision block. Include "
+                                "a package only when the user explicitly "
+                                "requested it or the harness platform contract "
+                                "requires it; benchmark tool-params never imply "
+                                "a host package requirement."
                             ),
                         },
                         "benchmark": {

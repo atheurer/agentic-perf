@@ -143,12 +143,16 @@ Your job is to analyze a performance test request ticket and:
      directive already carries the hostnames, do not restate them — only
      add supplemental context the verbatim block does not cover.)
    - "provision": Harness installation instructions, user-requested
-     packages (e.g., "install nmap-ncat"). Do NOT include benchmark tool
-     names (uperf, fio, trafficgen, etc.), benchmark parameters, test
-     configs, connectivity testing, SSH key setup, or reporting
-     expectations. The provision agent installs the harness only —
-     benchmark tools run inside the harness's containers and do not need
-     host-level installation.
+     packages (e.g., "install nmap-ncat"), and nothing inferred from the
+     benchmark. A host package requirement exists ONLY when the user
+     explicitly requests that package or the selected harness's platform
+     contract requires it. `tool-params`, profiler names, tool selection,
+     benchmark parameters, and test configs have NO implied relationship to
+     host package requirements; keep all of them out of this section and in
+     "benchmark" instead. Do not infer a package requirement from a matching
+     name: an explicit request to install `kernel` is a host package request,
+     while `{"tool": "kernel"}` is benchmark configuration. Do NOT include
+     connectivity testing, SSH key setup, or reporting expectations.
    - "benchmark": Test parameters (message sizes, thread counts, protocols,
      duration, samples), workload specifications, connectivity requirements,
      tool selection, run approval preferences, and any benchmark-specific
