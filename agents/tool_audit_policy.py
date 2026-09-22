@@ -114,6 +114,7 @@ TOOL_AUDIT_POLICY = (
         "agents/benchmark/server.py:get_tool_params",
         "agents/benchmark/server.py:get_example_runfile",
         "agents/benchmark/server.py:get_run_logs",
+        "agents/benchmark/server.py:get_plugin_schema",
     ),
     *_side_effecting(
         "providers.ssh.SSHExecutor",
