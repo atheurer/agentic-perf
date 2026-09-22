@@ -4302,6 +4302,12 @@ function render() {
   currentView = route.view;
   currentTicketId = route.ticketId || null;
 
+  // Hide global chat immediately to prevent flash during
+  // async view transitions.  Each view re-shows the
+  // appropriate chat widget after its DOM is ready.
+  var gc = document.getElementById('chat-container');
+  if (gc) gc.style.display = 'none';
+
   if (route.view === 'detail' && route.ticketId) {
     renderDetail(route.ticketId);
   } else {
@@ -4443,7 +4449,7 @@ async function sendChatMessage() {
     } else {
       var errMsg = 'Something went wrong (HTTP ' + r.status + '). ';
       if (r.status === 504 || r.status === 408) {
-        errMsg = 'The request timed out. Try a simpler question, or break your request into smaller steps.';
+        errMsg = 'The request took longer than expected. Please try again — the chat will pick up where it left off.';
       } else if (r.status === 503) {
         errMsg = 'Chat agent is not available. Check that chat is enabled in the configuration.';
       } else if (r.status === 401) {
@@ -4488,7 +4494,7 @@ async function sendTicketChatMessage() {
       updateChatCost(data.usage || {}, 'ticket-chat-cost');
     } else {
       var tErr = r.status === 504 || r.status === 408
-        ? 'Request timed out. Try a simpler question.'
+        ? 'The request took longer than expected. Please try again.'
         : 'Something went wrong (HTTP ' + r.status + ')';
       appendChatMessage('ticket-chat-messages', 'system', tErr);
     }
