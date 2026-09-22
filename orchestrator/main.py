@@ -1653,6 +1653,37 @@ async def _poll_loop_after_lease(
 
     repo_cache = RepoCache()
 
+    # Create an MCP client for arcaflow plugin discovery
+    # when the Arcaflow MCP is configured.
+    arcaflow_mcp = None
+    for srv in config.raw.get("external_mcp_servers", []):
+        if srv.get("name") == "arcaflow" and srv.get("transport") == "stdio":
+            try:
+                from agents.mcp_client import AgentMCPClient
+
+                arcaflow_mcp = AgentMCPClient()
+                command = srv.get("command", [])
+                if command:
+                    await arcaflow_mcp.connect_command(
+                        command=command[0],
+                        args=(command[1:] if len(command) > 1 else []),
+                        name="arcaflow",
+                        env=srv.get("env"),
+                    )
+                    logger.info(
+                        "[orchestrator] Arcaflow MCP connected for plugin discovery"
+                    )
+                else:
+                    arcaflow_mcp = None
+            except Exception:
+                logger.warning(
+                    "[orchestrator] Failed to connect Arcaflow MCP "
+                    "for plugin discovery \u2014 using Quay fallback",
+                    exc_info=True,
+                )
+                arcaflow_mcp = None
+            break
+
     skills = build_skill_provider(
         crucible_home=config.crucible_home,
         repo_cache=repo_cache,
@@ -1661,6 +1692,7 @@ async def _poll_loop_after_lease(
         zathras_home=config.zathras_home,
         resolve_source=False,
         catalog_only=True,
+        arcaflow_mcp_client=arcaflow_mcp,
     )
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
@@ -2100,6 +2132,14 @@ async def _poll_loop_after_lease(
         if dispatcher is not None:
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)
+        if arcaflow_mcp is not None:
+            try:
+                await arcaflow_mcp.disconnect()
+            except Exception:
+                logger.warning(
+                    "[orchestrator] Failed to disconnect Arcaflow MCP",
+                    exc_info=True,
+                )
         events.close()
 
 

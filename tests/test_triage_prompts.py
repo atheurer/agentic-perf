@@ -3,6 +3,13 @@ from __future__ import annotations
 from agents.triage.prompts import TRIAGE_SYSTEM_PROMPT
 
 
+def test_workflow_directive_uses_canonical_arcaflow_harness():
+    from agents.triage.agent import _canonicalize_workflow_harness
+
+    directives = {"workflow_source": "https://example.test/workflow.yaml"}
+    assert _canonicalize_workflow_harness(directives)["harness"] == "arcaflow-plugins"
+
+
 def _resource_section(prompt: str) -> str:
     """Extract the resource bullet block from the scoped_context section."""
     lines = prompt.splitlines()

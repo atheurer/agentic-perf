@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -13,6 +14,14 @@ from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from .prompts import TRIAGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]:
+    """Route workflow tickets through the canonical Arcaflow provider key."""
+    if directives.get("workflow_source"):
+        directives["harness"] = "arcaflow-plugins"
+    return directives
+
 
 _SCOPED_CONTEXT_CALL_RE = re.compile(
     r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
@@ -208,6 +217,27 @@ _LOCAL_TOOLS = [
                                 "controller). Set to 'kube' when user "
                                 "mentions Kubernetes, K8s, pods, "
                                 "containers, or cloud-native."
+                            ),
+                        },
+                        "workflow_source": {
+                            "type": "string",
+                            "description": (
+                                "Git repo URL or raw workflow file URL "
+                                "for Arcaflow workflow execution. When "
+                                "set, the benchmark agent uses the "
+                                "Arcaflow MCP to load, configure, and "
+                                "run the workflow instead of direct "
+                                "plugin execution. Example: "
+                                "'https://gitlab.com/org/repo.git'"
+                            ),
+                        },
+                        "workflow_name": {
+                            "type": "string",
+                            "description": (
+                                "Name or path of the workflow within "
+                                "the workflow_source repo. Only needed "
+                                "when the source contains multiple "
+                                "workflows. Example: 'workflow-fio'"
                             ),
                         },
                     },
@@ -480,9 +510,21 @@ class TriageAgent(AgentBase):
             state_store_url=self.store_url,
             agent_name=self.agent_name,
         )
+
+        # Triage may use explicitly authorized external discovery tools (for
+        # example Arcaflow's plugin_list). Keep those servers scoped exactly
+        # as configured; never expose an unconfigured external tool to the
+        # triage LLM.
+        from agents.mcp_client import connect_external_servers, filter_external_tools
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "triage")
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
+        if ext_tools:
+            mcp_tools = filter_external_tools(
+                mcp_tools, mcp._tool_routing, connected_ext, ext_tools
+            )
         self.tools = mcp_tools + self.tools
 
         try:
@@ -560,6 +602,20 @@ class TriageAgent(AgentBase):
                 "comparison.\n"
             )
 
+        # Surface existing directives so the LLM knows
+        # what the user already specified (e.g., workflow_source,
+        # board_selector set at ticket creation).
+        existing_directives = cf.get("directives", {})
+        if existing_directives:
+            content += "\n## User-Provided Directives\n\n"
+            content += (
+                "These directives were set at ticket creation. "
+                "Include them in your submit_triage_result "
+                "directives \u2014 do NOT ask the user to provide "
+                "information that is already here.\n\n"
+                f"```json\n{json.dumps(existing_directives, indent=2)}\n```\n"
+            )
+
         _TRIAGE_NOISE_AUTHORS = frozenset({"system", "orchestrator"})
         relevant_comments = [
             c
@@ -626,6 +682,8 @@ class TriageAgent(AgentBase):
             "image_version",
             "serial_capture",
             "board_selector",
+            "workflow_source",
+            "workflow_name",
         )
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
@@ -639,6 +697,15 @@ class TriageAgent(AgentBase):
         if harness == "boot-time":
             required_hosts = [{"roles": ["client"]}]
 
+        # Code-enforce harness for workflow tickets.
+        # When workflow_source is set, the benchmark agent
+        # must use MCP workflow tools, not direct plugin
+        # execution. The 'arcaflow' harness key routes to
+        # the workflow tool set.
+        # Arcaflow workflow/plugin execution is owned by the same canonical
+        # harness provider. Keep this value aligned with the provider catalog
+        # and BenchmarkAgent tool-scoping key.
+        directives = _canonicalize_workflow_harness(directives)
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),

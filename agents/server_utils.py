@@ -92,6 +92,7 @@ def build_skill_provider(
     zathras_home: str | None = None,
     resolve_source: bool = True,
     catalog_only: bool = False,
+    arcaflow_mcp_client: Any | None = None,
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -122,7 +123,9 @@ def build_skill_provider(
         "vstorm": VstormSkillProvider(),
         "ioscale": IoscaleSkillProvider(),
         "forge": ForgeSkillProvider(),
-        "arcaflow-plugins": ArcaflowPluginSkillProvider(),
+        "arcaflow-plugins": ArcaflowPluginSkillProvider(
+            mcp_client=arcaflow_mcp_client,
+        ),
     }
 
     if catalog_only:

@@ -28,6 +28,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/server.py", "execute_boot_time_test", "mutating_http_state"),
     ("agents/benchmark/server.py", "execute_boot_time_test", "ssh"),
     ("agents/benchmark/server.py", "execute_boot_time_test", "subprocess"),
+    ("agents/benchmark/server.py", "get_plugin_schema", "ssh"),
     ("agents/benchmark/server.py", "get_run_logs", "ssh"),
     ("agents/benchmark/server.py", "guarded_maintenance", "ssh"),
     ("agents/benchmark/server.py", "pause_for_reconciliation", "mutating_http_state"),
@@ -363,6 +364,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/skills/arcaflow_plugins.py", "__init__", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_benchmark_to_repo_name", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_cache_path", "filesystem"),
+    ("providers/skills/arcaflow_plugins.py", "_discover_from_mcp", "mcp"),
     (
         "providers/skills/arcaflow_plugins.py",
         "_description_from_repo_name",
@@ -617,6 +619,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/server.py:execute_boot_time_test",
+        "2027-12-31",
+    ),
+    ("agents/benchmark/server.py", "get_plugin_schema", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:get_plugin_schema",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "get_run_logs", "ssh"): (
@@ -2351,6 +2359,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/skills/arcaflow_plugins.py:_cache_path",
+        "2027-12-31",
+    ),
+    ("providers/skills/arcaflow_plugins.py", "_discover_from_mcp", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/arcaflow_plugins.py:_discover_from_mcp",
         "2027-12-31",
     ),
     (

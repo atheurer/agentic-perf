@@ -130,3 +130,64 @@ class TestHarnessToolScoping:
         }
         agent._apply_tool_scoping(ticket)
         assert len(agent.tools) == 2
+
+    def test_workflow_ticket_hides_direct_plugin_runner(self):
+        agent = self._make_agent()
+        agent.tools = self._make_tools(
+            [
+                "workflow_load",
+                "workflow_input_build",
+                "workflow_input_validate",
+                "workflow_input_export",
+                "workflow_execute",
+                "workflow_execution_status",
+                "workflow_execution_output",
+                "execute_benchmark",
+                "get_plugin_schema",
+                "plugin_list",
+                "request_clarification",
+            ]
+        )
+        agent._apply_tool_scoping(
+            {
+                "custom_fields": {
+                    "directives": {
+                        "harness": "arcaflow-plugins",
+                        "workflow_source": "https://example.test/workflow.yaml",
+                    }
+                }
+            }
+        )
+        assert {tool.name for tool in agent.tools} == {
+            "workflow_load",
+            "workflow_input_build",
+            "workflow_input_validate",
+            "workflow_input_export",
+            "workflow_execute",
+            "workflow_execution_status",
+            "workflow_execution_output",
+            "request_clarification",
+        }
+
+    def test_workflow_prompt_consumes_source_and_requires_mcp_path(self):
+        agent = BenchmarkAgent.__new__(BenchmarkAgent)
+        agent._repo_cache = None
+        prompt = agent._system_prompt(
+            {
+                "custom_fields": {
+                    "directives": {
+                        "harness": "arcaflow-plugins",
+                        "workflow_source": "https://example.test/workflow.yaml",
+                        "workflow_name": "fio-workflow",
+                    }
+                }
+            }
+        )
+        assert "workflow_load" in prompt
+        assert "workflow_input_build" in prompt
+        assert "workflow_input_validate" in prompt
+        assert "workflow_input_export" in prompt
+        assert "workflow_execute" in prompt
+        assert "https://example.test/workflow.yaml" in prompt
+        assert "fio-workflow" in prompt
+        assert "do not call `execute_benchmark`" in prompt

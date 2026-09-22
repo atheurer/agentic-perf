@@ -96,8 +96,43 @@ class TestBenchmarkToolScoping:
         assert allowed is not None
         assert "execute_benchmark" in allowed
         assert "get_runfile_schema" in allowed
+        assert {
+            "plugin_list",
+            "plugin_describe",
+            "workflow_load",
+            "workflow_input_build",
+            "workflow_input_validate",
+            "workflow_input_export",
+            "workflow_execute",
+            "workflow_execution_status",
+            "workflow_execution_cancel",
+            "workflow_execution_output",
+        } <= allowed
         # Unrestricted shell access is not part of any harness allowlist.
         assert "write_remote_file" not in allowed
+
+    def test_external_tool_filter_keeps_local_and_enabled_workflow_tools(self):
+        from agents.benchmark.agent import _filter_external_tools
+
+        tools = [
+            ToolDefinition(name="execute_benchmark", description="", input_schema={}),
+            ToolDefinition(name="workflow_load", description="", input_schema={}),
+            ToolDefinition(name="workflow_execute", description="", input_schema={}),
+        ]
+        filtered = _filter_external_tools(
+            tools,
+            {
+                "execute_benchmark": "benchmark",
+                "workflow_load": "arcaflow",
+                "workflow_execute": "arcaflow",
+            },
+            ["arcaflow"],
+            {"workflow_load"},
+        )
+        assert {tool.name for tool in filtered} == {
+            "execute_benchmark",
+            "workflow_load",
+        }
 
     def test_boot_time_scoping(self):
         from agents.benchmark.agent import BenchmarkAgent

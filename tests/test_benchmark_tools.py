@@ -7,6 +7,8 @@ import pytest
 
 from agents.benchmark.server import (
     _apply_runfile_safety_directives,
+    _validate_plugin_host,
+    _validate_plugin_image,
     _validate_run_command,
 )
 from providers.skills.base import RunfileTemplate
@@ -76,6 +78,92 @@ def test_no_host_mounts_directive_removes_the_key_from_nested_runfile(monkeypatc
     assert "host-mounts" not in sanitized["remotes"][0]["config"]["settings"]
     assert sanitized["remotes"][0]["config"]["settings"]["disable-tools"] is True
     assert original["remotes"][0]["config"]["settings"]["host-mounts"] == []
+
+
+def test_plugin_image_validation_rejects_shell_injection():
+    valid, message = _validate_plugin_image(
+        "quay.io/arcalot/arcaflow-plugin-fio:latest; touch /tmp/pwned"
+    )
+    assert not valid
+    assert "quay.io/arcalot/arcaflow-plugin" in message
+
+
+def test_plugin_host_validation_rejects_unassigned_target(monkeypatch):
+    import agents.benchmark.server as srv
+
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {
+            "custom_fields": {
+                "assigned_hardware_ips": {
+                    "controller": "controller.example.test",
+                    "targets": ["node-1.example.test"],
+                },
+                "host_inventory": {"node-1.example.test": {"os": "linux"}},
+            }
+        },
+    )
+    valid, message = _validate_plugin_host("unassigned.example.test")
+    assert not valid
+    assert "not assigned" in message
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_schema_rejects_malicious_image_before_ssh(monkeypatch):
+    import agents.benchmark.server as srv
+
+    class _SSH:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("rejected image must not reach SSH")
+
+    ssh = _SSH()
+    monkeypatch.setattr(srv, "_initialized", True)
+    monkeypatch.setattr(srv, "_ssh", ssh)
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {"custom_fields": {"assigned_hardware_ips": {"controller": "ctrl"}}},
+    )
+    result = json.loads(
+        await srv.get_plugin_schema(
+            "quay.io/arcalot/arcaflow-plugin-fio:latest; id", host="ctrl"
+        )
+    )
+    assert "error" in result
+    assert not ssh.calls
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_schema_rejects_unassigned_host_before_ssh(monkeypatch):
+    import agents.benchmark.server as srv
+
+    class _SSH:
+        async def run(self, *args, **kwargs):
+            raise AssertionError("unassigned host must not reach SSH")
+
+    monkeypatch.setattr(srv, "_initialized", True)
+    monkeypatch.setattr(srv, "_ssh", _SSH())
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {
+            "custom_fields": {
+                "assigned_hardware_ips": {"controller": "ctrl"},
+                "host_inventory": {"node-1": {"os": "linux"}},
+            }
+        },
+    )
+    result = json.loads(
+        await srv.get_plugin_schema(
+            "quay.io/arcalot/arcaflow-plugin-fio:latest", host="not-assigned"
+        )
+    )
+    assert result["error"] == "Target host is not assigned to this ticket"
 
 
 @pytest.mark.asyncio

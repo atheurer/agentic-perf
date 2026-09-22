@@ -18,6 +18,33 @@ from .prompts import BENCHMARK_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
+
+def _filter_external_tools(
+    tools: list[ToolDefinition],
+    routing: dict[str, str],
+    connected_external: list[str],
+    enabled_external: dict[str, set[str] | None],
+) -> list[ToolDefinition]:
+    """Apply each external MCP server's independent visibility policy."""
+    external = set(connected_external)
+    # Accept the pre-per-server set shape for callers that provide a mocked
+    # connector; production ``connect_external_servers`` always returns the
+    # mapping below.
+    if isinstance(enabled_external, set):
+        return [
+            tool
+            for tool in tools
+            if routing.get(tool.name) not in external or tool.name in enabled_external
+        ]
+    return [
+        tool
+        for tool in tools
+        if routing.get(tool.name) not in external
+        or enabled_external.get(routing.get(tool.name)) is None
+        or tool.name in (enabled_external.get(routing.get(tool.name)) or set())
+    ]
+
+
 _LOCAL_TOOLS = [
     ToolDefinition(
         name="request_clarification",
@@ -397,9 +424,20 @@ class BenchmarkAgent(AgentBase):
             agent_name=self.agent_name,
         )
 
+        # Workflow harnesses may expose their discovery and execution tools
+        # through a configured external MCP server (for example the Arcaflow
+        # stdio server). Keep those tools on this agent's MCP client so normal
+        # AgentBase dispatch can route calls to the owning external server.
+        from agents.mcp_client import connect_external_servers
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "benchmark")
+
         self._mcp = mcp
 
         all_tools = await mcp.list_tools()
+        all_tools = _filter_external_tools(
+            all_tools, mcp._tool_routing, connected_ext, ext_tools
+        )
         self.tools = all_tools + self.tools
 
         try:
@@ -463,6 +501,18 @@ class BenchmarkAgent(AgentBase):
             "get_execution_config",
             "get_runfile_schema",
             "get_benchmark_params",
+            "get_plugin_schema",
+            "plugin_list",
+            "plugin_describe",
+            "workflow_load",
+            "workflow_list",
+            "workflow_input_build",
+            "workflow_input_validate",
+            "workflow_input_export",
+            "workflow_execute",
+            "workflow_execution_status",
+            "workflow_execution_cancel",
+            "workflow_execution_output",
             "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",
@@ -496,6 +546,17 @@ class BenchmarkAgent(AgentBase):
             return
         allowed = self._HARNESS_TOOLS.get(harness)
         if allowed is not None:
+            directives = ticket.get("custom_fields", {}).get("directives", {})
+            if harness == "arcaflow-plugins" and directives.get("workflow_source"):
+                # Workflow tickets execute through the configured Arcaflow MCP
+                # workflow tools. The direct plugin runner requires
+                # ``plugin_image`` and is intentionally unavailable here.
+                allowed = allowed - {
+                    "execute_benchmark",
+                    "get_plugin_schema",
+                    "plugin_list",
+                    "plugin_describe",
+                }
             self.tools = [t for t in self.tools if t.name in allowed]
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
@@ -509,9 +570,45 @@ class BenchmarkAgent(AgentBase):
             resource_provider=provider,
             endpoint_type=endpoint,
         )
+        prompt = BENCHMARK_BASE_PROMPT
+        if directives.get("workflow_source"):
+            prompt += "\n\n" + self._workflow_instructions(directives)
         if fragments:
-            return f"{BENCHMARK_BASE_PROMPT}\n\n{fragments}"
-        return BENCHMARK_BASE_PROMPT
+            return f"{prompt}\n\n{fragments}"
+        return prompt
+
+    @staticmethod
+    def _workflow_instructions(directives: dict[str, Any]) -> str:
+        """Describe the required Arcaflow MCP execution path.
+
+        Workflow MCP tools are intentionally dispatched by the model because
+        their input schemas are supplied by the configured external server.
+        Keeping the directive here makes the ticket fields operational rather
+        than merely displaying them in the initial message.
+        """
+        source = directives.get("workflow_source", "")
+        name = directives.get("workflow_name")
+        name_line = f"\n- Workflow name/path: `{name}`" if name else ""
+        return (
+            "## Arcaflow Workflow Execution (mandatory)\n"
+            "This ticket supplies an Arcaflow workflow. Do not construct a "
+            "plugin-image run-file and do not call `execute_benchmark` for "
+            "this ticket. Use the configured Arcaflow MCP tools in this "
+            "order:\n"
+            "1. Call `workflow_load` for the supplied source (and workflow "
+            "name/path when present).\n"
+            "2. Use `workflow_input_build` to construct inputs from the "
+            "workflow schema and the ticket's requested parameters.\n"
+            "3. Call `workflow_input_validate`; correct any reported input "
+            "errors before continuing.\n"
+            "4. Call `workflow_input_export` to obtain the immutable input "
+            "payload, then call `workflow_execute` with the loaded workflow "
+            "and exported input.\n"
+            "5. Use the workflow status/output tools until execution reaches "
+            "a terminal state, then submit the result with its workflow run "
+            "ID.\n\n"
+            f"- Workflow source: `{source}`{name_line}"
+        )
 
     @staticmethod
     def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -562,6 +659,10 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**SSH User:** {cf['ssh_user']}\n"
         if cf.get("directives"):
             content += f"\n## User Directives\n```json\n{json.dumps(cf['directives'], indent=2)}\n```\n"
+
+        directives = cf.get("directives", {})
+        if directives.get("workflow_source"):
+            content += "\n" + self._workflow_instructions(directives) + "\n"
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 

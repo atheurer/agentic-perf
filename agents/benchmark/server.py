@@ -350,6 +350,15 @@ _SHELL_INJECTION_RE = re.compile(
     r";|&&|\|\||`|\$\(|\|",
 )
 
+# Arcaflow plugin discovery is deliberately limited to the published
+# Arcaflow plugin namespace. Besides preventing accidental execution of an
+# unrelated image, this means the image can never contribute shell syntax to
+# the remote command used by the schema probe.
+_ARCAFLOW_PLUGIN_IMAGE_RE = re.compile(
+    r"^quay\.io/arcalot/arcaflow-plugin-[a-z0-9][a-z0-9._-]*"
+    r"(?::[a-zA-Z0-9][a-zA-Z0-9._-]*|@sha256:[0-9a-fA-F]{64})?$"
+)
+
 
 def _validate_run_command(
     run_command: str,
@@ -384,6 +393,19 @@ def _validate_run_command(
             f"(allowed: {', '.join(sorted(allowed))})"
         )
 
+    return True, "OK"
+
+
+def _validate_plugin_image(plugin_image: str) -> tuple[bool, str]:
+    """Validate an Arcaflow plugin image before using it in a remote command."""
+    if not isinstance(plugin_image, str) or not plugin_image.strip():
+        return False, "plugin_image must be a non-empty string"
+    if not _ARCAFLOW_PLUGIN_IMAGE_RE.fullmatch(plugin_image):
+        return (
+            False,
+            "plugin_image must be a quay.io/arcalot/arcaflow-plugin image "
+            "with an optional tag or sha256 digest",
+        )
     return True, "OK"
 
 
@@ -669,6 +691,43 @@ def _controller_host() -> str | None:
     if isinstance(assigned, dict) and isinstance(assigned.get("controller"), str):
         return assigned["controller"].strip() or None
     return None
+
+
+def _authorized_plugin_hosts() -> set[str]:
+    """Return host identities assigned to this ticket for schema discovery."""
+    fields = _ticket.get("custom_fields", {}) if _ticket else {}
+    authorized: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            authorized.add(value.strip().rstrip(".").lower())
+
+    add(_controller_host())
+    assigned = fields.get("assigned_hardware_ips", {})
+    if isinstance(assigned, dict):
+        add(assigned.get("controller"))
+        targets = assigned.get("targets", [])
+        if isinstance(targets, (list, tuple, set)):
+            for target in targets:
+                add(target)
+        else:
+            add(targets)
+
+    inventory = fields.get("host_inventory", {})
+    if isinstance(inventory, dict):
+        for host in inventory:
+            add(host)
+    return authorized
+
+
+def _validate_plugin_host(host: str) -> tuple[bool, str]:
+    """Check that a schema target is an assigned controller/inventory host."""
+    if not isinstance(host, str) or not host.strip():
+        return False, "No target host available"
+    normalized = host.strip().rstrip(".").lower()
+    if normalized not in _authorized_plugin_hosts():
+        return False, "Target host is not assigned to this ticket"
+    return True, "OK"
 
 
 async def _read_controller_file(host: str, path: str) -> str | None:
@@ -1185,7 +1244,7 @@ async def get_execution_config(harness_name: str) -> str:
                     "may use different registries)"
                 ),
                 "workflow": [
-                    "1. Call get_runfile_schema to discover the plugin's input schema",
+                    "1. Call get_plugin_schema with the plugin image to discover available steps and input parameters",
                     "2. Build the input YAML based on the schema and ticket parameters",
                     "3. Call execute_benchmark with "
                     "run_file containing: plugin_image, "
@@ -1284,6 +1343,75 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
             }
         )
     return json.dumps({"found": True, "harness": harness_name, "schema": schema})
+
+
+@mcp.tool()
+async def get_plugin_schema(
+    plugin_image: str,
+    host: str = "",
+) -> str:
+    """Query an Arcaflow plugin container for its input schema.
+
+    Runs the plugin with --json-schema input on the target host
+    via podman. Returns the JSON schema describing the plugin's
+    available steps and their input parameters.
+
+    Args:
+        plugin_image: Full container image ref
+            (e.g., quay.io/arcalot/arcaflow-plugin-fio:0.5.0)
+        host: Target host IP. Uses the ticket's controller
+            if not specified.
+    """
+    await _ensure_init()
+    if _ssh is None:
+        return json.dumps({"error": "SSH not initialized"})
+
+    image_valid, image_error = _validate_plugin_image(plugin_image)
+    if not image_valid:
+        return json.dumps({"error": image_error})
+
+    target = host or _controller_host() or ""
+    host_valid, host_error = _validate_plugin_host(target)
+    if not host_valid:
+        return json.dumps({"error": host_error})
+
+    cmd = shlex.join(["podman", "run", "--rm", plugin_image, "--json-schema", "input"])
+    result = await _ssh.run(target, cmd, timeout=60)
+
+    if result.exit_code != 0:
+        # Try --schema as fallback (returns full schema)
+        cmd_full = shlex.join(["podman", "run", "--rm", plugin_image, "--schema"])
+        result = await _ssh.run(target, cmd_full, timeout=60)
+
+    if result.exit_code != 0:
+        return json.dumps(
+            {
+                "error": f"Failed to query plugin schema (exit {result.exit_code})",
+                "stderr": result.stderr[:500] if result.stderr else "",
+                "hint": (
+                    "The plugin image may not exist or may not "
+                    "support --json-schema. Check the image ref."
+                ),
+            }
+        )
+
+    # Parse and return the schema
+    try:
+        schema = json.loads(result.stdout)
+        return json.dumps(
+            {
+                "plugin_image": plugin_image,
+                "schema": schema,
+            }
+        )
+    except json.JSONDecodeError:
+        return json.dumps(
+            {
+                "plugin_image": plugin_image,
+                "raw_output": result.stdout[:2000],
+                "note": "Output was not valid JSON",
+            }
+        )
 
 
 @mcp.tool()
@@ -3389,6 +3517,19 @@ async def execute_benchmark(
                 }
             )
 
+        image_valid, image_error = _validate_plugin_image(plugin_image)
+        if not image_valid:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": -1,
+                    "run_id": f"arcaflow-{run_uuid}",
+                    "output": "",
+                    "error": image_error,
+                    "message": "Invalid Arcaflow plugin image",
+                }
+            )
+
         # Determine if we can run locally (no SSH needed)
         is_local = controller in ("localhost", "127.0.0.1", "::1")
 
@@ -3459,11 +3600,18 @@ async def execute_benchmark(
                 f"cat > {input_path} << 'ARCAEOF'\n{input_content}\nARCAEOF",
             )
 
-            step_flag = f"-s {plugin_step} "
-            cmd = (
-                f"cat {input_path} | podman run -i --rm "
-                f"{plugin_image} {step_flag}-f - 2>&1"
-            )
+            podman_args = [
+                "podman",
+                "run",
+                "-i",
+                "--rm",
+                plugin_image,
+                "-s",
+                plugin_step,
+                "-f",
+                "-",
+            ]
+            cmd = f"cat {shlex.quote(input_path)} | {shlex.join(podman_args)} 2>&1"
             logger.info(f"[benchmark] Executing Arcaflow plugin via SSH: {cmd}")
             result = await _ssh.run_with_progress(
                 controller,
