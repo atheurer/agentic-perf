@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import httpx
+from providers.execution import AuditedAsyncHTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,11 @@ async def _resolve_latest_monthly(
     and returns the path to the latest build.
     """
     try:
-        async with httpx.AsyncClient(
+        async with AuditedAsyncHTTPClient(
             timeout=15.0,
-            follow_redirects=True,
             verify=not trust_server,
         ) as client:
-            r = await client.get(monthly_url + "/")
+            r = await _audited_get_follow_redirects(client, monthly_url + "/")
             if r.status_code != 200:
                 return ""
             # Parse directory listing for dated subdirs
@@ -114,12 +113,11 @@ async def resolve_image_urls(
 
     manifest_url = f"{base_url}/{image_version}/{release}/info/test_images_info.json"
 
-    async with httpx.AsyncClient(
+    async with AuditedAsyncHTTPClient(
         timeout=30.0,
-        follow_redirects=True,
         verify=not trust_server,
     ) as client:
-        r = await client.get(manifest_url)
+        r = await _audited_get_follow_redirects(client, manifest_url)
 
         # Fallback chain when the specific release 404s:
         # 1. Match by datestamp (e.g., latest-RHIVOS-2-202607240103
