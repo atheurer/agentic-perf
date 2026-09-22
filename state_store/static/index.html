@@ -2327,12 +2327,15 @@ async function renderDetail(ticketId) {
   const app = document.getElementById('app');
   app.innerHTML = '<div class="spinner"></div> Loading ticket...';
 
+  // Clear event state immediately to prevent stale events
+  // from a previous ticket showing during the async fetch.
+  lastSeq = 0;
+  maxRenderedSeq = 0;
+  renderedEventCount = 0;
+  eventRecords = [];
+
   try {
     const ticket = await api('/tickets/' + ticketId);
-    lastSeq = 0;
-    maxRenderedSeq = 0;
-    renderedEventCount = 0;
-    eventRecords = [];
     eventView = 'activity';
     eventSearch = '';
     _lastResultHash = '';

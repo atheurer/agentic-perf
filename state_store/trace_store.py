@@ -265,6 +265,25 @@ class TraceStore:
         )
         return stored, False
 
+    def count_events(self, ticket_id: str) -> int:
+        """Return the number of trace events for a ticket.
+
+        Cheaper than list_events — no Pydantic validation.
+        """
+        with self._lock:
+            try:
+                row = (
+                    self._open_connection()
+                    .execute(
+                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    )
+                    .fetchone()
+                )
+                return row[0] if row else 0
+            except (sqlite3.Error, OSError):
+                return 0
+
     def list_events(
         self,
         ticket_id: str | None = None,
