@@ -18,6 +18,24 @@ from .prompts import BENCHMARK_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
 
+
+def _filter_external_tools(
+    tools: list[ToolDefinition],
+    routing: dict[str, str],
+    connected_external: list[str],
+    enabled_external: set[str] | None,
+) -> list[ToolDefinition]:
+    """Hide only unscoped external tools; retain all ticket-local tools."""
+    if enabled_external is None:
+        return tools
+    external = set(connected_external)
+    return [
+        tool
+        for tool in tools
+        if routing.get(tool.name) not in external or tool.name in enabled_external
+    ]
+
+
 _LOCAL_TOOLS = [
     ToolDefinition(
         name="request_clarification",
@@ -397,9 +415,20 @@ class BenchmarkAgent(AgentBase):
             agent_name=self.agent_name,
         )
 
+        # Workflow harnesses may expose their discovery and execution tools
+        # through a configured external MCP server (for example the Arcaflow
+        # stdio server). Keep those tools on this agent's MCP client so normal
+        # AgentBase dispatch can route calls to the owning external server.
+        from agents.mcp_client import connect_external_servers
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "benchmark")
+
         self._mcp = mcp
 
         all_tools = await mcp.list_tools()
+        all_tools = _filter_external_tools(
+            all_tools, mcp._tool_routing, connected_ext, ext_tools
+        )
         self.tools = all_tools + self.tools
 
         try:
@@ -466,6 +495,15 @@ class BenchmarkAgent(AgentBase):
             "get_plugin_schema",
             "plugin_list",
             "plugin_describe",
+            "workflow_load",
+            "workflow_list",
+            "workflow_input_build",
+            "workflow_input_validate",
+            "workflow_input_export",
+            "workflow_execute",
+            "workflow_execution_status",
+            "workflow_execution_cancel",
+            "workflow_execution_output",
             "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",

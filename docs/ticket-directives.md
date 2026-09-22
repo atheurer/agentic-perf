@@ -228,7 +228,7 @@ build requirements and set the directives.
 | `workflow_source` | Git repo URL or raw workflow file URL for Arcaflow workflow execution. When set, the benchmark agent uses the Arcaflow MCP to load, configure, and run the workflow. | `https://gitlab.com/org/arcaflow-workflow-auto-perf.git`, `https://example.com/workflow.yaml` |
 | `workflow_name` | Name or path of the workflow within the source repo. Only needed when the source contains multiple workflows. | `workflow-fio`, `workflow-stressng` |
 
-When `workflow_source` is set, triage automatically sets `harness: "arcaflow"`. The benchmark agent handles workflow loading, input construction, and execution via the Arcaflow MCP.
+When `workflow_source` is set, triage automatically sets `harness: "arcaflow-plugins"`. The benchmark agent handles workflow loading, input construction, and execution via the Arcaflow MCP.
 
 ### Diagnostics (Jumpstarter)
 

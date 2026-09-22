@@ -15,6 +15,14 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+
+def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]:
+    """Route workflow tickets through the canonical Arcaflow provider key."""
+    if directives.get("workflow_source"):
+        directives["harness"] = "arcaflow-plugins"
+    return directives
+
+
 _SCOPED_CONTEXT_CALL_RE = re.compile(
     r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
 )
@@ -682,8 +690,10 @@ class TriageAgent(AgentBase):
         # must use MCP workflow tools, not direct plugin
         # execution. The 'arcaflow' harness key routes to
         # the workflow tool set.
-        if directives.get("workflow_source"):
-            directives["harness"] = "arcaflow"
+        # Arcaflow workflow/plugin execution is owned by the same canonical
+        # harness provider. Keep this value aligned with the provider catalog
+        # and BenchmarkAgent tool-scoping key.
+        directives = _canonicalize_workflow_harness(directives)
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),

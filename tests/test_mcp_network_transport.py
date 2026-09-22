@@ -208,6 +208,40 @@ class TestMixedTransports:
 
 class TestConnectExternalServers:
     @pytest.mark.asyncio
+    async def test_connects_stdio_server_for_matching_agent(self):
+        client = AgentMCPClient()
+        client.connect_command = AsyncMock()
+        config = {
+            "external_mcp_servers": [
+                {
+                    "name": "arcaflow",
+                    "command": ["arcaflow-mcp", "--enable-execution"],
+                    "transport": "stdio",
+                    "agents": {
+                        "benchmark": {
+                            "enabled_tools": ["workflow_load", "workflow_execute"]
+                        }
+                    },
+                }
+            ]
+        }
+
+        from agents.mcp_client import connect_external_servers
+
+        connected, enabled = await connect_external_servers(
+            client, "benchmark", config=config
+        )
+
+        assert connected == ["arcaflow"]
+        assert enabled == {"workflow_load", "workflow_execute"}
+        client.connect_command.assert_awaited_once_with(
+            command="arcaflow-mcp",
+            args=["--enable-execution"],
+            name="arcaflow",
+            env=None,
+        )
+
+    @pytest.mark.asyncio
     async def test_connects_matching_agent(self):
         """Connects servers configured for the agent type."""
         transport = _make_mock_transport()

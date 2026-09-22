@@ -189,20 +189,20 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3687|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3732|staging.unlink
-agents/benchmark/server.py|3734|unlink
-agents/benchmark/server.py|4012|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|4117|staging.unlink
-agents/benchmark/server.py|4119|unlink
-agents/benchmark/server.py|4449|open
-agents/benchmark/server.py|4631|diag_file.write_text
-agents/benchmark/server.py|4662|artifact_filesystem.unlink
-agents/benchmark/server.py|4664|serial_log_path.unlink
-agents/benchmark/server.py|4695|metadata_file.write_bytes
-agents/benchmark/server.py|4702|metadata_file.write_text
-agents/benchmark/server.py|4708|metadata_file.write_text
-agents/benchmark/server.py|4763|merged_file.write_bytes
+agents/benchmark/server.py|3770|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3815|staging.unlink
+agents/benchmark/server.py|3817|unlink
+agents/benchmark/server.py|4095|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|4200|staging.unlink
+agents/benchmark/server.py|4202|unlink
+agents/benchmark/server.py|4532|open
+agents/benchmark/server.py|4714|diag_file.write_text
+agents/benchmark/server.py|4745|artifact_filesystem.unlink
+agents/benchmark/server.py|4747|serial_log_path.unlink
+agents/benchmark/server.py|4778|metadata_file.write_bytes
+agents/benchmark/server.py|4785|metadata_file.write_text
+agents/benchmark/server.py|4791|metadata_file.write_text
+agents/benchmark/server.py|4846|merged_file.write_bytes
 agents/infra/server.py|209|tempfile.NamedTemporaryFile
 agents/infra/server.py|217|staging.unlink
 agents/infra/server.py|219|unlink

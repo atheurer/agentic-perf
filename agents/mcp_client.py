@@ -1425,6 +1425,7 @@ async def connect_external_servers(
     for entry in servers:
         name = entry.get("name", "")
         url = entry.get("url", "")
+        command = entry.get("command", [])
         transport = entry.get("transport", "")
         agents = entry.get("agents", {})
 
@@ -1444,9 +1445,9 @@ async def connect_external_servers(
         else:
             continue
 
-        if not url or not transport:
+        if not transport:
             logger.warning(
-                f"[mcp] Skipping external server {name!r}: missing url or transport"
+                f"[mcp] Skipping external server {name!r}: missing transport"
             )
             continue
 
@@ -1467,7 +1468,27 @@ async def connect_external_servers(
         try:
             trust = entry.get("trust", False)
 
-            if transport == "sse":
+            if transport == "stdio":
+                if (
+                    not isinstance(command, list)
+                    or not command
+                    or not all(isinstance(item, str) and item for item in command)
+                ):
+                    logger.warning(
+                        "[mcp] Skipping stdio server %r: command must be a non-empty list",
+                        name,
+                    )
+                    continue
+                await client.connect_command(
+                    command=command[0],
+                    args=command[1:],
+                    name=name,
+                    env=entry.get("env"),
+                )
+            elif transport == "sse":
+                if not url:
+                    logger.warning("[mcp] Skipping SSE server %r: missing url", name)
+                    continue
                 await client.connect_sse(
                     url=url,
                     name=name,
@@ -1475,6 +1496,11 @@ async def connect_external_servers(
                     trust=trust,
                 )
             elif transport == "streamable_http":
+                if not url:
+                    logger.warning(
+                        "[mcp] Skipping StreamableHTTP server %r: missing url", name
+                    )
+                    continue
                 await client.connect_streamable_http(
                     url=url,
                     name=name,
