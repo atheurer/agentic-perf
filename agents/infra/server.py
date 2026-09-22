@@ -885,9 +885,9 @@ async def test_port_connectivity(
     client_ssh_host: str,
     server_test_ip: str,
     port: int | None = None,
-    ports: list[int] | None = None,
     client_test_ip: str = "",
     timeout: int = 10,
+    ports: list[int] | None = None,
 ) -> str:
     """Test TCP port connectivity between two hosts.
 
@@ -907,12 +907,13 @@ async def test_port_connectivity(
         server_ssh_host: IP to SSH into the server machine
         client_ssh_host: IP to SSH into the client machine
         server_test_ip: IP the server listens on (the IP being tested)
-        port: Single TCP port to test (mutually exclusive with ports)
-        ports: List of TCP ports to test concurrently (mutually exclusive
-            with port)
+        port: Single TCP port to test (mutually exclusive with ports). This
+            remains in its original positional position for compatibility.
         client_test_ip: Optional — if provided, also tests reverse
             connectivity (server connecting to client on the same port(s))
         timeout: Seconds to wait for each connection test
+        ports: List of TCP ports to test concurrently (mutually exclusive
+            with port)
     """
     _MAX_PORTS = 64
 
@@ -967,7 +968,32 @@ async def test_port_connectivity(
                 "error": (test.stderr.strip() if test.exit_code != 0 else ""),
             }
         finally:
-            await ssh.run(listener_ssh, f"kill {pid} 2>/dev/null", timeout=5)
+            # Cleanup must complete even when the connectivity probe is
+            # cancelled. Shielding a task alone is insufficient: the outer
+            # task can still receive CancelledError while awaiting it. Keep
+            # waiting for the kill command, then propagate cancellation.
+            cleanup_task = asyncio.create_task(
+                ssh.run(listener_ssh, f"kill {pid} 2>/dev/null", timeout=5)
+            )
+            was_cancelled = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    was_cancelled = True
+            try:
+                cleanup_task.result()
+            except asyncio.CancelledError:
+                was_cancelled = True
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up nc listener pid %s on %s: %s",
+                    pid,
+                    listener_ssh,
+                    exc,
+                )
+            if was_cancelled:
+                raise asyncio.CancelledError
 
     async def _test_port(test_port: int) -> list[dict[str, Any]]:
         port_results: list[dict[str, Any]] = []

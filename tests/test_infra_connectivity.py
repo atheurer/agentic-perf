@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -43,6 +44,21 @@ class TestPortConnectivitySinglePort:
         assert len(result["tests"]) == 1
         assert result["tests"][0]["port"] == 30002
         assert result["tests"][0]["reachable"] is True
+
+    @pytest.mark.asyncio
+    async def test_existing_positional_arguments_remain_compatible(self, patch_ssh):
+        result = json.loads(
+            await srv.test_port_connectivity(
+                "10.0.0.1",
+                "10.0.0.2",
+                "192.168.1.1",
+                30002,
+                "192.168.1.2",
+                10,
+            )
+        )
+        assert result["all_reachable"] is True
+        assert len(result["tests"]) == 2
 
     @pytest.mark.asyncio
     async def test_single_port_in_ports_list_returns_multi_shape(self, patch_ssh):
@@ -171,3 +187,29 @@ class TestPortConnectivityErrors:
         )
         assert result["all_ports_ok"] is True
         assert len(result["results"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_cancellation_still_kills_listener(self, patch_ssh):
+        started = asyncio.Event()
+
+        async def block_probe(host, command, **kwargs):
+            if "nc -z" in command:
+                started.set()
+                await asyncio.Event().wait()
+            return await MockSSHExecutor.run(patch_ssh, host, command, **kwargs)
+
+        patch_ssh.run = block_probe
+        task = asyncio.create_task(
+            srv.test_port_connectivity(
+                server_ssh_host="10.0.0.1",
+                client_ssh_host="10.0.0.2",
+                server_test_ip="192.168.1.1",
+                port=30002,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert any(call["command"].startswith("kill 12345") for call in patch_ssh.calls)
