@@ -3199,6 +3199,9 @@ async function pollEvents(ticketId) {
   eventPollInFlight = true;
   try {
     var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
+    // Guard: if the user navigated away during the fetch,
+    // discard the response to prevent stale event injection.
+    if (ticketId !== currentTicketId) return;
     var newEvents = data.events || [];
     if (newEvents.length > 0) {
       lastSeq = data.latest_seq;

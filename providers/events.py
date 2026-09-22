@@ -176,10 +176,12 @@ class EventBus:
         # Per-ticket merged event cache.  Each entry is
         # (jsonl_mtime_ns, jsonl_size, trace_count, merged_events)
         # and invalidates when the JSONL file or trace store changes.
+        # Bounded to _MAX_CACHED_TICKETS to prevent unbounded growth.
         self._merged_event_cache: dict[
             str, tuple[int, int, int, list[dict[str, Any]]]
         ] = {}
         self._merged_event_cache_lock = threading.Lock()
+        self._MAX_CACHED_TICKETS = 50
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
@@ -503,6 +505,11 @@ class EventBus:
                 trace_count,
                 merged,
             )
+            # Evict oldest entries if cache exceeds bound
+            if len(self._merged_event_cache) > self._MAX_CACHED_TICKETS:
+                excess = len(self._merged_event_cache) - self._MAX_CACHED_TICKETS
+                for key in list(self._merged_event_cache)[:excess]:
+                    del self._merged_event_cache[key]
         return merged
 
     def get_events(
@@ -512,7 +519,9 @@ class EventBus:
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         merged = self._get_merged_events(ticket_id)
-        return [item for item in merged if item["seq"] > since][:limit]
+        # Return shallow copies — callers (e.g. api/stream.py)
+        # may mutate the dicts, which would corrupt the cache.
+        return [dict(item) for item in merged if item["seq"] > since][:limit]
 
     def get_usage_events(
         self,
