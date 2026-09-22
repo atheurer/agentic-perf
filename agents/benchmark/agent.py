@@ -34,16 +34,14 @@ def _filter_external_tools(
         return [
             tool
             for tool in tools
-            if routing.get(tool.name) not in external
-            or tool.name in enabled_external
+            if routing.get(tool.name) not in external or tool.name in enabled_external
         ]
     return [
         tool
         for tool in tools
         if routing.get(tool.name) not in external
         or enabled_external.get(routing.get(tool.name)) is None
-        or tool.name
-        in (enabled_external.get(routing.get(tool.name)) or set())
+        or tool.name in (enabled_external.get(routing.get(tool.name)) or set())
     ]
 
 

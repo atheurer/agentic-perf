@@ -457,7 +457,9 @@ class TestConnectExternalServers:
             ]
         }
         with (
-            patch("agents.mcp_client.ClientSession", side_effect=[cs_all, cs_restricted]),
+            patch(
+                "agents.mcp_client.ClientSession", side_effect=[cs_all, cs_restricted]
+            ),
             patch(
                 "mcp.client.streamable_http.streamablehttp_client",
                 return_value=transport,
