@@ -4349,20 +4349,88 @@ async def execute_boot_time_test(
 
     # ── Wait for SSH readiness ─────────────────────────
     # Freshly provisioned boards may not have SSH ready
-    # immediately. Wait up to 60s for port 22.
+    # immediately. Wait up to 60s for port 22.  If a
+    # Jumpstarter lease is available and SSH fails, power-
+    # cycle the board and retry — the board may not have
+    # booted cleanly after flashing.
     import asyncio as _asyncio
     import socket as _socket
 
-    for _attempt in range(12):
-        try:
-            s = _socket.create_connection((sut_host, 22), timeout=5)
-            s.close()
+    _js_lease_id = ""
+    if _ticket:
+        _js_fields = _ticket.get("custom_fields", {})
+        _js_meta = _js_fields.get("resource_provider_metadata", {})
+        _js_lease_id = _js_meta.get("lease_id", "")
+        if _js_fields.get("resource_provider") != "jumpstarter":
+            _js_lease_id = ""
+
+    _MAX_POWER_CYCLES = 3
+    _SSH_ATTEMPTS_PER_CYCLE = 12
+    _ssh_ready = False
+
+    for _cycle in range(_MAX_POWER_CYCLES):
+        for _attempt in range(_SSH_ATTEMPTS_PER_CYCLE):
+            try:
+                s = _socket.create_connection((sut_host, 22), timeout=5)
+                s.close()
+                _ssh_ready = True
+                break
+            except (OSError, ConnectionRefusedError):
+                logger.info(
+                    "[boot-time] Waiting for SSH on %s (cycle %d/%d, attempt %d/%d)",
+                    sut_host,
+                    _cycle + 1,
+                    _MAX_POWER_CYCLES,
+                    _attempt + 1,
+                    _SSH_ATTEMPTS_PER_CYCLE,
+                )
+                await _asyncio.sleep(5)
+
+        if _ssh_ready:
             break
-        except (OSError, ConnectionRefusedError):
-            logger.info(
-                f"[boot-time] Waiting for SSH on {sut_host} (attempt {_attempt + 1}/12)"
+
+        if not _js_lease_id:
+            # No Jumpstarter lease — cannot power-cycle
+            break
+
+        if _cycle + 1 < _MAX_POWER_CYCLES:
+            logger.warning(
+                "[boot-time] SSH unreachable after %ds,"
+                " power-cycling board via Jumpstarter"
+                " (lease=%s, cycle %d/%d)",
+                _SSH_ATTEMPTS_PER_CYCLE * 5,
+                _js_lease_id,
+                _cycle + 1,
+                _MAX_POWER_CYCLES,
             )
-            await _asyncio.sleep(5)
+            try:
+                _pc_proc = await AuditedSubprocessRunner().start(
+                    [
+                        "jmp",
+                        "shell",
+                        "--lease",
+                        _js_lease_id,
+                        "--",
+                        "j",
+                        "power",
+                        "cycle",
+                    ],
+                    mutating=True,
+                )
+                _pc_out, _pc_err = await asyncio.wait_for(
+                    _pc_proc.communicate(),
+                    timeout=60,
+                )
+                logger.info(
+                    "[boot-time] Power cycle complete (rc=%d), waiting for SSH",
+                    _pc_proc.returncode,
+                )
+            except Exception as _pc_exc:
+                logger.warning(
+                    "[boot-time] Power cycle failed: %s",
+                    _pc_exc,
+                )
+                break
 
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
     ssh_user = "root"
