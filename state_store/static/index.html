@@ -4302,6 +4302,12 @@ function render() {
   currentView = route.view;
   currentTicketId = route.ticketId || null;
 
+  // Hide global chat immediately to prevent flash during
+  // async view transitions.  Each view re-shows the
+  // appropriate chat widget after its DOM is ready.
+  var gc = document.getElementById('chat-container');
+  if (gc) gc.style.display = 'none';
+
   if (route.view === 'detail' && route.ticketId) {
     renderDetail(route.ticketId);
   } else {
