@@ -510,9 +510,21 @@ class TriageAgent(AgentBase):
             state_store_url=self.store_url,
             agent_name=self.agent_name,
         )
+
+        # Triage may use explicitly authorized external discovery tools (for
+        # example Arcaflow's plugin_list). Keep those servers scoped exactly
+        # as configured; never expose an unconfigured external tool to the
+        # triage LLM.
+        from agents.mcp_client import connect_external_servers, filter_external_tools
+
+        connected_ext, ext_tools = await connect_external_servers(mcp, "triage")
         self._mcp = mcp
 
         mcp_tools = await mcp.list_tools()
+        if ext_tools:
+            mcp_tools = filter_external_tools(
+                mcp_tools, mcp._tool_routing, connected_ext, ext_tools
+            )
         self.tools = mcp_tools + self.tools
 
         try:

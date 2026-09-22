@@ -43,7 +43,7 @@ The manifest entries fall into these reviewed classes:
   The orchestrator's poll-loop lifecycle cleanup is intentionally structured
   around initialization and shutdown, so this code's reviewed mutation line
   numbers may move when resource-teardown logic changes. The current reviewed
-  lock mutations are at lines 2080, 2081, 2096, 2097, and 2117; the fixed
+  lock mutations are at lines 2152, 2153, 2168, 2169, and 2189; the fixed
   manifest in `tests/test_filesystem_inventory.py` must follow such moves
   without changing the reviewed mutation set.
 

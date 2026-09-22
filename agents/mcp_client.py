@@ -1326,14 +1326,14 @@ async def connect_external_servers(
     agent_type: str,
     config: dict[str, Any] | None = None,
     secrets_dir: str = "",
-) -> tuple[list[str], set[str] | None]:
+) -> tuple[list[str], dict[str, set[str] | None]]:
     """Connect an MCP client to external servers configured
     for the given agent type.
 
     Reads ``external_mcp_servers`` from config and connects
     to each server whose ``agents`` dict includes the given
     agent_type. Returns the list of server names connected
-    and a set of enabled tool names (or None for all tools).
+    and a per-server map of enabled tool names (or None for all tools).
 
     The ``agents`` field is a dict mapping agent type keys to
     their configuration::
@@ -1367,9 +1367,9 @@ async def connect_external_servers(
             Defaults to ~/.agentic-perf/secrets/.
 
     Returns:
-        Tuple of (connected server names, enabled tool names).
-        The tool set is None if all tools are enabled, or a
-        set of tool name strings if filtering is configured.
+        Tuple of (connected server names, per-server tool scopes). Each
+        scope is None when that server exposes all tools, or a set of tool
+        names when the server is restricted.
 
     Example:
         .. code-block:: python
@@ -1416,11 +1416,10 @@ async def connect_external_servers(
 
     servers = config.get("external_mcp_servers", [])
     connected: list[str] = []
-    # Collect enabled tools across all connected servers.
-    # None means "all tools" (no filtering). A set means
-    # only those tools are visible to the LLM.
-    enabled_tools: set[str] | None = None
-    _has_scoping = False
+    # Keep authorization independent for every connected server. A global
+    # union would incorrectly hide tools from an unrestricted server whenever
+    # another server configured a restrictive list.
+    enabled_tools: dict[str, set[str] | None] = {}
 
     for entry in servers:
         name = entry.get("name", "")
@@ -1516,25 +1515,40 @@ async def connect_external_servers(
             connected.append(name)
             logger.info(f"[mcp] Connected to external server {name!r} ({transport})")
 
-            # Collect tool scoping for this agent.
+            # Collect tool scoping for this agent, retaining the owning
+            # server's policy instead of flattening all policies together.
             tools_cfg = agent_config.get("enabled_tools", "all")
             if isinstance(tools_cfg, list):
-                _has_scoping = True
-                if enabled_tools is None:
-                    enabled_tools = set(tools_cfg)
-                else:
-                    enabled_tools.update(tools_cfg)
-            # "all" or omitted — no filtering for
-            # this server (but other servers may
-            # still add scoping).
+                enabled_tools[name] = set(tools_cfg)
+            else:
+                # "all" or omitted means no filtering for this server.
+                enabled_tools[name] = None
         except Exception:
             logger.warning(
                 f"[mcp] Failed to connect to {name!r} at {url}",
                 exc_info=True,
             )
 
-    # If any server specified a tool list, return the
-    # union. If all servers used "all", return None.
-    if not _has_scoping:
-        enabled_tools = None
     return connected, enabled_tools
+
+
+def filter_external_tools(
+    tools: list[Any],
+    routing: dict[str, str],
+    connected_servers: list[str],
+    scopes: dict[str, set[str] | None],
+) -> list[Any]:
+    """Filter LLM-visible tools using each external server's own policy.
+
+    Ticket-local tools are always retained. External tools from an
+    unrestricted server (``None``) are retained, while restricted servers
+    expose only their configured names.
+    """
+    connected = set(connected_servers)
+    return [
+        tool
+        for tool in tools
+        if routing.get(tool.name) not in connected
+        or scopes.get(routing.get(tool.name)) is None
+        or tool.name in (scopes.get(routing.get(tool.name)) or set())
+    ]

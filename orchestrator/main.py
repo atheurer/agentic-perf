@@ -2132,6 +2132,14 @@ async def _poll_loop_after_lease(
         if dispatcher is not None:
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)
+        if arcaflow_mcp is not None:
+            try:
+                await arcaflow_mcp.disconnect()
+            except Exception:
+                logger.warning(
+                    "[orchestrator] Failed to disconnect Arcaflow MCP",
+                    exc_info=True,
+                )
         events.close()
 
 

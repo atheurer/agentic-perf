@@ -233,7 +233,7 @@ class TestConnectExternalServers:
         )
 
         assert connected == ["arcaflow"]
-        assert enabled == {"workflow_load", "workflow_execute"}
+        assert enabled == {"arcaflow": {"workflow_load", "workflow_execute"}}
         client.connect_command.assert_awaited_once_with(
             command="arcaflow-mcp",
             args=["--enable-execution"],
@@ -274,7 +274,7 @@ class TestConnectExternalServers:
 
         assert connected == ["domain-mcp"]
         assert "domain_tool" in client._tool_routing
-        assert enabled is None  # "all" means no filtering
+        assert enabled == {"domain-mcp": None}  # "all" means no filtering
 
     @pytest.mark.asyncio
     async def test_skips_non_matching_agent(self):
@@ -321,7 +321,7 @@ class TestConnectExternalServers:
         )
 
         assert connected == []
-        assert enabled is None
+        assert enabled == {}
 
     @pytest.mark.asyncio
     async def test_reads_auth_from_secrets(self, tmp_path):
@@ -392,8 +392,8 @@ class TestConnectExternalServers:
         assert connected == []
 
     @pytest.mark.asyncio
-    async def test_tool_scoping_returns_enabled_set(self):
-        """Returns enabled tool set when configured."""
+    async def test_tool_scoping_returns_enabled_set_per_server(self):
+        """Returns each server's independent enabled tool set."""
         transport = _make_mock_transport()
         cs = _make_mock_session(["get_baseline_stats", "get_key_metrics", "compare"])
 
@@ -430,9 +430,67 @@ class TestConnectExternalServers:
             )
 
         assert connected == ["domain-mcp"]
-        assert enabled == {"get_baseline_stats", "compare"}
+        assert enabled == {"domain-mcp": {"get_baseline_stats", "compare"}}
         # get_key_metrics is connected but not in enabled set
         assert "get_key_metrics" in client._tool_routing
+
+    @pytest.mark.asyncio
+    async def test_mixed_all_and_restricted_servers_keep_independent_scopes(self):
+        """An unrestricted server must not inherit another server's list."""
+        transport = _make_mock_transport()
+        cs_all = _make_mock_session(["all_tool"])
+        cs_restricted = _make_mock_session(["allowed_tool", "hidden_tool"])
+        config = {
+            "external_mcp_servers": [
+                {
+                    "name": "open",
+                    "url": "http://open.test/mcp",
+                    "transport": "streamable_http",
+                    "agents": {"review": {"enabled_tools": "all"}},
+                },
+                {
+                    "name": "restricted",
+                    "url": "http://restricted.test/mcp",
+                    "transport": "streamable_http",
+                    "agents": {"review": {"enabled_tools": ["allowed_tool"]}},
+                },
+            ]
+        }
+        with (
+            patch("agents.mcp_client.ClientSession", side_effect=[cs_all, cs_restricted]),
+            patch(
+                "mcp.client.streamable_http.streamablehttp_client",
+                return_value=transport,
+            ),
+        ):
+            from agents.mcp_client import (
+                connect_external_servers,
+                filter_external_tools,
+            )
+
+            client = AgentMCPClient()
+            connected, scopes = await connect_external_servers(
+                client, "review", config=config
+            )
+            client._tool_routing.update(
+                {
+                    "all_tool": "open",
+                    "allowed_tool": "restricted",
+                    "hidden_tool": "restricted",
+                }
+            )
+            tools = [
+                MagicMock(name=name)
+                for name in ("all_tool", "allowed_tool", "hidden_tool")
+            ]
+            for tool in tools:
+                tool.name = tool._mock_name
+            visible = filter_external_tools(
+                tools, client._tool_routing, connected, scopes
+            )
+
+        assert scopes == {"open": None, "restricted": {"allowed_tool"}}
+        assert {tool.name for tool in visible} == {"all_tool", "allowed_tool"}
 
     @pytest.mark.asyncio
     async def test_agent_filtering_preserves_internal_tools(self):
