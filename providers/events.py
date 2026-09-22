@@ -173,6 +173,15 @@ class EventBus:
         self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
         self._legacy_usage_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
         self._legacy_usage_cache_lock = threading.Lock()
+        # Per-ticket merged event cache.  Each entry is
+        # (jsonl_mtime_ns, jsonl_size, trace_count, merged_events)
+        # and invalidates when the JSONL file or trace store changes.
+        # Bounded to _MAX_CACHED_TICKETS to prevent unbounded growth.
+        self._merged_event_cache: dict[
+            str, tuple[int, int, int, list[dict[str, Any]]]
+        ] = {}
+        self._merged_event_cache_lock = threading.Lock()
+        self._MAX_CACHED_TICKETS = 50
 
     def _ensure_loaded_locked(self, ticket_id: str) -> None:
         """Restore ticket sequence number and cumulative usage from jsonl.
@@ -452,15 +461,33 @@ class EventBus:
                 total.models_used.update(usage.models_used)
             return total.to_dict()
 
-    def get_events(
-        self,
-        ticket_id: str,
-        since: int = 0,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        # Project both sources once, then assign compatibility cursors after the
-        # stable mixed-history ordering. Cursors therefore advance over filtered
-        # SSE records without skips or trace/legacy sequence collisions.
+    def _get_merged_events(self, ticket_id: str) -> list[dict[str, Any]]:
+        """Return the full merged event list, cached per ticket.
+
+        The cache invalidates when the JSONL file changes
+        (mtime/size) or the trace event count changes.
+        """
+        path = self._log_dir / f"{ticket_id}.jsonl"
+        try:
+            stat = path.stat()
+            jsonl_sig = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            jsonl_sig = (0, 0)
+
+        with self._lock:
+            trace_count = self._trace_store.count_events(ticket_id)
+
+        cache_key = ticket_id
+        with self._merged_event_cache_lock:
+            cached = self._merged_event_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] == jsonl_sig[0]
+                and cached[1] == jsonl_sig[1]
+                and cached[2] == trace_count
+            ):
+                return cached[3]
+
         legacy = self._read_from_file(ticket_id, since=0, limit=100_000)
         with self._lock:
             traces = [
@@ -470,7 +497,31 @@ class EventBus:
         merged = sorted(legacy + traces, key=event_order_key)
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
-        return [item for item in merged if item["seq"] > since][:limit]
+
+        with self._merged_event_cache_lock:
+            self._merged_event_cache[cache_key] = (
+                jsonl_sig[0],
+                jsonl_sig[1],
+                trace_count,
+                merged,
+            )
+            # Evict oldest entries if cache exceeds bound
+            if len(self._merged_event_cache) > self._MAX_CACHED_TICKETS:
+                excess = len(self._merged_event_cache) - self._MAX_CACHED_TICKETS
+                for key in list(self._merged_event_cache)[:excess]:
+                    del self._merged_event_cache[key]
+        return merged
+
+    def get_events(
+        self,
+        ticket_id: str,
+        since: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        merged = self._get_merged_events(ticket_id)
+        # Return shallow copies — callers (e.g. api/stream.py)
+        # may mutate the dicts, which would corrupt the cache.
+        return [dict(item) for item in merged if item["seq"] > since][:limit]
 
     def get_usage_events(
         self,

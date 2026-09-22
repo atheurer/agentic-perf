@@ -2327,12 +2327,15 @@ async function renderDetail(ticketId) {
   const app = document.getElementById('app');
   app.innerHTML = '<div class="spinner"></div> Loading ticket...';
 
+  // Clear event state immediately to prevent stale events
+  // from a previous ticket showing during the async fetch.
+  lastSeq = 0;
+  maxRenderedSeq = 0;
+  renderedEventCount = 0;
+  eventRecords = [];
+
   try {
     const ticket = await api('/tickets/' + ticketId);
-    lastSeq = 0;
-    maxRenderedSeq = 0;
-    renderedEventCount = 0;
-    eventRecords = [];
     eventView = 'activity';
     eventSearch = '';
     _lastResultHash = '';
@@ -3196,6 +3199,9 @@ async function pollEvents(ticketId) {
   eventPollInFlight = true;
   try {
     var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
+    // Guard: if the user navigated away during the fetch,
+    // discard the response to prevent stale event injection.
+    if (ticketId !== currentTicketId) return;
     var newEvents = data.events || [];
     if (newEvents.length > 0) {
       lastSeq = data.latest_seq;
