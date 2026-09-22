@@ -4433,6 +4433,19 @@ async def execute_boot_time_test(
                 break
 
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
+    if not _ssh_ready:
+        _cycles_tried = min(_cycle + 1, _MAX_POWER_CYCLES)
+        return json.dumps(
+            {
+                "status": "failed",
+                "error": (
+                    f"SUT {sut_host} not SSH-reachable after"
+                    f" {_cycles_tried} boot cycle(s)."
+                    f" Board may need manual intervention."
+                ),
+            }
+        )
+
     ssh_user = "root"
     ssh_password = "password"
     if _ticket:
