@@ -157,7 +157,7 @@ class HorreumRecordProvider(InvestigationRecordProvider):
         runs = data.get("runs", data)
         if isinstance(runs, list):
             for run in runs:
-                desc = run.get("description", "")
+                desc = run.get("description") or ""
                 if desc.startswith(f"{investigation_id}:"):
                     return run.get("id")
         return None
