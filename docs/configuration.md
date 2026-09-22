@@ -26,6 +26,16 @@ If `config.json` is malformed or unreadable at dispatch time, the
 orchestrator logs a warning and continues with the last successfully
 loaded configuration.
 
+### Inspecting the running configuration
+
+Use `python3 cli.py config show` to print a redacted, machine-readable JSON
+snapshot. When the orchestrator is running, this reports its persisted startup
+configuration rather than the caller's shell environment, including the
+effective private-skills and secrets paths and loaded harness policy values
+such as Crucible's `provisioning.on_existing_install`. Private skill files are
+cached for the service lifetime, so restart the orchestrator after changing
+one. Credentials, tokens, and private file contents are never included.
+
 ## Minimal Example
 
 ```json

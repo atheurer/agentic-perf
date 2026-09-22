@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
 from orchestrator.config import (
     OrchestratorConfig,
     build_redacted_config,
+    read_effective_config,
+    write_effective_config,
 )
 
 FAKE_CONFIG_DATA = {
@@ -116,7 +121,37 @@ class TestBuildRedactedConfig:
         assert isinstance(snapshot["config_path"], str)
         assert isinstance(snapshot["paths"]["private_skills_dir"], str)
         assert isinstance(snapshot["paths"]["artifact_dir"], str)
-        assert "secrets_dir" not in snapshot["paths"]
+        assert snapshot["paths"]["secrets_dir"] == str(tmp_path / "secrets")
+
+    def test_private_skill_keys_and_policies_are_redacted(self, fake_config, tmp_path):
+        import paths
+
+        skills_dir = tmp_path / "private-skills"
+        skills_dir.mkdir()
+        (skills_dir / "crucible.json").write_text(
+            json.dumps(
+                {
+                    "provisioning": {
+                        "on_existing_install": "update",
+                        "install_target_path": "/opt/crucible",
+                    },
+                    "private_marker": "redacted-marker",
+                }
+            )
+        )
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(paths, "PRIVATE_SKILLS_DIR", skills_dir)
+        try:
+            snapshot = build_redacted_config(OrchestratorConfig(raw_config=fake_config))
+        finally:
+            monkeypatch.undo()
+
+        crucible = snapshot["private_skills"]["files"]["crucible"]
+        assert crucible["loaded"] is True
+        assert "provisioning" in crucible["keys"]
+        assert crucible["policies"]["provisioning"]["on_existing_install"] == "update"
+        output = json.dumps(snapshot)
+        assert "redacted-marker" not in output
 
     def test_defaults_when_no_config_file(self, tmp_path, monkeypatch):
         import paths
@@ -147,6 +182,19 @@ class TestBuildRedactedConfig:
         assert "s3cret" not in output
         assert "user:" not in output
         assert "store.example" in snapshot["state_store"]["url"]
+        assert snapshot["state_store"]["url"] == "https://store.example:8090/api"
+
+    def test_snapshot_round_trip_is_live_process_config(
+        self, fake_config, tmp_path, monkeypatch
+    ):
+        import paths
+
+        monkeypatch.setattr(paths, "AGENTIC_PERF_HOME", tmp_path)
+        config = OrchestratorConfig(raw_config=fake_config)
+        written = write_effective_config(config)
+        loaded = read_effective_config()
+        assert loaded == written
+        assert loaded["runtime"]["source"] == "orchestrator"
 
     def test_non_int_agent_iterations_excluded(self, fake_config):
         fake_config["agent_iterations"]["bad"] = "secret-value"
@@ -174,3 +222,25 @@ class TestCmdConfig:
 
         assert output["instance_name"] == "test-instance"
         assert "sk-ant-FAKE-KEY-12345" not in captured.out
+
+
+def test_cli_config_show_stdout_is_machine_readable(tmp_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(tmp_path),
+            "AGENTIC_PERF_SKILLS": str(tmp_path / "private-skills"),
+            "AGENTIC_PERF_SECRETS": str(tmp_path / "secrets"),
+        }
+    )
+    env.pop("AGENTIC_PERF_DISCLAIMER_SHOWN", None)
+    result = subprocess.run(
+        [sys.executable, "cli.py", "config", "show"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    parsed = json.loads(result.stdout)
+    assert parsed["runtime"]["source"] == "cli"
+    assert "AI-generated content" in result.stderr

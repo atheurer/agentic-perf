@@ -1582,11 +1582,14 @@ async def _refresh_harness_repos(
 
 
 async def poll_loop(config: OrchestratorConfig) -> None:
+    from .config import write_effective_config
+
     global _last_good_config, _last_good_digest
     _last_good_config = config
     _last_good_digest = hashlib.sha256(
         json.dumps(config.raw, sort_keys=True).encode()
     ).hexdigest()[:12]
+    write_effective_config(config)
     _ensure_state_store_environment(config)
 
     from .leader_lease import LeaderLeaseClient

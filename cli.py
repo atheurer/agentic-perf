@@ -24,7 +24,8 @@ def show_disclaimer():
         return
 
     print(
-        "\n⚠️  AI-generated content may contain errors. Always verify before acting.\n"
+        "\n⚠️  AI-generated content may contain errors. Always verify before acting.\n",
+        file=sys.stderr,
     )
     os.environ["AGENTIC_PERF_DISCLAIMER_SHOWN"] = "1"
 
@@ -1427,10 +1428,16 @@ def cmd_config(args):
     from orchestrator.config import (
         OrchestratorConfig,
         build_redacted_config,
+        read_effective_config,
     )
 
-    config = OrchestratorConfig()
-    snapshot = build_redacted_config(config)
+    # Prefer the snapshot written by the orchestrator.  Constructing a new
+    # config here would describe the caller's environment, not a running
+    # service that may have different paths or credentials.
+    snapshot = read_effective_config()
+    if snapshot is None:
+        config = OrchestratorConfig()
+        snapshot = build_redacted_config(config, source="cli")
     print(json.dumps(snapshot, indent=2))
 
 

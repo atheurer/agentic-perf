@@ -183,6 +183,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("cli.py", "cmd_submit", "mutating_http_state"),
     ("cli.py", "cmd_trace", "filesystem"),
     ("cli.py", "cmd_user", "mutating_http_state"),
+    ("orchestrator/config.py", "write_effective_config", "filesystem"),
     ("orchestrator/dispatcher.py", "renew_claim", "mutating_http_state"),
     ("orchestrator/dispatcher.py", "try_claim", "mutating_http_state"),
     ("orchestrator/leader_lease.py", "acquire", "mutating_http_state"),
@@ -1529,6 +1530,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "orchestration-maintainers",
         "cli.py:cmd_user",
+        "2027-12-31",
+    ),
+    ("orchestrator/config.py", "write_effective_config", "filesystem"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/config.py:write_effective_config",
         "2027-12-31",
     ),
     ("orchestrator/dispatcher.py", "renew_claim", "mutating_http_state"): (
