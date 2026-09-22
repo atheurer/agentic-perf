@@ -364,6 +364,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/skills/arcaflow_plugins.py", "__init__", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_benchmark_to_repo_name", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_cache_path", "filesystem"),
+    ("providers/skills/arcaflow_plugins.py", "_discover_from_mcp", "mcp"),
     (
         "providers/skills/arcaflow_plugins.py",
         "_description_from_repo_name",
@@ -2358,6 +2359,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/skills/arcaflow_plugins.py:_cache_path",
+        "2027-12-31",
+    ),
+    ("providers/skills/arcaflow_plugins.py", "_discover_from_mcp", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/arcaflow_plugins.py:_discover_from_mcp",
         "2027-12-31",
     ),
     (
