@@ -1435,6 +1435,9 @@ async def _stop_ticket(
         headers=headers,
         json={"reason": reason},
     )
+    if r.status_code == 409:
+        detail = r.json().get("detail", "Ticket cannot be stopped")
+        return json.dumps({"status": "already_stopped", "detail": detail})
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
 
