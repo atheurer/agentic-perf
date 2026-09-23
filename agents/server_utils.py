@@ -375,6 +375,79 @@ def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
     return None
 
 
+FORBIDDEN_REBOOT_HOSTS = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "0.0.0.0",
+    }
+)
+
+
+def resolve_addrs(host: str) -> frozenset[str]:
+    """Resolve a hostname to a set of IP address strings."""
+    import socket
+
+    addrs: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(host, None):
+            addrs.add(info[4][0])
+    except (socket.gaierror, OSError):
+        pass
+    cleaned = host.strip().lower()
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(cleaned)
+        addrs.add(cleaned)
+    except ValueError:
+        pass
+    return frozenset(addrs)
+
+
+def _self_addrs() -> frozenset[str]:
+    """Compute the set of addresses that identify this host."""
+    import socket
+
+    addrs: set[str] = {"127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        addrs.update(resolve_addrs(socket.gethostname()))
+    except Exception:
+        pass
+    try:
+        addrs.update(resolve_addrs(socket.getfqdn()))
+    except Exception:
+        pass
+    return frozenset(addrs)
+
+
+def is_self_host(host: str) -> bool:
+    """Return True if *host* resolves to the orchestrator itself.
+
+    Uses address resolution rather than string comparison to catch
+    aliases, IPs, and alternate DNS names. Fails closed: an
+    unresolvable host is treated as potentially self.
+    """
+    import socket
+
+    if host.strip().lower() in FORBIDDEN_REBOOT_HOSTS:
+        return True
+    try:
+        own = socket.gethostname()
+        if host.strip().lower() == own.lower():
+            return True
+        fqdn = socket.getfqdn()
+        if host.strip().lower() == fqdn.lower():
+            return True
+    except Exception:
+        pass
+    host_addrs = resolve_addrs(host)
+    if not host_addrs:
+        return True
+    return bool(host_addrs & _self_addrs())
+
+
 def _controller_relative_path(path: str) -> str | None:
     """Normalize a path learned from controller documentation.
 

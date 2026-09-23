@@ -1296,6 +1296,14 @@ class TicketStore:
                 raise ValueError("approval request is not approved")
             if current.consumed_at is not None:
                 raise ValueError("approval request was already consumed")
+            if current.kind != request.kind:
+                raise ValueError(
+                    f"approval kind mismatch: {current.kind} != {request.kind}"
+                )
+            if current.expires_at is not None and current.expires_at <= datetime.now(
+                timezone.utc
+            ):
+                raise ValueError("approval request expired")
             for key in (
                 "validation_id",
                 "presented_run_file_digest",
