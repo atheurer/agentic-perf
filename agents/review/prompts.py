@@ -160,13 +160,12 @@ Do NOT call request_clarification.
   distributions, and unexpected patterns ARE findings —
   describe them as observations, not reasons to be
   inconclusive.
-- When no hypothesis was stated, choose the verdict that
-  best matches your observations: hypothesis_confirmed if
-  results look normal, hypothesis_refuted if a problem was
-  found (regression, anomaly), or inconclusive only if
-  data is truly missing.
+- A valid measured value of zero is not missing data. If
+  samples were collected and a metric is validly measured as
+  zero (for example, zero throughput), treat it as evidence
+  and report the corresponding finding.
 - Reserve inconclusive for: tool failures that prevented
-  data access, empty/zero results, corrupted artifacts.
+  data access, empty/no-sample results, corrupted artifacts.
 
 
 
