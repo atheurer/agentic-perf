@@ -312,13 +312,17 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
     """Parse ethtool output (either native JSON or text format) into structured dict."""
     try:
         parsed = json.loads(stdout)
-        if (
-            isinstance(parsed, list)
-            and len(parsed) == 1
-            and isinstance(parsed[0], dict)
-        ):
-            return parsed[0]
-        return parsed
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            # ethtool emits a one-element list for native JSON output.  Keep
+            # this tolerant of versions that emit multiple records by
+            # merging their object members before applying key filters.
+            merged: dict[str, Any] = {}
+            for item in parsed:
+                if isinstance(item, dict):
+                    merged.update(item)
+            return merged
     except Exception:
         pass
 
@@ -349,20 +353,68 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
                 data[key] = {
                     "active": is_on,
                     "fixed": is_fixed,
-                    "raw": val,
                 }
             else:
                 data[key] = val
     return data
 
 
+def _filter_ethtool_data(
+    data: dict[str, Any],
+    mode: str,
+    compiled: re.Pattern[str] | None = None,
+    active_only: bool = False,
+) -> dict[str, Any]:
+    """Apply pattern and active_only filters to parsed ethtool data."""
+    filtered: dict[str, Any] = {}
+    for key, val in data.items():
+        if compiled and not compiled.search(key):
+            continue
+        if mode == "features" and active_only:
+            if not isinstance(val, dict):
+                continue
+            if not val.get("active") or val.get("fixed"):
+                continue
+        filtered[key] = val
+    return filtered
+
+
 @mcp.tool()
-async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str:
+async def get_ethtool_info(
+    host: str,
+    iface: str,
+    mode: str = "features",
+    pattern: str = "",
+    active_only: bool = True,
+) -> str:
     """Get ethtool information for a network interface as structured JSON.
 
     mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
     mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S).
+
+    Args:
+        host: IP to SSH into
+        iface: Network interface name (e.g. eth0)
+        mode: 'features' or 'stats'
+        pattern: Case-insensitive regex to filter keys (e.g. 'rx|tx'
+            returns only keys matching that pattern). Empty = all keys.
+        active_only: (features mode only) When True (the default), return
+            only non-fixed active features — the subset the agent reasons
+            about. Set False to include all feature flags. Ignored in stats
+            mode.
     """
+    compiled = None
+    if pattern:
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Invalid regex {pattern!r}: {exc}",
+                }
+            )
+
     ssh = _get_ssh()
     quoted = shlex.quote(iface)
     if mode == "features":
@@ -387,17 +439,30 @@ async def get_ethtool_info(host: str, iface: str, mode: str = "features") -> str
         return _format_result(result)
 
     parsed_data = _parse_ethtool_output(result.stdout, mode)
-    return json.dumps(
-        {
-            "host": host,
-            "iface": iface,
-            "mode": mode,
-            "exit_code": result.exit_code,
-            "data": parsed_data,
-            "stdout": result.stdout,
-        },
-        indent=2,
+    filtered_data = _filter_ethtool_data(
+        parsed_data, mode, compiled=compiled, active_only=active_only
     )
+
+    response: dict[str, Any] = {
+        "host": host,
+        "iface": iface,
+        "mode": mode,
+        "exit_code": result.exit_code,
+        "data": filtered_data,
+    }
+    # stdout is useful for backwards-compatible unfiltered responses, but it
+    # defeats the purpose of server-side filtering by retaining the complete
+    # raw dump in the tool result.  Keep it only when no filter was requested.
+    if not pattern and not (active_only and mode == "features"):
+        response["stdout"] = result.stdout
+    if pattern:
+        response["pattern"] = pattern
+        response["total_keys"] = len(parsed_data)
+        response["matched_keys"] = len(filtered_data)
+    if active_only and mode == "features":
+        response["active_only"] = True
+
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()

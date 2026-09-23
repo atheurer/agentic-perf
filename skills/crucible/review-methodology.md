@@ -43,7 +43,7 @@ Every claim must be backed by queried data. If a tool can answer the question, c
 Before concluding about:
 - **NUMA / Hardware locality** — query host inventory or call `get_hardware_topology(host, iface=...)`
 - **Interrupt affinity** — query procstat `interrupts-sec` with `hostname+irq+cpu` breakout, not assumptions about default behavior
-- **GRO/GSO status** — call `get_ethtool_info(host, iface, mode="features")` and `get_ethtool_info(host, iface, mode="stats")` (returns structured JSON)
+- **GRO/GSO status** — call `get_ethtool_info(host, iface, mode="features", active_only=True)` (the default; returns only enabled, non-fixed offloads) and use `get_ethtool_info(host, iface, mode="stats", pattern="rx_(errors|missed)|tx_errors")` for targeted counters (both return structured JSON without retaining the full raw dump when filtered)
 - **TCP tuning** — call `get_sysctl_values(host, ["net.core.rmem_max", "net.core.wmem_max", "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"])` (returns structured JSON)
 
 Present actual numbers in findings, not qualitative descriptions. "CPU 341 at 72% soft" is useful. "The CPU appears busy" is not.
