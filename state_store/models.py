@@ -176,7 +176,7 @@ class ApprovalRequest(BaseModel):
 
     approval_request_id: str = Field(pattern=r"^apr-[a-f0-9]{32}$")
     ticket_id: str
-    kind: Literal["benchmark_run_file"] = "benchmark_run_file"
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str = ""
     waiter_owner: str | None = None
@@ -203,6 +203,7 @@ class ApprovalRequest(BaseModel):
 
 
 class CreateApprovalRequest(BaseModel):
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
     validation_id: str = Field(min_length=1, max_length=255)
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -230,6 +231,7 @@ class ResolveApprovalRequest(BaseModel):
 class ConsumeApprovalRequest(BaseModel):
     """Execution-side single-use capability check for an approval."""
 
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
     validation_id: str = Field(min_length=1, max_length=255)
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")

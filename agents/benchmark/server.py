@@ -31,6 +31,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    FORBIDDEN_REBOOT_HOSTS,
     _emit_context_audit_event,
     _public_context_document,
     _public_context_result,
@@ -39,6 +40,7 @@ from agents.server_utils import (
     build_skill_provider,
     build_ssh_from_ticket,
     controller_context_gateway,
+    is_self_host,
     read_skill_documents,
     tool_progress,
 )
@@ -409,28 +411,8 @@ def _validate_plugin_image(plugin_image: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-# Hosts that must never be passed as a reboot target.
-# boot-timings-test.sh reboots the SUT — hitting localhost
-# would kill the orchestrator.
-_FORBIDDEN_REBOOT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
-
-
-def _is_self_host(host: str) -> bool:
-    """Return True if *host* resolves to the orchestrator itself."""
-    import socket
-
-    if host.lower() in _FORBIDDEN_REBOOT_HOSTS:
-        return True
-    try:
-        own_hostname = socket.gethostname()
-        if host.lower() == own_hostname.lower():
-            return True
-        own_fqdn = socket.getfqdn()
-        if host.lower() == own_fqdn.lower():
-            return True
-    except Exception:
-        pass
-    return False
+_FORBIDDEN_REBOOT_HOSTS = FORBIDDEN_REBOOT_HOSTS
+_is_self_host = is_self_host
 
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"

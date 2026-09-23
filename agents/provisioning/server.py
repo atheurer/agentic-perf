@@ -36,6 +36,7 @@ from agents.server_utils import (
     read_skill_documents,
 )
 from providers.llm.base import ToolDefinition
+from providers.rhel_kernel import KernelSpec
 from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
@@ -2737,6 +2738,385 @@ async def ensure_harness_installed(
         install_path,
     )
     results.update(skipped)
+    return json.dumps(_summarize(results))
+
+
+# ---------------------------------------------------------------------------
+# Kernel tools
+# ---------------------------------------------------------------------------
+
+
+async def _kernel_inventory_one(
+    host: str,
+    kernel: str = "",
+) -> dict[str, Any]:
+    """Gather kernel inventory for a single host."""
+    from providers.rhel_kernel import (
+        KernelSpec,
+        build_available_command,
+        build_inventory_command,
+        classify_available,
+        inventory_fingerprint,
+        parse_inventory,
+    )
+
+    result = await _ssh.run(host, build_inventory_command(), timeout=30)
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "unreachable",
+            "error": result.stderr or result.stdout,
+        }
+    try:
+        inv = parse_inventory(result.stdout)
+    except ValueError as exc:
+        return {
+            "host": host,
+            "state": "not_checked",
+            "error": str(exc),
+        }
+
+    response: dict[str, Any] = {
+        "host": host,
+        "state": "ok",
+        "inventory": inv.to_dict(),
+        "fingerprint": inventory_fingerprint(inv),
+    }
+
+    if kernel:
+        try:
+            spec = KernelSpec.parse(kernel)
+        except ValueError as exc:
+            response["requested"] = {
+                "release": kernel if isinstance(kernel, str) else str(kernel),
+                "state": "not_checked",
+                "error": str(exc),
+            }
+            return response
+
+        if spec.release in inv.installed:
+            response["requested"] = {
+                "release": spec.release,
+                "state": "installed",
+            }
+        else:
+            avail_result = await _ssh.run(
+                host,
+                build_available_command(spec),
+                timeout=30,
+            )
+            state = classify_available(
+                avail_result.exit_code,
+                avail_result.stdout,
+            )
+            response["requested"] = {
+                "release": spec.release,
+                "state": state,
+            }
+            if state == "not_checked":
+                response["requested"]["error"] = (
+                    avail_result.stderr or avail_result.stdout
+                )
+
+    return response
+
+
+async def _prepare_kernel_change_impl(
+    host: str,
+    spec: KernelSpec,
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute actions_required for a single host."""
+    inv = inventory.get("inventory", {})
+    installed = inv.get("installed", [])
+    default_entry = inv.get("default_entry", "")
+
+    actions: list[str] = []
+    if spec.release not in installed:
+        actions.append("install")
+    if default_entry != spec.vmlinuz:
+        actions.append("select_default")
+    actions.append("reboot")
+
+    return {
+        "host": host,
+        "actions_required": actions,
+        "currently_running": inv.get("running", ""),
+        "currently_default": default_entry,
+    }
+
+
+async def _install_kernel_one(
+    host: str,
+    spec: KernelSpec,
+) -> dict[str, Any]:
+    """Install a kernel on a single host."""
+    from providers.rhel_kernel import (
+        build_install_command,
+        build_inventory_command,
+        parse_inventory,
+    )
+
+    inv_before = await _ssh.run(host, build_inventory_command(), timeout=30)
+    try:
+        before = parse_inventory(inv_before.stdout)
+    except ValueError:
+        return {
+            "host": host,
+            "state": "unreachable",
+            "error": "could not read inventory before install",
+        }
+
+    if spec.release in before.installed:
+        return {
+            "host": host,
+            "state": "already_installed",
+            "before": before.to_dict(),
+        }
+
+    result = await _ssh.run(
+        host,
+        build_install_command(spec),
+        timeout=900,
+        mutating=True,
+    )
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": result.stderr or result.stdout,
+            "before": before.to_dict(),
+        }
+
+    inv_after = await _ssh.run(host, build_inventory_command(), timeout=30)
+    try:
+        after = parse_inventory(inv_after.stdout)
+    except ValueError:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": "could not read inventory after install",
+            "before": before.to_dict(),
+        }
+
+    if spec.release not in after.installed:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": "package installed but release not in rpm list",
+            "before": before.to_dict(),
+            "after": after.to_dict(),
+        }
+
+    return {
+        "host": host,
+        "state": "installed",
+        "before": before.to_dict(),
+        "after": after.to_dict(),
+    }
+
+
+async def _select_default_kernel_one(
+    host: str,
+    spec: KernelSpec,
+) -> dict[str, Any]:
+    """Select a kernel as the default boot entry on a single host."""
+    from providers.rhel_kernel import build_select_command
+
+    before_result = await _ssh.run(
+        host,
+        "grubby --default-kernel 2>&1",
+        timeout=15,
+    )
+    before_default = before_result.stdout.strip()
+
+    if before_default == spec.vmlinuz:
+        return {
+            "host": host,
+            "state": "already_default",
+            "before": before_default,
+            "after": before_default,
+        }
+
+    initramfs_check = await _ssh.run(
+        host,
+        f"test -f {spec.vmlinuz} && test -f {spec.initramfs}",
+        timeout=10,
+    )
+    if initramfs_check.exit_code != 0:
+        return {
+            "host": host,
+            "state": "not_bootable",
+            "error": f"missing {spec.vmlinuz} or {spec.initramfs}",
+            "before": before_default,
+        }
+
+    result = await _ssh.run(
+        host,
+        build_select_command(spec),
+        timeout=30,
+        mutating=True,
+    )
+    after_default = result.stdout.strip().split("\n")[-1].strip()
+    if after_default != spec.vmlinuz:
+        return {
+            "host": host,
+            "state": "selection_failed",
+            "error": f"grubby reports {after_default}, expected {spec.vmlinuz}",
+            "before": before_default,
+            "after": after_default,
+        }
+
+    return {
+        "host": host,
+        "state": "ok",
+        "before": before_default,
+        "after": after_default,
+    }
+
+
+@mcp.tool()
+async def get_kernel_inventory(
+    hosts: list[str],
+    kernel: str = "",
+) -> str:
+    """Get kernel inventory for multiple hosts. Returns running kernel, installed packages, grubby entries, default boot entry, and arch/OS info. When kernel is provided, also checks whether the requested release is installed or available."""
+    await _ensure_init()
+    coros = [_kernel_inventory_one(h, kernel) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, Any] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
+@mcp.tool()
+async def prepare_kernel_change(
+    hosts: list[str],
+    kernel: str,
+) -> str:
+    """Prepare a kernel change intent. Validates hosts against the plan and ticket, takes inventory, computes required actions (install, select_default, reboot), and writes an intent record for approval. Returns the intent_id needed for the approval request."""
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        current_kernel_step,
+        new_intent,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import KernelSpec
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(kernel)
+    ks = current_kernel_step(ticket)
+    step_id = ks[0] if ks else -1
+
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+
+    inventories: dict[str, Any] = {}
+    per_host_actions: dict[str, Any] = {}
+    for host in allowed:
+        inv = await _kernel_inventory_one(host, kernel)
+        inventories[host] = inv
+        actions = await _prepare_kernel_change_impl(host, spec, inv)
+        per_host_actions[host] = actions
+
+    all_actions: set[str] = set()
+    for h_actions in per_host_actions.values():
+        all_actions.update(h_actions.get("actions_required", []))
+    actions_list = []
+    for a in ["install", "select_default", "reboot"]:
+        if a in all_actions:
+            actions_list.append(a)
+
+    ticket_id = ticket.get("id", "")
+    intent = new_intent(
+        ticket_id,
+        step_id,
+        allowed,
+        spec,
+        actions_list,
+        inventories,
+    )
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "intent": intent,
+            "per_host": per_host_actions,
+            "refused": refused,
+        }
+    )
+
+
+@mcp.tool()
+async def install_kernel(
+    hosts: list[str],
+    kernel: str,
+    approval_request_id: str,
+) -> str:
+    """Install a specific kernel version on multiple hosts. Requires a consumed or consumable approval. Idempotent — already-installed kernels are reported without running dnf."""
+    await _ensure_init()
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import KernelSpec
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    spec = KernelSpec.parse(kernel)
+    coros = [_install_kernel_one(h, spec) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, Any] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
+@mcp.tool()
+async def select_default_kernel(
+    hosts: list[str],
+    kernel: str,
+    approval_request_id: str,
+) -> str:
+    """Select a kernel as the default boot entry on multiple hosts using grubby. Verifies vmlinuz and initramfs exist before selection. Idempotent — already-default kernels are reported without changes."""
+    await _ensure_init()
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import KernelSpec
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    spec = KernelSpec.parse(kernel)
+    coros = [_select_default_kernel_one(h, spec) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, Any] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
     return json.dumps(_summarize(results))
 
 
