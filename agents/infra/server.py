@@ -28,6 +28,7 @@ if _project_root not in sys.path:
 
 from pydantic import BaseModel, ConfigDict
 
+from agents.ethtool import parse_ethtool_flow_rules
 from agents.infra.topology import discover_cache_topology
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
@@ -390,14 +391,16 @@ async def get_ethtool_info(
     """Get ethtool information for a network interface as structured JSON.
 
     mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
-    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S).
+    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S), and
+    mode='flow_rules' returns RX ntuple flow rules (ethtool -u), including
+    flow type, match fields and masks, action, and queue.
 
     Args:
         host: IP to SSH into
         iface: Network interface name (e.g. eth0)
-        mode: 'features' or 'stats'
-        pattern: Case-insensitive regex to filter keys (e.g. 'rx|tx'
-            returns only keys matching that pattern). Empty = all keys.
+        mode: 'features', 'stats', or 'flow_rules'
+        pattern: Case-insensitive regex to filter feature/stat keys (e.g.
+            'rx|tx' returns only keys matching that pattern). Empty = all keys.
         active_only: (features mode only) When True (the default), return
             only non-fixed active features — the subset the agent reasons
             about. Set False to include all feature flags. Ignored in stats
@@ -405,6 +408,13 @@ async def get_ethtool_info(
     """
     compiled = None
     if pattern:
+        if mode == "flow_rules":
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "pattern filtering is supported only in features and stats modes",
+                }
+            )
         try:
             compiled = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
@@ -421,27 +431,54 @@ async def get_ethtool_info(
         flag = "-k"
     elif mode == "stats":
         flag = "-S"
+    elif mode == "flow_rules":
+        flag = "-u"
     else:
         return json.dumps(
             {
                 "success": False,
-                "error": f"Unknown mode {mode!r}. Use 'features' or 'stats'.",
+                "error": (
+                    f"Unknown mode {mode!r}. Use 'features', 'stats', or 'flow_rules'."
+                ),
             }
         )
 
-    # Try native JSON output first
-    result = await ssh.run(host, f"ethtool --json {flag} {quoted}", timeout=30)
-    if result.exit_code != 0 or not result.stdout.strip().startswith(("{", "[")):
-        # Fallback to standard ethtool
+    if mode == "flow_rules":
         result = await ssh.run(host, f"ethtool {flag} {quoted}", timeout=30)
+    else:
+        # Try native JSON output first
+        result = await ssh.run(host, f"ethtool --json {flag} {quoted}", timeout=30)
+        if result.exit_code != 0 or not result.stdout.strip().startswith(("{", "[")):
+            # Fallback to standard ethtool
+            result = await ssh.run(host, f"ethtool {flag} {quoted}", timeout=30)
 
     if result.exit_code != 0:
         return _format_result(result)
 
-    parsed_data = _parse_ethtool_output(result.stdout, mode)
-    filtered_data = _filter_ethtool_data(
-        parsed_data, mode, compiled=compiled, active_only=active_only
-    )
+    try:
+        if mode == "flow_rules":
+            parsed_data = {"rules": parse_ethtool_flow_rules(result.stdout)}
+        else:
+            parsed_data = _parse_ethtool_output(result.stdout, mode)
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "host": host,
+                "iface": iface,
+                "mode": mode,
+                "exit_code": result.exit_code,
+                "success": False,
+                "error": str(exc),
+                "stdout": result.stdout,
+            },
+            indent=2,
+        )
+    if mode == "flow_rules":
+        filtered_data = parsed_data
+    else:
+        filtered_data = _filter_ethtool_data(
+            parsed_data, mode, compiled=compiled, active_only=active_only
+        )
 
     response: dict[str, Any] = {
         "host": host,
@@ -450,6 +487,8 @@ async def get_ethtool_info(
         "exit_code": result.exit_code,
         "data": filtered_data,
     }
+    if mode == "flow_rules":
+        response["rule_count"] = len(filtered_data["rules"])
     # stdout is useful for backwards-compatible unfiltered responses, but it
     # defeats the purpose of server-side filtering by retaining the complete
     # raw dump in the tool result.  Keep it only when no filter was requested.
