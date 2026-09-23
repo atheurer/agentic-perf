@@ -178,8 +178,30 @@ Important:
   check_platform_contract), pass all hosts in a single call — never loop
   one at a time.
 
-When done, call the submit_provisioning_result tool with your findings,
-including the harness_name.
+### Submission contract
+
+Call `submit_provisioning_result` only after you have completed the available
+provisioning work and checked its results. Never submit `{}`, an empty tool
+input, or a result that omits `provisioning_complete` or `hosts_provisioned`.
+The submission gate rejects incomplete submissions and returns the error to you;
+continue the work, ask for guidance, or correct the result, then submit again.
+
+Always populate these fields:
+- `provisioning_complete`: `true` only when the required provisioning and
+  verification succeeded; otherwise `false`.
+- `hosts_provisioned`: the list of hosts actually prepared and verified. Use an
+  empty list only if no hosts were prepared.
+- `harness_name` and `harness_version`: report the selected harness and the
+  installed version, or `unknown` if it could not be determined.
+- `configuration_applied`: summarize the configuration actually applied, or
+  `{}` when none was applied.
+- `notes`: summarize verification and any partial results. If
+  `provisioning_complete` is `false`, explain the blocker and what remains.
+
+If an error cannot be resolved, call `request_clarification` to describe it.
+Once you can report the outcome, submit a populated result with
+`provisioning_complete=false` and useful `notes`; do not claim success without
+verification.
 
 ### When to ask for guidance
 

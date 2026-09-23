@@ -8,7 +8,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 from .prompts import PROVISIONING_BASE_PROMPT
 
@@ -30,14 +30,26 @@ _LOCAL_TOOLS = [
     ),
     ToolDefinition(
         name="submit_provisioning_result",
-        description="Submit the provisioning result when all hosts are prepared.",
+        description=(
+            "Submit a populated, verified provisioning result after provisioning "
+            "work is complete or a blocker has been documented."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "provisioning_complete": {"type": "boolean"},
+                "provisioning_complete": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when provisioning and required verification succeeded."
+                    ),
+                },
                 "hosts_provisioned": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "description": (
+                        "Hosts actually prepared and verified; use [] only when "
+                        "none were prepared."
+                    ),
                 },
                 "harness_version": {"type": "string"},
                 "harness_name": {"type": "string"},
@@ -50,7 +62,13 @@ _LOCAL_TOOLS = [
                     "type": "string",
                     "description": "K3s version string (if installed)",
                 },
-                "notes": {"type": "string"},
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Summary of verification, partial results, or the reason "
+                        "provisioning is incomplete."
+                    ),
+                },
             },
             "required": ["provisioning_complete", "hosts_provisioned"],
         },
@@ -93,6 +111,52 @@ class ProvisioningAgent(AgentBase):
         if self._ticket_id:
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        """Reject incomplete provisioning reports before advancing the ticket."""
+        result = submit_call.input
+        required = ("provisioning_complete", "hosts_provisioned")
+        missing = [name for name in required if name not in result]
+        if missing:
+            return (
+                "REJECTED: submit_provisioning_result is missing required field(s): "
+                f"{', '.join(missing)}. Continue provisioning or verify the hosts, "
+                "then submit a populated result with provisioning_complete and "
+                "hosts_provisioned. If blocked, call request_clarification first "
+                "or submit provisioning_complete=false with an explanation in notes."
+            )
+
+        if type(result["provisioning_complete"]) is not bool:
+            return (
+                "REJECTED: provisioning_complete must be true or false. Continue "
+                "the required checks, then submit a structured provisioning result."
+            )
+        hosts = result["hosts_provisioned"]
+        if not isinstance(hosts, list) or any(
+            not isinstance(host, str) or not host.strip() for host in hosts
+        ):
+            return (
+                "REJECTED: hosts_provisioned must be a list of non-empty host "
+                "addresses or names. Verify which hosts were prepared and submit "
+                "the populated list."
+            )
+        if result["provisioning_complete"] and not hosts:
+            return (
+                "REJECTED: provisioning_complete cannot be true when "
+                "hosts_provisioned is empty. Finish provisioning and verify the "
+                "hosts, or submit provisioning_complete=false with an explanation."
+            )
+        if not result["provisioning_complete"] and not str(
+            result.get("notes", "")
+        ).strip():
+            return (
+                "REJECTED: an incomplete provisioning result must explain the "
+                "blocker in notes. Continue troubleshooting, ask for clarification "
+                "if needed, then submit provisioning_complete=false with useful notes."
+            )
+        return None
 
     # Harnesses that need no provisioning setup beyond
     # flash + boot. These get a reduced tool set and
