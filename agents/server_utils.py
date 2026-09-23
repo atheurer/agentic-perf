@@ -425,29 +425,163 @@ async def _search_controller_source(
         return {"found": False, "operation": "search", "reason": "empty_query"}
     max_results = max(1, min(int(max_results), 100))
     max_bytes = max(1024, min(int(max_bytes), 131072))
-    find_pattern = shlex.quote(f".*({query}).*")
+    search_script = r"""
+import os
+import re
+import sys
+
+VISIBLE_ROOT = "/opt/crucible"
+EXCLUDED_PARTS = {".git", ".ssh", "secrets"}
+EXCLUDED_FILES = {"authorized_keys"}
+MAX_DIRECTORIES = 20000
+MAX_FILES = 200000
+MAX_FILE_BYTES = 1048576
+MAX_TOTAL_FILE_BYTES = 16777216
+
+query = sys.argv[1]
+max_results = int(sys.argv[2])
+max_output_bytes = int(sys.argv[3])
+real_root = os.path.realpath(VISIBLE_ROOT)
+root_prefix = real_root.rstrip(os.sep) + os.sep
+
+try:
+    pattern = re.compile(query)
+except re.error:
+    pattern = re.compile(re.escape(query))
+
+def is_within_root(path):
+    resolved = os.path.realpath(path)
+    return resolved == real_root or resolved.startswith(root_prefix)
+
+def is_excluded(path):
+    parts = set(os.path.normpath(path).split(os.sep))
+    if parts & EXCLUDED_PARTS:
+        return True
+    name = os.path.basename(path)
+    return name in EXCLUDED_FILES or name.endswith((".pem", ".key"))
+
+def main():
+    output = []
+    output_bytes = 0
+    truncated = False
+    incomplete = False
+    visited_directories = 0
+    visited_files = 0
+    total_file_bytes = 0
+    stack = [(VISIBLE_ROOT, ())]
+
+    def emit(record):
+        nonlocal output_bytes, truncated
+        encoded = (record + "\n").encode("utf-8", errors="replace")
+        if output_bytes + len(encoded) > max_output_bytes:
+            truncated = True
+            return False
+        output.append(record)
+        output_bytes += len(encoded)
+        if len(output) >= max_results:
+            truncated = True
+            return False
+        return True
+
+    while stack and not truncated:
+        directory, ancestors = stack.pop()
+        real_directory = os.path.realpath(directory)
+        if (
+            not is_within_root(directory)
+            or real_directory in ancestors
+            or is_excluded(directory)
+            or is_excluded(real_directory)
+        ):
+            continue
+        visited_directories += 1
+        if visited_directories > MAX_DIRECTORIES:
+            truncated = True
+            break
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            continue
+
+        child_directories = []
+        next_ancestors = ancestors + (real_directory,)
+        for entry in entries:
+            path = entry.path
+            if (
+                "\t" in path
+                or "\n" in path
+                or "\r" in path
+                or is_excluded(path)
+                or not is_within_root(path)
+            ):
+                continue
+            real_path = os.path.realpath(path)
+            if is_excluded(real_path):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=True):
+                    if pattern.search(path) and not emit("NAME\td\t" + path):
+                        break
+                    child_directories.append(path)
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                if pattern.search(path) and not emit("NAME\tf\t" + path):
+                    break
+                visited_files += 1
+                if visited_files > MAX_FILES or total_file_bytes >= MAX_TOTAL_FILE_BYTES:
+                    truncated = True
+                    break
+                with open(path, "rb") as source:
+                    content = source.read(MAX_FILE_BYTES + 1)
+                if len(content) > MAX_FILE_BYTES:
+                    incomplete = True
+                total_file_bytes += min(len(content), MAX_FILE_BYTES)
+                content = content[:MAX_FILE_BYTES]
+                if b"\0" in content[:8192]:
+                    continue
+                for line_number, line in enumerate(content.splitlines(), 1):
+                    decoded = line.decode("utf-8", errors="replace")
+                    if pattern.search(decoded):
+                        decoded = decoded.replace("\t", " ")
+                        if not emit(
+                            "CONTENT\t{}\t{}\t{}".format(
+                                path, line_number, decoded[:1000]
+                            )
+                        ):
+                            break
+            except OSError:
+                continue
+            if truncated:
+                break
+        if not truncated:
+            stack.extend((path, next_ancestors) for path in reversed(child_directories))
+
+    if truncated or incomplete:
+        output.append("TRUNCATED\tlimit_reached")
+    sys.stdout.write("\n".join(output))
+    if output:
+        sys.stdout.write("\n")
+
+main()
+"""
     command = (
-        "{ "
-        "find /opt/crucible -regextype posix-extended "
-        "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
-        f"\\( -type f -o -type d \\) -regex {find_pattern} "
-        "-printf 'NAME\\t%y\\t%p\\n' 2>/dev/null; "
-        "grep -rInE --binary-files=without-match "
-        "--exclude-dir=.git --exclude-dir=.ssh --exclude-dir=secrets "
-        "--exclude='*.pem' --exclude='*.key' --exclude='authorized_keys' "
-        f"-- {shlex.quote(query)} /opt/crucible 2>/dev/null "
-        "| sed 's/^/CONTENT\\t/'; "
-        f"}} | head -n {max_results}"
+        "python3 -c "
+        f"{shlex.quote(search_script)} "
+        f"{shlex.quote(query)} {max_results} {max_bytes}"
     )
     result = await ssh.run(controller_host, command, timeout=30)
     raw_output = result.stdout.encode("utf-8", errors="replace")
     grouped: dict[str, dict[str, Any]] = {}
     total_matches = 0
+    remote_truncated = False
     for line in raw_output[:max_bytes].decode("utf-8", errors="replace").splitlines():
         fields = line.split("\t", 3)
         if not fields:
             continue
         kind = fields[0]
+        if kind == "TRUNCATED":
+            remote_truncated = True
+            continue
         if kind == "NAME":
             if len(fields) != 3:
                 continue
@@ -456,14 +590,19 @@ async def _search_controller_source(
             line_number = ""
             content = ""
         elif kind == "CONTENT":
-            if len(fields) != 2:
+            if len(fields) == 4:
+                _, raw_path, line_number, content = fields
+                file_type = "f"
+            elif len(fields) == 2:
+                # Accept the legacy grep format while older remote servers roll
+                # forward to the structured tab-separated output.
+                file_type = "f"
+                content_fields = fields[1].split(":", 2)
+                if len(content_fields) != 3:
+                    continue
+                raw_path, line_number, content = content_fields
+            else:
                 continue
-            file_type = "f"
-            value = fields[1]
-            content_fields = value.split(":", 2)
-            if len(content_fields) != 3:
-                continue
-            raw_path, line_number, content = content_fields
         else:
             continue
         if not raw_path.startswith("/opt/crucible/"):
@@ -503,7 +642,11 @@ async def _search_controller_source(
         "results": files,
         "total_files": len(files),
         "total_matches": total_matches,
-        "truncated": total_matches >= max_results or len(raw_output) > max_bytes,
+        "truncated": (
+            remote_truncated
+            or total_matches >= max_results
+            or len(raw_output) > max_bytes
+        ),
     }
 
 

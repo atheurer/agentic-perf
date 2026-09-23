@@ -1745,9 +1745,10 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
                         0,
                     )
                 return SSHResult("", "missing", 1)
-            if "grep -rInE" in command:
+            if "python3 -c" in command:
                 return SSHResult(
-                    "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md:12:device guidance\n"
+                    "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md\t12\t"
+                    "device guidance\n"
                     "NAME\tf\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
                     "NAME\td\t/opt/crucible/subprojects/benchmarks/perftest\n",
                     "",
