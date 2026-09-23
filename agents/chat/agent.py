@@ -131,9 +131,29 @@ class ChatSession:
         self.llm_calls += 1
 
     def _truncate(self) -> None:
-        if len(self.messages) > _MAX_HISTORY:
-            # Keep first message (context) and last N
-            self.messages = self.messages[-_MAX_HISTORY:]
+        if len(self.messages) <= _MAX_HISTORY:
+            return
+        # Slice from the end, but ensure we don't orphan
+        # tool_result blocks from their tool_use blocks.
+        cut = self.messages[-_MAX_HISTORY:]
+        # If the first message is a user message containing
+        # tool_results, it references tool_use_ids from the
+        # assistant message we just dropped. Remove it.
+        while cut and self._is_tool_result(cut[0]):
+            cut = cut[1:]
+        self.messages = cut
+
+    @staticmethod
+    def _is_tool_result(msg: dict[str, Any]) -> bool:
+        """Check if a message contains tool_result blocks."""
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if isinstance(content, list):
+            return any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            )
+        return False
 
 
 class ChatSessionStore:
