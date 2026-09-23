@@ -504,7 +504,11 @@ class ChatAgent:
                         "I wasn't able to use my tools for "
                         "this request. Could you try rephrasing?"
                     )
-                except Exception:
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Chat retry without tools also failed: %s",
+                        retry_exc,
+                    )
                     text = (
                         "I'm having trouble processing your "
                         "request right now. Please try again."
