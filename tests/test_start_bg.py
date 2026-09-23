@@ -15,6 +15,22 @@ from pathlib import Path
 
 REPO = Path(__file__).parents[1]
 SCRIPT = REPO / "scripts" / "start-bg.sh"
+_FAKE_LEASE_RESPONSE = """\
+lease_response() {
+    local pid="$1" start_id
+    start_id="$(python3 - "$pid" <<'PY'
+from pathlib import Path
+import sys
+
+pid = sys.argv[1]
+fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+print(f"{boot_id}:{fields[19]}")
+PY
+)"
+    printf '{\"lease\":{\"pid\":%s,\"process_start_id\":\"%s\"}}\\n' "$pid" "$start_id"
+}
+"""
 
 
 def _holder(path: Path, *, role: str, lock_path: Path, store_id: str) -> None:
@@ -74,7 +90,17 @@ def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None
     fake_bin.mkdir()
     curl = fake_bin / "curl"
     curl.write_text(
-        f"#!/usr/bin/env bash\n"
+        f"#!/usr/bin/env bash\n{_FAKE_LEASE_RESPONSE}"
+        'if [[ "$*" == *"/control/orchestrator-lease"* ]]; then\n'
+        '  pid_file="$AGENTIC_PERF_HOME/orchestrator.pid"\n'
+        '  if [ -f "$pid_file" ]; then\n'
+        '    pid="$(tr -d \'[:space:]\' < "$pid_file")"\n'
+        '    lease_response "$pid"\n'
+        "  else\n"
+        "    printf '{\"lease\":null}\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
         'exec 9>>"$AGENTIC_PERF_HOME/state-store.lock"\n'
         "if flock -n 9; then flock -u 9; exit 7; fi\n"
         f"printf '%s\\n' '{{\"store_id\":\"{store_id}\"}}'\n"
@@ -181,7 +207,38 @@ def test_fresh_start_waits_for_lock_creation(tmp_path: Path) -> None:
     fake_bin.mkdir()
     curl = fake_bin / "curl"
     curl.write_text(
-        "#!/usr/bin/env bash\n"
+        f"#!/usr/bin/env bash\n{_FAKE_LEASE_RESPONSE}"
+        'if [[ "$*" == *"/control/orchestrator-lease"* ]]; then\n'
+        '  count_file="$AGENTIC_PERF_HOME/lease-query-count"\n'
+        "  count=0\n"
+        '  [ ! -f "$count_file" ] || read -r count < "$count_file"\n'
+        "  count=$((count + 1))\n"
+        '  printf \'%s\\n\' "$count" > "$count_file"\n'
+        '  if [ -f "$AGENTIC_PERF_HOME/lease-force-mismatch" ]; then\n'
+        '    pid="$(tr -d \'[:space:]\' < "$AGENTIC_PERF_HOME/orchestrator.pid")"\n'
+        '    printf \'{"lease":{"pid":%s,"process_start_id":"wrong-incarnation"}}\\n\' "$pid"\n'
+        "    exit 0\n"
+        "  fi\n"
+        '  if [ "$count" -lt 4 ]; then\n'
+        '    if [ "$count" -eq 1 ]; then\n'
+        '      pid="$(tr -d \'[:space:]\' < "$AGENTIC_PERF_HOME/orchestrator.pid")"\n'
+        '      printf \'{"lease":{"pid":%s,"process_start_id":"wrong-incarnation"}}\\n\' "$pid"\n'
+        '    elif [ "$count" -eq 2 ]; then\n'
+        '      printf \'{"lease":{"pid":999999,"process_start_id":"other-process"}}\\n\'\n'
+        "    else\n"
+        "      printf '[]\\n'\n"
+        "    fi\n"
+        "    exit 0\n"
+        "  fi\n"
+        '  pid_file="$AGENTIC_PERF_HOME/orchestrator.pid"\n'
+        '  if [ -f "$pid_file" ]; then\n'
+        '    pid="$(tr -d \'[:space:]\' < "$pid_file")"\n'
+        '    lease_response "$pid"\n'
+        "  else\n"
+        "    printf '{\"lease\":null}\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
         'exec 9>>"$AGENTIC_PERF_HOME/state-store.lock"\n'
         "if flock -n 9; then flock -u 9; exit 7; fi\n"
         f"printf '%s\\n' '{{\"store_id\":\"{store_id}\"}}'\n"
@@ -227,7 +284,11 @@ exec \"$@\"
         [
             "bash",
             "-c",
-            f"{SCRIPT} start; {SCRIPT} start; {SCRIPT} restart; {SCRIPT} stop",
+            f"{SCRIPT} start; "
+            '[ "$(cat "$AGENTIC_PERF_HOME/lease-query-count")" -ge 4 ] || exit 13; '
+            f"{SCRIPT} start; {SCRIPT} restart; {SCRIPT} stop; "
+            'touch "$AGENTIC_PERF_HOME/lease-force-mismatch"; '
+            f"if {SCRIPT} start; then exit 12; fi; {SCRIPT} status",
         ],
         cwd=REPO,
         env=env,
@@ -242,6 +303,12 @@ exec \"$@\"
     assert "Orchestrator already running" in result.stdout
     assert "Restarting services" in result.stdout
     assert "Services stopped" in result.stdout
+    assert "Cleaning up failed orchestrator startup" in result.stdout
+    assert "orchestrator failed to become ready" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "State store:  STOPPED" in result.stdout
+    assert "Orchestrator: STOPPED" in result.stdout
+    assert int((home / "lease-query-count").read_text()) >= 4
 
 
 def test_start_waits_for_unverifiable_lock_owner_to_release(tmp_path: Path) -> None:
