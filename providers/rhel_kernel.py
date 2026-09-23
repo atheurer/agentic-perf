@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 KERNEL_RELEASE_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9._+~]+$")
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _MAX_RELEASE_LEN = 96
 
 
@@ -35,6 +36,10 @@ class KernelSpec:
             raise ValueError(
                 f"kernel release {self.release!r} does not match"
                 f" {KERNEL_RELEASE_RE.pattern}"
+            )
+        if not _PACKAGE_NAME_RE.match(self.package):
+            raise ValueError(
+                f"package name {self.package!r} contains invalid characters"
             )
         for cp in self.companion_packages:
             if not KERNEL_RELEASE_RE.match(cp):
@@ -268,6 +273,11 @@ class KernelInventory:
 
 def parse_inventory(stdout: str) -> KernelInventory:
     sections = _split_sections(stdout)
+    if not sections.get("uname", "").strip() or not sections.get("boot_id", "").strip():
+        raise ValueError(
+            f"INVENTORY output missing required sections"
+            f" (got: {sorted(sections.keys())})"
+        )
 
     running = sections.get("uname", "").strip()
     arch = sections.get("arch", "").strip()

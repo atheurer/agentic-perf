@@ -3070,8 +3070,11 @@ async def install_kernel(
 ) -> str:
     """Install a specific kernel version on multiple hosts. Requires a consumed or consumable approval. Idempotent — already-installed kernels are reported without running dnf."""
     await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
     from agents.server_utils import assert_ticket_active
-    from providers.rhel_kernel import KernelSpec
 
     active = await assert_ticket_active(
         expected_status="awaiting_provision",
@@ -3079,11 +3082,18 @@ async def install_kernel(
     if active.get("status") == "rejected":
         return json.dumps(active)
 
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
     spec = KernelSpec.parse(kernel)
-    coros = [_install_kernel_one(h, spec) for h in hosts]
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_install_kernel_one(h, spec) for h in allowed]
     raw = await asyncio.gather(*coros, return_exceptions=True)
-    results: dict[str, Any] = {}
-    for host, result in zip(hosts, raw):
+    for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
             results[host] = {"state": "error", "error": str(result)}
         else:
@@ -3099,8 +3109,11 @@ async def select_default_kernel(
 ) -> str:
     """Select a kernel as the default boot entry on multiple hosts using grubby. Verifies vmlinuz and initramfs exist before selection. Idempotent — already-default kernels are reported without changes."""
     await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
     from agents.server_utils import assert_ticket_active
-    from providers.rhel_kernel import KernelSpec
 
     active = await assert_ticket_active(
         expected_status="awaiting_provision",
@@ -3108,11 +3121,18 @@ async def select_default_kernel(
     if active.get("status") == "rejected":
         return json.dumps(active)
 
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
     spec = KernelSpec.parse(kernel)
-    coros = [_select_default_kernel_one(h, spec) for h in hosts]
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_select_default_kernel_one(h, spec) for h in allowed]
     raw = await asyncio.gather(*coros, return_exceptions=True)
-    results: dict[str, Any] = {}
-    for host, result in zip(hosts, raw):
+    for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
             results[host] = {"state": "error", "error": str(result)}
         else:
