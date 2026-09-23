@@ -184,6 +184,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:nm_show_connection",
         "agents/provisioning/server.py:nm_verify_interface",
         "agents/provisioning/server.py:get_private_config",
+        "agents/provisioning/server.py:get_kernel_inventory",
     ),
     *_side_effecting(
         "providers.ssh.SSHExecutor",
@@ -206,6 +207,9 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:nm_set_ip",
         "agents/provisioning/server.py:nm_set_dhcp",
         "agents/provisioning/server.py:ensure_harness_installed",
+        "agents/provisioning/server.py:prepare_kernel_change",
+        "agents/provisioning/server.py:install_kernel",
+        "agents/provisioning/server.py:select_default_kernel",
     ),
     *_read_only(
         "agents/resource/server.py:parse_host_config",
