@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 
@@ -314,6 +317,228 @@ class OrchestratorConfig:
         if builtin is not None:
             return builtin
         return None
+
+
+def _sanitize_url(url: str) -> str:
+    """Strip credentials from a URL (userinfo, query, fragment)."""
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        # ``hostname`` drops userinfo, but preserve the useful non-secret port.
+        # Bracket IPv6 literals when rebuilding the authority component.
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return urlunparse((parsed.scheme, hostname + port, parsed.path, "", "", ""))
+    except (TypeError, ValueError):
+        return "(invalid URL)"
+
+
+_POLICY_KEYS = frozenset(
+    {
+        "on_existing_install",
+        "install_method",
+        "install_script",
+        "install_target_path",
+        "verify_command",
+        "update_command",
+        "run_install_as_root",
+    }
+)
+
+
+def _redacted_private_skills(skills_dir: Path) -> dict:
+    """Describe private skill files without exposing their private contents."""
+    files: dict[str, dict] = {}
+    if not skills_dir.is_dir():
+        return {"path": str(skills_dir), "directory_exists": False, "files": files}
+
+    for path in sorted(skills_dir.glob("*.json")):
+        if not path.is_file():
+            continue
+        entry: dict = {"keys": [], "loaded": False, "policies": {}}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            files[path.stem] = entry
+            continue
+        if not isinstance(raw, dict):
+            files[path.stem] = entry
+            continue
+
+        entry["loaded"] = True
+        entry["keys"] = sorted(str(key) for key in raw)
+        for section_name, section in raw.items():
+            if not isinstance(section, dict):
+                continue
+            policies = {
+                key: section[key]
+                for key in sorted(_POLICY_KEYS.intersection(section))
+                if isinstance(section[key], (bool, int, float, str))
+            }
+            if policies:
+                entry["policies"][str(section_name)] = policies
+        files[path.stem] = entry
+
+    return {"path": str(skills_dir), "directory_exists": True, "files": files}
+
+
+def build_redacted_config(
+    config: OrchestratorConfig, *, source: str = "in-process"
+) -> dict:
+    """Build a diagnostic snapshot of the effective config.
+
+    Uses an allowlist — only known-safe fields are included.
+    Secret values (API keys, tokens, vault credentials) are
+    never present in the output, by construction. Values in
+    user-controlled fields are sanitized or type-validated.
+    """
+    import paths
+
+    # Import paths at call time so diagnostics describe the service's path
+    # environment, including tests and multi-instance deployments.
+    agentic_perf_home = paths.AGENTIC_PERF_HOME
+    artifact_dir = paths.ARTIFACT_DIR
+    config_path = paths.CONFIG_PATH
+    private_skills_dir = paths.PRIVATE_SKILLS_DIR
+    secrets_dir = paths.SECRETS_DIR
+
+    safe_iterations: dict[str, int] = {}
+    for k, v in config._agent_iterations.items():
+        try:
+            safe_iterations[str(k)] = int(v)
+        except (ValueError, TypeError):
+            continue
+
+    safe_agent_models: dict[str, dict[str, str]] = {}
+    for k, v in config._agent_models.items():
+        if not isinstance(v, dict):
+            continue
+        safe_agent_models[str(k)] = {
+            "provider": str(v.get("provider", "")),
+            "model": str(v.get("model", "")),
+        }
+
+    snapshot: dict = {
+        "instance_name": config.instance_name,
+        "agentic_perf_home": str(agentic_perf_home),
+        "config_path": str(config_path),
+        "config_file_exists": config_path.exists(),
+        "runtime": {
+            "source": source,
+            "pid": os.getpid(),
+            "config_reload": "per-dispatch",
+            "private_skills_cache": "until-restart",
+            "restart_required_after_private_skill_change": True,
+        },
+        "paths": {
+            "private_skills_dir": str(private_skills_dir),
+            "secrets_dir": str(secrets_dir),
+            "artifact_dir": str(artifact_dir),
+        },
+        "private_skills": _redacted_private_skills(private_skills_dir),
+        "state_store": {
+            "url": _sanitize_url(config.state_store_url),
+            "port": config.state_store_port,
+        },
+        "llm": {
+            "provider": config.llm_provider,
+            "model": config.llm_model,
+            "backend": config.llm_backend,
+            "region": config.llm_region,
+            "api": config.llm_api,
+            "timeout": config.llm_timeout,
+            "max_tokens": config.llm_max_tokens,
+            "reasoning_effort": config.llm_reasoning_effort,
+        },
+        "orchestrator": {
+            "poll_interval": config.poll_interval,
+            "global_max_iterations": config.global_max_iterations,
+            "agent_task_timeout": config.agent_task_timeout,
+            "stale_task_timeout": config.stale_task_timeout,
+            "max_concurrent_agents": config.max_concurrent_agents,
+            "skip_teardown": config.skip_teardown,
+            "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
+            "leader_lease_renew_interval": config.leader_lease_renew_interval,
+        },
+        "harness": {
+            "crucible_home": config.crucible_home,
+            "zathras_home": config.zathras_home,
+        },
+        "introspection": {
+            "enabled": config.introspection_enabled,
+            "llm": config.introspection_llm,
+        },
+        "budget": {
+            "session_cost_usd": config.budget_session_cost_usd,
+        },
+        "ssh": {
+            "key_configured": config.ssh_key is not None,
+            "vault_secret_configured": config.ssh_key_vault_secret is not None,
+        },
+        "agent_iterations": safe_iterations,
+        "agent_models": safe_agent_models,
+    }
+    return snapshot
+
+
+def _effective_config_path() -> Path:
+    import paths
+
+    return paths.AGENTIC_PERF_HOME / "effective-config.json"
+
+
+def write_effective_config(config: OrchestratorConfig) -> dict:
+    """Persist the service's redacted config for authenticated diagnostics.
+
+    The file contains an allowlisted snapshot only and is atomically replaced.
+    It is intentionally not treated as input configuration.
+    """
+    snapshot = build_redacted_config(config, source="orchestrator")
+    destination = _effective_config_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    snapshot["runtime"]["written_at"] = datetime.now(timezone.utc).isoformat()
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(snapshot, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return snapshot
+
+
+def read_effective_config() -> dict | None:
+    """Read a live service snapshot, ignoring stale or malformed files."""
+    path = _effective_config_path()
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    runtime = snapshot.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("source") != "orchestrator":
+        return None
+    pid = runtime.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return snapshot
 
 
 def _env_or_cfg(

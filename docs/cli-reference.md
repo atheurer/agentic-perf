@@ -8,6 +8,28 @@ The global `--store-url URL` option must appear before the command. It
 overrides the state store address (default: `http://localhost:8090`) and can
 also be set with `STATE_STORE_URL`.
 
+## config show
+
+Show the effective runtime configuration with credentials and private values
+redacted:
+
+```bash
+python3 cli.py config show
+```
+
+When an orchestrator is running, the command reads its persisted startup
+snapshot, including the effective `AGENTIC_PERF_HOME`, `AGENTIC_PERF_SKILLS`,
+`AGENTIC_PERF_SECRETS`, and private harness policy such as
+`provisioning.on_existing_install`. The snapshot also identifies whether the
+private-skills directory was present and loaded. If no running snapshot is
+available, it reports the invoking process's configuration instead.
+
+Private skill files are cached by the running service. Restart the orchestrator
+after changing a private skill file; changing `config.json` fields that are
+marked restart-required likewise needs a restart. The JSON document is emitted
+on stdout; the general AI-safety disclaimer is emitted on stderr so stdout is
+safe for scripts and `jq`.
+
 ## trace
 
 Query or export an authenticated causal trace:
