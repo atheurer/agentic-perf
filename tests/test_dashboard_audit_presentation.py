@@ -72,3 +72,43 @@ def test_dashboard_renders_provider_record_links_safely() -> None:
     assert render("") == "RCA-&lt;42&gt;"
     assert render("not a URL") == "RCA-&lt;42&gt;"
     assert render("javascript:alert(1)") == "RCA-&lt;42&gt;"
+
+
+def _detail_layout_css(html: str) -> str:
+    start = html.index("/* Detail view: two-panel split layout */")
+    end = html.index("details {", start)
+    return html[start:end]
+
+
+def test_ticket_detail_layout_accounts_for_header_and_disclaimer() -> None:
+    """Desktop detail panels fill only the space below fixed-height chrome."""
+    html = INDEX.read_text(encoding="utf-8")
+    detail_css = _detail_layout_css(html)
+
+    assert "body:has(.detail-view) {" in detail_css
+    assert "height: 100vh;" in detail_css
+    assert "display: flex;" in detail_css
+    assert "flex-direction: column;" in detail_css
+    assert "body:has(.detail-view) > header," in detail_css
+    assert "body:has(.detail-view) > .ai-disclaimer" in detail_css
+    assert "body:has(.detail-view) > .container" in detail_css
+    assert "#app {\n  flex: 1;\n  min-height: 0;" in detail_css
+    assert "height: calc(100vh - 54px);" not in detail_css
+    assert (
+        ".detail-view {\n  display: flex;\n  flex-direction: column;\n  height: 100%;"
+        in detail_css
+    )
+
+
+def test_ticket_detail_layout_restores_mobile_page_scrolling() -> None:
+    """Stacked detail panels must not inherit desktop overflow suppression."""
+    html = INDEX.read_text(encoding="utf-8")
+    detail_css = _detail_layout_css(html)
+    mobile_start = detail_css.index("@media (max-width: 900px) {")
+    mobile_css = detail_css[mobile_start:]
+
+    assert (
+        "body:has(.detail-view) {\n    height: auto;\n    overflow: auto;" in mobile_css
+    )
+    assert "body:has(.detail-view) > .container {\n    display: block;" in mobile_css
+    assert ".detail-view { height: auto; overflow: visible; }" in mobile_css
