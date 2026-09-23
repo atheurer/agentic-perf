@@ -24,10 +24,17 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from agents.ethtool import (
+    flow_rule_matches_config,
+    parse_ethtool_flow_rules,
+    same_parsed_flow_rule,
+)
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
@@ -41,6 +48,16 @@ from providers.ssh import SSHExecutor
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("provisioning-agent")
+
+
+class FlowSteeringTarget(BaseModel):
+    """One host/interface pair for active RX rule inspection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host: str
+    interface: str
+
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
@@ -1504,44 +1521,174 @@ def _build_flow_rule_cmd(interface: str, rule: dict) -> str:
                     |"ah4"|"esp4"|"ah6"|"esp6"  (required)
       queue       : int — destination queue, or -1 to drop  (required)
       src_mac / src_mac_mask  : MAC address strings (ether only)
-      dst_mac / dst_mac_mask  : MAC address strings (ether only)
-      vlan_ether_type         : hex string e.g. "0x0800" (ether only)
+      dst_mac / dst_mac_mask  : MAC address strings (ether or IP flows)
+      ethertype / ethertype_mask: raw Ethernet protocol value/mask (ether only)
+      vlan_ether_type         : VLAN tag EtherType (vlan-etype extension)
       src_ip / src_ip_mask    : IPv4/IPv6 address strings
       dst_ip / dst_ip_mask    : IPv4/IPv6 address strings
-      tos / tos_mask          : int (IPv4 TOS / IPv6 traffic class)
+      tos / tos_mask          : int (IPv4 tos / IPv6 tclass)
       src_port / src_port_mask: int (TCP/UDP/SCTP only)
       dst_port / dst_port_mask: int (TCP/UDP/SCTP only)
     Omitting a mask uses the NIC default (exact match for most drivers).
     """
+    if not isinstance(rule, dict):
+        raise TypeError("rule must be a dictionary")
+    allowed_keys = {
+        "flow_type",
+        "queue",
+        "src_mac",
+        "src_mac_mask",
+        "dst_mac",
+        "dst_mac_mask",
+        "ethertype",
+        "ethertype_mask",
+        "vlan_ether_type",
+        "src_ip",
+        "src_ip_mask",
+        "dst_ip",
+        "dst_ip_mask",
+        "tos",
+        "tos_mask",
+        "src_port",
+        "src_port_mask",
+        "dst_port",
+        "dst_port_mask",
+    }
+    unknown_keys = set(rule) - allowed_keys
+    if unknown_keys:
+        raise ValueError(f"unsupported field(s): {', '.join(sorted(unknown_keys))}")
+
     ft = rule["flow_type"]
-    parts = [f"ethtool -N {interface} flow-type {ft}"]
+    flow_types = {
+        "ether",
+        "ip4",
+        "tcp4",
+        "udp4",
+        "sctp4",
+        "ah4",
+        "esp4",
+        "ip6",
+        "tcp6",
+        "udp6",
+        "sctp6",
+        "ah6",
+        "esp6",
+    }
+    if not isinstance(ft, str) or ft not in flow_types:
+        raise ValueError(f"unsupported flow_type: {ft!r}")
+    queue = rule["queue"]
+    if type(queue) is not int or queue < -1:
+        raise ValueError("queue must be an integer greater than or equal to -1")
+
+    parts = [f"ethtool -N {shlex.quote(interface)} flow-type {ft}"]
 
     def _field(key: str, arg: str, mask_key: str | None = None) -> None:
         val = rule.get(key)
         if val is None:
             return
-        parts.append(f"{arg} {val}")
+        parts.append(f"{arg} {shlex.quote(str(val))}")
         if mask_key:
             mask = rule.get(mask_key)
             if mask is not None:
-                parts.append(f"m {mask}")
+                parts.append(f"m {shlex.quote(str(mask))}")
 
-    # L2 fields (ether flow type)
-    _field("src_mac", "src-mac", "src_mac_mask")
-    _field("dst_mac", "dst-mac", "dst_mac_mask")
-    _field("vlan_ether_type", "vlan-ether-type")
+    # Raw Ethernet uses src/dst/proto; IP flows use the extended dst-mac option.
+    if ft == "ether":
+        incompatible_fields = {
+            "src_ip",
+            "src_ip_mask",
+            "dst_ip",
+            "dst_ip_mask",
+            "tos",
+            "tos_mask",
+            "src_port",
+            "src_port_mask",
+            "dst_port",
+            "dst_port_mask",
+        }
+        requested_incompatible = sorted(
+            key for key in incompatible_fields if rule.get(key) is not None
+        )
+        if requested_incompatible:
+            raise ValueError(
+                "unsupported field(s) for ether flow_type: "
+                f"{', '.join(requested_incompatible)}"
+            )
+        _field("src_mac", "src", "src_mac_mask")
+        _field("dst_mac", "dst", "dst_mac_mask")
+        _field("ethertype", "proto", "ethertype_mask")
+    else:
+        if rule.get("src_mac") is not None or rule.get("src_mac_mask") is not None:
+            raise ValueError("src_mac is supported only for ether flow_type")
+        if rule.get("ethertype") is not None or rule.get("ethertype_mask") is not None:
+            raise ValueError("ethertype is supported only for ether flow_type")
+        _field("dst_mac", "dst-mac", "dst_mac_mask")
+    _field("vlan_ether_type", "vlan-etype")
 
     # L3 fields
     _field("src_ip", "src-ip", "src_ip_mask")
     _field("dst_ip", "dst-ip", "dst_ip_mask")
-    _field("tos", "tos", "tos_mask")
+    _field("tos", "tclass" if ft.endswith("6") else "tos", "tos_mask")
 
     # L4 fields
     _field("src_port", "src-port", "src_port_mask")
     _field("dst_port", "dst-port", "dst_port_mask")
 
-    parts.append(f"action {rule['queue']}")
+    for value_key, mask_key in (
+        ("src_mac", "src_mac_mask"),
+        ("dst_mac", "dst_mac_mask"),
+        ("ethertype", "ethertype_mask"),
+        ("src_ip", "src_ip_mask"),
+        ("dst_ip", "dst_ip_mask"),
+        ("tos", "tos_mask"),
+        ("src_port", "src_port_mask"),
+        ("dst_port", "dst_port_mask"),
+    ):
+        if rule.get(mask_key) is not None and rule.get(value_key) is None:
+            raise ValueError(f"{mask_key} requires {value_key}")
+
+    parts.append(f"action {queue}")
     return " ".join(parts)
+
+
+async def _read_flow_steering_rules_one(host: str, interface: str) -> dict:
+    """Read the active RX ntuple rules and return parsed entries plus evidence."""
+    quoted_interface = shlex.quote(interface)
+    try:
+        result = await _ssh.run(host, f"ethtool -u {quoted_interface} 2>&1", timeout=30)
+    except Exception as exc:
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "errors": [f"ethtool -u command failed: {exc}"],
+        }
+    response = {
+        "host": host,
+        "interface": interface,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+    }
+    if result.exit_code != 0:
+        return {
+            **response,
+            "status": "error",
+            "errors": [f"ethtool -u failed: {result.stdout.strip()}"],
+        }
+    try:
+        rules = parse_ethtool_flow_rules(result.stdout)
+    except ValueError as exc:
+        return {
+            **response,
+            "status": "error",
+            "errors": [f"could not verify ethtool rule table: {exc}"],
+        }
+    return {
+        **response,
+        "status": "ok",
+        "rule_count": len(rules),
+        "rules": rules,
+    }
 
 
 async def _configure_flow_steering_one(
@@ -1553,8 +1700,26 @@ async def _configure_flow_steering_one(
     applied: list[str] = []
     errors: list[str] = []
 
+    commands: list[str] = []
+    for i, rule in enumerate(rules):
+        try:
+            commands.append(_build_flow_rule_cmd(interface, rule))
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"rule[{i}] invalid: {exc}")
+    if errors:
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "applied": applied,
+            "errors": errors,
+            "verification": {"status": "not_checked"},
+        }
+
+    quoted_interface = shlex.quote(interface)
+
     # Enable ntuple filtering
-    r = await _ssh.run(host, f"ethtool -K {interface} ntuple on 2>&1")
+    r = await _ssh.run(host, f"ethtool -K {quoted_interface} ntuple on 2>&1")
     if r.exit_code != 0:
         errors.append(f"failed to enable ntuple: {r.stdout.strip()}")
         return {
@@ -1566,29 +1731,36 @@ async def _configure_flow_steering_one(
         }
     applied.append("ntuple-filters: enabled")
 
+    before = await _read_flow_steering_rules_one(host, interface)
+    if before["status"] != "ok":
+        errors.extend(before["errors"])
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "applied": applied,
+            "errors": errors,
+            "verification": {"status": "not_checked", "before": before},
+        }
+    previous_rules = before["rules"] if not clear_existing else []
+
     # Clear existing rules if requested
     if clear_existing:
-        r2 = await _ssh.run(host, f"ethtool -n {interface} 2>&1")
-        rule_ids = []
-        for line in r2.stdout.splitlines():
-            if line.strip().startswith("Filter:"):
-                try:
-                    rule_ids.append(int(line.split()[-1]))
-                except ValueError:
-                    pass
+        rule_ids = [rule["id"] for rule in before["rules"]]
         for rid in rule_ids:
-            await _ssh.run(host, f"ethtool -N {interface} delete {rid} 2>&1")
+            deleted = await _ssh.run(
+                host, f"ethtool -N {quoted_interface} delete {rid} 2>&1"
+            )
+            if deleted.exit_code != 0:
+                errors.append(
+                    f"failed to delete existing rule {rid}: {deleted.stdout.strip()}"
+                )
         if rule_ids:
             applied.append(f"cleared {len(rule_ids)} existing rule(s)")
 
     # Add new rules
     rule_ids_added = []
-    for i, rule in enumerate(rules):
-        try:
-            cmd = _build_flow_rule_cmd(interface, rule)
-        except (KeyError, TypeError) as e:
-            errors.append(f"rule[{i}] invalid: {e}")
-            continue
+    for i, (rule, cmd) in enumerate(zip(rules, commands)):
         r3 = await _ssh.run(host, f"{cmd} 2>&1")
         if r3.exit_code == 0:
             # Extract assigned rule ID from output
@@ -1608,6 +1780,70 @@ async def _configure_flow_steering_one(
         else:
             errors.append(f"rule[{i}] failed: {r3.stdout.strip()}")
 
+    after = await _read_flow_steering_rules_one(host, interface)
+    verification: dict[str, Any] = {
+        "status": "error",
+        "requested_rule_count": len(rules),
+        "preserved_rule_count": len(previous_rules),
+        "actual_rules": after.get("rules"),
+    }
+    if after["status"] != "ok":
+        errors.extend(after["errors"])
+        verification["errors"] = after["errors"]
+    else:
+        remaining = list(after["rules"])
+        missing: list[str] = []
+        for old_rule in previous_rules:
+            old_index = next(
+                (
+                    index
+                    for index, actual_rule in enumerate(remaining)
+                    if same_parsed_flow_rule(actual_rule, old_rule)
+                ),
+                None,
+            )
+            if old_index is None:
+                missing.append(f"pre-existing rule {old_rule['id']} was not preserved")
+            else:
+                remaining.pop(old_index)
+        for index, rule in enumerate(rules):
+            matching_index = next(
+                (
+                    candidate_index
+                    for candidate_index, actual_rule in enumerate(remaining)
+                    if flow_rule_matches_config(actual_rule, rule)
+                ),
+                None,
+            )
+            if matching_index is None:
+                missing.append(
+                    f"requested rule[{index}] is missing or mismatched "
+                    f"(flow_type={rule['flow_type']}, "
+                    f"dst_port={rule.get('dst_port', '*')}, queue={rule['queue']})"
+                )
+            else:
+                remaining.pop(matching_index)
+        if missing:
+            errors.extend(missing)
+        if remaining:
+            extra = [rule["id"] for rule in remaining]
+            errors.append(f"unexpected RX flow-steering rule(s) remain: {extra}")
+        verification.update(
+            {
+                "status": "verified" if not missing and not remaining else "error",
+                "expected_rule_count": len(previous_rules) + len(rules),
+                "actual_rule_count": len(after["rules"]),
+                "missing": missing,
+                "unexpected_rule_ids": [rule["id"] for rule in remaining],
+            }
+        )
+        if len(after["rules"]) != len(previous_rules) + len(rules):
+            errors.append(
+                "RX rule count mismatch: expected "
+                f"{len(previous_rules) + len(rules)}, observed {len(after['rules'])}"
+            )
+            verification["status"] = "error"
+
     return {
         "host": host,
         "interface": interface,
@@ -1615,6 +1851,7 @@ async def _configure_flow_steering_one(
         "applied": applied,
         "errors": errors,
         "rule_ids": rule_ids_added,
+        "verification": verification,
     }
 
 
@@ -1623,7 +1860,8 @@ async def _reset_flow_steering_one(host: str, interface: str) -> dict:
     applied: list[str] = []
     errors: list[str] = []
 
-    r = await _ssh.run(host, f"ethtool -n {interface} 2>&1")
+    quoted_interface = shlex.quote(interface)
+    r = await _ssh.run(host, f"ethtool -n {quoted_interface} 2>&1")
     rule_ids = []
     for line in r.stdout.splitlines():
         if line.strip().startswith("Filter:"):
@@ -1632,11 +1870,11 @@ async def _reset_flow_steering_one(host: str, interface: str) -> dict:
             except ValueError:
                 pass
     for rid in rule_ids:
-        await _ssh.run(host, f"ethtool -N {interface} delete {rid} 2>&1")
+        await _ssh.run(host, f"ethtool -N {quoted_interface} delete {rid} 2>&1")
     if rule_ids:
         applied.append(f"deleted {len(rule_ids)} rule(s)")
 
-    r2 = await _ssh.run(host, f"ethtool -K {interface} ntuple off 2>&1")
+    r2 = await _ssh.run(host, f"ethtool -K {quoted_interface} ntuple off 2>&1")
     if r2.exit_code == 0:
         applied.append("ntuple-filters: disabled")
     else:
@@ -1668,18 +1906,71 @@ async def configure_flow_steering(
       flow_type (required): "ether"|"ip4"|"tcp4"|"udp4"|"sctp4"|"ip6"|"tcp6"|
                             "udp6"|"sctp6"|"ah4"|"esp4"|"ah6"|"esp6"
       queue     (required): int — destination RX queue, or -1 to drop
-      src_mac / src_mac_mask, dst_mac / dst_mac_mask: MAC addr strings (ether)
-      vlan_ether_type: hex string e.g. "0x0800" (ether)
+      src_mac / src_mac_mask: MAC address strings (ether only)
+      dst_mac / dst_mac_mask: MAC address strings (ether or IP flows)
+      ethertype / ethertype_mask: raw Ethernet protocol value/mask (ether only)
+      vlan_ether_type: VLAN tag EtherType (vlan-etype extension)
       src_ip / src_ip_mask, dst_ip / dst_ip_mask: IP address strings
       tos / tos_mask: int (IPv4 TOS or IPv6 traffic class)
       src_port / src_port_mask, dst_port / dst_port_mask: int (L4 types only)
     Omitting a mask uses the NIC driver default (exact match for most drivers).
 
     MUST be called AFTER tune_nic (changing channel count invalidates rules)
-    and BEFORE pin_irq. Use reset_flow_steering to undo."""
+    and BEFORE pin_irq. The tool reads the active rule table after applying
+    changes and returns verification status, including missing, mismatched,
+    or unexpected rules. Treat the result as incomplete if status is not
+    "ok" or verification.status is not "verified". Use
+    get_flow_steering_rules for a read-only inspection or reset_flow_steering
+    to undo."""
     await _ensure_init()
     return json.dumps(
         await _configure_flow_steering_one(host, interface, rules, clear_existing)
+    )
+
+
+@mcp.tool()
+async def get_flow_steering_rules(targets: list[FlowSteeringTarget]) -> str:
+    """Read the active RX ntuple flow-steering rules from a NIC.
+
+    Returns structured rule IDs, flow types, match fields and masks, actions,
+    queue destinations, and the raw ``ethtool -u`` output. Use it to inspect
+    current state independently after configure_flow_steering; a read failure
+    or unrecognized table is reported as status="error", never as an empty
+    rule list. Pass targets=[{"host": "10.0.0.1", "interface": "ens1f0"}];
+    each target can name its own host and interface.
+    """
+    await _ensure_init()
+    if not targets:
+        return json.dumps({"status": "error", "errors": ["targets must not be empty"]})
+
+    async def _read_target(target: FlowSteeringTarget) -> dict:
+        host = target.host
+        interface = target.interface
+        if not host or not interface:
+            return {
+                "host": host,
+                "interface": interface,
+                "status": "error",
+                "errors": ["each target requires non-empty host and interface"],
+            }
+        try:
+            return await _read_flow_steering_rules_one(host, interface)
+        except Exception as exc:
+            return {
+                "host": host,
+                "interface": interface,
+                "status": "error",
+                "errors": [f"ethtool rule read failed: {exc}"],
+            }
+
+    results = await asyncio.gather(*(_read_target(target) for target in targets))
+    errors = [result for result in results if result.get("status") != "ok"]
+    return json.dumps(
+        {
+            "status": "error" if errors else "ok",
+            "results": results,
+            "error_count": len(errors),
+        }
     )
 
 
