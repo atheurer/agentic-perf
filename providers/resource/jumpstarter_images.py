@@ -22,11 +22,132 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin, urlsplit
 
 from providers.execution import AuditedAsyncHTTPClient
 
+if TYPE_CHECKING:
+    import httpx
+
 logger = logging.getLogger(__name__)
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_TRUSTED_CROSS_ORIGIN_REDIRECTS = frozenset(
+    {("autosd.sig.centos.org", "download.autosd.sig.centos.org")}
+)
+
+
+def _effective_port(parts: Any) -> int | None:
+    try:
+        if parts.port is not None:
+            return parts.port
+    except ValueError:
+        return None
+    return 443 if parts.scheme == "https" else 80
+
+
+def _safe_redirect_url(current_url: str, location: str) -> str | None:
+    """Resolve and authorize an image-server redirect.
+
+    Requests made by ``AuditedAsyncHTTPClient`` carry the current ticket's
+    causal headers.  Image manifests must therefore stay on the same host;
+    otherwise those headers could be disclosed to an unrelated redirect
+    destination.  HTTPS downgrades are rejected for the same reason.
+    """
+
+    try:
+        resolved = urljoin(current_url, location)
+        current = urlsplit(current_url)
+        target = urlsplit(resolved)
+    except ValueError:
+        return None
+
+    if (
+        current.scheme not in {"http", "https"}
+        or target.scheme not in {"http", "https"}
+        or not current.hostname
+        or not target.hostname
+        or target.username is not None
+        or target.password is not None
+    ):
+        return None
+
+    # Never follow an HTTPS downgrade.  Same-origin redirects retain the
+    # original audited causal headers and must retain the effective port.
+    if current.scheme == "https" and target.scheme != "https":
+        return None
+
+    current_host = current.hostname.lower()
+    target_host = target.hostname.lower()
+    if current_host == target_host:
+        if _effective_port(current) != _effective_port(target):
+            return None
+        return resolved
+
+    # AutoSD's build service intentionally redirects the public manifest host
+    # to its download host.  This is the sole cross-origin exception.  Both
+    # hops must use the default HTTPS port; no causal headers are sent on the
+    # follow-up request (see _audited_get_follow_redirects).
+    if (
+        current.scheme == target.scheme == "https"
+        and _effective_port(current) == _effective_port(target) == 443
+        and (current_host, target_host) in _TRUSTED_CROSS_ORIGIN_REDIRECTS
+    ):
+        return resolved
+    return None
+
+
+async def _audited_get_follow_redirects(
+    client: AuditedAsyncHTTPClient,
+    url: str,
+    *,
+    max_redirects: int = 5,
+) -> "httpx.Response":
+    """GET with redirect following via the audited client.
+
+    The audited client disables automatic redirects so each
+    hop gets its own audit event.  This helper follows 3xx
+    responses manually, issuing a separately audited request
+    for each redirect.
+    """
+
+    strip_causal_headers = False
+    for _ in range(max_redirects):
+        request_options = (
+            {"_strip_causal_headers": True} if strip_causal_headers else {}
+        )
+        r = await client.get(url, **request_options)
+        if r.status_code in _REDIRECT_STATUSES:
+            location = r.headers.get("location", "")
+            if not location:
+                return r
+            next_url = _safe_redirect_url(url, location)
+            if next_url is None:
+                logger.warning(
+                    "[images] rejected unsafe redirect from %s to %s",
+                    url,
+                    location,
+                )
+                return r
+            current = urlsplit(url)
+            target = urlsplit(next_url)
+            cross_origin = (
+                current.scheme.lower(),
+                current.hostname.lower() if current.hostname else "",
+                _effective_port(current),
+            ) != (
+                target.scheme.lower(),
+                target.hostname.lower() if target.hostname else "",
+                _effective_port(target),
+            )
+            url = next_url
+            # Once a redirect leaves the original origin, keep the causal
+            # envelope stripped for the remainder of that redirect chain.
+            strip_causal_headers = strip_causal_headers or cross_origin
+            continue
+        return r
+    return r
 
 
 async def _resolve_latest_monthly(
@@ -44,7 +165,7 @@ async def _resolve_latest_monthly(
             timeout=15.0,
             verify=not trust_server,
         ) as client:
-            r = await client.get(monthly_url + "/")
+            r = await _audited_get_follow_redirects(client, monthly_url + "/")
             if r.status_code != 200:
                 return ""
             # Parse directory listing for dated subdirs
@@ -115,10 +236,9 @@ async def resolve_image_urls(
 
     async with AuditedAsyncHTTPClient(
         timeout=30.0,
-        follow_redirects=True,
         verify=not trust_server,
     ) as client:
-        r = await client.get(manifest_url)
+        r = await _audited_get_follow_redirects(client, manifest_url)
 
         # Fallback chain when the specific release 404s:
         # 1. Match by datestamp (e.g., latest-RHIVOS-2-202607240103
@@ -134,7 +254,7 @@ async def resolve_image_urls(
                 datestamp = date_match.group(1)
                 listing_url = f"{base_url}/{image_version}/"
                 try:
-                    listing_r = await client.get(listing_url)
+                    listing_r = await _audited_get_follow_redirects(client, listing_url)
                     if listing_r.status_code == 200:
                         dir_matches = _re.findall(
                             r'href=["\']?([^"\'\s]*'
@@ -155,7 +275,9 @@ async def resolve_image_urls(
                                 f"[images] Release {release} not found,"
                                 f" trying datestamp match: {matched_dir}"
                             )
-                            r = await client.get(datestamp_url)
+                            r = await _audited_get_follow_redirects(
+                                client, datestamp_url
+                            )
                             if r.status_code == 200:
                                 manifest_url = datestamp_url
                                 release = matched_dir
@@ -171,7 +293,7 @@ async def resolve_image_urls(
             logger.info(
                 f"[images] Release {release} not found, trying {fallback_release}"
             )
-            r = await client.get(fallback_url)
+            r = await _audited_get_follow_redirects(client, fallback_url)
             if r.status_code == 200:
                 manifest_url = fallback_url
                 release = fallback_release

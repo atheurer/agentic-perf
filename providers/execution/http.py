@@ -38,6 +38,17 @@ from providers.tracing import (
 from providers.tracing.client import TraceClient, TraceDeliveryError
 
 _SAFE_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-requested-with"})
+_CAUSAL_HEADERS = frozenset(
+    {
+        "traceparent",
+        "x-agentic-perf-causal-context",
+        "x-agentic-perf-ticket-id",
+        "x-agentic-perf-agent-id",
+        "x-agentic-perf-invocation-id",
+        "x-agentic-perf-action-id",
+        "x-agentic-perf-parent-action-id",
+    }
+)
 _REQUEST_ID_HEADERS = frozenset(
     {
         "x-request-id",
@@ -317,12 +328,28 @@ class _AuditedHTTPBase:
             self._recorder.record_critical if critical else self._recorder.record, event
         )
 
-    def _headers(self, headers: Any, context: Any, key: str | None) -> dict[str, str]:
+    def _headers(
+        self,
+        headers: Any,
+        context: Any,
+        key: str | None,
+        *,
+        strip_causal_headers: bool = False,
+    ) -> dict[str, str]:
         result = dict(headers or {})
         if context is not None:
             result.update(trace_headers(context))
         if key:
             result.setdefault("Idempotency-Key", key)
+        if strip_causal_headers:
+            result = {
+                name: value
+                for name, value in result.items()
+                if (
+                    str(name).lower() not in _CAUSAL_HEADERS
+                    and not str(name).lower().startswith("x-agentic-perf-")
+                )
+            }
         return result
 
     def _idempotency_key(self, context: Any, method: str, target: str) -> str | None:
@@ -382,6 +409,7 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
         self, method: str, url: str | httpx.URL, **kwargs: Any
     ) -> httpx.Response:
         send_method = kwargs.pop("_audit_send_method", None)
+        strip_causal_headers = bool(kwargs.pop("_strip_causal_headers", False))
         if kwargs.pop("follow_redirects", False):
             raise ValueError(
                 "automatic redirects are disabled for audited HTTP; issue a separately audited request"
@@ -416,7 +444,10 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
         for attempt in range(1, self.retries + 2):
             request_context = child_context(context) if context is not None else None
             kwargs["headers"] = self._headers(
-                kwargs.get("headers"), request_context, key
+                kwargs.get("headers"),
+                request_context,
+                key,
+                strip_causal_headers=strip_causal_headers,
             )
             await self._record(
                 self._event(
