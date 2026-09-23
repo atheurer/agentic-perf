@@ -203,11 +203,11 @@ agents/benchmark/server.py|4778|metadata_file.write_bytes
 agents/benchmark/server.py|4785|metadata_file.write_text
 agents/benchmark/server.py|4791|metadata_file.write_text
 agents/benchmark/server.py|4846|merged_file.write_bytes
-agents/infra/server.py|209|tempfile.NamedTemporaryFile
-agents/infra/server.py|217|staging.unlink
-agents/infra/server.py|219|unlink
-agents/infra/server.py|295|filesystem.mkdir
-agents/infra/server.py|299|tempfile.mkdtemp
+agents/infra/server.py|210|tempfile.NamedTemporaryFile
+agents/infra/server.py|218|staging.unlink
+agents/infra/server.py|220|unlink
+agents/infra/server.py|296|filesystem.mkdir
+agents/infra/server.py|300|tempfile.mkdtemp
 orchestrator/config.py|501|destination.parent.mkdir
 orchestrator/config.py|503|tempfile.mkstemp
 orchestrator/config.py|507|os.fdopen
