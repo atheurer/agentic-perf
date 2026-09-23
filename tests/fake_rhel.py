@@ -96,11 +96,16 @@ class FakeRHELHost:
         return SSHResult(stdout=stdout, stderr="", exit_code=0)
 
     def _handle_inventory(self, command: str) -> SSHResult:
+        pkg = "kernel"
+        if "rpm -q " in command:
+            rpm_part = command.split("rpm -q ", 1)[1].split(" --qf")[0]
+            pkg = rpm_part.split()[0]
+
         rpm_lines = []
         for rel in self.installed:
-            rpm_lines.append(f"kernel {rel}")
+            rpm_lines.append(f"{pkg} {rel}")
         if not rpm_lines:
-            rpm_lines.append("package kernel is not installed")
+            rpm_lines.append(f"package {pkg} is not installed")
 
         entries_text = ""
         for i, rel in enumerate(self.installed):

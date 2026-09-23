@@ -1139,6 +1139,7 @@ class TicketStore:
                 existing = ApprovalRequest.model_validate(value)
                 if (
                     existing.status == "pending"
+                    and existing.kind == request.kind
                     and existing.validation_id == request.validation_id
                     and existing.presented_run_file_digest
                     == request.presented_run_file_digest
