@@ -97,14 +97,16 @@ def build_probe_command() -> str:
     )
 
 
-def build_inventory_command() -> str:
+def build_inventory_command(package: str = "kernel") -> str:
+    if not _PACKAGE_NAME_RE.match(package):
+        raise ValueError(f"invalid package name: {package!r}")
     return (
         "echo @@uname; uname -r;"
         " echo @@arch; uname -m;"
         " echo @@cmdline; cat /proc/cmdline;"
         " echo @@boot_id; cat /proc/sys/kernel/random/boot_id;"
         " echo @@os; cat /etc/os-release;"
-        " echo @@rpm; rpm -q kernel kernel-core"
+        f" echo @@rpm; rpm -q {package} {package}-core"
         " --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\\n' 2>&1;"
         " echo @@default; grubby --default-kernel 2>&1;"
         " echo @@default_index; grubby --default-index 2>&1;"

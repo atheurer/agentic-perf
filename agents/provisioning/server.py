@@ -2760,7 +2760,15 @@ async def _kernel_inventory_one(
         parse_inventory,
     )
 
-    result = await _ssh.run(host, build_inventory_command(), timeout=30)
+    package = "kernel"
+    if kernel:
+        try:
+            spec_for_pkg = KernelSpec.parse(kernel)
+            package = spec_for_pkg.package
+        except ValueError:
+            pass
+
+    result = await _ssh.run(host, build_inventory_command(package), timeout=30)
     if result.exit_code != 0:
         return {
             "host": host,
@@ -2857,7 +2865,7 @@ async def _install_kernel_one(
         parse_inventory,
     )
 
-    inv_before = await _ssh.run(host, build_inventory_command(), timeout=30)
+    inv_before = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
     try:
         before = parse_inventory(inv_before.stdout)
     except ValueError:
@@ -2888,7 +2896,7 @@ async def _install_kernel_one(
             "before": before.to_dict(),
         }
 
-    inv_after = await _ssh.run(host, build_inventory_command(), timeout=30)
+    inv_after = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
     try:
         after = parse_inventory(inv_after.stdout)
     except ValueError:
@@ -2980,12 +2988,24 @@ async def get_kernel_inventory(
     hosts: list[str],
     kernel: str = "",
 ) -> str:
-    """Get kernel inventory for multiple hosts. Returns running kernel, installed packages, grubby entries, default boot entry, and arch/OS info. When kernel is provided, also checks whether the requested release is installed or available."""
+    """Get kernel inventory for multiple hosts. Returns running kernel, installed packages, grubby entries, default boot entry, and arch/OS info. When kernel is provided, also checks whether the requested release is installed or available. Only probes hosts assigned to this ticket."""
     await _ensure_init()
-    coros = [_kernel_inventory_one(h, kernel) for h in hosts]
+    from agents.provisioning.kernel import refuse_protected_targets
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_kernel_inventory_one(h, kernel) for h in allowed]
     raw = await asyncio.gather(*coros, return_exceptions=True)
-    results: dict[str, Any] = {}
-    for host, result in zip(hosts, raw):
+    for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
             results[host] = {"state": "error", "error": str(result)}
         else:

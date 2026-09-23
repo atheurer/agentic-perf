@@ -42,12 +42,6 @@ KERNEL_STEP_TICKET = {
 }
 
 
-def _mock_assert_active():
-    """Return a mock that simulates assert_ticket_active."""
-    mock = AsyncMock(return_value={"status": "ok", "ticket": KERNEL_STEP_TICKET})
-    return mock
-
-
 @pytest.fixture
 def two_hosts():
     h1 = FakeRHELHost("host1", running=KERNEL_A, available=[KERNEL_B])
@@ -63,6 +57,14 @@ def fleet_ssh(two_hosts):
 @pytest.fixture
 def handlers(fleet_ssh):
     return make_provisioning_handlers(fleet_ssh)
+
+
+@pytest.fixture(autouse=True)
+def mock_ticket_active():
+    """Mock assert_ticket_active for all kernel tool tests."""
+    mock = AsyncMock(return_value={"status": "ok", "ticket": KERNEL_STEP_TICKET})
+    with patch("agents.server_utils.assert_ticket_active", mock):
+        yield
 
 
 class TestGetKernelInventory:
@@ -83,11 +85,8 @@ class TestGetKernelInventory:
             hosts=["10.0.0.1", "10.99.99.99"],
         )
         assert result["results"]["10.0.0.1"]["state"] == "ok"
-        assert result["results"]["10.99.99.99"]["state"] in (
-            "unreachable",
-            "not_checked",
-            "error",
-        )
+        unreach = result["results"]["10.99.99.99"]
+        assert unreach["state"] in ("unreachable", "not_checked", "error", "refused")
 
     @pytest.mark.asyncio
     async def test_with_kernel_installed(self, handlers):
@@ -121,15 +120,11 @@ class TestGetKernelInventory:
 class TestInstallKernel:
     @pytest.mark.asyncio
     async def test_install_new_kernel(self, handlers, fleet_ssh):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["install_kernel"](
-                hosts=["10.0.0.1"],
-                kernel=KERNEL_B,
-                approval_request_id="test-approval",
-            )
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1"],
+            kernel=KERNEL_B,
+            approval_request_id="test-approval",
+        )
         h1 = result["results"]["10.0.0.1"]
         assert h1["state"] == "installed"
         assert KERNEL_B in h1["after"]["installed"]
@@ -142,43 +137,31 @@ class TestInstallKernel:
         assert KERNEL_B in dnf_calls[0]["command"]
 
     @pytest.mark.asyncio
-    async def test_idempotent_install(self, handlers, fleet_ssh):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["install_kernel"](
-                hosts=["10.0.0.1"],
-                kernel=KERNEL_A,
-                approval_request_id="test",
-            )
+    async def test_wrong_kernel_rejected(self, handlers):
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1"],
+            kernel=KERNEL_A,
+            approval_request_id="test",
+        )
         assert result.get("status") == "rejected"
         assert result["reason_code"].startswith("kernel_mismatch")
 
     @pytest.mark.asyncio
-    async def test_wrong_kernel_rejected(self, handlers):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["install_kernel"](
-                hosts=["10.0.0.1"],
-                kernel="9.99.0-1.el99.x86_64",
-                approval_request_id="test",
-            )
+    async def test_nonexistent_kernel_rejected(self, handlers):
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1"],
+            kernel="9.99.0-1.el99.x86_64",
+            approval_request_id="test",
+        )
         assert result["reason_code"].startswith("kernel_mismatch")
 
     @pytest.mark.asyncio
     async def test_controller_host_refused(self, handlers):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["install_kernel"](
-                hosts=["10.0.0.100"],
-                kernel=KERNEL_B,
-                approval_request_id="test",
-            )
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.100"],
+            kernel=KERNEL_B,
+            approval_request_id="test",
+        )
         h = result["results"]["10.0.0.100"]
         assert h["state"] == "refused"
         assert h["reason"] == "harness_controller"
@@ -186,46 +169,34 @@ class TestInstallKernel:
 
 class TestSelectDefaultKernel:
     @pytest.mark.asyncio
-    async def test_select_new_default(self, handlers, two_hosts, fleet_ssh):
+    async def test_select_new_default(self, handlers, two_hosts):
         two_hosts["10.0.0.1"].installed.append(KERNEL_B)
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["select_default_kernel"](
-                hosts=["10.0.0.1"],
-                kernel=KERNEL_B,
-                approval_request_id="test-approval",
-            )
+        result = await handlers["select_default_kernel"](
+            hosts=["10.0.0.1"],
+            kernel=KERNEL_B,
+            approval_request_id="test-approval",
+        )
         h1 = result["results"]["10.0.0.1"]
         assert h1["state"] == "ok"
         assert h1["after"] == f"/boot/vmlinuz-{KERNEL_B}"
 
     @pytest.mark.asyncio
-    async def test_not_bootable(self, handlers, two_hosts):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["select_default_kernel"](
-                hosts=["10.0.0.1"],
-                kernel=KERNEL_B,
-                approval_request_id="test-approval",
-            )
+    async def test_not_bootable(self, handlers):
+        result = await handlers["select_default_kernel"](
+            hosts=["10.0.0.1"],
+            kernel=KERNEL_B,
+            approval_request_id="test-approval",
+        )
         h1 = result["results"]["10.0.0.1"]
         assert h1["state"] == "not_bootable"
 
     @pytest.mark.asyncio
     async def test_wrong_kernel_rejected(self, handlers):
-        with patch(
-            "agents.server_utils.assert_ticket_active",
-            _mock_assert_active(),
-        ):
-            result = await handlers["select_default_kernel"](
-                hosts=["10.0.0.1"],
-                kernel="9.99.0-1.el99.x86_64",
-                approval_request_id="test",
-            )
+        result = await handlers["select_default_kernel"](
+            hosts=["10.0.0.1"],
+            kernel="9.99.0-1.el99.x86_64",
+            approval_request_id="test",
+        )
         assert result["reason_code"].startswith("kernel_mismatch")
 
 
