@@ -69,6 +69,31 @@ def test_openai_model():
     assert abs(c_o3 - 0.006) < 0.0001
 
 
+def test_openai_gpt6_model_pricing():
+    """GPT-6 models use their standard input, cache, and output rates."""
+    expected = {
+        "gpt-6-astra": (0.035, 0.02805),
+        "gpt-6-sol": (0.007, 0.00561),
+        "gpt-6-luna": (0.00035, 0.0002805),
+    }
+
+    for model, (uncached_cost, cached_cost) in expected.items():
+        assert abs(estimate_cost(model, 1000, 500) - uncached_cost) < 1e-10
+        assert (
+            abs(
+                estimate_cost(
+                    model,
+                    1000,
+                    500,
+                    cache_read_input_tokens=800,
+                    cache_creation_input_tokens=100,
+                )
+                - cached_cost
+            )
+            < 1e-10
+        )
+
+
 def test_google_model():
     """Google models have their own pricing."""
     c = estimate_cost("gemini-2.5-pro", 1000, 500)
