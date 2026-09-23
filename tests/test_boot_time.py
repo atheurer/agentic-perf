@@ -279,6 +279,7 @@ class TestBootTimeKPIExtraction:
                     side_effect=mock_subprocess_exec,
                 ),
                 patch("tempfile.mkdtemp", return_value=str(tmp_path)),
+                patch("socket.create_connection", return_value=MagicMock()),
             ):
                 result = json.loads(
                     await server.execute_boot_time_test(
