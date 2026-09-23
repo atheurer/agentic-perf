@@ -59,6 +59,33 @@ class TestKernelSpec:
         with pytest.raises(ValueError, match="missing 'release'"):
             KernelSpec.parse({"package": "kernel"})
 
+    def test_rejects_malicious_package(self):
+        with pytest.raises(ValueError, match="invalid characters"):
+            KernelSpec.parse(
+                {
+                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                    "package": "kernel; rm -rf /",
+                }
+            )
+
+    def test_rejects_package_with_shell_chars(self):
+        with pytest.raises(ValueError, match="invalid characters"):
+            KernelSpec.parse(
+                {
+                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                    "package": "kernel$(whoami)",
+                }
+            )
+
+    def test_valid_package_names(self):
+        s = KernelSpec.parse(
+            {
+                "release": "5.14.0-503.14.1.el9_5.x86_64",
+                "package": "kernel-rt",
+            }
+        )
+        assert s.package == "kernel-rt"
+
     def test_frozen(self):
         s = KernelSpec.parse("5.14.0-503.14.1.el9_5.x86_64")
         with pytest.raises(AttributeError):
@@ -160,6 +187,14 @@ class TestParseInventory:
         assert d["running"] == inv.running
         assert len(d["entries"]) == 2
         assert d["entries"][0]["index"] == 0
+
+    def test_empty_output_raises(self):
+        with pytest.raises(ValueError, match="missing required sections"):
+            parse_inventory("")
+
+    def test_partial_output_raises(self):
+        with pytest.raises(ValueError, match="missing required sections"):
+            parse_inventory("@@arch\nx86_64\n")
 
 
 class TestParseProbe:
