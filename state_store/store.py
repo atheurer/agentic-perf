@@ -441,6 +441,15 @@ class TicketStore:
                 raise TicketNotFound(f"Ticket {ticket_id} not found")
             return ticket.model_copy()
 
+    def count_by_status(self) -> dict[str, int]:
+        """Return ticket counts per status without copying tickets."""
+        with self._lock:
+            counts: dict[str, int] = {}
+            for ticket in self._tickets.values():
+                key = ticket.status.value
+                counts[key] = counts.get(key, 0) + 1
+            return counts
+
     def list_tickets(self, status: TicketStatus | None = None) -> list[Ticket]:
         with self._lock:
             tickets = list(self._tickets.values())
