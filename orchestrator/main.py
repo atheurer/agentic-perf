@@ -1307,10 +1307,27 @@ async def _block_handoff_failed(
                 f"Rewinding to {retry_status} so the agent"
                 f" can retry after user guidance"
             )
-            await client.post(
+            resp = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={"status": retry_status, "comment": rewind_comment},
             )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Rewind %s → %s failed (HTTP %d) for %s; "
+                    "will transition directly to awaiting_customer_guidance",
+                    current_status,
+                    retry_status,
+                    resp.status_code,
+                    ticket_id,
+                )
+        # Re-fetch ticket to determine actual status after rewind attempt.
+        ticket_resp = await client.get(
+            f"{store_url}/api/v1/tickets/{ticket_id}",
+        )
+        if ticket_resp.status_code == 200:
+            actual_status = ticket_resp.json().get("status", current_status)
+        else:
+            actual_status = current_status
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -1324,13 +1341,21 @@ async def _block_handoff_failed(
             },
         )
         block_comment = f"Handoff validation failed: {reason}"
-        await client.post(
+        hitl_resp = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
                 "comment": block_comment,
             },
         )
+        if hitl_resp.status_code >= 400:
+            logger.error(
+                "HITL transition to awaiting_customer_guidance failed "
+                "(HTTP %d) for %s from status %s",
+                hitl_resp.status_code,
+                ticket_id,
+                actual_status,
+            )
 
 
 async def _process_stop_requests(
