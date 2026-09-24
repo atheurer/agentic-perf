@@ -195,7 +195,8 @@ class ResourceAgent(AgentBase):
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
-            await self._check_fleet_exhaustion(question)
+            # Fleet exhaustion is checked in _request_human_input
+            # override — no need to duplicate here.
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
