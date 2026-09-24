@@ -110,9 +110,10 @@ class UsageLedger:
 
     def __init__(self, log_dir: str | Path | None = None) -> None:
         self._log_dir = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
-        self._log_dir.mkdir(parents=True, exist_ok=True)
-        self._file_handle: Any = None
-        self._current_date: str = ""
+        from providers.execution import AuditedFilesystem
+
+        self._filesystem = AuditedFilesystem.system(self._log_dir)
+        self._filesystem.mkdir(".", mode=0o777)
 
     def _ledger_path(self, date_str: str) -> Path:
         return self._log_dir / f"usage-ledger-{date_str}.jsonl"
@@ -124,15 +125,8 @@ class UsageLedger:
         """Append a single usage record to today's ledger."""
         today = self._today()
         try:
-            if self._current_date != today:
-                if self._file_handle is not None:
-                    self._file_handle.close()
-                path = self._ledger_path(today)
-                self._file_handle = open(path, "a", encoding="utf-8")
-                self._current_date = today
             line = entry.model_dump_json() + "\n"
-            self._file_handle.write(line)
-            self._file_handle.flush()
+            self._filesystem.append(self._ledger_path(today).name, line)
         except Exception:
             logger.exception("Failed to write usage ledger entry")
 
@@ -213,13 +207,7 @@ class UsageLedger:
         }
 
     def close(self) -> None:
-        if self._file_handle is not None:
-            try:
-                self._file_handle.close()
-            except Exception:
-                pass
-            self._file_handle = None
-            self._current_date = ""
+        return None
 
 
 # ------------------------------------------------------------------

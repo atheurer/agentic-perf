@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,35 @@ def _instance(root: Path, name: str, port: int) -> tuple[Path, Path]:
     )
     identity.create_manifest(str(home), str(worktree), name, port)
     return home, worktree
+
+
+def test_create_manifest_works_with_system_stdlib_python(tmp_path: Path) -> None:
+    script = Path(__file__).parents[1] / "scripts/dev_instance_identity.py"
+    home = tmp_path / "instance-home"
+    worktree = tmp_path / "instance-repo"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(script),
+            "create",
+            "--home",
+            str(home),
+            "--worktree",
+            str(worktree),
+            "--name",
+            "instance",
+            "--port",
+            "18100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (home / identity.MANIFEST).is_file()
+    assert (home / identity.MANIFEST_DIGEST).is_file()
 
 
 def test_manifest_and_config_identity_are_checked(tmp_path: Path) -> None:
