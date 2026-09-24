@@ -39,6 +39,58 @@ class TestChatSession:
             session.add_user_message(f"msg {i}")
         assert len(session.messages) <= 100
 
+    def test_truncation_drops_orphaned_tool_results(self):
+        session = ChatSession(
+            user="test",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t1"},
+                        {"type": "tool_use", "id": "t2"},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1"},
+                        {"type": "tool_result", "tool_use_id": "t2"},
+                    ],
+                },
+                *[
+                    message
+                    for i in range(49)
+                    for message in (
+                        {"role": "assistant", "content": f"assistant {i}"},
+                        {"role": "user", "content": f"user {i}"},
+                    )
+                ],
+                {"role": "assistant", "content": "latest"},
+            ],
+        )
+
+        session._truncate()
+
+        assert len(session.messages) == 98
+        assert session.messages[0] == {"role": "user", "content": "user 0"}
+        assert all(not session._is_tool_result(message) for message in session.messages)
+
+    def test_truncation_starts_with_user_when_suffix_starts_with_assistant(self):
+        messages = [{"role": "user", "content": "initial"}]
+        for i in range(50):
+            messages.extend(
+                (
+                    {"role": "assistant", "content": f"assistant {i}"},
+                    {"role": "user", "content": f"user {i}"},
+                )
+            )
+        session = ChatSession(user="test", messages=messages)
+
+        session._truncate()
+
+        assert len(session.messages) == 99
+        assert session.messages[0] == {"role": "user", "content": "user 0"}
+
     def test_record_usage(self):
         session = ChatSession(user="test")
         session.record_usage({"input_tokens": 100, "output_tokens": 50})
