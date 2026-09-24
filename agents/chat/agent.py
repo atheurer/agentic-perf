@@ -34,6 +34,17 @@ _DEFAULT_TIMEOUT = 60
 logger = logging.getLogger(__name__)
 
 
+def _safe_exception_summary(exc: Exception) -> str:
+    """Return useful provider error metadata without logging response text."""
+    status_code = getattr(exc, "status_code", None)
+    if type(status_code) is not int:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if type(status_code) is int:
+        return f"{type(exc).__name__} (HTTP {status_code})"
+    return type(exc).__name__
+
+
 def _is_confirmation(message: str) -> bool:
     """Return whether a conversational reply approves a pending action."""
     normalized = message.lower().strip().rstrip(".!?")
@@ -497,7 +508,7 @@ class ChatAgent:
                 logger.warning(
                     "Chat LLM call failed on round %d: %s",
                     _round + 1,
-                    exc,
+                    _safe_exception_summary(exc),
                 )
                 if _round > 0:
                     # Later rounds: return partial results.
@@ -524,7 +535,11 @@ class ChatAgent:
                         "I wasn't able to use my tools for "
                         "this request. Could you try rephrasing?"
                     )
-                except Exception:
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Chat retry without tools also failed: %s",
+                        _safe_exception_summary(retry_exc),
+                    )
                     text = (
                         "I'm having trouble processing your "
                         "request right now. Please try again."

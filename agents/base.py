@@ -187,12 +187,16 @@ class AgentBase(ABC):
             file_ref: str,
             filter: str,
             limit: int = 50,
+            max_bytes: int = 16384,
+            offset_bytes: int = 0,
             include_alternates: bool = False,
         ) -> str:
             res = _get_manager().jq_query(
                 file_ref,
                 filter,
                 limit=limit,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
                 include_alternates=include_alternates,
             )
             return json.dumps(res, indent=2)
@@ -240,12 +244,14 @@ class AgentBase(ABC):
         async def _read_document(
             ref: str,
             include_alternates: bool = False,
-            max_bytes: int = 262144,
+            max_bytes: int = 16384,
+            offset_bytes: int = 0,
         ) -> str:
             res = _get_manager().read_document(
                 ref,
                 include_alternates=include_alternates,
                 max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             return json.dumps(res, indent=2)
 
@@ -397,6 +403,17 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
+            "- **Bounded reads**: `jq_file_from_workspace`, `read_file_from_workspace`, and "
+            "`read_document_from_workspace` accept `max_bytes` up to 16384. When a result includes "
+            "`next_offset_bytes`, repeat the same request with the same file/ref, filter, limit, and "
+            "`max_bytes`, setting `offset_bytes` to that value. For a paged jq result, read the `result_slice` "
+            "field; join its pages in order (it is text for strings and compact JSON text for objects/arrays). "
+            "If `items_truncated` is true, use an array slice in the jq filter because `limit` omitted items.\n"
+            "- For `read_file_from_workspace` with `max_lines`, keep the same line range and use "
+            "`next_offset_bytes` until it is null; then use `next_start_line` with `offset_bytes=0` "
+            "(or omit `offset_bytes`) to request the following range.\n"
+            "- Workspace file listings and document searches include `size_bytes`; use that to choose "
+            "a focused jq filter or an appropriately sized read.\n"
             "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
             "to slice and return the exact data in a single turn without multi-step querying. When a tool "
@@ -1771,13 +1788,23 @@ class AgentBase(ABC):
                 )
                 if q_res.get("status") == "ok":
                     filtered_data = q_res.get("result")
+                    filtered_slice = q_res.get("result_slice")
                     filtered_json = json.dumps(
                         {
                             "status": "filtered",
                             "file_ref": file_ref,
                             "jq_filter": jq_filter,
-                            "data": filtered_data,
+                            "data": (
+                                filtered_slice
+                                if filtered_slice is not None
+                                else filtered_data
+                            ),
+                            "result_format": q_res.get("result_format"),
+                            "offset_bytes": q_res.get("offset_bytes", 0),
+                            "next_offset_bytes": q_res.get("next_offset_bytes"),
+                            "result_total_bytes": q_res.get("total_bytes"),
                             "truncated": q_res.get("truncated", False),
+                            "items_truncated": q_res.get("items_truncated", False),
                             "total_items": q_res.get("total_items"),
                             "full_size_bytes": len(raw_bytes),
                         },
@@ -1799,9 +1826,11 @@ class AgentBase(ABC):
                             "size_bytes": len(raw_bytes),
                             "preview": preview,
                             "message": (
-                                f"Full output saved to '{file_ref}'. Filtered result ({len(filtered_json)} bytes) "
-                                f"exceeds threshold. Refine jq_file_from_workspace or read slices."
+                                f"Full output saved to '{file_ref}'. Filtered page ({len(filtered_json)} bytes) "
+                                "exceeds threshold. Call jq_file_from_workspace with the same filter and "
+                                "set offset_bytes to next_offset_bytes to continue."
                             ),
+                            "next_offset_bytes": q_res.get("next_offset_bytes"),
                         }
                         return json.dumps(descriptor, indent=2)
                 else:
