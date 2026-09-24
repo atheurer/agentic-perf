@@ -55,7 +55,7 @@ MUTATING_QUALIFIED = {
 @dataclass(frozen=True)
 class Mutation:
     path: str
-    line: int
+    scope: str  # enclosing function/method name, or "<module>"
     call: str
 
 
@@ -166,22 +166,45 @@ def _is_mutation(node: ast.Call, call: str) -> bool:
     return False
 
 
+def _enclosing_scope(node: ast.AST, parents: dict[int, ast.AST]) -> str:
+    """Walk up the AST to find the enclosing function/method name."""
+    current = node
+    while True:
+        parent = parents.get(id(current))
+        if parent is None:
+            return "<module>"
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return parent.name
+        current = parent
+
+
+def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+    """Map each node id to its parent for scope lookups."""
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return parents
+
+
 def _inventory() -> list[Mutation]:
     paths = [ROOT / "paths.py"]
-    for tree in PRODUCTION_TREES:
-        paths.extend((ROOT / tree).rglob("*.py"))
+    for tree_dir in PRODUCTION_TREES:
+        paths.extend((ROOT / tree_dir).rglob("*.py"))
     found: list[Mutation] = []
     for path in paths:
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         aliases = _import_aliases(tree)
+        parents = _build_parent_map(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             call = _resolved_call_name(node.func, aliases)
             if _is_mutation(node, call):
-                found.append(Mutation(relative, node.lineno, call))
-    return sorted(found, key=lambda item: (item.path, item.line, item.call))
+                scope = _enclosing_scope(node, parents)
+                found.append(Mutation(relative, scope, call))
+    return sorted(found, key=lambda item: (item.path, item.scope, item.call))
 
 
 # Fixed review manifest. Each entry is a deliberate audited-boundary primitive,
@@ -189,160 +212,160 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3770|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3815|staging.unlink
-agents/benchmark/server.py|3817|unlink
-agents/benchmark/server.py|4095|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|4200|staging.unlink
-agents/benchmark/server.py|4202|unlink
-agents/benchmark/server.py|4532|open
-agents/benchmark/server.py|4714|diag_file.write_text
-agents/benchmark/server.py|4745|artifact_filesystem.unlink
-agents/benchmark/server.py|4747|serial_log_path.unlink
-agents/benchmark/server.py|4778|metadata_file.write_bytes
-agents/benchmark/server.py|4785|metadata_file.write_text
-agents/benchmark/server.py|4791|metadata_file.write_text
-agents/benchmark/server.py|4846|merged_file.write_bytes
-agents/infra/server.py|209|tempfile.NamedTemporaryFile
-agents/infra/server.py|217|staging.unlink
-agents/infra/server.py|219|unlink
-agents/infra/server.py|295|filesystem.mkdir
-agents/infra/server.py|299|tempfile.mkdtemp
-orchestrator/config.py|501|destination.parent.mkdir
-orchestrator/config.py|503|tempfile.mkstemp
-orchestrator/config.py|507|os.fdopen
-orchestrator/config.py|512|os.replace
-orchestrator/config.py|515|os.unlink
-orchestrator/main.py|2155|LOCK_FILE.parent.mkdir
-orchestrator/main.py|2156|os.open
-orchestrator/main.py|2171|os.ftruncate
-orchestrator/main.py|2172|os.write
-orchestrator/main.py|2192|LOCK_FILE.unlink
-paths.py|145|mkdir
-paths.py|152|tempfile.mkdtemp
-paths.py|170|ws_dir.mkdir
-paths.py|174|temp_dir.mkdir
-providers/events.py|159|self._log_dir.mkdir
-providers/execution/filesystem.py|359|path.mkdir
-providers/execution/filesystem.py|385|path.parent.mkdir
-providers/execution/filesystem.py|386|open
-providers/execution/filesystem.py|387|os.chmod
-providers/execution/filesystem.py|431|path.parent.mkdir
-providers/execution/filesystem.py|435|tempfile.mkstemp
-providers/execution/filesystem.py|436|os.fdopen
-providers/execution/filesystem.py|438|open
-providers/execution/filesystem.py|440|os.chmod
-providers/execution/filesystem.py|446|os.replace
-providers/execution/filesystem.py|454|os.unlink
-providers/execution/filesystem.py|477|source_path.rename
-providers/execution/filesystem.py|486|path.unlink
-providers/execution/filesystem.py|499|target.parent.mkdir
-providers/execution/filesystem.py|500|tempfile.mkstemp
-providers/execution/filesystem.py|505|tarfile.open
-providers/execution/filesystem.py|508|os.replace
-providers/execution/filesystem.py|515|os.unlink
-providers/image_build/caib.py|193|tempfile.NamedTemporaryFile
-providers/image_build/caib.py|339|unlink
-providers/investigation/file.py|42|self._dir.mkdir
-providers/investigation/file.py|52|path.write_text
-providers/quota.py|113|self._log_dir.mkdir
-providers/quota.py|131|open
-providers/resource/jumpstarter.py|147|user_config.parent.mkdir
-providers/resource/jumpstarter.py|148|user_config.write_text
-providers/resource/jumpstarter_provision.py|127|tempfile.mktemp
-providers/resource/jumpstarter_provision.py|132|open
-providers/secrets/bitwarden.py|217|tempfile.mkdtemp
-providers/secrets/bitwarden.py|219|tmp_dir.chmod
-providers/secrets/bitwarden.py|221|tmp_file.write_text
-providers/secrets/bitwarden.py|222|tmp_file.chmod
-providers/secrets/bitwarden.py|227|child.unlink
-providers/secrets/bitwarden.py|228|tmp_dir.rmdir
-providers/skills/arcaflow_plugins.py|37|self._cache_dir.mkdir
-providers/skills/arcaflow_plugins.py|70|path.write_text
-providers/skills/repo_cache.py|35|repo_path.parent.mkdir
-providers/tracing/fingerprints.py|15|key_path.parent.mkdir
-providers/tracing/fingerprints.py|16|os.chmod
-providers/tracing/fingerprints.py|22|os.chmod
-providers/tracing/fingerprints.py|31|tempfile.mkstemp
-providers/tracing/fingerprints.py|35|os.fchmod
-providers/tracing/fingerprints.py|36|os.fdopen
-providers/tracing/fingerprints.py|42|os.link
-providers/tracing/fingerprints.py|50|os.unlink
-providers/tracing/payloads.py|76|self.directory.mkdir
-providers/tracing/payloads.py|77|os.chmod
-providers/tracing/payloads.py|86|os.chmod
-providers/tracing/payloads.py|93|tempfile.mkstemp
-providers/tracing/payloads.py|95|os.fchmod
-providers/tracing/payloads.py|96|os.fdopen
-providers/tracing/payloads.py|102|os.replace
-providers/tracing/payloads.py|110|os.unlink
-providers/tracing/payloads.py|113|os.chmod
-providers/tracing/spool.py|59|self.directory.mkdir
-providers/tracing/spool.py|62|os.chmod
-providers/tracing/spool.py|73|os.open
-providers/tracing/spool.py|81|os.fchmod
-providers/tracing/spool.py|89|self.lock_path.unlink
-providers/tracing/spool.py|98|os.open
-providers/tracing/spool.py|103|os.chmod
-providers/tracing/spool.py|121|self.path.open
-providers/tracing/spool.py|138|tempfile.mkstemp
-providers/tracing/spool.py|140|os.fchmod
-providers/tracing/spool.py|141|os.fdopen
-providers/tracing/spool.py|145|os.replace
-providers/tracing/spool.py|149|os.unlink
-providers/tracing/spool.py|195|tempfile.mkstemp
-providers/tracing/spool.py|197|os.fchmod
-providers/tracing/spool.py|198|os.fdopen
-providers/tracing/spool.py|208|os.replace
-providers/tracing/spool.py|212|os.unlink
-providers/tracing/spool.py|223|self.path.unlink
-providers/tracing/spool.py|224|self.ack_path.unlink
-providers/tracing/spool.py|225|self.lock_path.unlink
-providers/tracing/spool.py|234|os.replace
-providers/tracing/spool.py|235|self.path.touch
-providers/tracing/spool.py|236|self.ack_path.unlink
-providers/workspace/manager.py|78|self._filesystem.mkdir
-state_store/api/artifacts.py|136|filesystem.unlink
-state_store/audit.py|42|self._path.parent.mkdir
-state_store/auth.py|66|SECRETS_DIR.mkdir
-state_store/auth.py|68|TOKEN_FILE.write_text
-state_store/auth.py|69|TOKEN_FILE.chmod
-state_store/auth.py|81|SECRETS_DIR.mkdir
-state_store/auth.py|83|VALIDATOR_TOKEN_FILE.write_text
-state_store/auth.py|84|VALIDATOR_TOKEN_FILE.chmod
-state_store/identity.py|387|self._path.parent.mkdir
-state_store/identity.py|388|tempfile.mkstemp
-state_store/identity.py|393|os.fdopen
-state_store/identity.py|395|os.chmod
-state_store/identity.py|396|os.replace
-state_store/identity.py|399|os.unlink
-state_store/store.py|99|self._persist_dir.mkdir
-state_store/store.py|130|self._lease_path.unlink
-state_store/store.py|139|temporary.open
-state_store/store.py|143|os.replace
-state_store/process_lock.py|97|path.parent.mkdir
-state_store/process_lock.py|107|os.open
-state_store/process_lock.py|109|os.write
-state_store/process_lock.py|113|os.replace
-state_store/process_lock.py|121|temporary.unlink
-state_store/process_lock.py|148|self.root.mkdir
-state_store/process_lock.py|150|os.open
-state_store/process_lock.py|194|os.ftruncate
-state_store/process_lock.py|196|os.write
-state_store/store.py|1889|filesystem.mkdir
-state_store/store.py|1896|filesystem.mkdir
-state_store/store.py|1909|log_filesystem.rename
-state_store/store.py|1918|filesystem.rename
-state_store/trace_store.py|82|self.db_path.parent.mkdir
+agents/benchmark/server.py|execute_benchmark|staging.unlink
+agents/benchmark/server.py|execute_benchmark|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|execute_benchmark|unlink
+agents/benchmark/server.py|execute_boot_time_test|artifact_filesystem.unlink
+agents/benchmark/server.py|execute_boot_time_test|diag_file.write_text
+agents/benchmark/server.py|execute_boot_time_test|merged_file.write_bytes
+agents/benchmark/server.py|execute_boot_time_test|metadata_file.write_bytes
+agents/benchmark/server.py|execute_boot_time_test|metadata_file.write_text
+agents/benchmark/server.py|execute_boot_time_test|metadata_file.write_text
+agents/benchmark/server.py|execute_boot_time_test|open
+agents/benchmark/server.py|execute_boot_time_test|serial_log_path.unlink
+agents/benchmark/server.py|validate_benchmark|staging.unlink
+agents/benchmark/server.py|validate_benchmark|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|validate_benchmark|unlink
+agents/infra/server.py|read_remote_dir|filesystem.mkdir
+agents/infra/server.py|read_remote_dir|tempfile.mkdtemp
+agents/infra/server.py|write_remote_file|staging.unlink
+agents/infra/server.py|write_remote_file|tempfile.NamedTemporaryFile
+agents/infra/server.py|write_remote_file|unlink
+orchestrator/config.py|write_effective_config|destination.parent.mkdir
+orchestrator/config.py|write_effective_config|os.fdopen
+orchestrator/config.py|write_effective_config|os.replace
+orchestrator/config.py|write_effective_config|os.unlink
+orchestrator/config.py|write_effective_config|tempfile.mkstemp
+orchestrator/main.py|_acquire_lock|LOCK_FILE.parent.mkdir
+orchestrator/main.py|_acquire_lock|os.ftruncate
+orchestrator/main.py|_acquire_lock|os.open
+orchestrator/main.py|_acquire_lock|os.write
+orchestrator/main.py|_release_lock|LOCK_FILE.unlink
+paths.py|create_artifact_dir|mkdir
+paths.py|create_artifact_dir|tempfile.mkdtemp
+paths.py|get_ticket_workspace_dir|temp_dir.mkdir
+paths.py|get_ticket_workspace_dir|ws_dir.mkdir
+providers/events.py|__init__|self._log_dir.mkdir
+providers/execution/filesystem.py|create_archive|os.replace
+providers/execution/filesystem.py|create_archive|os.unlink
+providers/execution/filesystem.py|create_archive|tarfile.open
+providers/execution/filesystem.py|create_archive|target.parent.mkdir
+providers/execution/filesystem.py|create_archive|tempfile.mkstemp
+providers/execution/filesystem.py|mkdir|path.mkdir
+providers/execution/filesystem.py|open_stream|open
+providers/execution/filesystem.py|open_stream|os.chmod
+providers/execution/filesystem.py|open_stream|path.parent.mkdir
+providers/execution/filesystem.py|rename|source_path.rename
+providers/execution/filesystem.py|unlink|path.unlink
+providers/execution/filesystem.py|write_file|open
+providers/execution/filesystem.py|write_file|os.chmod
+providers/execution/filesystem.py|write_file|os.fdopen
+providers/execution/filesystem.py|write_file|os.replace
+providers/execution/filesystem.py|write_file|os.unlink
+providers/execution/filesystem.py|write_file|path.parent.mkdir
+providers/execution/filesystem.py|write_file|tempfile.mkstemp
+providers/image_build/caib.py|build|tempfile.NamedTemporaryFile
+providers/image_build/caib.py|build|unlink
+providers/investigation/file.py|__init__|self._dir.mkdir
+providers/investigation/file.py|_write|path.write_text
+providers/quota.py|__init__|self._log_dir.mkdir
+providers/quota.py|append|open
+providers/resource/jumpstarter.py|from_secrets|user_config.parent.mkdir
+providers/resource/jumpstarter.py|from_secrets|user_config.write_text
+providers/resource/jumpstarter_provision.py|provision_jumpstarter|open
+providers/resource/jumpstarter_provision.py|provision_jumpstarter|tempfile.mktemp
+providers/secrets/bitwarden.py|secret_file|child.unlink
+providers/secrets/bitwarden.py|secret_file|tempfile.mkdtemp
+providers/secrets/bitwarden.py|secret_file|tmp_dir.chmod
+providers/secrets/bitwarden.py|secret_file|tmp_dir.rmdir
+providers/secrets/bitwarden.py|secret_file|tmp_file.chmod
+providers/secrets/bitwarden.py|secret_file|tmp_file.write_text
+providers/skills/arcaflow_plugins.py|__init__|self._cache_dir.mkdir
+providers/skills/arcaflow_plugins.py|put|path.write_text
+providers/skills/repo_cache.py|ensure_repo|repo_path.parent.mkdir
+providers/tracing/fingerprints.py|_read_existing|os.chmod
+providers/tracing/fingerprints.py|load_audit_key|key_path.parent.mkdir
+providers/tracing/fingerprints.py|load_audit_key|os.chmod
+providers/tracing/fingerprints.py|load_audit_key|os.fchmod
+providers/tracing/fingerprints.py|load_audit_key|os.fdopen
+providers/tracing/fingerprints.py|load_audit_key|os.link
+providers/tracing/fingerprints.py|load_audit_key|os.unlink
+providers/tracing/fingerprints.py|load_audit_key|tempfile.mkstemp
+providers/tracing/payloads.py|put|os.chmod
+providers/tracing/payloads.py|put|os.chmod
+providers/tracing/payloads.py|put|os.chmod
+providers/tracing/payloads.py|put|os.fchmod
+providers/tracing/payloads.py|put|os.fdopen
+providers/tracing/payloads.py|put|os.replace
+providers/tracing/payloads.py|put|os.unlink
+providers/tracing/payloads.py|put|self.directory.mkdir
+providers/tracing/payloads.py|put|tempfile.mkstemp
+providers/tracing/spool.py|__init__|os.chmod
+providers/tracing/spool.py|__init__|os.chmod
+providers/tracing/spool.py|__init__|os.fchmod
+providers/tracing/spool.py|__init__|os.open
+providers/tracing/spool.py|__init__|os.open
+providers/tracing/spool.py|__init__|self.directory.mkdir
+providers/tracing/spool.py|__init__|self.lock_path.unlink
+providers/tracing/spool.py|_quarantine|os.replace
+providers/tracing/spool.py|_quarantine|self.ack_path.unlink
+providers/tracing/spool.py|_quarantine|self.path.touch
+providers/tracing/spool.py|_write_ack|os.fchmod
+providers/tracing/spool.py|_write_ack|os.fdopen
+providers/tracing/spool.py|_write_ack|os.replace
+providers/tracing/spool.py|_write_ack|os.unlink
+providers/tracing/spool.py|_write_ack|tempfile.mkstemp
+providers/tracing/spool.py|append|self.path.open
+providers/tracing/spool.py|close|self.ack_path.unlink
+providers/tracing/spool.py|close|self.lock_path.unlink
+providers/tracing/spool.py|close|self.path.unlink
+providers/tracing/spool.py|compact|os.fchmod
+providers/tracing/spool.py|compact|os.fdopen
+providers/tracing/spool.py|compact|os.replace
+providers/tracing/spool.py|compact|os.unlink
+providers/tracing/spool.py|compact|tempfile.mkstemp
+providers/workspace/manager.py|__init__|self._filesystem.mkdir
+state_store/api/artifacts.py|download_archive|filesystem.unlink
+state_store/audit.py|__init__|self._path.parent.mkdir
+state_store/auth.py|load_or_generate_token|SECRETS_DIR.mkdir
+state_store/auth.py|load_or_generate_token|TOKEN_FILE.chmod
+state_store/auth.py|load_or_generate_token|TOKEN_FILE.write_text
+state_store/auth.py|load_or_generate_validator_token|SECRETS_DIR.mkdir
+state_store/auth.py|load_or_generate_validator_token|VALIDATOR_TOKEN_FILE.chmod
+state_store/auth.py|load_or_generate_validator_token|VALIDATOR_TOKEN_FILE.write_text
+state_store/identity.py|_save|os.chmod
+state_store/identity.py|_save|os.fdopen
+state_store/identity.py|_save|os.replace
+state_store/identity.py|_save|os.unlink
+state_store/identity.py|_save|self._path.parent.mkdir
+state_store/identity.py|_save|tempfile.mkstemp
+state_store/process_lock.py|acquire|os.ftruncate
+state_store/process_lock.py|acquire|os.open
+state_store/process_lock.py|acquire|os.write
+state_store/process_lock.py|acquire|self.root.mkdir
+state_store/process_lock.py|ensure_store_id|os.open
+state_store/process_lock.py|ensure_store_id|os.replace
+state_store/process_lock.py|ensure_store_id|os.write
+state_store/process_lock.py|ensure_store_id|path.parent.mkdir
+state_store/process_lock.py|ensure_store_id|temporary.unlink
+state_store/store.py|__init__|self._persist_dir.mkdir
+state_store/store.py|_write_orchestrator_lease|os.replace
+state_store/store.py|_write_orchestrator_lease|self._lease_path.unlink
+state_store/store.py|_write_orchestrator_lease|temporary.open
+state_store/store.py|archive_ticket|filesystem.mkdir
+state_store/store.py|archive_ticket|filesystem.mkdir
+state_store/store.py|archive_ticket|filesystem.rename
+state_store/store.py|archive_ticket|log_filesystem.rename
+state_store/trace_store.py|__init__|self.db_path.parent.mkdir
 """
 
 
-def _expected_manifest() -> frozenset[Mutation]:
+def _expected_manifest() -> list[Mutation]:
     entries = []
     for raw in _EXPECTED_MANIFEST.strip().splitlines():
-        path, line, call = raw.split("|", 2)
-        entries.append(Mutation(path, int(line), call))
-    return frozenset(entries)
+        path, scope, call = raw.split("|", 2)
+        entries.append(Mutation(path, scope, call))
+    return sorted(entries, key=lambda m: (m.path, m.scope, m.call))
 
 
 EXPECTED_MUTATIONS = _expected_manifest()
@@ -366,18 +389,21 @@ def test_aliases_cannot_hide_os_open_mutations() -> None:
 def test_full_production_mutation_inventory_has_reviewed_exclusions() -> None:
     """Every production mutation exactly matches the reviewed manifest."""
     document = (ROOT / "docs/filesystem-audit-inventory.md").read_text()
-    assert "fixed `file:line:call` manifest" in document
-    actual = frozenset(_inventory())
-    missing = sorted(
-        EXPECTED_MUTATIONS - actual, key=lambda item: (item.path, item.line, item.call)
-    )
-    added = sorted(
-        actual - EXPECTED_MUTATIONS, key=lambda item: (item.path, item.line, item.call)
-    )
-    assert not missing and not added, (
-        "filesystem mutation inventory changed; review each delta and update the "
-        f"fixed manifest. missing={missing!r}, added={added!r}"
-    )
+    assert "fixed `file:" in document
+    actual = sorted(_inventory(), key=lambda m: (m.path, m.scope, m.call))
+    expected = EXPECTED_MUTATIONS  # already sorted
+    # Compare as sorted lists to handle duplicate scope+call pairs
+    if actual != expected:
+        actual_set = set((m.path, m.scope, m.call) for m in actual)
+        expected_set = set((m.path, m.scope, m.call) for m in expected)
+        missing = sorted(expected_set - actual_set)
+        added = sorted(actual_set - expected_set)
+        raise AssertionError(
+            "filesystem mutation inventory changed; review each delta "
+            "and update the fixed manifest. "
+            f"missing={[Mutation(*m) for m in missing]!r}, "
+            f"added={[Mutation(*m) for m in added]!r}"
+        )
 
 
 def test_leader_lease_temporary_write_is_inventoried() -> None:

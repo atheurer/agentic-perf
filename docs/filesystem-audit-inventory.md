@@ -4,7 +4,7 @@
 `orchestrator`, `providers`, and `state_store`, plus `paths.py`. It recognizes
 path mutation methods, write-mode `open`/`fdopen`/`tarfile.open`, write-creating
 `os.open` flags, descriptor writes/truncation/permission changes, OS and shutil
-mutators, and temporary-file constructors. Its fixed `file:line:call` manifest
+mutators, and temporary-file constructors. Its fixed `file:scope:call` manifest
 must exactly equal the discovered set, so additions, removals, and moved calls
 require review.
 
