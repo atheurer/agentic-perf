@@ -31,6 +31,9 @@ class ChartGenerationError(ValueError):
 class WorkspaceManager:
     """Manages per-ticket scratchpad workspace files and query operations."""
 
+    MAX_RESULT_BYTES = 16 * 1024
+    MIN_RESULT_BYTES = 4
+
     NAMESPACES = ("context", "runfiles", "results", "logs", "metadata", "scratch")
     FILE_KINDS = frozenset(
         {
@@ -478,6 +481,14 @@ class WorkspaceManager:
                 and not str(item.get("namespace", "")).startswith(namespace)
             ):
                 continue
+            size_bytes = None
+            workspace_ref = item.get("workspace_ref")
+            if workspace_ref:
+                try:
+                    self._check_visible(workspace_ref, include_alternates=False)
+                    size_bytes = self.resolve_path(workspace_ref).stat().st_size
+                except (OSError, WorkspaceSecurityError):
+                    pass
             documents.append(
                 {
                     "ref": ref,
@@ -485,6 +496,7 @@ class WorkspaceManager:
                     "uri": item.get("uri"),
                     "entrypoint": item.get("entrypoint", False),
                     "subject_areas": item.get("subject_areas", []),
+                    "size_bytes": size_bytes,
                 }
             )
         documents.sort(key=lambda item: item["ref"])
@@ -531,7 +543,8 @@ class WorkspaceManager:
         ref: str,
         *,
         include_alternates: bool = False,
-        max_bytes: int = 262144,
+        max_bytes: int = MAX_RESULT_BYTES,
+        offset_bytes: int = 0,
     ) -> dict[str, Any]:
         """Read an indexed logical document from the ticket workspace."""
         item = self._context_document(ref, include_alternates=include_alternates)
@@ -561,13 +574,15 @@ class WorkspaceManager:
         workspace_ref = item["workspace_ref"]
         path = self.resolve_path(workspace_ref)
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            page = self._slice_file(path, offset_bytes, max_bytes)
         except OSError as exc:
             return {"status": "error", "error": str(exc), "ref": ref}
-        encoded = content.encode("utf-8")
-        truncated = len(encoded) > max_bytes
-        if truncated:
-            content = encoded[:max_bytes].decode("utf-8", errors="replace")
+        if page is None:
+            return {
+                "status": "error",
+                "error": self._invalid_page_request(offset_bytes, max_bytes),
+                "ref": ref,
+            }
         return {
             "status": "ok",
             "ref": item.get("ref"),
@@ -576,9 +591,9 @@ class WorkspaceManager:
             "source": item.get("source"),
             "authority": item.get("authority"),
             "provenance": item.get("provenance", {}),
-            "content": content,
-            "size_bytes": len(encoded),
-            "truncated": truncated,
+            "content": page["content"],
+            "size_bytes": page["total_bytes"],
+            **page,
         }
 
     def search_documents(
@@ -608,9 +623,9 @@ class WorkspaceManager:
                 continue
             try:
                 self._check_visible(workspace_ref, include_alternates)
-                content = self.resolve_path(workspace_ref).read_text(
-                    encoding="utf-8", errors="replace"
-                )
+                path = self.resolve_path(workspace_ref)
+                size_bytes = path.stat().st_size
+                content = path.read_text(encoding="utf-8", errors="replace")
             except (OSError, WorkspaceSecurityError):
                 continue
             path_matched = bool(pattern.search(str(item.get("ref", ""))))
@@ -632,6 +647,7 @@ class WorkspaceManager:
                     "source": item.get("source"),
                     "authority": item.get("authority"),
                     "provenance": item.get("provenance", {}),
+                    "size_bytes": size_bytes,
                     "path_match": path_matched,
                     "matches": line_matches[:10],
                     "match_count": len(line_matches),
@@ -713,6 +729,7 @@ class WorkspaceManager:
         query: str,
         limit: int = 50,
         max_bytes: int = 16384,
+        offset_bytes: int = 0,
         include_alternates: bool = False,
     ) -> dict[str, Any]:
         """Execute a jq filter against a JSON file in the workspace.
@@ -721,8 +738,16 @@ class WorkspaceManager:
             file_ref: workspace:// file reference or relative path
             query: jq filter string (e.g. '.uperf_100 | keys')
             limit: maximum items if result is a list
-            max_bytes: maximum byte length of formatted result before truncating
+            max_bytes: maximum result bytes to return (capped at 16 KiB)
+            offset_bytes: byte offset in the same jq result for pagination
         """
+        if self._invalid_page_request(offset_bytes, max_bytes):
+            return {
+                "status": "error",
+                "error": self._invalid_page_request(offset_bytes, max_bytes),
+                "file_ref": file_ref,
+                "query": query,
+            }
         self._check_visible(file_ref, include_alternates)
         path = self.resolve_path(file_ref)
         if not path.is_file():
@@ -774,73 +799,126 @@ class WorkspaceManager:
                     "error": f"JSON parsing failed: {e}",
                 }
 
+        total_items = None
+        items_truncated = False
+        result_format = "json"
         try:
             parsed = json.loads(raw_out)
-            truncated = False
-            total_count = None
-
             if isinstance(parsed, list):
-                total_count = len(parsed)
+                total_items = len(parsed)
                 if len(parsed) > limit:
                     parsed = parsed[:limit]
-                    truncated = True
-
-            parsed, byte_truncated = self._bound_jq_result(parsed, max_bytes)
-            return {
-                "status": "ok",
-                "file_ref": file_ref,
-                "query": query,
-                "result": parsed,
-                "truncated": truncated or byte_truncated,
-                "total_items": total_count,
-            }
+                    items_truncated = True
+            result_text = (
+                parsed
+                if isinstance(parsed, str)
+                else json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            )
+            result_format = "text" if isinstance(parsed, str) else "json"
         except json.JSONDecodeError:
             # Could be stream of objects or scalar values
             lines = raw_out.splitlines()
-            truncated = len(lines) > limit
-            result, byte_truncated = self._bound_jq_result(
-                "\n".join(lines[:limit]), max_bytes
-            )
+            total_items = len(lines)
+            items_truncated = len(lines) > limit
+            result_text = "\n".join(lines[:limit])
+            result_format = "text"
+
+        page = self._slice_text(result_text.encode("utf-8"), offset_bytes, max_bytes)
+        if page is None:
             return {
-                "status": "ok",
+                "status": "error",
+                "error": self._invalid_page_request(offset_bytes, max_bytes),
                 "file_ref": file_ref,
                 "query": query,
-                "result": result,
-                "truncated": truncated or byte_truncated,
-                "total_items": len(lines),
             }
+        response: dict[str, Any] = {
+            "status": "ok",
+            "file_ref": file_ref,
+            "query": query,
+            "truncated": items_truncated or page["truncated"],
+            "items_truncated": items_truncated,
+            "total_items": total_items,
+            "total_bytes": page["total_bytes"],
+            "offset_bytes": page["offset_bytes"],
+            "bytes_returned": page["bytes_returned"],
+            "next_offset_bytes": page["next_offset_bytes"],
+        }
+        if page["truncated"] or offset_bytes > 0:
+            response["result_slice"] = page["content"]
+            response["result_format"] = result_format
+        else:
+            # Preserve the structured result for outputs that fit in one call.
+            response["result"] = parsed if result_format == "json" else result_text
+        return response
 
     @staticmethod
-    def _bound_jq_result(result: Any, max_bytes: int) -> tuple[Any, bool]:
-        """Return a JSON-serializable jq result within its byte budget."""
-        serialized = json.dumps(result)
-        original_size = len(serialized.encode("utf-8"))
-        if original_size <= max_bytes:
-            return result, False
+    def _invalid_page_request(offset_bytes: int, max_bytes: int) -> str | None:
+        if offset_bytes < 0:
+            return "offset_bytes must be non-negative"
+        if max_bytes < WorkspaceManager.MIN_RESULT_BYTES:
+            return f"max_bytes must be at least {WorkspaceManager.MIN_RESULT_BYTES}"
+        return None
 
-        if isinstance(result, list):
-            bounded: list[Any] = []
-            for item in result:
-                candidate = [*bounded, item]
-                if len(json.dumps(candidate).encode("utf-8")) > max_bytes:
-                    break
-                bounded.append(item)
-            if bounded:
-                return bounded, True
-
-        summary: dict[str, Any] = {
-            "_truncated": True,
-            "_original_size_bytes": original_size,
-            "_hint": (
-                "Result too large. Use a more specific jq filter to extract "
-                "only the fields you need."
-            ),
+    @classmethod
+    def _slice_text(
+        cls, encoded: bytes, offset_bytes: int, max_bytes: int
+    ) -> dict[str, Any] | None:
+        """Return a UTF-8-safe page with a strict maximum of 16 KiB."""
+        if cls._invalid_page_request(offset_bytes, max_bytes):
+            return None
+        budget = min(max_bytes, cls.MAX_RESULT_BYTES)
+        start = min(offset_bytes, len(encoded))
+        while start < len(encoded) and start > 0 and encoded[start] & 0xC0 == 0x80:
+            start += 1
+        end = min(start + budget, len(encoded))
+        while end > start and end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+            end -= 1
+        page = encoded[start:end]
+        next_offset = end if end < len(encoded) else None
+        return {
+            "content": page.decode("utf-8", errors="strict"),
+            "offset_bytes": start,
+            "bytes_returned": len(page),
+            "total_bytes": len(encoded),
+            "next_offset_bytes": next_offset,
+            "truncated": next_offset is not None,
         }
-        # A caller can request a budget smaller than the explanatory summary.
-        # Preserve the byte limit even then, rather than returning an oversized hint.
-        if len(json.dumps(summary).encode("utf-8")) <= max_bytes:
-            return summary, True
-        return None, True
+
+    @classmethod
+    def _slice_file(
+        cls, path: Path, offset_bytes: int, max_bytes: int
+    ) -> dict[str, Any] | None:
+        """Read one bounded UTF-8-safe page from a workspace file."""
+        if cls._invalid_page_request(offset_bytes, max_bytes):
+            return None
+        total_bytes = path.stat().st_size
+        start = min(offset_bytes, total_bytes)
+        budget = min(max_bytes, cls.MAX_RESULT_BYTES)
+        with path.open("rb") as stream:
+            stream.seek(start)
+            if start > 0:
+                # An arbitrary caller offset may land in a UTF-8 continuation
+                # byte. Advance to the next codepoint boundary.
+                while start < total_bytes:
+                    current = stream.read(1)
+                    if not current or current[0] & 0xC0 != 0x80:
+                        break
+                    start += 1
+            stream.seek(start)
+            data = stream.read(budget + 4)
+        end = min(budget, len(data))
+        while end > 0 and end < len(data) and data[end] & 0xC0 == 0x80:
+            end -= 1
+        page = data[:end]
+        next_offset = start + len(page)
+        return {
+            "content": page.decode("utf-8", errors="replace"),
+            "offset_bytes": start,
+            "bytes_returned": len(page),
+            "total_bytes": total_bytes,
+            "next_offset_bytes": next_offset if next_offset < total_bytes else None,
+            "truncated": next_offset < total_bytes,
+        }
 
     # Maximum characters per matched line in grep output.
     # Prevents single-line JSON files from returning the
@@ -939,11 +1017,20 @@ class WorkspaceManager:
         file_ref: str,
         offset_bytes: int = 0,
         max_bytes: int = 4096,
-        start_line: int = 1,
+        start_line: int | None = 1,
         max_lines: int | None = None,
         include_alternates: bool = False,
     ) -> dict[str, Any]:
         """Read a slice of a workspace file by byte offset or line range."""
+        invalid_page_request = self._invalid_page_request(offset_bytes, max_bytes)
+        if invalid_page_request:
+            return {"status": "error", "error": invalid_page_request}
+        requested_ref = file_ref
+        context_item = self._context_document(
+            file_ref, include_alternates=include_alternates
+        )
+        if context_item and context_item.get("workspace_ref"):
+            file_ref = str(context_item["workspace_ref"])
         self._check_visible(file_ref, include_alternates)
         path = self.resolve_path(file_ref)
         if not path.is_file():
@@ -959,37 +1046,60 @@ class WorkspaceManager:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             total_lines = len(lines)
+            start_line = start_line or 1
             start_idx = max(0, start_line - 1)
             end_idx = min(total_lines, start_idx + max_lines)
             slice_lines = lines[start_idx:end_idx]
-            content = "".join(slice_lines)
+            raw_content = "".join(slice_lines).encode("utf-8")
+            prefix_bytes = sum(len(line.encode("utf-8")) for line in lines[:start_idx])
+            relative_offset = max(0, offset_bytes - prefix_bytes)
+            page = self._slice_text(raw_content, relative_offset, max_bytes)
+            if page is None:
+                return {
+                    "status": "error",
+                    "error": self._invalid_page_request(offset_bytes, max_bytes),
+                }
+            next_start_line = end_idx + 1 if end_idx < total_lines else None
+            next_offset = (
+                prefix_bytes + page["next_offset_bytes"]
+                if page["next_offset_bytes"] is not None
+                else None
+            )
             return {
                 "status": "ok",
-                "file_ref": file_ref,
-                "content": content,
+                "file_ref": requested_ref,
+                "content": page["content"],
                 "start_line": start_line,
-                "lines_returned": len(slice_lines),
+                "lines_returned": page["content"].count("\n")
+                + (1 if page["content"] and not page["content"].endswith("\n") else 0),
                 "total_lines": total_lines,
-                "eof": end_idx >= total_lines,
-                "next_start_line": end_idx + 1 if end_idx < total_lines else None,
+                "eof": end_idx >= total_lines and not page["truncated"],
+                "next_start_line": next_start_line if not page["truncated"] else None,
+                "offset_bytes": prefix_bytes + page["offset_bytes"],
+                "bytes_returned": page["bytes_returned"],
+                "total_bytes": total_bytes,
+                "next_offset_bytes": next_offset,
             }
 
         # Byte-oriented reading
-        with open(path, "rb") as f:
-            f.seek(offset_bytes)
-            data = f.read(max_bytes)
-
-        text = data.decode("utf-8", errors="replace")
-        next_offset = offset_bytes + len(data)
+        try:
+            page = self._slice_file(path, offset_bytes, max_bytes)
+        except OSError as exc:
+            return {"status": "error", "error": f"Failed reading file: {exc}"}
+        if page is None:
+            return {
+                "status": "error",
+                "error": self._invalid_page_request(offset_bytes, max_bytes),
+            }
         return {
             "status": "ok",
-            "file_ref": file_ref,
-            "content": text,
-            "offset_bytes": offset_bytes,
-            "bytes_returned": len(data),
+            "file_ref": requested_ref,
+            "content": page["content"],
+            "offset_bytes": page["offset_bytes"],
+            "bytes_returned": page["bytes_returned"],
             "total_bytes": total_bytes,
-            "eof": next_offset >= total_bytes,
-            "next_offset_bytes": next_offset if next_offset < total_bytes else None,
+            "eof": not page["truncated"],
+            "next_offset_bytes": page["next_offset_bytes"],
         }
 
     @staticmethod
