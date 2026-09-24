@@ -24,8 +24,9 @@ def test_known_model_pricing():
     assert abs(c - 0.0105) < 0.0001
 
     c_sonnet5 = estimate_cost("claude-sonnet-5", 1000, 500)
-    # 1000 * 2.0/1M + 500 * 10.0/1M = 0.002 + 0.005 = 0.007
-    assert abs(c_sonnet5 - 0.007) < 0.0001
+    # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075 = 0.0105
+    # (standard pricing post Aug 31 2026)
+    assert abs(c_sonnet5 - 0.0105) < 0.0001
 
     c_opus5 = estimate_cost("claude-opus-5", 1000, 500)
     # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
