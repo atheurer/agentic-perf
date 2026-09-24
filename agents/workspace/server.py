@@ -49,6 +49,8 @@ async def jq_file_from_workspace(
     file_ref: str,
     filter: str,
     limit: int = 50,
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
     include_alternates: bool = False,
 ) -> str:
     """Execute a jq filter expression on a structured JSON workspace file.
@@ -57,10 +59,17 @@ async def jq_file_from_workspace(
         file_ref: workspace:// URI or relative filename (e.g. 'workspace://cdm_ts.json')
         filter: jq expression (e.g. '.uperf_100.values' or '.[] | {name, status}')
         limit: max list items to return in result (default 50)
+        max_bytes: maximum result bytes to return (default and hard maximum 16384)
+        offset_bytes: byte offset in the same query result for pagination
     """
     manager = _get_manager()
     res = manager.jq_query(
-        file_ref, filter, limit=limit, include_alternates=include_alternates
+        file_ref,
+        filter,
+        limit=limit,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+        include_alternates=include_alternates,
     )
     return json.dumps(res, indent=2)
 
@@ -100,18 +109,17 @@ async def read_file_from_workspace(
     file_ref: str,
     offset_bytes: int = 0,
     max_bytes: int = 4096,
-    start_line: int = 1,
-    max_lines: int = 50,
+    start_line: int | None = None,
+    max_lines: int | None = None,
     include_alternates: bool = False,
 ) -> str:
     """Read a slice/chunk of a workspace file by lines or bytes.
 
-    Args:
-        file_ref: workspace:// URI or relative filename
-        offset_bytes: byte offset to start reading from
-        max_bytes: maximum bytes to read
-        start_line: 1-indexed starting line number
-        max_lines: number of lines to read (if set, uses line slicing instead of byte slicing)
+    ``file_ref`` may also be a logical ref from the context inventory. Byte
+    reads are capped at 16 KiB and return ``next_offset_bytes`` for continuation.
+    With ``max_lines``, continue the same line range by byte offset until that
+    offset is null, then use ``next_start_line`` with ``offset_bytes=0`` (or
+    omit the offset) for the following range.
     """
     manager = _get_manager()
     res = manager.read_file_slice(
@@ -137,17 +145,23 @@ async def list_files_from_workspace() -> str:
 async def read_document_from_workspace(
     ref: str,
     include_alternates: bool = False,
-    max_bytes: int = 262144,
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Read an exact context document previously inventoried into the workspace.
 
     Pass a logical ref or URI returned by the context gateway. The effective
     phase source is used by default; alternate sources require explicit opt-in.
+    The returned content is capped at 16 KiB and returns ``next_offset_bytes``
+    when more document bytes remain.
     """
     manager = _get_manager()
     return json.dumps(
         manager.read_document(
-            ref, include_alternates=include_alternates, max_bytes=max_bytes
+            ref,
+            include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         ),
         indent=2,
     )

@@ -428,6 +428,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/workspace/manager.py", "grep_file", "filesystem"),
     ("providers/workspace/manager.py", "load_source_snapshot", "filesystem"),
     ("providers/workspace/manager.py", "read_file_slice", "filesystem"),
+    ("providers/workspace/manager.py", "_slice_file", "filesystem"),
     ("providers/workspace/manager.py", "save_source_snapshot", "filesystem"),
     ("state_store/api/approvals.py", "consume_approval", "mutating_http_state"),
     ("state_store/api/approvals.py", "create_approval", "mutating_http_state"),
@@ -2711,6 +2712,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/workspace/manager.py:read_file_slice",
+        "2027-12-31",
+    ),
+    ("providers/workspace/manager.py", "_slice_file", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/workspace/manager.py:_slice_file",
         "2027-12-31",
     ),
     ("providers/workspace/manager.py", "save_source_snapshot", "filesystem"): (
