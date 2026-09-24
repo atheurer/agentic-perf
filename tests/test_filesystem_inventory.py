@@ -189,20 +189,20 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3770|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3815|staging.unlink
-agents/benchmark/server.py|3817|unlink
-agents/benchmark/server.py|4095|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|4200|staging.unlink
-agents/benchmark/server.py|4202|unlink
-agents/benchmark/server.py|4532|open
-agents/benchmark/server.py|4714|diag_file.write_text
-agents/benchmark/server.py|4745|artifact_filesystem.unlink
-agents/benchmark/server.py|4747|serial_log_path.unlink
-agents/benchmark/server.py|4778|metadata_file.write_bytes
-agents/benchmark/server.py|4785|metadata_file.write_text
-agents/benchmark/server.py|4791|metadata_file.write_text
-agents/benchmark/server.py|4846|merged_file.write_bytes
+agents/benchmark/server.py|3777|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3822|staging.unlink
+agents/benchmark/server.py|3824|unlink
+agents/benchmark/server.py|4102|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|4207|staging.unlink
+agents/benchmark/server.py|4209|unlink
+agents/benchmark/server.py|4539|open
+agents/benchmark/server.py|4721|diag_file.write_text
+agents/benchmark/server.py|4752|artifact_filesystem.unlink
+agents/benchmark/server.py|4754|serial_log_path.unlink
+agents/benchmark/server.py|4785|metadata_file.write_bytes
+agents/benchmark/server.py|4792|metadata_file.write_text
+agents/benchmark/server.py|4798|metadata_file.write_text
+agents/benchmark/server.py|4853|merged_file.write_bytes
 agents/infra/server.py|210|tempfile.NamedTemporaryFile
 agents/infra/server.py|218|staging.unlink
 agents/infra/server.py|220|unlink
@@ -301,7 +301,7 @@ providers/tracing/spool.py|225|self.lock_path.unlink
 providers/tracing/spool.py|234|os.replace
 providers/tracing/spool.py|235|self.path.touch
 providers/tracing/spool.py|236|self.ack_path.unlink
-providers/workspace/manager.py|78|self._filesystem.mkdir
+providers/workspace/manager.py|81|self._filesystem.mkdir
 state_store/api/artifacts.py|136|filesystem.unlink
 state_store/audit.py|42|self._path.parent.mkdir
 state_store/auth.py|66|SECRETS_DIR.mkdir

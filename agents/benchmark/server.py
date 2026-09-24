@@ -1459,14 +1459,15 @@ async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Use generic context primitives for the designated Crucible controller.
 
     ``bootstrap`` returns the controller's entrypoint document. ``read`` reads
-    the caller-selected controller-relative path. ``search`` searches controller
-    path names and file contents, returning grouped candidates; the caller then
-    selects files to read. Source selection, phase policy, and provenance are
-    server-managed.
+    a caller-selected path with bounded byte paging. ``search`` searches
+    controller paths and file contents, returning grouped candidates and sizes.
+    Source selection, phase policy, and provenance are server-managed.
     """
     await _ensure_init()
     if operation not in {"bootstrap", "read", "search"}:
@@ -1498,6 +1499,8 @@ async def _get_crucible_benchmark_context_tool(
         query=query,
         benchmark="",
         include_alternates=False,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
     )
 
 
@@ -1510,6 +1513,8 @@ async def _legacy_get_crucible_benchmark_context(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
@@ -1529,6 +1534,8 @@ async def _legacy_get_crucible_benchmark_context(
             path=path,
             query=query,
             include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         )
     if operation == "context" and _ssh is not None and _controller_host():
         return json.dumps(
