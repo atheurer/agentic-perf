@@ -96,6 +96,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/provisioning/server.py", "_configure_flow_steering_one", "ssh"),
     ("agents/provisioning/server.py", "_discover_crucible_token_files", "ssh"),
     ("agents/provisioning/server.py", "_discover_irqs", "ssh"),
+    ("agents/provisioning/server.py", "_read_flow_steering_rules_one", "ssh"),
     ("agents/provisioning/server.py", "_ensure_prerequisites_one", "filesystem"),
     ("agents/provisioning/server.py", "_ensure_prerequisites_one", "ssh"),
     ("agents/provisioning/server.py", "_install_harness_one", "ssh"),
@@ -1026,6 +1027,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/provisioning/server.py:_configure_flow_steering_one",
+        "2027-12-31",
+    ),
+    ("agents/provisioning/server.py", "_read_flow_steering_rules_one", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/provisioning/server.py:_read_flow_steering_rules_one",
         "2027-12-31",
     ),
     ("agents/provisioning/server.py", "_discover_crucible_token_files", "ssh"): (
