@@ -40,7 +40,10 @@ iteratively. Pass controller-relative paths exactly as documented to
 gateway to interpret Crucible repository metadata or invent a namespace. Use
 `operation="search"` with a literal or regex `query` to discover candidate
 controller-relative paths when AGENTS.md does not identify the needed file;
-search returns paths/snippets, so read selected files separately.
+search returns paths/snippets, so read selected files separately. Search queries
+are interpreted as regular expressions; whitespace is literal, not an AND/OR
+separator. For independent alternatives, use `|`, such as
+`ethtool|multiplex\\.json|flow steering`.
 Never construct or pass a `workspace://` path and never select a source
 explicitly. Cover the required subjects: run-file format, endpoints, execution,
 engines, tools, benchmark semantics, and result handling. If a documented path
