@@ -266,6 +266,30 @@ class TestRefusalAndValidation:
         assert result["status"] == "rejected"
         assert result["reason_code"] == "strategy_unsupported"
 
+    @pytest.mark.asyncio
+    async def test_duplicate_hosts_deduped(self, handlers, fleet_ssh):
+        await handlers["reboot_hosts_and_verify"](
+            hosts=["10.0.0.1", "10.0.0.1"],
+            expected_kernel=KERNEL_B,
+            approval_request_id="test",
+            reconnect_timeout_seconds=300,
+            poll_interval_seconds=1,
+        )
+        reboot_calls = [
+            c for c in fleet_ssh.calls if "systemctl reboot" in c["command"]
+        ]
+        assert len(reboot_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_refused_not_verified(self, handlers):
+        result = await handlers["reboot_hosts_and_verify"](
+            hosts=["10.0.0.100"],
+            expected_kernel=KERNEL_B,
+            approval_request_id="test",
+        )
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "all_hosts_refused"
+
 
 class TestVerifyKernelState:
     @pytest.mark.asyncio

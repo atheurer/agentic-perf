@@ -64,6 +64,10 @@ def parse_environment(stdout: str) -> dict[str, Any]:
 
     kernel = sections.get("uname", "").strip()
     arch = sections.get("arch", "").strip()
+    if not kernel:
+        raise ValueError(
+            f"ENV output missing kernel release (sections: {sorted(sections.keys())})"
+        )
     cmdline = sections.get("cmdline", "").strip()
 
     os_id = ""
@@ -172,7 +176,8 @@ _CMDLINE_STRIP = re.compile(
 
 def _stable_cmdline(cmdline: str) -> str:
     """Remove boot-specific tokens from the kernel cmdline."""
-    return _CMDLINE_STRIP.sub("", cmdline).strip()
+    stripped = _CMDLINE_STRIP.sub("", cmdline)
+    return " ".join(stripped.split())
 
 
 def environment_fingerprint(snapshot: dict[str, Any]) -> str:

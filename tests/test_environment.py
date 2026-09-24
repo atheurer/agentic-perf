@@ -64,12 +64,18 @@ class TestParseEnvironment:
         assert env["nics"][0]["speed"] == "100000"
         assert env["nics"][0]["mtu"] == "9000"
 
-    def test_partial_output(self):
+    def test_partial_output_with_kernel(self):
         partial = "@@uname\n5.14.0-503.14.1.el9_5.x86_64\n@@arch\nx86_64\n"
         env = parse_environment(partial)
         assert env["kernel_release"] == "5.14.0-503.14.1.el9_5.x86_64"
         assert env["tuned_profile"] == ""
         assert env["nics"] == []
+
+    def test_empty_output_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="missing kernel"):
+            parse_environment("")
 
     def test_missing_tuned(self):
         no_tuned = ENV_FIXTURE.replace(

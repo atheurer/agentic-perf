@@ -89,8 +89,12 @@ def refuse_protected_targets(
     controller = ticket_controller_host(ticket)
     allowed: list[str] = []
     refused: dict[str, dict[str, str]] = {}
+    seen: set[str] = set()
 
     for host in hosts:
+        if host in seen:
+            continue
+        seen.add(host)
         if is_self_host(host):
             refused[host] = {
                 "state": "refused",

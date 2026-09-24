@@ -70,6 +70,16 @@ class TestWelch:
         assert w["p"] < 0.001
         assert w["t"] < 0
 
+    def test_zero_variance_different_means(self):
+        w = welch([1.0, 1.0], [2.0, 2.0])
+        assert w["p"] == 0.0
+        assert math.isinf(w["t"])
+
+    def test_zero_variance_same_means(self):
+        w = welch([5.0, 5.0], [5.0, 5.0])
+        assert w["t"] == 0.0
+        assert w["p"] == 1.0
+
     def test_insufficient_samples(self):
         w = welch([1.0], [2.0, 3.0])
         assert math.isnan(w["t"])

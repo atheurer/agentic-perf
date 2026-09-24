@@ -3338,6 +3338,15 @@ async def reboot_hosts_and_verify(
     spec = KernelSpec.parse(expected_kernel)
     allowed, refused = refuse_protected_targets(hosts, ticket)
 
+    if not allowed and refused:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "all_hosts_refused",
+                "hosts": refused,
+            }
+        )
+
     results: dict[str, dict[str, Any]] = {}
     for host, info in refused.items():
         results[host] = info
@@ -3362,7 +3371,53 @@ async def reboot_hosts_and_verify(
                     }
             break
 
+    if not allowed:
+        all_verified = False
+
     overall = "verified" if all_verified else "partial_failure"
+
+    from agents.provisioning.kernel import current_kernel_step
+
+    ks = current_kernel_step(ticket)
+    if ks is not None:
+        step_id = str(ks[0])
+        transition_record = {
+            "kernel": spec.release,
+            "requested_hosts": allowed,
+            "strategy": strategy,
+            "state": overall,
+            "hosts": {
+                h: {
+                    "state": r.get("state", ""),
+                    "observed_kernel": r.get("observed_kernel", ""),
+                    "rebooted": r.get("rebooted", False),
+                }
+                for h, r in results.items()
+                if h in allowed
+            },
+        }
+        import os as _os
+
+        from agents.server_utils import ticket_state_headers
+        from providers.execution import (
+            AuditedAsyncHTTPClient as _AuditedClient,
+        )
+
+        async with _AuditedClient(
+            timeout=10.0, headers=ticket_state_headers()
+        ) as client:
+            store_url = _os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            ticket_id = ticket.get("id", "")
+            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+            if r.status_code == 200:
+                current_cf = r.json().get("custom_fields", {})
+                transitions = dict(current_cf.get("kernel_transitions", {}))
+                transitions[step_id] = transition_record
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"kernel_transitions": transitions}},
+                )
+
     return json.dumps(
         {
             "status": overall,

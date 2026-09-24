@@ -146,7 +146,13 @@ def welch(a: list[float], b: list[float]) -> dict[str, float]:
     se2_b = var_b / nb
     denom = se2_a + se2_b
     if denom == 0:
-        return {"t": 0.0, "df": float("inf"), "p": 1.0}
+        if mean_a == mean_b:
+            return {"t": 0.0, "df": float(na + nb - 2), "p": 1.0}
+        return {
+            "t": float("inf") if mean_a > mean_b else float("-inf"),
+            "df": float(na + nb - 2),
+            "p": 0.0,
+        }
 
     t_stat = (mean_a - mean_b) / math.sqrt(denom)
     df = denom**2 / (se2_a**2 / (na - 1) + se2_b**2 / (nb - 1))
