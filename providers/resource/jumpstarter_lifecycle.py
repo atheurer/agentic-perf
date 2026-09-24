@@ -343,6 +343,27 @@ async def resolve_images(
             img_cfg.get("image_version", ""),
         )
 
+        # Normalize image directives — the chat agent or triage
+        # may conflate fields (e.g., image_version="AutoSD-10-nightly"
+        # instead of image_version="AutoSD-10" + release="nightly").
+        # Strip known release suffixes from image_version (#992).
+        _RELEASE_SUFFIXES = ("-nightly", "-monthly")
+        for suffix in _RELEASE_SUFFIXES:
+            if image_version.lower().endswith(suffix):
+                extracted_release = suffix.lstrip("-")
+                image_version = image_version[: -len(suffix)]
+                if not directives.get("release"):
+                    directives = dict(directives)
+                    directives["release"] = extracted_release
+                logger.info(
+                    "[jumpstarter-images] Normalized image_version "
+                    "for %s: stripped '%s' suffix, release=%s",
+                    ticket_id,
+                    suffix,
+                    extracted_release,
+                )
+                break
+
         base_url = directives.get("image_server", "")
         if not base_url:
             base_url = _derive_image_server(
@@ -388,6 +409,30 @@ async def resolve_images(
 
         image_name = directives.get("image_name", default_name)
         image_type = directives.get("image_type", default_type)
+
+        # Validate image_name and image_type against known values.
+        # The chat agent may put version/release info into these
+        # fields by mistake (#992).
+        _KNOWN_IMAGE_NAMES = {"ps", "qa"}
+        _KNOWN_IMAGE_TYPES = {"regular", "ostree"}
+        if image_name and image_name not in _KNOWN_IMAGE_NAMES:
+            logger.warning(
+                "[jumpstarter-images] Unrecognized image_name '%s' "
+                "for %s — falling back to '%s'",
+                image_name,
+                ticket_id,
+                default_name,
+            )
+            image_name = default_name
+        if image_type and image_type not in _KNOWN_IMAGE_TYPES:
+            logger.warning(
+                "[jumpstarter-images] Unrecognized image_type '%s' "
+                "for %s — falling back to '%s'",
+                image_type,
+                ticket_id,
+                default_type,
+            )
+            image_type = default_type
 
         if not image_version:
             logger.info(
