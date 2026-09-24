@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from providers.fleet import (
     build_tested_host_entry,
     get_fleet_progress,
@@ -199,3 +201,77 @@ class TestStateMachineFleetTransitions:
 
         allowed = VALID_TRANSITIONS[TicketStatus.COORDINATING_FLEET]
         assert TicketStatus.AWAITING_CUSTOMER_GUIDANCE in allowed
+
+
+class TestResourceAgentFleetExhaustion:
+    """Resource agent routes to fleet coordinator on exhaustion (#994)."""
+
+    async def test_request_human_input_catches_fleet_exhaustion(self):
+        """_request_human_input triggers fleet exhaustion check."""
+        from unittest.mock import AsyncMock
+
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent.agent_name = "resource-agent"
+        agent._ticket_id = "PERF-FLEET"
+        agent._mode = "acquire"
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "PERF-FLEET",
+                "custom_fields": {
+                    "fleet_investigation": {
+                        "enabled": True,
+                        "tested_hosts": [
+                            {"host_id": "board-01"},
+                        ],
+                    },
+                },
+            }
+        )
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+
+        from agents.base import HITLDriftError
+
+        with pytest.raises(HITLDriftError, match="Fleet"):
+            await agent._request_human_input(
+                "PERF-FLEET",
+                "All boards excluded",
+            )
+
+        agent._transition_ticket.assert_called_once()
+        call_args = agent._transition_ticket.call_args
+        assert call_args.args[1] == "coordinating_fleet"
+
+    async def test_non_fleet_falls_through(self):
+        """Non-fleet tickets use normal HITL path."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.base import AgentBase
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent.agent_name = "resource-agent"
+        agent._ticket_id = "PERF-NORMAL"
+        agent._mode = "acquire"
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "PERF-NORMAL",
+                "custom_fields": {},
+            }
+        )
+
+        # Patch the grandparent _request_human_input
+        with patch.object(
+            AgentBase,
+            "_request_human_input",
+            new_callable=AsyncMock,
+            return_value="user reply",
+        ) as mock_hitl:
+            result = await agent._request_human_input(
+                "PERF-NORMAL",
+                "Need help",
+            )
+            assert result == "user reply"
+            mock_hitl.assert_called_once()

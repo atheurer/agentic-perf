@@ -162,30 +162,47 @@ class ResourceAgent(AgentBase):
             event_bus=event_bus,
         )
 
+    async def _check_fleet_exhaustion(self, context: str = "") -> bool:
+        """Route to fleet coordinator if all boards are tested.
+
+        Returns True (and raises HITLDriftError) if fleet exhaustion
+        was detected, False otherwise.  Called from both
+        _do_request_clarification and _request_human_input so the
+        detection is deterministic regardless of which path the
+        LLM takes (#994).
+        """
+        if not self._ticket_id:
+            return False
+        from providers.fleet import is_fleet_investigation
+
+        ticket = await self._get_ticket(self._ticket_id)
+        cf = ticket.get("custom_fields", {})
+        if not is_fleet_investigation(cf):
+            return False
+
+        await self._add_comment(
+            self._ticket_id,
+            f"**Fleet: no more boards available**\n\n{context[:500]}",
+        )
+        await self._transition_ticket(
+            self._ticket_id,
+            "coordinating_fleet",
+            comment="Fleet: no resources available, coordinating exhaustion",
+        )
+        from agents.base import HITLDriftError
+
+        raise HITLDriftError("Fleet: routed to coordinator")
+
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:
-            # Fleet investigation: if the resource agent
-            # can't find boards, route to coordinator to
-            # set fleet_exhausted. Don't ask the user.
-            from providers.fleet import is_fleet_investigation
-
-            ticket = await self._get_ticket(self._ticket_id)
-            cf = ticket.get("custom_fields", {})
-            if is_fleet_investigation(cf):
-                await self._add_comment(
-                    self._ticket_id,
-                    f"**Fleet: no more boards available**\n\n{question[:500]}",
-                )
-                await self._transition_ticket(
-                    self._ticket_id,
-                    "coordinating_fleet",
-                    comment=("Fleet: no resources available, coordinating exhaustion"),
-                )
-                from agents.base import HITLDriftError
-
-                raise HITLDriftError("Fleet: routed to coordinator")
+            await self._check_fleet_exhaustion(question)
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _request_human_input(self, ticket_id: str, question: str) -> str:
+        """Override base to catch fleet exhaustion on unstructured ends."""
+        await self._check_fleet_exhaustion(question)
+        return await super()._request_human_input(ticket_id, question)
 
     async def run(self, ticket_id: str) -> None:
         if self._mode == "teardown":

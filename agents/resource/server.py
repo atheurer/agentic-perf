@@ -299,6 +299,23 @@ async def check_available_resources(
     if not result.get("available") and result.get("selector", "").startswith("name="):
         await _auto_escalate_named_device(result)
 
+    # Fleet: deterministic exhaustion detection.
+    # When all matching devices are excluded (i.e., already tested),
+    # route to the fleet coordinator instead of letting the LLM
+    # decide — the LLM may skip request_clarification and go
+    # straight to HITL, bypassing fleet exhaustion handling (#994).
+    if is_fleet_investigation(fresh_cf) and result.get("all_excluded"):
+        ticket_id = _ticket.get("id", "")
+        logger.info(
+            "[resource] Fleet exhaustion detected for %s — all matching devices tested",
+            ticket_id,
+        )
+        result["fleet_exhausted"] = True
+        result["message"] = (
+            "All matching devices have been tested. "
+            "Fleet exhaustion detected — routing to coordinator."
+        )
+
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
     global _fleet_next_device
