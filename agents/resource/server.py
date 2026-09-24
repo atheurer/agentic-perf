@@ -268,9 +268,16 @@ async def check_available_resources(
             pass
     if is_fleet_investigation(fresh_cf):
         exclude = get_tested_host_ids(fresh_cf)
-        if exclude:
+        # Merge with user-provided exclusions from directives
+        # so user exclude_hosts survive across fleet iterations (#1021).
+        user_excludes = fresh_cf.get("directives", {}).get("exclude_hosts", [])
+        if isinstance(user_excludes, str):
+            user_excludes = [h.strip() for h in user_excludes.split(",") if h.strip()]
+        combined = list(set(exclude) | set(user_excludes))
+        if combined:
             requirements = dict(requirements or {})
-            requirements["exclude_hosts"] = exclude
+            requirements["exclude_hosts"] = combined
+            exclude = combined  # use merged list for per-host reqs too
 
     if required_hosts:
         recommendations = []
