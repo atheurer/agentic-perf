@@ -410,15 +410,17 @@ async def resolve_images(
         image_name = directives.get("image_name", default_name)
         image_type = directives.get("image_type", default_type)
 
-        # Validate image_name and image_type against known values.
-        # The chat agent may put version/release info into these
-        # fields by mistake (#992).
-        _KNOWN_IMAGE_NAMES = {"ps", "qa"}
+        # Detect version/release info mistakenly placed in
+        # image_name or image_type by the chat agent (#992).
+        # Only override when the value is clearly wrong (looks
+        # like a version string, not a variant name).  Valid
+        # variants are dynamic (ps, qa, developer-vm, etc.)
+        # so we cannot use a static allowlist.
         _KNOWN_IMAGE_TYPES = {"regular", "ostree"}
-        if image_name and image_name not in _KNOWN_IMAGE_NAMES:
+        if image_name and image_name.lower().startswith(("autosd", "rhivos", "centos")):
             logger.warning(
-                "[jumpstarter-images] Unrecognized image_name '%s' "
-                "for %s — falling back to '%s'",
+                "[jumpstarter-images] image_name '%s' looks like "
+                "a version string for %s — falling back to '%s'",
                 image_name,
                 ticket_id,
                 default_name,
