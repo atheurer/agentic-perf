@@ -268,12 +268,17 @@ async def check_available_resources(
             pass
     if is_fleet_investigation(fresh_cf):
         exclude = get_tested_host_ids(fresh_cf)
-        # Merge with user-provided exclusions from directives
-        # so user exclude_hosts survive across fleet iterations (#1021).
-        user_excludes = fresh_cf.get("directives", {}).get("exclude_hosts", [])
+        # Merge three exclusion sources so nothing is lost:
+        # 1. tested_hosts (fleet iteration tracking)
+        # 2. user-provided exclude_hosts from directives
+        # 3. LLM-provided exclude_hosts from tool arguments
+        user_excludes = fresh_cf.get("directives", {}).get("exclude_hosts") or []
         if isinstance(user_excludes, str):
             user_excludes = [h.strip() for h in user_excludes.split(",") if h.strip()]
-        combined = list(set(exclude) | set(user_excludes))
+        llm_excludes = (requirements or {}).get("exclude_hosts") or []
+        if isinstance(llm_excludes, str):
+            llm_excludes = [h.strip() for h in llm_excludes.split(",") if h.strip()]
+        combined = list(set(exclude) | set(user_excludes) | set(llm_excludes))
         if combined:
             requirements = dict(requirements or {})
             requirements["exclude_hosts"] = combined
@@ -284,7 +289,11 @@ async def check_available_resources(
         for host_req in required_hosts:
             if is_fleet_investigation(fresh_cf) and exclude:
                 host_req = dict(host_req)
-                host_req["exclude_hosts"] = exclude
+                # Merge with any LLM-provided per-host exclusions
+                existing = host_req.get("exclude_hosts") or []
+                if isinstance(existing, str):
+                    existing = [h.strip() for h in existing.split(",") if h.strip()]
+                host_req["exclude_hosts"] = list(set(exclude) | set(existing))
             result = await prov.check_available(host_req)
             rec = dict(host_req)
             if result.get("options"):
