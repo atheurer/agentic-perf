@@ -24,8 +24,9 @@ def test_known_model_pricing():
     assert abs(c - 0.0105) < 0.0001
 
     c_sonnet5 = estimate_cost("claude-sonnet-5", 1000, 500)
-    # 1000 * 2.0/1M + 500 * 10.0/1M = 0.002 + 0.005 = 0.007
-    assert abs(c_sonnet5 - 0.007) < 0.0001
+    # 1000 * 3.0/1M + 500 * 15.0/1M = 0.003 + 0.0075 = 0.0105
+    # (standard pricing post Aug 31 2026)
+    assert abs(c_sonnet5 - 0.0105) < 0.0001
 
     c_opus5 = estimate_cost("claude-opus-5", 1000, 500)
     # 1000 * 5.0/1M + 500 * 25.0/1M = 0.005 + 0.0125 = 0.0175
@@ -67,6 +68,31 @@ def test_openai_model():
     c_o3 = estimate_cost("o3", 1000, 500)
     # 1000 * 2.0/1M + 500 * 8.0/1M = 0.002 + 0.004 = 0.006
     assert abs(c_o3 - 0.006) < 0.0001
+
+
+def test_openai_gpt6_model_pricing():
+    """GPT-6 models use their standard input, cache, and output rates."""
+    expected = {
+        "gpt-6-astra": (0.035, 0.02805),
+        "gpt-6-sol": (0.007, 0.00561),
+        "gpt-6-luna": (0.00035, 0.0002805),
+    }
+
+    for model, (uncached_cost, cached_cost) in expected.items():
+        assert abs(estimate_cost(model, 1000, 500) - uncached_cost) < 1e-10
+        assert (
+            abs(
+                estimate_cost(
+                    model,
+                    1000,
+                    500,
+                    cache_read_input_tokens=800,
+                    cache_creation_input_tokens=100,
+                )
+                - cached_cost
+            )
+            < 1e-10
+        )
 
 
 def test_google_model():
