@@ -124,8 +124,10 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/agent.py", "<module>", "cloud_resource"),
     ("agents/resource/agent.py", "__init__", "cloud_resource"),
     ("agents/resource/agent.py", "_build_messages", "cloud_resource"),
+    ("agents/resource/agent.py", "_check_fleet_exhaustion", "cloud_resource"),
     ("agents/resource/agent.py", "_do_request_clarification", "cloud_resource"),
     ("agents/resource/agent.py", "_handle_completion", "cloud_resource"),
+    ("agents/resource/agent.py", "_request_human_input", "cloud_resource"),
     ("agents/resource/agent.py", "_handle_completion", "mcp"),
     ("agents/resource/agent.py", "_match_to_provider_ip", "cloud_resource"),
     ("agents/resource/agent.py", "_run_host_cleanup", "cloud_resource"),
@@ -1208,10 +1210,22 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/agent.py:_build_messages",
         "2027-12-31",
     ),
+    ("agents/resource/agent.py", "_check_fleet_exhaustion", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_check_fleet_exhaustion",
+        "2027-12-31",
+    ),
     ("agents/resource/agent.py", "_do_request_clarification", "cloud_resource"): (
         "audited",
         "observability-maintainers",
         "agents/resource/agent.py:_do_request_clarification",
+        "2027-12-31",
+    ),
+    ("agents/resource/agent.py", "_request_human_input", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_request_human_input",
         "2027-12-31",
     ),
     ("agents/resource/agent.py", "_handle_completion", "cloud_resource"): (
