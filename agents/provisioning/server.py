@@ -3442,6 +3442,54 @@ async def verify_kernel_state(
     return json.dumps(_summarize(results))
 
 
+async def _capture_environment_one(host: str) -> dict[str, Any]:
+    """Capture environment snapshot for a single host."""
+    from providers.environment import (
+        build_env_command,
+        environment_fingerprint,
+        parse_environment,
+    )
+
+    result = await _ssh.run(host, build_env_command(), timeout=30)
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "unavailable",
+            "error": result.stderr or result.stdout,
+        }
+    try:
+        snapshot = parse_environment(result.stdout)
+    except Exception as exc:
+        return {
+            "host": host,
+            "state": "unavailable",
+            "error": str(exc),
+        }
+    return {
+        "host": host,
+        "state": "ok",
+        "snapshot": snapshot,
+        "fingerprint": environment_fingerprint(snapshot),
+    }
+
+
+@mcp.tool()
+async def capture_environment_fingerprint(
+    hosts: list[str],
+) -> str:
+    """Capture environment fingerprints for multiple hosts. Returns per-host snapshots including kernel, arch, CPU topology, NUMA, tuned profile, THP, sysctls, and NIC configuration. The fingerprint is stable across reboots but changes when tuning or hardware changes."""
+    await _ensure_init()
+    coros = [_capture_environment_one(h) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, Any] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
     """Fetch private configuration for a benchmark harness. Returns organization-specific data like install method, repo paths, registry URLs, and constraints (supported OS, prerequisites). Use key='constraints' to check OS and platform requirements before attempting installation."""
