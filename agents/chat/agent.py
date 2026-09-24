@@ -147,10 +147,9 @@ class ChatSession:
         # Slice from the end, but ensure we don't orphan
         # tool_result blocks from their tool_use blocks.
         cut = self.messages[-_MAX_HISTORY:]
-        # If the first message is a user message containing
-        # tool_results, it references tool_use_ids from the
-        # assistant message we just dropped. Remove it.
-        while cut and self._is_tool_result(cut[0]):
+        # Start on a normal user turn: assistant-first histories and
+        # tool_results without their preceding tool_use are invalid.
+        while cut and (cut[0].get("role") != "user" or self._is_tool_result(cut[0])):
             cut = cut[1:]
         self.messages = cut
 
