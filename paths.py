@@ -131,8 +131,6 @@ def create_artifact_dir(
 
     Falls back to a temp directory if ticket_id is not set.
     """
-    import tempfile
-
     if ticket_id:
         artifact_dir = ARTIFACT_DIR / ticket_id / run_id
         # Import locally to avoid making paths.py depend on tracing at import time.
@@ -149,7 +147,13 @@ def create_artifact_dir(
             critical=True,
         ).mkdir(f"{ticket_id}/{run_id}")
         return artifact_dir
-    return Path(tempfile.mkdtemp(prefix=f"{run_id}-"))
+    import tempfile
+
+    from providers.execution import AuditedFilesystem
+
+    return AuditedFilesystem.system(Path(tempfile.gettempdir())).temporary_directory(
+        prefix=f"{run_id}-"
+    )
 
 
 def get_ticket_workspace_dir(
@@ -162,14 +166,28 @@ def get_ticket_workspace_dir(
 
     Falls back to a temp directory if ticket_id is not set.
     """
-    import tempfile
-
     if ticket_id:
         ws_dir = TICKET_DIR / ticket_id / "workspace"
         if create:
-            ws_dir.mkdir(parents=True, exist_ok=True)
+            from providers.execution import (
+                AuditedFilesystem,
+                RootedPath,
+                durable_filesystem_emitter,
+            )
+
+            AuditedFilesystem(
+                RootedPath(TICKET_DIR, "workspace"),
+                ticket_id=ticket_id,
+                emit=durable_filesystem_emitter(),
+                critical=True,
+            ).mkdir(f"{ticket_id}/workspace", mode=0o777)
         return ws_dir
-    temp_dir = Path(tempfile.gettempdir()) / "agentic-perf-workspace-scratch"
+    import tempfile
+
+    temp_root = Path(tempfile.gettempdir())
+    temp_dir = temp_root / "agentic-perf-workspace-scratch"
     if create:
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        AuditedFilesystem.system(temp_root).mkdir(temp_dir.name, mode=0o777)
     return temp_dir

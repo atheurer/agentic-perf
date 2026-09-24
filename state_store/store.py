@@ -96,7 +96,10 @@ class TicketStore:
         self._lock = threading.Lock()
         self._global_seq = 0
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
-        self._persist_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        self._system_filesystem = AuditedFilesystem.system(self._persist_dir)
+        self._system_filesystem.mkdir(".", mode=0o777)
         self._audit = audit_log
         self._event_bus = event_bus
         self._trace_store = trace_store
@@ -127,20 +130,13 @@ class TicketStore:
     def _write_orchestrator_lease(self, lease: OrchestratorLease | None) -> None:
         if lease is None:
             try:
-                self._lease_path.unlink()
+                self._system_filesystem.unlink(self._lease_path.name)
             except FileNotFoundError:
                 return
             self._fsync_lease_directory()
             return
-        temporary = self._lease_path.with_name(
-            f".{self._lease_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
         payload = json.dumps(lease.model_dump(mode="json"), sort_keys=True) + "\n"
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self._lease_path)
+        self._system_filesystem.write(self._lease_path.name, payload, mode=0o600)
         self._fsync_lease_directory()
 
     def _fsync_lease_directory(self) -> None:
