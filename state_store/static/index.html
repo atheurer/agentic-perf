@@ -3164,11 +3164,13 @@ async function refreshResultSection(ticketId) {
           if (s) openDetails[s.textContent.trim()] = d.open;
         }
       });
+      var expandedTexts = captureExpandedText(el);
       el.innerHTML = renderCustomFields(ticket);
       el.querySelectorAll('details').forEach(function(d) {
         var key = d.id || (d.querySelector('summary') || {}).textContent;
         if (key && openDetails[key.trim()] !== undefined) d.open = openDetails[key.trim()];
       });
+      restoreExpandedText(el, expandedTexts);
     }
     var hypo = document.getElementById('hypothesis-section');
     if (hypo) {
@@ -3180,11 +3182,13 @@ async function refreshResultSection(ticketId) {
           if (s) hypoOpen[s.textContent.trim()] = d.open;
         }
       });
+      var hypoExpanded = captureExpandedText(hypo);
       hypo.innerHTML = renderHypothesisCard(ticket);
       hypo.querySelectorAll('details').forEach(function(d) {
         var key = d.id || (d.querySelector('summary') || {}).textContent;
         if (key && hypoOpen[key.trim()] !== undefined) d.open = hypoOpen[key.trim()];
       });
+      restoreExpandedText(hypo, hypoExpanded);
     }
     // Also refresh introspection on transitions
     var cf = ticket.custom_fields || {};
@@ -3725,6 +3729,26 @@ function restoreOpenDetails(container, open) {
   });
 }
 
+function captureExpandedText(container) {
+  var expanded = new Set();
+  if (!container) return expanded;
+  container.querySelectorAll('.expandable-text.expanded').forEach(function(el) {
+    var trunc = el.querySelector('.expand-truncated');
+    if (trunc) expanded.add(trunc.textContent.trim().substring(0, 80));
+  });
+  return expanded;
+}
+
+function restoreExpandedText(container, expanded) {
+  if (!container || !expanded.size) return;
+  container.querySelectorAll('.expandable-text').forEach(function(el) {
+    var trunc = el.querySelector('.expand-truncated');
+    if (trunc && expanded.has(trunc.textContent.trim().substring(0, 80))) {
+      el.classList.add('expanded');
+    }
+  });
+}
+
 function renderEventGroup(group) {
   if (group.events.length === 1) return renderEvent(group.events[0]);
   var first = group.events[0];
@@ -3750,6 +3774,7 @@ function renderEventStream() {
   var container = document.getElementById('event-stream');
   if (!container) return;
   var open = captureOpenDetails(container);
+  var expandedTexts = captureExpandedText(container);
   var visible = eventRecords.filter(function(evt) {
     return eventMatchesView(evt) && eventMatchesSearch(evt);
   });
@@ -3765,6 +3790,7 @@ function renderEventStream() {
   });
   container.innerHTML = groups.map(renderEventGroup).join('');
   restoreOpenDetails(container, open);
+  restoreExpandedText(container, expandedTexts);
 
   renderedEventCount = visible.length;
   var countEl = document.getElementById('event-count');
