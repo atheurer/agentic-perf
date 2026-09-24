@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,59 @@ def test_atomic_replace_rename_and_unlink(filesystem) -> None:
         "unlink",
     ]
     assert events[3].attributes["atomic"] is True
+
+
+def test_final_symlink_entry_is_used_for_unlink_rename_and_atomic_replace(
+    filesystem,
+) -> None:
+    fs, _, root = filesystem
+    target = root / "target.txt"
+    target.write_text("original")
+    link = root / "link.txt"
+    link.symlink_to(target.name)
+
+    fs.unlink("link.txt")
+    assert not link.exists()
+    assert target.read_text() == "original"
+
+    link.symlink_to(target.name)
+    moved = fs.rename("link.txt", "moved-link.txt")
+    assert moved.is_symlink()
+    assert moved.readlink() == Path(target.name)
+    assert target.read_text() == "original"
+
+    fs.write("moved-link.txt", "replacement")
+    assert not moved.is_symlink()
+    assert moved.read_text() == "replacement"
+    assert target.read_text() == "original"
+
+
+def test_open_descriptor_nofollow_rejects_symlinks_and_keeps_root_containment(
+    filesystem,
+) -> None:
+    fs, _, root = filesystem
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        pytest.skip("O_NOFOLLOW is unavailable on this platform")
+    outside = root.parent / f"{root.name}-outside.txt"
+    outside.write_text("outside")
+    (root / "outside-link").symlink_to(outside)
+
+    with pytest.raises(OSError):
+        fs.open_descriptor("outside-link", os.O_RDONLY | nofollow)
+    with pytest.raises(ValueError, match="escapes its audited root"):
+        fs.open_descriptor("outside-link", os.O_RDONLY)
+
+
+def test_hardlink_rejects_out_of_root_symlink_sources(filesystem) -> None:
+    fs, _, root = filesystem
+    outside = root.parent / f"{root.name}-hardlink-outside.txt"
+    outside.write_text("outside")
+    (root / "outside-link").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="escapes its audited root"):
+        fs.hardlink("outside-link", "inside-link")
+    assert not (root / "inside-link").exists()
 
 
 def test_missing_target_and_audit_delivery_failure_are_not_success(filesystem) -> None:
@@ -153,6 +207,18 @@ def test_stream_is_requested_before_open_and_finalized_on_close(filesystem) -> N
     )
 
 
+def test_stream_sensitivity_includes_parent_path_components(filesystem) -> None:
+    fs, events, _ = filesystem
+    stream = fs.open_stream("secret-store/serial.log")
+    stream.write(b"sensitive stream data")
+    stream.close()
+
+    attributes = events[-1].attributes
+    assert attributes["sensitive"] is True
+    assert attributes["size_bytes"] == len(b"sensitive stream data")
+    assert "digest" not in attributes
+
+
 def test_archive_uses_only_logical_member_names(filesystem) -> None:
     fs, events, root = filesystem
     fs.write("logs/output.txt", "output")
@@ -162,6 +228,42 @@ def test_archive_uses_only_logical_member_names(filesystem) -> None:
     assert events[-1].attributes["size_bytes"] > 0
     assert len(events[-1].attributes["digest"]) == 64
     assert str(root) not in events[-1].model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("destination", "member"),
+    [
+        ("secret-bundle.tar.gz", "ordinary.txt"),
+        ("ordinary-bundle.tar.gz", "credentials/member.txt"),
+    ],
+)
+def test_archive_sensitivity_suppresses_digest_for_sensitive_paths(
+    filesystem, destination: str, member: str
+) -> None:
+    fs, events, _ = filesystem
+    fs.write(member, "sensitive member contents")
+
+    fs.archive(destination, [member])
+
+    attributes = events[-1].attributes
+    assert attributes["sensitive"] is True
+    assert attributes["size_bytes"] > 0
+    assert "digest" not in attributes
+
+
+def test_non_atomic_write_sensitivity_checks_resolved_target(filesystem) -> None:
+    fs, events, root = filesystem
+    secret = root / "secret-store" / "credential.json"
+    secret.parent.mkdir()
+    secret.write_text("old secret")
+    (root / "friendly-alias.json").symlink_to(secret)
+
+    fs.write("friendly-alias.json", "new secret", atomic=False)
+
+    assert secret.read_text() == "new secret"
+    attributes = events[-1].attributes
+    assert attributes["sensitive"] is True
+    assert "digest" not in attributes
 
 
 def test_permission_failure_has_one_failed_terminal(filesystem, monkeypatch) -> None:

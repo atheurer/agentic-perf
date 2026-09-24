@@ -109,6 +109,23 @@ Logs are written to `~/.agentic-perf/logs/orchestrator.log` and
 - **No unused imports or variables** — use `_` for discards
 - **Trailing commas** in multi-line collections and arguments
 
+### Filesystem Mutation Policy
+
+Route ordinary first-party Python filesystem writes, creates, replacements,
+permission changes, and removals through `AuditedFilesystem` in
+`providers/execution/filesystem.py`. Ticket-owned mutations must use a critical
+facade with a durable audit emitter. Process-level, cache, credential, and
+scratch mutations without a ticket must use `AuditedFilesystem.system(...)` so
+the non-audited context is explicit. Do not call raw mutators from application
+code or add per-call exceptions to the scanner.
+
+`tests/test_filesystem_inventory.py` enforces this whole-tree rule for
+recognized Python APIs and prints current path, line, call, and lexical scope.
+Imports and read-only file access remain allowed. The scan is a source-policy
+check, not an operating-system sandbox; it does not cover hostile Python,
+dynamic API lookup, mutations delegated to subprocesses or native extensions,
+or writes performed internally by database engines.
+
 Wrap long lines cleanly:
 ```python
 # Good

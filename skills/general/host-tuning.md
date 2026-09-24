@@ -126,6 +126,16 @@ Example (AMD R7725, ConnectX-7 NIC on NUMA node 1):
    })
 ```
 
+When the ticket requests RX flow-steering rules, call
+`configure_flow_steering` after `tune_nic` and before `pin_irq`. That tool
+reads the active `ethtool -u` table and verifies the requested flow type,
+explicit match fields, action, and queue, as well as unexpected or missing
+rules. Include its complete result with the provisioning report. If readback
+fails or reports a mismatch, use
+`get_flow_steering_rules(targets=[{"host": "<host>", "interface": "<interface>"}])` for
+read-only inspection and do not report provisioning complete until the rules
+are verified or the user has provided guidance.
+
 Include the full `verify_host_tuning` result in the provisioning completion
 report. The benchmark agent uses this to confirm the host was correctly tuned
 before launching a run.
