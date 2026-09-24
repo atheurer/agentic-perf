@@ -1440,11 +1440,14 @@ async def _stop_ticket(
         json={"mode": mode},
     )
     if r.status_code == 409:
+        detail = "Ticket cannot be stopped"
         try:
-            detail = r.json().get("detail", "Ticket cannot be stopped")
-        except (ValueError, KeyError):
-            detail = "Ticket cannot be stopped"
-        return json.dumps({"status": "already_stopped", "detail": detail})
+            error_body = r.json()
+        except ValueError:
+            error_body = None
+        if isinstance(error_body, dict) and isinstance(error_body.get("detail"), str):
+            detail = error_body["detail"]
+        return json.dumps({"status": "cannot_stop", "detail": detail})
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
 

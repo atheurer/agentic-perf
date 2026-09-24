@@ -146,6 +146,11 @@ class TestToolDefinitions:
         assert "description" in required
         assert "custom_fields" in required
 
+    def test_stop_ticket_uses_supported_stop_mode(self):
+        stop = next(t for t in CHAT_TOOLS if t.name == "stop_ticket")
+        mode = stop.input_schema["properties"]["mode"]
+        assert mode["enum"] == ["graceful", "hard"]
+
 
 # --- Tool execution tests ---
 
@@ -283,6 +288,59 @@ class TestToolExecution:
         )
         parsed = json.loads(result)
         assert parsed["id"] == "PERF-NEW"
+
+    async def test_stop_ticket_returns_structured_conflict_for_409(self):
+        client = AsyncMock()
+        details = (
+            "Ticket PERF-123 is in terminal state 'closed' — nothing to stop",
+            "Ticket PERF-123 is in paused state 'awaiting_customer_guidance'"
+            " — nothing to stop",
+        )
+        responses = []
+        for detail in details:
+            response = AsyncMock()
+            response.status_code = 409
+            response.json = MagicMock(return_value={"detail": detail})
+            responses.append(response)
+        client.post = AsyncMock(side_effect=responses)
+
+        for detail in details:
+            result = await execute_tool(
+                "stop_ticket",
+                {"ticket_id": "PERF-123", "mode": "hard"},
+                client,
+                "http://localhost:8090",
+                "token123",
+                audit=_audit(client),
+            )
+            assert json.loads(result) == {"status": "cannot_stop", "detail": detail}
+
+        assert client.post.await_count == 2
+        assert client.post.await_args_list[0].kwargs == {
+            "headers": {"Authorization": "Bearer token123"},
+            "json": {"mode": "hard"},
+        }
+
+    async def test_stop_ticket_409_handles_non_object_error_json(self):
+        client = AsyncMock()
+        response = AsyncMock()
+        response.status_code = 409
+        response.json = MagicMock(return_value=["unexpected error shape"])
+        client.post = AsyncMock(return_value=response)
+
+        result = await execute_tool(
+            "stop_ticket",
+            {"ticket_id": "PERF-123"},
+            client,
+            "http://localhost:8090",
+            "token123",
+            audit=_audit(client),
+        )
+
+        assert json.loads(result) == {
+            "status": "cannot_stop",
+            "detail": "Ticket cannot be stopped",
+        }
 
     async def test_unknown_tool(self):
         client = AsyncMock()
