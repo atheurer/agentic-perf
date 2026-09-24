@@ -144,12 +144,17 @@ class JumpstarterResourceProvider(ResourceProvider):
                 except Exception:
                     pass
             if needs_set:
-                user_config.parent.mkdir(parents=True, exist_ok=True)
-                user_config.write_text(
+                from providers.execution import AuditedFilesystem
+
+                filesystem = AuditedFilesystem.system(user_config.parent)
+                filesystem.mkdir(".", mode=0o777)
+                filesystem.write(
+                    user_config.name,
                     "apiVersion: jumpstarter.dev/v1alpha1\n"
                     "kind: UserConfig\n"
                     "config:\n"
-                    f"  current-client: {client_name}\n"
+                    f"  current-client: {client_name}\n",
+                    mode=0o644,
                 )
                 logger.info(f"[jumpstarter] Set current client to {client_name}")
 

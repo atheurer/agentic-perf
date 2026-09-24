@@ -22,6 +22,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from providers.execution import AuditedSubprocessRunner
+
 logger = logging.getLogger(__name__)
 
 # Timeout defaults (seconds)
@@ -120,16 +122,27 @@ async def provision_jumpstarter(
                     emit=durable_filesystem_emitter(),
                     critical=True,
                 )
+            else:
+                from providers.execution import AuditedFilesystem
+
+                serial_filesystem = AuditedFilesystem.system(artifact_dir)
             serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
+            serial_log_relative = "serial-capture.log"
         else:
             import tempfile
 
-            serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
+            from providers.execution import AuditedFilesystem
+
+            serial_filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+            serial_log_path = str(
+                serial_filesystem.temporary_file(
+                    prefix="serial-capture-", suffix=".log", mode=0o644
+                )
+            )
+            serial_log_relative = serial_log_path
         try:
-            serial_log_fh = (
-                serial_filesystem.open_stream("serial-capture.log")
-                if serial_filesystem
-                else open(serial_log_path, "wb")
+            serial_log_fh = serial_filesystem.open_stream(
+                serial_log_relative, mode=0o644 if not ticket_id else 0o600
             )
             serial_proc = await AuditedSubprocessRunner().start(
                 [
@@ -560,6 +573,3 @@ async def _run_provision_steps(
         ip,
     )
     return result
-
-
-from providers.execution import AuditedSubprocessRunner

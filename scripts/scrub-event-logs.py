@@ -26,10 +26,8 @@ rename, and subsequent appends go to the now-unlinked inode.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 SCRUB_MARKER = "[SCRUBBED]"
@@ -126,18 +124,11 @@ def scrub_file(
             scrubbed_lines.append(new_line)
 
     if apply and lines_changed > 0:
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
+        from providers.execution import AuditedFilesystem
+
+        AuditedFilesystem.system(path.parent).write(
+            path.name, "".join(scrubbed_lines), mode=0o600
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.writelines(scrubbed_lines)
-            os.replace(tmp, str(path))
-        except BaseException:
-            os.unlink(tmp)
-            raise
 
     return lines_changed, totals
 

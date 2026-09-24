@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -498,24 +497,16 @@ def write_effective_config(config: OrchestratorConfig) -> dict:
     """
     snapshot = build_redacted_config(config, source="orchestrator")
     destination = _effective_config_path()
-    destination.parent.mkdir(parents=True, exist_ok=True)
     snapshot["runtime"]["written_at"] = datetime.now(timezone.utc).isoformat()
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", dir=destination.parent
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(destination.parent)
+    filesystem.mkdir(".", mode=0o777)
+    filesystem.write(
+        destination.name,
+        json.dumps(snapshot, indent=2) + "\n",
+        mode=0o600,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(snapshot, stream, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
     return snapshot
 
 

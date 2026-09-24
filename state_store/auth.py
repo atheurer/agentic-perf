@@ -63,10 +63,12 @@ def load_or_generate_token() -> str:
         if token:
             return token
 
-    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(32)
-    TOKEN_FILE.write_text(token + "\n")
-    TOKEN_FILE.chmod(0o600)
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(SECRETS_DIR)
+    filesystem.mkdir(".", mode=0o777)
+    filesystem.write(TOKEN_FILE.name, token + "\n", mode=0o600)
     logger.info("Generated new API token at %s", TOKEN_FILE)
     return token
 
@@ -78,10 +80,12 @@ def load_or_generate_validator_token() -> str:
         return token
     if VALIDATOR_TOKEN_FILE.exists():
         return VALIDATOR_TOKEN_FILE.read_text().strip()
-    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(32)
-    VALIDATOR_TOKEN_FILE.write_text(token + "\n")
-    VALIDATOR_TOKEN_FILE.chmod(0o600)
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(SECRETS_DIR)
+    filesystem.mkdir(".", mode=0o777)
+    filesystem.write(VALIDATOR_TOKEN_FILE.name, token + "\n", mode=0o600)
     return token
 
 
