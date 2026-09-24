@@ -455,13 +455,16 @@ class ProvisioningAgent(AgentBase):
                         await mcp.disconnect()
                         self._mcp = None
                         return
-                await self._auto_complete_jumpstarter(
-                    ticket_id,
-                    cf,
-                )
-                await mcp.disconnect()
-                self._mcp = None
-                return
+                from agents.provisioning.kernel import current_kernel_step
+
+                if current_kernel_step({"custom_fields": cf}) is None:
+                    await self._auto_complete_jumpstarter(
+                        ticket_id,
+                        cf,
+                    )
+                    await mcp.disconnect()
+                    self._mcp = None
+                    return
 
         mcp_tools = await mcp.list_tools()
         self.tools = mcp_tools + self.tools

@@ -452,3 +452,82 @@ class TestHostIdentityEnforcement:
         }
         ok, reason = check_handoff("awaiting_provision", ticket)
         assert ok, reason
+
+
+class TestKernelTransitionHandoff:
+    """Benchmark handoff must verify kernel transition state."""
+
+    def test_verified_transition_passes(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "execution_plan": {
+                    "current_step": 3,
+                    "steps": [
+                        {
+                            "id": 2,
+                            "agent_type": "provision",
+                            "params": {
+                                "kernel": {
+                                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                                },
+                            },
+                        },
+                        {"id": 3, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+                "kernel_transitions": {
+                    "2": {"state": "verified"},
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert ok, reason
+
+    def test_partial_failure_blocks(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "execution_plan": {
+                    "current_step": 3,
+                    "steps": [
+                        {
+                            "id": 2,
+                            "agent_type": "provision",
+                            "params": {
+                                "kernel": {
+                                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                                },
+                            },
+                        },
+                        {"id": 3, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+                "kernel_transitions": {
+                    "2": {"state": "partial_failure"},
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+        assert "partial_failure" in reason
+
+    def test_no_kernel_step_unaffected(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "execution_plan": {
+                    "current_step": 2,
+                    "steps": [
+                        {
+                            "id": 1,
+                            "agent_type": "provision",
+                            "params": {"label": "harness"},
+                        },
+                        {"id": 2, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert ok, reason

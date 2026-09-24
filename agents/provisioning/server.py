@@ -36,6 +36,7 @@ from agents.server_utils import (
     read_skill_documents,
 )
 from providers.llm.base import ToolDefinition
+from providers.rhel_kernel import KernelSpec
 from providers.ssh import SSHExecutor
 
 logger = logging.getLogger(__name__)
@@ -2737,6 +2738,810 @@ async def ensure_harness_installed(
         install_path,
     )
     results.update(skipped)
+    return json.dumps(_summarize(results))
+
+
+# ---------------------------------------------------------------------------
+# Kernel tools
+# ---------------------------------------------------------------------------
+
+
+async def _kernel_inventory_one(
+    host: str,
+    kernel: str = "",
+) -> dict[str, Any]:
+    """Gather kernel inventory for a single host."""
+    from providers.rhel_kernel import (
+        KernelSpec,
+        build_available_command,
+        build_inventory_command,
+        classify_available,
+        inventory_fingerprint,
+        parse_inventory,
+    )
+
+    package = "kernel"
+    if kernel:
+        try:
+            spec_for_pkg = KernelSpec.parse(kernel)
+            package = spec_for_pkg.package
+        except ValueError:
+            pass
+
+    result = await _ssh.run(host, build_inventory_command(package), timeout=30)
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "unreachable",
+            "error": result.stderr or result.stdout,
+        }
+    try:
+        inv = parse_inventory(result.stdout)
+    except ValueError as exc:
+        return {
+            "host": host,
+            "state": "not_checked",
+            "error": str(exc),
+        }
+
+    response: dict[str, Any] = {
+        "host": host,
+        "state": "ok",
+        "inventory": inv.to_dict(),
+        "fingerprint": inventory_fingerprint(inv),
+    }
+
+    if kernel:
+        try:
+            spec = KernelSpec.parse(kernel)
+        except ValueError as exc:
+            response["requested"] = {
+                "release": kernel if isinstance(kernel, str) else str(kernel),
+                "state": "not_checked",
+                "error": str(exc),
+            }
+            return response
+
+        if spec.release in inv.installed:
+            response["requested"] = {
+                "release": spec.release,
+                "state": "installed",
+            }
+        else:
+            avail_result = await _ssh.run(
+                host,
+                build_available_command(spec),
+                timeout=30,
+            )
+            state = classify_available(
+                avail_result.exit_code,
+                avail_result.stdout,
+            )
+            response["requested"] = {
+                "release": spec.release,
+                "state": state,
+            }
+            if state == "not_checked":
+                response["requested"]["error"] = (
+                    avail_result.stderr or avail_result.stdout
+                )
+
+    return response
+
+
+async def _prepare_kernel_change_impl(
+    host: str,
+    spec: KernelSpec,
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute actions_required for a single host."""
+    inv = inventory.get("inventory", {})
+    installed = inv.get("installed", [])
+    default_entry = inv.get("default_entry", "")
+
+    actions: list[str] = []
+    if spec.release not in installed:
+        actions.append("install")
+    if default_entry != spec.vmlinuz:
+        actions.append("select_default")
+    actions.append("reboot")
+
+    return {
+        "host": host,
+        "actions_required": actions,
+        "currently_running": inv.get("running", ""),
+        "currently_default": default_entry,
+    }
+
+
+async def _install_kernel_one(
+    host: str,
+    spec: KernelSpec,
+) -> dict[str, Any]:
+    """Install a kernel on a single host."""
+    from providers.rhel_kernel import (
+        build_install_command,
+        build_inventory_command,
+        parse_inventory,
+    )
+
+    inv_before = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
+    try:
+        before = parse_inventory(inv_before.stdout)
+    except ValueError:
+        return {
+            "host": host,
+            "state": "unreachable",
+            "error": "could not read inventory before install",
+        }
+
+    if spec.release in before.installed:
+        return {
+            "host": host,
+            "state": "already_installed",
+            "before": before.to_dict(),
+        }
+
+    result = await _ssh.run(
+        host,
+        build_install_command(spec),
+        timeout=900,
+        mutating=True,
+    )
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": result.stderr or result.stdout,
+            "before": before.to_dict(),
+        }
+
+    inv_after = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
+    try:
+        after = parse_inventory(inv_after.stdout)
+    except ValueError:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": "could not read inventory after install",
+            "before": before.to_dict(),
+        }
+
+    if spec.release not in after.installed:
+        return {
+            "host": host,
+            "state": "install_failed",
+            "error": "package installed but release not in rpm list",
+            "before": before.to_dict(),
+            "after": after.to_dict(),
+        }
+
+    return {
+        "host": host,
+        "state": "installed",
+        "before": before.to_dict(),
+        "after": after.to_dict(),
+    }
+
+
+async def _select_default_kernel_one(
+    host: str,
+    spec: KernelSpec,
+) -> dict[str, Any]:
+    """Select a kernel as the default boot entry on a single host."""
+    from providers.rhel_kernel import build_select_command
+
+    before_result = await _ssh.run(
+        host,
+        "grubby --default-kernel 2>&1",
+        timeout=15,
+    )
+    before_default = before_result.stdout.strip()
+
+    if before_default == spec.vmlinuz:
+        return {
+            "host": host,
+            "state": "already_default",
+            "before": before_default,
+            "after": before_default,
+        }
+
+    initramfs_check = await _ssh.run(
+        host,
+        f"test -f {spec.vmlinuz} && test -f {spec.initramfs}",
+        timeout=10,
+    )
+    if initramfs_check.exit_code != 0:
+        return {
+            "host": host,
+            "state": "not_bootable",
+            "error": f"missing {spec.vmlinuz} or {spec.initramfs}",
+            "before": before_default,
+        }
+
+    result = await _ssh.run(
+        host,
+        build_select_command(spec),
+        timeout=30,
+        mutating=True,
+    )
+    after_default = result.stdout.strip().split("\n")[-1].strip()
+    if after_default != spec.vmlinuz:
+        return {
+            "host": host,
+            "state": "selection_failed",
+            "error": f"grubby reports {after_default}, expected {spec.vmlinuz}",
+            "before": before_default,
+            "after": after_default,
+        }
+
+    return {
+        "host": host,
+        "state": "ok",
+        "before": before_default,
+        "after": after_default,
+    }
+
+
+@mcp.tool()
+async def get_kernel_inventory(
+    hosts: list[str],
+    kernel: str = "",
+) -> str:
+    """Get kernel inventory for multiple hosts. Returns running kernel, installed packages, grubby entries, default boot entry, and arch/OS info. When kernel is provided, also checks whether the requested release is installed or available. Only probes hosts assigned to this ticket."""
+    await _ensure_init()
+    from agents.provisioning.kernel import refuse_protected_targets
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_kernel_inventory_one(h, kernel) for h in allowed]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
+@mcp.tool()
+async def prepare_kernel_change(
+    hosts: list[str],
+    kernel: str,
+) -> str:
+    """Prepare a kernel change intent. Validates hosts against the plan and ticket, takes inventory, computes required actions (install, select_default, reboot), and writes an intent record for approval. Returns the intent_id needed for the approval request."""
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        current_kernel_step,
+        new_intent,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import KernelSpec
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(kernel)
+    ks = current_kernel_step(ticket)
+    step_id = ks[0] if ks else -1
+
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+
+    inventories: dict[str, Any] = {}
+    per_host_actions: dict[str, Any] = {}
+    for host in allowed:
+        inv = await _kernel_inventory_one(host, kernel)
+        inventories[host] = inv
+        actions = await _prepare_kernel_change_impl(host, spec, inv)
+        per_host_actions[host] = actions
+
+    all_actions: set[str] = set()
+    for h_actions in per_host_actions.values():
+        all_actions.update(h_actions.get("actions_required", []))
+    actions_list = []
+    for a in ["install", "select_default", "reboot"]:
+        if a in all_actions:
+            actions_list.append(a)
+
+    ticket_id = ticket.get("id", "")
+    intent = new_intent(
+        ticket_id,
+        step_id,
+        allowed,
+        spec,
+        actions_list,
+        inventories,
+    )
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "intent": intent,
+            "per_host": per_host_actions,
+            "refused": refused,
+        }
+    )
+
+
+@mcp.tool()
+async def install_kernel(
+    hosts: list[str],
+    kernel: str,
+    approval_request_id: str,
+) -> str:
+    """Install a specific kernel version on multiple hosts. Requires a consumed or consumable approval. Idempotent — already-installed kernels are reported without running dnf."""
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_install_kernel_one(h, spec) for h in allowed]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
+@mcp.tool()
+async def select_default_kernel(
+    hosts: list[str],
+    kernel: str,
+    approval_request_id: str,
+) -> str:
+    """Select a kernel as the default boot entry on multiple hosts using grubby. Verifies vmlinuz and initramfs exist before selection. Idempotent — already-default kernels are reported without changes."""
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    coros = [_select_default_kernel_one(h, spec) for h in allowed]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
+    return json.dumps(_summarize(results))
+
+
+async def _reboot_and_verify_one(
+    host: str,
+    spec: KernelSpec,
+    *,
+    reconnect_timeout_seconds: int,
+    poll_interval_seconds: int,
+    reboot_policy: str,
+    down_grace_seconds: int = 120,
+) -> dict[str, Any]:
+    """Reboot a single host and verify it comes up on the expected kernel."""
+    import time
+
+    from providers.rhel_kernel import (
+        build_probe_command,
+        build_reboot_command,
+        parse_probe,
+    )
+
+    record: dict[str, Any] = {
+        "host": host,
+        "state": "pending",
+        "rebooted": False,
+        "pre_boot_id": None,
+        "post_boot_id": None,
+        "pre_kernel": None,
+        "observed_kernel": None,
+        "default_entry": None,
+        "went_down": False,
+        "attempts": 0,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": None,
+        "error": None,
+    }
+
+    def _finish(state: str) -> dict[str, Any]:
+        record["state"] = state
+        record["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return record
+
+    # Pre-check: probe the host
+    probe_result = await _ssh.run(host, build_probe_command(), timeout=15)
+    if probe_result.exit_code != 0:
+        return _finish("precheck_failed")
+
+    try:
+        probe = parse_probe(probe_result.stdout)
+    except ValueError:
+        record["error"] = "unparsable probe output"
+        return _finish("indeterminate")
+
+    record["pre_boot_id"] = probe.boot_id
+    record["pre_kernel"] = probe.kernel
+    record["default_entry"] = probe.default_entry
+
+    # Check the default entry matches expected
+    if probe.default_entry != spec.vmlinuz:
+        record["error"] = (
+            f"default entry {probe.default_entry} != expected {spec.vmlinuz}"
+        )
+        return _finish("precheck_failed")
+
+    # If the host is already running the expected kernel
+    if probe.kernel == spec.release:
+        if reboot_policy == "if_needed":
+            record["observed_kernel"] = probe.kernel
+            record["post_boot_id"] = probe.boot_id
+            return _finish("verified")
+        # reboot_policy == "always" — reboot even if already on target
+
+    # Issue the reboot
+    record["state"] = "rebooting"
+    reboot_result = await _ssh.run(
+        host, build_reboot_command(), timeout=15, mutating=True
+    )
+    if reboot_result.exit_code not in (0, 255):
+        record["error"] = "reboot command failed"
+        return _finish("indeterminate")
+    record["rebooted"] = True
+
+    # Poll for reconnection
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < reconnect_timeout_seconds:
+        record["attempts"] += 1
+        await asyncio.sleep(poll_interval_seconds)
+
+        poll_result = await _ssh.run(host, build_probe_command(), timeout=10)
+        if poll_result.exit_code in (255, -1):
+            record["went_down"] = True
+            record["state"] = "reconnecting"
+            continue
+
+        if poll_result.exit_code != 0:
+            continue
+
+        try:
+            poll_probe = parse_probe(poll_result.stdout)
+        except ValueError:
+            record["error"] = "unparsable probe during reconnect"
+            return _finish("indeterminate")
+
+        if poll_probe.boot_id != record["pre_boot_id"]:
+            record["post_boot_id"] = poll_probe.boot_id
+            record["observed_kernel"] = poll_probe.kernel
+            if poll_probe.kernel == spec.release:
+                return _finish("verified")
+            elif poll_probe.kernel == record["pre_kernel"]:
+                return _finish("fallback_boot")
+            else:
+                return _finish("kernel_mismatch")
+
+        # Still on the old boot
+        elapsed = time.monotonic() - start_time
+        if elapsed > down_grace_seconds and not record["went_down"]:
+            return _finish("reboot_not_observed")
+
+    return _finish("reconnect_timeout")
+
+
+@mcp.tool()
+async def reboot_hosts_and_verify(
+    hosts: list[str],
+    expected_kernel: str,
+    approval_request_id: str,
+    strategy: str = "serial",
+    reconnect_timeout_seconds: int = 900,
+    poll_interval_seconds: int = 10,
+    reboot_policy: str = "always",
+) -> str:
+    """Reboot hosts serially and verify each comes up on the expected kernel.
+
+    This is a long-lived operation. Each host is rebooted, then polled
+    until SSH reconnects and uname -r matches the expected kernel. Hosts
+    are processed serially — the next host is only rebooted after the
+    previous one is verified.
+
+    reboot_policy: "always" (default) reboots even if the host already
+    runs the expected kernel; "if_needed" skips the reboot if the host
+    is already on the target kernel with the correct default entry.
+    """
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+
+    if strategy != "serial":
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "strategy_unsupported",
+                "error": f"Only 'serial' strategy is supported, got {strategy!r}",
+            }
+        )
+
+    if reboot_policy not in ("always", "if_needed"):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "invalid_reboot_policy",
+                "error": "reboot_policy must be 'always' or 'if_needed'",
+            }
+        )
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, expected_kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(expected_kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+
+    if not allowed and refused:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "all_hosts_refused",
+                "hosts": refused,
+            }
+        )
+
+    results: dict[str, dict[str, Any]] = {}
+    for host, info in refused.items():
+        results[host] = info
+
+    all_verified = True
+    for host in allowed:
+        record = await _reboot_and_verify_one(
+            host,
+            spec,
+            reconnect_timeout_seconds=reconnect_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            reboot_policy=reboot_policy,
+        )
+        results[host] = record
+        if record["state"] not in ("verified", "already_verified"):
+            all_verified = False
+            for remaining in allowed[allowed.index(host) + 1 :]:
+                if remaining not in results:
+                    results[remaining] = {
+                        "host": remaining,
+                        "state": "not_attempted",
+                    }
+            break
+
+    if not allowed:
+        all_verified = False
+
+    overall = "verified" if all_verified else "partial_failure"
+
+    from agents.provisioning.kernel import current_kernel_step
+
+    ks = current_kernel_step(ticket)
+    if ks is not None:
+        step_id = str(ks[0])
+        transition_record = {
+            "kernel": spec.release,
+            "requested_hosts": allowed,
+            "strategy": strategy,
+            "state": overall,
+            "hosts": {
+                h: {
+                    "state": r.get("state", ""),
+                    "observed_kernel": r.get("observed_kernel", ""),
+                    "rebooted": r.get("rebooted", False),
+                }
+                for h, r in results.items()
+                if h in allowed
+            },
+        }
+        import os as _os
+
+        from agents.server_utils import ticket_state_headers
+        from providers.execution import (
+            AuditedAsyncHTTPClient as _AuditedClient,
+        )
+
+        async with _AuditedClient(
+            timeout=10.0, headers=ticket_state_headers()
+        ) as client:
+            store_url = _os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            ticket_id = ticket.get("id", "")
+            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+            if r.status_code == 200:
+                current_cf = r.json().get("custom_fields", {})
+                transitions = dict(current_cf.get("kernel_transitions", {}))
+                transitions[step_id] = transition_record
+                await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"kernel_transitions": transitions}},
+                )
+
+    return json.dumps(
+        {
+            "status": overall,
+            "kernel": spec.release,
+            "strategy": strategy,
+            "reboot_policy": reboot_policy,
+            "hosts": results,
+        }
+    )
+
+
+@mcp.tool()
+async def verify_kernel_state(
+    hosts: list[str],
+    expected_kernel: str,
+) -> str:
+    """Probe hosts and verify they are running the expected kernel.
+
+    This is a read-only reconciliation tool — it never reboots, never
+    requires approval. Use it after a pause to confirm host state before
+    resuming, or when the reboot tool reports boot_drift.
+    """
+    await _ensure_init()
+    from agents.provisioning.kernel import refuse_protected_targets
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import build_probe_command, parse_probe
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    spec = KernelSpec.parse(expected_kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    for host in allowed:
+        probe_result = await _ssh.run(host, build_probe_command(), timeout=15)
+        if probe_result.exit_code != 0:
+            results[host] = {
+                "host": host,
+                "state": "unreachable",
+                "error": probe_result.stderr or "",
+            }
+            continue
+
+        try:
+            probe = parse_probe(probe_result.stdout)
+        except ValueError as exc:
+            results[host] = {
+                "host": host,
+                "state": "indeterminate",
+                "error": str(exc),
+            }
+            continue
+
+        if probe.kernel == spec.release:
+            results[host] = {
+                "host": host,
+                "state": "verified",
+                "kernel": probe.kernel,
+                "boot_id": probe.boot_id,
+                "default_entry": probe.default_entry,
+                "reconciled": True,
+            }
+        else:
+            results[host] = {
+                "host": host,
+                "state": "kernel_mismatch",
+                "expected": spec.release,
+                "running": probe.kernel,
+                "boot_id": probe.boot_id,
+            }
+
+    return json.dumps(_summarize(results))
+
+
+async def _capture_environment_one(host: str) -> dict[str, Any]:
+    """Capture environment snapshot for a single host."""
+    from providers.environment import (
+        build_env_command,
+        environment_fingerprint,
+        parse_environment,
+    )
+
+    result = await _ssh.run(host, build_env_command(), timeout=30)
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "unavailable",
+            "error": result.stderr or result.stdout,
+        }
+    try:
+        snapshot = parse_environment(result.stdout)
+    except Exception as exc:
+        return {
+            "host": host,
+            "state": "unavailable",
+            "error": str(exc),
+        }
+    return {
+        "host": host,
+        "state": "ok",
+        "snapshot": snapshot,
+        "fingerprint": environment_fingerprint(snapshot),
+    }
+
+
+@mcp.tool()
+async def capture_environment_fingerprint(
+    hosts: list[str],
+) -> str:
+    """Capture environment fingerprints for multiple hosts. Returns per-host snapshots including kernel, arch, CPU topology, NUMA, tuned profile, THP, sysctls, and NIC configuration. The fingerprint is stable across reboots but changes when tuning or hardware changes."""
+    await _ensure_init()
+    coros = [_capture_environment_one(h) for h in hosts]
+    raw = await asyncio.gather(*coros, return_exceptions=True)
+    results: dict[str, Any] = {}
+    for host, result in zip(hosts, raw):
+        if isinstance(result, Exception):
+            results[host] = {"state": "error", "error": str(result)}
+        else:
+            results[host] = result
     return json.dumps(_summarize(results))
 
 
