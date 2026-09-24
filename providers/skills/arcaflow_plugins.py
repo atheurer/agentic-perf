@@ -34,7 +34,10 @@ class PluginSchemaCache:
 
     def __init__(self, cache_dir: Path = _DEFAULT_SCHEMA_CACHE_DIR) -> None:
         self._cache_dir = cache_dir
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        self._filesystem = AuditedFilesystem.system(self._cache_dir)
+        self._filesystem.mkdir(".", mode=0o777)
         self._memory: dict[str, dict[str, Any]] = {}
 
     def _cache_path(self, repo_name: str, version: str) -> Path:
@@ -67,7 +70,9 @@ class PluginSchemaCache:
         self._memory[key] = schema_data
         path = self._cache_path(repo_name, version)
         try:
-            path.write_text(json.dumps(schema_data, indent=2))
+            self._filesystem.write(
+                path.name, json.dumps(schema_data, indent=2), mode=0o644
+            )
         except OSError:
             logger.debug(f"[arcaflow-plugins] Failed to write schema cache for {key}")
 

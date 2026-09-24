@@ -212,13 +212,129 @@ wait_for_store() {
 wait_for_orchestrator() {
     local pid="$1" deadline=$((SECONDS + ORCH_START_TIMEOUT))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if orchestrator_owner_valid "$pid" && lock_is_held "$ORCH_LOCK"; then
+        # The local PID lock is acquired before the state-store leader lease.
+        # A process that loses the lease race holds this lock briefly while it
+        # starts, so only the control-plane lease can establish readiness.
+        if orchestrator_owner_valid "$pid" && lock_is_held "$ORCH_LOCK" \
+            && orchestrator_lease_owner_valid "$pid"; then
             return 0
         fi
         process_alive "$pid" || return 1
         sleep 0.2
     done
     return 1
+}
+
+orchestrator_process_start_id() {
+    local pid="$1" boot_id start_identity
+    boot_id="$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null)" || return 1
+    [ -n "$boot_id" ] || return 1
+    start_identity="$(process_start_identity "$pid")"
+    [[ "$start_identity" == "$pid:"* ]] || return 1
+    printf '%s:%s' "$boot_id" "${start_identity#*:}"
+}
+
+orchestrator_lease_owner_valid() {
+    local pid="$1" token expected_start_id
+    expected_start_id="$(orchestrator_process_start_id "$pid")" || return 1
+    token="$(read_api_token)"
+    [[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] || return 1
+    token="$(printf '%s' "$token" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        | curl -fsS --max-time 1 --config - \
+            "http://localhost:$STORE_PORT/api/v1/control/orchestrator-lease" 2>/dev/null \
+        | python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+    lease = payload.get("lease") if isinstance(payload, dict) else None
+    matches = (
+        isinstance(lease, dict)
+        and type(lease.get("pid")) is int
+        and lease["pid"] == int(sys.argv[1])
+        and lease.get("process_start_id") == sys.argv[2]
+    )
+except (TypeError, ValueError, json.JSONDecodeError):
+    matches = False
+raise SystemExit(0 if matches else 1)
+' "$pid" "$expected_start_id"
+}
+
+terminate_startup_process() {
+    local pid="$1" expected_identity="$2"
+    python3 - "$pid" "$expected_identity" "$STOP_TIMEOUT" <<'PY'
+import os
+import select
+import signal
+import sys
+from pathlib import Path
+
+pid = int(sys.argv[1])
+expected_identity = sys.argv[2]
+timeout_ms = int(float(sys.argv[3]) * 1000)
+
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    raise SystemExit("pidfd signaling is unavailable; refusing unsafe PID signaling")
+
+def start_identity():
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return f"{pid}:{fields[19]}"
+    except (IndexError, OSError):
+        return ""
+
+try:
+    pidfd = os.pidfd_open(pid, 0)
+except OSError as exc:
+    raise SystemExit(f"could not open pidfd for startup PID {pid}: {exc}") from exc
+
+try:
+    if start_identity() != expected_identity:
+        raise SystemExit(f"startup PID {pid} changed identity; refusing to signal it")
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    if poller.poll(0):
+        raise SystemExit(0)
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    except ProcessLookupError:
+        raise SystemExit(0) from None
+    if poller.poll(timeout_ms):
+        raise SystemExit(0)
+    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    if not poller.poll(5000):
+        raise SystemExit(f"startup PID {pid} did not exit after SIGKILL")
+finally:
+    os.close(pidfd)
+PY
+}
+
+cleanup_failed_orchestrator_start() {
+    local pid="$1" expected_identity="$2" current_identity
+    if process_alive "$pid"; then
+        if ! orchestrator_owner_valid "$pid"; then
+            error "failed orchestrator startup PID $pid is still alive but unverifiable"
+            return 1
+        fi
+        echo "Cleaning up failed orchestrator startup (PID $pid)..."
+        current_identity="$(process_start_identity "$pid")"
+        if [ "$current_identity" != "$expected_identity" ] || [ -z "$expected_identity" ]; then
+            error "failed orchestrator startup PID $pid changed identity; refusing to signal it"
+            return 1
+        fi
+        if ! terminate_startup_process "$pid" "$expected_identity" \
+            && process_alive "$pid"; then
+            error "could not confirm failed orchestrator startup PID $pid stopped"
+            return 1
+        fi
+    fi
+    if lock_is_held "$ORCH_LOCK"; then
+        error "orchestrator lock is still held after failed startup PID $pid"
+        return 1
+    fi
+    rm -f "$ORCH_LOCK"
 }
 
 terminate_process() {
@@ -342,7 +458,7 @@ start_store() {
 }
 
 start_orchestrator() {
-    local pid="" deadline=$((SECONDS + ORCH_START_TIMEOUT))
+    local pid="" pid_start_identity="" attempt deadline=$((SECONDS + ORCH_START_TIMEOUT))
     if lock_is_held "$ORCH_LOCK"; then
         pid="$(orchestrator_pid || true)"
         if ! orchestrator_owner_valid "$pid"; then
@@ -370,9 +486,21 @@ start_orchestrator() {
         echo "Starting orchestrator..."
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
+        for attempt in 1 2 3 4 5; do
+            pid_start_identity="$(process_start_identity "$pid")"
+            [[ "$pid_start_identity" == "$pid:"* ]] && break
+            process_alive "$pid" || break
+            sleep 0.02
+        done
+        if [[ ! "$pid_start_identity" == "$pid:"* ]]; then
+            pid_start_identity=""
+        fi
         if wait_for_orchestrator "$pid"; then
             echo "Orchestrator started (PID $pid; state-store port $STORE_PORT)."
             return 0
+        fi
+        if ! cleanup_failed_orchestrator_start "$pid" "$pid_start_identity"; then
+            return 3
         fi
         if grep -q "leader lease unavailable" "$ORCH_LOG" 2>/dev/null; then
             echo "Orchestrator is waiting for the previous leader lease to expire; retrying..."
@@ -386,9 +514,6 @@ start_orchestrator() {
         return 1
     done
     error "orchestrator did not become ready within ${ORCH_START_TIMEOUT}s; see $ORCH_LOG"
-    if ! lock_is_held "$ORCH_LOCK"; then
-        rm -f "$ORCH_LOCK"
-    fi
     return 1
 }
 
@@ -399,7 +524,19 @@ cmd_start() {
     flock -n "$launch_fd" || { error "another start-bg.sh invocation is starting or stopping $AP_HOME"; return 1; }
     local store_result=0 orch_result=0 store_started=0
     if start_store; then store_started=1; else store_result=$?; [ "$store_result" -eq 2 ] || { flock -u "$launch_fd" || true; return 1; }; fi
-    if start_orchestrator; then orch_result=0; else orch_result=$?; if [ "$orch_result" -ne 2 ] && [ "$store_started" -eq 1 ]; then error "orchestrator startup failed; rolling back the state store started by this invocation"; stop_store || true; fi; flock -u "$launch_fd" || true; return 1; fi
+    if start_orchestrator; then
+        orch_result=0
+    else
+        orch_result=$?
+        if [ "$orch_result" -eq 3 ]; then
+            error "orchestrator startup cleanup is unconfirmed; leaving the state store running for safety"
+        elif [ "$orch_result" -ne 2 ] && [ "$store_started" -eq 1 ]; then
+            error "orchestrator startup failed; rolling back the state store started by this invocation"
+            stop_store || true
+        fi
+        flock -u "$launch_fd" || true
+        return 1
+    fi
     flock -u "$launch_fd" || true
     echo "Services running."
 }
