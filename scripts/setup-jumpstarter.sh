@@ -45,22 +45,18 @@ echo "  System dependencies OK"
 echo "Installing project dependencies..."
 pip install -e "${PROJECT_DIR}[dev,vertex,telemetry]" --quiet 2>&1 | tail -3
 
-# 2. Install Jumpstarter from GitHub latest release.
-#    PyPI may lag behind — install from the latest GitHub
-#    release (including pre-releases) to match exporter
-#    versions in the lab.
-echo "Installing Jumpstarter from latest GitHub release..."
+# 2. Install Jumpstarter from the pinned stable GitHub release.
+echo "Installing Jumpstarter from stable GitHub release..."
 # install.sh lives under python/ in the repo
 JMP_INSTALL_URL="https://raw.githubusercontent.com/jumpstarter-dev/jumpstarter/BRANCH/python/install.sh"
 
-# Determine the latest release tag (including pre-releases)
 # Use the stable v0.9.0 release tag.
 # Previously pinned to cc2706f5fd (0.9.0rc2.dev5) to work around
-# jumpstarter-dev/jumpstarter#896 — verify the fix is in v0.9.0.
+# jumpstarter-dev/jumpstarter#896.
 JMP_COMMIT=""
 JMP_BRANCH="v0.9.0"
 
-echo "  Target: $JMP_BRANCH @ $JMP_COMMIT"
+echo "  Target: $JMP_BRANCH"
 
 if false; then
     : # placeholder for future PyPI fallback
@@ -99,10 +95,10 @@ else
     echo "  Jumpstarter installed: $($JMP_VENV/bin/jmp version 2>/dev/null | head -1)"
 fi
 
-# The install.sh may install from a pinned snapshot.
+# The install.sh may install from a snapshot.
 # Upgrade core packages and install jumpstarter-mcp
-# from the branch tip to ensure jmp mcp serve works.
-echo "Upgrading packages from pinned commit..."
+# from the selected release to ensure jmp mcp serve works.
+echo "Upgrading packages from $JMP_BRANCH..."
 JMP_SRC="/tmp/jmp-src-$$"
 git clone --branch "$JMP_BRANCH" \
     https://github.com/jumpstarter-dev/jumpstarter.git \

@@ -46,6 +46,8 @@ vertex = [
 bitwarden = [
     "bitwarden-sdk>=1.0.0",
 ]
+# Jumpstarter packages use their own index; include it when installing this extra:
+# python -m pip install --extra-index-url https://pkg.jumpstarter.dev/simple -e '.[jumpstarter]'
 jumpstarter = [
     "jumpstarter-cli>=0.9.0",
     "jumpstarter-driver-power>=0.9.0",
