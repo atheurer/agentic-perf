@@ -432,6 +432,36 @@ HOST_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 
+def prelaunch_kernel_check(
+    probes: dict[str, ProbeResult],
+    expected_release: str,
+    checkpoints: dict[str, dict[str, Any]],
+) -> tuple[bool, str, dict[str, str]]:
+    """Check that all probed hosts are on the expected kernel.
+
+    Returns (ok, reason_code, {host: issue}).
+    """
+    issues: dict[str, str] = {}
+    for host, probe in probes.items():
+        if probe.kernel != expected_release:
+            issues[host] = (
+                f"kernel_drift: running {probe.kernel}, expected {expected_release}"
+            )
+            continue
+        cp = checkpoints.get(host, {})
+        cp_boot_id = cp.get("post_boot_id")
+        if cp_boot_id and probe.boot_id != cp_boot_id:
+            issues[host] = (
+                f"boot_drift: boot_id {probe.boot_id[:8]}..."
+                f" != checkpoint {cp_boot_id[:8]}..."
+            )
+    if not issues:
+        return True, "", {}
+    if any("kernel_drift" in v for v in issues.values()):
+        return False, "kernel_drift", issues
+    return False, "boot_drift", issues
+
+
 def validate_host_transition(from_state: str, to_state: str) -> None:
     """Raise ValueError if the transition is not legal."""
     if from_state not in HOST_STATES:

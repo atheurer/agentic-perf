@@ -247,6 +247,59 @@ class TestInventoryFingerprint:
         assert fp1 != fp2
 
 
+class TestPrelaunchKernelCheck:
+    def test_all_on_expected(self):
+        from providers.rhel_kernel import ProbeResult, prelaunch_kernel_check
+
+        probes = {
+            "h1": ProbeResult(
+                "boot-1", "5.14.0-503.16.1.el9_5.x86_64", "/boot/vmlinuz"
+            ),
+            "h2": ProbeResult(
+                "boot-2", "5.14.0-503.16.1.el9_5.x86_64", "/boot/vmlinuz"
+            ),
+        }
+        checkpoints = {
+            "h1": {"post_boot_id": "boot-1"},
+            "h2": {"post_boot_id": "boot-2"},
+        }
+        ok, reason, issues = prelaunch_kernel_check(
+            probes, "5.14.0-503.16.1.el9_5.x86_64", checkpoints
+        )
+        assert ok
+        assert issues == {}
+
+    def test_kernel_drift(self):
+        from providers.rhel_kernel import ProbeResult, prelaunch_kernel_check
+
+        probes = {
+            "h1": ProbeResult(
+                "boot-1", "5.14.0-503.14.1.el9_5.x86_64", "/boot/vmlinuz"
+            ),
+        }
+        ok, reason, issues = prelaunch_kernel_check(
+            probes, "5.14.0-503.16.1.el9_5.x86_64", {}
+        )
+        assert not ok
+        assert reason == "kernel_drift"
+        assert "h1" in issues
+
+    def test_boot_drift(self):
+        from providers.rhel_kernel import ProbeResult, prelaunch_kernel_check
+
+        probes = {
+            "h1": ProbeResult(
+                "new-boot", "5.14.0-503.16.1.el9_5.x86_64", "/boot/vmlinuz"
+            ),
+        }
+        checkpoints = {"h1": {"post_boot_id": "old-boot"}}
+        ok, reason, issues = prelaunch_kernel_check(
+            probes, "5.14.0-503.16.1.el9_5.x86_64", checkpoints
+        )
+        assert not ok
+        assert reason == "boot_drift"
+
+
 class TestHostStateTransitions:
     def test_all_states_covered(self):
         defined = set(HOST_STATE_TRANSITIONS.keys())
