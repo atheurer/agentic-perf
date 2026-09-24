@@ -17,7 +17,11 @@ from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
-from state_store.models import AcquireOrchestratorLeaseRequest, CreateTicketRequest
+from state_store.models import (
+    AcquireOrchestratorLeaseRequest,
+    CreateTicketRequest,
+    TicketStatus,
+)
 from state_store.store import OrchestratorLeaseHeld, TicketStore
 
 
@@ -214,6 +218,34 @@ def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
     )
     result = health(request)
     assert result["orchestrator_lease"] == {"active": True}
+    assert result["total"] == 0
+    assert all(count == 0 for count in result["ticket_counts"].values())
+
+
+def test_public_health_counts_tickets_without_listing_them(tmp_path, monkeypatch):
+    store = TicketStore(persist_dir=tmp_path)
+    for summary in ("first", "second"):
+        store.create_ticket(CreateTicketRequest(summary=summary, description="test"))
+    monkeypatch.setattr(
+        store,
+        "list_tickets",
+        lambda: pytest.fail("health must not copy the full ticket list"),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                trace_health={},
+            )
+        ),
+        client=None,
+    )
+
+    result = health(request)
+
+    assert result["ticket_counts"][TicketStatus.NEW.value] == 2
+    assert set(result["ticket_counts"]) == {status.value for status in TicketStatus}
+    assert result["total"] == 2
 
 
 @pytest.mark.asyncio

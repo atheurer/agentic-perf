@@ -2148,15 +2148,23 @@ async def _poll_loop_after_lease(
 
 _lock_fd: int | None = None
 _lock_file_identity: tuple[int, int] | None = None
+_lock_filesystem = None
 
 
 def _acquire_lock() -> None:
-    global _lock_fd, _lock_file_identity
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o644)
+    global _lock_fd, _lock_file_identity, _lock_filesystem
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(LOCK_FILE.parent)
+    filesystem.mkdir(".", mode=0o777)
+    _lock_filesystem = filesystem
+    fd = filesystem.open_descriptor(
+        LOCK_FILE.name, os.O_WRONLY | os.O_CREAT, mode=0o644
+    )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        filesystem.forget_descriptor(fd)
         os.close(fd)
         try:
             old_pid = LOCK_FILE.read_text().strip()
@@ -2168,8 +2176,12 @@ def _acquire_lock() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    os.ftruncate(fd, 0)
-    os.write(fd, str(os.getpid()).encode())
+    filesystem.write_descriptor(
+        fd,
+        str(os.getpid()).encode(),
+        truncate=True,
+        seek_start=True,
+    )
     _lock_fd = fd
     lock_stat = os.fstat(fd)
     _lock_file_identity = (lock_stat.st_dev, lock_stat.st_ino)
@@ -2177,28 +2189,34 @@ def _acquire_lock() -> None:
 
 
 def _release_lock() -> None:
-    global _lock_fd, _lock_file_identity
+    global _lock_fd, _lock_file_identity, _lock_filesystem
     if _lock_fd is not None:
         # Remove only the pathname that this process actually opened, and do
         # so while still holding the flock.  A replacement orchestrator cannot
         # acquire the lock or race the pathname check until after this point.
         try:
+            from providers.execution import AuditedFilesystem
+
+            filesystem = AuditedFilesystem.system(LOCK_FILE.parent)
             lock_stat = os.stat(LOCK_FILE)
             current_pid = LOCK_FILE.read_text().strip()
             if _lock_file_identity == (
                 lock_stat.st_dev,
                 lock_stat.st_ino,
             ) and current_pid == str(os.getpid()):
-                LOCK_FILE.unlink(missing_ok=True)
+                filesystem.unlink(LOCK_FILE.name, missing_ok=True)
         except OSError:
             pass
         try:
-            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            if _lock_filesystem is not None:
+                _lock_filesystem.lock_descriptor(_lock_fd, fcntl.LOCK_UN)
+                _lock_filesystem.forget_descriptor(_lock_fd)
             os.close(_lock_fd)
         except OSError:
             pass
         _lock_fd = None
         _lock_file_identity = None
+        _lock_filesystem = None
 
 
 def _setup_api_token() -> None:
