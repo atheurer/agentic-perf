@@ -371,6 +371,39 @@ class TestSearchFiltering:
 
 
 class TestHandleMessage:
+    async def test_failed_round_zero_retry_logs_sanitized_exception(self, caplog):
+        from agents.chat.agent import ChatAgent
+
+        class ProviderError(Exception):
+            def __init__(self, status_code: int, detail: str) -> None:
+                self.status_code = status_code
+                super().__init__(detail)
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(
+            side_effect=[
+                ProviderError(503, "first response echoed private chat text"),
+                ProviderError(429, "retry response echoed private ticket text"),
+            ]
+        )
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
+        caplog.set_level("WARNING", logger="agents.chat.agent")
+
+        result = await agent.handle_message(
+            user="alice", message="hello", auth_token="token123"
+        )
+
+        assert (
+            result
+            == "I'm having trouble processing your request right now. Please try again."
+        )
+        assert "private chat text" not in caplog.text
+        assert "private ticket text" not in caplog.text
+        assert "ProviderError (HTTP 503)" in caplog.text
+        assert "ProviderError (HTTP 429)" in caplog.text
+
     async def test_simple_text_response(self):
         from agents.chat.agent import ChatAgent
 
