@@ -3142,12 +3142,12 @@ function renderCustomFields(ticket) {
 
 var _lastResultHash = '';
 
-async function refreshResultSection(ticketId) {
+async function refreshResultSection(ticketId, cachedTicket) {
   if (!ticketId) return;
   if (resultPollInFlight) return;
   resultPollInFlight = true;
   try {
-    var ticket = await api('/tickets/' + ticketId);
+    var ticket = cachedTicket || await api('/tickets/' + ticketId);
     // Skip rebuild if ticket data hasn't changed.
     // innerHTML comparison fails because browsers normalize HTML.
     var dataHash = JSON.stringify(ticket.custom_fields || {});
@@ -3256,9 +3256,9 @@ async function pollEvents(ticketId) {
       actionEl.innerHTML = actionButtonsHtml(ticket.status, ticket);
       bindActionButtons(ticketId);
     }
-    refreshResultSection(ticketId);
+    refreshResultSection(ticketId, ticket);
     updateUsageSidebar(ticketId);
-    updateIntrospectionCard(ticketId);
+    updateIntrospectionCard(ticketId, ticket);
 
     // Proactive HITL: notify chat when ticket needs guidance
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
@@ -3290,7 +3290,7 @@ async function pollEvents(ticketId) {
   }
 }
 
-function updateIntrospectionCard(ticketId) {
+function updateIntrospectionCard(ticketId, cachedTicket) {
   if (!ticketId) return;
   var card = document.getElementById('introspection-card');
   var content = document.getElementById('introspection-content');
@@ -3298,7 +3298,10 @@ function updateIntrospectionCard(ticketId) {
   if (introspectionPollInFlight) return;
   introspectionPollInFlight = true;
 
-  api('/tickets/' + ticketId).then(function(ticket) {
+  var ticketPromise = cachedTicket
+    ? Promise.resolve(cachedTicket)
+    : api('/tickets/' + ticketId);
+  ticketPromise.then(function(ticket) {
     var cf = ticket.custom_fields || {};
     var summary = cf.introspection_summary;
     var intro = cf.introspection;
@@ -3808,18 +3811,23 @@ function renderEventStream() {
 }
 
 function renderNewEvents(events) {
+  var added = 0;
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
     if (evt.seq <= maxRenderedSeq) continue;
     maxRenderedSeq = evt.seq;
     eventRecords.push(evt);
+    added++;
   }
   // Keep the browser-side projection bounded. Raw forensic records remain
   // available through the trace endpoint and are never deleted here.
   if (eventRecords.length > 10000) {
     eventRecords = eventRecords.slice(eventRecords.length - 10000);
   }
-  renderEventStream();
+  // Only rebuild DOM when new events arrived.
+  if (added > 0) {
+    renderEventStream();
+  }
 }
 
 function renderAuditEvent(evt) {
@@ -4354,6 +4362,12 @@ function stopPolling() {
     }
   }
   _chartInstances = {};
+
+  // Clear chart sync groups accumulated across navigations
+  window._cdmSyncGroups = {};
+
+  // Clear cached ticket data
+  _lastResultHash = '';
 }
 
 // ── Main render ──
