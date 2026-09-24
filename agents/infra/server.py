@@ -28,7 +28,7 @@ if _project_root not in sys.path:
 
 from pydantic import BaseModel, ConfigDict
 
-from agents.ethtool import parse_ethtool_flow_rules
+from agents.ethtool import flow_rule_is_verifiable, parse_ethtool_flow_rules
 from agents.infra.topology import discover_cache_topology
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
@@ -392,8 +392,10 @@ async def get_ethtool_info(
 
     mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
     mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S), and
-    mode='flow_rules' returns RX ntuple flow rules (ethtool -u), including
-    flow type, match fields and masks, action, and queue.
+    mode='flow_rules' returns RX ntuple flow rules (ethtool -u), preserving
+    the original flow-type/action text and each qualifier's label, value, and
+    mask alongside the unmodified command output. Partial or unsupported rule
+    details remain visible and are marked with ``partial=true``.
 
     Args:
         host: IP to SSH into
@@ -474,6 +476,11 @@ async def get_ethtool_info(
             indent=2,
         )
     if mode == "flow_rules":
+        for rule in parsed_data["rules"]:
+            rule["partial"] = bool(rule.get("partial")) or not flow_rule_is_verifiable(
+                rule
+            )
+    if mode == "flow_rules":
         filtered_data = parsed_data
     else:
         filtered_data = _filter_ethtool_data(
@@ -489,6 +496,9 @@ async def get_ethtool_info(
     }
     if mode == "flow_rules":
         response["rule_count"] = len(filtered_data["rules"])
+        response["partial"] = any(
+            not flow_rule_is_verifiable(rule) for rule in filtered_data["rules"]
+        )
     # stdout is useful for backwards-compatible unfiltered responses, but it
     # defeats the purpose of server-side filtering by retaining the complete
     # raw dump in the tool result.  Keep it only when no filter was requested.

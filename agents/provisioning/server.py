@@ -31,6 +31,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from agents.ethtool import (
+    flow_rule_is_verifiable,
     flow_rule_matches_config,
     parse_ethtool_flow_rules,
     same_parsed_flow_rule,
@@ -1683,9 +1684,26 @@ async def _read_flow_steering_rules_one(host: str, interface: str) -> dict:
             "status": "error",
             "errors": [f"could not verify ethtool rule table: {exc}"],
         }
+    for rule in rules:
+        rule["partial"] = bool(rule.get("partial")) or not flow_rule_is_verifiable(rule)
+    incomplete_rules = [rule for rule in rules if not flow_rule_is_verifiable(rule)]
+    if incomplete_rules:
+        ids = [rule["id"] for rule in incomplete_rules]
+        return {
+            **response,
+            "status": "error",
+            "partial": True,
+            "rule_count": len(rules),
+            "rules": rules,
+            "errors": [
+                "ethtool rule details are incomplete or unsupported for filter(s): "
+                f"{ids}"
+            ],
+        }
     return {
         **response,
         "status": "ok",
+        "partial": False,
         "rule_count": len(rules),
         "rules": rules,
     }
@@ -1861,18 +1879,41 @@ async def _reset_flow_steering_one(host: str, interface: str) -> dict:
     errors: list[str] = []
 
     quoted_interface = shlex.quote(interface)
-    r = await _ssh.run(host, f"ethtool -n {quoted_interface} 2>&1")
-    rule_ids = []
-    for line in r.stdout.splitlines():
-        if line.strip().startswith("Filter:"):
-            try:
-                rule_ids.append(int(line.split()[-1]))
-            except ValueError:
-                pass
+    readback = await _read_flow_steering_rules_one(host, interface)
+    if readback["status"] != "ok":
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "applied": applied,
+            "errors": readback["errors"],
+            "readback": readback,
+        }
+
+    rule_ids = [rule["id"] for rule in readback["rules"]]
+    deleted_count = 0
     for rid in rule_ids:
-        await _ssh.run(host, f"ethtool -N {quoted_interface} delete {rid} 2>&1")
-    if rule_ids:
-        applied.append(f"deleted {len(rule_ids)} rule(s)")
+        deleted = await _ssh.run(
+            host, f"ethtool -N {quoted_interface} delete {rid} 2>&1"
+        )
+        if deleted.exit_code != 0:
+            errors.append(
+                f"failed to delete existing rule {rid}: {deleted.stdout.strip()}"
+            )
+        else:
+            deleted_count += 1
+    if deleted_count:
+        applied.append(f"deleted {deleted_count} of {len(rule_ids)} rule(s)")
+
+    if errors:
+        return {
+            "host": host,
+            "interface": interface,
+            "status": "error",
+            "applied": applied,
+            "errors": errors,
+            "readback": readback,
+        }
 
     r2 = await _ssh.run(host, f"ethtool -K {quoted_interface} ntuple off 2>&1")
     if r2.exit_code == 0:
@@ -1886,6 +1927,7 @@ async def _reset_flow_steering_one(host: str, interface: str) -> dict:
         "status": "error" if errors else "ok",
         "applied": applied,
         "errors": errors,
+        "readback": readback,
     }
 
 
@@ -1932,12 +1974,15 @@ async def configure_flow_steering(
 async def get_flow_steering_rules(targets: list[FlowSteeringTarget]) -> str:
     """Read the active RX ntuple flow-steering rules from a NIC.
 
-    Returns structured rule IDs, flow types, match fields and masks, actions,
-    queue destinations, and the raw ``ethtool -u`` output. Use it to inspect
-    current state independently after configure_flow_steering; a read failure
-    or unrecognized table is reported as status="error", never as an empty
-    rule list. Pass targets=[{"host": "10.0.0.1", "interface": "ens1f0"}];
-    each target can name its own host and interface.
+    Returns rule IDs plus raw Rule Type/Flow Type and Action labels and values,
+    qualifier labels and value/mask strings, and the original ``ethtool -u``
+    output. Partial or unsupported rule details are returned with
+    ``partial=true`` and ``status="error"`` rather than discarded. Use it to
+    inspect current state independently after configure_flow_steering; a
+    malformed table or read failure is reported as status="error", never as
+    an empty rule list. Pass
+    targets=[{"host": "10.0.0.1", "interface": "ens1f0"}]; each target can
+    name its own host and interface.
     """
     await _ensure_init()
     if not targets:
