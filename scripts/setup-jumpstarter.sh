@@ -54,11 +54,11 @@ echo "Installing Jumpstarter from latest GitHub release..."
 JMP_INSTALL_URL="https://raw.githubusercontent.com/jumpstarter-dev/jumpstarter/BRANCH/python/install.sh"
 
 # Determine the latest release tag (including pre-releases)
-# Pin to a known-working commit on release-0.9.
-# The branch tip has a MCP crash (jumpstarter-dev/jumpstarter#896).
-# Update this when a fixed release is available.
-JMP_COMMIT="cc2706f5fd"
-JMP_BRANCH="release-0.9"
+# Use the stable v0.9.0 release tag.
+# Previously pinned to cc2706f5fd (0.9.0rc2.dev5) to work around
+# jumpstarter-dev/jumpstarter#896 — verify the fix is in v0.9.0.
+JMP_COMMIT=""
+JMP_BRANCH="v0.9.0"
 
 echo "  Target: $JMP_BRANCH @ $JMP_COMMIT"
 
