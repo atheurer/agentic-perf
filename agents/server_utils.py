@@ -199,6 +199,9 @@ def _public_context_document(document: dict[str, Any]) -> dict[str, Any]:
         for key, value in document.items()
         if key not in _CONTEXT_PRIVATE_KEYS
     }
+    content = document.get("content")
+    if isinstance(content, str) and "size_bytes" not in public:
+        public["size_bytes"] = len(content.encode("utf-8"))
     public.pop("source_path", None)
     return public
 
@@ -255,6 +258,9 @@ def _public_context_result(
             for item in public["documents"]
             if isinstance(item, dict)
         ]
+        if public.get("operation") in {"bootstrap", "read"}:
+            for document in public["documents"]:
+                document.pop("content", None)
     if isinstance(public.get("document"), dict):
         public["document"] = _public_context_document(public["document"])
     if isinstance(public.get("results"), list):
@@ -425,45 +431,188 @@ async def _search_controller_source(
         return {"found": False, "operation": "search", "reason": "empty_query"}
     max_results = max(1, min(int(max_results), 100))
     max_bytes = max(1024, min(int(max_bytes), 131072))
-    find_pattern = shlex.quote(f".*({query}).*")
+    search_script = r"""
+import os
+import re
+import sys
+
+VISIBLE_ROOT = "/opt/crucible"
+EXCLUDED_PARTS = {".git", ".ssh", "secrets"}
+EXCLUDED_FILES = {"authorized_keys"}
+MAX_DIRECTORIES = 20000
+MAX_FILES = 200000
+MAX_FILE_BYTES = 1048576
+MAX_TOTAL_FILE_BYTES = 16777216
+
+query = sys.argv[1]
+max_results = int(sys.argv[2])
+max_output_bytes = int(sys.argv[3])
+real_root = os.path.realpath(VISIBLE_ROOT)
+root_prefix = real_root.rstrip(os.sep) + os.sep
+
+try:
+    pattern = re.compile(query)
+except re.error:
+    pattern = re.compile(re.escape(query))
+
+def is_within_root(path):
+    resolved = os.path.realpath(path)
+    return resolved == real_root or resolved.startswith(root_prefix)
+
+def is_excluded(path):
+    parts = set(os.path.normpath(path).split(os.sep))
+    if parts & EXCLUDED_PARTS:
+        return True
+    name = os.path.basename(path)
+    return name in EXCLUDED_FILES or name.endswith((".pem", ".key"))
+
+def main():
+    output = []
+    output_bytes = 0
+    truncated = False
+    incomplete = False
+    visited_directories = 0
+    visited_files = 0
+    total_file_bytes = 0
+    stack = [(VISIBLE_ROOT, ())]
+
+    def emit(record):
+        nonlocal output_bytes, truncated
+        encoded = (record + "\n").encode("utf-8", errors="replace")
+        if output_bytes + len(encoded) > max_output_bytes:
+            truncated = True
+            return False
+        output.append(record)
+        output_bytes += len(encoded)
+        if len(output) >= max_results:
+            truncated = True
+            return False
+        return True
+
+    while stack and not truncated:
+        directory, ancestors = stack.pop()
+        real_directory = os.path.realpath(directory)
+        if (
+            not is_within_root(directory)
+            or real_directory in ancestors
+            or is_excluded(directory)
+            or is_excluded(real_directory)
+        ):
+            continue
+        visited_directories += 1
+        if visited_directories > MAX_DIRECTORIES:
+            truncated = True
+            break
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            continue
+
+        child_directories = []
+        next_ancestors = ancestors + (real_directory,)
+        for entry in entries:
+            path = entry.path
+            if (
+                "\t" in path
+                or "\n" in path
+                or "\r" in path
+                or is_excluded(path)
+                or not is_within_root(path)
+            ):
+                continue
+            real_path = os.path.realpath(path)
+            if is_excluded(real_path):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=True):
+                    if pattern.search(path) and not emit("NAME\td\t\t" + path):
+                        break
+                    child_directories.append(path)
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                file_size = entry.stat(follow_symlinks=True).st_size
+                if pattern.search(path) and not emit(
+                    "NAME\tf\t{}\t{}".format(file_size, path)
+                ):
+                    break
+                visited_files += 1
+                if visited_files > MAX_FILES or total_file_bytes >= MAX_TOTAL_FILE_BYTES:
+                    truncated = True
+                    break
+                with open(path, "rb") as source:
+                    content = source.read(MAX_FILE_BYTES + 1)
+                if len(content) > MAX_FILE_BYTES:
+                    incomplete = True
+                total_file_bytes += min(len(content), MAX_FILE_BYTES)
+                content = content[:MAX_FILE_BYTES]
+                if b"\0" in content[:8192]:
+                    continue
+                for line_number, line in enumerate(content.splitlines(), 1):
+                    decoded = line.decode("utf-8", errors="replace")
+                    if pattern.search(decoded):
+                        decoded = decoded.replace("\t", " ")
+                        if not emit(
+                            "CONTENT\t{}\t{}\t{}".format(
+                                path, line_number, decoded[:1000]
+                            )
+                        ):
+                            break
+            except OSError:
+                continue
+            if truncated:
+                break
+        if not truncated:
+            stack.extend((path, next_ancestors) for path in reversed(child_directories))
+
+    if truncated or incomplete:
+        output.append("TRUNCATED\tlimit_reached")
+    sys.stdout.write("\n".join(output))
+    if output:
+        sys.stdout.write("\n")
+
+main()
+"""
     command = (
-        "{ "
-        "find /opt/crucible -regextype posix-extended "
-        "\\( -path '*/.git' -o -path '*/.ssh' -o -path '*/secrets' \\) -prune -o "
-        f"\\( -type f -o -type d \\) -regex {find_pattern} "
-        "-printf 'NAME\\t%y\\t%p\\n' 2>/dev/null; "
-        "grep -rInE --binary-files=without-match "
-        "--exclude-dir=.git --exclude-dir=.ssh --exclude-dir=secrets "
-        "--exclude='*.pem' --exclude='*.key' --exclude='authorized_keys' "
-        f"-- {shlex.quote(query)} /opt/crucible 2>/dev/null "
-        "| sed 's/^/CONTENT\\t/'; "
-        f"}} | head -n {max_results}"
+        "python3 -c "
+        f"{shlex.quote(search_script)} "
+        f"{shlex.quote(query)} {max_results} {max_bytes}"
     )
     result = await ssh.run(controller_host, command, timeout=30)
     raw_output = result.stdout.encode("utf-8", errors="replace")
     grouped: dict[str, dict[str, Any]] = {}
     total_matches = 0
+    remote_truncated = False
     for line in raw_output[:max_bytes].decode("utf-8", errors="replace").splitlines():
         fields = line.split("\t", 3)
         if not fields:
             continue
         kind = fields[0]
+        if kind == "TRUNCATED":
+            remote_truncated = True
+            continue
+        raw_size = ""
         if kind == "NAME":
-            if len(fields) != 3:
+            if len(fields) != 4:
                 continue
-            file_type, value = fields[1:]
+            file_type, raw_size, value = fields[1:]
             raw_path = value
             line_number = ""
             content = ""
         elif kind == "CONTENT":
-            if len(fields) != 2:
+            if len(fields) == 4:
+                _, raw_path, line_number, content = fields
+                file_type = "f"
+            elif len(fields) == 2:
+                # Accept the legacy grep format while older remote servers roll
+                # forward to the structured tab-separated output.
+                file_type = "f"
+                content_fields = fields[1].split(":", 2)
+                if len(content_fields) != 3:
+                    continue
+                raw_path, line_number, content = content_fields
+            else:
                 continue
-            file_type = "f"
-            value = fields[1]
-            content_fields = value.split(":", 2)
-            if len(content_fields) != 3:
-                continue
-            raw_path, line_number, content = content_fields
         else:
             continue
         if not raw_path.startswith("/opt/crucible/"):
@@ -478,10 +627,22 @@ async def _search_controller_source(
                 "ref": relative,
                 "uri": f"crucible://{relative}",
                 "type": "directory" if file_type == "d" else "file",
+                "size_bytes": (
+                    int(raw_size)
+                    if kind == "NAME" and file_type == "f" and raw_size.isdigit()
+                    else None
+                ),
                 "match_kinds": [],
                 "matches": [],
             },
         )
+        if (
+            kind == "NAME"
+            and entry.get("size_bytes") is None
+            and file_type == "f"
+            and raw_size.isdigit()
+        ):
+            entry["size_bytes"] = int(raw_size)
         match_kind = "name" if kind == "NAME" else "content"
         if match_kind not in entry["match_kinds"]:
             entry["match_kinds"].append(match_kind)
@@ -493,6 +654,24 @@ async def _search_controller_source(
             }
         )
     files = list(grouped.values())
+    missing_sizes = [
+        "/opt/crucible/" + entry["ref"]
+        for entry in files
+        if entry["type"] == "file" and entry.get("size_bytes") is None
+    ]
+    if missing_sizes:
+        stat_command = shlex.join(["stat", "--printf=%n\\t%s\\n", "--", *missing_sizes])
+        stat_result = await ssh.run(controller_host, stat_command, timeout=15)
+        sizes_by_path = {}
+        for line in stat_result.stdout.splitlines():
+            fields = line.split("\t", 1)
+            if len(fields) == 2 and fields[1].isdigit():
+                relative = _controller_relative_path(fields[0])
+                if relative:
+                    sizes_by_path[relative] = int(fields[1])
+        for entry in files:
+            if entry.get("size_bytes") is None:
+                entry["size_bytes"] = sizes_by_path.get(entry["ref"])
     for entry in files:
         entry["match_count"] = len(entry["matches"])
     return {
@@ -503,7 +682,11 @@ async def _search_controller_source(
         "results": files,
         "total_files": len(files),
         "total_matches": total_matches,
-        "truncated": total_matches >= max_results or len(raw_output) > max_bytes,
+        "truncated": (
+            remote_truncated
+            or total_matches >= max_results
+            or len(raw_output) > max_bytes
+        ),
     }
 
 
@@ -512,7 +695,6 @@ async def _read_controller_document(
     ssh: Any,
     controller_host: str,
     relative: str,
-    max_bytes: int = 262144,
 ) -> Any:
     """Read a controller document only after resolving symlinks safely.
 
@@ -527,7 +709,7 @@ async def _read_controller_document(
         "root=$(realpath -e -- /opt/crucible) && "
         f"candidate=$(realpath -e -- {quoted_path}) && "
         'case "$candidate" in "$root"/*) '
-        f'test -f "$candidate" && head -c {max_bytes} "$candidate";; '
+        'test -f "$candidate" && cat -- "$candidate";; '
         "*) exit 2;; esac"
     )
     return await ssh.run(controller_host, command, timeout=30)
@@ -545,6 +727,8 @@ async def controller_context_gateway(
     path: str = "",
     query: str = "",
     include_alternates: bool = False,
+    max_bytes: int = 16 * 1024,
+    offset_bytes: int = 0,
 ) -> str:
     """Read controller context by following paths supplied by AGENTS.md.
 
@@ -559,7 +743,12 @@ async def controller_context_gateway(
     if operation == "bootstrap":
         path = "AGENTS.md"
     if operation == "read":
-        cached = manager.read_document(path, include_alternates=include_alternates)
+        cached = manager.read_document(
+            path,
+            include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
         if cached.get("status") == "ok":
             result = {
                 "found": True,
@@ -648,6 +837,7 @@ async def controller_context_gateway(
             "provenance": provenance,
             "entrypoint": relative == "AGENTS.md",
             "content": content,
+            "size_bytes": len(content.encode("utf-8")),
             "workspace_ref": saved.get("files", {}).get(relative),
         }
         manager.index_context_documents([document])
@@ -665,6 +855,22 @@ async def controller_context_gateway(
             "document": document,
             "documents": [document],
         }
+        if operation in {"bootstrap", "read"}:
+            page = manager.read_document(
+                relative,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
+            )
+            if page.get("status") != "ok":
+                return json.dumps(
+                    {
+                        "found": False,
+                        "operation": operation,
+                        **page,
+                    }
+                )
+            result["document"] = {**document, **page}
     elif operation == "search":
         result = await _search_controller_source(
             ssh=ssh,
@@ -711,6 +917,8 @@ async def crucible_context_gateway(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16 * 1024,
+    offset_bytes: int = 0,
 ) -> str:
     """Expose and persist the phase-owned Crucible context gateway.
 
@@ -734,7 +942,10 @@ async def crucible_context_gateway(
         )
         if operation == "bootstrap":
             cached = manager.read_document(
-                "core/AGENTS.md", include_alternates=include_alternates
+                "core/AGENTS.md",
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             if cached.get("status") == "ok":
                 return json.dumps(
@@ -760,7 +971,12 @@ async def crucible_context_gateway(
                 }
             )
         if operation == "read" and path:
-            cached = manager.read_document(path, include_alternates=include_alternates)
+            cached = manager.read_document(
+                path,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
+            )
             if cached.get("status") == "ok":
                 return json.dumps(
                     _public_context_result(
@@ -901,7 +1117,10 @@ async def crucible_context_gateway(
         }
         if requested_operation == "read":
             workspace_document = manager.read_document(
-                path, include_alternates=include_alternates
+                path,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             if workspace_document.get("status") == "ok":
                 metadata = next(
@@ -915,7 +1134,7 @@ async def crucible_context_gateway(
                 )
                 result["document"] = {
                     **metadata,
-                    "content": workspace_document["content"],
+                    **workspace_document,
                 }
         elif requested_operation == "search":
             result = {
