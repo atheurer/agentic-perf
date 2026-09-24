@@ -384,6 +384,10 @@ async def _apply_step_overrides(
         override_fields["provisioning_complete"] = False
         override_fields["hosts_provisioned"] = []
 
+    if agent_type == "provision" and step_params.get("kernel"):
+        override_fields["provisioning_complete"] = False
+        override_fields["hosts_provisioned"] = []
+
     if agent_type in ("resource", "provision"):
         if step_params.get("directives"):
             existing = dict(cf.get("directives", {}))

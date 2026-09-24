@@ -165,6 +165,26 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
             f"(harness={harness}, hosts_provisioned={hosts})",
         )
 
+    plan = cf.get("execution_plan", {})
+    current_step = plan.get("current_step")
+    if current_step is not None and plan.get("steps"):
+        from providers.kernel_plan import preceding_kernel_step
+
+        prev_kernel = preceding_kernel_step(plan, current_step)
+        if prev_kernel is not None:
+            step_id = str(prev_kernel["id"])
+            transitions = cf.get("kernel_transitions", {})
+            transition = transitions.get(step_id, {})
+            state = transition.get("state", "")
+            if state != "verified":
+                expected = prev_kernel["params"]["kernel"].get("release", "?")
+                return (
+                    False,
+                    f"Kernel transition for step {step_id} is"
+                    f" {state!r}, not 'verified'"
+                    f" (expected kernel: {expected})",
+                )
+
     return True, ""
 
 
