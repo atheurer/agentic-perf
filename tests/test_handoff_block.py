@@ -166,3 +166,100 @@ class TestBlockHandoffFailedRewindFallback:
         assert len(post_calls) == 3
         final_url, final_json = post_calls[-1]
         assert final_json["status"] == "awaiting_customer_guidance"
+
+    async def test_returns_false_when_hitl_transition_fails(
+        self,
+        mock_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Returns False when HITL transition fails so caller retries."""
+        import orchestrator.main as mod
+
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+
+        def make_response(
+            status_code: int = 200,
+            json_data: dict | None = None,
+        ):
+            resp = MagicMock()
+            resp.status_code = status_code
+            resp.json.return_value = json_data or {}
+            return resp
+
+        call_count = 0
+
+        async def fake_post(url: str, json: dict | None = None, **kw):
+            nonlocal call_count
+            call_count += 1
+            # Rewind fails, comment succeeds, HITL transition fails
+            if "transition" in url:
+                return make_response(422)
+            return make_response(200)
+
+        async def fake_get(url: str, **kw):
+            return make_response(
+                200,
+                {"status": "evaluating_convergence"},
+            )
+
+        mock_client.post = fake_post
+        mock_client.get = fake_get
+
+        with patch.object(
+            mod,
+            "AuditedAsyncHTTPClient",
+            lambda **kwargs: mock_client,
+        ):
+            result = await mod._block_handoff_failed(
+                store_url="http://store:8090",
+                ticket_id="PERF-TEST3",
+                reason="test",
+                current_status="evaluating_convergence",
+            )
+
+        assert result is False
+
+    async def test_returns_true_when_hitl_succeeds(
+        self,
+        mock_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Returns True when HITL transition succeeds."""
+        import orchestrator.main as mod
+
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+
+        def make_response(
+            status_code: int = 200,
+            json_data: dict | None = None,
+        ):
+            resp = MagicMock()
+            resp.status_code = status_code
+            resp.json.return_value = json_data or {}
+            return resp
+
+        async def fake_post(url: str, json: dict | None = None, **kw):
+            return make_response(200)
+
+        async def fake_get(url: str, **kw):
+            return make_response(
+                200,
+                {"status": "executing_benchmark"},
+            )
+
+        mock_client.post = fake_post
+        mock_client.get = fake_get
+
+        with patch.object(
+            mod,
+            "AuditedAsyncHTTPClient",
+            lambda **kwargs: mock_client,
+        ):
+            result = await mod._block_handoff_failed(
+                store_url="http://store:8090",
+                ticket_id="PERF-TEST4",
+                reason="test",
+                current_status="evaluating_convergence",
+            )
+
+        assert result is True

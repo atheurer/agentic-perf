@@ -1298,7 +1298,13 @@ async def _block_handoff_failed(
     reason: str,
     current_status: str = "",
     event_bus: EventBus | None = None,
-) -> None:
+) -> bool:
+    """Attempt to recover a handoff-blocked ticket to HITL.
+
+    Returns True if the ticket was successfully transitioned to
+    awaiting_customer_guidance, False if the transition failed
+    and should be retried on the next poll cycle.
+    """
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
@@ -1351,11 +1357,13 @@ async def _block_handoff_failed(
         if hitl_resp.status_code >= 400:
             logger.error(
                 "HITL transition to awaiting_customer_guidance failed "
-                "(HTTP %d) for %s from status %s",
+                "(HTTP %d) for %s from status %s — will retry",
                 hitl_resp.status_code,
                 ticket_id,
                 actual_status,
             )
+            return False
+    return True
 
 
 async def _process_stop_requests(
@@ -2012,14 +2020,19 @@ async def _poll_loop_after_lease(
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            dispatcher.mark_handoff_blocked(tid, status)
-                            await _block_handoff_failed(
+                            recovered = await _block_handoff_failed(
                                 config.state_store_url,
                                 tid,
                                 reason,
                                 status,
                                 event_bus=dispatcher.events,
                             )
+                            # Only mark as blocked if the HITL
+                            # transition succeeded. If it failed,
+                            # leave unblocked so we retry next cycle
+                            # instead of hanging forever.
+                            if recovered:
+                                dispatcher.mark_handoff_blocked(tid, status)
                         continue
 
                     # Per-user/group quota check (multi-user only).
