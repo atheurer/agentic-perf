@@ -19,7 +19,7 @@ def health(request: Request):
     # Ensure all statuses are present (including zero counts)
     for status in TicketStatus:
         counts.setdefault(status.value, 0)
-    total = store.ticket_count()
+    total = sum(counts.values())
     spool_bytes = 0
     oldest = None
     quarantined = 0

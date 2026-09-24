@@ -454,11 +454,6 @@ class TicketStore:
                 counts[key] = counts.get(key, 0) + 1
             return counts
 
-    def ticket_count(self) -> int:
-        """Return total number of tickets without copying."""
-        with self._lock:
-            return len(self._tickets)
-
     def list_tickets(self, status: TicketStatus | None = None) -> list[Ticket]:
         with self._lock:
             tickets = list(self._tickets.values())
