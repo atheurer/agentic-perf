@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -18,6 +19,8 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from providers.tracing import (
     ActionDescriptor,
@@ -324,9 +327,21 @@ class _AuditedHTTPBase:
                     "mutating HTTP requires central trace readiness"
                 )
             return
-        await asyncio.to_thread(
-            self._recorder.record_critical if critical else self._recorder.record, event
-        )
+        try:
+            await asyncio.to_thread(
+                self._recorder.record_critical if critical else self._recorder.record,
+                event,
+            )
+        except Exception:
+            if critical:
+                raise
+            # Non-critical trace failures (e.g., spool full) must
+            # never block agent operations.  Log once and continue.
+            logger.warning(
+                "non-critical trace event dropped: %s",
+                event.event_id,
+                exc_info=True,
+            )
 
     def _headers(
         self,
