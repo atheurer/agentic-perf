@@ -15,10 +15,11 @@ from agents.platform.agent import PlatformAgent
 class TestPlatformAgent:
     """Test platform agent setup and routing."""
 
-    def _make_agent(self):
+    def _make_agent(self, event_bus=None):
         return PlatformAgent(
             llm_provider=AsyncMock(),
             state_store_url="http://localhost:8090",
+            event_bus=event_bus,
         )
 
     def test_system_prompt(self):
@@ -79,6 +80,84 @@ class TestPlatformAgent:
         msgs = agent._build_messages(ticket)
         assert "Image Resolution Error" in msgs[0]["content"]
         assert "platform_ready=false" in msgs[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_run_escalates_missing_image_version_without_llm(self):
+        event_bus = MagicMock()
+        agent = self._make_agent(event_bus=event_bus)
+        flash_error = (
+            "No OS image version specified. Set image_version in ticket directives."
+        )
+
+        with (
+            patch("agents.platform.agent.AgentMCPClient") as mcp_factory,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {"jumpstarter_flash": {"error": flash_error}}
+                },
+            ),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock) as add_comment,
+            patch.object(
+                agent, "_transition_ticket", new_callable=AsyncMock
+            ) as transition,
+            patch(
+                "agents.platform.agent.AgentBase.run", new_callable=AsyncMock
+            ) as base_run,
+        ):
+            await agent.run("T-1")
+
+        add_comment.assert_awaited_once()
+        assert "missing user input" in add_comment.await_args.args[1]
+        assert flash_error in add_comment.await_args.args[1]
+        transition.assert_awaited_once_with(
+            "T-1",
+            "awaiting_customer_guidance",
+            comment="Platform agent: missing image_version — user input required",
+        )
+        mcp_factory.assert_not_called()
+        base_run.assert_not_awaited()
+        assert agent._mcp is None
+        assert [call.args[2] for call in event_bus.emit.call_args_list] == [
+            "agent_started",
+            "agent_finished",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_records_early_escalation_error(self):
+        event_bus = MagicMock()
+        agent = self._make_agent(event_bus=event_bus)
+
+        with (
+            patch("agents.platform.agent.AgentMCPClient") as mcp_factory,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "jumpstarter_flash": {"error": "No OS image_version specified"}
+                    }
+                },
+            ),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("transition failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="transition failed"):
+                await agent.run("T-1")
+
+        mcp_factory.assert_not_called()
+        assert [call.args[2] for call in event_bus.emit.call_args_list] == [
+            "agent_started",
+            "agent_error",
+        ]
 
     @pytest.mark.asyncio
     async def test_handle_completion_success(self):
