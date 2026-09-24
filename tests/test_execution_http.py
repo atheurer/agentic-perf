@@ -5,6 +5,7 @@ import asyncio
 import httpx
 import pytest
 
+import providers.execution.http as execution_http
 from providers.execution import (
     AmbiguousHTTPReplayError,
     AuditedAsyncHTTPClient,
@@ -16,6 +17,7 @@ from providers.tracing import (
     new_trace_context,
     reset_trace_context,
 )
+from providers.tracing.spool import SpoolBackpressure
 from state_store.trace_store import TraceStore
 
 
@@ -359,6 +361,73 @@ async def test_mutation_without_audit_readiness_fails_before_send(monkeypatch) -
     finally:
         reset_trace_context(token)
     assert not called
+
+
+@pytest.mark.asyncio
+async def test_noncritical_spool_backpressure_does_not_block_read(monkeypatch, caplog):
+    sent = False
+
+    class BackpressuredRecorder:
+        def record(self, _event):
+            raise SpoolBackpressure("trace spool size cap reached")
+
+        def record_critical(self, _event):
+            raise SpoolBackpressure("trace spool size cap reached")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent = True
+        return httpx.Response(200)
+
+    monkeypatch.setattr(execution_http, "_backpressure_logged", False)
+    token = _context()
+    try:
+        async with AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            recorder=BackpressuredRecorder(),
+        ) as client:
+            response = await client.get("https://provider.example/read")
+    finally:
+        reset_trace_context(token)
+
+    assert response.status_code == 200
+    assert sent
+    warnings = [
+        record
+        for record in caplog.records
+        if "non-critical trace recording degraded" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_critical_spool_backpressure_fails_mutation_before_send():
+    sent = False
+
+    class BackpressuredRecorder:
+        def record(self, _event):
+            raise SpoolBackpressure("trace spool size cap reached")
+
+        def record_critical(self, _event):
+            raise SpoolBackpressure("trace spool size cap reached")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent = True
+        return httpx.Response(201)
+
+    token = _context()
+    try:
+        async with AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            recorder=BackpressuredRecorder(),
+        ) as client:
+            with pytest.raises(SpoolBackpressure, match="size cap reached"):
+                await client.post("https://provider.example/jobs")
+    finally:
+        reset_trace_context(token)
+
+    assert not sent
 
 
 @pytest.mark.asyncio
