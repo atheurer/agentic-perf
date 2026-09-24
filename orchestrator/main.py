@@ -312,7 +312,7 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             ),
         }
     elif agent_type == "provision":
-        return {
+        result = {
             "provisioning_complete": cf.get("provisioning_complete", False),
             "hosts_provisioned": cf.get("hosts_provisioned", []),
             "harness_name": cf.get("harness_name", ""),
@@ -321,6 +321,22 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
             "ssh_hardware_ips": cf.get("ssh_hardware_ips", {}),
             "assigned_hardware_ips": cf.get("assigned_hardware_ips", {}),
         }
+        plan = cf.get("execution_plan", {})
+        current = plan.get("current_step")
+        if current is not None:
+            step_id = str(current)
+            transitions = cf.get("kernel_transitions", {})
+            if step_id in transitions:
+                t = transitions[step_id]
+                result["kernel_transition"] = {
+                    "kernel": t.get("kernel", ""),
+                    "state": t.get("state", ""),
+                    "hosts": {
+                        h: {"observed_kernel": info.get("observed_kernel", "")}
+                        for h, info in t.get("hosts", {}).items()
+                    },
+                }
+        return result
     elif agent_type == "teardown":
         return {"teardown_complete": True}
     elif agent_type == "review":
@@ -523,6 +539,34 @@ async def _advance_plan(
                             "to apply NIC/IRQ tuning. Reply to have "
                             "provisioning re-run tuning, or override if this "
                             "was intentional."
+                        ),
+                    },
+                )
+                response.raise_for_status()
+                return
+
+        if step.get("agent_type") == "provision" and step.get("params", {}).get(
+            "kernel"
+        ):
+            step_id = str(step.get("id", current))
+            transitions = cf.get("kernel_transitions", {})
+            transition = transitions.get(step_id, {})
+            t_state = transition.get("state", "")
+            if t_state != "verified":
+                kernel_rel = step["params"]["kernel"].get("release", "?")
+                logger.warning(
+                    f"[advance-plan] {ticket_id}: kernel transition"
+                    f" for step {step_id} is {t_state!r}, blocking advance"
+                )
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": (
+                            f"Kernel transition for step {step_id}"
+                            f" ({kernel_rel}) is {t_state!r}, not"
+                            f" 'verified'. The benchmark cannot proceed"
+                            f" until the kernel is verified on all hosts."
                         ),
                     },
                 )
