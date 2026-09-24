@@ -421,9 +421,9 @@ class TestHandleCompletion:
         ):
             await agent._handle_completion("PERF-TEST", response)
 
-        assert agent._update_fields.await_count == 1
+        assert agent._update_fields.await_count == 2
         dedup = agent._update_fields.await_args.args[1]["dedup_result"]
-        assert "record_url" not in dedup
+        assert dedup["record_url"] == ""
         assert "[RCA-998](" not in agent._add_comment.await_args.args[1]
 
 
