@@ -189,20 +189,20 @@ def _inventory() -> list[Mutation]:
 # The equality assertion below makes source additions, removals, and line moves
 # fail until a reviewer updates this list and the rationale document together.
 _EXPECTED_MANIFEST = """
-agents/benchmark/server.py|3770|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|3815|staging.unlink
-agents/benchmark/server.py|3817|unlink
-agents/benchmark/server.py|4095|tempfile.NamedTemporaryFile
-agents/benchmark/server.py|4200|staging.unlink
-agents/benchmark/server.py|4202|unlink
-agents/benchmark/server.py|4532|open
-agents/benchmark/server.py|4714|diag_file.write_text
-agents/benchmark/server.py|4745|artifact_filesystem.unlink
-agents/benchmark/server.py|4747|serial_log_path.unlink
-agents/benchmark/server.py|4778|metadata_file.write_bytes
-agents/benchmark/server.py|4785|metadata_file.write_text
-agents/benchmark/server.py|4791|metadata_file.write_text
-agents/benchmark/server.py|4846|merged_file.write_bytes
+agents/benchmark/server.py|3752|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|3797|staging.unlink
+agents/benchmark/server.py|3799|unlink
+agents/benchmark/server.py|4077|tempfile.NamedTemporaryFile
+agents/benchmark/server.py|4182|staging.unlink
+agents/benchmark/server.py|4184|unlink
+agents/benchmark/server.py|4514|open
+agents/benchmark/server.py|4696|diag_file.write_text
+agents/benchmark/server.py|4727|artifact_filesystem.unlink
+agents/benchmark/server.py|4729|serial_log_path.unlink
+agents/benchmark/server.py|4760|metadata_file.write_bytes
+agents/benchmark/server.py|4767|metadata_file.write_text
+agents/benchmark/server.py|4773|metadata_file.write_text
+agents/benchmark/server.py|4828|merged_file.write_bytes
 agents/infra/server.py|209|tempfile.NamedTemporaryFile
 agents/infra/server.py|217|staging.unlink
 agents/infra/server.py|219|unlink
@@ -329,10 +329,10 @@ state_store/process_lock.py|148|self.root.mkdir
 state_store/process_lock.py|150|os.open
 state_store/process_lock.py|194|os.ftruncate
 state_store/process_lock.py|196|os.write
-state_store/store.py|1889|filesystem.mkdir
-state_store/store.py|1896|filesystem.mkdir
-state_store/store.py|1909|log_filesystem.rename
-state_store/store.py|1918|filesystem.rename
+state_store/store.py|1897|filesystem.mkdir
+state_store/store.py|1904|filesystem.mkdir
+state_store/store.py|1917|log_filesystem.rename
+state_store/store.py|1926|filesystem.rename
 state_store/trace_store.py|82|self.db_path.parent.mkdir
 """
 

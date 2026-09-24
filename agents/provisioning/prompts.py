@@ -17,7 +17,9 @@ separate calls. This reduces round-trips and runs operations in parallel.
 Tools that take uniform parameters across hosts use `hosts: list[str]`:
   check_platform_contract, ensure_prerequisites, install_harness,
   check_existing_install, verify_harness_install, update_install,
-  uninstall_harness, install_k3s, ensure_harness_installed
+  uninstall_harness, install_k3s, ensure_harness_installed,
+  get_kernel_inventory, prepare_kernel_change, install_kernel,
+  select_default_kernel
 
 Install-related tools (install_harness, ensure_harness_installed, uninstall_harness,
 verify_harness_install, check_existing_install, update_install) also accept
