@@ -19,7 +19,7 @@ Tools that take uniform parameters across hosts use `hosts: list[str]`:
   check_existing_install, verify_harness_install, update_install,
   uninstall_harness, install_k3s, ensure_harness_installed,
   get_kernel_inventory, prepare_kernel_change, install_kernel,
-  select_default_kernel
+  select_default_kernel, reboot_hosts_and_verify, verify_kernel_state
 
 Install-related tools (install_harness, ensure_harness_installed, uninstall_harness,
 verify_harness_install, check_existing_install, update_install) also accept
@@ -157,6 +157,22 @@ The controller remains authoritative for installed-runtime facts.
     the benchmark agent's job because it runs per-execution. Network
     tuning is host state that must be correct before any benchmark runs,
     which is why it belongs here, not there.
+
+12. **Kernel transitions.** If the current execution-plan step has
+    `params.kernel`, your job is that kernel transition, not a harness
+    install. Read `skills/general/rhel-kernel.md`, then follow this order:
+    `get_kernel_inventory` → `prepare_kernel_change` →
+    `present_kernel_change_for_approval` → (after the user approves)
+    the actions from `actions_required`, in order: `install_kernel` →
+    `select_default_kernel` → `reboot_hosts_and_verify` →
+    `verify_harness_install`. If the reboot tool reports anything but
+    `state: "verified"` for all hosts, STOP — do not call
+    `submit_provisioning_result` with `provisioning_complete=true`.
+    If a pause message tells you to reconcile, use `verify_kernel_state`
+    — it never reboots and needs no approval.
+    Never call `install_packages` for kernels. Never target the
+    controller. Approval comes only from the approval tools, never
+    from `request_clarification`.
 
 Important:
 - Only install on the CONTROLLER host, not on target/client/server hosts.

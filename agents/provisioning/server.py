@@ -3160,6 +3160,288 @@ async def select_default_kernel(
     return json.dumps(_summarize(results))
 
 
+async def _reboot_and_verify_one(
+    host: str,
+    spec: KernelSpec,
+    *,
+    reconnect_timeout_seconds: int,
+    poll_interval_seconds: int,
+    reboot_policy: str,
+    down_grace_seconds: int = 120,
+) -> dict[str, Any]:
+    """Reboot a single host and verify it comes up on the expected kernel."""
+    import time
+
+    from providers.rhel_kernel import (
+        build_probe_command,
+        build_reboot_command,
+        parse_probe,
+    )
+
+    record: dict[str, Any] = {
+        "host": host,
+        "state": "pending",
+        "rebooted": False,
+        "pre_boot_id": None,
+        "post_boot_id": None,
+        "pre_kernel": None,
+        "observed_kernel": None,
+        "default_entry": None,
+        "went_down": False,
+        "attempts": 0,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": None,
+        "error": None,
+    }
+
+    def _finish(state: str) -> dict[str, Any]:
+        record["state"] = state
+        record["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return record
+
+    # Pre-check: probe the host
+    probe_result = await _ssh.run(host, build_probe_command(), timeout=15)
+    if probe_result.exit_code != 0:
+        return _finish("precheck_failed")
+
+    try:
+        probe = parse_probe(probe_result.stdout)
+    except ValueError:
+        record["error"] = "unparsable probe output"
+        return _finish("indeterminate")
+
+    record["pre_boot_id"] = probe.boot_id
+    record["pre_kernel"] = probe.kernel
+    record["default_entry"] = probe.default_entry
+
+    # Check the default entry matches expected
+    if probe.default_entry != spec.vmlinuz:
+        record["error"] = (
+            f"default entry {probe.default_entry} != expected {spec.vmlinuz}"
+        )
+        return _finish("precheck_failed")
+
+    # If the host is already running the expected kernel
+    if probe.kernel == spec.release:
+        if reboot_policy == "if_needed":
+            record["observed_kernel"] = probe.kernel
+            record["post_boot_id"] = probe.boot_id
+            return _finish("verified")
+        # reboot_policy == "always" — reboot even if already on target
+
+    # Issue the reboot
+    record["state"] = "rebooting"
+    reboot_result = await _ssh.run(
+        host, build_reboot_command(), timeout=15, mutating=True
+    )
+    if reboot_result.exit_code not in (0, 255):
+        record["error"] = "reboot command failed"
+        return _finish("indeterminate")
+    record["rebooted"] = True
+
+    # Poll for reconnection
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < reconnect_timeout_seconds:
+        record["attempts"] += 1
+        await asyncio.sleep(poll_interval_seconds)
+
+        poll_result = await _ssh.run(host, build_probe_command(), timeout=10)
+        if poll_result.exit_code in (255, -1):
+            record["went_down"] = True
+            record["state"] = "reconnecting"
+            continue
+
+        if poll_result.exit_code != 0:
+            continue
+
+        try:
+            poll_probe = parse_probe(poll_result.stdout)
+        except ValueError:
+            record["error"] = "unparsable probe during reconnect"
+            return _finish("indeterminate")
+
+        if poll_probe.boot_id != record["pre_boot_id"]:
+            record["post_boot_id"] = poll_probe.boot_id
+            record["observed_kernel"] = poll_probe.kernel
+            if poll_probe.kernel == spec.release:
+                return _finish("verified")
+            elif poll_probe.kernel == record["pre_kernel"]:
+                return _finish("fallback_boot")
+            else:
+                return _finish("kernel_mismatch")
+
+        # Still on the old boot
+        elapsed = time.monotonic() - start_time
+        if elapsed > down_grace_seconds and not record["went_down"]:
+            return _finish("reboot_not_observed")
+
+    return _finish("reconnect_timeout")
+
+
+@mcp.tool()
+async def reboot_hosts_and_verify(
+    hosts: list[str],
+    expected_kernel: str,
+    approval_request_id: str,
+    strategy: str = "serial",
+    reconnect_timeout_seconds: int = 900,
+    poll_interval_seconds: int = 10,
+    reboot_policy: str = "always",
+) -> str:
+    """Reboot hosts serially and verify each comes up on the expected kernel.
+
+    This is a long-lived operation. Each host is rebooted, then polled
+    until SSH reconnects and uname -r matches the expected kernel. Hosts
+    are processed serially — the next host is only rebooted after the
+    previous one is verified.
+
+    reboot_policy: "always" (default) reboots even if the host already
+    runs the expected kernel; "if_needed" skips the reboot if the host
+    is already on the target kernel with the correct default entry.
+    """
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        assert_kernel_matches_step,
+        refuse_protected_targets,
+    )
+    from agents.server_utils import assert_ticket_active
+
+    if strategy != "serial":
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "strategy_unsupported",
+                "error": f"Only 'serial' strategy is supported, got {strategy!r}",
+            }
+        )
+
+    if reboot_policy not in ("always", "if_needed"):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "invalid_reboot_policy",
+                "error": "reboot_policy must be 'always' or 'if_needed'",
+            }
+        )
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    ok, reason = assert_kernel_matches_step(ticket, expected_kernel)
+    if not ok:
+        return json.dumps({"status": "rejected", "reason_code": reason})
+
+    spec = KernelSpec.parse(expected_kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+
+    results: dict[str, dict[str, Any]] = {}
+    for host, info in refused.items():
+        results[host] = info
+
+    all_verified = True
+    for host in allowed:
+        record = await _reboot_and_verify_one(
+            host,
+            spec,
+            reconnect_timeout_seconds=reconnect_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            reboot_policy=reboot_policy,
+        )
+        results[host] = record
+        if record["state"] not in ("verified", "already_verified"):
+            all_verified = False
+            for remaining in allowed[allowed.index(host) + 1 :]:
+                if remaining not in results:
+                    results[remaining] = {
+                        "host": remaining,
+                        "state": "not_attempted",
+                    }
+            break
+
+    overall = "verified" if all_verified else "partial_failure"
+    return json.dumps(
+        {
+            "status": overall,
+            "kernel": spec.release,
+            "strategy": strategy,
+            "reboot_policy": reboot_policy,
+            "hosts": results,
+        }
+    )
+
+
+@mcp.tool()
+async def verify_kernel_state(
+    hosts: list[str],
+    expected_kernel: str,
+) -> str:
+    """Probe hosts and verify they are running the expected kernel.
+
+    This is a read-only reconciliation tool — it never reboots, never
+    requires approval. Use it after a pause to confirm host state before
+    resuming, or when the reboot tool reports boot_drift.
+    """
+    await _ensure_init()
+    from agents.provisioning.kernel import refuse_protected_targets
+    from agents.server_utils import assert_ticket_active
+    from providers.rhel_kernel import build_probe_command, parse_probe
+
+    active = await assert_ticket_active(
+        expected_status="awaiting_provision",
+    )
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+
+    ticket = active.get("ticket", active)
+    spec = KernelSpec.parse(expected_kernel)
+    allowed, refused = refuse_protected_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+
+    for host in allowed:
+        probe_result = await _ssh.run(host, build_probe_command(), timeout=15)
+        if probe_result.exit_code != 0:
+            results[host] = {
+                "host": host,
+                "state": "unreachable",
+                "error": probe_result.stderr or "",
+            }
+            continue
+
+        try:
+            probe = parse_probe(probe_result.stdout)
+        except ValueError as exc:
+            results[host] = {
+                "host": host,
+                "state": "indeterminate",
+                "error": str(exc),
+            }
+            continue
+
+        if probe.kernel == spec.release:
+            results[host] = {
+                "host": host,
+                "state": "verified",
+                "kernel": probe.kernel,
+                "boot_id": probe.boot_id,
+                "default_entry": probe.default_entry,
+                "reconciled": True,
+            }
+        else:
+            results[host] = {
+                "host": host,
+                "state": "kernel_mismatch",
+                "expected": spec.release,
+                "running": probe.kernel,
+                "boot_id": probe.boot_id,
+            }
+
+    return json.dumps(_summarize(results))
+
+
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
     """Fetch private configuration for a benchmark harness. Returns organization-specific data like install method, repo paths, registry URLs, and constraints (supported OS, prerequisites). Use key='constraints' to check OS and platform requirements before attempting installation."""
