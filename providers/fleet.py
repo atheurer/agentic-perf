@@ -81,6 +81,51 @@ def get_fleet_progress(
     }
 
 
+def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
+    """Capture per-iteration state that would otherwise be overwritten.
+
+    Called by the fleet coordinator before recording a host result
+    so that each tested_host entry carries the full context from
+    its iteration — run_id, serial data, flash diagnostics, etc.
+    Without this, subsequent iterations overwrite ticket-level
+    fields and synthesis has no per-board data to analyze.
+    """
+    flash = custom_fields.get("jumpstarter_flash", {})
+    bm = custom_fields.get("benchmark_status")
+    snapshot: dict[str, Any] = {}
+
+    # Benchmark results
+    run_id = custom_fields.get("run_id", "")
+    if run_id:
+        snapshot["run_id"] = run_id
+    if isinstance(bm, dict):
+        snapshot["benchmark_status"] = bm
+    elif isinstance(bm, str):
+        snapshot["benchmark_status"] = bm
+    samples = custom_fields.get("samples_collected")
+    if samples is not None:
+        snapshot["samples_collected"] = samples
+
+    # Platform / provisioning
+    platform_ip = custom_fields.get("platform_ip", "")
+    if platform_ip:
+        snapshot["platform_ip"] = platform_ip
+    if flash.get("flash_duration_s"):
+        snapshot["flash_duration_s"] = flash["flash_duration_s"]
+    if flash.get("diagnostics"):
+        snapshot["flash_diagnostics"] = flash["diagnostics"]
+    serial_path = flash.get("serial_log_path", "")
+    if serial_path:
+        snapshot["serial_log_path"] = serial_path
+
+    # KPIs if any were extracted
+    kpis = custom_fields.get("benchmark_kpis")
+    if kpis:
+        snapshot["benchmark_kpis"] = kpis
+
+    return snapshot
+
+
 def build_tested_host_entry(
     host_id: str,
     lease_id: str = "",
@@ -88,6 +133,7 @@ def build_tested_host_entry(
     status: str = "completed",
     failure_reason: str | None = None,
     metrics: dict[str, Any] | None = None,
+    iteration_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a tested_hosts entry for the fleet tracker."""
     entry: dict[str, Any] = {
@@ -100,6 +146,8 @@ def build_tested_host_entry(
         entry["failure_reason"] = failure_reason
     if metrics:
         entry["metrics"] = metrics
+    if iteration_data:
+        entry["iteration_data"] = iteration_data
     return entry
 
 
@@ -113,12 +161,17 @@ async def record_host_result(
     status: str = "completed",
     failure_reason: str | None = None,
     metrics: dict[str, Any] | None = None,
+    iteration_data: dict[str, Any] | None = None,
 ) -> None:
     """Record a host result in the fleet tracker.
 
     Appends a tested_host entry and persists it via the
     provided update_fields callback (typically agent's
     ``_update_fields`` method).
+
+    When ``iteration_data`` is provided (from
+    ``snapshot_iteration_data``), it is stored in the entry
+    so per-board context survives across fleet iterations.
     """
     fleet = dict(custom_fields.get("fleet_investigation", {}))
     tested = list(fleet.get("tested_hosts", []))
@@ -130,6 +183,7 @@ async def record_host_result(
             status=status,
             failure_reason=failure_reason,
             metrics=metrics,
+            iteration_data=iteration_data,
         )
     )
     fleet["tested_hosts"] = tested
