@@ -2131,10 +2131,11 @@ function truncate(s, n) {
 
 var EXPAND_LIMIT = 300;
 
-function expandableText(text, limit) {
+function expandableText(text, limit, stateKey) {
   limit = limit || EXPAND_LIMIT;
   if (!text || text.length <= limit) return escHtml(text || '');
-  return '<span class="expandable-text">' +
+  var keyAttr = stateKey ? ' data-expand-key="' + escHtml(stateKey) + '"' : '';
+  return '<span class="expandable-text"' + keyAttr + '>' +
     '<span class="expand-truncated">' + escHtml(text.substring(0, limit)) +
       '<span class="expand-toggle">…</span>' +
     '</span>' +
@@ -2734,7 +2735,7 @@ function renderHypothesisCard(ticket) {
       ) + '</div>';
     html += '<div class="result-summary">' +
       'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
-      expandableText(String(dedupResult.match_rationale || ''), 200) + '</div>';
+      expandableText(String(dedupResult.match_rationale || ''), 200, 'dedup-match-rationale') + '</div>';
   }
   if (!verdict && synthResult) {
     var sCls = 'inconclusive';
@@ -3733,8 +3734,8 @@ function captureExpandedText(container) {
   var expanded = new Set();
   if (!container) return expanded;
   container.querySelectorAll('.expandable-text.expanded').forEach(function(el) {
-    var trunc = el.querySelector('.expand-truncated');
-    if (trunc) expanded.add(trunc.textContent.trim().substring(0, 80));
+    var key = el.dataset.expandKey;
+    if (key) expanded.add(key);
   });
   return expanded;
 }
@@ -3742,8 +3743,8 @@ function captureExpandedText(container) {
 function restoreExpandedText(container, expanded) {
   if (!container || !expanded.size) return;
   container.querySelectorAll('.expandable-text').forEach(function(el) {
-    var trunc = el.querySelector('.expand-truncated');
-    if (trunc && expanded.has(trunc.textContent.trim().substring(0, 80))) {
+    var key = el.dataset.expandKey;
+    if (key && expanded.has(key)) {
       el.classList.add('expanded');
     }
   });
@@ -4030,7 +4031,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + expandableText(data.details || '') + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + expandableText(data.details || '', null, 'event-' + evt.seq + '-guidance-details') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -4044,7 +4045,7 @@ function renderEvent(evt) {
       return '<div class="event tool-progress">' +
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-progress">PROGRESS</span>' +
-        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + expandableText(data.body || '') + '</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + expandableText(data.body || '', null, 'event-' + evt.seq + '-progress-body') + '</span>' +
       '</div>';
 
     case 'comment':
@@ -4052,7 +4053,7 @@ function renderEvent(evt) {
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-comment">COMMENT</span>' +
         '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
-        '<div class="event-text short">' + expandableText(data.body || '') + '</div>' +
+        '<div class="event-text short">' + expandableText(data.body || '', null, 'event-' + evt.seq + '-comment-body') + '</div>' +
       '</div>';
 
     default:
@@ -4097,7 +4098,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + expandableText(display) + '</div>';
+        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + expandableText(display, null, 'event-' + evt.seq + '-agent-data-' + k) + '</div>';
       });
       dataHtml += '</div>';
     }

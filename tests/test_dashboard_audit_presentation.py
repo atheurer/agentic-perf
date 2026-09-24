@@ -36,6 +36,57 @@ def test_dashboard_bounds_browser_activity_projection() -> None:
     assert "isAuditFailure(evt)" in html
 
 
+def test_dashboard_restores_expansion_by_stable_element_key() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    helpers = html[
+        html.index("function captureExpandedText") : html.index(
+            "function renderEventGroup"
+        )
+    ]
+    script = (
+        helpers
+        + r"""
+const assert = require('node:assert/strict');
+
+function expandable(key, expanded) {
+  return {
+    dataset: {expandKey: key},
+    expanded: expanded,
+    classList: {
+      contains: function(name) { return name === 'expanded' && this.owner.expanded; },
+      add: function(name) { if (name === 'expanded') this.owner.expanded = true; },
+      owner: null
+    }
+  };
+}
+
+function container(elements) {
+  return {querySelectorAll: function(selector) {
+    return selector.indexOf('.expanded') !== -1
+      ? elements.filter(function(el) { return el.classList.contains('expanded'); })
+      : elements;
+  }};
+}
+
+const previousFirst = expandable('event-41-comment-body', true);
+const previousSecond = expandable('event-42-comment-body', false);
+previousFirst.classList.owner = previousFirst;
+previousSecond.classList.owner = previousSecond;
+const state = captureExpandedText(container([previousFirst, previousSecond]));
+
+const currentFirst = expandable('event-41-comment-body', false);
+const currentSecond = expandable('event-42-comment-body', false);
+currentFirst.classList.owner = currentFirst;
+currentSecond.classList.owner = currentSecond;
+restoreExpandedText(container([currentFirst, currentSecond]), state);
+assert.equal(currentFirst.expanded, true);
+assert.equal(currentSecond.expanded, false);
+"""
+    )
+
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_dashboard_renders_provider_record_links_safely() -> None:
     html = INDEX.read_text(encoding="utf-8")
 
