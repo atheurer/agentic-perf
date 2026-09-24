@@ -15,10 +15,11 @@ router = APIRouter(tags=["health"])
 def health(request: Request):
     store = request.app.state.store
     lease = store.get_orchestrator_lease()
-    all_tickets = store.list_tickets()
-    counts = {}
+    counts = store.count_by_status()
+    # Ensure all statuses are present (including zero counts)
     for status in TicketStatus:
-        counts[status.value] = sum(1 for t in all_tickets if t.status == status)
+        counts.setdefault(status.value, 0)
+    total = store.ticket_count()
     spool_bytes = 0
     oldest = None
     quarantined = 0
@@ -39,7 +40,7 @@ def health(request: Request):
     return {
         "status": "ok",
         "ticket_counts": counts,
-        "total": len(all_tickets),
+        "total": total,
         "terminal_statuses": [s.value for s in TERMINAL_STATUSES],
         "trace": {
             **getattr(request.app.state, "trace_health", {}),
