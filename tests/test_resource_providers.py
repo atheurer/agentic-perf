@@ -1112,6 +1112,98 @@ class TestResourceToolHandlers:
         )
         assert result["options"][0]["instance_type"] == "m5n.4xlarge"
 
+    @pytest.mark.asyncio
+    async def test_fleet_flat_requirements_merge_all_host_exclusions(self, monkeypatch):
+        import agents.resource.server as resource_server
+        from tests.conftest import make_resource_handlers
+
+        provider = MagicMock()
+        provider.provider_name = "mock"
+        provider.check_available = AsyncMock(
+            return_value={"available": True, "devices": []}
+        )
+        registry = MagicMock()
+        registry.get_provider = AsyncMock(return_value=provider)
+        handlers = make_resource_handlers(registry=registry)
+        monkeypatch.setattr(
+            resource_server,
+            "_ticket",
+            {
+                "custom_fields": {
+                    "fleet_investigation": {
+                        "enabled": True,
+                        "tested_hosts": [{"host_id": "tested-host"}],
+                    },
+                    "directives": {"exclude_hosts": ["directive-host"]},
+                }
+            },
+        )
+        monkeypatch.setenv("TICKET_ID", "")
+
+        await handlers["check_available_resources"](
+            provider="mock",
+            requirements={"exclude_hosts": ["llm-host"]},
+        )
+
+        req = provider.check_available.await_args.args[0]
+        assert set(req["exclude_hosts"]) == {
+            "tested-host",
+            "directive-host",
+            "llm-host",
+        }
+
+    @pytest.mark.asyncio
+    async def test_fleet_required_hosts_handle_null_and_keep_per_host_exclusions(
+        self, monkeypatch
+    ):
+        import agents.resource.server as resource_server
+        from tests.conftest import make_resource_handlers
+
+        provider = MagicMock()
+        provider.provider_name = "mock"
+        provider.check_available = AsyncMock(return_value={"options": []})
+        registry = MagicMock()
+        registry.get_provider = AsyncMock(return_value=provider)
+        handlers = make_resource_handlers(registry=registry)
+        monkeypatch.setattr(
+            resource_server,
+            "_ticket",
+            {
+                "custom_fields": {
+                    "fleet_investigation": {
+                        "enabled": True,
+                        "tested_hosts": [{"host_id": "tested-host"}],
+                    },
+                    "directives": {"exclude_hosts": None},
+                }
+            },
+        )
+        monkeypatch.setenv("TICKET_ID", "")
+
+        result = await handlers["check_available_resources"](
+            provider="mock",
+            requirements={"exclude_hosts": None},
+            required_hosts=[
+                {"name": "host-a", "exclude_hosts": ["host-a-exclusion"]},
+                {"name": "host-b", "exclude_hosts": "host-b-exclusion"},
+            ],
+        )
+
+        calls = provider.check_available.await_args_list
+        assert len(calls) == 2
+        assert set(calls[0].args[0]["exclude_hosts"]) == {
+            "tested-host",
+            "host-a-exclusion",
+        }
+        assert set(calls[1].args[0]["exclude_hosts"]) == {
+            "tested-host",
+            "host-b-exclusion",
+        }
+        assert [item["name"] for item in result["per_host_recommendations"]] == [
+            "host-a",
+            "host-b",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Teardown dispatch tests

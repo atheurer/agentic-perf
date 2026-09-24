@@ -8,10 +8,11 @@ import os
 import socket
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from paths import STATE_STORE_ID_PATH, STATE_STORE_LOCK_PATH
+from providers.execution import AuditedFilesystem
 
 _MAX_METADATA_BYTES = 4096
 
@@ -94,7 +95,6 @@ def ensure_store_id(path: Path = STATE_STORE_ID_PATH) -> str:
     of editing the identity file means a crash can leave either the old complete
     UUID or a complete new UUID, never a partially written identity.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         value = path.read_text(encoding="utf-8").strip()
         if value and str(uuid.UUID(value)) == value:
@@ -102,25 +102,14 @@ def ensure_store_id(path: Path = STATE_STORE_ID_PATH) -> str:
     except (OSError, ValueError):
         pass
     value = str(uuid.uuid4())
-    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    filesystem = AuditedFilesystem.system(path.parent)
+    filesystem.mkdir(".", mode=0o777)
+    filesystem.write(path.name, value + "\n", mode=0o600)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, (value + "\n").encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.fsync(directory_fd)
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        os.close(directory_fd)
     return value
 
 
@@ -131,6 +120,7 @@ class PersistenceRootLock:
     fd: int | None = None
     session_id: str | None = None
     store_id: str | None = None
+    _filesystem: AuditedFilesystem | None = field(default=None, repr=False)
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -145,11 +135,13 @@ class PersistenceRootLock:
         }
 
     def acquire(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        filesystem = AuditedFilesystem.system(self.root)
+        filesystem.mkdir(".")
+        self._filesystem = filesystem
         path = self.root / STATE_STORE_LOCK_PATH.name
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = filesystem.open_descriptor(path.name, os.O_RDWR | os.O_CREAT, mode=0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             holder = _read_metadata(path=path)
             # If the holder process is no longer the same
@@ -166,8 +158,9 @@ class PersistenceRootLock:
                     # A kernel flock is released when its owning process dies;
                     # retry non-blocking so a stale metadata file can never
                     # make a contender hang behind a live lock.
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
+                    filesystem.forget_descriptor(fd)
                     os.close(fd)
                     detail = (
                         json.dumps(holder, sort_keys=True) if holder else "unavailable"
@@ -177,6 +170,7 @@ class PersistenceRootLock:
                         f"(holder metadata: {detail})"
                     ) from exc
             else:
+                filesystem.forget_descriptor(fd)
                 os.close(fd)
                 detail = json.dumps(holder, sort_keys=True) if holder else "unavailable"
                 raise PersistenceRootLockedError(
@@ -191,10 +185,9 @@ class PersistenceRootLock:
             encoded = json.dumps(self.metadata, sort_keys=True).encode("utf-8")
             if len(encoded) > _MAX_METADATA_BYTES:
                 raise RuntimeError("state-store lock metadata exceeds bounded size")
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, encoded)
-            os.fsync(fd)
+            filesystem.write_descriptor(
+                fd, encoded, truncate=True, seek_start=True, sync=True
+            )
         except Exception:
             self.release()
             self.session_id = None
@@ -203,9 +196,12 @@ class PersistenceRootLock:
 
     def release(self) -> None:
         if self.fd is not None:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            if self._filesystem is not None:
+                self._filesystem.lock_descriptor(self.fd, fcntl.LOCK_UN)
+                self._filesystem.forget_descriptor(self.fd)
             os.close(self.fd)
             self.fd = None
+        self._filesystem = None
 
     def close_inherited(self) -> None:
         """Discard a descriptor inherited across fork without unlocking it.
@@ -215,8 +211,11 @@ class PersistenceRootLock:
         Closing only the child's descriptor leaves the parent's lock intact.
         """
         if self.fd is not None:
+            if self._filesystem is not None:
+                self._filesystem.forget_descriptor(self.fd)
             os.close(self.fd)
             self.fd = None
+        self._filesystem = None
         self.session_id = None
         self.store_id = None
 

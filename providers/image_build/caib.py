@@ -15,7 +15,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
+from providers.execution import (
+    AuditedAsyncHTTPClient,
+    AuditedFilesystem,
+    AuditedSubprocessRunner,
+)
 
 from .base import BuildResult, BuildSpec, ImageBuildProvider
 
@@ -190,15 +194,16 @@ class CAIBProvider(ImageBuildProvider):
             name=spec.name or "agentic-perf-custom",
         )
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".aib.yml",
-            delete=False,
-        ) as f:
-            import yaml
+        import yaml
 
-            yaml.dump(manifest, f, default_flow_style=False)
-            manifest_path = f.name
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        manifest_path = filesystem.temporary_file(suffix=".aib.yml")
+        filesystem.write(
+            manifest_path,
+            yaml.dump(manifest, default_flow_style=False),
+            mode=0o600,
+            atomic=False,
+        )
 
         try:
             build_name = spec.name or "agentic-perf-custom"
@@ -336,7 +341,7 @@ class CAIBProvider(ImageBuildProvider):
             )
 
         finally:
-            Path(manifest_path).unlink(missing_ok=True)
+            filesystem.unlink(manifest_path, missing_ok=True)
 
     async def _set_quay_tag_expiration(
         self,

@@ -1148,8 +1148,12 @@ def cmd_trace(args):
     response.raise_for_status()
     if args.export:
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as stream:
-                stream.write(response.text)
+            from providers.execution import AuditedFilesystem
+
+            output = Path(args.output)
+            AuditedFilesystem.system(output.parent).write(
+                output.name, response.text, mode=None, atomic=False
+            )
         else:
             print(response.text, end="" if response.text.endswith("\n") else "\n")
         return

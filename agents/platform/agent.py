@@ -55,26 +55,54 @@ class PlatformAgent(AgentBase):
         self._ticket_id = ticket_id
 
         ticket = await self._get_ticket(ticket_id)
-        ticket.get("custom_fields", {})
+        cf = ticket.get("custom_fields", {})
+        flash_info = cf.get("jumpstarter_flash", {})
+        flash_error = flash_info.get("error", "")
+        if flash_error and "image_version" in flash_error.lower():
+            self._emit(
+                ticket_id,
+                "agent_started",
+                {"reason": "missing_image_version"},
+            )
+            try:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Platform setup blocked — missing user input**\n\n"
+                    f"{flash_error}\n\n"
+                    f"Please update the ticket directives with the "
+                    f"required image_version and retry.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        "Platform agent: missing image_version — user input required"
+                    ),
+                )
+            except Exception as exc:
+                self._emit(ticket_id, "agent_error", {"reason": str(exc)})
+                raise
+            self._emit(ticket_id, "agent_finished")
+            return
 
         platform_server = str(Path(__file__).with_name("server.py"))
         mcp = AgentMCPClient()
-        await mcp.connect_ticket_server(
-            platform_server,
-            name="platform",
-            ticket_id=ticket_id,
-            state_store_url=self.store_url,
-            agent_name=self.agent_name,
-        )
-
         self._mcp = mcp
-        self.tools = await mcp.list_tools()
-
         try:
+            await mcp.connect_ticket_server(
+                platform_server,
+                name="platform",
+                ticket_id=ticket_id,
+                state_store_url=self.store_url,
+                agent_name=self.agent_name,
+            )
+            self.tools = await mcp.list_tools()
             await super().run(ticket_id)
         finally:
-            await mcp.disconnect()
-            self._mcp = None
+            try:
+                await mcp.disconnect()
+            finally:
+                self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return PLATFORM_SYSTEM_PROMPT

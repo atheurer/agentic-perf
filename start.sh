@@ -47,7 +47,7 @@ STORE_PORT="$STORE_PORT" python3 -m uvicorn state_store.main:app --host 0.0.0.0 
 STORE_PID=$!
 
 # Wait for it to be ready
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     if curl -s "http://localhost:$STORE_PORT/api/v1/health" >/dev/null 2>&1; then
         echo "State store ready (PID $STORE_PID)."
         echo "  Dashboard: http://localhost:$STORE_PORT/"
@@ -58,7 +58,7 @@ for i in $(seq 1 30); do
         wait "$STORE_PID" 2>/dev/null
         exit 1
     fi
-    if [ "$i" -eq 30 ]; then
+    if [ "$i" -eq 60 ]; then
         echo "ERROR: State store failed to start (health check timeout)."
         exit 1
     fi
