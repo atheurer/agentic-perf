@@ -20,8 +20,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -39,6 +37,12 @@ from providers.tracing import (
     trace_headers,
 )
 from providers.tracing.client import TraceClient, TraceDeliveryError
+from providers.tracing.spool import SpoolError
+
+logger = logging.getLogger(__name__)
+
+# Module-level latch: log spool backpressure once, not per event.
+_backpressure_logged = False
 
 _SAFE_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-requested-with"})
 _CAUSAL_HEADERS = frozenset(
@@ -332,16 +336,19 @@ class _AuditedHTTPBase:
                 self._recorder.record_critical if critical else self._recorder.record,
                 event,
             )
-        except Exception:
+        except (SpoolError, TraceDeliveryError, OSError) as exc:
             if critical:
                 raise
             # Non-critical trace failures (e.g., spool full) must
-            # never block agent operations.  Log once and continue.
-            logger.warning(
-                "non-critical trace event dropped: %s",
-                event.event_id,
-                exc_info=True,
-            )
+            # never block agent operations.  Log once per process
+            # lifetime to avoid flooding under sustained backpressure.
+            global _backpressure_logged
+            if not _backpressure_logged:
+                logger.warning(
+                    "non-critical trace recording degraded: %s",
+                    exc,
+                )
+                _backpressure_logged = True
 
     def _headers(
         self,
