@@ -61,13 +61,16 @@ _CRUCIBLE_ROOT = "/opt/crucible"
 def _write_ticket_staging_file(
     ticket_id: str, content: str
 ) -> tuple[AuditedFilesystem, str, str]:
-    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
-    filesystem = AuditedFilesystem(
-        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
-        ticket_id=ticket_id,
-        emit=durable_filesystem_emitter(),
-        critical=True,
-    )
+    """Create an audited ticket or explicit system-context SCP staging file."""
+    if ticket_id:
+        filesystem = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+    else:
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
     name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
     return filesystem, name, str(filesystem.write(name, content))
 
@@ -3767,16 +3770,9 @@ async def execute_benchmark(
             }
         )
 
-    if ticket_id:
-        staging, staging_name, local_path = _write_ticket_staging_file(
-            ticket_id, json.dumps(run_file, indent=2)
-        )
-    else:
-        staging = None
-        staging_name = ""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(run_file, f, indent=2)
-            local_path = f.name
+    staging, staging_name, local_path = _write_ticket_staging_file(
+        ticket_id, json.dumps(run_file, indent=2)
+    )
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     try:
@@ -3818,10 +3814,7 @@ async def execute_benchmark(
                 }
             )
     finally:
-        if staging:
-            staging.unlink(staging_name, missing_ok=True)
-        else:
-            Path(local_path).unlink(missing_ok=True)
+        staging.unlink(staging_name, missing_ok=True)
 
     if scp_result.exit_code != 0:
         response = {
@@ -4094,16 +4087,9 @@ async def validate_benchmark(
         ticket_id = os.environ.get("TICKET_ID", "")
         staging = None
         staging_name = ""
-        if ticket_id:
-            staging, staging_name, local_path = _write_ticket_staging_file(
-                ticket_id, json.dumps(run_file, indent=2)
-            )
-        else:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as file:
-                json.dump(run_file, file, indent=2)
-                local_path = file.name
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
 
         copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
@@ -4205,8 +4191,6 @@ async def validate_benchmark(
         if local_path:
             if staging:
                 staging.unlink(staging_name, missing_ok=True)
-            else:
-                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -4432,8 +4416,9 @@ async def execute_boot_time_test(
             critical=True,
         )
         if _ticket_id
-        else None
+        else AuditedFilesystem.system(output_dir)
     )
+    artifact_file_mode = 0o600 if _ticket_id else 0o644
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -4533,10 +4518,8 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = (
-                    artifact_filesystem.open_stream("serial-capture.log")
-                    if artifact_filesystem
-                    else open(serial_log_path, "wb")
+                serial_log_fh = artifact_filesystem.open_stream(
+                    "serial-capture.log", mode=artifact_file_mode
                 )
                 serial_proc = await AuditedSubprocessRunner().start(
                     [
@@ -4714,11 +4697,14 @@ async def execute_boot_time_test(
         stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
         # Write diagnostics to artifact file
-        diag_file = output_dir / "stall-diagnostics.json"
         try:
             import json as _json
 
-            diag_file.write_text(_json.dumps(stall_diag, indent=2))
+            artifact_filesystem.write(
+                "stall-diagnostics.json",
+                _json.dumps(stall_diag, indent=2),
+                mode=artifact_file_mode,
+            )
             logger.info(
                 "[boot-time] Stall diagnostics: %s",
                 stall_diag,
@@ -4748,10 +4734,7 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            if artifact_filesystem:
-                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
-            else:
-                serial_log_path.unlink(missing_ok=True)
+            artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -4779,23 +4762,16 @@ async def execute_boot_time_test(
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", meta_out)
-            else:
-                metadata_file.write_bytes(meta_out)
+            artifact_filesystem.write(
+                "metadata.json", meta_out, mode=artifact_file_mode
+            )
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", "{}")
-            else:
-                metadata_file.write_text("{}")
+            artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        if artifact_filesystem:
-            artifact_filesystem.write("metadata.json", "{}")
-        else:
-            metadata_file.write_text("{}")
+        artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -4847,10 +4823,9 @@ async def execute_boot_time_test(
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("merged-results.json", merge_out)
-            else:
-                merged_file.write_bytes(merge_out)
+            artifact_filesystem.write(
+                "merged-results.json", merge_out, mode=artifact_file_mode
+            )
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(

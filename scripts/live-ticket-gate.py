@@ -307,7 +307,11 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any
 
 
 def _save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    from providers.execution import AuditedFilesystem
+
+    AuditedFilesystem.system(path.parent).write(
+        path.name, json.dumps(value, indent=2, sort_keys=True) + "\n", mode=0o644
+    )
 
 
 def _contains_in_order(values: list[str], required: tuple[str, ...]) -> bool:
@@ -420,8 +424,11 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
         raise GateError("AGENTIC_PERF_HOME must name a prepared isolated instance")
     runtime_config = json.loads((home / "config.json").read_text())
     store_url = os.environ.get("STATE_STORE_URL", runtime_config["state_store"]["url"])
-    artifacts.mkdir(parents=True, exist_ok=False)
-    artifacts.chmod(0o700)
+    from providers.execution import AuditedFilesystem
+
+    artifact_filesystem = AuditedFilesystem.system(artifacts)
+    artifact_filesystem.mkdir(".", mode=0o777, parents=True, exist_ok=False)
+    artifact_filesystem.chmod(".", 0o700)
     git_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
@@ -555,7 +562,7 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
             home / "logs" / "state-store.log",
         ):
             if source.exists():
-                (artifacts / source.name).write_bytes(source.read_bytes())
+                artifact_filesystem.write(source.name, source.read_bytes(), mode=0o644)
 
 
 _RECOVERABLE_SSH_CONTEXT_RETRY = re.compile(
@@ -639,11 +646,25 @@ def main() -> int:
             Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
             / "agentic-perf-live-gate.lock"
         )
-        with lock_path.open("w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise GateError("another live gate is already running") from error
+        from providers.execution import AuditedFilesystem
+
+        lock_filesystem = AuditedFilesystem.system(lock_path.parent)
+        lock_fd = lock_filesystem.open_descriptor(
+            lock_path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            mode=0o644,
+        )
+        try:
+            lock_filesystem.lock_descriptor(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(lock_fd)
+            lock_filesystem.forget_descriptor(lock_fd)
+            raise GateError("another live gate is already running") from error
+        except BaseException:
+            lock_filesystem.forget_descriptor(lock_fd)
+            os.close(lock_fd)
+            raise
+        try:
             manage_services = not args.services_already_running
             ticket_id = run_gate(
                 config,
@@ -654,10 +675,16 @@ def main() -> int:
                 _validate_managed_service_shutdown(
                     home, Path(__file__).resolve().parents[1]
                 )
-            _save_json(
-                artifacts / "result.json",
-                {"status": "passed", "ticket_id": ticket_id},
-            )
+        finally:
+            try:
+                lock_filesystem.lock_descriptor(lock_fd, fcntl.LOCK_UN)
+            finally:
+                lock_filesystem.forget_descriptor(lock_fd)
+                os.close(lock_fd)
+        _save_json(
+            artifacts / "result.json",
+            {"status": "passed", "ticket_id": ticket_id},
+        )
         print(f"Live gate passed: {ticket_id}")
         return 0
     except (GateError, httpx.HTTPError, OSError, ValueError) as error:

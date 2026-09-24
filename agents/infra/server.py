@@ -207,17 +207,14 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
         name = f"agentic-perf-{ticket_id}-{os.urandom(8).hex()}.tmp"
         local_path = str(staging.write(name, content))
     else:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
-            f.write(content)
-            local_path = f.name
+        staging = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        name = f"agentic-perf-{os.urandom(8).hex()}.tmp"
+        local_path = str(staging.write(name, content))
 
     try:
         scp_result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     finally:
-        if ticket_id:
-            staging.unlink(Path(local_path).name, missing_ok=True)
-        else:
-            Path(local_path).unlink(missing_ok=True)
+        staging.unlink(name, missing_ok=True)
 
     return json.dumps(
         {
@@ -297,7 +294,8 @@ async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str
     else:
         # Direct server invocation is a documented no-ticket compatibility
         # mode; ticket-owned MCP connections always set TICKET_ID.
-        local_dir = tempfile.mkdtemp(prefix="remote-dir-")
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        local_dir = str(filesystem.temporary_directory(prefix="remote-dir-"))
     result = await ssh.copy_from(host, remote_path, local_dir)
     if result.exit_code != 0:
         return json.dumps(
