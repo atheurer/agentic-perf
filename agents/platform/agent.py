@@ -70,6 +70,30 @@ class PlatformAgent(AgentBase):
         self._mcp = mcp
         self.tools = await mcp.list_tools()
 
+        # Code-enforce: if image resolution failed due to missing
+        # user input, escalate to HITL immediately instead of
+        # letting the LLM attempt to recover (#990).
+        ticket = await self._get_ticket(ticket_id)
+        cf = ticket.get("custom_fields", {})
+        flash_info = cf.get("jumpstarter_flash", {})
+        flash_error = flash_info.get("error", "")
+        if flash_error and "image_version" in flash_error.lower():
+            await self._add_comment(
+                ticket_id,
+                f"**Platform setup blocked — missing user input**\n\n"
+                f"{flash_error}\n\n"
+                f"Please update the ticket directives with the "
+                f"required image_version and retry.",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment=("Platform agent: missing image_version — user input required"),
+            )
+            await mcp.disconnect()
+            self._mcp = None
+            return
+
         try:
             await super().run(ticket_id)
         finally:
