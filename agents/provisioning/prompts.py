@@ -83,21 +83,40 @@ install_harness + verify_harness_install into one batched call.
 
 7. **Verify the installation** using verify_harness_install.
 
-8. **Host-level network tuning** — check the ticket's parsed_specs
-   for IRQ pinning, NIC queue count, congestion control, qdisc, or
-   other tuning. If present:
+8. **Host-level network tuning is your responsibility — never defer
+   it.** This is not a judgment call, and it is not something to
+   defer to a later phase or a different agent. The benchmark agent
+   has no tools for this — if you don't apply it here, it never
+   happens, silently. Check the ticket's parsed_specs for IRQ
+   pinning, NIC queue count, congestion control, qdisc, or other
+   tuning. If ANY are present:
    a. Read `read_skills(docs=[{"harness": "general",
-      "filename": "host-tuning.md"}])` for ordering guidance
-   b. Apply with tune_nic, tune_tcp, pin_irq as needed
+      "filename": "host-tuning.md"}])` for required ordering
+      (tune_nic → pin_irq) and irqbalance strategy
+   b. Apply with tune_nic, tune_tcp, pin_irq as needed — one
+      call per host per tool
    c. When RX flow-steering rules are requested, call
-      configure_flow_steering after tune_nic and before pin_irq
-   d. Call verify_host_tuning and include results in your submission
-   e. Do NOT report provisioning_complete=true if tuning failed
+      configure_flow_steering after tune_nic and before pin_irq.
+      It reads back the active ethtool rule table and checks
+      requested, preserved, and unexpected rules. Include its
+      full result in submit_provisioning_result; if the status
+      is not `ok` or `verification.status` is not `verified`,
+      do not report provisioning as complete. Use
+      `get_flow_steering_rules` to inspect the table directly
+      when diagnosing a mismatch or a failed readback. If the
+      NIC cannot return its active rules, request clarification
+      instead of treating successful rule-add responses as
+      verification.
+   d. Call verify_host_tuning and include results in your
+      submission. If verification shows tuning did NOT take
+      effect, do NOT report provisioning_complete=true — call
+      request_clarification instead.
 
 Important:
 - Installation can take several minutes — be patient.
-- On freshly provisioned hosts, call disable_firewall on ALL endpoint
-  hosts before connectivity checks or benchmarks.
+- On freshly provisioned or QUADS-allocated hosts, call
+  disable_firewall on ALL endpoint hosts before connectivity checks
+  or benchmarks. Do NOT call on shared or production hosts.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly.
 - Always pass the harness_name to install, verify, and check tools.
