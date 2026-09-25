@@ -177,7 +177,9 @@ class ResourceAgent(AgentBase):
 
         ticket = await self._get_ticket(self._ticket_id)
         cf = ticket.get("custom_fields", {})
-        if not is_fleet_investigation(cf):
+        if not is_fleet_investigation(cf) or not cf.get(
+            "resource_fleet_exhaustion_detected"
+        ):
             return False
 
         await self._add_comment(
@@ -241,10 +243,12 @@ class ResourceAgent(AgentBase):
 
         try:
             ticket = await self._get_ticket(ticket_id)
-            if ticket.get(
-                "status"
-            ) == "awaiting_customer_guidance" and is_fleet_investigation(
-                ticket.get("custom_fields", {})
+            if (
+                ticket.get("status") == "awaiting_customer_guidance"
+                and is_fleet_investigation(ticket.get("custom_fields", {}))
+                and ticket.get("custom_fields", {}).get(
+                    "resource_fleet_exhaustion_detected"
+                )
             ):
                 await self._add_comment(
                     ticket_id,
@@ -743,6 +747,10 @@ class ResourceAgent(AgentBase):
                 "ssh_key_path": get_default_ssh_key(),
                 "notes": "Could not produce structured output",
             }
+
+        # Do not let an LLM-submitted allocation bypass a confirmed
+        # exhaustion result from check_available_resources.
+        await self._check_fleet_exhaustion(str(result.get("notes", "")))
 
         fields: dict[str, Any] = {
             "assigned_hardware_ips": result.get("assigned_hardware_ips", {}),

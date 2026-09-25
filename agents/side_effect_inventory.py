@@ -144,6 +144,13 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"),
     (
         "agents/resource/server.py",
+        "_persist_fleet_exhaustion_marker",
+        "mutating_http_state",
+    ),
+    ("agents/resource/server.py", "_persist_fleet_exhaustion_marker", "cloud_resource"),
+    ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"),
+    (
+        "agents/resource/server.py",
         "_auto_escalate_named_device",
         "mutating_http_state",
     ),
@@ -1322,6 +1329,32 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_infer_os_from_ticket",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_fleet_exhaustion_marker",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_fleet_exhaustion_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_fleet_exhaustion_marker",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_fleet_exhaustion_marker",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_is_confirmed_fleet_exhaustion",
         "2027-12-31",
     ),
     (

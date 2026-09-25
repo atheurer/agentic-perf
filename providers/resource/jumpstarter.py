@@ -337,9 +337,8 @@ class JumpstarterResourceProvider(ResourceProvider):
                 requirements,
             )
 
-        matching = [
-            d for d in all_devices if d["labels"].get(key) == value and d["available"]
-        ]
+        selector_matches = [d for d in all_devices if d["labels"].get(key) == value]
+        matching = [d for d in selector_matches if d["available"]]
 
         # Fleet exclusion: filter out already-tested hosts
         exclude = requirements.get("exclude_hosts", [])
@@ -358,16 +357,17 @@ class JumpstarterResourceProvider(ResourceProvider):
         # No matches — distinguish between "wrong
         # selector" and "all devices already tested."
         if not matching:
-            if exclude:
+            excluded_matches = [d for d in selector_matches if d["name"] in exclude]
+            if selector_matches and len(excluded_matches) == len(selector_matches):
                 # All matching devices have been tested
                 return {
                     "provider": "jumpstarter",
                     "available": False,
-                    "matching_devices": 0,
+                    "matching_devices": len(selector_matches),
                     "requested": count,
                     "selector": selector,
                     "all_excluded": True,
-                    "excluded_hosts": exclude,
+                    "excluded_hosts": [d["name"] for d in excluded_matches],
                     "message": ("All matching devices have been excluded."),
                 }
             targets = await self.list_targets()
