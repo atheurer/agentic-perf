@@ -564,17 +564,43 @@ class BenchmarkAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
+        harness = directives.get("harness", "")
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
             resource_provider=provider,
             endpoint_type=endpoint,
         )
+
+        # Load harness-specific prompt fragment (e.g., crucible.md,
+        # jumpstarter.md).  These contain harness-specific execution
+        # instructions that don't belong in the base prompt.
+        harness_fragment = ""
+        prompts_dir = Path(__file__).parent / "prompts"
+        # For controller harnesses, also try the harness name
+        harness_file = prompts_dir / f"{harness}.md"
+        if harness_file.exists():
+            harness_fragment = harness_file.read_text().strip()
+
         prompt = BENCHMARK_BASE_PROMPT
+
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+
+        if cf.get("execution_model") == EXECUTION_MODEL_DIRECT:
+            prompt += (
+                "\n\n## Direct Execution Model\n\n"
+                "This benchmark uses the **direct** execution model. "
+                "There is no dedicated controller host \u2014 the "
+                "orchestrator runs benchmark tools directly. The "
+                "assigned targets are the systems under test (SUTs). "
+                "Use `targets[0]` as the `sut_host` parameter."
+            )
+        if harness_fragment:
+            prompt += f"\n\n{harness_fragment}"
         if directives.get("workflow_source"):
             prompt += "\n\n" + self._workflow_instructions(directives)
         if fragments:
-            return f"{prompt}\n\n{fragments}"
+            prompt += f"\n\n{fragments}"
         return prompt
 
     @staticmethod
@@ -650,7 +676,19 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
             content += f"\n**Hypothesis:** {cf['hypothesis']}\n"
-        if cf.get("ssh_hardware_ips"):
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+
+        is_direct = cf.get("execution_model") == EXECUTION_MODEL_DIRECT
+        if is_direct:
+            hw = cf.get("assigned_hardware_ips", {})
+            targets = hw.get("targets", [])
+            if targets:
+                content += (
+                    f"\n## Target Hosts\n"
+                    f"These are the hosts to run benchmarks against.\n"
+                    f"```json\n{json.dumps(targets, indent=2)}\n```\n"
+                )
+        elif cf.get("ssh_hardware_ips"):
             content += f"\n## Controller SSH Addresses\nUse these addresses for Crucible remotehost `config.host` values only after verifying controller-to-host SSH reachability. They may be hostnames or IPs and are independent from benchmark dataplane addresses.\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"
             content += f"\n## Assigned Network Addresses\nThese are candidates for benchmark dataplane connectivity. Do not use them as Crucible remotehost `config.host` values unless the controller independently verifies SSH access through them.\n```json\n{json.dumps(cf.get('assigned_hardware_ips', {}), indent=2)}\n```\n"
         elif cf.get("assigned_hardware_ips"):
