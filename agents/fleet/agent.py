@@ -136,6 +136,7 @@ class FleetCoordinatorAgent:
             get_fleet_progress,
             get_tested_host_ids,
             record_host_result,
+            snapshot_iteration_data,
         )
 
         ticket = await self._get_ticket(ticket_id)
@@ -200,6 +201,12 @@ class FleetCoordinatorAgent:
             )
             return
 
+        # Snapshot per-board iteration data before recording.
+        # Without this, subsequent iterations overwrite ticket-level
+        # fields (run_id, benchmark_status, etc.) and synthesis
+        # has no per-board data to analyze (#1035).
+        iter_data = snapshot_iteration_data(cf)
+
         if not platform_ready:
             # Platform provisioning failed — record partial.
             diag = self._get_latest_diagnostic(ticket)
@@ -212,6 +219,7 @@ class FleetCoordinatorAgent:
                 ip=ip,
                 status="partial",
                 failure_reason=diag[:500] if diag else "provisioning failed",
+                iteration_data=iter_data,
             )
             await self._add_comment(
                 ticket_id,
@@ -230,6 +238,7 @@ class FleetCoordinatorAgent:
                 status="partial",
                 metrics=cf.get("benchmark_kpis"),
                 failure_reason=str(notes)[:500],
+                iteration_data=iter_data,
             )
             await self._add_comment(
                 ticket_id,
@@ -246,6 +255,7 @@ class FleetCoordinatorAgent:
                 ip=ip,
                 status="completed",
                 metrics=cf.get("benchmark_kpis"),
+                iteration_data=iter_data,
             )
             await self._add_comment(
                 ticket_id,

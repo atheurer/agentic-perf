@@ -5069,14 +5069,17 @@ async def execute_boot_time_test(
                     new_dir = response["output_dir"]
                     if new_dir not in existing:
                         existing.append(new_dir)
+                    result_fields = {
+                        "output_dir": new_dir,
+                        "output_dirs": existing,
+                        # These per-run values are snapshotted by the fleet
+                        # coordinator before the next board overwrites them.
+                        "samples_collected": response.get("samples_collected", 0),
+                        "benchmark_kpis": response.get("kpis") or {},
+                    }
                     update_response = await _client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={
-                            "fields": {
-                                "output_dir": new_dir,
-                                "output_dirs": existing,
-                            }
-                        },
+                        json={"fields": result_fields},
                     )
                     update_response.raise_for_status()
                 logger.info(
