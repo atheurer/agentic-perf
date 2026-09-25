@@ -197,18 +197,28 @@ class PlatformAgent(AgentBase):
                 ticket = await self._get_ticket(ticket_id)
                 provider = ticket.get("custom_fields", {}).get("resource_provider", "")
             except Exception:
+                ticket = {}
                 provider = ""
             if provider == "jumpstarter":
-                # For Jumpstarter, the discovered IP is the
-                # board itself (the SUT).  There is no separate
-                # controller host — the Jumpstarter controller
-                # is a service, not a physical machine.  Put
-                # the IP in targets so the benchmark agent can
-                # find it as the SUT.
-                fields["assigned_hardware_ips"] = {
-                    "controller": hosts[0],
-                    "targets": hosts,
-                }
+                from providers.skills.base import EXECUTION_MODEL_DIRECT
+
+                cf = ticket.get("custom_fields", {})
+                execution_model = cf.get("execution_model", "")
+                if execution_model == EXECUTION_MODEL_DIRECT:
+                    # Direct harnesses: all discovered IPs are
+                    # targets.  The orchestrator runs tools —
+                    # no dedicated controller host exists.
+                    fields["assigned_hardware_ips"] = {
+                        "controller": "",
+                        "targets": hosts,
+                    }
+                else:
+                    # Controller harnesses: first host is the
+                    # controller, rest are targets.
+                    fields["assigned_hardware_ips"] = {
+                        "controller": hosts[0],
+                        "targets": [h for h in hosts[1:] if h != hosts[0]],
+                    }
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
         if result.get("ssh_key_path"):
