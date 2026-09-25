@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -169,6 +170,8 @@ async def create_investigation_record(
     info_gain_trajectory: JSON array string, e.g. "[0.0, 0.5, 0.9]"
     causal_commits: comma-separated commit hashes
     """
+    # Fallback to env var set by mcp_client for ticket-bound servers
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     provider = _get_provider()
     record = InvestigationRecord(
         anomaly_context=AnomalyContext(
@@ -256,6 +259,8 @@ async def append_build_history(
     FULL_INVESTIGATION or SKIP_MATCHED. Include ticket_id to
     link the history entry to the originating ticket.
     """
+    # Fallback to env var set by mcp_client for ticket-bound servers
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     provider = _get_provider()
     entry = BuildHistoryEntry(
         build_id=build_id,
