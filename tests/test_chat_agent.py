@@ -433,8 +433,8 @@ class TestSearchFiltering:
         response = AsyncMock()
         response.json = MagicMock(
             return_value=[
+                # Server-side status filter returns only matches
                 {"id": "PERF-1", "summary": "a", "status": "closed"},
-                {"id": "PERF-2", "summary": "b", "status": "running"},
             ]
         )
         response.raise_for_status = MagicMock()
@@ -451,6 +451,9 @@ class TestSearchFiltering:
         parsed = json.loads(result)
         assert parsed["count"] == 1
         assert parsed["tickets"][0]["id"] == "PERF-1"
+        # Verify status passed as server-side param
+        call_kwargs = client.get.call_args
+        assert call_kwargs.kwargs.get("params", {}).get("status") == "closed"
 
     async def test_query_filter(self):
         client = AsyncMock()
@@ -819,3 +822,311 @@ class TestBenchmarkCatalog:
 
         result = await get_catalog_benchmark(StubProvider(), "nonexistent")
         assert result is None
+
+
+class TestSearchMetadataFilters:
+    """Tests for owner, created_by, harness, board_type, since filters."""
+
+    def _mock_client(self, tickets):
+        client = AsyncMock()
+        response = AsyncMock()
+        response.json = MagicMock(return_value=tickets)
+        response.raise_for_status = MagicMock()
+        client.get = AsyncMock(return_value=response)
+        return client
+
+    async def test_owner_filter(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "owners": ["mcurrier"],
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "b",
+                    "status": "closed",
+                    "owners": ["dustinblack"],
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"owner": "mcurrier"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["id"] == "PERF-1"
+
+    async def test_created_by_filter(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "created_by": "mcurrier",
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "b",
+                    "status": "closed",
+                    "created_by": "dustinblack",
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"created_by": "mcurrier"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["created_by"] == "mcurrier"
+
+    async def test_harness_filter(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {"directives": {"harness": "boot-time"}},
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "b",
+                    "status": "closed",
+                    "custom_fields": {"directives": {"harness": "uperf"}},
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"harness": "boot-time"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["harness"] == "boot-time"
+
+    async def test_board_type_filter(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {
+                        "directives": {"board_selector": "board-type=nxp-s32g-vnp-rdb3"}
+                    },
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "b",
+                    "status": "closed",
+                    "custom_fields": {
+                        "directives": {"board_selector": "board-type=qc8775"}
+                    },
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"board_type": "s32g"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert "s32g" in parsed["tickets"][0]["board_type"]
+
+    async def test_board_type_fallback_to_top_level(self):
+        """board_selector at top-level custom_fields, not in directives."""
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {
+                        "board_selector": "board-type=qc8775",
+                        "directives": {},
+                    },
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"board_type": "qc8775"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+
+    async def test_since_filter(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "created_at": "2026-09-20T10:00:00Z",
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "b",
+                    "status": "closed",
+                    "created_at": "2026-09-15T10:00:00Z",
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"since": "2026-09-18"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["id"] == "PERF-1"
+
+    async def test_null_harness_does_not_crash(self):
+        """Explicit null in directives should not crash."""
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {"directives": {"harness": None}},
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"harness": "boot-time"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 0
+
+    async def test_null_board_selector_does_not_crash(self):
+        """Explicit null board_selector should not crash."""
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {"directives": {"board_selector": None}},
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {"board_type": "qc8775"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 0
+
+    async def test_null_directives_does_not_crash_while_building_output(self):
+        """Explicit null directives should be treated as empty metadata."""
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {"directives": None},
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["id"] == "PERF-1"
+        assert "harness" not in parsed["tickets"][0]
+        assert "board_type" not in parsed["tickets"][0]
+
+    async def test_malformed_metadata_is_ignored_in_filters_and_output(self):
+        """Ignore non-mapping containers and non-string metadata values."""
+        tickets = [
+            {
+                "id": "PERF-1",
+                "summary": "a",
+                "status": "closed",
+                "custom_fields": ["invalid"],
+            },
+            {
+                "id": "PERF-2",
+                "summary": "b",
+                "status": "closed",
+                "custom_fields": {"directives": ["invalid"]},
+            },
+            {
+                "id": "PERF-3",
+                "summary": "c",
+                "status": "closed",
+                "custom_fields": {
+                    "directives": {
+                        "harness": {"value": "boot-time"},
+                        "board_selector": ["board-type=qc8775"],
+                    }
+                },
+            },
+        ]
+
+        async def search(params):
+            client = self._mock_client(tickets)
+            result = await execute_tool(
+                "search_tickets",
+                params,
+                client,
+                "http://localhost:8090",
+                "token",
+                audit=_audit(client),
+            )
+            return json.loads(result)
+
+        parsed = await search({})
+        assert parsed["count"] == 3
+        assert all(
+            "harness" not in ticket and "board_type" not in ticket
+            for ticket in parsed["tickets"]
+        )
+        assert (await search({"harness": "boot-time"}))["count"] == 0
+        assert (await search({"board_type": "qc8775"}))["count"] == 0
