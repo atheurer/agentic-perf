@@ -226,6 +226,81 @@ class TestBootTimeJumpstarterRecovery:
         )
 
 
+class TestBootTimePassiveSerialDefaults:
+    @pytest.mark.parametrize(
+        ("resource_provider", "directives", "expect_passive"),
+        [
+            ("jumpstarter", {}, True),
+            ("quads", {}, False),
+            ("jumpstarter", {"serial_capture": False}, False),
+            ("jumpstarter", {"jumpstarter_serial": True}, False),
+        ],
+        ids=[
+            "jumpstarter-default-on",
+            "other-provider-default-off",
+            "explicit-false-disables",
+            "active-serial-suppresses-passive",
+        ],
+    )
+    async def test_passive_capture_default_and_overrides(
+        self, tmp_path, monkeypatch, resource_provider, directives, expect_passive
+    ):
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        ticket = {
+            "custom_fields": {
+                "resource_provider": resource_provider,
+                "resource_provider_metadata": {"lease_id": "lease-123"},
+                "directives": directives,
+            }
+        }
+        serial_proc = MagicMock(pid=123, returncode=None)
+        serial_proc.wait = AsyncMock(return_value=0)
+        benchmark_proc = MagicMock(returncode=0)
+        benchmark_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def start(argv, **_kwargs):
+            return serial_proc if argv[0] == "jmp" else benchmark_proc
+
+        runner = MagicMock()
+        runner.start = AsyncMock(side_effect=start)
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", ticket),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+        ):
+            await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+
+        calls = runner.start.call_args_list
+        passive_calls = [call for call in calls if call.args[0][0] == "jmp"]
+        assert bool(passive_calls) is expect_passive
+        if expect_passive:
+            assert passive_calls[0].args[0] == [
+                "jmp",
+                "shell",
+                "--lease=lease-123",
+                "--",
+                "j",
+                "serial",
+                "pipe",
+            ]
+            serial_proc.terminate.assert_called_once()
+            serial_proc.wait.assert_awaited_once_with(timeout=10)
+        else:
+            serial_proc.terminate.assert_not_called()
+        if directives.get("jumpstarter_serial"):
+            benchmark_call = next(call for call in calls if call.args[0][0] != "jmp")
+            assert "--jumpstarter-serial" in benchmark_call.args[0]
+
+
 class TestBootTimeKPIExtraction:
     """KPI extraction from merged boot-time results."""
 
