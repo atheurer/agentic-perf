@@ -61,13 +61,16 @@ _CRUCIBLE_ROOT = "/opt/crucible"
 def _write_ticket_staging_file(
     ticket_id: str, content: str
 ) -> tuple[AuditedFilesystem, str, str]:
-    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
-    filesystem = AuditedFilesystem(
-        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
-        ticket_id=ticket_id,
-        emit=durable_filesystem_emitter(),
-        critical=True,
-    )
+    """Create an audited ticket or explicit system-context SCP staging file."""
+    if ticket_id:
+        filesystem = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+    else:
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
     name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
     return filesystem, name, str(filesystem.write(name, content))
 
@@ -1459,14 +1462,15 @@ async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Use generic context primitives for the designated Crucible controller.
 
     ``bootstrap`` returns the controller's entrypoint document. ``read`` reads
-    the caller-selected controller-relative path. ``search`` searches controller
-    path names and file contents, returning grouped candidates; the caller then
-    selects files to read. Source selection, phase policy, and provenance are
-    server-managed.
+    a caller-selected path with bounded byte paging. ``search`` searches
+    controller paths and file contents, returning grouped candidates and sizes.
+    Source selection, phase policy, and provenance are server-managed.
     """
     await _ensure_init()
     if operation not in {"bootstrap", "read", "search"}:
@@ -1498,6 +1502,8 @@ async def _get_crucible_benchmark_context_tool(
         query=query,
         benchmark="",
         include_alternates=False,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
     )
 
 
@@ -1510,6 +1516,8 @@ async def _legacy_get_crucible_benchmark_context(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
@@ -1529,6 +1537,8 @@ async def _legacy_get_crucible_benchmark_context(
             path=path,
             query=query,
             include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         )
     if operation == "context" and _ssh is not None and _controller_host():
         return json.dumps(
@@ -3760,16 +3770,9 @@ async def execute_benchmark(
             }
         )
 
-    if ticket_id:
-        staging, staging_name, local_path = _write_ticket_staging_file(
-            ticket_id, json.dumps(run_file, indent=2)
-        )
-    else:
-        staging = None
-        staging_name = ""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(run_file, f, indent=2)
-            local_path = f.name
+    staging, staging_name, local_path = _write_ticket_staging_file(
+        ticket_id, json.dumps(run_file, indent=2)
+    )
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     try:
@@ -3811,10 +3814,7 @@ async def execute_benchmark(
                 }
             )
     finally:
-        if staging:
-            staging.unlink(staging_name, missing_ok=True)
-        else:
-            Path(local_path).unlink(missing_ok=True)
+        staging.unlink(staging_name, missing_ok=True)
 
     if scp_result.exit_code != 0:
         response = {
@@ -4087,16 +4087,9 @@ async def validate_benchmark(
         ticket_id = os.environ.get("TICKET_ID", "")
         staging = None
         staging_name = ""
-        if ticket_id:
-            staging, staging_name, local_path = _write_ticket_staging_file(
-                ticket_id, json.dumps(run_file, indent=2)
-            )
-        else:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as file:
-                json.dump(run_file, file, indent=2)
-                local_path = file.name
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
 
         copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
@@ -4198,8 +4191,6 @@ async def validate_benchmark(
         if local_path:
             if staging:
                 staging.unlink(staging_name, missing_ok=True)
-            else:
-                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -4349,22 +4340,109 @@ async def execute_boot_time_test(
 
     # ── Wait for SSH readiness ─────────────────────────
     # Freshly provisioned boards may not have SSH ready
-    # immediately. Wait up to 60s for port 22.
+    # immediately. Wait up to 60s for port 22.  If a
+    # Jumpstarter lease is available and SSH fails, power-
+    # cycle the board and retry — the board may not have
+    # booted cleanly after flashing.
     import asyncio as _asyncio
     import socket as _socket
 
-    for _attempt in range(12):
-        try:
-            s = _socket.create_connection((sut_host, 22), timeout=5)
-            s.close()
+    _js_lease_id = ""
+    if _ticket:
+        _js_fields = _ticket.get("custom_fields", {})
+        _js_meta = _js_fields.get("resource_provider_metadata", {})
+        _js_lease_id = _js_meta.get("lease_id", "")
+        if _js_fields.get("resource_provider") != "jumpstarter":
+            _js_lease_id = ""
+
+    _MAX_POWER_CYCLES = 3
+    _SSH_ATTEMPTS_PER_CYCLE = 12
+    _ssh_ready = False
+    _power_cycles_attempted = 0
+    _ssh_polling_windows = 0
+
+    while True:
+        _ssh_polling_windows += 1
+        for _attempt in range(_SSH_ATTEMPTS_PER_CYCLE):
+            try:
+                s = _socket.create_connection((sut_host, 22), timeout=5)
+                s.close()
+                _ssh_ready = True
+                break
+            except (OSError, ConnectionRefusedError):
+                logger.info(
+                    "[boot-time] Waiting for SSH on %s (cycle %d/%d, attempt %d/%d)",
+                    sut_host,
+                    _power_cycles_attempted + 1,
+                    _MAX_POWER_CYCLES + 1,
+                    _attempt + 1,
+                    _SSH_ATTEMPTS_PER_CYCLE,
+                )
+                await _asyncio.sleep(5)
+
+        if _ssh_ready:
             break
-        except (OSError, ConnectionRefusedError):
-            logger.info(
-                f"[boot-time] Waiting for SSH on {sut_host} (attempt {_attempt + 1}/12)"
+
+        if not _js_lease_id:
+            # No Jumpstarter lease — cannot power-cycle
+            break
+
+        if _power_cycles_attempted >= _MAX_POWER_CYCLES:
+            break
+
+        _power_cycles_attempted += 1
+        logger.warning(
+            "[boot-time] SSH unreachable after %ds,"
+            " power-cycling board via Jumpstarter"
+            " (lease=%s, power cycle %d/%d)",
+            _SSH_ATTEMPTS_PER_CYCLE * 5,
+            _js_lease_id,
+            _power_cycles_attempted,
+            _MAX_POWER_CYCLES,
+        )
+        try:
+            _pc_proc = await AuditedSubprocessRunner().start(
+                [
+                    "jmp",
+                    "shell",
+                    "--lease",
+                    _js_lease_id,
+                    "--",
+                    "j",
+                    "power",
+                    "cycle",
+                ],
+                mutating=True,
             )
-            await _asyncio.sleep(5)
+            _pc_out, _pc_err = await asyncio.wait_for(
+                _pc_proc.communicate(),
+                timeout=60,
+            )
+            logger.info(
+                "[boot-time] Power cycle complete (rc=%d), waiting for SSH",
+                _pc_proc.returncode,
+            )
+        except Exception as _pc_exc:
+            logger.warning(
+                "[boot-time] Power cycle failed: %s",
+                _pc_exc,
+            )
+            break
 
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
+    if not _ssh_ready:
+        return json.dumps(
+            {
+                "status": "failed",
+                "error": (
+                    f"SUT {sut_host} not SSH-reachable after"
+                    f" {_power_cycles_attempted} Jumpstarter power-cycle attempt(s)"
+                    f" across {_ssh_polling_windows} SSH polling window(s)."
+                    f" Board may need manual intervention."
+                ),
+            }
+        )
+
     ssh_user = "root"
     ssh_password = "password"
     if _ticket:
@@ -4425,8 +4503,9 @@ async def execute_boot_time_test(
             critical=True,
         )
         if _ticket_id
-        else None
+        else AuditedFilesystem.system(output_dir)
     )
+    artifact_file_mode = 0o600 if _ticket_id else 0o644
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -4526,10 +4605,8 @@ async def execute_boot_time_test(
             and not _serial_active
         ):
             try:
-                serial_log_fh = (
-                    artifact_filesystem.open_stream("serial-capture.log")
-                    if artifact_filesystem
-                    else open(serial_log_path, "wb")
+                serial_log_fh = artifact_filesystem.open_stream(
+                    "serial-capture.log", mode=artifact_file_mode
                 )
                 serial_proc = await AuditedSubprocessRunner().start(
                     [
@@ -4707,11 +4784,14 @@ async def execute_boot_time_test(
         stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
         # Write diagnostics to artifact file
-        diag_file = output_dir / "stall-diagnostics.json"
         try:
             import json as _json
 
-            diag_file.write_text(_json.dumps(stall_diag, indent=2))
+            artifact_filesystem.write(
+                "stall-diagnostics.json",
+                _json.dumps(stall_diag, indent=2),
+                mode=artifact_file_mode,
+            )
             logger.info(
                 "[boot-time] Stall diagnostics: %s",
                 stall_diag,
@@ -4741,10 +4821,7 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            if artifact_filesystem:
-                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
-            else:
-                serial_log_path.unlink(missing_ok=True)
+            artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -4772,23 +4849,16 @@ async def execute_boot_time_test(
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", meta_out)
-            else:
-                metadata_file.write_bytes(meta_out)
+            artifact_filesystem.write(
+                "metadata.json", meta_out, mode=artifact_file_mode
+            )
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", "{}")
-            else:
-                metadata_file.write_text("{}")
+            artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        if artifact_filesystem:
-            artifact_filesystem.write("metadata.json", "{}")
-        else:
-            metadata_file.write_text("{}")
+        artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -4840,10 +4910,9 @@ async def execute_boot_time_test(
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("merged-results.json", merge_out)
-            else:
-                merged_file.write_bytes(merge_out)
+            artifact_filesystem.write(
+                "merged-results.json", merge_out, mode=artifact_file_mode
+            )
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(

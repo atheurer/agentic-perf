@@ -897,9 +897,32 @@ async def test_gateway_materializes_inventory_for_workspace_read_and_search(
             operation="read",
             namespace="benchmark/perftest",
             path=readme["ref"],
+            max_bytes=8,
         )
     )
-    assert "server-1" in read["document"]["content"]
+    assert read["document"]["content"] == "client-1"
+    assert read["document"]["size_bytes"] == len(
+        b"client-1 and server-1 form one perftest pair"
+    )
+    assert read["document"]["next_offset_bytes"] == 8
+    continued_read = json.loads(
+        await crucible_context_gateway(
+            provider,
+            ticket_id="PERF-WORKSPACE-CONTEXT",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            benchmark="perftest",
+            operation="read",
+            namespace="benchmark/perftest",
+            path=readme["ref"],
+            max_bytes=64,
+            offset_bytes=read["document"]["next_offset_bytes"],
+        )
+    )
+    assert read["document"]["content"] + continued_read["document"]["content"] == (
+        "client-1 and server-1 form one perftest pair"
+    )
+    assert continued_read["document"]["next_offset_bytes"] is None
 
     search = json.loads(
         await crucible_context_gateway(
@@ -1720,7 +1743,13 @@ async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
         tool = next(
             item for item in tools if item.name == "get_crucible_benchmark_context"
         )
-        assert set(tool.parameters["properties"]) == {"operation", "path", "query"}
+        assert set(tool.parameters["properties"]) == {
+            "operation",
+            "path",
+            "query",
+            "max_bytes",
+            "offset_bytes",
+        }
         assert tool.parameters["additionalProperties"] is False
 
 
@@ -1749,8 +1778,8 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
                 return SSHResult(
                     "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md\t12\t"
                     "device guidance\n"
-                    "NAME\tf\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
-                    "NAME\td\t/opt/crucible/subprojects/benchmarks/perftest\n",
+                    "NAME\tf\t17\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
+                    "NAME\td\t\t/opt/crucible/subprojects/benchmarks/perftest\n",
                     "",
                     0,
                 )
@@ -1786,10 +1815,28 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
             phase="benchmark",
             operation="read",
             path="subprojects/benchmarks/perftest/README.md",
+            max_bytes=8,
         )
     )
     assert read["document"]["ref"] == "subprojects/benchmarks/perftest/README.md"
-    assert read["document"]["content"] == "perftest guidance"
+    assert read["document"]["content"] == "perftest"
+    assert read["document"]["size_bytes"] == len(b"perftest guidance")
+    assert read["document"]["next_offset_bytes"] == 8
+    assert "content" not in read["documents"][0]
+    continued = json.loads(
+        await controller_context_gateway(
+            ssh=FakeSSH(),
+            controller_host="controller.example.test",
+            ticket_id=ticket_id,
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="subprojects/benchmarks/perftest/README.md",
+            max_bytes=8,
+            offset_bytes=read["document"]["next_offset_bytes"],
+        )
+    )
+    assert continued["document"]["content"] == " guidanc"
     manager = WorkspaceManager(
         ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
     )
@@ -1811,6 +1858,7 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
     )
     assert search["found"] is True
     assert search["results"][0]["ref"] == "subprojects/benchmarks/perftest/README.md"
+    assert search["results"][0]["size_bytes"] == 17
     assert search["results"][0]["match_kinds"] == ["content", "name"]
     assert search["results"][0]["matches"][0]["kind"] == "content"
     assert search["total_files"] == 2

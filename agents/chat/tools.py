@@ -564,9 +564,13 @@ CHAT_TOOLS: list[ToolDefinition] = [
                     "type": "string",
                     "description": "Ticket ID to stop",
                 },
-                "reason": {
+                "mode": {
                     "type": "string",
-                    "description": "Reason for stopping",
+                    "enum": ["graceful", "hard"],
+                    "description": (
+                        "Stop mode: graceful (finish current step)"
+                        " or hard (stop immediately)"
+                    ),
                 },
             },
             "required": ["ticket_id"],
@@ -1429,12 +1433,21 @@ async def _stop_ticket(
     params: dict[str, Any],
 ) -> str:
     ticket_id = params["ticket_id"]
-    reason = params.get("reason", "Stopped by user via chat")
+    mode = params.get("mode", "graceful")
     r = await client.post(
         f"{store_url}/api/v1/tickets/{ticket_id}/stop",
         headers=headers,
-        json={"reason": reason},
+        json={"mode": mode},
     )
+    if r.status_code == 409:
+        detail = "Ticket cannot be stopped"
+        try:
+            error_body = r.json()
+        except ValueError:
+            error_body = None
+        if isinstance(error_body, dict) and isinstance(error_body.get("detail"), str):
+            detail = error_body["detail"]
+        return json.dumps({"status": "cannot_stop", "detail": detail})
     r.raise_for_status()
     return json.dumps({"status": "stopped"})
 

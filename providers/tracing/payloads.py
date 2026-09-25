@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import stat
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -69,12 +68,34 @@ class PayloadBlobStore:
                 raise PayloadStorageError("invalid ticket payload scope")
             root = root / ticket_id
         self.directory = root
+        self._ticket_id = ticket_id
 
     def put(self, content: bytes, *, max_bytes: int | None = None) -> str:
         if max_bytes is not None and len(content) > max_bytes:
             raise PayloadStorageError("payload exceeds quota")
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.directory, 0o700)
+        if self._ticket_id is None:
+            from providers.execution import AuditedFilesystem
+
+            filesystem = AuditedFilesystem.system(self.directory)
+        else:
+            from providers.execution import (
+                AuditedFilesystem,
+                RootedPath,
+                durable_filesystem_emitter,
+            )
+
+            filesystem = AuditedFilesystem(
+                RootedPath(
+                    self.directory,
+                    "artifact",
+                    logical_prefix="trace-payloads",
+                ),
+                ticket_id=self._ticket_id,
+                emit=durable_filesystem_emitter(),
+                critical=True,
+            )
+        filesystem.mkdir(".")
+        filesystem.chmod(".", 0o700)
         digest = hashlib.sha256(content).hexdigest()
         target = self.directory / digest
         try:
@@ -83,23 +104,19 @@ class PayloadBlobStore:
                 and stat.S_ISREG(target.lstat().st_mode)
                 and target.read_bytes() == content
             ):
-                os.chmod(target, 0o600)
+                filesystem.chmod(target.name, 0o600)
                 self._fsync_directory()
                 return f"sha256:{digest}"
         except OSError as exc:
             raise PayloadStorageError(
                 "could not verify an existing redacted payload"
             ) from exc
-        fd, temp_name = tempfile.mkstemp(prefix=".payload-", dir=self.directory)
+        temp_name = filesystem.temporary_file(prefix=".payload-")
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
+            filesystem.write(temp_name, content, mode=0o600, atomic=False)
             # Replacing identical content is atomic and makes concurrent writes
             # idempotent.  A rename error is deliberately propagated.
-            os.replace(temp_name, target)
+            filesystem.rename(temp_name, target.name)
             self._fsync_directory()
         except OSError as exc:
             raise PayloadStorageError(
@@ -107,10 +124,10 @@ class PayloadBlobStore:
             ) from exc
         finally:
             try:
-                os.unlink(temp_name)
+                filesystem.unlink(temp_name, missing_ok=True)
             except FileNotFoundError:
                 pass
-        os.chmod(target, 0o600)
+        filesystem.chmod(target.name, 0o600)
         return f"sha256:{digest}"
 
     def get(self, ref: str, *, max_bytes: int) -> bytes:
