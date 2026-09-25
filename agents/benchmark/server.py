@@ -4635,9 +4635,13 @@ async def execute_boot_time_test(
             )
             _lease_id = _metadata.get("lease_id", "")
             _directives = _fields.get("directives", {})
+            # Default to serial capture for Jumpstarter boards.
+            # Serial output is the only diagnostic evidence when
+            # boards fail to come back from reboots.
+            _is_jumpstarter = _fields.get("resource_provider") == "jumpstarter"
             _passive_serial = _directives.get(
                 "serial_capture",
-                False,
+                _is_jumpstarter,
             )
             # Don't run passive serial alongside active serial
             _serial_active = _directives.get(
