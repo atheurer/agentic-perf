@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
 from providers.llm.base import ToolDefinition
 
 
 class TestProvisioningToolScoping:
     """Test _apply_tool_scoping on the provisioning agent."""
 
-    def _make_agent(self):
-        from unittest.mock import AsyncMock
-
+    def _make_agent(self, skill_provider=None):
         from agents.provisioning.agent import ProvisioningAgent
 
         agent = ProvisioningAgent(
             llm_provider=AsyncMock(),
             state_store_url="http://localhost:8090",
+            skill_provider=skill_provider,
         )
         # Simulate tools that would be loaded from MCP
         agent.tools = [
@@ -84,6 +88,60 @@ class TestProvisioningToolScoping:
         names = {t.name for t in agent.tools}
         assert "install_harness" in names
         assert "deploy_secret" in names
+
+    def test_default_crucible_keeps_install_tools_when_directive_is_omitted(self):
+        agent = self._make_agent(
+            skill_provider=SimpleNamespace(default_harness="crucible")
+        )
+        ticket = {"custom_fields": {"directives": {}}}
+
+        agent._apply_tool_scoping(ticket)
+
+        names = {tool.name for tool in agent.tools}
+        assert "install_harness" in names
+        assert "deploy_secret" in names
+
+    @pytest.mark.asyncio
+    async def test_default_crucible_jumpstarter_does_not_auto_complete(self):
+        agent = self._make_agent(
+            skill_provider=SimpleNamespace(default_harness="crucible")
+        )
+        ticket = {
+            "id": "PERF-DEFAULT-CRUCIBLE",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "directives": {},
+                "platform_ready": True,
+                "hosts_provisioned": ["10.0.0.8"],
+            },
+        }
+        mcp = AsyncMock()
+        mcp.list_tools = AsyncMock(
+            return_value=[
+                ToolDefinition(
+                    name="install_harness", description="", input_schema={}
+                )
+            ]
+        )
+
+        with (
+            patch("agents.provisioning.agent.AgentMCPClient", return_value=mcp),
+            patch.object(
+                agent, "_get_ticket", new_callable=AsyncMock, return_value=ticket
+            ),
+            patch.object(
+                agent, "_auto_complete_jumpstarter", new_callable=AsyncMock
+            ) as auto_complete,
+            patch(
+                "agents.provisioning.agent.AgentBase.run", new_callable=AsyncMock
+            ) as base_run,
+        ):
+            await agent.run(ticket["id"])
+
+        auto_complete.assert_not_awaited()
+        base_run.assert_awaited_once_with(ticket["id"])
+        assert any(tool.name == "install_harness" for tool in agent.tools)
+        assert "## Crucible Provisioning Notes" in agent._system_prompt(ticket)
 
 
 class TestBenchmarkToolScoping:

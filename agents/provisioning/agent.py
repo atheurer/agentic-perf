@@ -364,8 +364,9 @@ class ProvisioningAgent(AgentBase):
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Hide install/config tools for self-installing harnesses."""
-        harness = (
-            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
         )
         if harness in self._SELF_INSTALLING:
             self.tools = [
@@ -403,7 +404,9 @@ class ProvisioningAgent(AgentBase):
         # and advance.
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
-        harness = cf.get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            cf.get("directives", {}), getattr(self, "_skill_provider", None)
+        )
         is_jumpstarter = cf.get("resource_provider") == "jumpstarter"
 
         if is_jumpstarter and (not harness or harness in self._SELF_INSTALLING):
