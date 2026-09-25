@@ -359,6 +359,25 @@ references plan steps by index, maintaining clear separation:
 the plan handles sequencing (what runs next), the ledger handles
 reasoning (what was learned). The ledger is append-only.
 
+### Execution Model
+
+Each benchmark harness declares an `execution_model` in its
+`BenchmarkSuite` metadata:
+
+- **`controller`** (default) — A dedicated host runs the benchmark
+  framework (e.g., Crucible). The orchestrator relays commands to
+  the controller, which SSHes to target hosts. Hardware allocation
+  produces a controller host plus target/endpoint hosts.
+- **`direct`** — The orchestrator runs benchmark tools itself (via
+  SSH or local subprocess). No separate controller host exists.
+  Hardware allocation produces target hosts only. Examples:
+  boot-time, Arcaflow.
+
+The triage agent resolves `execution_model` from the harness
+metadata and writes it to `custom_fields.execution_model`. All
+downstream agents (platform, provisioning, benchmark) branch on
+this value to determine IP mapping, prompt content, and tool usage.
+
 ### Execution Plans
 
 Tickets can carry a multi-step execution plan in

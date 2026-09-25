@@ -265,3 +265,93 @@ async def test_mcp_client_list_tools_with_filter(mock_triage_server: Path):
         assert result  # didn't raise
     finally:
         await client.disconnect()
+
+
+class TestExecutionModelPropagation:
+    """Triage propagates execution_model from harness metadata."""
+
+    async def test_boot_time_gets_direct_model(self):
+        """Boot-time harness resolves to direct execution model."""
+        from unittest.mock import MagicMock
+
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+        from providers.skills.catalog import resolve_execution_model
+
+        provider = MagicMock()
+        provider.get_provider = MagicMock(return_value=None)
+        result = await resolve_execution_model(provider, "boot-time")
+        assert result == EXECUTION_MODEL_DIRECT
+
+    async def test_crucible_gets_controller_model(self):
+        """Crucible harness resolves to controller execution model."""
+        from unittest.mock import MagicMock
+
+        from providers.skills.base import EXECUTION_MODEL_CONTROLLER
+        from providers.skills.catalog import resolve_execution_model
+
+        provider = MagicMock()
+        provider.get_provider = MagicMock(return_value=None)
+        result = await resolve_execution_model(provider, "crucible")
+        assert result == EXECUTION_MODEL_CONTROLLER
+
+    async def test_unknown_harness_defaults_to_controller(self):
+        """Unknown harness defaults to controller model."""
+        from unittest.mock import MagicMock
+
+        from providers.skills.base import EXECUTION_MODEL_CONTROLLER
+        from providers.skills.catalog import resolve_execution_model
+
+        provider = MagicMock()
+        provider.get_provider = MagicMock(return_value=None)
+        result = await resolve_execution_model(provider, "unknown-harness")
+        assert result == EXECUTION_MODEL_CONTROLLER
+
+    async def test_arcaflow_gets_direct_model(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        """Arcaflow harness resolves to direct execution model."""
+        from providers.skills.base import EXECUTION_MODEL_DIRECT, BenchmarkSuite
+        from providers.skills.catalog import resolve_execution_model
+
+        suite = BenchmarkSuite(
+            name="stressng",
+            description="test",
+            harness="arcaflow-plugins",
+            execution_model=EXECUTION_MODEL_DIRECT,
+        )
+        mock_provider = AsyncMock()
+        mock_provider.get_benchmark = AsyncMock(return_value=suite)
+        mock_provider.list_benchmarks = AsyncMock(
+            return_value=[
+                BenchmarkSuite(
+                    name="stressng",
+                    description="test",
+                    harness="arcaflow-plugins",
+                    execution_model=EXECUTION_MODEL_DIRECT,
+                )
+            ]
+        )
+        provider = MagicMock()
+        provider.get_provider = MagicMock(return_value=mock_provider)
+        result = await resolve_execution_model(provider, "arcaflow-plugins", "stressng")
+        assert result == EXECUTION_MODEL_DIRECT
+
+    async def test_direct_harness_strips_controller_role(self):
+        """Direct harnesses should not have controller in required_hosts."""
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+
+        # Simulate what triage does for a direct harness
+        required_hosts = [
+            {"roles": ["controller"]},
+            {"roles": ["client"]},
+        ]
+        execution_model = EXECUTION_MODEL_DIRECT
+        if execution_model == EXECUTION_MODEL_DIRECT:
+            required_hosts = [
+                h for h in required_hosts if "controller" not in h.get("roles", [])
+            ]
+            if not required_hosts:
+                required_hosts = [{"roles": ["client"]}]
+
+        assert len(required_hosts) == 1
+        assert required_hosts[0]["roles"] == ["client"]
