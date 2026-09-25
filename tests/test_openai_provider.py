@@ -527,6 +527,87 @@ class TestResponseParsing:
 
 
 class TestResponsesAPI:
+    @staticmethod
+    def _make_gpt6_provider(base_url=None, api="chat_completions"):
+        with patch("openai.OpenAI") as openai_constructor:
+            provider = OpenAICompatLLMProvider(
+                model="gpt-6-luna",
+                base_url=base_url,
+                api=api,
+            )
+        client = openai_constructor.return_value
+        provider._client = client
+        provider.default_timeout = None
+        provider.reasoning_effort = "medium"
+        provider.max_tokens = None
+        client.responses.create.return_value = SimpleNamespace(output=[], usage=None)
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        return provider, client
+
+    @staticmethod
+    def _complete_inline(provider, tools=None):
+        import asyncio
+
+        async def run_in_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch("asyncio.to_thread", new=run_in_thread):
+            return asyncio.run(
+                provider.complete(
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "hello"}],
+                    tools=tools,
+                    timeout=0,
+                )
+            )
+
+    def test_gpt6_with_tools_uses_responses_for_direct_openai(self):
+        provider, client = self._make_gpt6_provider()
+        tools = [ToolDefinition("lookup", "Look up a value", {"type": "object"})]
+
+        self._complete_inline(provider, tools=tools)
+
+        client.responses.create.assert_called_once()
+        client.chat.completions.create.assert_not_called()
+
+    def test_gpt6_without_tools_stays_on_chat_completions(self):
+        provider, client = self._make_gpt6_provider()
+
+        self._complete_inline(provider)
+
+        client.chat.completions.create.assert_called_once()
+        client.responses.create.assert_not_called()
+
+    def test_gpt6_tools_on_custom_endpoint_stay_on_chat_completions(self):
+        provider, client = self._make_gpt6_provider(
+            base_url="https://openai-compatible.example/v1"
+        )
+        tools = [ToolDefinition("lookup", "Look up a value", {"type": "object"})]
+
+        self._complete_inline(provider, tools=tools)
+
+        client.chat.completions.create.assert_called_once()
+        client.responses.create.assert_not_called()
+
+    def test_explicit_responses_api_is_used_for_custom_endpoint(self):
+        provider, client = self._make_gpt6_provider(
+            base_url="https://openai-compatible.example/v1",
+            api="responses",
+        )
+
+        self._complete_inline(provider)
+
+        client.responses.create.assert_called_once()
+        client.chat.completions.create.assert_not_called()
+
     def test_complete_uses_responses_endpoint_and_parameters(self):
         provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
         provider._api = "responses"

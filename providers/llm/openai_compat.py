@@ -79,16 +79,9 @@ class OpenAICompatLLMProvider(LLMProvider):
             raise ValueError(
                 f"OpenAI API must be 'chat_completions' or 'responses', got {api!r}"
             )
-        # Auto-upgrade to Responses API for models that require it
-        # (e.g., GPT-6 rejects reasoning_effort + tools on chat
-        # completions).  Log so the operator knows.
-        if api == "chat_completions" and self._requires_responses_api(model):
-            logger.info(
-                "Auto-upgrading %s to Responses API "
-                "(chat completions rejects reasoning_effort + tools)",
-                model,
-            )
-            api = "responses"
+        # Only direct OpenAI usage can infer Responses API support from the
+        # model name. OpenAI-compatible endpoints must opt in explicitly.
+        self._auto_responses_for_gpt6 = api == "chat_completions" and base_url is None
         self._api = api
 
     async def complete(
@@ -99,7 +92,20 @@ class OpenAICompatLLMProvider(LLMProvider):
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> LLMResponse:
-        if getattr(self, "_api", "chat_completions") == "responses":
+        use_responses_api = getattr(self, "_api", "chat_completions") == "responses"
+        if (
+            not use_responses_api
+            and getattr(self, "_auto_responses_for_gpt6", False)
+            and tools
+            and self._requires_responses_api(self._model)
+        ):
+            logger.info(
+                "Auto-upgrading %s to Responses API for tool use",
+                self._model,
+            )
+            use_responses_api = True
+
+        if use_responses_api:
             return await self._complete_responses(
                 system_prompt, messages, tools, max_tokens, timeout
             )
