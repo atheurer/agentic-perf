@@ -295,11 +295,22 @@ class TestBootTimeKPIExtraction:
         (tmp_path / "boot-time-merge.py").write_text("")
 
         mock_ticket = {
+            "id": "PERF-BOOT",
             "custom_fields": {
                 "ssh_user": "root",
                 "ssh_password": "password",
             },
         }
+
+        http_response = MagicMock()
+        http_response.json.return_value = {"custom_fields": {"output_dirs": []}}
+        update_response = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=http_response)
+        http_client.patch = AsyncMock(return_value=update_response)
+        http_context = AsyncMock()
+        http_context.__aenter__.return_value = http_client
+        http_context.__aexit__.return_value = False
 
         async def mock_subprocess_exec(*args, **kwargs):
             proc = MagicMock()
@@ -336,6 +347,10 @@ class TestBootTimeKPIExtraction:
                 ),
                 patch("tempfile.mkdtemp", return_value=str(tmp_path)),
                 patch("socket.create_connection", return_value=MagicMock()),
+                patch(
+                    "providers.execution.AuditedAsyncHTTPClient",
+                    return_value=http_context,
+                ),
             ):
                 result = json.loads(
                     await server.execute_boot_time_test(
@@ -355,6 +370,11 @@ class TestBootTimeKPIExtraction:
         assert kpis["sample_count"] == 3
         assert kpis["avg_kernel_s"] == 0.21
         assert kpis["avg_total_boot_s"] == 10.51
+        saved_fields = http_client.patch.await_args.kwargs["json"]["fields"]
+        assert saved_fields["output_dir"] == result["output_dir"]
+        assert saved_fields["output_dirs"] == [result["output_dir"]]
+        assert saved_fields["samples_collected"] == 3
+        assert saved_fields["benchmark_kpis"] == kpis
 
 
 class TestBootTimeDiagnostics:

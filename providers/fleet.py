@@ -91,6 +91,8 @@ def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
     fields and synthesis has no per-board data to analyze.
     """
     flash = custom_fields.get("jumpstarter_flash", {})
+    if not isinstance(flash, dict):
+        flash = {}
     bm = custom_fields.get("benchmark_status")
     snapshot: dict[str, Any] = {}
 
@@ -110,13 +112,21 @@ def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
     platform_ip = custom_fields.get("platform_ip", "")
     if platform_ip:
         snapshot["platform_ip"] = platform_ip
-    if flash.get("flash_duration_s"):
-        snapshot["flash_duration_s"] = flash["flash_duration_s"]
+    flash_duration = custom_fields.get("platform_flash_duration_s")
+    if flash_duration is not None:
+        snapshot["flash_duration_s"] = flash_duration
+    boot_duration = custom_fields.get("platform_boot_duration_s")
+    if boot_duration is not None:
+        snapshot["boot_duration_s"] = boot_duration
     if flash.get("diagnostics"):
         snapshot["flash_diagnostics"] = flash["diagnostics"]
-    serial_path = flash.get("serial_log_path", "")
+    serial_path = custom_fields.get("platform_serial_log", "")
     if serial_path:
         snapshot["serial_log_path"] = serial_path
+
+    output_dir = custom_fields.get("output_dir", "")
+    if output_dir:
+        snapshot["output_dir"] = output_dir
 
     # KPIs if any were extracted
     kpis = custom_fields.get("benchmark_kpis")

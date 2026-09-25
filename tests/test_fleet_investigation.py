@@ -224,17 +224,19 @@ class TestSnapshotIterationData:
 
         cf = {
             "platform_ip": "10.26.29.22",
-            "jumpstarter_flash": {
-                "flash_duration_s": 98.5,
-                "diagnostics": ["Flash succeeded in 98s"],
-                "serial_log_path": "/tmp/serial-capture.log",
-            },
+            "platform_flash_duration_s": 98.5,
+            "platform_boot_duration_s": 31.2,
+            "platform_serial_log": "/tmp/serial-capture.log",
+            "output_dir": "/tmp/artifacts/run-123",
+            "jumpstarter_flash": {"diagnostics": ["Flash succeeded in 98s"]},
         }
         snap = snapshot_iteration_data(cf)
         assert snap["platform_ip"] == "10.26.29.22"
         assert snap["flash_duration_s"] == 98.5
+        assert snap["boot_duration_s"] == 31.2
         assert snap["flash_diagnostics"] == ["Flash succeeded in 98s"]
         assert snap["serial_log_path"] == "/tmp/serial-capture.log"
+        assert snap["output_dir"] == "/tmp/artifacts/run-123"
 
     def test_empty_fields_omitted(self):
         from providers.fleet import snapshot_iteration_data
