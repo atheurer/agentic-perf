@@ -1199,8 +1199,10 @@ class TestMaybeStartIntrospection:
 
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = True
+        config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
         dispatcher.is_introspection_active.return_value = False
+        dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
         ticket = {"custom_fields": {}}
 
@@ -1228,8 +1230,10 @@ class TestMaybeStartIntrospection:
 
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = False
+        config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
         dispatcher.is_introspection_active.return_value = False
+        dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
         ticket = {"custom_fields": {"introspection_enabled": True}}
 

@@ -5,6 +5,31 @@ Secrets (API keys, SSH credentials, tokens) are resolved through a
 The first layer to contain a requested secret wins; later layers are
 skipped (with shadow-detection logging when a duplicate exists).
 
+## LLM API keys
+
+LLM credentials can be stored with the same provider and referenced from
+`config.json` instead of placing the value in configuration. For example,
+store an OpenAI key at `~/.agentic-perf/secrets/openai/api-key` and configure:
+
+```json
+{
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "api_key_secret": "openai/api-key"
+  }
+}
+```
+
+Use `agent_models.<agent_type>.api_key_secret` to select a credential for a
+specific agent. This also supports mixed vendors. The global reference applies
+only to agents using the global provider and is not inherited by an agent that
+overrides that provider. An explicit reference takes precedence over the
+provider's environment variable; a missing or empty referenced value is an
+error. Without a reference, environment-variable authentication continues to
+work as before. See [LLM configuration](configuration.md#llm--global-llm-provider)
+for provider-specific details.
+
 ## Provider Types
 
 ### Local (file-backed)

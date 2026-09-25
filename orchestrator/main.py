@@ -29,7 +29,7 @@ from providers.tracing import (
     trace_headers,
 )
 
-from .config import OrchestratorConfig
+from .config import OrchestratorConfig, _provider_family
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
 from .handoff import check_handoff
 from .poller import fetch_all_tickets
@@ -55,12 +55,24 @@ def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
 
 
 def _make_llm_provider(
-    config: OrchestratorConfig, provider: str = "", model: str = "", api: str = ""
+    config: OrchestratorConfig,
+    provider: str = "",
+    model: str = "",
+    api: str = "",
+    api_key: str | None = None,
 ):
+    provider_name = provider or config.llm_provider
+    if api_key is None:
+        if provider_name in ("claude", "anthropic"):
+            api_key = config.anthropic_api_key
+        elif provider_name == "openai":
+            api_key = config._openai_api_key
+        elif provider_name in ("gemini", "google"):
+            api_key = config._gemini_api_key
     return create_llm_provider(
-        provider=provider or config.llm_provider,
+        provider=provider_name,
         model=model or config.llm_model,
-        api_key=config.anthropic_api_key,
+        api_key=api_key,
         backend=config.llm_backend,
         project_id=config.llm_project_id,
         region=config.llm_region,
@@ -70,7 +82,10 @@ def _make_llm_provider(
     )
 
 
-def _make_llm_factory(config: OrchestratorConfig):
+def _make_llm_factory(
+    config: OrchestratorConfig,
+    api_keys: dict[str, str] | None = None,
+):
     def factory(agent_type: str):
         agent_cfg = config.get_agent_llm_config(agent_type)
         provider = _make_llm_provider(
@@ -78,6 +93,7 @@ def _make_llm_factory(config: OrchestratorConfig):
             provider=agent_cfg.get("provider", ""),
             model=agent_cfg.get("model", ""),
             api=agent_cfg.get("api", ""),
+            api_key=(api_keys or {}).get(agent_type),
         )
         provider.default_timeout = config.llm_timeout
         effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
@@ -157,7 +173,51 @@ def _fresh_config(fallback: OrchestratorConfig) -> OrchestratorConfig:
     return config
 
 
-async def _validate_models(config: OrchestratorConfig) -> None:
+class SecretReferenceError(RuntimeError):
+    """A configured LLM secret path could not be resolved safely."""
+
+
+async def _resolve_api_key_secret(
+    config: OrchestratorConfig,
+    agent_type: str,
+    secrets_provider: Any,
+) -> str | None:
+    """Resolve an explicitly configured API key secret for one agent."""
+    agent_cfg = config.get_agent_llm_config(agent_type)
+    secret_path = agent_cfg.get("api_key_secret")
+    if secret_path is None:
+        return None
+    if not isinstance(secret_path, str) or not secret_path.strip():
+        raise SecretReferenceError(
+            f"llm API-key secret for agent {agent_type or 'default'} "
+            "must be a non-empty secret path"
+        )
+    if secrets_provider is None:
+        raise SecretReferenceError(
+            f"LLM API-key secret '{secret_path}' is configured for "
+            f"agent {agent_type or 'default'}, but no secrets provider is available"
+        )
+    try:
+        value = await secrets_provider.get_secret(secret_path)
+    except Exception:
+        # Provider exception messages may contain backend details. Keep logs
+        # and ticket failure comments free of any returned credential data.
+        raise SecretReferenceError(
+            f"Unable to resolve configured LLM API-key secret '{secret_path}' "
+            f"for agent {agent_type or 'default'}"
+        ) from None
+    if value is None or not value.strip():
+        raise SecretReferenceError(
+            f"Configured LLM API-key secret '{secret_path}' was not found "
+            f"for agent {agent_type or 'default'}"
+        )
+    return value.strip()
+
+
+async def _validate_models(
+    config: OrchestratorConfig,
+    secrets_provider: Any = None,
+) -> None:
     """Make a minimal test call for each distinct LLM configuration at startup.
 
     Catches model/region mismatches before any tickets are processed.
@@ -170,18 +230,14 @@ async def _validate_models(config: OrchestratorConfig) -> None:
 
     # Two-pass: first collect all configs and group agent types per
     # dedup key, then probe each unique configuration once.
-    key_to_agents: dict[tuple[str, str, str, str, str], list[str]] = {}
-    key_to_cfg: dict[tuple[str, str, str, str, str], dict] = {}
+    key_to_agents: dict[tuple[str, str, str, str, str, str], list[str]] = {}
+    key_to_cfg: dict[tuple[str, str, str, str, str, str], dict] = {}
 
     for agent_type in agent_types:
         if agent_type:
             cfg = config.get_agent_llm_config(agent_type)
         else:
-            cfg = {
-                "provider": config.llm_provider,
-                "model": config.llm_model,
-                "api": getattr(config, "llm_api", "chat_completions"),
-            }
+            cfg = config.get_agent_llm_config("")
 
         provider_name = cfg.get("provider", config.llm_provider) or ""
         model_name = cfg.get("model", config.llm_model) or ""
@@ -198,7 +254,20 @@ async def _validate_models(config: OrchestratorConfig) -> None:
             fallback = config.llm_reasoning_effort
             effort = fallback if isinstance(fallback, str) else None
         effort_str = effort or ""
-        key = (provider_name, model_name, region, api_name, effort_str)
+        secret_ref = cfg.get("api_key_secret")
+        secret_ref_key = (
+            secret_ref
+            if isinstance(secret_ref, str)
+            else f"<invalid:{type(secret_ref).__name__}>"
+        )
+        key = (
+            provider_name,
+            model_name,
+            region,
+            api_name,
+            effort_str,
+            secret_ref_key,
+        )
 
         agent_label = agent_type or "default"
         key_to_agents.setdefault(key, []).append(agent_label)
@@ -206,9 +275,10 @@ async def _validate_models(config: OrchestratorConfig) -> None:
             key_to_cfg[key] = cfg
 
     for key, agents in key_to_agents.items():
-        provider_name, model_name, region, api_name, effort_str = key
+        provider_name, model_name, region, api_name, effort_str, _ = key
         effort = effort_str or None
         cfg = key_to_cfg[key]
+        secret_ref = cfg.get("api_key_secret")
 
         label = f"{provider_name}/{model_name}" + (f" [{region}]" if region else "")
         if effort:
@@ -216,11 +286,19 @@ async def _validate_models(config: OrchestratorConfig) -> None:
         agents_str = ", ".join(agents)
 
         try:
+            api_key = None
+            if secret_ref is not None:
+                api_key = await _resolve_api_key_secret(
+                    config,
+                    agents[0] if agents[0] != "default" else "",
+                    secrets_provider,
+                )
             provider = _make_llm_provider(
                 config,
                 provider=cfg.get("provider", ""),
                 model=cfg.get("model", ""),
                 api=api_name,
+                api_key=api_key,
             )
             if effort:
                 provider.reasoning_effort = effort
@@ -258,8 +336,23 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                     f" — reasoning calls can be slower"
                 )
             logger.error(msg)
+        except SecretReferenceError as exc:
+            logger.warning(
+                "Skipping startup model check for %s (agents: %s): %s. "
+                "Startup validation uses shared secrets; ticket dispatch "
+                "resolves each user's cascade.",
+                label,
+                agents_str,
+                exc,
+            )
         except Exception as exc:
-            msg = f"Model check FAILED: {label} (agents: {agents_str}) — {exc}"
+            probe_error = (
+                f"configured API-key secret '{secret_ref}' was resolved, "
+                "but the model probe failed"
+                if secret_ref
+                else str(exc)
+            )
+            msg = f"Model check FAILED: {label} (agents: {agents_str}) — {probe_error}"
             if effort:
                 msg += (
                     f"\n  → reasoning_effort={effort} is configured for"
@@ -697,13 +790,28 @@ async def run_agent_task(
     success = False
 
     try:
-        snapshot_factory = _make_llm_factory(config) if config else None
+        ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
+        agent_type = STATUS_AGENT_MAP.get(status, "")
+        api_key = (
+            await _resolve_api_key_secret(config, agent_type, ticket_secrets)
+            if config
+            else None
+        )
+        snapshot_factory = (
+            _make_llm_factory(
+                config,
+                api_keys={agent_type: api_key} if api_key is not None else {},
+            )
+            if config
+            else None
+        )
         snapshot_iterations = config.get_agent_max_iterations if config else None
         agent = dispatcher.create_agent(
             status,
             ticket_data=ticket_data,
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
+            secrets_provider=ticket_secrets,
         )
         if agent is None:
             return
@@ -758,11 +866,26 @@ async def run_agent_task(
                             )
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
+                        agent_type = STATUS_AGENT_MAP.get(status, "")
+                        agent_cfg = config.get_agent_llm_config(agent_type)
+                        agent_provider = (
+                            agent_cfg.get("provider") or config.llm_provider
+                        )
+                        override_provider = (
+                            llm_override.get("provider") or agent_provider
+                        )
+                        override_api_key = (
+                            api_key
+                            if _provider_family(override_provider)
+                            == _provider_family(agent_provider)
+                            else None
+                        )
                         override_llm = _make_llm_provider(
                             config,
-                            provider=llm_override.get("provider", ""),
+                            provider=override_provider,
                             model=llm_override.get("model", ""),
                             api=llm_override.get("api", ""),
+                            api_key=override_api_key,
                         )
                         override_llm.default_timeout = config.llm_timeout
                         override_effort = llm_override.get("reasoning_effort")
@@ -1472,6 +1595,8 @@ def _maybe_start_introspection(
     """
     if dispatcher.is_introspection_active(ticket_id):
         return
+    if ticket_id in dispatcher._introspection_starting:
+        return
 
     cf = ticket.get("custom_fields", {})
     per_ticket = cf.get("introspection_enabled")
@@ -1482,9 +1607,60 @@ def _maybe_start_introspection(
     if per_ticket is not True and not config.introspection_enabled:
         return
 
+    if dispatcher._introspection_llm:
+        intro_cfg = config.get_agent_llm_config("introspection")
+        if intro_cfg.get("api_key_secret") is not None:
+            dispatcher._introspection_starting.add(ticket_id)
+            asyncio.create_task(
+                _start_introspection_with_secret(
+                    dispatcher,
+                    config,
+                    ticket,
+                    ticket_id,
+                ),
+                name=f"introspection-llm-setup-{ticket_id}",
+            )
+            return
+
     started = dispatcher.start_introspection(ticket_id)
     if started:
         logger.info(f"Introspection started for {ticket_id}")
+
+
+async def _start_introspection_with_secret(
+    dispatcher: Dispatcher,
+    config: OrchestratorConfig,
+    ticket: dict[str, Any],
+    ticket_id: str,
+) -> None:
+    """Resolve an introspection credential before creating its LLM client."""
+    api_key = None
+    try:
+        secrets_provider = dispatcher._get_secrets_for_ticket(ticket)
+        api_key = await _resolve_api_key_secret(
+            config,
+            "introspection",
+            secrets_provider,
+        )
+        factory = _make_llm_factory(
+            config,
+            api_keys={"introspection": api_key} if api_key is not None else {},
+        )
+        if dispatcher.start_introspection(ticket_id, llm_factory=factory):
+            logger.info("Introspection started for %s", ticket_id)
+    except Exception as exc:
+        failure = (
+            f"provider setup failed ({type(exc).__name__})"
+            if api_key is not None
+            else str(exc)
+        )
+        logger.error(
+            "Could not start introspection for %s: %s",
+            ticket_id,
+            failure,
+        )
+    finally:
+        dispatcher._introspection_starting.discard(ticket_id)
 
 
 async def _add_comment(
@@ -1686,15 +1862,6 @@ async def _poll_loop_after_lease(
 ) -> None:
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
-    await _validate_models(config)
-
-    llm = _make_llm_provider(config)
-    llm.default_timeout = config.llm_timeout
-    if config.llm_reasoning_effort:
-        llm.reasoning_effort = config.llm_reasoning_effort
-    llm.max_tokens = config.llm_max_tokens
-    llm_factory = _make_llm_factory(config)
-
     repo_cache = RepoCache()
 
     # Create an MCP client for arcaflow plugin discovery
@@ -1781,6 +1948,27 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
+        isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
+        for agent_cfg in config._agent_models.values()
+    )
+    # The dispatcher needs a fallback provider object, but real dispatches
+    # construct their client from the effective per-agent config. Avoid
+    # eagerly constructing an unauthenticated vendor client when credentials
+    # are ticket-scoped or configured only for individual agents.
+    llm = (
+        create_llm_provider(provider="mock")
+        if has_api_key_secret_refs
+        else _make_llm_provider(config)
+    )
+    llm.default_timeout = config.llm_timeout
+    if config.llm_reasoning_effort:
+        llm.reasoning_effort = config.llm_reasoning_effort
+    llm.max_tokens = config.llm_max_tokens
+    llm_factory = _make_llm_factory(config)
+
+    await _validate_models(config, secrets)
 
     from providers.redaction import get_shared_redactor
 
@@ -2136,16 +2324,18 @@ async def _poll_loop_after_lease(
                                     [],
                                 )
 
+                    snapshot = _fresh_config(config)
+
                     # Start introspection BEFORE the pipeline agent
-                    # so no events are missed in a startup race.
+                    # so no events are missed in a startup race. Use
+                    # the same per-ticket config snapshot as dispatch.
                     _maybe_start_introspection(
                         dispatcher,
-                        config,
+                        snapshot,
                         ticket,
                         tid,
                     )
 
-                    snapshot = _fresh_config(config)
                     logger.info(f"Dispatching {status} agent for ticket {tid}")
                     task = asyncio.create_task(
                         run_agent_task(

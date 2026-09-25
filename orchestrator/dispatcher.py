@@ -110,6 +110,7 @@ class Dispatcher:
         self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
+        self._introspection_starting: set[str] = set()
         self._trace_contexts: dict[str, Any] = {}
         self._previous_invocations: dict[str, Any] = {}
         trace_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
@@ -467,6 +468,7 @@ class Dispatcher:
     def start_introspection(
         self,
         ticket_id: str,
+        llm_factory: Any | None = None,
     ) -> bool:
         """Start the introspection agent for a ticket.
 
@@ -481,7 +483,13 @@ class Dispatcher:
 
         from agents.introspection.agent import IntrospectionAgent
 
-        llm = self._get_llm("introspection") if self._introspection_llm else None
+        llm = None
+        if self._introspection_llm:
+            llm = (
+                llm_factory("introspection")
+                if llm_factory
+                else self._get_llm("introspection")
+            )
         agent = IntrospectionAgent(
             state_store_url=self.store_url,
             event_bus=self.events,
@@ -610,14 +618,19 @@ class Dispatcher:
         ticket_data: dict | None = None,
         llm_factory: Any | None = None,
         iterations_factory: Any | None = None,
+        secrets_provider: SecretsProvider | None = None,
     ) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
             return None
 
         factory = self._llm_factory if llm_factory is None else llm_factory
+        ticket_secrets = (
+            secrets_provider
+            if secrets_provider is not None
+            else self._get_secrets_for_ticket(ticket_data)
+        )
         llm = factory(agent_type) if factory is not None else self.llm
-        ticket_secrets = self._get_secrets_for_ticket(ticket_data)
         agent: Any = None
 
         if agent_type == "triage":
