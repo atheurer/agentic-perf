@@ -475,6 +475,7 @@ class TestPlatformIPScoping:
         agent._tool_handlers = {}
         agent._events = None
         agent._mcp = None
+        agent._skill_provider = None
         agent._stop_requested = False
         agent._client = AsyncMock()
 
