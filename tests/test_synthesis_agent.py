@@ -281,6 +281,7 @@ class TestHandleCompletion:
         assert call_args[0][0] == "create_investigation_record"
         assert call_args[0][1]["subsystem"] == "storage_io"
         assert call_args[0][1]["root_cause_summary"] == "virtio-blk regression"
+        assert call_args[0][1]["ticket_id"] == "PERF-TEST"
 
         # Verify transition to teardown
         transition_calls = [
