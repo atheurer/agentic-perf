@@ -127,7 +127,12 @@ async def resolve_execution_model(
             if suite is not None:
                 return suite.execution_model
         except Exception:
-            pass
+            logger.debug(
+                "Failed to resolve execution_model for %s/%s",
+                harness,
+                benchmark_name,
+                exc_info=True,
+            )
 
     # If we have a harness provider but no specific benchmark,
     # check any benchmark from that provider for its model.
@@ -137,6 +142,10 @@ async def resolve_execution_model(
             if suites:
                 return suites[0].execution_model
         except Exception:
-            pass
+            logger.debug(
+                "Failed to list benchmarks for harness %s",
+                harness,
+                exc_info=True,
+            )
 
     return EXECUTION_MODEL_CONTROLLER
