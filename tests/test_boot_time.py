@@ -167,6 +167,62 @@ class TestBootTimeRepoLookup:
         mock_cache.get_path.assert_called_once_with("boot-time-analysis-scripts")
 
 
+class TestBootTimeJumpstarterRecovery:
+    async def test_retries_after_three_power_cycles(self, tmp_path):
+        from agents.benchmark import server
+
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"", b""))
+        mock_runner = MagicMock()
+        mock_runner.start = AsyncMock(return_value=mock_process)
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {"lease_id": "lease-123"},
+            }
+        }
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", ticket),
+            patch("socket.create_connection", side_effect=OSError("not ready")) as ssh,
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(server, "AuditedSubprocessRunner", return_value=mock_runner),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(
+                    sut_host="192.168.1.100",
+                    samples=1,
+                )
+            )
+
+        assert result["status"] == "failed"
+        assert "3 Jumpstarter power-cycle attempt(s)" in result["error"]
+        assert "4 SSH polling window(s)" in result["error"]
+        assert ssh.call_count == 4 * 12
+        assert mock_runner.start.call_count == 3
+        assert all(
+            call.kwargs["mutating"] is True
+            and call.args[0]
+            == [
+                "jmp",
+                "shell",
+                "--lease",
+                "lease-123",
+                "--",
+                "j",
+                "power",
+                "cycle",
+            ]
+            for call in mock_runner.start.call_args_list
+        )
+
+
 class TestBootTimeKPIExtraction:
     """KPI extraction from merged boot-time results."""
 
@@ -279,6 +335,7 @@ class TestBootTimeKPIExtraction:
                     side_effect=mock_subprocess_exec,
                 ),
                 patch("tempfile.mkdtemp", return_value=str(tmp_path)),
+                patch("socket.create_connection", return_value=MagicMock()),
             ):
                 result = json.loads(
                     await server.execute_boot_time_test(
