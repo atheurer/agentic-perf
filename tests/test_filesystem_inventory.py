@@ -2181,3 +2181,13 @@ def test_os_open_and_bound_path_open_writes_are_inventoried() -> None:
     assert _is_mutation(write_open, "os.open")
     assert not _is_mutation(read_open, "os.open")
     assert _is_mutation(bound_open, "self.path.open")
+
+
+def test_leader_lease_write_uses_audited_filesystem() -> None:
+    """Lease persistence must use the wrapper instead of a direct file write."""
+    source = _production_sources(ROOT)["state_store/store.py"]
+    assert "self._system_filesystem.write(self._lease_path.name, payload" in source
+    mutations = _inventory_from_sources({"state_store/store.py": source})
+    assert not any(
+        mutation.scope.endswith("._write_orchestrator_lease") for mutation in mutations
+    )
