@@ -4358,8 +4358,11 @@ async def execute_boot_time_test(
     _MAX_POWER_CYCLES = 3
     _SSH_ATTEMPTS_PER_CYCLE = 12
     _ssh_ready = False
+    _power_cycles_attempted = 0
+    _ssh_polling_windows = 0
 
-    for _cycle in range(_MAX_POWER_CYCLES):
+    while True:
+        _ssh_polling_windows += 1
         for _attempt in range(_SSH_ATTEMPTS_PER_CYCLE):
             try:
                 s = _socket.create_connection((sut_host, 22), timeout=5)
@@ -4370,8 +4373,8 @@ async def execute_boot_time_test(
                 logger.info(
                     "[boot-time] Waiting for SSH on %s (cycle %d/%d, attempt %d/%d)",
                     sut_host,
-                    _cycle + 1,
-                    _MAX_POWER_CYCLES,
+                    _power_cycles_attempted + 1,
+                    _MAX_POWER_CYCLES + 1,
                     _attempt + 1,
                     _SSH_ATTEMPTS_PER_CYCLE,
                 )
@@ -4384,54 +4387,57 @@ async def execute_boot_time_test(
             # No Jumpstarter lease — cannot power-cycle
             break
 
-        if _cycle + 1 < _MAX_POWER_CYCLES:
-            logger.warning(
-                "[boot-time] SSH unreachable after %ds,"
-                " power-cycling board via Jumpstarter"
-                " (lease=%s, cycle %d/%d)",
-                _SSH_ATTEMPTS_PER_CYCLE * 5,
-                _js_lease_id,
-                _cycle + 1,
-                _MAX_POWER_CYCLES,
+        if _power_cycles_attempted >= _MAX_POWER_CYCLES:
+            break
+
+        _power_cycles_attempted += 1
+        logger.warning(
+            "[boot-time] SSH unreachable after %ds,"
+            " power-cycling board via Jumpstarter"
+            " (lease=%s, power cycle %d/%d)",
+            _SSH_ATTEMPTS_PER_CYCLE * 5,
+            _js_lease_id,
+            _power_cycles_attempted,
+            _MAX_POWER_CYCLES,
+        )
+        try:
+            _pc_proc = await AuditedSubprocessRunner().start(
+                [
+                    "jmp",
+                    "shell",
+                    "--lease",
+                    _js_lease_id,
+                    "--",
+                    "j",
+                    "power",
+                    "cycle",
+                ],
+                mutating=True,
             )
-            try:
-                _pc_proc = await AuditedSubprocessRunner().start(
-                    [
-                        "jmp",
-                        "shell",
-                        "--lease",
-                        _js_lease_id,
-                        "--",
-                        "j",
-                        "power",
-                        "cycle",
-                    ],
-                    mutating=True,
-                )
-                _pc_out, _pc_err = await asyncio.wait_for(
-                    _pc_proc.communicate(),
-                    timeout=60,
-                )
-                logger.info(
-                    "[boot-time] Power cycle complete (rc=%d), waiting for SSH",
-                    _pc_proc.returncode,
-                )
-            except Exception as _pc_exc:
-                logger.warning(
-                    "[boot-time] Power cycle failed: %s",
-                    _pc_exc,
-                )
-                break
+            _pc_out, _pc_err = await asyncio.wait_for(
+                _pc_proc.communicate(),
+                timeout=60,
+            )
+            logger.info(
+                "[boot-time] Power cycle complete (rc=%d), waiting for SSH",
+                _pc_proc.returncode,
+            )
+        except Exception as _pc_exc:
+            logger.warning(
+                "[boot-time] Power cycle failed: %s",
+                _pc_exc,
+            )
+            break
 
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
     if not _ssh_ready:
-        _cycles_tried = min(_cycle + 1, _MAX_POWER_CYCLES)
         return json.dumps(
             {
                 "status": "failed",
                 "error": (
                     f"SUT {sut_host} not SSH-reachable after"
-                    f" {_cycles_tried} boot cycle(s)."
+                    f" {_power_cycles_attempted} Jumpstarter power-cycle attempt(s)"
+                    f" across {_ssh_polling_windows} SSH polling window(s)."
                     f" Board may need manual intervention."
                 ),
             }
