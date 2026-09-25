@@ -323,6 +323,12 @@ async def resolve_images(
             return
 
         directives = cf.get("directives", {})
+        if not isinstance(directives, dict):
+            logger.warning(
+                "[jumpstarter-images] Ignoring non-object directives for %s",
+                ticket_id,
+            )
+            directives = {}
         metadata = cf.get("resource_provider_metadata", {})
 
         # Resolve image source. No hardcoded OS defaults
@@ -338,10 +344,27 @@ async def resolve_images(
         # 2. Run metadata (knows which OS produced the alert)
         # 3. Config default (jumpstarter_images.server)
         # 4. Hardcoded AutoSD fallback
-        image_version = directives.get(
-            "image_version",
-            img_cfg.get("image_version", ""),
-        )
+        image_version = directives.get("image_version")
+        if image_version is None:
+            image_version = img_cfg.get("image_version", "")
+        if not isinstance(image_version, str):
+            logger.warning(
+                "[jumpstarter-images] Ignoring non-string image_version for %s",
+                ticket_id,
+            )
+            image_version = ""
+        else:
+            image_version = image_version.strip()
+
+        release = directives.get("release", "")
+        if not isinstance(release, str):
+            logger.warning(
+                "[jumpstarter-images] Ignoring non-string release for %s",
+                ticket_id,
+            )
+            release = ""
+        else:
+            release = release.strip()
 
         # Normalize image directives — the chat agent or triage
         # may conflate fields (e.g., image_version="AutoSD-10-nightly"
@@ -352,9 +375,8 @@ async def resolve_images(
             if image_version.lower().endswith(suffix):
                 extracted_release = suffix.lstrip("-")
                 image_version = image_version[: -len(suffix)]
-                if not directives.get("release"):
-                    directives = dict(directives)
-                    directives["release"] = extracted_release
+                if not release:
+                    release = extracted_release
                 logger.info(
                     "[jumpstarter-images] Normalized image_version "
                     "for %s: stripped '%s' suffix, release=%s",
@@ -388,7 +410,6 @@ async def resolve_images(
 
         # Release path: RHIVOS uses full release label,
         # AutoSD uses 'nightly'.
-        release = directives.get("release", "")
         if not release:
             release = _derive_release(run_labels, os_id)
 
@@ -407,6 +428,11 @@ async def resolve_images(
             default_name = "ps"
             default_type = "regular"
 
+        if not isinstance(default_name, str) or not default_name.strip():
+            default_name = "ps" if mode in ("bootc", "ostree") else "qa"
+        else:
+            default_name = default_name.strip()
+
         image_name = directives.get("image_name", default_name)
         image_type = directives.get("image_type", default_type)
 
@@ -417,7 +443,16 @@ async def resolve_images(
         # variants are dynamic (ps, qa, developer-vm, etc.)
         # so we cannot use a static allowlist.
         _KNOWN_IMAGE_TYPES = {"regular", "ostree"}
-        if image_name and image_name.lower().startswith(("autosd", "rhivos", "centos")):
+        if not isinstance(image_name, str) or not image_name.strip():
+            logger.warning(
+                "[jumpstarter-images] Invalid image_name for %s — falling back to '%s'",
+                ticket_id,
+                default_name,
+            )
+            image_name = default_name
+        else:
+            image_name = image_name.strip()
+        if image_name.lower().startswith(("autosd", "rhivos", "centos")):
             logger.warning(
                 "[jumpstarter-images] image_name '%s' looks like "
                 "a version string for %s — falling back to '%s'",
@@ -426,7 +461,12 @@ async def resolve_images(
                 default_name,
             )
             image_name = default_name
-        if image_type and image_type not in _KNOWN_IMAGE_TYPES:
+
+        if isinstance(image_type, str):
+            image_type = image_type.strip().lower()
+        else:
+            image_type = ""
+        if image_type not in _KNOWN_IMAGE_TYPES:
             logger.warning(
                 "[jumpstarter-images] Unrecognized image_type '%s' "
                 "for %s — falling back to '%s'",
