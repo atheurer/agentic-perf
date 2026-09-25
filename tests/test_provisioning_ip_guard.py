@@ -560,6 +560,16 @@ class TestPlatformIPScoping:
             ) as mock_fields,
             patch.object(
                 agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
                 "_get_ticket",
                 new_callable=AsyncMock,
                 return_value={
