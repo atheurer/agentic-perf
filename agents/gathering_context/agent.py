@@ -243,6 +243,7 @@ class GatheringContextAgent(AgentBase):
         try:
             entry = BuildHistoryEntry(
                 build_id=str(build_id),
+                ticket_id=ticket_id,
                 action="SKIP_MATCHED",
                 comment=(f"Deterministic dedup from ticket {ticket_id}"),
             )
