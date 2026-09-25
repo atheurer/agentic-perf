@@ -4783,6 +4783,39 @@ async def execute_boot_time_test(
         stall_diag["samples_before_stall"] = sample_count
         stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
+        # Analyze serial capture log for failure indicators.
+        # The serial log captures board console output during
+        # the benchmark and can reveal kernel panics, boot
+        # hangs, or U-Boot failures that SSH diagnostics miss.
+        if serial_log_path.exists() and serial_log_path.stat().st_size > 0:
+            try:
+                serial_text = serial_log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                stall_diag["serial_log_bytes"] = len(serial_text)
+                # Include last 2000 chars for the LLM to analyze
+                stall_diag["serial_tail"] = serial_text[-2000:]
+                # Flag known failure patterns
+                _FAILURE_PATTERNS = [
+                    ("kernel panic", "kernel_panic"),
+                    ("unable to mount root", "root_mount_failure"),
+                    ("not syncing", "kernel_not_syncing"),
+                    ("reboot: system halted", "system_halted"),
+                    ("u-boot", "uboot_prompt"),
+                    ("autoboot", "uboot_autoboot"),
+                    ("login:", "reached_login"),
+                ]
+                lower_text = serial_text.lower()
+                detected = [
+                    label
+                    for pattern, label in _FAILURE_PATTERNS
+                    if pattern in lower_text
+                ]
+                if detected:
+                    stall_diag["serial_indicators"] = detected
+            except Exception:
+                pass
+
         # Write diagnostics to artifact file
         try:
             import json as _json
