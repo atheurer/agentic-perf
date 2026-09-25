@@ -433,8 +433,8 @@ class TestSearchFiltering:
         response = AsyncMock()
         response.json = MagicMock(
             return_value=[
+                # Server-side status filter returns only matches
                 {"id": "PERF-1", "summary": "a", "status": "closed"},
-                {"id": "PERF-2", "summary": "b", "status": "running"},
             ]
         )
         response.raise_for_status = MagicMock()
@@ -451,6 +451,9 @@ class TestSearchFiltering:
         parsed = json.loads(result)
         assert parsed["count"] == 1
         assert parsed["tickets"][0]["id"] == "PERF-1"
+        # Verify status passed as server-side param
+        call_kwargs = client.get.call_args
+        assert call_kwargs.kwargs.get("params", {}).get("status") == "closed"
 
     async def test_query_filter(self):
         client = AsyncMock()

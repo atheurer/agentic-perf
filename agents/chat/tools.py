@@ -382,15 +382,45 @@ CHAT_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="search_tickets",
         description=(
-            "Search tickets by status, board type, harness, "
-            "or keywords. Returns a summary list."
+            "Search tickets by status, owner, harness, board "
+            "type, date range, or keywords. Returns a summary "
+            "list with metadata."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "status": {
                     "type": "string",
-                    "description": "Filter by status (e.g., 'executing_benchmark', 'closed')",
+                    "description": (
+                        "Filter by status (e.g., 'closed', 'executing_benchmark')"
+                    ),
+                },
+                "owner": {
+                    "type": "string",
+                    "description": ("Filter by ticket owner username"),
+                },
+                "created_by": {
+                    "type": "string",
+                    "description": ("Filter by ticket creator username"),
+                },
+                "harness": {
+                    "type": "string",
+                    "description": (
+                        "Filter by benchmark harness (e.g., 'boot-time', 'uperf')"
+                    ),
+                },
+                "board_type": {
+                    "type": "string",
+                    "description": (
+                        "Filter by board type from board_selector "
+                        "(e.g., 'nxp-s32g-vnp-rdb3', 'qc8775')"
+                    ),
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Only tickets created after this ISO date (e.g., '2026-09-17')"
+                    ),
                 },
                 "limit": {
                     "type": "integer",
@@ -398,7 +428,7 @@ CHAT_TOOLS: list[ToolDefinition] = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "Keyword search in summary/description",
+                    "description": ("Keyword search in summary/description"),
                 },
             },
         },
@@ -812,34 +842,68 @@ async def _search_tickets(
     params: dict[str, Any],
 ) -> str:
     limit = params.get("limit", 10)
+    api_params: dict[str, str] = {}
+    status_filter = params.get("status", "").lower()
+    if status_filter:
+        api_params["status"] = status_filter
     r = await client.get(
         f"{store_url}/api/v1/tickets",
         headers=headers,
-        params={"limit": limit},
+        params=api_params,
     )
     r.raise_for_status()
     tickets = r.json()
 
-    # Filter by status/query if provided
-    status_filter = params.get("status", "").lower()
+    # Client-side filters
     query_filter = params.get("query", "").lower()
+    owner_filter = params.get("owner", "").lower()
+    created_by_filter = params.get("created_by", "").lower()
+    harness_filter = params.get("harness", "").lower()
+    board_type_filter = params.get("board_type", "").lower()
+    since_filter = params.get("since", "")
 
     results = []
     for t in tickets:
-        if status_filter and t.get("status", "").lower() != status_filter:
-            continue
         if query_filter:
             text = (t.get("summary", "") + " " + t.get("description", "")).lower()
             if query_filter not in text:
                 continue
-        results.append(
-            {
-                "id": t["id"],
-                "summary": t.get("summary", "")[:100],
-                "status": t.get("status", ""),
-                "created_at": t.get("created_at", "")[:19],
-            }
-        )
+        if owner_filter:
+            owners = [o.lower() for o in t.get("owners", [])]
+            if owner_filter not in owners:
+                continue
+        if created_by_filter:
+            if t.get("created_by", "").lower() != created_by_filter:
+                continue
+        cf = t.get("custom_fields", {})
+        directives = cf.get("directives", {})
+        if harness_filter:
+            if directives.get("harness", "").lower() != harness_filter:
+                continue
+        if board_type_filter:
+            selector = directives.get("board_selector", "")
+            if board_type_filter not in selector.lower():
+                continue
+        if since_filter:
+            created = t.get("created_at", "")
+            if created and created[:10] < since_filter[:10]:
+                continue
+
+        # Build enriched result entry
+        entry: dict[str, Any] = {
+            "id": t["id"],
+            "summary": t.get("summary", "")[:120],
+            "status": t.get("status", ""),
+            "owners": t.get("owners", []),
+            "created_by": t.get("created_by", ""),
+            "created_at": t.get("created_at", "")[:19],
+            "updated_at": t.get("updated_at", "")[:19],
+        }
+        if directives.get("harness"):
+            entry["harness"] = directives["harness"]
+        if directives.get("board_selector"):
+            entry["board_type"] = directives["board_selector"]
+        results.append(entry)
         if len(results) >= limit:
             break
 
