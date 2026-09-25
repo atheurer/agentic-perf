@@ -700,10 +700,16 @@ stops automatically when the ticket reaches a terminal status. See
 
 ### investigation_records — Investigation Record Backend
 
-Investigation tools use the file backend unless configured otherwise. The
-backend is selected by configuration; Horreum requires its endpoint and
-credentials. See the investigation provider section in Architecture for the
-supported shapes and behavior.
+Investigation tools use the file backend by default. The registry currently
+supports file storage; composite configuration can combine file providers
+for multi-read setups. See the investigation provider section in
+[Architecture](architecture.md) for the supported shapes and behavior.
+
+When upgrading from a version that used the Horreum investigation-record
+backend, remove or change `"backend": "horreum"` to a supported backend such
+as `"file"`. A config that still selects `horreum` fails with an unknown
+backend error. The file provider does not import existing records from
+Horreum, so switching backends does not migrate records automatically.
 
     {
         "investigation_records": {

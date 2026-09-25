@@ -45,7 +45,6 @@ OpenAI requires the optional `openai` extra in a derived image.
 │  ├─ Secret (LLM creds)        │               │
 │  ├─ Secret (Jumpstarter)       │               │
 │  ├─ Secret (Domain MCP)        │               │
-│  └─ Secret (Horreum API key)   │               │
 │                                │               │
 │  Route ─────────────────────>──┘               │
 └─────────────────────────────────────────────────┘
@@ -132,9 +131,6 @@ stringData:
   token: <domain-mcp-token>
 ```
 
-### Horreum API Key (for investigation records)
-
-```yaml
 ### Webhook Service Account Token
 
 Webhook service account tokens are stored in the state store's
