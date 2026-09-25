@@ -511,6 +511,7 @@ class TestPlatformIPScoping:
                 return_value={
                     "custom_fields": {
                         "resource_provider": "jumpstarter",
+                        "execution_model": "direct",
                     },
                 },
             ),
@@ -518,8 +519,9 @@ class TestPlatformIPScoping:
             await agent._handle_completion("PERF-TEST", response)
 
             fields = mock_fields.call_args[0][1]
+            # Direct execution: all IPs are targets, no controller
             assert fields["assigned_hardware_ips"] == {
-                "controller": "10.0.0.1",
+                "controller": "",
                 "targets": ["10.0.0.1", "10.0.0.2"],
             }
 
