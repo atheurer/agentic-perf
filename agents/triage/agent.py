@@ -692,14 +692,8 @@ class TriageAgent(AgentBase):
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
                 directives[key] = cf[key]
-        # Code-enforce: boot-time needs only a client host.
-        # The orchestrator pod IS the controller — no separate
-        # controller host is needed.  The LLM often sets
-        # controller + client roles which causes the resource
-        # agent to search for a non-existent controller.
+        # Determine harness early for execution model resolution.
         harness = directives.get("harness", "")
-        if harness == "boot-time":
-            required_hosts = [{"roles": ["client"]}]
 
         # Code-enforce harness for workflow tickets.
         # When workflow_source is set, the benchmark agent
@@ -710,6 +704,27 @@ class TriageAgent(AgentBase):
         # harness provider. Keep this value aligned with the provider catalog
         # and BenchmarkAgent tool-scoping key.
         directives = _canonicalize_workflow_harness(directives)
+        # Resolve execution model from the harness metadata.
+        # This is a harness-level property declared in BenchmarkSuite,
+        # not a per-ticket decision or a hardcoded list.
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+        from providers.skills.catalog import resolve_execution_model
+
+        benchmark_name = result.get("benchmark_suite", "")
+        execution_model = await resolve_execution_model(
+            self._skill_provider, harness, benchmark_name
+        )
+
+        # Direct harnesses need only target hosts — no controller.
+        # The LLM often includes a controller role which causes the
+        # resource agent to allocate a non-existent controller host.
+        if execution_model == EXECUTION_MODEL_DIRECT:
+            required_hosts = [
+                h for h in required_hosts if "controller" not in h.get("roles", [])
+            ]
+            if not required_hosts:
+                required_hosts = [{"roles": ["client"]}]
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
@@ -717,6 +732,7 @@ class TriageAgent(AgentBase):
             "absent_suite": result.get("absent_suite", False),
             "required_hosts": required_hosts,
             "directives": directives,
+            "execution_model": execution_model,
         }
         if hasattr(self._skill_provider, "get_source_provenance"):
             source_provenance = self._skill_provider.get_source_provenance("crucible")

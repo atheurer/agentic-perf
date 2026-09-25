@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .base import BenchmarkSuite
+from .base import (
+    EXECUTION_MODEL_CONTROLLER,
+    EXECUTION_MODEL_DIRECT,
+    BenchmarkSuite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,7 @@ STANDALONE_BENCHMARKS = (
         roles=["client"],
         min_hosts=1,
         harness="boot-time",
+        execution_model=EXECUTION_MODEL_DIRECT,
     ),
 )
 
@@ -37,6 +42,7 @@ def benchmark_entry(suite: BenchmarkSuite) -> dict[str, Any]:
         "min_hosts": suite.min_hosts,
         "harness": suite.harness,
         "source": suite.source,
+        "execution_model": suite.execution_model,
     }
     if suite.endpoint_types:
         entry["endpoint_types"] = suite.endpoint_types
@@ -90,3 +96,47 @@ async def get_catalog_benchmark(provider: Any, name: str) -> dict[str, Any] | No
         logger.debug("Benchmark details unavailable for %s", name, exc_info=True)
         return None
     return benchmark_entry(suite) if suite is not None else None
+
+
+async def resolve_execution_model(
+    provider: Any,
+    harness: str,
+    benchmark_name: str = "",
+) -> str:
+    """Resolve the execution model for a harness/benchmark.
+
+    Checks standalone benchmarks first, then the harness provider's
+    benchmark suites. Returns the execution_model declared by the
+    harness, defaulting to "controller" if not found.
+
+    This is the single source of truth for execution model — callers
+    should not hardcode harness-to-model mappings.
+    """
+    # Check standalone benchmarks (boot-time, etc.)
+    for suite in STANDALONE_BENCHMARKS:
+        if suite.harness == harness or suite.name == benchmark_name:
+            return suite.execution_model
+
+    # Check harness provider
+    harness_provider = None
+    if hasattr(provider, "get_provider"):
+        harness_provider = provider.get_provider(harness)
+    if harness_provider is not None and benchmark_name:
+        try:
+            suite = await harness_provider.get_benchmark(benchmark_name)
+            if suite is not None:
+                return suite.execution_model
+        except Exception:
+            pass
+
+    # If we have a harness provider but no specific benchmark,
+    # check any benchmark from that provider for its model.
+    if harness_provider is not None:
+        try:
+            suites = await harness_provider.list_benchmarks()
+            if suites:
+                return suites[0].execution_model
+        except Exception:
+            pass
+
+    return EXECUTION_MODEL_CONTROLLER

@@ -4,6 +4,20 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+# Execution model constants.
+#
+# CONTROLLER: a dedicated host runs the benchmark framework;
+#   the orchestrator relays commands to it.  Examples: Crucible,
+#   benchmark-runner.  Hardware allocation produces a controller
+#   host plus target/endpoint hosts.
+#
+# DIRECT: the orchestrator runs benchmark tools itself (via SSH
+#   or local subprocess).  No separate controller host exists.
+#   Examples: boot-time, Arcaflow.  Hardware allocation produces
+#   target hosts only.
+EXECUTION_MODEL_CONTROLLER = "controller"
+EXECUTION_MODEL_DIRECT = "direct"
+
 
 @dataclass
 class BenchmarkSuite:
@@ -17,6 +31,7 @@ class BenchmarkSuite:
     harness: str = ""
     source: dict[str, Any] = field(default_factory=dict)
     architectures: list[str] = field(default_factory=list)
+    execution_model: str = EXECUTION_MODEL_CONTROLLER
 
 
 @dataclass
