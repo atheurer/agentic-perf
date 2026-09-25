@@ -878,10 +878,15 @@ async def _search_tickets(
         cf = t.get("custom_fields", {})
         directives = cf.get("directives", {})
         if harness_filter:
-            if directives.get("harness", "").lower() != harness_filter:
+            harness = directives.get("harness") or ""
+            if harness.lower() != harness_filter:
                 continue
         if board_type_filter:
-            selector = directives.get("board_selector", "")
+            # Fallback: triage may place board_selector at
+            # top-level custom_fields or inside directives.
+            selector = (
+                directives.get("board_selector") or cf.get("board_selector") or ""
+            )
             if board_type_filter not in selector.lower():
                 continue
         if since_filter:
@@ -899,10 +904,14 @@ async def _search_tickets(
             "created_at": t.get("created_at", "")[:19],
             "updated_at": t.get("updated_at", "")[:19],
         }
-        if directives.get("harness"):
-            entry["harness"] = directives["harness"]
-        if directives.get("board_selector"):
-            entry["board_type"] = directives["board_selector"]
+        entry_harness = directives.get("harness") or ""
+        if entry_harness:
+            entry["harness"] = entry_harness
+        entry_selector = (
+            directives.get("board_selector") or cf.get("board_selector") or ""
+        )
+        if entry_selector:
+            entry["board_type"] = entry_selector
         results.append(entry)
         if len(results) >= limit:
             break
