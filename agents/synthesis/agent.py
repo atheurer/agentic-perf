@@ -254,6 +254,7 @@ class SynthesisAgent(AgentBase):
                         "change_classification": change_class,
                         "causal_commits": ",".join(causal_commits),
                         "change_summary": change_summary,
+                        "ticket_id": ticket_id,
                     },
                 )
                 record_created = True

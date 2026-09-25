@@ -1298,7 +1298,13 @@ async def _block_handoff_failed(
     reason: str,
     current_status: str = "",
     event_bus: EventBus | None = None,
-) -> None:
+) -> bool:
+    """Attempt to recover a handoff-blocked ticket to HITL.
+
+    Returns True if the ticket was successfully transitioned to
+    awaiting_customer_guidance, False if the transition failed
+    and should be retried on the next poll cycle.
+    """
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
@@ -1307,9 +1313,34 @@ async def _block_handoff_failed(
                 f"Rewinding to {retry_status} so the agent"
                 f" can retry after user guidance"
             )
-            await client.post(
+            resp = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={"status": retry_status, "comment": rewind_comment},
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Rewind %s → %s failed (HTTP %d) for %s; "
+                    "will transition directly to awaiting_customer_guidance",
+                    current_status,
+                    retry_status,
+                    resp.status_code,
+                    ticket_id,
+                )
+        # This lookup only improves the failure log; a store read error must
+        # not prevent the HITL recovery attempt or stop the poll loop.
+        actual_status = current_status
+        try:
+            ticket_resp = await client.get(
+                f"{store_url}/api/v1/tickets/{ticket_id}",
+            )
+            if ticket_resp.status_code == 200:
+                actual_status = ticket_resp.json().get("status", current_status)
+        except Exception:
+            logger.warning(
+                "Could not re-fetch %s after handoff rewind; using known status %s",
+                ticket_id,
+                current_status,
+                exc_info=True,
             )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
@@ -1324,13 +1355,23 @@ async def _block_handoff_failed(
             },
         )
         block_comment = f"Handoff validation failed: {reason}"
-        await client.post(
+        hitl_resp = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
                 "comment": block_comment,
             },
         )
+        if hitl_resp.status_code >= 400:
+            logger.error(
+                "HITL transition to awaiting_customer_guidance failed "
+                "(HTTP %d) for %s from status %s — will retry",
+                hitl_resp.status_code,
+                ticket_id,
+                actual_status,
+            )
+            return False
+    return True
 
 
 async def _process_stop_requests(
@@ -1875,6 +1916,17 @@ async def _poll_loop_after_lease(
                 await asyncio.sleep(config.poll_interval)
                 continue
 
+            # Reconcile against every fetched ticket before status filtering.
+            # In particular, awaiting_customer_guidance is not dispatched, but
+            # observing it must clear a block left at the previous source status.
+            dispatcher.reconcile_handoff_blocked(
+                {
+                    ticket["id"]: ticket.get("status", "")
+                    for ticket in all_fetched
+                    if ticket.get("id")
+                }
+            )
+
             tickets_by_status: dict[str, list[dict[str, Any]]] = {}
             for t in all_fetched:
                 tickets_by_status.setdefault(t.get("status", ""), []).append(t)
@@ -1987,14 +2039,19 @@ async def _poll_loop_after_lease(
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            dispatcher.mark_handoff_blocked(tid, status)
-                            await _block_handoff_failed(
+                            recovered = await _block_handoff_failed(
                                 config.state_store_url,
                                 tid,
                                 reason,
                                 status,
                                 event_bus=dispatcher.events,
                             )
+                            # Only mark as blocked if the HITL
+                            # transition succeeded. If it failed,
+                            # leave unblocked so we retry next cycle
+                            # instead of hanging forever.
+                            if recovered:
+                                dispatcher.mark_handoff_blocked(tid, status)
                         continue
 
                     # Per-user/group quota check (multi-user only).

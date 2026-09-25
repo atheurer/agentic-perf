@@ -755,6 +755,9 @@ class TestDedupTemporalDecay:
         dedup_result = update_call[0][1]["dedup_result"]
         assert dedup_result["match_confidence"] == 1.0
         assert dedup_result["record_age_days"] == 5
+        mock_provider.append_build_history.assert_awaited_once()
+        appended_entry = mock_provider.append_build_history.await_args.args[1]
+        assert appended_entry.ticket_id == "PERF-TEST1"
 
     @pytest.mark.asyncio
     async def test_deterministic_match_persists_provider_record_url(self):

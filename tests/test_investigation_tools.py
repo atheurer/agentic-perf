@@ -73,6 +73,31 @@ async def test_create_without_build_id():
     assert result["status"] == "created"
 
 
+@pytest.mark.asyncio
+async def test_create_initial_build_history_ticket_id(monkeypatch):
+    """The initial build links to its ticket, with an environment fallback."""
+    monkeypatch.setenv("TICKET_ID", "PERF-ENV")
+
+    for ticket_kwargs, expected in (
+        ({}, "PERF-ENV"),
+        ({"ticket_id": "PERF-EXPLICIT"}, "PERF-EXPLICIT"),
+    ):
+        created = json.loads(
+            await create_investigation_record(
+                subsystem="storage_io",
+                metric="iops",
+                build_id="2026.05.14",
+                **ticket_kwargs,
+            )
+        )
+        fetched = json.loads(
+            await get_investigation_record(created["investigation_id"])
+        )
+        history = fetched["record"]["build_history"]
+        assert len(history) == 1
+        assert history[0]["ticket_id"] == expected
+
+
 # --- Query ---
 
 
@@ -211,6 +236,33 @@ async def test_append_build_history():
     assert len(history) == 2
     assert history[1]["build_id"] == "2026.05.15"
     assert history[1]["action"] == "SKIP_MATCHED"
+
+
+@pytest.mark.asyncio
+async def test_append_build_history_ticket_id(monkeypatch):
+    """Appended builds use the environment ticket unless explicitly set."""
+    monkeypatch.setenv("TICKET_ID", "PERF-ENV")
+    created = json.loads(
+        await create_investigation_record(
+            subsystem="storage_io",
+            metric="iops",
+        )
+    )
+    rid = created["investigation_id"]
+
+    await append_build_history(investigation_id=rid, build_id="2026.05.14")
+    await append_build_history(
+        investigation_id=rid,
+        build_id="2026.05.15",
+        ticket_id="PERF-EXPLICIT",
+    )
+
+    fetched = json.loads(await get_investigation_record(rid))
+    history = fetched["record"]["build_history"]
+    assert [entry["ticket_id"] for entry in history] == [
+        "PERF-ENV",
+        "PERF-EXPLICIT",
+    ]
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -153,11 +154,14 @@ async def create_investigation_record(
     change_classification: str = "",
     causal_commits: str = "",
     change_summary: str = "",
+    ticket_id: str = "",
 ) -> str:
     """Create a new Investigation Record.
 
     Call this when an investigation completes (convergence gate
     fires) to persist the outcome with operational metrics.
+    Include ticket_id to link the initial build history entry
+    to the originating ticket.
     Records are write-once — all investigation data must be
     provided at creation time. The record cannot be modified
     after creation except for build history (append-only),
@@ -166,6 +170,8 @@ async def create_investigation_record(
     info_gain_trajectory: JSON array string, e.g. "[0.0, 0.5, 0.9]"
     causal_commits: comma-separated commit hashes
     """
+    # Fallback to env var set by mcp_client for ticket-bound servers
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     provider = _get_provider()
     record = InvestigationRecord(
         anomaly_context=AnomalyContext(
@@ -220,6 +226,7 @@ async def create_investigation_record(
         record.build_history.append(
             BuildHistoryEntry(
                 build_id=build_id,
+                ticket_id=ticket_id,
                 action="FULL_INVESTIGATION",
                 comment="Initial discovery",
             )
@@ -242,17 +249,22 @@ async def append_build_history(
     build_id: str,
     action: str = "SKIP_MATCHED",
     comment: str = "",
+    ticket_id: str = "",
 ) -> str:
     """Append a build history entry to an Investigation Record.
 
     Call this when a known regression is detected in a new build
     — the agent skips the full investigation and records that the
     regression is still present. Action should be
-    FULL_INVESTIGATION or SKIP_MATCHED.
+    FULL_INVESTIGATION or SKIP_MATCHED. Include ticket_id to
+    link the history entry to the originating ticket.
     """
+    # Fallback to env var set by mcp_client for ticket-bound servers
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
     provider = _get_provider()
     entry = BuildHistoryEntry(
         build_id=build_id,
+        ticket_id=ticket_id,
         action=action,
         comment=comment,
     )

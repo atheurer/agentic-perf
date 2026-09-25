@@ -85,6 +85,7 @@ class BuildHistoryEntry(BaseModel):
     """Tracks a regression across nightly builds."""
 
     build_id: str
+    ticket_id: str = ""
     action: str  # FULL_INVESTIGATION or SKIP_MATCHED
     comment: str = ""
     timestamp: datetime = Field(
