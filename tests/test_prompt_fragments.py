@@ -103,9 +103,7 @@ class TestLoadPromptFragments:
         outside.write_text("outside prompt content")
         (prompts_dir / "aws.md").symlink_to(outside)
 
-        assert AgentBase._load_prompt_fragments(
-            tmp_path, resource_provider="aws"
-        ) == ""
+        assert AgentBase._load_prompt_fragments(tmp_path, resource_provider="aws") == ""
 
 
 class TestResourceAgentPromptFragments:

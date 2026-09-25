@@ -60,18 +60,14 @@ def _completion_response(host: str) -> MagicMock:
     return response
 
 
-async def _platform_fields(
-    ticket: dict, skill_provider: MultiHarnessSkillProvider
-):
+async def _platform_fields(ticket: dict, skill_provider: MultiHarnessSkillProvider):
     agent = PlatformAgent(
         llm_provider=AsyncMock(),
         state_store_url="http://localhost:8090",
         skill_provider=skill_provider,
     )
     with (
-        patch.object(
-            agent, "_get_ticket", new_callable=AsyncMock, return_value=ticket
-        ),
+        patch.object(agent, "_get_ticket", new_callable=AsyncMock, return_value=ticket),
         patch.object(agent, "_update_fields", new_callable=AsyncMock) as update_fields,
         patch.object(agent, "_add_comment", new_callable=AsyncMock),
         patch.object(
@@ -98,9 +94,7 @@ async def test_old_arcaflow_jumpstarter_ticket_keeps_single_board_as_target():
         "custom_fields": {
             "resource_provider": "jumpstarter",
             "benchmark_suite": "stressng",
-            "directives": {
-                "workflow_source": "https://example.test/workflow.yaml"
-            },
+            "directives": {"workflow_source": "https://example.test/workflow.yaml"},
         },
         "comments": [],
     }

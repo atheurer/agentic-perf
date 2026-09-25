@@ -118,9 +118,7 @@ class TestProvisioningToolScoping:
         mcp = AsyncMock()
         mcp.list_tools = AsyncMock(
             return_value=[
-                ToolDefinition(
-                    name="install_harness", description="", input_schema={}
-                )
+                ToolDefinition(name="install_harness", description="", input_schema={})
             ]
         )
 

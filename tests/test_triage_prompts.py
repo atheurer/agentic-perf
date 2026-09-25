@@ -18,9 +18,12 @@ def test_workflow_harness_canonicalization_precedes_default_resolution():
 
     directives = {"workflow_source": "https://example.test/workflow.yaml"}
     directives = _canonicalize_workflow_harness(directives)
-    assert AgentBase._effective_harness(
-        directives, SimpleNamespace(default_harness="crucible")
-    ) == "arcaflow-plugins"
+    assert (
+        AgentBase._effective_harness(
+            directives, SimpleNamespace(default_harness="crucible")
+        )
+        == "arcaflow-plugins"
+    )
 
 
 def test_direct_harness_filter_preserves_mixed_host_roles_and_specs():
