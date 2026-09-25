@@ -1908,6 +1908,17 @@ async def _poll_loop_after_lease(
                 await asyncio.sleep(config.poll_interval)
                 continue
 
+            # Reconcile against every fetched ticket before status filtering.
+            # In particular, awaiting_customer_guidance is not dispatched, but
+            # observing it must clear a block left at the previous source status.
+            dispatcher.reconcile_handoff_blocked(
+                {
+                    ticket["id"]: ticket.get("status", "")
+                    for ticket in all_fetched
+                    if ticket.get("id")
+                }
+            )
+
             tickets_by_status: dict[str, list[dict[str, Any]]] = {}
             for t in all_fetched:
                 tickets_by_status.setdefault(t.get("status", ""), []).append(t)

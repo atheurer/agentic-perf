@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.dispatcher import Dispatcher
 from orchestrator.handoff import check_handoff
 
 
@@ -263,3 +264,26 @@ class TestBlockHandoffFailedRewindFallback:
             )
 
         assert result is True
+
+
+def test_handoff_block_suppression_expires_after_hitl_resume() -> None:
+    """A resumed ticket can retry the same stage after its HITL pause."""
+    dispatcher = Dispatcher("http://store", MagicMock(), MagicMock())
+    ticket_id = "PERF-RESUME"
+    source_status = "evaluating_convergence"
+    hitl_status = "awaiting_customer_guidance"
+
+    dispatcher.mark_handoff_blocked(ticket_id, source_status)
+
+    # A stale snapshot at the failed stage must keep suppressing another block.
+    dispatcher.reconcile_handoff_blocked({ticket_id: source_status})
+    assert dispatcher.is_handoff_blocked(ticket_id, source_status)
+
+    # The poll loop observes all fetched statuses before filtering dispatchable
+    # stages, so the non-dispatched HITL status clears the stale marker.
+    dispatcher.reconcile_handoff_blocked({ticket_id: hitl_status})
+    assert not dispatcher.is_handoff_blocked(ticket_id, source_status)
+
+    # When the user resumes to the original stage, it is eligible for retry.
+    dispatcher.reconcile_handoff_blocked({ticket_id: source_status})
+    assert not dispatcher.is_handoff_blocked(ticket_id, source_status)
