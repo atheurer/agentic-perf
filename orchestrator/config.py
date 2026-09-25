@@ -11,6 +11,19 @@ from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 logger = logging.getLogger(__name__)
 
 
+def _provider_family(provider: str) -> str:
+    """Normalize provider aliases when deciding credential inheritance."""
+    if not isinstance(provider, str):
+        return str(provider)
+    provider = provider.lower()
+    return {
+        "claude": "anthropic",
+        "anthropic": "anthropic",
+        "gemini": "google",
+        "google": "google",
+    }.get(provider, provider)
+
+
 def _load_config_file() -> dict:
     if CONFIG_PATH.exists():
         try:
@@ -82,6 +95,7 @@ class OrchestratorConfig:
             or os.environ.get("LLM_PROVIDER")
             or llm_cfg.get("provider", "mock")
         )
+        self.llm_api_key_secret = llm_cfg.get("api_key_secret")
         self.llm_model = (
             llm_model or os.environ.get("LLM_MODEL") or llm_cfg.get("model", "")
         )
@@ -280,6 +294,8 @@ class OrchestratorConfig:
         introspection).
         """
         base = {"provider": self.llm_provider, "model": self.llm_model}
+        if self.llm_api_key_secret is not None:
+            base["api_key_secret"] = self.llm_api_key_secret
         if self.llm_provider == "openai":
             base["api"] = self.llm_api
 
@@ -290,7 +306,17 @@ class OrchestratorConfig:
 
         # Explicit per-agent overrides from config.
         if agent_type in self._agent_models:
-            base.update(self._agent_models[agent_type])
+            agent_cfg = self._agent_models[agent_type]
+            configured_provider = agent_cfg.get("provider", self.llm_provider)
+            if (
+                _provider_family(configured_provider)
+                != _provider_family(self.llm_provider)
+                and "api_key_secret" not in agent_cfg
+            ):
+                # A credential reference belongs to the provider it was
+                # configured alongside; do not pass it to another vendor.
+                base.pop("api_key_secret", None)
+            base.update(agent_cfg)
         if base.get("provider") == "openai" and "api" not in base:
             base["api"] = self.llm_api
         return base
@@ -418,6 +444,7 @@ def build_redacted_config(
         safe_agent_models[str(k)] = {
             "provider": str(v.get("provider", "")),
             "model": str(v.get("model", "")),
+            "api_key_secret_configured": v.get("api_key_secret") is not None,
         }
 
     snapshot: dict = {
@@ -448,6 +475,7 @@ def build_redacted_config(
             "backend": config.llm_backend,
             "region": config.llm_region,
             "api": config.llm_api,
+            "api_key_secret_configured": config.llm_api_key_secret is not None,
             "timeout": config.llm_timeout,
             "max_tokens": config.llm_max_tokens,
             "reasoning_effort": config.llm_reasoning_effort,
