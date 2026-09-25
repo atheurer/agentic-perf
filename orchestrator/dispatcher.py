@@ -367,6 +367,14 @@ class Dispatcher:
             (t, s) for t, s in self._handoff_blocked if t != ticket_id
         }
 
+    def reconcile_handoff_blocked(self, ticket_statuses: dict[str, str]) -> None:
+        """Keep suppression only while each ticket remains at its blocked status."""
+        self._handoff_blocked = {
+            (ticket_id, status)
+            for ticket_id, status in self._handoff_blocked
+            if ticket_statuses.get(ticket_id) == status
+        }
+
     def is_quota_blocked(self, ticket_id: str) -> bool:
         return ticket_id in self._quota_blocked
 
