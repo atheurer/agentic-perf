@@ -3,8 +3,9 @@
 This device was provisioned via Jumpstarter (a physical board or
 virtual machine managed through a lab controller service).
 
-- The device IP is in `assigned_hardware_ips.targets[0]`
-- Use this as `sut_host` for boot-time tests
+- The device IP is in `assigned_hardware_ips.targets[0]` (shown
+  in the Assigned Hardware section above)
+- Use `targets[0]` as `sut_host` for boot-time tests
 - SSH as root with the key path from the ticket fields
 - Podman is available for running containerized benchmarks
 - The device may have limited resources compared to full servers —

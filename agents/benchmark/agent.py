@@ -11,6 +11,7 @@ from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.skills.base import EXECUTION_MODEL_DIRECT
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
 
@@ -584,8 +585,6 @@ class BenchmarkAgent(AgentBase):
 
         prompt = BENCHMARK_BASE_PROMPT
 
-        from providers.skills.base import EXECUTION_MODEL_DIRECT
-
         if cf.get("execution_model") == EXECUTION_MODEL_DIRECT:
             prompt += (
                 "\n\n## Direct Execution Model\n\n"
@@ -676,17 +675,26 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
             content += f"\n**Hypothesis:** {cf['hypothesis']}\n"
-        from providers.skills.base import EXECUTION_MODEL_DIRECT
-
         is_direct = cf.get("execution_model") == EXECUTION_MODEL_DIRECT
         if is_direct:
+            # Show full assigned_hardware_ips so fragments
+            # can reference targets[0] by path.  Also show
+            # ssh_hardware_ips when they differ (cloud envs).
             hw = cf.get("assigned_hardware_ips", {})
-            targets = hw.get("targets", [])
-            if targets:
+            if hw:
                 content += (
-                    f"\n## Target Hosts\n"
-                    f"These are the hosts to run benchmarks against.\n"
-                    f"```json\n{json.dumps(targets, indent=2)}\n```\n"
+                    f"\n## Assigned Hardware\n"
+                    f"Target hosts for this benchmark. Use "
+                    f"`targets[0]` as the SUT.\n"
+                    f"```json\n{json.dumps(hw, indent=2)}\n```\n"
+                )
+            ssh_hw = cf.get("ssh_hardware_ips", {})
+            if ssh_hw and ssh_hw != hw:
+                content += (
+                    f"\n## SSH Addresses\n"
+                    f"Use these for SSH access (may differ from "
+                    f"assigned addresses in cloud environments).\n"
+                    f"```json\n{json.dumps(ssh_hw, indent=2)}\n```\n"
                 )
         elif cf.get("ssh_hardware_ips"):
             content += f"\n## Controller SSH Addresses\nUse these addresses for Crucible remotehost `config.host` values only after verifying controller-to-host SSH reachability. They may be hostnames or IPs and are independent from benchmark dataplane addresses.\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"

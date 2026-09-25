@@ -56,8 +56,8 @@ harness-specific guidance.
    build a correct run-file. Check directives for `test_interfaces`
    and discover actual interface names/IPs on the hosts if specified.
 
-6. **Validate** — Call `validate_benchmark(controller, run_file,
-   harness)` if supported by the harness. Save the `validation_id`.
+6. **Validate** — If the harness supports validation, call the
+   appropriate validation tool. Save the returned `validation_id`.
 
 7. **Present for approval** — Check directives for
    `user_pre_run_approval` (default: true). If false, skip to execute.

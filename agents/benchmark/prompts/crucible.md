@@ -86,11 +86,28 @@ f. **Choose remote hosts from verified SSH reachability.** For
   only the exact run-file saved by the successful validation.
 
 - **Verify results:** If status is "completed" AND `result_summary`
-  is present, submit with status "completed". If `result-summary.json`
-  is missing, the run did not produce usable results — read `run_log`
-  to understand why. If exit_code is non-zero, submit as "failed"
-  immediately. Do NOT query OpenSearch or attempt to extract results
-  from a failed run.
+  is present, submit with status "completed". Include the
+  `validation_id` returned by `execute_benchmark` when submitting.
+
+  If `result-summary.json` is missing, the run did not produce
+  usable results even though crucible exited cleanly. Read the
+  `run_log` to understand why. Based on the log:
+  - If the failure is transient (network timeout, container pull
+    error), retry once.
+  - If the failure indicates a configuration problem (bad
+    parameters, missing endpoints, schema errors), call
+    `request_clarification` to escalate.
+  - If you cannot determine the cause, call
+    `request_clarification` with the relevant log excerpt.
+
+  If exit_code is non-zero, submit as "failed" immediately. Do
+  NOT call `get_run_logs`, do NOT attempt to read files from the
+  run directory, do NOT query OpenSearch. There are no results to
+  extract from a failed run.
+  Exception: if exit_code is non-zero but `run_id` is present and
+  the message indicates only the indexing step failed (not the
+  benchmark itself), call `request_clarification` to let the user
+  decide.
 
 ### Common Pitfalls
 
