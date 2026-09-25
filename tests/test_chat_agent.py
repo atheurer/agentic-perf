@@ -1055,3 +1055,29 @@ class TestSearchMetadataFilters:
         )
         parsed = json.loads(result)
         assert parsed["count"] == 0
+
+    async def test_null_directives_does_not_crash_while_building_output(self):
+        """Explicit null directives should be treated as empty metadata."""
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "a",
+                    "status": "closed",
+                    "custom_fields": {"directives": None},
+                },
+            ]
+        )
+        result = await execute_tool(
+            "search_tickets",
+            {},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["id"] == "PERF-1"
+        assert "harness" not in parsed["tickets"][0]
+        assert "board_type" not in parsed["tickets"][0]

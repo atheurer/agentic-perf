@@ -876,7 +876,7 @@ async def _search_tickets(
             if t.get("created_by", "").lower() != created_by_filter:
                 continue
         cf = t.get("custom_fields", {})
-        directives = cf.get("directives", {})
+        directives = cf.get("directives") or {}
         if harness_filter:
             harness = directives.get("harness") or ""
             if harness.lower() != harness_filter:
