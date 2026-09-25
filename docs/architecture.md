@@ -868,7 +868,6 @@ creation time and never modified. The only allowed mutations are:
 | Provider | Backend | Use Case |
 |---|---|---|
 | `FileRecordProvider` | JSON files on disk | Default. No external deps. Development and testing. |
-| `HorreumRecordProvider` | Horreum REST API | Production use with Horreum as the data store. |
 | `CompositeRecordProvider` | One writer + N readers | Migration, federated dedup, local caching. |
 
 #### File backend (default)
@@ -887,31 +886,10 @@ suitable for small-to-medium record counts.
 }
 ```
 
-#### Horreum backend
-
-Stores records as Horreum test runs under a dedicated test type
-(`investigation_records`). The test is auto-created on first use
-if it doesn't exist. Records are uploaded as schemaless JSON
-payloads.
-
-Supports Horreum API keys (`HUSR_*` tokens via `X-Horreum-API-Key`
-header) and standard Bearer tokens. TLS verification can be
-disabled for instances with internal CA certificates.
-
-```json
-{
-    "investigation_records": {
-        "backend": "horreum",
-        "url": "https://horreum.example.com",
-        "token": "HUSR_...",
-        "tls_verify": false,
-        "test_id": 426
-    }
-}
-```
-
-The `test_id` is optional — if omitted, the provider searches for
-the test by name and creates it if missing.
+The file backend is the default and stores records as JSON files in
+the configured directory. The registry currently provides file
+storage; composite configuration can combine configured providers
+for reads and writes.
 
 #### Composite backend (multi-read)
 
@@ -920,7 +898,8 @@ across multiple backends concurrently. Results are deduplicated by
 `investigation_id` — the writer's copy takes precedence.
 
 Use cases:
-- **Migration**: old records in files, new records in the primary store
+- **Migration**: read existing records from one file store while new
+  records are written to another
 - **Federated dedup**: check multiple teams' record stores before
   starting an investigation
 - **Local cache**: write to primary, read from local mirror too
@@ -929,9 +908,9 @@ Use cases:
 {
     "investigation_records": {
         "backend": "composite",
-        "writer": {"backend": "horreum", "url": "..."},
+        "writer": {"backend": "file", "persist_dir": "/new/records"},
         "readers": [
-            {"backend": "horreum", "url": "..."},
+            {"backend": "file", "persist_dir": "/new/records"},
             {"backend": "file", "persist_dir": "/old/records"}
         ]
     }

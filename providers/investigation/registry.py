@@ -15,9 +15,9 @@ Multi-read (composite) configuration — one writer, multiple readers:
     {
         "investigation_records": {
             "backend": "composite",
-            "writer": {"backend": "opensearch", "url": "..."},
+            "writer": {"backend": "file", "persist_dir": "/new/records"},
             "readers": [
-                {"backend": "opensearch", "url": "..."},
+                {"backend": "file", "persist_dir": "/new/records"},
                 {"backend": "file", "persist_dir": "/old/records"}
             ]
         }
@@ -44,9 +44,6 @@ logger = logging.getLogger(__name__)
 BACKEND_REGISTRY: dict[str, dict[str, str]] = {
     "file": {
         "class": ("providers.investigation.file.FileRecordProvider"),
-    },
-    "horreum": {
-        "class": ("providers.investigation.horreum.HorreumRecordProvider"),
     },
 }
 
