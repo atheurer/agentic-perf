@@ -11,6 +11,7 @@ from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
 
@@ -153,6 +154,7 @@ class BenchmarkAgent(AgentBase):
         self._active_validation_id: str | None = None
         self._active_approval_request_id: str | None = None
         self._active_approval: dict[str, Any] | None = None
+        self._resolved_execution_models: dict[str, str] = {}
 
         local_tools = list(_LOCAL_TOOLS)
 
@@ -442,6 +444,7 @@ class BenchmarkAgent(AgentBase):
 
         try:
             ticket = await self._get_ticket(ticket_id)
+            await self._prepare_legacy_execution_model(ticket)
 
             # Scope tools to the harness. Standalone
             # harnesses need only a few tools — hiding
@@ -537,8 +540,9 @@ class BenchmarkAgent(AgentBase):
         Harnesses listed in _HARNESS_TOOLS get a reduced
         tool set. Unlisted harnesses keep all tools.
         """
-        harness = (
-            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
         )
         excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
         if excluded is not None:
@@ -559,22 +563,71 @@ class BenchmarkAgent(AgentBase):
                 }
             self.tools = [t for t in self.tools if t.name in allowed]
 
+    def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
+        cf = ticket.get("custom_fields", {})
+        if "execution_model" in cf:
+            return cf["execution_model"]
+        return getattr(self, "_resolved_execution_models", {}).get(
+            str(ticket.get("id", "")), EXECUTION_MODEL_CONTROLLER
+        )
+
+    async def _prepare_legacy_execution_model(self, ticket: dict[str, Any]) -> str:
+        """Resolve the model for old tickets before prompt construction."""
+        cf = ticket.get("custom_fields", {})
+        if "execution_model" in cf:
+            return cf["execution_model"]
+        from providers.skills.catalog import resolve_ticket_execution_model
+
+        execution_model = await resolve_ticket_execution_model(
+            getattr(self, "_skill_provider", None), ticket
+        )
+        ticket_id = str(ticket.get("id", ""))
+        if ticket_id:
+            if not hasattr(self, "_resolved_execution_models"):
+                self._resolved_execution_models = {}
+            self._resolved_execution_models[ticket_id] = execution_model
+        return execution_model
+
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
             resource_provider=provider,
             endpoint_type=endpoint,
         )
+
+        # Load harness-specific prompt fragment (e.g., crucible.md,
+        # jumpstarter.md).  These contain harness-specific execution
+        # instructions that don't belong in the base prompt.
+        harness_fragment = ""
+        prompts_dir = Path(__file__).parent / "prompts"
+        # For controller harnesses, also try the harness name
+        harness_fragment = self._load_prompt_fragment(prompts_dir, harness)
+
         prompt = BENCHMARK_BASE_PROMPT
+
+        if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
+            prompt += (
+                "\n\n## Direct Execution Model\n\n"
+                "This benchmark uses the **direct** execution model. "
+                "There is no dedicated controller host \u2014 the "
+                "orchestrator runs benchmark tools directly. The "
+                "assigned targets are the systems under test (SUTs). "
+                "Use `targets[0]` as the `sut_host` parameter."
+            )
+        if harness_fragment:
+            prompt += f"\n\n{harness_fragment}"
         if directives.get("workflow_source"):
             prompt += "\n\n" + self._workflow_instructions(directives)
         if fragments:
-            return f"{prompt}\n\n{fragments}"
+            prompt += f"\n\n{fragments}"
         return prompt
 
     @staticmethod
@@ -650,7 +703,28 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
             content += f"\n**Hypothesis:** {cf['hypothesis']}\n"
-        if cf.get("ssh_hardware_ips"):
+        is_direct = self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT
+        if is_direct:
+            # Show full assigned_hardware_ips so fragments
+            # can reference targets[0] by path.  Also show
+            # ssh_hardware_ips when they differ (cloud envs).
+            hw = cf.get("assigned_hardware_ips", {})
+            if hw:
+                content += (
+                    f"\n## Assigned Hardware\n"
+                    f"Target hosts for this benchmark. Use "
+                    f"`targets[0]` as the SUT.\n"
+                    f"```json\n{json.dumps(hw, indent=2)}\n```\n"
+                )
+            ssh_hw = cf.get("ssh_hardware_ips", {})
+            if ssh_hw and ssh_hw != hw:
+                content += (
+                    f"\n## SSH Addresses\n"
+                    f"Use these for SSH access (may differ from "
+                    f"assigned addresses in cloud environments).\n"
+                    f"```json\n{json.dumps(ssh_hw, indent=2)}\n```\n"
+                )
+        elif cf.get("ssh_hardware_ips"):
             content += f"\n## Controller SSH Addresses\nUse these addresses for Crucible remotehost `config.host` values only after verifying controller-to-host SSH reachability. They may be hostnames or IPs and are independent from benchmark dataplane addresses.\n```json\n{json.dumps(cf['ssh_hardware_ips'], indent=2)}\n```\n"
             content += f"\n## Assigned Network Addresses\nThese are candidates for benchmark dataplane connectivity. Do not use them as Crucible remotehost `config.host` values unless the controller independently verifies SSH access through them.\n```json\n{json.dumps(cf.get('assigned_hardware_ips', {}), indent=2)}\n```\n"
         elif cf.get("assigned_hardware_ips"):

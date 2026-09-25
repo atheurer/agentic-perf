@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -1653,6 +1654,39 @@ class AgentBase(ABC):
         return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
 
     @staticmethod
+    def _effective_harness(
+        directives: dict[str, Any], skill_provider: Any = None
+    ) -> str:
+        """Return the selected harness or the provider's configured default."""
+        if directives.get("workflow_source"):
+            return "arcaflow-plugins"
+        explicit = directives.get("harness")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        default = getattr(skill_provider, "default_harness", "")
+        return default if isinstance(default, str) else ""
+
+    @staticmethod
+    def _load_prompt_fragment(prompts_dir: Path, name: str | None) -> str:
+        """Read one prompt fragment only when it stays inside prompts_dir.
+
+        Fragment names originate in ticket fields, so accept only a single
+        filename component and resolve symlinks before checking containment.
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            return ""
+        try:
+            root = prompts_dir.resolve(strict=True)
+            if not root.is_dir():
+                return ""
+            fragment = (root / f"{name}.md").resolve(strict=True)
+            if not fragment.is_relative_to(root) or not fragment.is_file():
+                return ""
+            return fragment.read_text().strip()
+        except (OSError, RuntimeError):
+            return ""
+
+    @staticmethod
     def _load_prompt_fragments(
         agent_dir: Path,
         resource_provider: str | None = None,
@@ -1665,18 +1699,22 @@ class AgentBase(ABC):
 
         parts = []
         if resource_provider:
-            provider_file = prompts_dir / f"{resource_provider}.md"
-            if provider_file.exists():
-                parts.append(provider_file.read_text().strip())
+            provider_fragment = AgentBase._load_prompt_fragment(
+                prompts_dir, resource_provider
+            )
+            if provider_fragment:
+                parts.append(provider_fragment)
         else:
-            auto_file = prompts_dir / "auto_select.md"
-            if auto_file.exists():
-                parts.append(auto_file.read_text().strip())
+            auto_fragment = AgentBase._load_prompt_fragment(prompts_dir, "auto_select")
+            if auto_fragment:
+                parts.append(auto_fragment)
 
         if endpoint_type:
-            endpoint_file = prompts_dir / f"{endpoint_type}.md"
-            if endpoint_file.exists():
-                parts.append(endpoint_file.read_text().strip())
+            endpoint_fragment = AgentBase._load_prompt_fragment(
+                prompts_dir, endpoint_type
+            )
+            if endpoint_fragment:
+                parts.append(endpoint_fragment)
 
         return "\n\n".join(parts)
 

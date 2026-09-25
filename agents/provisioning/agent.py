@@ -364,8 +364,9 @@ class ProvisioningAgent(AgentBase):
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Hide install/config tools for self-installing harnesses."""
-        harness = (
-            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
         )
         if harness in self._SELF_INSTALLING:
             self.tools = [
@@ -403,7 +404,9 @@ class ProvisioningAgent(AgentBase):
         # and advance.
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
-        harness = cf.get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            cf.get("directives", {}), getattr(self, "_skill_provider", None)
+        )
         is_jumpstarter = cf.get("resource_provider") == "jumpstarter"
 
         if is_jumpstarter and (not harness or harness in self._SELF_INSTALLING):
@@ -486,15 +489,28 @@ class ProvisioningAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
             resource_provider=provider,
             endpoint_type=endpoint,
         )
+
+        # Load harness-specific provisioning fragment.
+        harness_fragment = ""
+        harness_fragment = self._load_prompt_fragment(
+            Path(__file__).parent / "prompts", harness
+        )
+
+        prompt = PROVISIONING_BASE_PROMPT
+        if harness_fragment:
+            prompt += f"\n\n{harness_fragment}"
         if fragments:
-            return f"{PROVISIONING_BASE_PROMPT}\n\n{fragments}"
-        return PROVISIONING_BASE_PROMPT
+            prompt += f"\n\n{fragments}"
+        return prompt
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})

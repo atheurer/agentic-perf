@@ -475,6 +475,7 @@ class TestPlatformIPScoping:
         agent._tool_handlers = {}
         agent._events = None
         agent._mcp = None
+        agent._skill_provider = None
         agent._stop_requested = False
         agent._client = AsyncMock()
 
@@ -518,9 +519,73 @@ class TestPlatformIPScoping:
             await agent._handle_completion("PERF-TEST", response)
 
             fields = mock_fields.call_args[0][1]
+            # Controller execution (default): first host is
+            # controller, rest are targets
             assert fields["assigned_hardware_ips"] == {
                 "controller": "10.0.0.1",
-                "targets": ["10.0.0.1", "10.0.0.2"],
+                "targets": ["10.0.0.2"],
+            }
+
+    @pytest.mark.asyncio
+    async def test_jumpstarter_direct_writes_targets_only(self):
+        """Direct execution model puts all IPs in targets."""
+        from agents.platform.agent import PlatformAgent
+
+        agent = PlatformAgent.__new__(PlatformAgent)
+        agent.agent_name = "platform-agent"
+        agent.llm = MagicMock()
+        agent.store_url = "http://localhost:8090"
+        agent.tools = []
+        agent._tool_handlers = {}
+        agent._events = None
+        agent._mcp = None
+        agent._stop_requested = False
+        agent._client = AsyncMock()
+
+        tc = MagicMock()
+        tc.name = "submit_platform_result"
+        tc.input = {
+            "platform_ready": True,
+            "hosts_provisioned": ["10.0.0.1"],
+        }
+        response = MagicMock()
+        response.text = ""
+        response.tool_calls = [tc]
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "jumpstarter",
+                        "execution_model": "direct",
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert fields["assigned_hardware_ips"] == {
+                "controller": "",
+                "targets": ["10.0.0.1"],
             }
 
     @pytest.mark.asyncio

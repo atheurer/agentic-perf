@@ -23,6 +23,21 @@ def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]
     return directives
 
 
+def _filter_direct_required_hosts(
+    required_hosts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove controller roles while retaining other host requirements."""
+    filtered: list[dict[str, Any]] = []
+    for host in required_hosts:
+        roles = host.get("roles", [])
+        remaining_roles = [role for role in roles if role != "controller"]
+        if remaining_roles:
+            filtered_host = dict(host)
+            filtered_host["roles"] = remaining_roles
+            filtered.append(filtered_host)
+    return filtered or [{"roles": ["client"]}]
+
+
 _SCOPED_CONTEXT_CALL_RE = re.compile(
     r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
 )
@@ -692,15 +707,6 @@ class TriageAgent(AgentBase):
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
                 directives[key] = cf[key]
-        # Code-enforce: boot-time needs only a client host.
-        # The orchestrator pod IS the controller — no separate
-        # controller host is needed.  The LLM often sets
-        # controller + client roles which causes the resource
-        # agent to search for a non-existent controller.
-        harness = directives.get("harness", "")
-        if harness == "boot-time":
-            required_hosts = [{"roles": ["client"]}]
-
         # Code-enforce harness for workflow tickets.
         # When workflow_source is set, the benchmark agent
         # must use MCP workflow tools, not direct plugin
@@ -710,6 +716,26 @@ class TriageAgent(AgentBase):
         # harness provider. Keep this value aligned with the provider catalog
         # and BenchmarkAgent tool-scoping key.
         directives = _canonicalize_workflow_harness(directives)
+        # Resolve after canonicalization, and honor the configured provider
+        # default when triage omitted an explicit harness.
+        harness = self._effective_harness(directives, self._skill_provider)
+        # Resolve execution model from the harness metadata.
+        # This is a harness-level property declared in BenchmarkSuite,
+        # not a per-ticket decision or a hardcoded list.
+        from providers.skills.base import EXECUTION_MODEL_DIRECT
+        from providers.skills.catalog import resolve_execution_model
+
+        benchmark_name = result.get("benchmark_suite", "")
+        execution_model = await resolve_execution_model(
+            self._skill_provider, harness, benchmark_name
+        )
+
+        # Direct harnesses need only target hosts — no controller.
+        # The LLM often includes a controller role which causes the
+        # resource agent to allocate a non-existent controller host.
+        if execution_model == EXECUTION_MODEL_DIRECT:
+            required_hosts = _filter_direct_required_hosts(required_hosts)
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
@@ -717,6 +743,7 @@ class TriageAgent(AgentBase):
             "absent_suite": result.get("absent_suite", False),
             "required_hosts": required_hosts,
             "directives": directives,
+            "execution_model": execution_model,
         }
         if hasattr(self._skill_provider, "get_source_provenance"):
             source_provenance = self._skill_provider.get_source_provenance("crucible")

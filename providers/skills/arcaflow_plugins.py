@@ -14,7 +14,12 @@ import httpx
 from paths import PLUGIN_SCHEMA_CACHE_DIR as _DEFAULT_SCHEMA_CACHE_DIR
 from providers.execution import AuditedSubprocessRunner
 
-from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .base import (
+    EXECUTION_MODEL_DIRECT,
+    BenchmarkSuite,
+    RunfileTemplate,
+    SkillProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -824,6 +829,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                     min_hosts=1,
                     harness="arcaflow-plugins",
                     architectures=info.get("architectures", []),
+                    execution_model=EXECUTION_MODEL_DIRECT,
                 )
             )
         return results
@@ -842,6 +848,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             min_hosts=1,
             harness="arcaflow-plugins",
             architectures=info.get("architectures", []),
+            execution_model=EXECUTION_MODEL_DIRECT,
         )
 
     async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:

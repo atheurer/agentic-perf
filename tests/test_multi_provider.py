@@ -153,6 +153,10 @@ def multi(
     )
 
 
+def test_exposes_configured_default_harness(multi: MultiHarnessSkillProvider):
+    assert multi.default_harness == "crucible"
+
+
 @pytest.mark.asyncio
 async def test_list_benchmarks_aggregates(multi: MultiHarnessSkillProvider):
     benchmarks = await multi.list_benchmarks()
