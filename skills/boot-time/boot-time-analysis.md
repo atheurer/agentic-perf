@@ -204,7 +204,7 @@ capture independently from power control (`--no-power` mode).
 
 ### SSH reboot with Jumpstarter fallback
 
-When Jumpstarter is available but serial capture is not
+When Jumpstarter is available but active serial capture is not
 enabled, the harness attempts SSH reboot first. If the SSH
 reboot hangs (board doesn't go down within 120 seconds), the
 harness falls back to Jumpstarter power cycling automatically.
