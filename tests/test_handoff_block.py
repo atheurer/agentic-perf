@@ -220,6 +220,51 @@ class TestBlockHandoffFailedRewindFallback:
 
         assert result is False
 
+    async def test_status_lookup_failure_does_not_stop_hitl_recovery(
+        self,
+        mock_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed diagnostic read still allows the HITL transition attempt."""
+        import orchestrator.main as mod
+
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+
+        transition_calls = 0
+
+        def make_response(status_code: int = 200):
+            resp = MagicMock()
+            resp.status_code = status_code
+            return resp
+
+        async def fake_post(url: str, json: dict | None = None, **kw):
+            nonlocal transition_calls
+            if "transition" in url:
+                transition_calls += 1
+                return make_response(422)
+            return make_response(200)
+
+        async def fake_get(url: str, **kw):
+            raise OSError("state store temporarily unavailable")
+
+        mock_client.post = fake_post
+        mock_client.get = fake_get
+
+        with patch.object(
+            mod,
+            "AuditedAsyncHTTPClient",
+            lambda **kwargs: mock_client,
+        ):
+            result = await mod._block_handoff_failed(
+                store_url="http://store:8090",
+                ticket_id="PERF-TEST-LOOKUP-ERROR",
+                reason="test",
+                current_status="evaluating_convergence",
+            )
+
+        assert result is False
+        assert transition_calls == 2
+
     async def test_returns_true_when_hitl_succeeds(
         self,
         mock_client: MagicMock,

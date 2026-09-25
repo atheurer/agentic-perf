@@ -1326,14 +1326,22 @@ async def _block_handoff_failed(
                     resp.status_code,
                     ticket_id,
                 )
-        # Re-fetch ticket to determine actual status after rewind attempt.
-        ticket_resp = await client.get(
-            f"{store_url}/api/v1/tickets/{ticket_id}",
-        )
-        if ticket_resp.status_code == 200:
-            actual_status = ticket_resp.json().get("status", current_status)
-        else:
-            actual_status = current_status
+        # This lookup only improves the failure log; a store read error must
+        # not prevent the HITL recovery attempt or stop the poll loop.
+        actual_status = current_status
+        try:
+            ticket_resp = await client.get(
+                f"{store_url}/api/v1/tickets/{ticket_id}",
+            )
+            if ticket_resp.status_code == 200:
+                actual_status = ticket_resp.json().get("status", current_status)
+        except Exception:
+            logger.warning(
+                "Could not re-fetch %s after handoff rewind; using known status %s",
+                ticket_id,
+                current_status,
+                exc_info=True,
+            )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
