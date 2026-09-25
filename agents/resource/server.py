@@ -76,6 +76,38 @@ async def _ensure_init():
     _initialized = True
 
 
+async def _persist_fleet_exhaustion_marker(ticket_id: str, exhausted: bool) -> None:
+    """Persist the provider's current, confirmed fleet exhaustion result."""
+    if not ticket_id:
+        return
+    from providers.execution import AuditedAsyncHTTPClient
+    from state_store.auth import read_token_from_file
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    token = read_token_from_file()
+    async with AuditedAsyncHTTPClient(
+        base_url=store_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10.0,
+    ) as client:
+        response = await client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"resource_fleet_exhaustion_detected": exhausted}},
+        )
+        response.raise_for_status()
+
+
+def _is_confirmed_fleet_exhaustion(result: dict, tested_host_ids: set[str]) -> bool:
+    """Only treat matching boards already tested by the fleet as exhaustion."""
+    excluded_hosts = set(result.get("excluded_hosts") or [])
+    return bool(
+        result.get("all_excluded")
+        and not result.get("available")
+        and excluded_hosts
+        and excluded_hosts.issubset(tested_host_ids)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regex helpers — two-stage scan + validate
 # ---------------------------------------------------------------------------
@@ -248,7 +280,7 @@ async def check_available_resources(
     from providers.fleet import get_tested_host_ids, is_fleet_investigation
 
     fresh_cf = _ticket.get("custom_fields", {})
-    ticket_id = os.environ.get("TICKET_ID", "")
+    ticket_id = os.environ.get("TICKET_ID", "") or _ticket.get("id", "")
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     if ticket_id:
         try:
@@ -267,7 +299,8 @@ async def check_available_resources(
         except Exception:
             pass
     if is_fleet_investigation(fresh_cf):
-        exclude = get_tested_host_ids(fresh_cf)
+        tested_host_ids = set(get_tested_host_ids(fresh_cf))
+        exclude = list(tested_host_ids)
         # Merge three exclusion sources so nothing is lost:
         # 1. tested_hosts (fleet iteration tracking)
         # 2. user-provided exclude_hosts from directives
@@ -286,6 +319,7 @@ async def check_available_resources(
 
     if required_hosts:
         recommendations = []
+        availability_results = []
         for host_req in required_hosts:
             if is_fleet_investigation(fresh_cf) and exclude:
                 host_req = dict(host_req)
@@ -295,16 +329,28 @@ async def check_available_resources(
                     existing = [h.strip() for h in existing.split(",") if h.strip()]
                 host_req["exclude_hosts"] = list(set(exclude) | set(existing))
             result = await prov.check_available(host_req)
+            availability_results.append(result)
             rec = dict(host_req)
             if result.get("options"):
                 rec["recommended"] = result["options"][0]
             recommendations.append(rec)
-        return json.dumps(
-            {
-                "provider": prov.provider_name,
-                "per_host_recommendations": recommendations,
-            }
-        )
+        response = {
+            "provider": prov.provider_name,
+            "per_host_recommendations": recommendations,
+        }
+        if is_fleet_investigation(fresh_cf) and ticket_id:
+            fleet_exhausted = bool(availability_results) and all(
+                _is_confirmed_fleet_exhaustion(item, tested_host_ids)
+                for item in availability_results
+            )
+            await _persist_fleet_exhaustion_marker(ticket_id, fleet_exhausted)
+            if fleet_exhausted:
+                response["fleet_exhausted"] = True
+                response["message"] = (
+                    "All matching devices have been tested. "
+                    "Fleet exhaustion detected — routing to coordinator."
+                )
+        return json.dumps(response)
     result = await prov.check_available(requirements or {})
 
     # Code-enforce: when a specific device was requested by
@@ -314,6 +360,27 @@ async def check_available_resources(
     # alternatives of the same board type.
     if not result.get("available") and result.get("selector", "").startswith("name="):
         await _auto_escalate_named_device(result)
+
+    # Fleet: deterministic exhaustion detection.
+    # When all matching devices are excluded (i.e., already tested),
+    # route to the fleet coordinator instead of letting the LLM
+    # decide — the LLM may skip request_clarification and go
+    # straight to HITL, bypassing fleet exhaustion handling (#994).
+    if is_fleet_investigation(fresh_cf) and ticket_id:
+        fleet_exhausted = _is_confirmed_fleet_exhaustion(result, tested_host_ids)
+        await _persist_fleet_exhaustion_marker(ticket_id, fleet_exhausted)
+    else:
+        fleet_exhausted = False
+    if fleet_exhausted:
+        logger.info(
+            "[resource] Fleet exhaustion detected for %s — all matching devices tested",
+            ticket_id,
+        )
+        result["fleet_exhausted"] = True
+        result["message"] = (
+            "All matching devices have been tested. "
+            "Fleet exhaustion detected — routing to coordinator."
+        )
 
     # Fleet: remember the first available device so
     # reserve_resources can target it by name.
