@@ -1081,3 +1081,52 @@ class TestSearchMetadataFilters:
         assert parsed["tickets"][0]["id"] == "PERF-1"
         assert "harness" not in parsed["tickets"][0]
         assert "board_type" not in parsed["tickets"][0]
+
+    async def test_malformed_metadata_is_ignored_in_filters_and_output(self):
+        """Ignore non-mapping containers and non-string metadata values."""
+        tickets = [
+            {
+                "id": "PERF-1",
+                "summary": "a",
+                "status": "closed",
+                "custom_fields": ["invalid"],
+            },
+            {
+                "id": "PERF-2",
+                "summary": "b",
+                "status": "closed",
+                "custom_fields": {"directives": ["invalid"]},
+            },
+            {
+                "id": "PERF-3",
+                "summary": "c",
+                "status": "closed",
+                "custom_fields": {
+                    "directives": {
+                        "harness": {"value": "boot-time"},
+                        "board_selector": ["board-type=qc8775"],
+                    }
+                },
+            },
+        ]
+
+        async def search(params):
+            client = self._mock_client(tickets)
+            result = await execute_tool(
+                "search_tickets",
+                params,
+                client,
+                "http://localhost:8090",
+                "token",
+                audit=_audit(client),
+            )
+            return json.loads(result)
+
+        parsed = await search({})
+        assert parsed["count"] == 3
+        assert all(
+            "harness" not in ticket and "board_type" not in ticket
+            for ticket in parsed["tickets"]
+        )
+        assert (await search({"harness": "boot-time"}))["count"] == 0
+        assert (await search({"board_type": "qc8775"}))["count"] == 0

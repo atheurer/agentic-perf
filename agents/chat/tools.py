@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -875,18 +875,22 @@ async def _search_tickets(
         if created_by_filter:
             if t.get("created_by", "").lower() != created_by_filter:
                 continue
-        cf = t.get("custom_fields", {})
-        directives = cf.get("directives") or {}
+        custom_fields = t.get("custom_fields")
+        cf = custom_fields if isinstance(custom_fields, Mapping) else {}
+        raw_directives = cf.get("directives")
+        directives = raw_directives if isinstance(raw_directives, Mapping) else {}
+        raw_harness = directives.get("harness")
+        harness = raw_harness if isinstance(raw_harness, str) else ""
+        raw_selector = directives.get("board_selector")
+        if not isinstance(raw_selector, str) or not raw_selector:
+            raw_selector = cf.get("board_selector")
+        selector = raw_selector if isinstance(raw_selector, str) else ""
         if harness_filter:
-            harness = directives.get("harness") or ""
             if harness.lower() != harness_filter:
                 continue
         if board_type_filter:
             # Fallback: triage may place board_selector at
             # top-level custom_fields or inside directives.
-            selector = (
-                directives.get("board_selector") or cf.get("board_selector") or ""
-            )
             if board_type_filter not in selector.lower():
                 continue
         if since_filter:
@@ -904,14 +908,10 @@ async def _search_tickets(
             "created_at": t.get("created_at", "")[:19],
             "updated_at": t.get("updated_at", "")[:19],
         }
-        entry_harness = directives.get("harness") or ""
-        if entry_harness:
-            entry["harness"] = entry_harness
-        entry_selector = (
-            directives.get("board_selector") or cf.get("board_selector") or ""
-        )
-        if entry_selector:
-            entry["board_type"] = entry_selector
+        if harness:
+            entry["harness"] = harness
+        if selector:
+            entry["board_type"] = selector
         results.append(entry)
         if len(results) >= limit:
             break
