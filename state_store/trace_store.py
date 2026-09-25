@@ -79,7 +79,9 @@ class TraceStore:
         # ASGI handlers may write concurrently while this store deliberately
         # shares one SQLite connection. Serialize transaction ownership.
         self._write_lock = threading.RLock()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        AuditedFilesystem.system(self.db_path.parent).mkdir(".", mode=0o777)
         # Serialize all transaction-bearing operations on the
         # shared connection.  Multiple callers (audit log,
         # store mutations, API handlers) access this store

@@ -71,9 +71,20 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _prepare_repository_imports() -> None:
+    """Make the local stdlib-only facade available before an instance venv exists."""
+    repository = str(Path(__file__).resolve().parents[1])
+    if repository not in sys.path:
+        sys.path.insert(0, repository)
+
+
 def create_manifest(home: str, worktree: str, name: str, port: int) -> None:
+    _prepare_repository_imports()
+    from providers.execution.filesystem import AuditedFilesystem
+
     target = Path(home)
-    target.mkdir(parents=True, exist_ok=True)
+    filesystem = AuditedFilesystem.system(target)
+    filesystem.mkdir(".", mode=0o777)
     path = target / MANIFEST
     if path.exists():
         raise ValueError(f"identity manifest already exists: {path}")
@@ -89,12 +100,12 @@ def create_manifest(home: str, worktree: str, name: str, port: int) -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-    path.write_bytes(encoded)
-    (target / MANIFEST_DIGEST).write_text(_digest(encoded) + "\n")
+    filesystem.write(path.name, encoded, mode=0o444)
+    filesystem.write(MANIFEST_DIGEST, _digest(encoded) + "\n", mode=0o444)
     # Identity is not a mutable provider setting.  The digest detects edits
     # while keeping the files portable across filesystems.
-    path.chmod(0o444)
-    (target / MANIFEST_DIGEST).chmod(0o444)
+    filesystem.chmod(path.name, 0o444)
+    filesystem.chmod(MANIFEST_DIGEST, 0o444)
 
 
 def _load_manifest(home: str) -> tuple[dict, Path]:
@@ -280,9 +291,18 @@ def import_state(
             "  exclude config.json, secrets, PID/lock files, logs, audit, claims, leases, approvals"
         )
     if apply:
-        destination.joinpath("tickets").mkdir(parents=True, exist_ok=True)
+        _prepare_repository_imports()
+        from providers.execution.filesystem import AuditedFilesystem
+
+        filesystem = AuditedFilesystem.system(destination)
+        filesystem.mkdir("tickets", mode=0o777)
         for path, record in outputs:
-            path.write_text(json.dumps(record, indent=2, default=str) + "\n")
+            filesystem.write(
+                path.relative_to(destination),
+                json.dumps(record, indent=2, default=str) + "\n",
+                mode=None,
+                atomic=False,
+            )
     return len(outputs)
 
 

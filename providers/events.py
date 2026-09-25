@@ -156,7 +156,11 @@ class EventBus:
                 "trace dual-write comparison mode requires a comparison sink"
             )
         self._log_dir = Path(log_dir) if log_dir is not None else paths.LOG_DIR
-        self._log_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        AuditedFilesystem.system(self._log_dir.parent).mkdir(
+            self._log_dir.name, mode=0o777
+        )
         self._redactor = redactor
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
