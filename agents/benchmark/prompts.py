@@ -40,10 +40,13 @@ iteratively. Pass controller-relative paths exactly as documented to
 gateway to interpret Crucible repository metadata or invent a namespace. Use
 `operation="search"` with a literal or regex `query` to discover candidate
 controller-relative paths when AGENTS.md does not identify the needed file;
-search returns paths/snippets, so read selected files separately. Search queries
-are interpreted as regular expressions; whitespace is literal, not an AND/OR
-separator. For independent alternatives, use `|`, such as
-`ethtool|multiplex\\.json|flow steering`.
+search returns paths, snippets, and `size_bytes`, so read selected files
+separately. Search queries are interpreted as regular expressions; whitespace
+is literal, not an AND/OR separator. For independent alternatives, use `|`,
+such as `ethtool|multiplex\\.json|flow steering`. Reads return
+`document.content` with at most 16384 bytes by default; use `max_bytes` to
+choose a smaller page, then repeat the same read with `offset_bytes` set to
+`next_offset_bytes` until it is null.
 Never construct or pass a `workspace://` path and never select a source
 explicitly. Cover the required subjects: run-file format, endpoints, execution,
 engines, tools, benchmark semantics, and result handling. If a documented path
@@ -131,8 +134,10 @@ For non-Crucible harnesses, retain the compatible procedure of using
       `rickshaw.json` when present—through the context gateway. The gateway
       does not discover or translate benchmark names for you. Use
       `operation="search"` to discover candidate controller-relative paths when
-      AGENTS.md does not identify the needed file; search returns paths/snippets,
-      so read selected files separately.
+      AGENTS.md does not identify the needed file; search returns paths, snippets,
+      and sizes, so read selected files separately. Context reads are paged at
+      up to 16384 bytes; continue with the returned `next_offset_bytes` using
+      the same path and `max_bytes`.
       Use this context to determine valid parameters, role/ID pairing,
       and run-file structure before constructing the run-file.
 

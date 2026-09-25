@@ -183,6 +183,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:verify_host_tuning",
         "agents/provisioning/server.py:nm_show_connection",
         "agents/provisioning/server.py:nm_verify_interface",
+        "agents/provisioning/server.py:get_flow_steering_rules",
         "agents/provisioning/server.py:get_private_config",
     ),
     *_side_effecting(

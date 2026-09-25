@@ -61,12 +61,12 @@ async def test_mcp_read_file_from_workspace(ws_env):
     ws_env.save_file("test.txt", "Line 1\nLine 2\nLine 3\nLine 4\n")
 
     raw_resp = await ws_server.read_file_from_workspace(
-        file_ref="workspace://test.txt", start_line=2, max_lines=2
+        file_ref="workspace://test.txt", offset_bytes=7, max_bytes=8
     )
     resp = json.loads(raw_resp)
     assert resp["status"] == "ok"
-    assert resp["lines_returned"] == 2
-    assert "Line 2\nLine 3\n" in resp["content"]
+    assert resp["content"] == "Line 2\nL"
+    assert resp["next_offset_bytes"] == 15
 
 
 async def test_mcp_list_files_from_workspace(ws_env):
@@ -79,6 +79,65 @@ async def test_mcp_list_files_from_workspace(ws_env):
     assert resp["count"] == 2
     files = {f["filename"] for f in resp["files"]}
     assert files == {"file1.json", "file2.txt"}
+    sizes = {f["filename"]: f["size_bytes"] for f in resp["files"]}
+    assert sizes == {"file1.json": 2, "file2.txt": 3}
+
+
+async def test_mcp_jq_file_from_workspace_paginates_and_bounds_size(ws_env):
+    text = "x" * 20000
+    ws_env.save_file("long.json", json.dumps({"content": text}))
+
+    first = json.loads(
+        await ws_server.jq_file_from_workspace(
+            file_ref="workspace://long.json",
+            filter=".content",
+            max_bytes=16384,
+        )
+    )
+    assert first["bytes_returned"] == 16384
+    second = json.loads(
+        await ws_server.jq_file_from_workspace(
+            file_ref="workspace://long.json",
+            filter=".content",
+            max_bytes=16384,
+            offset_bytes=first["next_offset_bytes"],
+        )
+    )
+    assert first["result_slice"] + second["result_slice"] == text
+    assert second["next_offset_bytes"] is None
+
+
+async def test_mcp_context_document_pages_are_accessible_by_generic_reader(ws_env):
+    snapshot = ws_env.save_source_snapshot(
+        "github", {"commit": "abc"}, {"README.md": "context body"}, "fio"
+    )
+    ws_env.index_context_documents(
+        [
+            {
+                "ref": "benchmark/fio/README.md",
+                "namespace": "benchmark/fio",
+                "source": "github",
+                "authority": "effective",
+                "workspace_ref": snapshot["files"]["README.md"],
+            }
+        ]
+    )
+    raw_resp = await ws_server.read_file_from_workspace(
+        file_ref="benchmark/fio/README.md", offset_bytes=0, max_bytes=8
+    )
+    resp = json.loads(raw_resp)
+    assert resp["content"] == "context "
+    assert resp["next_offset_bytes"] == 8
+
+
+async def test_workspace_tool_schemas_advertise_paging_parameters():
+    definitions = {item.name: item for item in WORKSPACE_TOOLS}
+    jq_properties = definitions["jq_file_from_workspace"].input_schema["properties"]
+    assert {"max_bytes", "offset_bytes"} <= set(jq_properties)
+    document_properties = definitions["read_document_from_workspace"].input_schema[
+        "properties"
+    ]
+    assert {"max_bytes", "offset_bytes"} <= set(document_properties)
 
 
 async def test_mcp_generate_chart_applies_jq_filter_to_source(ws_env):

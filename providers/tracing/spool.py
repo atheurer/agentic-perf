@@ -14,7 +14,6 @@ import os
 import socket
 import stat
 import struct
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -55,11 +54,14 @@ class TraceSpool:
     ) -> None:
         if max_bytes < _HEADER.size + _DIGEST_SIZE:
             raise ValueError("max_bytes is too small for a trace frame")
+        from providers.execution import AuditedFilesystem
+
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._filesystem = AuditedFilesystem.system(self.directory)
+        self._filesystem.mkdir(".")
         if not os.path.isdir(self.directory) or os.path.islink(self.directory):
             raise SpoolError("trace spool directory must not be a symlink")
-        os.chmod(self.directory, 0o700)
+        self._filesystem.chmod(".", 0o700)
         identity = name or f"{socket.gethostname()}-{os.getpid()}-{time.time_ns()}"
         if "/" in identity or identity in {"", ".", ".."}:
             raise ValueError("invalid spool name")
@@ -70,23 +72,24 @@ class TraceSpool:
         created = not self.path.exists()
         if created and not create:
             raise FileNotFoundError(self.path)
-        lock_fd = os.open(
-            self.lock_path,
+        lock_fd = self._filesystem.open_descriptor(
+            self.lock_path.name,
             os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+            mode=0o600,
         )
         try:
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                 raise SpoolError("trace spool lock must be a regular file")
-            os.fchmod(lock_fd, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._filesystem.set_descriptor_mode(lock_fd, 0o600)
+            self._filesystem.lock_descriptor(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BaseException:
+            self._filesystem.forget_descriptor(lock_fd)
             os.close(lock_fd)
             raise
         self._lock_fd = lock_fd
         try:
             if not create and not self.path.exists():
-                self.lock_path.unlink(missing_ok=True)
+                self._filesystem.unlink(self.lock_path.name, missing_ok=True)
                 raise FileNotFoundError(self.path)
             if created:
                 flags = (
@@ -95,14 +98,16 @@ class TraceSpool:
                     | os.O_WRONLY
                     | getattr(os, "O_NOFOLLOW", 0)
                 )
-                fd = os.open(self.path, flags, 0o600)
+                fd = self._filesystem.open_descriptor(self.path.name, flags, mode=0o600)
+                self._filesystem.forget_descriptor(fd)
                 os.close(fd)
                 self._fsync_dir()
             if self.path.is_symlink() or not self.path.is_file():
                 raise SpoolError("trace spool must be a regular file")
-            os.chmod(self.path, 0o600)
+            self._filesystem.chmod(self.path.name, 0o600)
         except BaseException:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            self._filesystem.lock_descriptor(lock_fd, fcntl.LOCK_UN)
+            self._filesystem.forget_descriptor(lock_fd)
             os.close(lock_fd)
             self._lock_fd = None
             raise
@@ -118,10 +123,7 @@ class TraceSpool:
             )
             if self.path.stat().st_size + len(frame) > self.max_bytes:
                 raise SpoolBackpressure("trace spool size cap reached")
-            with self.path.open("ab", buffering=0) as stream:
-                self._write_all(stream, frame)
-                stream.flush()
-                os.fsync(stream.fileno())
+            self._filesystem.append(self.path.name, frame, sync=True)
 
     def _ack_offset(self) -> int:
         if self.ack_path.is_symlink():
@@ -135,20 +137,8 @@ class TraceSpool:
         return max(value, 0)
 
     def _write_ack(self, offset: int) -> None:
-        fd, tmp = tempfile.mkstemp(prefix=".ack-", dir=self.directory)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(str(offset))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, self.ack_path)
-            self._fsync_dir()
-        finally:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+        self._filesystem.write(self.ack_path.name, str(offset), mode=0o600)
+        self._fsync_dir()
 
     def pending(self) -> Iterator[tuple[int, TraceEventV1]]:
         with self._mutex, self.path.open("rb") as stream:
@@ -192,26 +182,19 @@ class TraceSpool:
             offset = self._ack_offset()
             if not offset:
                 return
-            fd, tmp = tempfile.mkstemp(prefix=".spool-", dir=self.directory)
-            try:
-                os.fchmod(fd, 0o600)
-                with self.path.open("rb") as source, os.fdopen(fd, "wb") as target:
-                    self._validate_ack_boundary(source, offset)
-                    source.seek(offset)
-                    while block := source.read(64 * 1024):
-                        self._write_all(target, block)
-                    target.flush()
-                    os.fsync(target.fileno())
-                # Reset before replace: either crash window replays the old file or
-                # uses the compacted file from offset zero; neither loses data.
-                self._write_ack(0)
-                os.replace(tmp, self.path)
-                self._fsync_dir()
-            finally:
+            with self.path.open("rb") as source:
+                self._validate_ack_boundary(source, offset)
+                source.seek(offset)
+                temporary = self._filesystem.temporary_file(prefix=".spool-")
                 try:
-                    os.unlink(tmp)
-                except FileNotFoundError:
-                    pass
+                    self._filesystem.write_stream(temporary, source, mode=0o600)
+                    # Reset before replace: either crash window replays the old file
+                    # or uses the compacted file from offset zero; neither loses data.
+                    self._write_ack(0)
+                    self._filesystem.rename(temporary, self.path.name)
+                    self._fsync_dir()
+                finally:
+                    self._filesystem.unlink(temporary, missing_ok=True)
 
     def bytes_pending(self) -> int:
         return max(0, self.path.stat().st_size - self._ack_offset())
@@ -220,10 +203,11 @@ class TraceSpool:
         with self._mutex:
             if self._lock_fd is not None:
                 if self.path.exists() and self.path.stat().st_size == 0:
-                    self.path.unlink()
-                    self.ack_path.unlink(missing_ok=True)
-                    self.lock_path.unlink(missing_ok=True)
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                    self._filesystem.unlink(self.path.name)
+                    self._filesystem.unlink(self.ack_path.name, missing_ok=True)
+                    self._filesystem.unlink(self.lock_path.name, missing_ok=True)
+                self._filesystem.lock_descriptor(self._lock_fd, fcntl.LOCK_UN)
+                self._filesystem.forget_descriptor(self._lock_fd)
                 os.close(self._lock_fd)
                 self._lock_fd = None
                 self._fsync_dir()
@@ -231,9 +215,9 @@ class TraceSpool:
     def _quarantine(self, reason: str) -> None:
         target = self.directory / f"{self.path.name}.{reason}.{time.time_ns()}.bad"
         try:
-            os.replace(self.path, target)
-            self.path.touch(mode=0o600)
-            self.ack_path.unlink(missing_ok=True)
+            self._filesystem.rename(self.path.name, target.name)
+            self._filesystem.touch(self.path.name, mode=0o600)
+            self._filesystem.unlink(self.ack_path.name, missing_ok=True)
             self._fsync_dir()
         except OSError:
             pass
@@ -271,17 +255,6 @@ class TraceSpool:
             self._quarantine("invalid-ack")
             raise SpoolCorruption("spool acknowledgement is not frame aligned")
         return offset
-
-    @staticmethod
-    def _write_all(stream: BinaryIO, data: bytes) -> None:
-        view = memoryview(data)
-        while view:
-            written = stream.write(view)
-            if written is None:
-                return
-            if written <= 0:
-                raise OSError("short spool write")
-            view = view[written:]
 
 
 def drain_abandoned_spools(

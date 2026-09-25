@@ -39,7 +39,10 @@ class FileRecordProvider(InvestigationRecordProvider):
 
     def __init__(self, persist_dir: Path | str | None = None) -> None:
         self._dir = Path(persist_dir or _DEFAULT_DIR)
-        self._dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        self._filesystem = AuditedFilesystem.system(self._dir)
+        self._filesystem.mkdir(".", mode=0o777)
 
     def _path(self, investigation_id: str) -> Path:
         """Path to the JSON file for a given record."""
@@ -49,9 +52,11 @@ class FileRecordProvider(InvestigationRecordProvider):
     def _write(self, record: InvestigationRecord) -> None:
         """Persist a record to disk."""
         path = self._path(record.investigation_id)
-        path.write_text(
+        self._filesystem.write(
+            path.name,
             record.model_dump_json(indent=2),
             encoding="utf-8",
+            mode=0o644,
         )
 
     def _read(self, path: Path) -> InvestigationRecord | None:
