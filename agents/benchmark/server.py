@@ -4783,33 +4783,44 @@ async def execute_boot_time_test(
         stall_diag["samples_before_stall"] = sample_count
         stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
-        # Analyze serial capture log for failure indicators.
+        # Analyze serial capture log for diagnostic indicators.
         # The serial log captures board console output during
         # the benchmark and can reveal kernel panics, boot
         # hangs, or U-Boot failures that SSH diagnostics miss.
+        _MAX_SERIAL_READ = 1024 * 1024  # 1MB cap to prevent OOM
         if serial_log_path.exists() and serial_log_path.stat().st_size > 0:
             try:
-                serial_text = serial_log_path.read_text(
-                    encoding="utf-8", errors="replace"
-                )
-                stall_diag["serial_log_bytes"] = len(serial_text)
+                file_size = serial_log_path.stat().st_size
+                stall_diag["serial_log_bytes"] = file_size
+                # Read at most the last 1MB to avoid OOM on
+                # runaway serial logs.
+                with open(serial_log_path, "rb") as f:
+                    if file_size > _MAX_SERIAL_READ:
+                        f.seek(-_MAX_SERIAL_READ, 2)
+                    serial_bytes = f.read()
+                serial_text = serial_bytes.decode("utf-8", errors="replace")
                 # Include last 2000 chars for the LLM to analyze
                 stall_diag["serial_tail"] = serial_text[-2000:]
-                # Flag known failure patterns
-                _FAILURE_PATTERNS = [
+                # Flag diagnostic indicators — includes both
+                # failure signals and boot milestones so agents
+                # can assess how far the board progressed.
+                _SERIAL_INDICATORS = [
                     ("kernel panic", "kernel_panic"),
                     ("unable to mount root", "root_mount_failure"),
                     ("not syncing", "kernel_not_syncing"),
                     ("reboot: system halted", "system_halted"),
+                    ("out of memory", "oom"),
+                    ("oom-killer", "oom_killer"),
+                    ("call trace", "call_trace"),
                     ("u-boot", "uboot_prompt"),
                     ("autoboot", "uboot_autoboot"),
                     ("login:", "reached_login"),
                 ]
-                lower_text = serial_text.lower()
+                lower_tail = serial_text[-_MAX_SERIAL_READ:].lower()
                 detected = [
                     label
-                    for pattern, label in _FAILURE_PATTERNS
-                    if pattern in lower_text
+                    for pattern, label in _SERIAL_INDICATORS
+                    if pattern in lower_tail
                 ]
                 if detected:
                     stall_diag["serial_indicators"] = detected
