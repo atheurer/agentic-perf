@@ -98,7 +98,13 @@ class OpenAICompatLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
         if self.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = self.reasoning_effort
+            # GPT-6 and similar models reject reasoning_effort
+            # combined with function tools on the chat completions
+            # API.  Omit reasoning_effort when tools are present
+            # so tool calls work; the model still reasons, just
+            # without the explicit effort hint.
+            if not tools:
+                kwargs["reasoning_effort"] = self.reasoning_effort
 
         effective_timeout = self._resolve_timeout(timeout)
         if effective_timeout == 0:
