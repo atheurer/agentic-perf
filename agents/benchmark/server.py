@@ -4254,6 +4254,51 @@ async def get_run_logs(
     )
 
 
+_MAX_BOOT_SERIAL_READ = 1024 * 1024
+
+
+def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
+    """Read a bounded serial snapshot and report boot/failure indicators."""
+    try:
+        with serial_log_path.open("rb") as stream:
+            file_size = stream.seek(0, os.SEEK_END)
+            if not file_size:
+                return {}
+            stream.seek(max(0, file_size - _MAX_BOOT_SERIAL_READ))
+            # A serial writer may append after the seek. Bound the read itself.
+            serial_bytes = stream.read(_MAX_BOOT_SERIAL_READ)
+    except OSError:
+        return {}
+
+    serial_text = serial_bytes.decode("utf-8", errors="replace")
+    lower_text = serial_text.lower()
+    indicators = [
+        label
+        for pattern, label in (
+            ("kernel panic", "kernel_panic"),
+            ("unable to mount root", "root_mount_failure"),
+            ("not syncing", "kernel_not_syncing"),
+            ("reboot: system halted", "system_halted"),
+            ("out of memory", "oom"),
+            ("oom-killer", "oom_killer"),
+            ("call trace", "call_trace"),
+            ("autoboot", "uboot_autoboot"),
+            ("login:", "reached_login"),
+        )
+        if pattern in lower_text
+    ]
+    if re.search(r"(?m)^u-boot(?:[ \t]+\d|[ \t]*$)", lower_text):
+        indicators.append("uboot_banner")
+
+    diagnostics: dict[str, Any] = {
+        "serial_log_bytes": file_size,
+        "serial_tail": serial_text[-2000:],
+    }
+    if indicators:
+        diagnostics["serial_indicators"] = indicators
+    return diagnostics
+
+
 @mcp.tool()
 async def execute_boot_time_test(
     sut_host: str,
@@ -4581,282 +4626,257 @@ async def execute_boot_time_test(
     serial_proc = None
     serial_log_fh = None
     serial_log_path = output_dir / "serial-capture.log"
-    if _ticket:
-        _fields = _ticket.get("custom_fields", {})
-        _metadata = _fields.get(
-            "resource_provider_metadata",
-            {},
-        )
-        _lease_id = _metadata.get("lease_id", "")
-        _directives = _fields.get("directives", {})
-        _passive_serial = _directives.get(
-            "serial_capture",
-            False,
-        )
-        # Don't run passive serial alongside active serial
-        _serial_active = _directives.get(
-            "jumpstarter_serial",
-            False,
-        )
-        if (
-            _lease_id
-            and _fields.get("resource_provider") == "jumpstarter"
-            and _passive_serial
-            and not _serial_active
-        ):
-            try:
-                serial_log_fh = artifact_filesystem.open_stream(
-                    "serial-capture.log", mode=artifact_file_mode
-                )
-                serial_proc = await AuditedSubprocessRunner().start(
-                    [
-                        "jmp",
-                        "shell",
-                        f"--lease={_lease_id}",
-                        "--",
-                        "j",
-                        "serial",
-                        "pipe",
-                    ],
-                    stdout=serial_log_fh,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                    mutating=True,
-                )
-                logger.info(
-                    f"[boot-time] Passive serial capture "
-                    f"started (lease={_lease_id}, "
-                    f"pid={serial_proc.pid})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[boot-time] Failed to start passive serial capture: {e}"
-                )
-                serial_proc = None
-                if serial_log_fh:
-                    serial_log_fh.close()
-                    serial_log_fh = None
-
-    # ── Execute ───────────────────────────────────────────
-    # Run from output_dir so boot-timings-test.sh creates
-    # its results folder (and SCPs files) here, not relative
-    # to the scripts repo.
-    # Merge Jumpstarter env vars with current environment
-    run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
-    # Timeout: samples × ~90s per sample + 15min overhead.
-    # Prevents orphaned jmp shell subprocesses from keeping
-    # the pipe open indefinitely (observed: 4hr hang when
-    # capture-boot timed out but jmp shell child lingered).
-    benchmark_timeout = (samples * 90) + 900
-
-    proc = await AuditedSubprocessRunner().start(
-        cmd,
-        cwd=str(output_dir),
-        env=run_env,
-        mutating=True,
-    )
-    _STALL_CHECK_INTERVAL = 60
-    _STALL_TIMEOUT = 300
-
-    # Keep communicate() running for the whole lifetime of the process so
-    # stdout/stderr pipes are drained while we poll for artifact progress.
-    # Waiting on proc.wait() with PIPEs can deadlock when the child produces
-    # more output than the pipe buffer can hold.
-    communicate_task = _asyncio.create_task(proc.communicate())
-    loop = _asyncio.get_running_loop()
-    start_time = loop.time()
-    deadline = start_time + benchmark_timeout
     try:
-        last_file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
-    except OSError:
-        last_file_count = 0
-    last_progress_time = start_time
-    stall_killed = False
-
-    while not communicate_task.done():
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            logger.warning(
-                "[boot-time] Subprocess timed out after %ds, killing",
-                benchmark_timeout,
+        if _ticket:
+            _fields = _ticket.get("custom_fields", {})
+            _metadata = _fields.get(
+                "resource_provider_metadata",
+                {},
             )
-            proc.kill()
-            break
+            _lease_id = _metadata.get("lease_id", "")
+            _directives = _fields.get("directives", {})
+            _passive_serial = _directives.get(
+                "serial_capture",
+                False,
+            )
+            # Don't run passive serial alongside active serial
+            _serial_active = _directives.get(
+                "jumpstarter_serial",
+                False,
+            )
+            if (
+                _lease_id
+                and _fields.get("resource_provider") == "jumpstarter"
+                and _passive_serial
+                and not _serial_active
+            ):
+                try:
+                    serial_log_fh = artifact_filesystem.open_stream(
+                        "serial-capture.log", mode=artifact_file_mode
+                    )
+                    serial_proc = await AuditedSubprocessRunner().start(
+                        [
+                            "jmp",
+                            "shell",
+                            f"--lease={_lease_id}",
+                            "--",
+                            "j",
+                            "serial",
+                            "pipe",
+                        ],
+                        stdout=serial_log_fh,
+                        stderr=_asyncio.subprocess.DEVNULL,
+                        mutating=True,
+                    )
+                    logger.info(
+                        f"[boot-time] Passive serial capture "
+                        f"started (lease={_lease_id}, "
+                        f"pid={serial_proc.pid})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[boot-time] Failed to start passive serial capture: {e}"
+                    )
+                    serial_proc = None
+                    if serial_log_fh:
+                        serial_log_fh.close()
+                        serial_log_fh = None
 
+        # ── Execute ───────────────────────────────────────────
+        # Run from output_dir so boot-timings-test.sh creates
+        # its results folder (and SCPs files) here, not relative
+        # to the scripts repo.
+        # Merge Jumpstarter env vars with current environment
+        run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
+        # Timeout: samples × ~90s per sample + 15min overhead.
+        # Prevents orphaned jmp shell subprocesses from keeping
+        # the pipe open indefinitely (observed: 4hr hang when
+        # capture-boot timed out but jmp shell child lingered).
+        benchmark_timeout = (samples * 90) + 900
+
+        proc = await AuditedSubprocessRunner().start(
+            cmd,
+            cwd=str(output_dir),
+            env=run_env,
+            mutating=True,
+        )
+        _STALL_CHECK_INTERVAL = 60
+        _STALL_TIMEOUT = 300
+
+        # Keep communicate() running for the whole lifetime of the process so
+        # stdout/stderr pipes are drained while we poll for artifact progress.
+        # Waiting on proc.wait() with PIPEs can deadlock when the child produces
+        # more output than the pipe buffer can hold.
+        communicate_task = _asyncio.create_task(proc.communicate())
+        loop = _asyncio.get_running_loop()
+        start_time = loop.time()
+        deadline = start_time + benchmark_timeout
         try:
-            await _asyncio.wait_for(
-                _asyncio.shield(communicate_task),
-                timeout=min(_STALL_CHECK_INTERVAL, remaining),
-            )
-            break
-        except _asyncio.TimeoutError:
-            now = loop.time()
-            try:
-                file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
-            except OSError:
-                file_count = last_file_count
+            last_file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
+        except OSError:
+            last_file_count = 0
+        last_progress_time = start_time
+        stall_killed = False
 
-            if file_count > last_file_count:
-                last_file_count = file_count
-                last_progress_time = now
-            elif now - last_progress_time >= _STALL_TIMEOUT:
+        while not communicate_task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
                 logger.warning(
-                    "[boot-time] No new artifacts for %ds (stall detected at "
-                    "%d files), killing subprocess",
-                    int(now - last_progress_time),
-                    file_count,
+                    "[boot-time] Subprocess timed out after %ds, killing",
+                    benchmark_timeout,
                 )
                 proc.kill()
-                stall_killed = True
                 break
 
-    # The communicate task continues draining output after kill. Bound the
-    # cleanup in case a descendant inherited one of the pipe file descriptors.
-    try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            _asyncio.shield(communicate_task),
-            timeout=10,
-        )
-    except _asyncio.TimeoutError:
-        communicate_task.cancel()
-        try:
-            await communicate_task
-        except _asyncio.CancelledError:
-            pass
-        stdout_bytes, stderr_bytes = b"", b""
-
-    exit_code = proc.returncode or 0
-    stdout_str = stdout_bytes.decode(errors="replace")
-    stderr_str = stderr_bytes.decode(errors="replace")
-    if stall_killed:
-        stderr_str += (
-            "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
-            "minutes (stall detected). This may indicate the board is "
-            "unresponsive after a cold reboot or the serial connection is dead."
-        )
-
-    # ── Parse reboot method from script output ───────
-    reboot_method = ""
-    for line in stdout_str.split("\n"):
-        if line.startswith("Reboot mode:"):
-            reboot_method = line.split(":", 1)[1].strip()
-            break
-
-    # ── Stall diagnostics ─────────────────────────────────
-    # When the stall detector kills the process, capture
-    # board state before reporting failure.
-    stall_diag: dict[str, Any] = {}
-    # Capture diagnostics on any failure, not just stall kills.
-    # The script may exit with code 1 (serial timeout, boot
-    # failure) before the stall detector triggers.
-    # Check for boot sample files (boot_time_logs.json), not
-    # raw file count — serial/metadata files are always present.
-    sample_count = _count_boot_time_samples(output_dir)
-    run_diag = stall_killed or (exit_code != 0 and sample_count == 0)
-    if run_diag and _ssh is not None and sut_host:
-        logger.info("[boot-time] Capturing stall diagnostics for %s", sut_host)
-        try:
-            ping = await _ssh.run(
-                sut_host,
-                "echo ALIVE",
-                timeout=5,
-            )
-            stall_diag["ssh_reachable"] = ping.exit_code == 0 and "ALIVE" in ping.stdout
-        except Exception:
-            stall_diag["ssh_reachable"] = False
-
-        if not stall_diag.get("ssh_reachable"):
-            # Board not reachable via SSH — try ping
             try:
-                ping_proc = await _asyncio.create_subprocess_exec(
-                    "ping",
-                    "-c1",
-                    "-W3",
-                    sut_host,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
+                await _asyncio.wait_for(
+                    _asyncio.shield(communicate_task),
+                    timeout=min(_STALL_CHECK_INTERVAL, remaining),
                 )
-                await ping_proc.wait()
-                stall_diag["pingable"] = ping_proc.returncode == 0
-            except Exception:
-                stall_diag["pingable"] = False
-
-        stall_diag["samples_before_stall"] = sample_count
-        stall_diag["stall_duration_s"] = _STALL_TIMEOUT
-
-        # Analyze serial capture log for diagnostic indicators.
-        # The serial log captures board console output during
-        # the benchmark and can reveal kernel panics, boot
-        # hangs, or U-Boot failures that SSH diagnostics miss.
-        _MAX_SERIAL_READ = 1024 * 1024  # 1MB cap to prevent OOM
-        if serial_log_path.exists() and serial_log_path.stat().st_size > 0:
-            try:
-                file_size = serial_log_path.stat().st_size
-                stall_diag["serial_log_bytes"] = file_size
-                # Read at most the last 1MB to avoid OOM on
-                # runaway serial logs.
-                with open(serial_log_path, "rb") as f:
-                    if file_size > _MAX_SERIAL_READ:
-                        f.seek(-_MAX_SERIAL_READ, 2)
-                    serial_bytes = f.read()
-                serial_text = serial_bytes.decode("utf-8", errors="replace")
-                # Include last 2000 chars for the LLM to analyze
-                stall_diag["serial_tail"] = serial_text[-2000:]
-                # Flag diagnostic indicators — includes both
-                # failure signals and boot milestones so agents
-                # can assess how far the board progressed.
-                _SERIAL_INDICATORS = [
-                    ("kernel panic", "kernel_panic"),
-                    ("unable to mount root", "root_mount_failure"),
-                    ("not syncing", "kernel_not_syncing"),
-                    ("reboot: system halted", "system_halted"),
-                    ("out of memory", "oom"),
-                    ("oom-killer", "oom_killer"),
-                    ("call trace", "call_trace"),
-                    ("u-boot", "uboot_prompt"),
-                    ("autoboot", "uboot_autoboot"),
-                    ("login:", "reached_login"),
-                ]
-                lower_tail = serial_text[-_MAX_SERIAL_READ:].lower()
-                detected = [
-                    label
-                    for pattern, label in _SERIAL_INDICATORS
-                    if pattern in lower_tail
-                ]
-                if detected:
-                    stall_diag["serial_indicators"] = detected
-            except Exception:
-                pass
-
-        # Write diagnostics to artifact file
-        try:
-            import json as _json
-
-            artifact_filesystem.write(
-                "stall-diagnostics.json",
-                _json.dumps(stall_diag, indent=2),
-                mode=artifact_file_mode,
-            )
-            logger.info(
-                "[boot-time] Stall diagnostics: %s",
-                stall_diag,
-            )
-        except Exception:
-            pass
-
-    # ── Stop passive serial capture ─────────────────────────
-    if serial_proc is not None:
-        try:
-            serial_proc.terminate()
-            try:
-                await serial_proc.wait(timeout=10)
+                break
             except _asyncio.TimeoutError:
-                # The tracked wait has already escalated to kill.
+                now = loop.time()
+                try:
+                    file_count = sum(
+                        1 for path in output_dir.rglob("*") if path.is_file()
+                    )
+                except OSError:
+                    file_count = last_file_count
+
+                if file_count > last_file_count:
+                    last_file_count = file_count
+                    last_progress_time = now
+                elif now - last_progress_time >= _STALL_TIMEOUT:
+                    logger.warning(
+                        "[boot-time] No new artifacts for %ds (stall detected at "
+                        "%d files), killing subprocess",
+                        int(now - last_progress_time),
+                        file_count,
+                    )
+                    proc.kill()
+                    stall_killed = True
+                    break
+
+        # The communicate task continues draining output after kill. Bound the
+        # cleanup in case a descendant inherited one of the pipe file descriptors.
+        try:
+            stdout_bytes, stderr_bytes = await _asyncio.wait_for(
+                _asyncio.shield(communicate_task),
+                timeout=10,
+            )
+        except _asyncio.TimeoutError:
+            communicate_task.cancel()
+            try:
+                await communicate_task
+            except _asyncio.CancelledError:
                 pass
-            logger.info("[boot-time] Passive serial capture stopped")
-        except Exception as e:
-            logger.warning(f"[boot-time] Error stopping serial capture: {e}")
-    if serial_log_fh is not None:
-        serial_log_fh.close()
+            stdout_bytes, stderr_bytes = b"", b""
+
+        exit_code = proc.returncode or 0
+        stdout_str = stdout_bytes.decode(errors="replace")
+        stderr_str = stderr_bytes.decode(errors="replace")
+        if stall_killed:
+            stderr_str += (
+                "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
+                "minutes (stall detected). This may indicate the board is "
+                "unresponsive after a cold reboot or the serial connection is dead."
+            )
+
+        # ── Parse reboot method from script output ───────
+        reboot_method = ""
+        for line in stdout_str.split("\n"):
+            if line.startswith("Reboot mode:"):
+                reboot_method = line.split(":", 1)[1].strip()
+                break
+
+        # ── Stall diagnostics ─────────────────────────────────
+        # When the stall detector kills the process, capture
+        # board state before reporting failure.
+        stall_diag: dict[str, Any] = {}
+        # Capture diagnostics on any failure, not just stall kills.
+        # The script may exit with code 1 (serial timeout, boot
+        # failure) before the stall detector triggers.
+        # Check for boot sample files (boot_time_logs.json), not
+        # raw file count — serial/metadata files are always present.
+        sample_count = _count_boot_time_samples(output_dir)
+        run_diag = stall_killed or (exit_code != 0 and sample_count == 0)
+        if run_diag and _ssh is not None and sut_host:
+            logger.info("[boot-time] Capturing stall diagnostics for %s", sut_host)
+            try:
+                ping = await _ssh.run(
+                    sut_host,
+                    "echo ALIVE",
+                    timeout=5,
+                )
+                stall_diag["ssh_reachable"] = (
+                    ping.exit_code == 0 and "ALIVE" in ping.stdout
+                )
+            except Exception:
+                stall_diag["ssh_reachable"] = False
+
+            if not stall_diag.get("ssh_reachable"):
+                # Board not reachable via SSH — try ping
+                try:
+                    ping_proc = await _asyncio.create_subprocess_exec(
+                        "ping",
+                        "-c1",
+                        "-W3",
+                        sut_host,
+                        stdout=_asyncio.subprocess.DEVNULL,
+                        stderr=_asyncio.subprocess.DEVNULL,
+                    )
+                    await ping_proc.wait()
+                    stall_diag["pingable"] = ping_proc.returncode == 0
+                except Exception:
+                    stall_diag["pingable"] = False
+
+            stall_diag["samples_before_stall"] = sample_count
+            stall_diag["stall_duration_s"] = _STALL_TIMEOUT
+
+            # Preserve the raw tail in the artifact/tool response, not service logs.
+            stall_diag.update(_boot_serial_diagnostics(serial_log_path))
+
+            # Write diagnostics to artifact file
+            try:
+                import json as _json
+
+                artifact_filesystem.write(
+                    "stall-diagnostics.json",
+                    _json.dumps(stall_diag, indent=2),
+                    mode=artifact_file_mode,
+                )
+                logger.info(
+                    "[boot-time] Stall diagnostics: %s",
+                    {
+                        key: value
+                        for key, value in stall_diag.items()
+                        if key != "serial_tail"
+                    },
+                )
+            except Exception:
+                pass
+
+    finally:
+        # Stop capture on command-start failures, monitoring errors, and cancellation.
+        try:
+            if serial_proc is not None:
+                try:
+                    if serial_proc.returncode is None:
+                        try:
+                            serial_proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        await serial_proc.wait(timeout=10)
+                    except _asyncio.TimeoutError:
+                        # The tracked wait has already escalated to kill.
+                        pass
+                    logger.info("[boot-time] Passive serial capture stopped")
+                except Exception as exc:
+                    logger.warning("[boot-time] Error stopping serial capture: %s", exc)
+        finally:
+            if serial_log_fh is not None:
+                serial_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
