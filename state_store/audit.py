@@ -39,7 +39,6 @@ class AuditLog:
     ) -> None:
         self._path = path or AUDIT_LOG
         self._redactor = redactor
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._trace_lock = threading.Lock()
         self._trace_store = trace_store or TraceStore(self._path.parent / "trace.db")

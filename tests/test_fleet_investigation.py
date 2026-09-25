@@ -275,3 +275,61 @@ class TestResourceAgentFleetExhaustion:
             )
             assert result == "user reply"
             mock_hitl.assert_called_once()
+class TestSnapshotIterationData:
+    """snapshot_iteration_data captures per-board state (#1035)."""
+
+    def test_captures_benchmark_data(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "run_id": "boot-time-abc123",
+            "benchmark_status": "failed",
+            "samples_collected": 2,
+            "benchmark_kpis": {"avg_boot_s": 12.5},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["run_id"] == "boot-time-abc123"
+        assert snap["benchmark_status"] == "failed"
+        assert snap["samples_collected"] == 2
+        assert snap["benchmark_kpis"]["avg_boot_s"] == 12.5
+
+    def test_captures_platform_data(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "platform_ip": "10.26.29.22",
+            "platform_flash_duration_s": 98.5,
+            "platform_boot_duration_s": 31.2,
+            "platform_serial_log": "/tmp/serial-capture.log",
+            "output_dir": "/tmp/artifacts/run-123",
+            "jumpstarter_flash": {"diagnostics": ["Flash succeeded in 98s"]},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["platform_ip"] == "10.26.29.22"
+        assert snap["flash_duration_s"] == 98.5
+        assert snap["boot_duration_s"] == 31.2
+        assert snap["flash_diagnostics"] == ["Flash succeeded in 98s"]
+        assert snap["serial_log_path"] == "/tmp/serial-capture.log"
+        assert snap["output_dir"] == "/tmp/artifacts/run-123"
+
+    def test_empty_fields_omitted(self):
+        from providers.fleet import snapshot_iteration_data
+
+        snap = snapshot_iteration_data({})
+        assert snap == {}
+
+    def test_build_entry_includes_iteration_data(self):
+        from providers.fleet import build_tested_host_entry
+
+        entry = build_tested_host_entry(
+            host_id="board-01",
+            status="completed",
+            iteration_data={"run_id": "boot-time-xyz"},
+        )
+        assert entry["iteration_data"]["run_id"] == "boot-time-xyz"
+
+    def test_build_entry_omits_iteration_data_when_none(self):
+        from providers.fleet import build_tested_host_entry
+
+        entry = build_tested_host_entry(host_id="board-01")
+        assert "iteration_data" not in entry

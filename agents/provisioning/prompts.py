@@ -146,6 +146,17 @@ The controller remains authoritative for installed-runtime facts.
     b. Apply the tuning with `tune_nic` (queue count, ring buffers,
        offloads), `tune_tcp` (congestion control, qdisc), and `pin_irq`
        (IRQ affinity + irqbalance) as needed — one call per host per tool.
+       When RX flow-steering rules are requested, call
+       `configure_flow_steering` after `tune_nic` and before `pin_irq`. It
+       reads back the active ethtool rule table and checks requested rules,
+       preserved rules, and unexpected rules. Include its full result in
+       `submit_provisioning_result`; if the status is not `ok` or
+       `verification.status` is not `verified`, do not report provisioning as
+       complete. Use `get_flow_steering_rules(targets=[{"host": "<host>", "interface": "<interface>"}])`
+       to inspect the table directly when diagnosing a mismatch or a failed
+       readback. If the NIC cannot return its active rules, request
+       clarification instead of treating successful rule-add responses as
+       verification.
     c. Call `verify_host_tuning` and include its result in your
        `submit_provisioning_result` call. If verification shows the tuning
        did NOT take effect (e.g. IRQ landed on a different CPU than

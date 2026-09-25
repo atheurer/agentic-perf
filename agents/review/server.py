@@ -80,6 +80,8 @@ async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Use generic context primitives for the designated Crucible controller."""
     await _ensure_init()
@@ -103,6 +105,8 @@ async def _get_crucible_benchmark_context_tool(
         query=query,
         benchmark="",
         include_alternates=False,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
     )
 
 
@@ -114,6 +118,8 @@ async def _legacy_get_crucible_benchmark_context(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
@@ -129,6 +135,8 @@ async def _legacy_get_crucible_benchmark_context(
             path=path,
             query=query,
             include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         )
     return await crucible_context_gateway(
         _crucible_context,
@@ -142,6 +150,8 @@ async def _legacy_get_crucible_benchmark_context(
         subject_area=subject_area,
         include_alternates=include_alternates,
         query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
     )
 
 
