@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from .base import (
@@ -81,7 +82,11 @@ class OpenAICompatLLMProvider(LLMProvider):
             )
         # Only direct OpenAI usage can infer Responses API support from the
         # model name. OpenAI-compatible endpoints must opt in explicitly.
-        self._auto_responses_for_gpt6 = api == "chat_completions" and base_url is None
+        self._auto_responses_for_gpt6 = (
+            api == "chat_completions"
+            and base_url is None
+            and not os.environ.get("OPENAI_BASE_URL")
+        )
         self._api = api
 
     async def complete(

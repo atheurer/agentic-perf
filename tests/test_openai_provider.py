@@ -569,7 +569,8 @@ class TestResponsesAPI:
                 )
             )
 
-    def test_gpt6_with_tools_uses_responses_for_direct_openai(self):
+    def test_gpt6_with_tools_uses_responses_for_direct_openai(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         provider, client = self._make_gpt6_provider()
         tools = [ToolDefinition("lookup", "Look up a value", {"type": "object"})]
 
@@ -577,6 +578,18 @@ class TestResponsesAPI:
 
         client.responses.create.assert_called_once()
         client.chat.completions.create.assert_not_called()
+
+    def test_gpt6_tools_with_environment_base_url_stay_on_chat_completions(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://openai-compatible.example/v1")
+        provider, client = self._make_gpt6_provider()
+        tools = [ToolDefinition("lookup", "Look up a value", {"type": "object"})]
+
+        self._complete_inline(provider, tools=tools)
+
+        client.chat.completions.create.assert_called_once()
+        client.responses.create.assert_not_called()
 
     def test_gpt6_without_tools_stays_on_chat_completions(self):
         provider, client = self._make_gpt6_provider()
