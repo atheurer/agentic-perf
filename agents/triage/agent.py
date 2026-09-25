@@ -23,6 +23,21 @@ def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]
     return directives
 
 
+def _filter_direct_required_hosts(
+    required_hosts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove controller roles while retaining other host requirements."""
+    filtered: list[dict[str, Any]] = []
+    for host in required_hosts:
+        roles = host.get("roles", [])
+        remaining_roles = [role for role in roles if role != "controller"]
+        if remaining_roles:
+            filtered_host = dict(host)
+            filtered_host["roles"] = remaining_roles
+            filtered.append(filtered_host)
+    return filtered or [{"roles": ["client"]}]
+
+
 _SCOPED_CONTEXT_CALL_RE = re.compile(
     r'_get_scoped_context\(\s*ticket\s*,\s*["\'](\w+)["\']'
 )
@@ -692,9 +707,6 @@ class TriageAgent(AgentBase):
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
                 directives[key] = cf[key]
-        # Determine harness early for execution model resolution.
-        harness = directives.get("harness", "")
-
         # Code-enforce harness for workflow tickets.
         # When workflow_source is set, the benchmark agent
         # must use MCP workflow tools, not direct plugin
@@ -704,6 +716,9 @@ class TriageAgent(AgentBase):
         # harness provider. Keep this value aligned with the provider catalog
         # and BenchmarkAgent tool-scoping key.
         directives = _canonicalize_workflow_harness(directives)
+        # Resolve after canonicalization, and honor the configured provider
+        # default when triage omitted an explicit harness.
+        harness = self._effective_harness(directives, self._skill_provider)
         # Resolve execution model from the harness metadata.
         # This is a harness-level property declared in BenchmarkSuite,
         # not a per-ticket decision or a hardcoded list.
@@ -719,11 +734,7 @@ class TriageAgent(AgentBase):
         # The LLM often includes a controller role which causes the
         # resource agent to allocate a non-existent controller host.
         if execution_model == EXECUTION_MODEL_DIRECT:
-            required_hosts = [
-                h for h in required_hosts if "controller" not in h.get("roles", [])
-            ]
-            if not required_hosts:
-                required_hosts = [{"roles": ["client"]}]
+            required_hosts = _filter_direct_required_hosts(required_hosts)
 
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),

@@ -538,8 +538,9 @@ class BenchmarkAgent(AgentBase):
         Harnesses listed in _HARNESS_TOOLS get a reduced
         tool set. Unlisted harnesses keep all tools.
         """
-        harness = (
-            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            self._skill_provider,
         )
         excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
         if excluded is not None:
@@ -565,7 +566,7 @@ class BenchmarkAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = directives.get("harness", "")
+        harness = self._effective_harness(directives, self._skill_provider)
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
@@ -579,9 +580,7 @@ class BenchmarkAgent(AgentBase):
         harness_fragment = ""
         prompts_dir = Path(__file__).parent / "prompts"
         # For controller harnesses, also try the harness name
-        harness_file = prompts_dir / f"{harness}.md"
-        if harness_file.exists():
-            harness_fragment = harness_file.read_text().strip()
+        harness_fragment = self._load_prompt_fragment(prompts_dir, harness)
 
         prompt = BENCHMARK_BASE_PROMPT
 

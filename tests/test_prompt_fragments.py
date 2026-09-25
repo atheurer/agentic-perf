@@ -88,6 +88,25 @@ class TestLoadPromptFragments:
         assert "AWS content" in result
         assert "Auto select content" not in result
 
+    def test_rejects_path_traversal_and_absolute_fragment_names(self, tmp_path):
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (tmp_path / "secret.md").write_text("outside prompt content")
+
+        assert AgentBase._load_prompt_fragment(prompts_dir, "../secret") == ""
+        assert AgentBase._load_prompt_fragment(prompts_dir, "/tmp/secret") == ""
+
+    def test_rejects_fragment_symlink_escape(self, tmp_path):
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        outside = tmp_path / "secret.md"
+        outside.write_text("outside prompt content")
+        (prompts_dir / "aws.md").symlink_to(outside)
+
+        assert AgentBase._load_prompt_fragments(
+            tmp_path, resource_provider="aws"
+        ) == ""
+
 
 class TestResourceAgentPromptFragments:
     """Test that the resource agent loads real fragments."""

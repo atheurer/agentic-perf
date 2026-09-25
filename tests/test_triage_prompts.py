@@ -10,6 +10,52 @@ def test_workflow_directive_uses_canonical_arcaflow_harness():
     assert _canonicalize_workflow_harness(directives)["harness"] == "arcaflow-plugins"
 
 
+def test_workflow_harness_canonicalization_precedes_default_resolution():
+    from types import SimpleNamespace
+
+    from agents.base import AgentBase
+    from agents.triage.agent import _canonicalize_workflow_harness
+
+    directives = {"workflow_source": "https://example.test/workflow.yaml"}
+    directives = _canonicalize_workflow_harness(directives)
+    assert AgentBase._effective_harness(
+        directives, SimpleNamespace(default_harness="crucible")
+    ) == "arcaflow-plugins"
+
+
+def test_direct_harness_filter_preserves_mixed_host_roles_and_specs():
+    from agents.triage.agent import _filter_direct_required_hosts
+
+    required_hosts = [
+        {
+            "roles": ["controller", "client"],
+            "min_memory_gb": 128,
+            "nic_speed": 100,
+            "host": "sut.example.test",
+        },
+        {"roles": ["controller"], "host": "controller.example.test"},
+        {"roles": ["server"], "min_cores": 32},
+    ]
+
+    assert _filter_direct_required_hosts(required_hosts) == [
+        {
+            "roles": ["client"],
+            "min_memory_gb": 128,
+            "nic_speed": 100,
+            "host": "sut.example.test",
+        },
+        {"roles": ["server"], "min_cores": 32},
+    ]
+
+
+def test_direct_harness_filter_falls_back_when_all_hosts_are_controllers():
+    from agents.triage.agent import _filter_direct_required_hosts
+
+    assert _filter_direct_required_hosts([{"roles": ["controller"]}]) == [
+        {"roles": ["client"]}
+    ]
+
+
 def _resource_section(prompt: str) -> str:
     """Extract the resource bullet block from the scoped_context section."""
     lines = prompt.splitlines()

@@ -486,7 +486,7 @@ class ProvisioningAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = directives.get("harness", "")
+        harness = self._effective_harness(directives, self._skill_provider)
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
@@ -496,9 +496,9 @@ class ProvisioningAgent(AgentBase):
 
         # Load harness-specific provisioning fragment.
         harness_fragment = ""
-        harness_file = Path(__file__).parent / "prompts" / f"{harness}.md"
-        if harness_file.exists():
-            harness_fragment = harness_file.read_text().strip()
+        harness_fragment = self._load_prompt_fragment(
+            Path(__file__).parent / "prompts", harness
+        )
 
         prompt = PROVISIONING_BASE_PROMPT
         if harness_fragment:
