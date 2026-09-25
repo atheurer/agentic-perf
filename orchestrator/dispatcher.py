@@ -656,6 +656,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
+                skill_provider=self.skills,
             )
         elif agent_type == "provisioning":
             agent = ProvisioningAgent(

@@ -28,9 +28,8 @@ Use batch and discovery tools to minimize iterations:
 ## Reading Harness Documentation
 
 Read harness-specific documentation using the tools available for your
-harness. Use `list_harness_docs` and `read_harness_doc` to understand
-the execution requirements. Skill files in the workspace provide
-harness-specific guidance.
+harness to understand the execution requirements. Skill files in the
+workspace provide harness-specific guidance.
 
 ## General Execution Process
 

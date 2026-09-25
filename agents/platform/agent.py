@@ -38,8 +38,10 @@ class PlatformAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         event_bus: EventBus | None = None,
+        skill_provider=None,
         **kwargs: Any,
     ) -> None:
+        self._skill_provider = skill_provider
         super().__init__(
             agent_name="platform-agent",
             llm_provider=llm_provider,
@@ -200,10 +202,17 @@ class PlatformAgent(AgentBase):
                 ticket = {}
                 provider = ""
             if provider == "jumpstarter":
+                cf = ticket.get("custom_fields", {})
+                if "execution_model" in cf:
+                    execution_model = cf["execution_model"]
+                else:
+                    from providers.skills.catalog import resolve_ticket_execution_model
+
+                    execution_model = await resolve_ticket_execution_model(
+                        self._skill_provider, ticket
+                    )
                 from providers.skills.base import EXECUTION_MODEL_DIRECT
 
-                cf = ticket.get("custom_fields", {})
-                execution_model = cf.get("execution_model", "")
                 if execution_model == EXECUTION_MODEL_DIRECT:
                     # Direct harnesses: all discovered IPs are
                     # targets.  The orchestrator runs tools —

@@ -149,3 +149,25 @@ async def resolve_execution_model(
             )
 
     return EXECUTION_MODEL_CONTROLLER
+
+
+async def resolve_ticket_execution_model(provider: Any, ticket: dict[str, Any]) -> str:
+    """Resolve execution_model for current and pre-metadata tickets.
+
+    A stored execution_model is authoritative when present. Older tickets do
+    not have that field, so resolve the model from their canonical harness and
+    benchmark metadata instead of guessing from the resource provider.
+    """
+    custom_fields = ticket.get("custom_fields", {})
+    if "execution_model" in custom_fields:
+        return custom_fields["execution_model"]
+
+    directives = custom_fields.get("directives", {})
+    harness = directives.get("harness", "")
+    if directives.get("workflow_source"):
+        harness = "arcaflow-plugins"
+    elif not harness:
+        harness = getattr(provider, "default_harness", "")
+    return await resolve_execution_model(
+        provider, harness, custom_fields.get("benchmark_suite", "")
+    )

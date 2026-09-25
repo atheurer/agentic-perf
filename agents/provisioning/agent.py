@@ -486,7 +486,9 @@ class ProvisioningAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = self._effective_harness(directives, self._skill_provider)
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,

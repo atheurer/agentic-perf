@@ -1658,6 +1658,8 @@ class AgentBase(ABC):
         directives: dict[str, Any], skill_provider: Any = None
     ) -> str:
         """Return the selected harness or the provider's configured default."""
+        if directives.get("workflow_source"):
+            return "arcaflow-plugins"
         explicit = directives.get("harness")
         if isinstance(explicit, str) and explicit:
             return explicit

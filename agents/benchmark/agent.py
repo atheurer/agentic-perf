@@ -11,7 +11,7 @@ from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
-from providers.skills.base import EXECUTION_MODEL_DIRECT
+from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
 
@@ -154,6 +154,7 @@ class BenchmarkAgent(AgentBase):
         self._active_validation_id: str | None = None
         self._active_approval_request_id: str | None = None
         self._active_approval: dict[str, Any] | None = None
+        self._resolved_execution_models: dict[str, str] = {}
 
         local_tools = list(_LOCAL_TOOLS)
 
@@ -443,6 +444,7 @@ class BenchmarkAgent(AgentBase):
 
         try:
             ticket = await self._get_ticket(ticket_id)
+            await self._prepare_legacy_execution_model(ticket)
 
             # Scope tools to the harness. Standalone
             # harnesses need only a few tools — hiding
@@ -540,7 +542,7 @@ class BenchmarkAgent(AgentBase):
         """
         harness = self._effective_harness(
             ticket.get("custom_fields", {}).get("directives", {}),
-            self._skill_provider,
+            getattr(self, "_skill_provider", None),
         )
         excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
         if excluded is not None:
@@ -561,12 +563,39 @@ class BenchmarkAgent(AgentBase):
                 }
             self.tools = [t for t in self.tools if t.name in allowed]
 
+    def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
+        cf = ticket.get("custom_fields", {})
+        if "execution_model" in cf:
+            return cf["execution_model"]
+        return getattr(self, "_resolved_execution_models", {}).get(
+            str(ticket.get("id", "")), EXECUTION_MODEL_CONTROLLER
+        )
+
+    async def _prepare_legacy_execution_model(self, ticket: dict[str, Any]) -> str:
+        """Resolve the model for old tickets before prompt construction."""
+        cf = ticket.get("custom_fields", {})
+        if "execution_model" in cf:
+            return cf["execution_model"]
+        from providers.skills.catalog import resolve_ticket_execution_model
+
+        execution_model = await resolve_ticket_execution_model(
+            getattr(self, "_skill_provider", None), ticket
+        )
+        ticket_id = str(ticket.get("id", ""))
+        if ticket_id:
+            if not hasattr(self, "_resolved_execution_models"):
+                self._resolved_execution_models = {}
+            self._resolved_execution_models[ticket_id] = execution_model
+        return execution_model
+
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = self._effective_harness(directives, self._skill_provider)
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
@@ -584,7 +613,7 @@ class BenchmarkAgent(AgentBase):
 
         prompt = BENCHMARK_BASE_PROMPT
 
-        if cf.get("execution_model") == EXECUTION_MODEL_DIRECT:
+        if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
             prompt += (
                 "\n\n## Direct Execution Model\n\n"
                 "This benchmark uses the **direct** execution model. "
@@ -674,7 +703,7 @@ class BenchmarkAgent(AgentBase):
             content += f"\n**Absent Suite:** {cf['absent_suite']} (no standard automation available)\n"
         if cf.get("hypothesis"):
             content += f"\n**Hypothesis:** {cf['hypothesis']}\n"
-        is_direct = cf.get("execution_model") == EXECUTION_MODEL_DIRECT
+        is_direct = self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT
         if is_direct:
             # Show full assigned_hardware_ips so fragments
             # can reference targets[0] by path.  Also show
