@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from .base import (
@@ -40,6 +41,18 @@ class OpenAICompatLLMProvider(LLMProvider):
         """
         normalized = model.lower()
         return normalized.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
+
+    @staticmethod
+    def _requires_responses_api(model: str) -> bool:
+        """Return whether a model needs the Responses API for tool use.
+
+        GPT-6 models reject reasoning_effort + function tools on the
+        chat completions API.  The Responses API supports both, so
+        auto-upgrade these models rather than silently dropping the
+        user's reasoning_effort configuration.
+        """
+        normalized = model.lower()
+        return normalized.startswith("gpt-6")
 
     def __init__(
         self,
@@ -67,6 +80,13 @@ class OpenAICompatLLMProvider(LLMProvider):
             raise ValueError(
                 f"OpenAI API must be 'chat_completions' or 'responses', got {api!r}"
             )
+        # Only direct OpenAI usage can infer Responses API support from the
+        # model name. OpenAI-compatible endpoints must opt in explicitly.
+        self._auto_responses_for_gpt6 = (
+            api == "chat_completions"
+            and base_url is None
+            and not os.environ.get("OPENAI_BASE_URL")
+        )
         self._api = api
 
     async def complete(
@@ -77,7 +97,20 @@ class OpenAICompatLLMProvider(LLMProvider):
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> LLMResponse:
-        if getattr(self, "_api", "chat_completions") == "responses":
+        use_responses_api = getattr(self, "_api", "chat_completions") == "responses"
+        if (
+            not use_responses_api
+            and getattr(self, "_auto_responses_for_gpt6", False)
+            and tools
+            and self._requires_responses_api(self._model)
+        ):
+            logger.info(
+                "Auto-upgrading %s to Responses API for tool use",
+                self._model,
+            )
+            use_responses_api = True
+
+        if use_responses_api:
             return await self._complete_responses(
                 system_prompt, messages, tools, max_tokens, timeout
             )
