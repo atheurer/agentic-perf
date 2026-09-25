@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 class OpenAICompatLLMProvider(LLMProvider):
     @staticmethod
-    @staticmethod
     def _uses_max_completion_tokens(model: str) -> bool:
         """Return whether a model uses the newer completion-token parameter.
 
@@ -84,9 +83,7 @@ class OpenAICompatLLMProvider(LLMProvider):
         # (e.g., GPT-6 rejects reasoning_effort + tools on chat
         # completions).  Log so the operator knows.
         if api == "chat_completions" and self._requires_responses_api(model):
-            import logging
-
-            logging.getLogger(__name__).info(
+            logger.info(
                 "Auto-upgrading %s to Responses API "
                 "(chat completions rejects reasoning_effort + tools)",
                 model,
