@@ -45,9 +45,6 @@ BACKEND_REGISTRY: dict[str, dict[str, str]] = {
     "file": {
         "class": ("providers.investigation.file.FileRecordProvider"),
     },
-    "horreum": {
-        "class": ("providers.investigation.horreum.HorreumRecordProvider"),
-    },
 }
 
 

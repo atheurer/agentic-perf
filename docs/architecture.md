@@ -901,17 +901,14 @@ disabled for instances with internal CA certificates.
 ```json
 {
     "investigation_records": {
-        "backend": "horreum",
-        "url": "https://horreum.example.com",
-        "token": "HUSR_...",
-        "tls_verify": false,
-        "test_id": 426
+        "backend": "file",
+        "persist_dir": "/data/agentic-perf/investigation-records"
     }
 }
 ```
 
-The `test_id` is optional — if omitted, the provider searches for
-the test by name and creates it if missing.
+The file backend is the default and stores records as JSON files in
+the configured directory.
 
 #### Composite backend (multi-read)
 
@@ -920,7 +917,7 @@ across multiple backends concurrently. Results are deduplicated by
 `investigation_id` — the writer's copy takes precedence.
 
 Use cases:
-- **Migration**: old records in files, new records in the primary store
+- **Migration**: old records in files, new records in primary store
 - **Federated dedup**: check multiple teams' record stores before
   starting an investigation
 - **Local cache**: write to primary, read from local mirror too
@@ -929,9 +926,9 @@ Use cases:
 {
     "investigation_records": {
         "backend": "composite",
-        "writer": {"backend": "horreum", "url": "..."},
+        "writer": {"backend": "file", "persist_dir": "/new/records"},
         "readers": [
-            {"backend": "horreum", "url": "..."},
+            {"backend": "file", "persist_dir": "/new/records"},
             {"backend": "file", "persist_dir": "/old/records"}
         ]
     }

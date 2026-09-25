@@ -65,10 +65,8 @@ the `investigation_records` config:
 ```json
 {
     "investigation_records": {
-        "backend": "horreum",
-        "url": "https://horreum.example.com",
-        "secret": "horreum/api-key",
-        "test_id": 426
+        "backend": "file",
+        "persist_dir": "/data/agentic-perf/investigation-records"
     }
 }
 ```

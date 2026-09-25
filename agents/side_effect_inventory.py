@@ -247,8 +247,6 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/image_build/caib.py", "resolve_target", "image"),
     ("providers/investigation/file.py", "__init__", "filesystem"),
     ("providers/investigation/file.py", "_path", "filesystem"),
-    ("providers/investigation/horreum.py", "_update_run", "mutating_http_state"),
-    ("providers/investigation/horreum.py", "create", "mutating_http_state"),
     ("providers/investigation/registry.py", "_load_config", "filesystem"),
     ("providers/quads.py", "_login", "mutating_http_state"),
     ("providers/quota.py", "__init__", "filesystem"),
@@ -1924,18 +1922,6 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/investigation/file.py:_path",
-        "2027-12-31",
-    ),
-    ("providers/investigation/horreum.py", "_update_run", "mutating_http_state"): (
-        "audited",
-        "observability-maintainers",
-        "providers/investigation/horreum.py:_update_run",
-        "2027-12-31",
-    ),
-    ("providers/investigation/horreum.py", "create", "mutating_http_state"): (
-        "audited",
-        "observability-maintainers",
-        "providers/investigation/horreum.py:create",
         "2027-12-31",
     ),
     ("providers/investigation/registry.py", "_load_config", "filesystem"): (

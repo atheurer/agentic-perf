@@ -135,15 +135,6 @@ stringData:
 ### Horreum API Key (for investigation records)
 
 ```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agentic-perf-horreum
-type: Opaque
-stringData:
-  api-key: <HUSR_...>
-```
-
 ### Webhook Service Account Token
 
 Webhook service account tokens are stored in the state store's
@@ -178,11 +169,7 @@ data:
         "enabled": true
       },
       "investigation_records": {
-        "backend": "horreum",
-        "url": "https://horreum.example.com",
-        "secret": "horreum/api-key",
-        "test_id": 426,
-        "tls_verify": false
+        "backend": "file"
       },
       "external_mcp_servers": [
         {
@@ -260,10 +247,6 @@ spec:
               mkdir -p /data/agentic-perf/secrets/domain-mcp
               cp /ext-secrets/domain-mcp/token /data/agentic-perf/secrets/domain-mcp/token
 
-              # Horreum API key
-              mkdir -p /data/agentic-perf/secrets/horreum
-              cp /ext-secrets/horreum/api-key /data/agentic-perf/secrets/horreum/api-key
-
               # Jumpstarter client config
               mkdir -p /opt/app-root/src/.config/jumpstarter/clients
               cp /ext-secrets/jumpstarter/perf-ci.yaml /opt/app-root/src/.config/jumpstarter/clients/perf-ci.yaml
@@ -282,10 +265,6 @@ spec:
               readOnly: true
             - name: jumpstarter-client
               mountPath: /ext-secrets/jumpstarter
-              readOnly: true
-            - name: horreum-api-key
-              mountPath: /ext-secrets/horreum/api-key
-              subPath: api-key
               readOnly: true
       containers:
         - name: agentic-perf
@@ -348,9 +327,6 @@ spec:
         - name: gcp-adc
           secret:
             secretName: agentic-perf-gcp-adc
-        - name: horreum-api-key
-          secret:
-            secretName: agentic-perf-horreum
 ```
 
 ## Service and Route
@@ -523,7 +499,6 @@ All persistent data lives on the PVC at
 | `investigation-records/` | Local investigation records (if using file backend) |
 | `secrets/api-token` | Auto-generated deployment token |
 | `secrets/domain-mcp/token` | Domain MCP auth token |
-| `secrets/horreum/api-key` | Horreum API key |
 | `users.json` | User accounts and token hashes |
 | `artifacts/<ticket>/<run>/` | Persistent benchmark artifacts |
 | `tickets/<ticket>/workspace/` | Workspace files and generated charts |
