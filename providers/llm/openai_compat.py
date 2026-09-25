@@ -39,7 +39,7 @@ class OpenAICompatLLMProvider(LLMProvider):
         endpoints such as vLLM and Ollama.
         """
         normalized = model.lower()
-        return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+        return normalized.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
 
     def __init__(
         self,
