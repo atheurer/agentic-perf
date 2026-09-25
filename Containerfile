@@ -63,7 +63,7 @@ RUN pip install --no-warn-script-location \
 # Install the application
 COPY . .
 RUN pip install --no-warn-script-location \
-    -e ".[vertex,telemetry]" \
+    -e ".[vertex,telemetry,openai]" \
     --no-deps
 
 # ── Runtime stage ────────────────────────────────
