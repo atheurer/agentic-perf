@@ -234,13 +234,13 @@ When `workflow_source` is set, triage automatically sets `harness: "arcaflow-plu
 
 | Directive | Description | Examples |
 |---|---|---|
-| `serial_capture` | Capture serial output during provisioning and benchmark. During provisioning, serial output is saved to `platform-provision/serial-capture.log` in the ticket's artifact directory. On provisioning failure, the last 2000 characters are included in diagnostics. During benchmarks, enables passive serial capture alongside SSH-based reboots. | `true`, `false` |
+| `serial_capture` | Capture serial output during provisioning and benchmark. Provisioning capture is opt-in; when enabled, output is saved to `platform-provision/serial-capture.log` in the ticket's artifact directory, and the last 2000 characters are included in provisioning-failure diagnostics. During boot-time benchmarks on Jumpstarter boards, passive capture alongside SSH-based reboots defaults on; set this to `false` to disable it. | `true`, `false` |
 
 ### Boot-Time Specific
 
 | Directive | Description | Examples |
 |---|---|---|
-| `jumpstarter_serial` | Enable *active* serial capture during boot-time measurement (replaces SSH-based reboot with serial-based). Mutually exclusive with passive `serial_capture` during benchmark. | `true`, `false` |
+| `jumpstarter_serial` | Enable *active* serial capture during boot-time measurement (replaces SSH-based reboot with serial-based). Active capture suppresses passive `serial_capture` during the benchmark. | `true`, `false` |
 | `ssh_password` | Override default SSH password | `password` |
 | `system_config` | Post-flash system configuration operations | See below |
 

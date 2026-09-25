@@ -211,11 +211,14 @@ harness falls back to Jumpstarter power cycling automatically.
 
 ### Passive serial capture
 
-Set `serial_capture: true` in directives to capture serial
-output in the background during SSH-based reboots. This runs
-`j serial pipe` alongside the benchmark without changing the
-reboot method. The serial log is saved as `serial-capture.log`
-in the output directory.
+On Jumpstarter boards, passive serial capture is enabled by
+default during SSH-based reboots. Set `serial_capture: false`
+to disable it, or `serial_capture: true` to enable it explicitly.
+This runs `j serial pipe` alongside the benchmark without
+changing the reboot method. The serial log is saved as
+`serial-capture.log` in the output directory. Active
+`jumpstarter_serial` capture takes precedence and suppresses
+passive capture.
 
 Use this when you need firmware/watchdog/kernel messages that
 aren't available via SSH or journal — for example, to
