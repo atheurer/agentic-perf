@@ -520,7 +520,7 @@ class TestPlatformIPScoping:
             fields = mock_fields.call_args[0][1]
             assert fields["assigned_hardware_ips"] == {
                 "controller": "10.0.0.1",
-                "targets": ["10.0.0.2"],
+                "targets": ["10.0.0.1", "10.0.0.2"],
             }
 
     @pytest.mark.asyncio

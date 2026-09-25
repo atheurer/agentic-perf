@@ -199,9 +199,15 @@ class PlatformAgent(AgentBase):
             except Exception:
                 provider = ""
             if provider == "jumpstarter":
+                # For Jumpstarter, the discovered IP is the
+                # board itself (the SUT).  There is no separate
+                # controller host — the Jumpstarter controller
+                # is a service, not a physical machine.  Put
+                # the IP in targets so the benchmark agent can
+                # find it as the SUT.
                 fields["assigned_hardware_ips"] = {
                     "controller": hosts[0],
-                    "targets": [h for h in hosts[1:] if h != hosts[0]],
+                    "targets": hosts,
                 }
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
