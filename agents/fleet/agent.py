@@ -244,6 +244,26 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (benchmark failure).",
             )
+        elif not benchmark_status:
+            # Benchmark never ran — agent escalated to HITL or
+            # was stopped before executing.  Record as partial
+            # so synthesis knows no data was collected (#1069).
+            diag = self._get_latest_diagnostic(ticket)
+            await record_host_result(
+                self._update_fields,
+                ticket_id,
+                cf,
+                host_id=board,
+                lease_id=lease_id,
+                ip=ip,
+                status="partial",
+                failure_reason=(diag[:500] if diag else "benchmark did not execute"),
+                iteration_data=iter_data,
+            )
+            await self._add_comment(
+                ticket_id,
+                f"Fleet: recorded {board} as partial (benchmark did not execute).",
+            )
         else:
             # Benchmark succeeded — record completed.
             await record_host_result(
