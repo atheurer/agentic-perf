@@ -17,7 +17,7 @@ from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
-from providers.execution import AuditedAsyncHTTPClient
+from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
@@ -2549,6 +2549,14 @@ def main():
         asyncio.run(poll_loop(config))
     except KeyboardInterrupt:
         logger.info("Orchestrator stopped")
+    finally:
+        try:
+            AuditedSubprocessRunner.reset_default_recorder()
+        except Exception:
+            logger.warning(
+                "Failed to close the default subprocess trace recorder",
+                exc_info=True,
+            )
 
 
 if __name__ == "__main__":

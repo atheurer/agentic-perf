@@ -8,7 +8,12 @@ import sys
 import pytest
 
 from providers.execution.subprocess import AuditedSubprocessRunner
-from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
+from providers.tracing import (
+    LifecycleState,
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 from providers.tracing.client import TraceDeliveryError
 
 
@@ -161,6 +166,63 @@ async def test_mutating_spawn_requires_critical_recorder() -> None:
             )
     finally:
         reset_trace_context(token)
+
+
+async def test_default_recorder_is_shared_and_reset_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from providers.execution import subprocess as subprocess_module
+
+    AuditedSubprocessRunner.reset_default_recorder()
+
+    instances = []
+
+    class FakeTraceClient:
+        def __init__(self, url: str, token: str) -> None:
+            self.url = url
+            self.token = token
+            self.closed = False
+            instances.append(self)
+
+        def record(self, _event) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setenv("STATE_STORE_URL", "http://state-store.invalid")
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setattr(subprocess_module, "TraceClient", FakeTraceClient)
+
+    first = AuditedSubprocessRunner()
+    second = AuditedSubprocessRunner()
+    event = first._event(
+        LifecycleState.REQUESTED,
+        ["demo"],
+        context=new_trace_context(ticket_id="PERF-1"),
+    )
+    assert event is not None
+
+    try:
+        await first._record(event)
+        await second._record(event)
+
+        assert len(instances) == 1
+        assert first._recorder is instances[0]
+        assert second._recorder is instances[0]
+        assert AuditedSubprocessRunner._default_recorder is instances[0]
+
+        AuditedSubprocessRunner.reset_default_recorder()
+        assert instances[0].closed
+        assert AuditedSubprocessRunner._default_recorder is None
+
+        third = AuditedSubprocessRunner()
+        await third._record(event)
+        assert len(instances) == 2
+        assert third._recorder is instances[1]
+        assert instances[1] is not instances[0]
+    finally:
+        AuditedSubprocessRunner.reset_default_recorder()
 
 
 async def test_mutating_spawn_without_context_fails_before_launch(
