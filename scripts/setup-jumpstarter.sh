@@ -43,7 +43,11 @@ echo "  System dependencies OK"
 
 # 1. Install project with all optional deps
 echo "Installing project dependencies..."
-pip install -e "${PROJECT_DIR}[dev,vertex,telemetry]" --quiet 2>&1 | tail -3
+# Install core deps first (must succeed), then telemetry
+# separately (best-effort — must not block Jumpstarter install).
+pip install -e "${PROJECT_DIR}[dev,vertex]" --quiet 2>&1 | tail -3
+pip install -e "${PROJECT_DIR}[telemetry]" --quiet 2>&1 | tail -3 || \
+    echo "  WARNING: telemetry extras failed (non-fatal)"
 
 # 2. Install Jumpstarter from the pinned stable GitHub release.
 echo "Installing Jumpstarter from stable GitHub release..."
