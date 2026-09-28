@@ -251,10 +251,11 @@ class AuditedSubprocessRunner:
                     os.environ.get("AGENTIC_PERF_API_TOKEN"),
                 )
                 if url and token:
-                    with self._default_recorder_lock:
-                        if self._default_recorder is None:
-                            self._default_recorder = TraceClient(url, token)
-                        self._recorder = self._default_recorder
+                    runner_type = type(self)
+                    with runner_type._default_recorder_lock:
+                        if runner_type._default_recorder is None:
+                            runner_type._default_recorder = TraceClient(url, token)
+                        self._recorder = runner_type._default_recorder
             if self._recorder is None and critical:
                 raise TraceDeliveryError(
                     "mutating subprocess requires central trace readiness"
