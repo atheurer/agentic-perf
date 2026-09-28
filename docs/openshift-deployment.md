@@ -292,18 +292,39 @@ spec:
               mountPath: /data/gcp/adc.json
               subPath: adc.json
               readOnly: true
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8090
+            # Allow up to 180s for the state store to load
+            # tickets from disk.  Deployments with 200+ tickets
+            # may need 30-60s.  The startup probe runs before
+            # the liveness probe activates.
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: 8090
-            initialDelaySeconds: 15
+            initialDelaySeconds: 60
+            timeoutSeconds: 10
             periodSeconds: 30
+            failureThreshold: 5
           resources:
             requests:
-              memory: 512Mi
+              memory: 1Gi
               cpu: 500m
             limits:
-              memory: 2Gi
+              # 4Gi recommended for deployments with 200+ tickets.
+              # The state store keeps active tickets in memory and
+              # loads closed tickets on demand.  Concurrent agent
+              # dispatch (up to max_concurrent_agents=8), MCP
+              # servers, and trace processing all contribute to
+              # memory usage.  Deployments with fewer than 100
+              # tickets can use 2Gi.
+              memory: 4Gi
               cpu: "2"
       volumes:
         - name: data
