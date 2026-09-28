@@ -474,9 +474,16 @@ class TicketStore:
     def list_tickets(self, status: TicketStatus | None = None) -> list[Ticket]:
         with self._lock:
             tickets = list(self._tickets.values())
-            # Load deferred tickets if the caller wants all tickets
-            # or specifically requests a terminal status.
-            if self._deferred_paths and (status is None or status in TERMINAL_STATUSES):
+            # Only load deferred tickets when explicitly requesting
+            # a terminal status.  The default (status=None) returns
+            # only in-memory tickets — this keeps the dashboard
+            # polling loop (every 5s) from mass-loading all closed
+            # tickets.
+            if (
+                self._deferred_paths
+                and status is not None
+                and status in TERMINAL_STATUSES
+            ):
                 for tid in list(self._deferred_paths):
                     t = self._load_deferred(tid)
                     if t is not None:
@@ -1976,6 +1983,11 @@ class TicketStore:
                 if self._is_terminal_json(raw, terminal_values):
                     self._deferred_paths[ticket_id] = path
                     deferred += 1
+                    # Track transition_seq without full parsing
+                    # so _global_seq stays correct for new tickets.
+                    seq = self._extract_transition_seq(raw)
+                    if seq > self._global_seq:
+                        self._global_seq = seq
                     continue
                 ticket = Ticket.model_validate_json(raw)
                 if "benchmark_validations" not in ticket.custom_fields and isinstance(
@@ -1997,6 +2009,19 @@ class TicketStore:
             loaded,
             deferred,
         )
+
+    @staticmethod
+    def _extract_transition_seq(raw: str) -> int:
+        """Extract transition_seq from ticket JSON without full parsing.
+
+        Scans for the field in the first 1000 chars (it's a top-level
+        integer near the ticket metadata).
+        """
+        import re
+
+        head = raw[:1000]
+        match = re.search(r'"transition_seq"\s*:\s*(\d+)', head)
+        return int(match.group(1)) if match else 0
 
     @staticmethod
     def _is_terminal_json(raw: str, terminal_values: set[str]) -> bool:
