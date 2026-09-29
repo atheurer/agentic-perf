@@ -474,16 +474,11 @@ class TicketStore:
     def list_tickets(self, status: TicketStatus | None = None) -> list[Ticket]:
         with self._lock:
             tickets = list(self._tickets.values())
-            # Only load deferred tickets when explicitly requesting
-            # a terminal status.  The default (status=None) returns
-            # only in-memory tickets — this keeps the dashboard
-            # polling loop (every 5s) from mass-loading all closed
-            # tickets.
-            if (
-                self._deferred_paths
-                and status is not None
-                and status in TERMINAL_STATUSES
-            ):
+            # Load deferred tickets when the caller needs them.
+            # For status=None (dashboard list view) or terminal
+            # status filters, load all deferred tickets so the
+            # dashboard shows the complete ticket list.
+            if self._deferred_paths and (status is None or status in TERMINAL_STATUSES):
                 for tid in list(self._deferred_paths):
                     t = self._load_deferred(tid)
                     if t is not None:
