@@ -97,6 +97,7 @@ class TicketStore:
         # Deferred ticket paths: closed tickets not yet loaded
         # into memory.  Loaded on demand by get_ticket().
         self._deferred_paths: dict[str, Path] = {}
+        self._deferred_transition_seqs: dict[str, int] = {}
         self._lock = threading.Lock()
         self._global_seq = 0
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
@@ -498,6 +499,8 @@ class TicketStore:
         """Drop a closed-ticket snapshot when late usage arrives."""
         with self._lock:
             ticket = self._tickets.get(ticket_id)
+            if ticket is None and ticket_id in self._deferred_paths:
+                ticket = self._load_deferred(ticket_id)
             if ticket is None or "_usage_summary" not in ticket.custom_fields:
                 return
             ticket.custom_fields.pop("_usage_summary", None)
@@ -1466,11 +1469,21 @@ class TicketStore:
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
         with self._lock:
-            return [
+            tickets = [
                 t.model_copy()
                 for t in self._tickets.values()
                 if t.transition_seq > since_seq
             ]
+            deferred_ids = [
+                ticket_id
+                for ticket_id, seq in self._deferred_transition_seqs.items()
+                if seq > since_seq
+            ]
+            for ticket_id in deferred_ids:
+                ticket = self._load_deferred(ticket_id)
+                if ticket is not None and ticket.transition_seq > since_seq:
+                    tickets.append(ticket.model_copy())
+            return tickets
 
     def claim_ticket(
         self,
@@ -1951,6 +1964,7 @@ class TicketStore:
         in _deferred_paths but not in _tickets.
         """
         path = self._deferred_paths.pop(ticket_id, None)
+        self._deferred_transition_seqs.pop(ticket_id, None)
         if path is None or not path.exists():
             return None
         try:
@@ -1975,12 +1989,13 @@ class TicketStore:
                 # Defer terminal tickets to avoid expensive
                 # model_validate_json on startup.
                 ticket_id = path.stem
-                if self._is_terminal_json(raw, terminal_values):
+                status, seq = self._extract_ticket_metadata(raw)
+                if status in terminal_values:
                     self._deferred_paths[ticket_id] = path
+                    self._deferred_transition_seqs[ticket_id] = seq
                     deferred += 1
-                    # Track transition_seq without full parsing
+                    # Track transition_seq without validating the full model
                     # so _global_seq stays correct for new tickets.
-                    seq = self._extract_transition_seq(raw)
                     if seq > self._global_seq:
                         self._global_seq = seq
                     continue
@@ -2006,28 +2021,115 @@ class TicketStore:
         )
 
     @staticmethod
-    def _extract_transition_seq(raw: str) -> int:
-        """Extract transition_seq from ticket JSON without full parsing.
+    def _extract_ticket_metadata(raw: str) -> tuple[str | None, int]:
+        """Read root status and transition sequence without building a model.
 
-        Scans for the field in the first 1000 chars (it's a top-level
-        integer near the ticket metadata).
+        Ticket files can contain very large nested custom fields, so this
+        walks JSON syntax while decoding only the two scalar fields needed at
+        startup. Root-level lookup avoids matching similarly named nested
+        fields, and it does not depend on serialized field order.
         """
-        import re
+        decoder = json.JSONDecoder()
+        length = len(raw)
 
-        head = raw[:1000]
-        match = re.search(r'"transition_seq"\s*:\s*(\d+)', head)
-        return int(match.group(1)) if match else 0
+        def skip_whitespace(index: int) -> int:
+            while index < length and raw[index] in " \t\r\n":
+                index += 1
+            return index
+
+        def string_end(index: int) -> int:
+            if index >= length or raw[index] != '"':
+                raise ValueError("expected JSON string")
+            index += 1
+            while index < length:
+                char = raw[index]
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == '"':
+                    return index + 1
+                index += 1
+            raise ValueError("unterminated JSON string")
+
+        def value_end(index: int) -> int:
+            index = skip_whitespace(index)
+            if index >= length:
+                raise ValueError("missing JSON value")
+            if raw[index] == '"':
+                return string_end(index)
+            if raw[index] not in "[{":
+                while index < length and raw[index] not in ",]} \t\r\n":
+                    index += 1
+                return index
+
+            stack = [raw[index]]
+            index += 1
+            in_string = False
+            escaped = False
+            while index < length and stack:
+                char = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                elif char == '"':
+                    in_string = True
+                elif char in "[{":
+                    stack.append(char)
+                elif char in "]}":
+                    opening = stack.pop()
+                    if (opening, char) not in (("[", "]"), ("{", "}")):
+                        raise ValueError("mismatched JSON container")
+                index += 1
+            if stack or in_string:
+                raise ValueError("unterminated JSON value")
+            return index
+
+        try:
+            index = skip_whitespace(0)
+            if index >= length or raw[index] != "{":
+                return None, 0
+            index += 1
+            status: str | None = None
+            transition_seq = 0
+            while True:
+                index = skip_whitespace(index)
+                if index >= length or raw[index] == "}":
+                    break
+                key_end = string_end(index)
+                key = decoder.decode(raw[index:key_end])
+                index = skip_whitespace(key_end)
+                if index >= length or raw[index] != ":":
+                    return None, 0
+                value_start = skip_whitespace(index + 1)
+                end = value_end(value_start)
+                if key == "status":
+                    value = decoder.decode(raw[value_start:end])
+                    status = value if isinstance(value, str) else None
+                elif key == "transition_seq":
+                    value = decoder.decode(raw[value_start:end])
+                    transition_seq = value if isinstance(value, int) else 0
+                index = skip_whitespace(end)
+                if index < length and raw[index] == ",":
+                    index += 1
+                elif index < length and raw[index] == "}":
+                    break
+                else:
+                    return None, 0
+            return status, transition_seq
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return None, 0
+
+    @staticmethod
+    def _extract_transition_seq(raw: str) -> int:
+        """Extract the root transition sequence without model validation."""
+        return TicketStore._extract_ticket_metadata(raw)[1]
 
     @staticmethod
     def _is_terminal_json(raw: str, terminal_values: set[str]) -> bool:
-        """Check if ticket JSON has a terminal status without full parsing.
-
-        Scans the first 500 chars for the status field to avoid
-        deserializing the entire ticket (which can be 700KB+).
-        """
-        # The status field is near the top of the JSON
-        head = raw[:500]
-        for status in terminal_values:
-            if f'"status":"{status}"' in head or f'"status": "{status}"' in head:
-                return True
-        return False
+        """Check root status without validating the full ticket model."""
+        status, _ = TicketStore._extract_ticket_metadata(raw)
+        return status in terminal_values
