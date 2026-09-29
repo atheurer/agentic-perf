@@ -29,6 +29,11 @@ infrastructure:
   - "driver.*mismatch"
   - "exporter.*version"
 
+  # OS image / boot health failures — retrying with the same
+  # image won't help.  The image build is broken.
+  - "initramfs unpacking failed"
+  - "reboot: power down"
+
 transient:
   - "timed? ?out"
   - "rate limit"
