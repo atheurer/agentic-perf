@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -27,6 +25,8 @@ from providers.tracing import (
 )
 
 from .trace_migrations import migrate
+
+logger = logging.getLogger(__name__)
 
 
 class TraceStoreError(RuntimeError):

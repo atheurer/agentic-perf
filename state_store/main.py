@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -385,15 +386,11 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
         # growth.  The WAL is memory-mapped by readers; an
         # unbounded WAL causes linear memory growth (#1074).
         async def _periodic_wal_checkpoint() -> None:
-            import asyncio
-
             while True:
                 await asyncio.sleep(300)  # every 5 minutes
                 ts = getattr(app.state, "trace_store", None)
                 if ts is not None and hasattr(ts, "checkpoint"):
                     await asyncio.to_thread(ts.checkpoint)
-
-        import asyncio
 
         checkpoint_task = asyncio.create_task(_periodic_wal_checkpoint())
         try:
