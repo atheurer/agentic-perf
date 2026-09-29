@@ -483,6 +483,10 @@ def _benchmark_intent_identity(
     return operation_key, request_hash, immutable
 
 
+_BENCHMARK_LEASE_TTL_SECONDS = 300.0
+_BENCHMARK_LEASE_RENEW_SECONDS = 100.0
+
+
 class _BenchmarkOperation:
     """Small async adapter over the shared fenced operation registry."""
 
@@ -492,21 +496,26 @@ class _BenchmarkOperation:
         self.owner = owner
         self._client = None
         self._local = None
+        self._renew_task: asyncio.Task | None = None
+        self._renew_stop: asyncio.Event | None = None
+        self._renew_error: BaseException | None = None
 
     async def acquire(self) -> tuple[dict[str, Any], str]:
         from providers.tracing.client import TraceClient
 
+        ttl = int(_BENCHMARK_LEASE_TTL_SECONDS)
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
         if token:
             self._client = TraceClient(url, token)
             try:
                 result = await asyncio.to_thread(
-                    self._client.operation_acquire, self.key, self.request_hash, 900
+                    self._client.operation_acquire,
+                    self.key,
+                    self.request_hash,
+                    ttl,
                 )
             except Exception as exc:
-                # Only a conflict proves that another worker owns the intent.
-                # Authentication, transport, and 5xx failures must fail closed.
                 cause = exc
                 while cause is not None:
                     response = getattr(cause, "response", None)
@@ -532,12 +541,63 @@ class _BenchmarkOperation:
                 self.key,
                 self.request_hash,
                 self.owner,
-                900,
+                ttl,
             )
         except (OperationLeaseError, OperationTransitionError):
             operation = self._local.get_operation(self.key)
             return (operation.__dict__ if operation else {}), "in_progress"
         return operation.__dict__, status
+
+    def start_renewal(self, operation: dict[str, Any]) -> None:
+        """Start background lease renewal after acquire."""
+        self._renew_stop = asyncio.Event()
+        self._renew_task = asyncio.create_task(self._renew_loop(operation))
+
+    async def stop_renewal(self) -> BaseException | None:
+        """Stop renewal and return any error that occurred."""
+        if self._renew_stop is not None:
+            self._renew_stop.set()
+        if self._renew_task is not None:
+            try:
+                await self._renew_task
+            except Exception:
+                pass
+        return self._renew_error
+
+    async def _renew_loop(self, operation: dict[str, Any]) -> None:
+        """Renew the operation lease periodically until stopped."""
+        fencing_token = int(operation.get("fencing_generation", 0))
+        interval = min(
+            _BENCHMARK_LEASE_RENEW_SECONDS,
+            _BENCHMARK_LEASE_TTL_SECONDS / 3,
+        )
+        while True:
+            try:
+                await asyncio.wait_for(self._renew_stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                if self._client is not None:
+                    await asyncio.to_thread(
+                        self._client.operation_transition,
+                        self.key,
+                        "renew",
+                        fencing_token,
+                        ttl_seconds=_BENCHMARK_LEASE_TTL_SECONDS,
+                    )
+                elif self._local is not None:
+                    await asyncio.to_thread(
+                        self._local.renew_operation,
+                        self.key,
+                        self.owner,
+                        fencing_token,
+                        int(_BENCHMARK_LEASE_TTL_SECONDS),
+                    )
+            except Exception as exc:
+                logger.warning("Benchmark operation lease renewal failed: %s", exc)
+                self._renew_error = exc
+                return
 
     async def transition(
         self, action: str, operation: dict[str, Any], **kwargs: Any
@@ -583,6 +643,9 @@ class _BenchmarkOperation:
         descriptor: dict[str, Any],
     ) -> bool:
         """Persist a terminal outcome; retry ambiguous writes as indeterminate."""
+        renew_exc = await self.stop_renewal()
+        if renew_exc and outcome not in ("fail", "indeterminate"):
+            logger.warning("Lease renewal failed before terminalize: %s", renew_exc)
         try:
             await self.transition(outcome, operation, descriptor=descriptor)
             return True
@@ -2599,6 +2662,7 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
@@ -3725,6 +3789,7 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
