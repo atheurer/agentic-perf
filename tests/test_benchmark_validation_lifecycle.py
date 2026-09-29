@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -213,6 +214,30 @@ def test_legacy_validation_migrates_deterministically(tmp_path):
         migrated.get_ticket(ticket_id).model_dump(mode="json"),
     )
     assert "legacy/unapproved" in error
+
+
+def test_deferred_closed_ticket_migrates_legacy_validation_on_access(tmp_path):
+    store = TicketStore(persist_dir=tmp_path)
+    ticket_id = _ticket(store)
+    ticket = store._tickets[ticket_id]
+    ticket.custom_fields["benchmark_validation"] = _record("val-legacy-closed")
+    store._persist_ticket(ticket)
+    store.force_close(ticket_id)
+
+    restarted = TicketStore(persist_dir=tmp_path)
+    assert ticket_id in restarted._deferred_paths
+
+    migrated = restarted.get_ticket(ticket_id)
+    manifest = migrated.custom_fields["benchmark_validations"]
+
+    assert manifest["active_validation_id"] == "val-legacy-closed"
+    assert manifest["records"]["val-legacy-closed"]["state"] == "legacy_unapproved"
+    assert (
+        "benchmark_validations"
+        in json.loads((tmp_path / f"{ticket_id}.json").read_text(encoding="utf-8"))[
+            "custom_fields"
+        ]
+    )
 
 
 def test_execution_rejects_runfile_or_plan_tampering(tmp_path):

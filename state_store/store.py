@@ -814,6 +814,16 @@ class TicketStore:
         ticket.custom_fields["benchmark_validations"] = manifest
         return manifest
 
+    def _migrate_legacy_validation(self, ticket: Ticket) -> None:
+        """Persist the canonical manifest when a legacy ticket is first loaded."""
+        if "benchmark_validations" in ticket.custom_fields or not isinstance(
+            ticket.custom_fields.get("benchmark_validation"), dict
+        ):
+            return
+        self._validation_manifest(ticket)
+        self._persist_ticket(ticket)
+        self._audit_log("migrate_benchmark_validation", ticket.id, {"version": 0})
+
     def _validation_conflict(self, ticket: Ticket, manifest: dict) -> dict:
         return {
             "current_version": manifest["version"],
@@ -1969,6 +1979,7 @@ class TicketStore:
             return None
         try:
             ticket = Ticket.model_validate_json(path.read_text(encoding="utf-8"))
+            self._migrate_legacy_validation(ticket)
             self._tickets[ticket.id] = ticket
             return ticket
         except Exception:
@@ -2000,14 +2011,7 @@ class TicketStore:
                         self._global_seq = seq
                     continue
                 ticket = Ticket.model_validate_json(raw)
-                if "benchmark_validations" not in ticket.custom_fields and isinstance(
-                    ticket.custom_fields.get("benchmark_validation"), dict
-                ):
-                    self._validation_manifest(ticket)
-                    self._persist_ticket(ticket)
-                    self._audit_log(
-                        "migrate_benchmark_validation", ticket.id, {"version": 0}
-                    )
+                self._migrate_legacy_validation(ticket)
                 self._tickets[ticket.id] = ticket
                 loaded += 1
                 if ticket.transition_seq > self._global_seq:
