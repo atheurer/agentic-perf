@@ -33,6 +33,7 @@ from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
 from .models import (
     _VALIDATION_RESERVED_FIELDS,
+    TERMINAL_STATUSES,
     VALID_TRANSITIONS,
     AcquireOrchestratorLeaseRequest,
     AddCommentRequest,
@@ -93,6 +94,10 @@ class TicketStore:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
+        # Deferred ticket paths: closed tickets not yet loaded
+        # into memory.  Loaded on demand by get_ticket().
+        self._deferred_paths: dict[str, Path] = {}
+        self._deferred_transition_seqs: dict[str, int] = {}
         self._lock = threading.Lock()
         self._global_seq = 0
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
@@ -434,12 +439,22 @@ class TicketStore:
             self._trace_mutation(ticket.id, "create_ticket")
             return ticket.model_copy()
 
+    def _resolve(self, ticket_id: str) -> Ticket:
+        """Look up a ticket, loading from disk if deferred.
+
+        Must be called under self._lock.  Raises TicketNotFound
+        if the ticket doesn't exist in memory or on disk.
+        """
+        ticket = self._tickets.get(ticket_id)
+        if ticket is None and ticket_id in self._deferred_paths:
+            ticket = self._load_deferred(ticket_id)
+        if ticket is None:
+            raise TicketNotFound(f"Ticket {ticket_id} not found")
+        return ticket
+
     def get_ticket(self, ticket_id: str) -> Ticket:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
-            return ticket.model_copy()
+            return self._resolve(ticket_id).model_copy()
 
     def count_by_status(self) -> dict[str, int]:
         """Return ticket counts per status without copying tickets."""
@@ -448,11 +463,27 @@ class TicketStore:
             for ticket in self._tickets.values():
                 key = ticket.status.value
                 counts[key] = counts.get(key, 0) + 1
+            # Count deferred (terminal) tickets without loading them
+            if self._deferred_paths:
+                # All deferred tickets are terminal (closed)
+                closed_key = TicketStatus.CLOSED.value
+                counts[closed_key] = counts.get(closed_key, 0) + len(
+                    self._deferred_paths
+                )
             return counts
 
     def list_tickets(self, status: TicketStatus | None = None) -> list[Ticket]:
         with self._lock:
             tickets = list(self._tickets.values())
+            # Load deferred tickets when the caller needs them.
+            # For status=None (dashboard list view) or terminal
+            # status filters, load all deferred tickets so the
+            # dashboard shows the complete ticket list.
+            if self._deferred_paths and (status is None or status in TERMINAL_STATUSES):
+                for tid in list(self._deferred_paths):
+                    t = self._load_deferred(tid)
+                    if t is not None:
+                        tickets.append(t)
             if status is not None:
                 tickets = [t for t in tickets if t.status == status]
             return [t.model_copy() for t in tickets]
@@ -460,9 +491,7 @@ class TicketStore:
     def get_cached_usage_summary(self, ticket_id: str) -> dict | None:
         """Return the persisted usage snapshot for a closed ticket, if present."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             cached = ticket.custom_fields.get("_usage_summary")
             return dict(cached) if isinstance(cached, dict) else None
 
@@ -470,6 +499,8 @@ class TicketStore:
         """Drop a closed-ticket snapshot when late usage arrives."""
         with self._lock:
             ticket = self._tickets.get(ticket_id)
+            if ticket is None and ticket_id in self._deferred_paths:
+                ticket = self._load_deferred(ticket_id)
             if ticket is None or "_usage_summary" not in ticket.custom_fields:
                 return
             ticket.custom_fields.pop("_usage_summary", None)
@@ -504,9 +535,7 @@ class TicketStore:
         reviewer_authorized: bool = False,
     ) -> Ticket:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             self._validate_claim_fence(session_id, epoch, ticket_id)
             self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
 
@@ -701,9 +730,7 @@ class TicketStore:
         claim_id: str | None = None,
     ) -> Ticket:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             self._validate_claim_fence(session_id, epoch, ticket_id)
             self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
             protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
@@ -787,6 +814,16 @@ class TicketStore:
         ticket.custom_fields["benchmark_validations"] = manifest
         return manifest
 
+    def _migrate_legacy_validation(self, ticket: Ticket) -> None:
+        """Persist the canonical manifest when a legacy ticket is first loaded."""
+        if "benchmark_validations" in ticket.custom_fields or not isinstance(
+            ticket.custom_fields.get("benchmark_validation"), dict
+        ):
+            return
+        self._validation_manifest(ticket)
+        self._persist_ticket(ticket)
+        self._audit_log("migrate_benchmark_validation", ticket.id, {"version": 0})
+
     def _validation_conflict(self, ticket: Ticket, manifest: dict) -> dict:
         return {
             "current_version": manifest["version"],
@@ -798,9 +835,7 @@ class TicketStore:
     ) -> tuple[Ticket | None, dict | None]:
         """Append a validation record iff the caller observed this manifest version."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             manifest = self._validation_manifest(ticket)
             # Append-only validation evidence is safe to merge: concurrent
             # controller successes must not be thrown away merely because the
@@ -938,9 +973,7 @@ class TicketStore:
     ) -> tuple[Ticket | None, dict | None]:
         """Append, rather than mutate, the evidence that retires a validation."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             manifest = self._validation_manifest(ticket)
             if manifest["version"] != expected_version:
                 self._audit_log(
@@ -1004,9 +1037,7 @@ class TicketStore:
 
     def set_owners(self, ticket_id: str, owners: list[str]) -> Ticket:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             old_owners = list(ticket.owners)
             ticket.owners = list(owners)
             ticket.updated_at = datetime.now(timezone.utc)
@@ -1027,9 +1058,7 @@ class TicketStore:
         claim_id: str | None = None,
     ) -> Comment:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             self._validate_claim_fence(session_id, epoch, ticket_id)
             self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
             comment = Comment(
@@ -1057,9 +1086,7 @@ class TicketStore:
     ) -> ApprovalRequest:
         """Persist one immutable benchmark approval before pausing the ticket."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             lease = self._read_orchestrator_lease()
             claim = ticket.custom_fields.get("claim")
             rejection_reason = None
@@ -1285,9 +1312,7 @@ class TicketStore:
     ) -> ApprovalRequest:
         """Atomically spend an approved request exactly once."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             raw = ticket.custom_fields.get("approval_requests", {})
             value = raw.get(approval_request_id) if isinstance(raw, dict) else None
             if not isinstance(value, dict):
@@ -1363,9 +1388,7 @@ class TicketStore:
 
     def list_approval_requests(self, ticket_id: str) -> list[ApprovalRequest]:
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             self._expire_pending_approvals_unlocked(ticket)
             raw = ticket.custom_fields.get("approval_requests", {})
             if not isinstance(raw, dict):
@@ -1386,9 +1409,7 @@ class TicketStore:
     ) -> ApprovalRequest:
         """Resolve exactly once, checking the immutable intent with CAS semantics."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
             raw = ticket.custom_fields.get("approval_requests", {})
             current_raw = (
                 raw.get(approval_request_id) if isinstance(raw, dict) else None
@@ -1458,11 +1479,21 @@ class TicketStore:
 
     def get_tickets_since(self, since_seq: int) -> list[Ticket]:
         with self._lock:
-            return [
+            tickets = [
                 t.model_copy()
                 for t in self._tickets.values()
                 if t.transition_seq > since_seq
             ]
+            deferred_ids = [
+                ticket_id
+                for ticket_id, seq in self._deferred_transition_seqs.items()
+                if seq > since_seq
+            ]
+            for ticket_id in deferred_ids:
+                ticket = self._load_deferred(ticket_id)
+                if ticket is not None and ticket.transition_seq > since_seq:
+                    tickets.append(ticket.model_copy())
+            return tickets
 
     def claim_ticket(
         self,
@@ -1481,9 +1512,7 @@ class TicketStore:
         another owner with an unexpired lease.
         """
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
 
             self._validate_claim_fence(session_id, epoch, ticket_id)
 
@@ -1590,9 +1619,7 @@ class TicketStore:
     ) -> bool:
         """Release a claim if owned by the given owner."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
 
             self._validate_claim_fence(session_id, epoch, ticket_id)
 
@@ -1638,9 +1665,7 @@ class TicketStore:
     ) -> dict | None:
         """Extend an existing claim's expiry. Returns updated claim or None."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
 
             self._validate_claim_fence(session_id, epoch, ticket_id)
 
@@ -1839,9 +1864,7 @@ class TicketStore:
         from early-pipeline statuses like NEW or TRIAGE_PENDING.
         """
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                raise TicketNotFound(f"Ticket {ticket_id} not found")
+            ticket = self._resolve(ticket_id)
 
             if ticket.status == TicketStatus.CLOSED:
                 self._audit_log(
@@ -1944,22 +1967,173 @@ class TicketStore:
         except OSError:
             logger.exception(f"Failed to persist ticket {ticket.id}")
 
+    def _load_deferred(self, ticket_id: str) -> Ticket | None:
+        """Load a deferred (closed) ticket from disk into memory.
+
+        Called under self._lock when get_ticket finds a ticket_id
+        in _deferred_paths but not in _tickets.
+        """
+        path = self._deferred_paths.pop(ticket_id, None)
+        self._deferred_transition_seqs.pop(ticket_id, None)
+        if path is None or not path.exists():
+            return None
+        try:
+            ticket = Ticket.model_validate_json(path.read_text(encoding="utf-8"))
+            self._migrate_legacy_validation(ticket)
+            self._tickets[ticket.id] = ticket
+            return ticket
+        except Exception:
+            logger.exception(f"Failed to load deferred ticket from {path}")
+            return None
+
     def _load_from_disk(self) -> None:
         if not self._persist_dir.exists():
             return
+        terminal_values = {s.value for s in TERMINAL_STATUSES}
+        deferred = 0
+        loaded = 0
         for path in sorted(self._persist_dir.glob("PERF-*.json")):
             try:
-                ticket = Ticket.model_validate_json(path.read_text(encoding="utf-8"))
-                if "benchmark_validations" not in ticket.custom_fields and isinstance(
-                    ticket.custom_fields.get("benchmark_validation"), dict
-                ):
-                    self._validation_manifest(ticket)
-                    self._persist_ticket(ticket)
-                    self._audit_log(
-                        "migrate_benchmark_validation", ticket.id, {"version": 0}
-                    )
+                raw = path.read_text(encoding="utf-8")
+                # Fast status check before full validation.
+                # Ticket JSON has "status":"closed" near the top.
+                # Defer terminal tickets to avoid expensive
+                # model_validate_json on startup.
+                ticket_id = path.stem
+                status, seq = self._extract_ticket_metadata(raw)
+                if status in terminal_values:
+                    self._deferred_paths[ticket_id] = path
+                    self._deferred_transition_seqs[ticket_id] = seq
+                    deferred += 1
+                    # Track transition_seq without validating the full model
+                    # so _global_seq stays correct for new tickets.
+                    if seq > self._global_seq:
+                        self._global_seq = seq
+                    continue
+                ticket = Ticket.model_validate_json(raw)
+                self._migrate_legacy_validation(ticket)
                 self._tickets[ticket.id] = ticket
+                loaded += 1
                 if ticket.transition_seq > self._global_seq:
                     self._global_seq = ticket.transition_seq
             except Exception:
                 logger.exception(f"Failed to load ticket from {path}")
+        logger.info(
+            "Loaded %d active tickets, deferred %d terminal tickets",
+            loaded,
+            deferred,
+        )
+
+    @staticmethod
+    def _extract_ticket_metadata(raw: str) -> tuple[str | None, int]:
+        """Read root status and transition sequence without building a model.
+
+        Ticket files can contain very large nested custom fields, so this
+        walks JSON syntax while decoding only the two scalar fields needed at
+        startup. Root-level lookup avoids matching similarly named nested
+        fields, and it does not depend on serialized field order.
+        """
+        decoder = json.JSONDecoder()
+        length = len(raw)
+
+        def skip_whitespace(index: int) -> int:
+            while index < length and raw[index] in " \t\r\n":
+                index += 1
+            return index
+
+        def string_end(index: int) -> int:
+            if index >= length or raw[index] != '"':
+                raise ValueError("expected JSON string")
+            index += 1
+            while index < length:
+                char = raw[index]
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == '"':
+                    return index + 1
+                index += 1
+            raise ValueError("unterminated JSON string")
+
+        def value_end(index: int) -> int:
+            index = skip_whitespace(index)
+            if index >= length:
+                raise ValueError("missing JSON value")
+            if raw[index] == '"':
+                return string_end(index)
+            if raw[index] not in "[{":
+                while index < length and raw[index] not in ",]} \t\r\n":
+                    index += 1
+                return index
+
+            stack = [raw[index]]
+            index += 1
+            in_string = False
+            escaped = False
+            while index < length and stack:
+                char = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                elif char == '"':
+                    in_string = True
+                elif char in "[{":
+                    stack.append(char)
+                elif char in "]}":
+                    opening = stack.pop()
+                    if (opening, char) not in (("[", "]"), ("{", "}")):
+                        raise ValueError("mismatched JSON container")
+                index += 1
+            if stack or in_string:
+                raise ValueError("unterminated JSON value")
+            return index
+
+        try:
+            index = skip_whitespace(0)
+            if index >= length or raw[index] != "{":
+                return None, 0
+            index += 1
+            status: str | None = None
+            transition_seq = 0
+            while True:
+                index = skip_whitespace(index)
+                if index >= length or raw[index] == "}":
+                    break
+                key_end = string_end(index)
+                key = decoder.decode(raw[index:key_end])
+                index = skip_whitespace(key_end)
+                if index >= length or raw[index] != ":":
+                    return None, 0
+                value_start = skip_whitespace(index + 1)
+                end = value_end(value_start)
+                if key == "status":
+                    value = decoder.decode(raw[value_start:end])
+                    status = value if isinstance(value, str) else None
+                elif key == "transition_seq":
+                    value = decoder.decode(raw[value_start:end])
+                    transition_seq = value if isinstance(value, int) else 0
+                index = skip_whitespace(end)
+                if index < length and raw[index] == ",":
+                    index += 1
+                elif index < length and raw[index] == "}":
+                    break
+                else:
+                    return None, 0
+            return status, transition_seq
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return None, 0
+
+    @staticmethod
+    def _extract_transition_seq(raw: str) -> int:
+        """Extract the root transition sequence without model validation."""
+        return TicketStore._extract_ticket_metadata(raw)[1]
+
+    @staticmethod
+    def _is_terminal_json(raw: str, terminal_values: set[str]) -> bool:
+        """Check root status without validating the full ticket model."""
+        status, _ = TicketStore._extract_ticket_metadata(raw)
+        return status in terminal_values
