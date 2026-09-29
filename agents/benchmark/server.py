@@ -4282,6 +4282,10 @@ def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
             ("out of memory", "oom"),
             ("oom-killer", "oom_killer"),
             ("call trace", "call_trace"),
+            ("initramfs unpacking failed", "initramfs_failed"),
+            ("reboot: power down", "power_down"),
+            ("reboot: restarting system", "reboot_restart"),
+            ("invalid gpt", "invalid_gpt"),
             ("autoboot", "uboot_autoboot"),
             ("login:", "reached_login"),
         )
