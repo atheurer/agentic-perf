@@ -104,9 +104,15 @@ def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
         snapshot["benchmark_status"] = bm
     elif isinstance(bm, str):
         snapshot["benchmark_status"] = bm
+    for field in ("benchmark_duration", "benchmark_notes", "run_file_used"):
+        value = custom_fields.get(field)
+        if value is not None:
+            snapshot[field] = value
     samples = custom_fields.get("samples_collected")
     if samples is not None:
         snapshot["samples_collected"] = samples
+    if "platform_ready" in custom_fields:
+        snapshot["platform_ready"] = custom_fields["platform_ready"]
 
     # Platform / provisioning
     platform_ip = custom_fields.get("platform_ip", "")
@@ -134,6 +140,36 @@ def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
         snapshot["benchmark_kpis"] = kpis
 
     return snapshot
+
+
+def next_iteration_fields(custom_fields: dict[str, Any]) -> dict[str, Any]:
+    """Clear ticket-global state owned by the completed fleet iteration.
+
+    The fleet result has already been captured in ``tested_hosts``.  Resetting
+    these fields prevents the next board from inheriting this board's benchmark
+    outcome while leaving the accumulated ``output_dirs`` history intact.
+    """
+    fields: dict[str, Any] = {
+        "platform_ready": False,
+        "platform_ip": "",
+        "platform_flash_duration_s": None,
+        "platform_boot_duration_s": None,
+        "platform_serial_log": "",
+        "run_id": "",
+        "benchmark_status": None,
+        "benchmark_notes": "",
+        "benchmark_duration": None,
+        "run_file_used": {},
+        "benchmark_kpis": {},
+        "samples_collected": None,
+        "output_dir": "",
+    }
+    flash = custom_fields.get("jumpstarter_flash", {})
+    if isinstance(flash, dict):
+        flash = dict(flash)
+        flash.pop("diagnostics", None)
+        fields["jumpstarter_flash"] = flash
+    return fields
 
 
 def build_tested_host_entry(

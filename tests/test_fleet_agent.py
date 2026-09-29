@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from agents.fleet.agent import FleetCoordinatorAgent
 
@@ -51,6 +51,88 @@ def _mock_ticket(
 
 class TestCoordinatorRecording:
     """Coordinator records per-host results correctly."""
+
+    async def test_two_board_iterations_reset_results_and_unknown_is_partial(self):
+        coord = _make_coordinator()
+        ticket = _mock_ticket(
+            benchmark_status="completed",
+            benchmark_kpis={"avg_boot_s": 17.8},
+        )
+        cf = ticket["custom_fields"]
+        cf.update(
+            {
+                "run_id": "run-board-01",
+                "benchmark_duration": 42,
+                "benchmark_notes": "board one notes",
+                "run_file_used": {"block_size": "4k"},
+                "samples_collected": 8,
+                "output_dir": "/runs/board-01",
+                "output_dirs": ["/runs/board-01"],
+                "platform_flash_duration_s": 11,
+                "platform_boot_duration_s": 9,
+                "platform_serial_log": "/runs/board-01/serial.log",
+                "jumpstarter_flash": {
+                    "command": "flash-board",
+                    "diagnostics": "board one diagnostics",
+                },
+            }
+        )
+        response = Mock(
+            status_code=200,
+            json=lambda: ticket,
+            raise_for_status=Mock(),
+        )
+        coord._client.get = AsyncMock(return_value=response)
+
+        async def update_fields(_url, *, json):
+            ticket["custom_fields"].update(json["fields"])
+            return Mock(status_code=200, raise_for_status=Mock())
+
+        coord._client.patch = AsyncMock(side_effect=update_fields)
+        coord._client.post = AsyncMock(
+            return_value=Mock(
+                status_code=200,
+                raise_for_status=Mock(),
+            )
+        )
+
+        await coord._coordinate("PERF-TEST")
+
+        first = ticket["custom_fields"]["fleet_investigation"]["tested_hosts"][0]
+        assert first["status"] == "completed"
+        assert first["iteration_data"]["run_id"] == "run-board-01"
+        assert first["iteration_data"]["benchmark_kpis"] == {"avg_boot_s": 17.8}
+        assert first["iteration_data"]["flash_diagnostics"] == "board one diagnostics"
+        cf = ticket["custom_fields"]
+        assert cf["benchmark_status"] is None
+        assert cf["run_id"] == ""
+        assert cf["benchmark_kpis"] == {}
+        assert cf["samples_collected"] is None
+        assert cf["output_dir"] == ""
+        assert cf["output_dirs"] == ["/runs/board-01"]
+        assert cf["jumpstarter_flash"] == {"command": "flash-board"}
+
+        # The next board did not complete a benchmark and reports an
+        # unrecognized status. No result from board 01 may bleed into it.
+        cf.update(
+            {
+                "platform_board": "board-02",
+                "resource_reservation_id": "lease-2",
+                "platform_ip": "10.0.0.2",
+                "platform_ready": True,
+                "benchmark_status": "unknown",
+            }
+        )
+        await coord._coordinate("PERF-TEST")
+
+        tested = ticket["custom_fields"]["fleet_investigation"]["tested_hosts"]
+        second = tested[1]
+        assert second["host_id"] == "board-02"
+        assert second["status"] == "partial"
+        assert "unexpected benchmark status" in second["failure_reason"]
+        assert second["iteration_data"]["benchmark_status"] == "unknown"
+        assert "run_id" not in second["iteration_data"]
+        assert "benchmark_kpis" not in second["iteration_data"]
 
     async def test_records_completed_host(self):
         coord = _make_coordinator()
