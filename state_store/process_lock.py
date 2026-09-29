@@ -40,6 +40,14 @@ def _holder_alive(holder: dict) -> bool:
     tick) ensures we don't mistake a new process at the
     same PID for the original holder.
     """
+    # Hostname check: in Kubernetes, each pod gets a unique
+    # hostname.  A lock from a different hostname is guaranteed
+    # stale — the old pod is dead.  This is the most reliable
+    # check for PVC deployments where PID-based detection fails.
+    holder_hostname = holder.get("hostname", "")
+    if holder_hostname and holder_hostname != socket.gethostname():
+        return False
+
     pid_value = holder.get("pid")
     if pid_value is None:
         # Unknown metadata must fail closed.  It is not evidence that the
@@ -160,15 +168,43 @@ class PersistenceRootLock:
                     # make a contender hang behind a live lock.
                     filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
+                    # On network filesystems (Ceph RBD, NFS), kernel flocks
+                    # may not be released when a pod is killed.  The process
+                    # is confirmed dead (_holder_alive returned False), so
+                    # delete the stale lock file and create a fresh one.
+                    # The old flock is orphaned on the old FD — closing it
+                    # and opening a new file gets a clean lock.
+                    logging.getLogger(__name__).warning(
+                        "Stale flock not released (network filesystem?) "
+                        "— deleting lock file and re-acquiring",
+                    )
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
-                    detail = (
-                        json.dumps(holder, sort_keys=True) if holder else "unavailable"
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    fd = filesystem.open_descriptor(
+                        path.name,
+                        os.O_RDWR | os.O_CREAT,
+                        mode=0o600,
                     )
-                    raise PersistenceRootLockedError(
-                        f"state-store persistence root is locked: {self.root} "
-                        f"(holder metadata: {detail})"
-                    ) from exc
+                    try:
+                        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        filesystem.forget_descriptor(fd)
+                        os.close(fd)
+                        detail = (
+                            json.dumps(holder, sort_keys=True)
+                            if holder
+                            else "unavailable"
+                        )
+                        raise PersistenceRootLockedError(
+                            f"state-store persistence root is locked "
+                            f"(even after stale lock removal): "
+                            f"{self.root} "
+                            f"(holder metadata: {detail})"
+                        ) from exc
             else:
                 filesystem.forget_descriptor(fd)
                 os.close(fd)
