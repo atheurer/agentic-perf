@@ -180,10 +180,13 @@ class PersistenceRootLock:
                     )
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
+                    # Delete the stale lock file through the
+                    # audited filesystem.  Note: this has a
+                    # TOCTOU race if multiple processes attempt
+                    # recovery simultaneously — acceptable for
+                    # single-replica deployments.  Multi-replica
+                    # would need Kubernetes Leases instead.
+                    filesystem.unlink(path.name, missing_ok=True)
                     fd = filesystem.open_descriptor(
                         path.name,
                         os.O_RDWR | os.O_CREAT,
