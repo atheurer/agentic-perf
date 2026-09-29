@@ -135,6 +135,7 @@ class FleetCoordinatorAgent:
         from providers.fleet import (
             get_fleet_progress,
             get_tested_host_ids,
+            next_iteration_fields,
             record_host_result,
             snapshot_iteration_data,
         )
@@ -225,47 +226,8 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as partial (provisioning failure).",
             )
-        elif benchmark_status == "failed":
-            # Benchmark failed — record partial with any data.
-            notes = cf.get("benchmark_notes", "benchmark failed")
-            await record_host_result(
-                self._update_fields,
-                ticket_id,
-                cf,
-                host_id=board,
-                lease_id=lease_id,
-                ip=ip,
-                status="partial",
-                metrics=cf.get("benchmark_kpis"),
-                failure_reason=str(notes)[:500],
-                iteration_data=iter_data,
-            )
-            await self._add_comment(
-                ticket_id,
-                f"Fleet: recorded {board} as partial (benchmark failure).",
-            )
-        elif not benchmark_status:
-            # Benchmark never ran — agent escalated to HITL or
-            # was stopped before executing.  Record as partial
-            # so synthesis knows no data was collected (#1069).
-            diag = self._get_latest_diagnostic(ticket)
-            await record_host_result(
-                self._update_fields,
-                ticket_id,
-                cf,
-                host_id=board,
-                lease_id=lease_id,
-                ip=ip,
-                status="partial",
-                failure_reason=(diag[:500] if diag else "benchmark did not execute"),
-                iteration_data=iter_data,
-            )
-            await self._add_comment(
-                ticket_id,
-                f"Fleet: recorded {board} as partial (benchmark did not execute).",
-            )
-        else:
-            # Benchmark succeeded — record completed.
+        elif benchmark_status == "completed":
+            # Only an explicit successful benchmark result completes a board.
             await record_host_result(
                 self._update_fields,
                 ticket_id,
@@ -281,6 +243,35 @@ class FleetCoordinatorAgent:
                 ticket_id,
                 f"Fleet: recorded {board} as completed.",
             )
+        else:
+            # Missing and unrecognized statuses are incomplete, not success.
+            if benchmark_status == "failed":
+                reason = str(cf.get("benchmark_notes") or "benchmark failed")
+            elif benchmark_status:
+                reason = f"unexpected benchmark status: {benchmark_status}"
+            else:
+                diagnostic = self._get_latest_diagnostic(ticket)
+                reason = diagnostic[:500] if diagnostic else "benchmark did not execute"
+            await record_host_result(
+                self._update_fields,
+                ticket_id,
+                cf,
+                host_id=board,
+                lease_id=lease_id,
+                ip=ip,
+                status="partial",
+                metrics=cf.get("benchmark_kpis"),
+                failure_reason=reason[:500],
+                iteration_data=iter_data,
+            )
+            await self._add_comment(
+                ticket_id,
+                f"Fleet: recorded {board} as partial ({reason[:120]}).",
+            )
+
+        # Preserve this board's history in tested_hosts, then clear the
+        # ticket-global iteration fields before another board is assigned.
+        await self._update_fields(ticket_id, next_iteration_fields(cf))
 
         # Route to the next board. All resource-exhaustion
         # cases are handled above (no board assigned,
