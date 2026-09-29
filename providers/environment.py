@@ -87,12 +87,17 @@ def parse_environment(stdout: str) -> dict[str, Any]:
 
     tuned_raw = sections.get("tuned", "").strip()
     tuned_profile = ""
-    for line in tuned_raw.splitlines():
-        if ":" in line:
-            tuned_profile = line.split(":", 1)[1].strip()
-            break
-    if not tuned_profile:
-        tuned_profile = tuned_raw.split("\n")[0].strip()
+    if "command not found" in tuned_raw or "No such file" in tuned_raw:
+        tuned_profile = ""
+    elif "No current active profile" in tuned_raw:
+        tuned_profile = ""
+    else:
+        for line in tuned_raw.splitlines():
+            if "Current active profile:" in line:
+                tuned_profile = line.split(":", 1)[1].strip()
+                break
+        if not tuned_profile:
+            tuned_profile = tuned_raw.split("\n")[0].strip()
 
     thp_raw = sections.get("thp", "").strip()
     thp = ""
@@ -168,7 +173,7 @@ def _parse_nics(text: str) -> list[dict[str, str]]:
 
 
 _CMDLINE_STRIP = re.compile(
-    r"\bBOOT_IMAGE=\S*|\broot=\S*|"
+    r"\bBOOT_IMAGE=\S*|\broot=\S*|\bresume=\S*|\brd\.lvm\.lv=\S*|"
     r"\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )

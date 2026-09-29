@@ -83,7 +83,7 @@ class TestParseEnvironment:
             "No current active profile.",
         )
         env = parse_environment(no_tuned)
-        assert env["tuned_profile"] == "No current active profile."
+        assert env["tuned_profile"] == ""
 
 
 class TestFingerprint:

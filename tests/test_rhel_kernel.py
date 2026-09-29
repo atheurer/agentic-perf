@@ -137,7 +137,7 @@ class TestParseInventory:
         assert inv.boot_id == "abc-123-def"
         assert inv.os_id == "rhel"
         assert inv.os_version_id == "9.5"
-        assert len(inv.installed) == 3
+        assert len(inv.installed) == 2
         assert "5.14.0-503.14.1.el9_5.x86_64" in inv.installed
         assert "5.14.0-503.16.1.el9_5.x86_64" in inv.installed
         assert inv.default_entry == "/boot/vmlinuz-5.14.0-503.16.1.el9_5.x86_64"

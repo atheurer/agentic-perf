@@ -294,14 +294,15 @@ def parse_inventory(stdout: str) -> KernelInventory:
         elif line.startswith("VERSION_ID="):
             os_version_id = line.split("=", 1)[1].strip().strip('"')
 
-    installed: list[str] = []
+    installed_set: set[str] = set()
     for line in sections.get("rpm", "").splitlines():
         line = line.strip()
         if not line or "is not installed" in line:
             continue
         parts = line.split()
         if len(parts) >= 2:
-            installed.append(parts[1])
+            installed_set.add(parts[1])
+    installed = sorted(installed_set)
 
     default_entry = sections.get("default", "").strip()
     try:
@@ -313,12 +314,17 @@ def parse_inventory(stdout: str) -> KernelInventory:
 
     tuned_raw = sections.get("tuned", "").strip()
     tuned_profile = ""
-    for line in tuned_raw.splitlines():
-        if ":" in line:
-            tuned_profile = line.split(":", 1)[1].strip()
-            break
-    if not tuned_profile:
-        tuned_profile = tuned_raw.split("\n")[0].strip()
+    if "command not found" in tuned_raw or "No such file" in tuned_raw:
+        tuned_profile = ""
+    elif "No current active profile" in tuned_raw:
+        tuned_profile = "No current active profile."
+    else:
+        for line in tuned_raw.splitlines():
+            if "Current active profile:" in line:
+                tuned_profile = line.split(":", 1)[1].strip()
+                break
+        if not tuned_profile:
+            tuned_profile = tuned_raw.split("\n")[0].strip()
 
     return KernelInventory(
         running=running,
