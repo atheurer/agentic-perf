@@ -1315,35 +1315,76 @@ async def _block_absent_suite(
     store_url: str,
     ticket_id: str,
     event_bus: EventBus | None = None,
-) -> None:
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
-        suite = ""
-        try:
-            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
-            suite = r.json().get("custom_fields", {}).get("benchmark_suite", "unknown")
-        except Exception:
-            pass
-        await client.post(
-            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
-            json={
-                "author": "orchestrator",
-                "body": (
-                    f"**Blocked:** No automation harness supports the "
-                    f"'{suite}' benchmark. The ticket cannot proceed to "
-                    f"hardware allocation.\n\n"
-                    f"Please specify a supported benchmark or harness, "
-                    f"or configure the harness that provides this benchmark."
-                ),
-            },
-        )
-        await client.post(
-            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-            json={
-                "status": "awaiting_customer_guidance",
-                "comment": "Absent benchmark suite — no harness can run this",
-            },
-        )
+) -> bool:
+    """Transition an absent-suite ticket to awaiting_customer_guidance.
 
+    Returns True if the transition succeeded, False otherwise.
+    """
+    try:
+        # Use auth-only headers — no orchestrator fencing.
+        # This is an internal orchestrator action, not a dispatched
+        # agent write.  Sending session+epoch without a claim ID
+        # triggers a 409 "invalid mutation fence" from the fencing
+        # middleware.
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        auth_only = {"Authorization": f"Bearer {token}"} if token else {}
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=auth_only) as client:
+            suite = ""
+            try:
+                r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+                suite = (
+                    r.json().get("custom_fields", {}).get("benchmark_suite", "unknown")
+                )
+            except Exception:
+                pass
+            comment_r = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Blocked:** No automation harness supports the "
+                        f"'{suite}' benchmark. The ticket cannot proceed "
+                        f"to hardware allocation.\n\n"
+                        f"Please specify a supported benchmark or harness, "
+                        f"or configure the harness that provides this "
+                        f"benchmark."
+                    ),
+                },
+            )
+            if comment_r.status_code >= 300:
+                logger.warning(
+                    "Failed to post absent-suite comment on %s: %s",
+                    ticket_id,
+                    comment_r.status_code,
+                )
+            transition_r = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": "awaiting_customer_guidance",
+                    "comment": (
+                        "Absent benchmark suite \u2014 no harness can run this"
+                    ),
+                },
+            )
+            if transition_r.status_code >= 300:
+                logger.error(
+                    "Failed to transition absent-suite ticket %s: %s %s",
+                    ticket_id,
+                    transition_r.status_code,
+                    transition_r.text[:200],
+                )
+                return False
+            return True
+    except Exception:
+        logger.exception("_block_absent_suite failed for %s", ticket_id)
+        return False
+
+
+# Tickets already transitioned for absent_suite.  Prevents the
+# orchestrator from retrying the transition every poll cycle when
+# the ticket has already been blocked (or the transition succeeded
+# but the ticket hasn't been re-fetched yet).
+_absent_suite_blocked: set[str] = set()
 
 # Jumpstarter lifecycle functions extracted to
 # providers/resource/jumpstarter_lifecycle.py
@@ -2176,12 +2217,26 @@ async def _poll_loop_after_lease(
                     if status == "awaiting_hardware" and ticket.get(
                         "custom_fields", {}
                     ).get("absent_suite"):
-                        logger.warning(
-                            f"Ticket {tid} has absent_suite=True, pausing for human input"
-                        )
-                        await _block_absent_suite(
-                            config.state_store_url, tid, event_bus=dispatcher.events
-                        )
+                        if tid not in _absent_suite_blocked:
+                            logger.warning(
+                                "Ticket %s has absent_suite=True, "
+                                "pausing for human input",
+                                tid,
+                            )
+                            ok = await _block_absent_suite(
+                                config.state_store_url,
+                                tid,
+                                event_bus=dispatcher.events,
+                            )
+                            if ok:
+                                _absent_suite_blocked.add(tid)
+                            else:
+                                logger.error(
+                                    "Could not block absent-suite "
+                                    "ticket %s — will retry next "
+                                    "cycle",
+                                    tid,
+                                )
                         continue
 
                     # Code-enforce investigation routing.
