@@ -125,6 +125,7 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "agents.mcp_audit.MCPAuditMiddleware.operation_transition",
         "agents/benchmark/server.py:execute_benchmark",
+        "agents/benchmark/agent.py:execute_arcaflow_workflow",
     ),
     *_read_only(
         "agents/evaluate/server.py:list_benchmark_artifacts",
