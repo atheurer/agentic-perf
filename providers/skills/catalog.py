@@ -168,6 +168,12 @@ async def resolve_ticket_execution_model(provider: Any, ticket: dict[str, Any]) 
         harness = "arcaflow-plugins"
     elif not harness:
         harness = getattr(provider, "default_harness", "")
+    # Normalize user-facing aliases to canonical provider names.
+    # The authoritative alias table lives on AgentBase; import
+    # inline to avoid a circular dependency.
+    from agents.base import AgentBase
+
+    harness = AgentBase._HARNESS_ALIASES.get(harness, harness)
     return await resolve_execution_model(
         provider, harness, custom_fields.get("benchmark_suite", "")
     )

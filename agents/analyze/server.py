@@ -121,7 +121,14 @@ async def search_tickets(
             continue
         cf = t.get("custom_fields", {})
         directives = cf.get("directives", {})
-        if harness and directives.get("harness") != harness:
+        ticket_harness = directives.get("harness", "")
+        # Normalize aliases so searches match across the
+        # 'arcaflow' / 'arcaflow-plugins' boundary.
+        from agents.base import AgentBase
+
+        ticket_harness = AgentBase._HARNESS_ALIASES.get(ticket_harness, ticket_harness)
+        normalized_filter = AgentBase._HARNESS_ALIASES.get(harness, harness)
+        if harness and ticket_harness != normalized_filter:
             continue
         if board_type:
             selector = directives.get("board_selector", "") or cf.get(

@@ -2323,9 +2323,18 @@ async def execute_benchmark(
             finally:
                 await replay_guard.close()
         return json.dumps(active_check)
+    run_uuid = uuid.uuid4().hex[:8]
+    harness_name = harness or "crucible"
+
+    # The approval gate applies only to Crucible, which has the
+    # validate_benchmark → request_approval → execute pipeline.
+    # Other harnesses (arcaflow-plugins, boot-time) do not use
+    # that flow and would be blocked unconditionally.
     if (
-        active_check.get("id") or os.environ.get("TICKET_ID")
-    ) and not approval_request_id:
+        harness_name == "crucible"
+        and (active_check.get("id") or os.environ.get("TICKET_ID"))
+        and not approval_request_id
+    ):
         return json.dumps(
             {
                 "status": "rejected",
@@ -2333,9 +2342,6 @@ async def execute_benchmark(
                 "message": "ticket-scoped benchmark execution requires approval_request_id",
             }
         )
-
-    run_uuid = uuid.uuid4().hex[:8]
-    harness_name = harness or "crucible"
 
     async def pause_for_reconciliation(reason: str) -> None:
         """Put ambiguous executions in the canonical human-guidance state."""

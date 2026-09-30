@@ -167,3 +167,38 @@ async def test_explicit_execution_model_overrides_harness_metadata():
         await resolve_ticket_execution_model(_skill_provider(), ticket)
         == EXECUTION_MODEL_CONTROLLER
     )
+
+
+@pytest.mark.asyncio
+async def test_arcaflow_short_name_resolves_to_direct():
+    """harness: 'arcaflow' in directives should resolve to direct model.
+
+    The provider is registered as 'arcaflow-plugins' but ticket directives
+    commonly use the short form 'arcaflow'.  The alias must resolve so
+    the execution model is 'direct', not the fallback 'controller'.
+    """
+    ticket = {
+        "custom_fields": {
+            "benchmark_suite": "stressng",
+            "directives": {"harness": "arcaflow"},
+        }
+    }
+
+    assert (
+        await resolve_ticket_execution_model(_skill_provider(), ticket)
+        == EXECUTION_MODEL_DIRECT
+    )
+
+
+def test_effective_harness_normalizes_alias():
+    """_effective_harness should normalize 'arcaflow' to 'arcaflow-plugins'."""
+    from agents.base import AgentBase
+
+    assert AgentBase._effective_harness({"harness": "arcaflow"}) == "arcaflow-plugins"
+    # Canonical name passes through unchanged
+    assert (
+        AgentBase._effective_harness({"harness": "arcaflow-plugins"})
+        == "arcaflow-plugins"
+    )
+    # Other harnesses unaffected
+    assert AgentBase._effective_harness({"harness": "boot-time"}) == "boot-time"

@@ -886,7 +886,15 @@ async def _search_tickets(
             raw_selector = cf.get("board_selector")
         selector = raw_selector if isinstance(raw_selector, str) else ""
         if harness_filter:
-            if harness.lower() != harness_filter:
+            # Normalize aliases so searches match across the
+            # 'arcaflow' / 'arcaflow-plugins' boundary.
+            from agents.base import AgentBase
+
+            norm_harness = AgentBase._HARNESS_ALIASES.get(
+                harness.lower(), harness.lower()
+            )
+            norm_filter = AgentBase._HARNESS_ALIASES.get(harness_filter, harness_filter)
+            if norm_harness != norm_filter:
                 continue
         if board_type_filter:
             # Fallback: triage may place board_selector at
