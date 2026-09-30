@@ -94,7 +94,9 @@ COPY --from=builder /opt/app-root/bin /opt/app-root/bin
 # jumpstarter image offers a Python 3.12 variant.
 WORKDIR /app
 COPY pyproject.toml .
-RUN pip install --no-cache-dir ".[jumpstarter]" && \
+RUN pip install --no-cache-dir \
+    --extra-index-url https://pkg.jumpstarter.dev/simple \
+    ".[jumpstarter]" && \
     python3 -c 'from jumpstarter_driver_snmp.client import SNMPServerClient; print("SNMP driver: OK")' && \
     python3 -c 'from jumpstarter_driver_gpiod.client import DigitalOutputClient; print("GPIO driver: OK")'
 

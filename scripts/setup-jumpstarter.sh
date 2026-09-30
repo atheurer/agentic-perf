@@ -39,7 +39,7 @@ echo "  System dependencies OK"
 
 # 1. Install project with jumpstarter extras
 echo "Installing project + jumpstarter dependencies..."
-pip install -e "${PROJECT_DIR}[dev,vertex,jumpstarter]" --quiet 2>&1 | tail -3
+pip install --extra-index-url https://pkg.jumpstarter.dev/simple -e "${PROJECT_DIR}[dev,vertex,jumpstarter]" --quiet 2>&1 | tail -3
 
 # Telemetry is best-effort — must not block Jumpstarter install.
 pip install -e "${PROJECT_DIR}[telemetry]" --quiet 2>&1 | tail -3 || \
