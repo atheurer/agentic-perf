@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from providers.llm.base import ToolDefinition
+from providers.skills.base import HARNESS_ALIASES
 from providers.tracing import (
     ActionType,
     IdempotencyDescriptor,
@@ -888,12 +889,8 @@ async def _search_tickets(
         if harness_filter:
             # Normalize aliases so searches match across the
             # 'arcaflow' / 'arcaflow-plugins' boundary.
-            from agents.base import AgentBase
-
-            norm_harness = AgentBase._HARNESS_ALIASES.get(
-                harness.lower(), harness.lower()
-            )
-            norm_filter = AgentBase._HARNESS_ALIASES.get(harness_filter, harness_filter)
+            norm_harness = HARNESS_ALIASES.get(harness.lower(), harness.lower())
+            norm_filter = HARNESS_ALIASES.get(harness_filter, harness_filter)
             if norm_harness != norm_filter:
                 continue
         if board_type_filter:
