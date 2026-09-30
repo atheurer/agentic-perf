@@ -738,9 +738,7 @@ class BenchmarkAgent(AgentBase):
                 return True
 
             task.cancel(_MCP_TIMEOUT_CANCELLATION)
-            stop_deadline = (
-                deadline + _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS
-            )
+            stop_deadline = deadline + _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS
             while not task.done():
                 remaining = stop_deadline - loop.time()
                 if remaining <= 0:

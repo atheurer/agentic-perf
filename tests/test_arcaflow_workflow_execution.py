@@ -269,8 +269,7 @@ async def test_arcaflow_late_launch_during_stop_grace_dispatches_cancel_before_d
     assert mcp.launch_cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
     assert mcp.cancel_started_at < cancellation_started + reconciliation_timeout
     assert (
-        mcp.cancel_finished_at - mcp.cancel_started_at
-        < reconciliation_timeout * 0.75
+        mcp.cancel_finished_at - mcp.cancel_started_at < reconciliation_timeout * 0.75
     )
 
 
