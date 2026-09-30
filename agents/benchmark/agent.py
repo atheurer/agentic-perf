@@ -741,7 +741,8 @@ class BenchmarkAgent(AgentBase):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
         harness = self._effective_harness(
-            cf.get("directives", {}), self._skill_provider
+            cf.get("directives", {}),
+            getattr(self, "_skill_provider", None),
         )
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
