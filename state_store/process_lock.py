@@ -173,6 +173,7 @@ class PersistenceRootLock:
                     ),
                     _STALE_FLOCK_TIMEOUT_SECS,
                 )
+
                 # Use a blocking flock with SIGALRM timeout.
                 # This avoids the unlink race: we never delete
                 # the lock file, so competing starters cannot
@@ -181,13 +182,16 @@ class PersistenceRootLock:
                 # dead); on network filesystems (Ceph RBD) it
                 # may take a few seconds for the server to
                 # reclaim it.
-                old_handler = signal.signal(signal.SIGALRM, signal.SIG_DFL)
+                def _alarm_handler(signum: int, frame: object) -> None:
+                    raise OSError("Timed out waiting for stale flock")
+
+                old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
                 old_alarm = signal.alarm(_STALE_FLOCK_TIMEOUT_SECS)
                 try:
                     filesystem.lock_descriptor(fd, fcntl.LOCK_EX)
-                except BaseException:
-                    # Timeout (SIGALRM raises or kills) or other
-                    # error — the lock is genuinely stuck.
+                except OSError:
+                    # Timeout or flock error — the lock is genuinely
+                    # stuck on the network filesystem.
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
                     filesystem.forget_descriptor(fd)
