@@ -178,7 +178,15 @@ class TraceStore:
             conn = getattr(self, "_connection", None)
             if conn is not None:
                 try:
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    # row = (busy_flag, pages_written, pages_checkpointed)
+                    if row and row[0]:
+                        logger.warning(
+                            "Periodic WAL checkpoint was busy "
+                            "(pages written=%s, checkpointed=%s)",
+                            row[1],
+                            row[2],
+                        )
                 except Exception:
                     logger.warning("WAL checkpoint failed", exc_info=True)
 
