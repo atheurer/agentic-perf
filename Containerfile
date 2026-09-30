@@ -85,34 +85,23 @@ COPY --from=builder /opt/app-root/lib /opt/app-root/lib
 COPY --from=builder /opt/app-root/lib64 /opt/app-root/lib64
 COPY --from=builder /opt/app-root/bin /opt/app-root/bin
 
-# Copy application source
+# Jumpstarter SDK: install from PyPI before copying app source
+# so the heavy driver layer is cached across code-only rebuilds.
+# Only changes to pyproject.toml bust this cache.
+# NOTE: The official jumpstarter container image uses Python 3.14,
+# incompatible with our UBI9 Python 3.12 (compiled .so ABI mismatch).
+# pip install is required until UBI ships Python 3.14 or the
+# jumpstarter image offers a Python 3.12 variant.
 WORKDIR /app
+COPY pyproject.toml .
+RUN pip install --no-cache-dir \
+    --extra-index-url https://pkg.jumpstarter.dev/simple \
+    ".[jumpstarter]" && \
+    python3 -c 'from jumpstarter_driver_snmp.client import SNMPServerClient; print("SNMP driver: OK")' && \
+    python3 -c 'from jumpstarter_driver_gpiod.client import DigitalOutputClient; print("GPIO driver: OK")'
+
+# Copy application source (changes here skip the layer above)
 COPY . .
-
-# Jumpstarter SDK: install into the image so
-# jmp/j CLIs and all drivers are available.
-# Runs as root for /usr/local/bin symlinks.
-# HOME must be /root for the install script's
-# hardcoded venv path.
-# The setup script's driver verification may fail
-# because system Python differs from the venv
-# Python. The drivers are installed correctly in
-# the venv — verification is non-blocking.
-RUN HOME=/root bash scripts/setup-jumpstarter.sh || \
-    echo 'WARNING: setup-jumpstarter.sh exited non-zero (driver verification may have failed)'
-
-# Fix the .pth file: the Jumpstarter install script
-# detects the venv's Python version (may differ from
-# the app Python). Rewrite to match the actual venv
-# site-packages layout.
-RUN PTH=$(find /opt/app-root -name 'jumpstarter.pth' 2>/dev/null | head -1) && \
-    if [ -n "$PTH" ]; then \
-        VENV=/root/.local/jumpstarter/venv && \
-        PYVER=$(ls "$VENV/lib64/" 2>/dev/null | grep python | head -1) && \
-        echo "$VENV/lib64/$PYVER/site-packages" > "$PTH" && \
-        echo "$VENV/lib/$PYVER/site-packages" >> "$PTH" && \
-        echo "Fixed .pth to $PYVER"; \
-    fi
 
 # CAIB (Cloud Automotive Image Builder) CLI
 RUN CAIB_VERSION="v0.2.0" && \
