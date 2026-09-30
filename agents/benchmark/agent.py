@@ -703,6 +703,36 @@ class BenchmarkAgent(AgentBase):
                 }
             )
 
+        async def _wait_for_inflight(task: asyncio.Task[Any]) -> None:
+            """Wait for cleanup/reconciliation work despite repeat cancellation."""
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+
+        async def _cancel_execution_after_cancellation(
+            execution_id: str,
+        ) -> None:
+            cancel_task = asyncio.create_task(
+                mcp.call_tool(
+                    "workflow_execution_cancel",
+                    {"execution_id": execution_id},
+                )
+            )
+            await _wait_for_inflight(cancel_task)
+            try:
+                cancel_task.result()
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(
+                    "Arcaflow cancellation cleanup failed "
+                    "(execution_id=%s, error_type=%s)",
+                    execution_id,
+                    type(e).__name__,
+                )
+
         # 1. Load the workflow
         load_args: dict[str, Any] = {"source": workflow_source}
         if workflow_name:
@@ -735,12 +765,36 @@ class BenchmarkAgent(AgentBase):
             )
 
         # 3. Execute the workflow
-        try:
-            exec_result = await mcp.call_tool(
+        launch_task = asyncio.create_task(
+            mcp.call_tool(
                 "workflow_execute",
                 {"input": exported_result},
             )
+        )
+        try:
+            exec_result = await asyncio.shield(launch_task)
             exec_data = json.loads(exec_result)
+        except asyncio.CancelledError as launch_cancellation:
+            # The engine may have accepted the launch before cancellation
+            # interrupted its response. Let the audited MCP call finish so we
+            # can recover its execution ID and cancel the engine run.
+            await _wait_for_inflight(launch_task)
+            execution_id = ""
+            try:
+                late_result = launch_task.result()
+                late_data = json.loads(late_result)
+                late_id = late_data.get("execution_id", "")
+                if isinstance(late_id, str):
+                    execution_id = late_id
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(
+                    "Arcaflow launch reconciliation failed "
+                    "(error_type=%s)",
+                    type(e).__name__,
+                )
+            if execution_id:
+                await _cancel_execution_after_cancellation(execution_id)
+            raise launch_cancellation
         except Exception as e:
             return json.dumps(
                 {
@@ -787,23 +841,10 @@ class BenchmarkAgent(AgentBase):
                 )
         except asyncio.CancelledError:
             # Best-effort cleanup must not turn caller cancellation into a
-            # successful return. Shield the cancel request from this task's
-            # cancellation, then re-raise the original cancellation.
+            # successful return. Finish the audited cancel request before
+            # re-raising caller cancellation.
             if execution_id:
-                try:
-                    await asyncio.shield(
-                        mcp.call_tool(
-                            "workflow_execution_cancel",
-                            {"execution_id": execution_id},
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Arcaflow cancellation cleanup failed "
-                        "(execution_id=%s, error_type=%s)",
-                        execution_id,
-                        type(e).__name__,
-                    )
+                await _cancel_execution_after_cancellation(execution_id)
             raise
 
         # 5. Get output

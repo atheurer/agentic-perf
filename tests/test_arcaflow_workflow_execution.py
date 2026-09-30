@@ -139,6 +139,49 @@ async def test_arcaflow_cancellation_cancels_engine_execution_before_reraising()
 
 
 @pytest.mark.asyncio
+async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellation():
+    class _LateLaunchWorkflowMCP(_WorkflowMCP):
+        def __init__(self):
+            super().__init__(exported_payload='{"duration":300}')
+            self.launch_started = asyncio.Event()
+            self.finish_launch = asyncio.Event()
+
+        async def call_tool(self, name: str, arguments: dict) -> str:
+            if name == "workflow_execute":
+                self.calls.append((name, arguments))
+                self.launch_started.set()
+                await self.finish_launch.wait()
+                return json.dumps({"execution_id": "late-execution-1"})
+            if name == "workflow_execution_cancel":
+                self.calls.append((name, arguments))
+                return json.dumps({"cancelled": True})
+            return await super().call_tool(name, arguments)
+
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    mcp = _LateLaunchWorkflowMCP()
+    agent._mcp = mcp
+    execution = asyncio.create_task(
+        agent._execute_arcaflow_workflow(
+            "https://example.test/workflow.yaml",
+            {"duration": "5m"},
+            "benchmark",
+        )
+    )
+
+    await mcp.launch_started.wait()
+    execution.cancel()
+    await asyncio.sleep(0)
+    mcp.finish_launch.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert (
+        "workflow_execution_cancel",
+        {"execution_id": "late-execution-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
 async def test_arcaflow_output_retrieval_failure_is_not_reported_as_completed():
     agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _WorkflowMCP(
