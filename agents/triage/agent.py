@@ -16,11 +16,11 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
-def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]:
-    """Route workflow tickets through the canonical Arcaflow provider key."""
-    if directives.get("workflow_source"):
-        directives["harness"] = "arcaflow-plugins"
-    return directives
+# _canonicalize_workflow_harness removed — workflow_source → harness
+# mapping is now handled by AgentBase._effective_harness, which is
+# the single source of truth for harness resolution.  The triage
+# agent writes the canonical name back to directives after calling
+# _effective_harness.
 
 
 def _filter_direct_required_hosts(
@@ -707,17 +707,11 @@ class TriageAgent(AgentBase):
         for key in _PROMOTABLE:
             if key in cf and key not in directives:
                 directives[key] = cf[key]
-        # Code-enforce harness for workflow tickets.
-        # When workflow_source is set, the benchmark agent
-        # must use MCP workflow tools, not direct plugin
-        # execution. The 'arcaflow' harness key routes to
-        # the workflow tool set.
-        # Arcaflow workflow/plugin execution is owned by the same canonical
-        # harness provider. Keep this value aligned with the provider catalog
-        # and BenchmarkAgent tool-scoping key.
-        directives = _canonicalize_workflow_harness(directives)
-        # Resolve after canonicalization, and honor the configured provider
-        # default when triage omitted an explicit harness.
+        # Resolve the canonical harness name.  _effective_harness
+        # handles workflow_source → arcaflow-workflows mapping and
+        # alias normalization.  The canonical name is written back
+        # to directives so downstream agents and the LLM see a
+        # consistent, resolvable value.
         harness = self._effective_harness(directives, self._skill_provider)
         # Store the canonical harness name so downstream agents
         # and the LLM see a consistent, resolvable value.

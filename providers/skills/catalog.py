@@ -28,6 +28,7 @@ STANDALONE_BENCHMARKS = (
         min_hosts=1,
         harness="boot-time",
         execution_model=EXECUTION_MODEL_DIRECT,
+        self_installing=True,
     ),
 )
 
@@ -165,15 +166,15 @@ async def resolve_ticket_execution_model(provider: Any, ticket: dict[str, Any]) 
     directives = custom_fields.get("directives", {})
     harness = directives.get("harness", "")
     if directives.get("workflow_source"):
-        harness = "arcaflow-plugins"
+        from providers.skills.base import WORKFLOW_HARNESS
+
+        harness = WORKFLOW_HARNESS
     elif not harness:
         harness = getattr(provider, "default_harness", "")
     # Normalize user-facing aliases to canonical provider names.
-    # The authoritative alias table lives on AgentBase; import
-    # inline to avoid a circular dependency.
-    from agents.base import AgentBase
+    from providers.skills.base import HARNESS_ALIASES
 
-    harness = AgentBase._HARNESS_ALIASES.get(harness, harness)
+    harness = HARNESS_ALIASES.get(harness, harness)
     return await resolve_execution_model(
         provider, harness, custom_fields.get("benchmark_suite", "")
     )

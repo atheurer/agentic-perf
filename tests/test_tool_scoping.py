@@ -152,20 +152,20 @@ class TestHarnessToolScoping:
             {
                 "custom_fields": {
                     "directives": {
-                        "harness": "arcaflow-plugins",
+                        "harness": "arcaflow-workflows",
                         "workflow_source": "https://example.test/workflow.yaml",
                     }
                 }
             }
         )
+        # Only tools from the input list that are also in the
+        # arcaflow-workflows allowed set survive.  Raw execution
+        # tools (workflow_execute, etc.) are NOT in the allowed
+        # set — execution goes through execute_arcaflow_workflow.
         assert {tool.name for tool in agent.tools} == {
             "workflow_load",
             "workflow_input_build",
             "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_output",
             "request_clarification",
         }
 
@@ -176,7 +176,7 @@ class TestHarnessToolScoping:
             {
                 "custom_fields": {
                     "directives": {
-                        "harness": "arcaflow-plugins",
+                        "harness": "arcaflow-workflows",
                         "workflow_source": "https://example.test/workflow.yaml",
                         "workflow_name": "fio-workflow",
                     }
@@ -186,8 +186,4 @@ class TestHarnessToolScoping:
         assert "workflow_load" in prompt
         assert "workflow_input_build" in prompt
         assert "workflow_input_validate" in prompt
-        assert "workflow_input_export" in prompt
-        assert "workflow_execute" in prompt
-        assert "https://example.test/workflow.yaml" in prompt
-        assert "fio-workflow" in prompt
-        assert "do not call `execute_benchmark`" in prompt
+        assert "execute_arcaflow_workflow" in prompt

@@ -41,6 +41,7 @@ class TestProvisioningToolScoping:
 
     def test_boot_time_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "boot-time"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
@@ -56,6 +57,7 @@ class TestProvisioningToolScoping:
 
     def test_arcaflow_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "arcaflow-plugins"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
@@ -148,24 +150,35 @@ class TestBenchmarkToolScoping:
     def test_arcaflow_scoping(self):
         from agents.benchmark.agent import BenchmarkAgent
 
-        allowed = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
-        assert allowed is not None
-        assert "execute_benchmark" in allowed
-        assert "get_runfile_schema" in allowed
-        assert {
-            "plugin_list",
-            "plugin_describe",
-            "workflow_load",
-            "workflow_input_build",
-            "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_cancel",
-            "workflow_execution_output",
-        } <= allowed
+        # arcaflow-plugins: direct plugin execution via podman
+        plugins = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
+        assert plugins is not None
+        assert "execute_benchmark" in plugins
+        assert "get_plugin_schema" in plugins
+        assert "plugin_list" in plugins
+        assert "plugin_describe" in plugins
+        # Workflow tools should NOT be in the plugins harness
+        assert "workflow_load" not in plugins
+        assert "workflow_execute" not in plugins
+
+        # arcaflow-workflows: MCP workflow execution
+        workflows = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-workflows")
+        assert workflows is not None
+        assert "workflow_load" in workflows
+        assert "workflow_input_build" in workflows
+        assert "workflow_input_validate" in workflows
+        assert "execute_arcaflow_workflow" in workflows
+        # Raw execution tools are internal to execute_arcaflow_workflow
+        assert "workflow_execute" not in workflows
+        assert "workflow_execution_status" not in workflows
+        # Plugin tools should NOT be in the workflows harness
+        assert "execute_benchmark" not in workflows
+        assert "get_plugin_schema" not in workflows
+        assert "plugin_list" not in workflows
+
         # Unrestricted shell access is not part of any harness allowlist.
-        assert "write_remote_file" not in allowed
+        assert "write_remote_file" not in plugins
+        assert "write_remote_file" not in workflows
 
     def test_external_tool_filter_keeps_local_and_enabled_workflow_tools(self):
         from agents.benchmark.agent import _filter_external_tools

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from state_store.models import (
     VALID_TRANSITIONS,
     CreateTicketRequest,
@@ -9,6 +13,62 @@ from state_store.models import (
     TransitionRequest,
 )
 from state_store.store import TicketStore
+
+
+@pytest.mark.asyncio
+async def test_analyze_harness_alias_search_uses_shared_aliases(monkeypatch):
+    tickets = [
+        {
+            "id": "PERF-ALIAS",
+            "status": "closed",
+            "custom_fields": {"directives": {"harness": "Arcaflow"}},
+        },
+        {
+            "id": "PERF-CANONICAL",
+            "status": "closed",
+            "custom_fields": {
+                "directives": {"harness": "arcaflow-plugins"},
+            },
+        },
+        {
+            "id": "PERF-OTHER",
+            "status": "closed",
+            "custom_fields": {"directives": {"harness": "uperf"}},
+        },
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return tickets
+
+    class _HTTPClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", _HTTPClient)
+    from agents.analyze.server import search_tickets
+
+    alias_filter = json.loads(await search_tickets(harness="arcaflow"))
+    canonical_filter = json.loads(await search_tickets(harness="arcaflow-plugins"))
+
+    assert alias_filter["count"] == 2
+    assert [t["ticket_id"] for t in alias_filter["tickets"]] == [
+        "PERF-ALIAS",
+        "PERF-CANONICAL",
+    ]
+    assert canonical_filter == alias_filter
 
 
 def test_analyzing_status_exists():

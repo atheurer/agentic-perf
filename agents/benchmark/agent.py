@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
-from agents.mcp_client import AgentMCPClient
+from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION, AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
@@ -18,6 +18,10 @@ from providers.tracing import current_trace_context
 from .prompts import BENCHMARK_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS = 30.0
+_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS = 1.0
+_ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS = 5.0
 
 
 def _filter_external_tools(
@@ -135,6 +139,42 @@ _LOCAL_TOOLS = [
         },
     ),
 ]
+
+
+_WORKFLOW_TOOL = ToolDefinition(
+    name="execute_arcaflow_workflow",
+    description=(
+        "Execute an Arcaflow workflow via the Arcaflow MCP engine. "
+        "Loads the workflow, exports the validated input, runs the "
+        "engine, and polls until completion. The engine runs on the "
+        "orchestrator node and targets the remote system directly."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "workflow_source": {
+                "type": "string",
+                "description": "Git URL or path to the workflow source",
+            },
+            "workflow_name": {
+                "type": "string",
+                "description": (
+                    "Workflow name/path within the source. "
+                    "Required when the source contains multiple workflows."
+                ),
+            },
+            "input": {
+                "type": "object",
+                "description": (
+                    "Validated workflow input parameters. "
+                    "Build with workflow_input_build and verify "
+                    "with workflow_input_validate before calling."
+                ),
+            },
+        },
+        "required": ["workflow_source", "input"],
+    },
+)
 
 
 class BenchmarkAgent(AgentBase):
@@ -436,6 +476,15 @@ class BenchmarkAgent(AgentBase):
 
         self._mcp = mcp
 
+        # Register the workflow execution handler if the
+        # Arcaflow MCP server is connected.  The handler
+        # uses self._mcp to call workflow tools.
+        if "arcaflow" in connected_ext:
+            self._tool_handlers["execute_arcaflow_workflow"] = (
+                self._execute_arcaflow_workflow
+            )
+            self.tools.append(_WORKFLOW_TOOL)
+
         all_tools = await mcp.list_tools()
         all_tools = _filter_external_tools(
             all_tools, mcp._tool_routing, connected_ext, ext_tools
@@ -507,16 +556,27 @@ class BenchmarkAgent(AgentBase):
             "get_plugin_schema",
             "plugin_list",
             "plugin_describe",
+            "execute_benchmark",
+            "submit_benchmark_result",
+            "request_clarification",
+        },
+        "arcaflow-workflows": {
+            "read_skills",
+            "set_ssh_context",
+            "check_host",
+            "get_execution_config",
+            "get_runfile_schema",
+            "get_benchmark_params",
+            # Discovery tools — LLM uses these to understand
+            # the workflow schema and build valid input.
             "workflow_load",
             "workflow_list",
             "workflow_input_build",
             "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_cancel",
-            "workflow_execution_output",
-            "execute_benchmark",
+            # Execution goes through execute_arcaflow_workflow,
+            # which internally calls workflow_execute and polls
+            # status via the Arcaflow MCP client.
+            "execute_arcaflow_workflow",
             "submit_benchmark_result",
             "request_clarification",
         },
@@ -550,17 +610,6 @@ class BenchmarkAgent(AgentBase):
             return
         allowed = self._HARNESS_TOOLS.get(harness)
         if allowed is not None:
-            directives = ticket.get("custom_fields", {}).get("directives", {})
-            if harness == "arcaflow-plugins" and directives.get("workflow_source"):
-                # Workflow tickets execute through the configured Arcaflow MCP
-                # workflow tools. The direct plugin runner requires
-                # ``plugin_image`` and is intentionally unavailable here.
-                allowed = allowed - {
-                    "execute_benchmark",
-                    "get_plugin_schema",
-                    "plugin_list",
-                    "plugin_describe",
-                }
             self.tools = [t for t in self.tools if t.name in allowed]
 
     def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
@@ -624,43 +673,308 @@ class BenchmarkAgent(AgentBase):
             )
         if harness_fragment:
             prompt += f"\n\n{harness_fragment}"
-        if directives.get("workflow_source"):
-            prompt += "\n\n" + self._workflow_instructions(directives)
+        # Workflow-specific instructions are now in the
+        # arcaflow-workflows.md prompt fragment loaded above.
+        # Ticket-specific values (workflow_source, workflow_name)
+        # are in the messages context.
         if fragments:
             prompt += f"\n\n{fragments}"
         return prompt
 
-    @staticmethod
-    def _workflow_instructions(directives: dict[str, Any]) -> str:
-        """Describe the required Arcaflow MCP execution path.
+    async def _execute_arcaflow_workflow(
+        self,
+        workflow_source: str,
+        input: dict[str, Any],
+        workflow_name: str | None = None,
+    ) -> str:
+        """Execute an Arcaflow workflow via the MCP engine.
 
-        Workflow MCP tools are intentionally dispatched by the model because
-        their input schemas are supplied by the configured external server.
-        Keeping the directive here makes the ticket fields operational rather
-        than merely displaying them in the initial message.
+        Deterministic sequence: load → export input → execute → poll.
+        The LLM builds and validates the input; this handler runs
+        the engine.
         """
-        source = directives.get("workflow_source", "")
-        name = directives.get("workflow_name")
-        name_line = f"\n- Workflow name/path: `{name}`" if name else ""
-        return (
-            "## Arcaflow Workflow Execution (mandatory)\n"
-            "This ticket supplies an Arcaflow workflow. Do not construct a "
-            "plugin-image run-file and do not call `execute_benchmark` for "
-            "this ticket. Use the configured Arcaflow MCP tools in this "
-            "order:\n"
-            "1. Call `workflow_load` for the supplied source (and workflow "
-            "name/path when present).\n"
-            "2. Use `workflow_input_build` to construct inputs from the "
-            "workflow schema and the ticket's requested parameters.\n"
-            "3. Call `workflow_input_validate`; correct any reported input "
-            "errors before continuing.\n"
-            "4. Call `workflow_input_export` to obtain the immutable input "
-            "payload, then call `workflow_execute` with the loaded workflow "
-            "and exported input.\n"
-            "5. Use the workflow status/output tools until execution reaches "
-            "a terminal state, then submit the result with its workflow run "
-            "ID.\n\n"
-            f"- Workflow source: `{source}`{name_line}"
+        import asyncio
+        import uuid
+
+        run_uuid = uuid.uuid4().hex[:8]
+        mcp = self._mcp
+        if mcp is None:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": "No MCP client available",
+                }
+            )
+
+        def _observe_detached_task(task: asyncio.Task[Any]) -> None:
+            """Retrieve a late result/exception after bounded cancellation wait."""
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        async def _wait_for_inflight(
+            task: asyncio.Task[Any],
+            *,
+            operation: str,
+            deadline: float,
+        ) -> bool:
+            """Bound reconciliation, cancel late work, and observe its result."""
+            loop = asyncio.get_running_loop()
+            while not task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+                except asyncio.CancelledError:
+                    continue
+                except TimeoutError:
+                    break
+                except Exception:
+                    break
+            if task.done():
+                return True
+
+            task.cancel(_MCP_TIMEOUT_CANCELLATION)
+            stop_deadline = deadline + _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS
+            while not task.done():
+                remaining = stop_deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+                except asyncio.CancelledError:
+                    continue
+                except TimeoutError:
+                    break
+                except Exception:
+                    break
+            if not task.done():
+                task.add_done_callback(_observe_detached_task)
+                logger.warning(
+                    "Arcaflow %s RPC did not stop within the cancellation "
+                    "reconciliation deadline; remote outcome is indeterminate",
+                    operation,
+                )
+            return task.done()
+
+        async def _cancel_execution_after_cancellation(
+            execution_id: str,
+            *,
+            deadline: float,
+        ) -> None:
+            cancel_task = asyncio.create_task(
+                mcp.call_tool(
+                    "workflow_execution_cancel",
+                    {"execution_id": execution_id},
+                )
+            )
+            if not await _wait_for_inflight(
+                cancel_task,
+                operation="cancel",
+                deadline=deadline,
+            ):
+                return
+            try:
+                cancel_task.result()
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(
+                    "Arcaflow cancellation cleanup outcome is indeterminate "
+                    "(execution_id=%s, error_type=%s)",
+                    execution_id,
+                    type(e).__name__,
+                )
+
+        # 1. Load the workflow
+        load_args: dict[str, Any] = {"source": workflow_source}
+        if workflow_name:
+            load_args["name"] = workflow_name
+        try:
+            load_result = await mcp.call_tool("workflow_load", load_args)
+            json.loads(load_result)  # validate response
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_load failed: {e}",
+                }
+            )
+
+        # 2. Export the validated input
+        try:
+            exported_result = await mcp.call_tool(
+                "workflow_input_export",
+                {"input": input},
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_input_export failed: {e}",
+                }
+            )
+
+        # 3. Execute the workflow
+        launch_task = asyncio.create_task(
+            mcp.call_tool(
+                "workflow_execute",
+                {"input": exported_result},
+            )
+        )
+        try:
+            exec_result = await asyncio.shield(launch_task)
+            exec_data = json.loads(exec_result)
+        except asyncio.CancelledError as launch_cancellation:
+            # The engine may have accepted the launch before cancellation
+            # interrupted its response. Let the audited MCP call finish within
+            # a bounded window so we can recover its execution ID and cancel.
+            loop = asyncio.get_running_loop()
+            cancellation_started = loop.time()
+            reconciliation_deadline = (
+                cancellation_started
+                + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
+            )
+            launch_reserve = min(
+                _ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS,
+                _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS * 0.2,
+            )
+            launch_deadline = max(
+                cancellation_started,
+                reconciliation_deadline
+                - launch_reserve
+                - _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS,
+            )
+            launch_finished = await _wait_for_inflight(
+                launch_task,
+                operation="launch",
+                deadline=launch_deadline,
+            )
+            execution_id = ""
+            if launch_finished:
+                try:
+                    late_result = launch_task.result()
+                    late_data = json.loads(late_result)
+                    late_id = late_data.get("execution_id", "")
+                    if isinstance(late_id, str):
+                        execution_id = late_id
+                except (asyncio.CancelledError, Exception) as e:
+                    logger.warning(
+                        "Arcaflow launch response unavailable after cancellation; "
+                        "execution outcome is indeterminate (error_type=%s)",
+                        type(e).__name__,
+                    )
+            if launch_finished and not execution_id:
+                logger.warning(
+                    "Arcaflow launch completed without a usable execution ID "
+                    "after caller cancellation; remote outcome is indeterminate"
+                )
+            if execution_id:
+                await _cancel_execution_after_cancellation(
+                    execution_id,
+                    deadline=reconciliation_deadline,
+                )
+            raise launch_cancellation
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_execute failed: {e}",
+                }
+            )
+
+        # 4. Poll until terminal
+        execution_id = exec_data.get("execution_id", "")
+        run_id = execution_id or f"arcaflow-wf-{run_uuid}"
+        max_polls = 360  # 30 minutes at 5s intervals
+        try:
+            for _ in range(max_polls):
+                try:
+                    status_result = await mcp.call_tool(
+                        "workflow_execution_status",
+                        {"execution_id": execution_id},
+                    )
+                    status_data = json.loads(status_result)
+                    state = status_data.get("state", "")
+                    if state in ("completed", "failed", "cancelled"):
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+            else:
+                # Cancel the orphaned workflow before returning.
+                try:
+                    await mcp.call_tool(
+                        "workflow_execution_cancel",
+                        {"execution_id": execution_id},
+                    )
+                except Exception:
+                    pass
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "run_id": run_id,
+                        "execution_id": execution_id,
+                        "error": "Workflow execution timed out after 30 minutes",
+                    }
+                )
+        except asyncio.CancelledError:
+            # Best-effort cleanup must not turn caller cancellation into a
+            # successful return. Finish the audited cancel request before
+            # re-raising caller cancellation.
+            if execution_id:
+                deadline = (
+                    asyncio.get_running_loop().time()
+                    + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
+                )
+                await _cancel_execution_after_cancellation(
+                    execution_id,
+                    deadline=deadline,
+                )
+            raise
+
+        # 5. Get output
+        try:
+            output_result = await mcp.call_tool(
+                "workflow_execution_output",
+                {"execution_id": execution_id},
+            )
+            output = json.loads(output_result)
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": run_id,
+                    "harness": "arcaflow-workflows",
+                    "execution_id": execution_id,
+                    "workflow_source": workflow_source,
+                    "workflow_name": workflow_name or "",
+                    "execution_state": state,
+                    "output": None,
+                    "error": f"workflow_execution_output failed: {e}",
+                    "message": "Arcaflow workflow output retrieval failed",
+                }
+            )
+
+        return json.dumps(
+            {
+                "status": "completed" if state == "completed" else "failed",
+                "run_id": run_id,
+                "harness": "arcaflow-workflows",
+                "execution_id": execution_id,
+                "workflow_source": workflow_source,
+                "workflow_name": workflow_name or "",
+                "output": output,
+                "message": (
+                    "Arcaflow workflow completed"
+                    if state == "completed"
+                    else f"Arcaflow workflow {state}"
+                ),
+            }
         )
 
     @staticmethod
@@ -736,7 +1050,11 @@ class BenchmarkAgent(AgentBase):
 
         directives = cf.get("directives", {})
         if directives.get("workflow_source"):
-            content += "\n" + self._workflow_instructions(directives) + "\n"
+            source = directives["workflow_source"]
+            content += f"\n## Workflow Source\n- Source: `{source}`\n"
+            wf_name = directives.get("workflow_name")
+            if wf_name:
+                content += f"- Workflow name: `{wf_name}`\n"
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 

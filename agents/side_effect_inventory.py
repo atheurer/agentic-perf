@@ -15,6 +15,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/base.py", "_update_fields", "mutating_http_state"),
     ("agents/benchmark/agent.py", "_request_benchmark_approval", "mutating_http_state"),
     ("agents/benchmark/agent.py", "_resolve_benchmark_approval", "mutating_http_state"),
+    ("agents/benchmark/agent.py", "_cancel_execution_after_cancellation", "mcp"),
+    ("agents/benchmark/agent.py", "_execute_arcaflow_workflow", "mcp"),
     ("agents/benchmark/server.py", "_boot_serial_diagnostics", "filesystem"),
     ("agents/benchmark/server.py", "_find_controller_path", "ssh"),
     ("agents/benchmark/server.py", "_find_controller_repository", "filesystem"),
@@ -562,6 +564,26 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/agent.py:_resolve_benchmark_approval",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/agent.py",
+        "_cancel_execution_after_cancellation",
+        "mcp",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/agent.py:_cancel_execution_after_cancellation",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/agent.py",
+        "_execute_arcaflow_workflow",
+        "mcp",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/agent.py:_execute_arcaflow_workflow",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "_boot_serial_diagnostics", "filesystem"): (

@@ -18,6 +18,18 @@ from typing import Any
 EXECUTION_MODEL_CONTROLLER = "controller"
 EXECUTION_MODEL_DIRECT = "direct"
 
+# Harness that handles workflow_source tickets.  Defined here
+# so both AgentBase._effective_harness and catalog resolution
+# reference the same constant rather than hardcoding the name.
+WORKFLOW_HARNESS = "arcaflow-workflows"
+
+# User-facing harness names that map to canonical provider
+# registry names.  Defined in the skills layer (not agents)
+# because alias resolution is harness metadata.
+HARNESS_ALIASES: dict[str, str] = {
+    "arcaflow": "arcaflow-plugins",
+}
+
 
 @dataclass
 class BenchmarkSuite:
@@ -32,6 +44,10 @@ class BenchmarkSuite:
     source: dict[str, Any] = field(default_factory=dict)
     architectures: list[str] = field(default_factory=list)
     execution_model: str = EXECUTION_MODEL_CONTROLLER
+    # True when the harness needs no host-side installation.
+    # The provisioning agent auto-completes for self-installing
+    # harnesses on Jumpstarter boards.
+    self_installing: bool = False
 
 
 @dataclass

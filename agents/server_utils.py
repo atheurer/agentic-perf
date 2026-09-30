@@ -127,6 +127,10 @@ def build_skill_provider(
             mcp_client=arcaflow_mcp_client,
         ),
     }
+    # arcaflow-workflows uses the same catalog/discovery as
+    # arcaflow-plugins but routes through the Arcaflow MCP
+    # workflow engine instead of direct podman execution.
+    harnesses["arcaflow-workflows"] = harnesses["arcaflow-plugins"]
 
     if catalog_only:
         harnesses["crucible"] = CrucibleCatalogSkillProvider(

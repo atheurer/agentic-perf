@@ -3,26 +3,25 @@ from __future__ import annotations
 from agents.triage.prompts import TRIAGE_SYSTEM_PROMPT
 
 
-def test_workflow_directive_uses_canonical_arcaflow_harness():
-    from agents.triage.agent import _canonicalize_workflow_harness
+def test_workflow_directive_resolves_to_workflows_harness():
+    """_effective_harness returns arcaflow-workflows for workflow_source tickets."""
+    from agents.base import AgentBase
 
     directives = {"workflow_source": "https://example.test/workflow.yaml"}
-    assert _canonicalize_workflow_harness(directives)["harness"] == "arcaflow-plugins"
+    assert AgentBase._effective_harness(directives) == "arcaflow-workflows"
 
 
-def test_workflow_harness_canonicalization_precedes_default_resolution():
+def test_workflow_harness_overrides_default_provider():
     from types import SimpleNamespace
 
     from agents.base import AgentBase
-    from agents.triage.agent import _canonicalize_workflow_harness
 
     directives = {"workflow_source": "https://example.test/workflow.yaml"}
-    directives = _canonicalize_workflow_harness(directives)
     assert (
         AgentBase._effective_harness(
             directives, SimpleNamespace(default_harness="crucible")
         )
-        == "arcaflow-plugins"
+        == "arcaflow-workflows"
     )
 
 

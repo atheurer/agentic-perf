@@ -19,7 +19,7 @@ from tests.conftest import MockSkillProvider
 
 
 def _skill_provider() -> MultiHarnessSkillProvider:
-    return MultiHarnessSkillProvider(
+    provider = MultiHarnessSkillProvider(
         harnesses={
             "crucible": MockSkillProvider(
                 benchmarks=[
@@ -44,6 +44,9 @@ def _skill_provider() -> MultiHarnessSkillProvider:
         },
         default_harness="crucible",
     )
+    # arcaflow-workflows shares the same provider for catalog/discovery
+    provider._harnesses["arcaflow-workflows"] = provider._harnesses["arcaflow-plugins"]
+    return provider
 
 
 def _completion_response(host: str) -> MagicMock:
@@ -118,7 +121,7 @@ async def test_old_arcaflow_jumpstarter_ticket_keeps_single_board_as_target():
     prompt = benchmark._system_prompt(ticket)
     messages = benchmark._build_messages(ticket)
     assert "## Direct Execution Model" in prompt
-    assert "## Arcaflow Workflow Execution (mandatory)" in prompt
+    assert "## Arcaflow Workflow Execution" in prompt
     assert "## Crucible Benchmark Execution" not in prompt
     assert "Target hosts for this benchmark" in messages[0]["content"]
     assert '"targets": [\n    "10.0.0.8"' in messages[0]["content"]

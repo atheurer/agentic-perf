@@ -1653,23 +1653,20 @@ class AgentBase(ABC):
         """
         return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
 
-    # User-facing harness names that map to canonical provider
-    # registry names.  Checked once in _effective_harness so every
-    # agent sees the canonical form.
-    _HARNESS_ALIASES: dict[str, str] = {
-        "arcaflow": "arcaflow-plugins",
-    }
-
     @staticmethod
     def _effective_harness(
         directives: dict[str, Any], skill_provider: Any = None
     ) -> str:
         """Return the selected harness or the provider's configured default."""
         if directives.get("workflow_source"):
-            return "arcaflow-plugins"
+            from providers.skills.base import WORKFLOW_HARNESS
+
+            return WORKFLOW_HARNESS
         explicit = directives.get("harness")
         if isinstance(explicit, str) and explicit:
-            return AgentBase._HARNESS_ALIASES.get(explicit, explicit)
+            from providers.skills.base import HARNESS_ALIASES
+
+            return HARNESS_ALIASES.get(explicit, explicit)
         default = getattr(skill_provider, "default_harness", "")
         return default if isinstance(default, str) else ""
 

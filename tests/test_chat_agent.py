@@ -922,6 +922,42 @@ class TestSearchMetadataFilters:
         assert parsed["count"] == 1
         assert parsed["tickets"][0]["harness"] == "boot-time"
 
+    async def test_harness_alias_filter_matches_canonical_name(self):
+        client = self._mock_client(
+            [
+                {
+                    "id": "PERF-1",
+                    "summary": "Arcaflow alias",
+                    "status": "closed",
+                    "custom_fields": {
+                        "directives": {"harness": "arcaflow"},
+                    },
+                },
+                {
+                    "id": "PERF-2",
+                    "summary": "Other harness",
+                    "status": "closed",
+                    "custom_fields": {
+                        "directives": {"harness": "uperf"},
+                    },
+                },
+            ]
+        )
+
+        result = await execute_tool(
+            "search_tickets",
+            {"harness": "arcaflow-plugins"},
+            client,
+            "http://localhost:8090",
+            "token",
+            audit=_audit(client),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["count"] == 1
+        assert parsed["tickets"][0]["id"] == "PERF-1"
+        assert parsed["tickets"][0]["harness"] == "arcaflow"
+
     async def test_board_type_filter(self):
         client = self._mock_client(
             [
