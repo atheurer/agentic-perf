@@ -165,8 +165,12 @@ class TestBenchmarkToolScoping:
         workflows = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-workflows")
         assert workflows is not None
         assert "workflow_load" in workflows
-        assert "workflow_execute" in workflows
-        assert "workflow_execution_status" in workflows
+        assert "workflow_input_build" in workflows
+        assert "workflow_input_validate" in workflows
+        assert "execute_arcaflow_workflow" in workflows
+        # Raw execution tools are internal to execute_arcaflow_workflow
+        assert "workflow_execute" not in workflows
+        assert "workflow_execution_status" not in workflows
         # Plugin tools should NOT be in the workflows harness
         assert "execute_benchmark" not in workflows
         assert "get_plugin_schema" not in workflows

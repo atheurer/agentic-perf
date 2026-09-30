@@ -159,15 +159,13 @@ class TestHarnessToolScoping:
             }
         )
         # Only tools from the input list that are also in the
-        # arcaflow-workflows allowed set survive.
+        # arcaflow-workflows allowed set survive.  Raw execution
+        # tools (workflow_execute, etc.) are NOT in the allowed
+        # set — execution goes through execute_arcaflow_workflow.
         assert {tool.name for tool in agent.tools} == {
             "workflow_load",
             "workflow_input_build",
             "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_output",
             "request_clarification",
         }
 
@@ -188,8 +186,4 @@ class TestHarnessToolScoping:
         assert "workflow_load" in prompt
         assert "workflow_input_build" in prompt
         assert "workflow_input_validate" in prompt
-        assert "workflow_input_export" in prompt
-        assert "workflow_execute" in prompt
-        assert "do not call `execute_benchmark`" in prompt
-        # Ticket-specific values (workflow_source URL, workflow_name)
-        # are in the messages context, not the system prompt.
+        assert "execute_arcaflow_workflow" in prompt

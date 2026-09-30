@@ -137,6 +137,42 @@ _LOCAL_TOOLS = [
 ]
 
 
+_WORKFLOW_TOOL = ToolDefinition(
+    name="execute_arcaflow_workflow",
+    description=(
+        "Execute an Arcaflow workflow via the Arcaflow MCP engine. "
+        "Loads the workflow, exports the validated input, runs the "
+        "engine, and polls until completion. The engine runs on the "
+        "orchestrator node and targets the remote system directly."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "workflow_source": {
+                "type": "string",
+                "description": "Git URL or path to the workflow source",
+            },
+            "workflow_name": {
+                "type": "string",
+                "description": (
+                    "Workflow name/path within the source. "
+                    "Required when the source contains multiple workflows."
+                ),
+            },
+            "input": {
+                "type": "object",
+                "description": (
+                    "Validated workflow input parameters. "
+                    "Build with workflow_input_build and verify "
+                    "with workflow_input_validate before calling."
+                ),
+            },
+        },
+        "required": ["workflow_source", "input"],
+    },
+)
+
+
 class BenchmarkAgent(AgentBase):
     def __init__(
         self,
@@ -436,6 +472,15 @@ class BenchmarkAgent(AgentBase):
 
         self._mcp = mcp
 
+        # Register the workflow execution handler if the
+        # Arcaflow MCP server is connected.  The handler
+        # uses self._mcp to call workflow tools.
+        if "arcaflow" in connected_ext:
+            self._tool_handlers["execute_arcaflow_workflow"] = (
+                self._execute_arcaflow_workflow
+            )
+            self.tools.append(_WORKFLOW_TOOL)
+
         all_tools = await mcp.list_tools()
         all_tools = _filter_external_tools(
             all_tools, mcp._tool_routing, connected_ext, ext_tools
@@ -518,15 +563,16 @@ class BenchmarkAgent(AgentBase):
             "get_execution_config",
             "get_runfile_schema",
             "get_benchmark_params",
+            # Discovery tools — LLM uses these to understand
+            # the workflow schema and build valid input.
             "workflow_load",
             "workflow_list",
             "workflow_input_build",
             "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_cancel",
-            "workflow_execution_output",
+            # Execution goes through execute_arcaflow_workflow,
+            # which internally calls workflow_execute and polls
+            # status via the Arcaflow MCP client.
+            "execute_arcaflow_workflow",
             "submit_benchmark_result",
             "request_clarification",
         },
@@ -630,6 +676,132 @@ class BenchmarkAgent(AgentBase):
         if fragments:
             prompt += f"\n\n{fragments}"
         return prompt
+
+    async def _execute_arcaflow_workflow(
+        self,
+        workflow_source: str,
+        input: dict[str, Any],
+        workflow_name: str | None = None,
+    ) -> str:
+        """Execute an Arcaflow workflow via the MCP engine.
+
+        Deterministic sequence: load → export input → execute → poll.
+        The LLM builds and validates the input; this handler runs
+        the engine.
+        """
+        import asyncio
+        import uuid
+
+        run_uuid = uuid.uuid4().hex[:8]
+        mcp = self._mcp
+        if mcp is None:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": "No MCP client available",
+                }
+            )
+
+        # 1. Load the workflow
+        load_args: dict[str, Any] = {"source": workflow_source}
+        if workflow_name:
+            load_args["name"] = workflow_name
+        try:
+            load_result = await mcp.call_tool("workflow_load", load_args)
+            json.loads(load_result)  # validate response
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_load failed: {e}",
+                }
+            )
+
+        # 2. Export the validated input
+        try:
+            await mcp.call_tool(
+                "workflow_input_export",
+                {"input": input},
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_input_export failed: {e}",
+                }
+            )
+
+        # 3. Execute the workflow
+        try:
+            exec_result = await mcp.call_tool(
+                "workflow_execute",
+                {"input": input},
+            )
+            exec_data = json.loads(exec_result)
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": f"workflow_execute failed: {e}",
+                }
+            )
+
+        # 4. Poll until terminal
+        execution_id = exec_data.get("execution_id", "")
+        max_polls = 360  # 30 minutes at 5s intervals
+        for _ in range(max_polls):
+            try:
+                status_result = await mcp.call_tool(
+                    "workflow_execution_status",
+                    {"execution_id": execution_id},
+                )
+                status_data = json.loads(status_result)
+                state = status_data.get("state", "")
+                if state in ("completed", "failed", "cancelled"):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+        else:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": "Workflow execution timed out after 30 minutes",
+                }
+            )
+
+        # 5. Get output
+        output = {}
+        try:
+            output_result = await mcp.call_tool(
+                "workflow_execution_output",
+                {"execution_id": execution_id},
+            )
+            output = json.loads(output_result)
+        except Exception:
+            pass
+
+        return json.dumps(
+            {
+                "status": "completed" if state == "completed" else "failed",
+                "run_id": f"arcaflow-wf-{run_uuid}",
+                "harness": "arcaflow-workflows",
+                "execution_id": execution_id,
+                "workflow_source": workflow_source,
+                "workflow_name": workflow_name or "",
+                "output": output,
+                "message": (
+                    "Arcaflow workflow completed"
+                    if state == "completed"
+                    else f"Arcaflow workflow {state}"
+                ),
+            }
+        )
 
     @staticmethod
     def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
