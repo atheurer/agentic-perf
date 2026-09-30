@@ -17,9 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 def _canonicalize_workflow_harness(directives: dict[str, Any]) -> dict[str, Any]:
-    """Route workflow tickets through the canonical Arcaflow provider key."""
+    """Route workflow tickets to the arcaflow-workflows harness.
+
+    Workflow tickets use the Arcaflow MCP engine with its own deployer
+    and multi-step orchestration.  Direct plugin tickets use podman on
+    the target host.  The two paths have different tool sets and are
+    registered as separate harnesses.
+    """
     if directives.get("workflow_source"):
-        directives["harness"] = "arcaflow-plugins"
+        directives["harness"] = "arcaflow-workflows"
     return directives
 
 

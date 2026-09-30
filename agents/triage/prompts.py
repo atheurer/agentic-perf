@@ -81,8 +81,9 @@ Your job is to analyze a performance test request ticket and:
    - User provides a git URL or workflow file URL → workflow_source: "<url>"
    - User names a specific workflow → workflow_name: "<name>"
 
-   When `workflow_source` is set, also set `harness: "arcaflow-plugins"`. The benchmark
-   agent will use the Arcaflow MCP to load and run the workflow. You do NOT need
+   When `workflow_source` is set, also set `harness: "arcaflow-workflows"`. The benchmark
+   agent will use the Arcaflow MCP to load and run the workflow.
+   For direct plugin execution (no workflow), use `harness: "arcaflow-plugins"`. You do NOT need
    to understand the workflow’s contents — just pass the source URL through.
    - "run on bare metal" / "use remotehosts" → endpoint_type: "remotehosts"
    - "test the 25G NICs" / "use the Intel interfaces" / "not the management network"

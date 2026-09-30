@@ -152,12 +152,14 @@ class TestHarnessToolScoping:
             {
                 "custom_fields": {
                     "directives": {
-                        "harness": "arcaflow-plugins",
+                        "harness": "arcaflow-workflows",
                         "workflow_source": "https://example.test/workflow.yaml",
                     }
                 }
             }
         )
+        # Only tools from the input list that are also in the
+        # arcaflow-workflows allowed set survive.
         assert {tool.name for tool in agent.tools} == {
             "workflow_load",
             "workflow_input_build",
@@ -176,7 +178,7 @@ class TestHarnessToolScoping:
             {
                 "custom_fields": {
                     "directives": {
-                        "harness": "arcaflow-plugins",
+                        "harness": "arcaflow-workflows",
                         "workflow_source": "https://example.test/workflow.yaml",
                         "workflow_name": "fio-workflow",
                     }

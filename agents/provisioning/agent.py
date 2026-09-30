@@ -98,7 +98,9 @@ class ProvisioningAgent(AgentBase):
     # flash + boot. These get a reduced tool set and
     # provisioning_complete override. Extend this set
     # when adding new self-contained harnesses.
-    _SELF_INSTALLING: frozenset[str] = frozenset({"boot-time", "arcaflow-plugins"})
+    _SELF_INSTALLING: frozenset[str] = frozenset(
+        {"boot-time", "arcaflow-plugins", "arcaflow-workflows"}
+    )
 
     _PROVISIONING_DENY_TOOLS: frozenset[str] = frozenset(
         {

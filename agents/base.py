@@ -1666,7 +1666,7 @@ class AgentBase(ABC):
     ) -> str:
         """Return the selected harness or the provider's configured default."""
         if directives.get("workflow_source"):
-            return "arcaflow-plugins"
+            return "arcaflow-workflows"
         explicit = directives.get("harness")
         if isinstance(explicit, str) and explicit:
             return AgentBase._HARNESS_ALIASES.get(explicit, explicit)

@@ -7,7 +7,7 @@ def test_workflow_directive_uses_canonical_arcaflow_harness():
     from agents.triage.agent import _canonicalize_workflow_harness
 
     directives = {"workflow_source": "https://example.test/workflow.yaml"}
-    assert _canonicalize_workflow_harness(directives)["harness"] == "arcaflow-plugins"
+    assert _canonicalize_workflow_harness(directives)["harness"] == "arcaflow-workflows"
 
 
 def test_workflow_harness_canonicalization_precedes_default_resolution():
@@ -22,7 +22,7 @@ def test_workflow_harness_canonicalization_precedes_default_resolution():
         AgentBase._effective_harness(
             directives, SimpleNamespace(default_harness="crucible")
         )
-        == "arcaflow-plugins"
+        == "arcaflow-workflows"
     )
 
 

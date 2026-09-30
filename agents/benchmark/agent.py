@@ -507,6 +507,17 @@ class BenchmarkAgent(AgentBase):
             "get_plugin_schema",
             "plugin_list",
             "plugin_describe",
+            "execute_benchmark",
+            "submit_benchmark_result",
+            "request_clarification",
+        },
+        "arcaflow-workflows": {
+            "read_skills",
+            "set_ssh_context",
+            "check_host",
+            "get_execution_config",
+            "get_runfile_schema",
+            "get_benchmark_params",
             "workflow_load",
             "workflow_list",
             "workflow_input_build",
@@ -516,7 +527,6 @@ class BenchmarkAgent(AgentBase):
             "workflow_execution_status",
             "workflow_execution_cancel",
             "workflow_execution_output",
-            "execute_benchmark",
             "submit_benchmark_result",
             "request_clarification",
         },
@@ -550,17 +560,6 @@ class BenchmarkAgent(AgentBase):
             return
         allowed = self._HARNESS_TOOLS.get(harness)
         if allowed is not None:
-            directives = ticket.get("custom_fields", {}).get("directives", {})
-            if harness == "arcaflow-plugins" and directives.get("workflow_source"):
-                # Workflow tickets execute through the configured Arcaflow MCP
-                # workflow tools. The direct plugin runner requires
-                # ``plugin_image`` and is intentionally unavailable here.
-                allowed = allowed - {
-                    "execute_benchmark",
-                    "get_plugin_schema",
-                    "plugin_list",
-                    "plugin_describe",
-                }
             self.tools = [t for t in self.tools if t.name in allowed]
 
     def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
@@ -624,7 +623,7 @@ class BenchmarkAgent(AgentBase):
             )
         if harness_fragment:
             prompt += f"\n\n{harness_fragment}"
-        if directives.get("workflow_source"):
+        if harness == "arcaflow-workflows":
             prompt += "\n\n" + self._workflow_instructions(directives)
         if fragments:
             prompt += f"\n\n{fragments}"

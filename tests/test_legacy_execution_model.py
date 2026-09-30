@@ -19,7 +19,7 @@ from tests.conftest import MockSkillProvider
 
 
 def _skill_provider() -> MultiHarnessSkillProvider:
-    return MultiHarnessSkillProvider(
+    provider = MultiHarnessSkillProvider(
         harnesses={
             "crucible": MockSkillProvider(
                 benchmarks=[
@@ -44,6 +44,9 @@ def _skill_provider() -> MultiHarnessSkillProvider:
         },
         default_harness="crucible",
     )
+    # arcaflow-workflows shares the same provider for catalog/discovery
+    provider._harnesses["arcaflow-workflows"] = provider._harnesses["arcaflow-plugins"]
+    return provider
 
 
 def _completion_response(host: str) -> MagicMock:
