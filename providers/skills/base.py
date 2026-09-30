@@ -23,6 +23,13 @@ EXECUTION_MODEL_DIRECT = "direct"
 # reference the same constant rather than hardcoding the name.
 WORKFLOW_HARNESS = "arcaflow-workflows"
 
+# User-facing harness names that map to canonical provider
+# registry names.  Defined in the skills layer (not agents)
+# because alias resolution is harness metadata.
+HARNESS_ALIASES: dict[str, str] = {
+    "arcaflow": "arcaflow-plugins",
+}
+
 
 @dataclass
 class BenchmarkSuite:
