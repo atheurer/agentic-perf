@@ -719,6 +719,10 @@ class TriageAgent(AgentBase):
         # Resolve after canonicalization, and honor the configured provider
         # default when triage omitted an explicit harness.
         harness = self._effective_harness(directives, self._skill_provider)
+        # Store the canonical harness name so downstream agents
+        # and the LLM see a consistent, resolvable value.
+        if harness and harness != directives.get("harness"):
+            directives["harness"] = harness
         # Resolve execution model from the harness metadata.
         # This is a harness-level property declared in BenchmarkSuite,
         # not a per-ticket decision or a hardcoded list.
