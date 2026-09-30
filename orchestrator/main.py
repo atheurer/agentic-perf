@@ -1321,9 +1321,14 @@ async def _block_absent_suite(
     Returns True if the transition succeeded, False otherwise.
     """
     try:
-        async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=_auth_headers()
-        ) as client:
+        # Use auth-only headers — no orchestrator fencing.
+        # This is an internal orchestrator action, not a dispatched
+        # agent write.  Sending session+epoch without a claim ID
+        # triggers a 409 "invalid mutation fence" from the fencing
+        # middleware.
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        auth_only = {"Authorization": f"Bearer {token}"} if token else {}
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=auth_only) as client:
             suite = ""
             try:
                 r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
