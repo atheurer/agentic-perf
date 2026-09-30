@@ -169,7 +169,7 @@ async def test_terminal_write_failure_is_reclassified_indeterminate(
         return {}
 
     monkeypatch.setattr(operation, "transition", transition)
-    assert await operation.terminalize({}, "complete", {"result": "ok"})
+    assert not await operation.terminalize({}, "complete", {"result": "ok"})
     assert calls == ["complete", "indeterminate"]
 
 
