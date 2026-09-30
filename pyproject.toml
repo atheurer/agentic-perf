@@ -49,7 +49,7 @@ bitwarden = [
 # Jumpstarter packages use their own index; include it when installing this extra:
 # python -m pip install --extra-index-url https://pkg.jumpstarter.dev/simple -e '.[jumpstarter]'
 jumpstarter = [
-    "jumpstarter-all>=0.9.0",
+    "jumpstarter-all==0.9.0",
 ]
 dev = [
     "pytest>=8.0",
