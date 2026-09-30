@@ -767,10 +767,19 @@ class BenchmarkAgent(AgentBase):
                 pass
             await asyncio.sleep(5)
         else:
+            # Cancel the orphaned workflow before returning.
+            try:
+                await mcp.call_tool(
+                    "workflow_execution_cancel",
+                    {"execution_id": execution_id},
+                )
+            except Exception:
+                pass
             return json.dumps(
                 {
                     "status": "failed",
                     "run_id": f"arcaflow-wf-{run_uuid}",
+                    "execution_id": execution_id,
                     "error": "Workflow execution timed out after 30 minutes",
                 }
             )
