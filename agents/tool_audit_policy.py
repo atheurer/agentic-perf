@@ -125,6 +125,8 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "agents.mcp_audit.MCPAuditMiddleware.operation_transition",
         "agents/benchmark/server.py:execute_benchmark",
+        # This is the registered entry point; its private cancellation helper
+        # has its direct MCP boundary inventoried separately.
         "agents/benchmark/agent.py:execute_arcaflow_workflow",
     ),
     *_read_only(
