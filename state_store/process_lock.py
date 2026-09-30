@@ -41,24 +41,70 @@ def _process_start_identity(pid: int | None = None) -> str:
         return str(pid)
 
 
-def _holder_alive(holder: dict) -> bool:
-    """Check if the lock holder process is still the same incarnation.
+def _k8s_pod_exists(hostname: str) -> bool | None:
+    """Check whether a Kubernetes pod with the given name exists.
 
-    In containers, PIDs are recycled across restarts.
-    Comparing the process_start_identity (kernel start-time
-    tick) ensures we don't mistake a new process at the
-    same PID for the original holder.
-
-    This function intentionally does NOT check hostnames.
-    During rolling deployments, two pods with different
-    hostnames can overlap — a hostname mismatch is not
-    proof of death.  Only kernel-level evidence (PID
-    existence + incarnation identity) is authoritative.
+    Returns True if the pod exists, False if the API confirms it
+    does not (404), or None if the API is unavailable (not running
+    in K8s, no permissions, network error).
     """
+    token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    ca_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    ns_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+    if not token_path.exists():
+        return None
+    try:
+        token = token_path.read_text().strip()
+        namespace = ns_path.read_text().strip()
+        import ssl
+        import urllib.request
+
+        ctx = ssl.create_default_context(cafile=str(ca_path))
+        url = (
+            f"https://kubernetes.default.svc/api/v1"
+            f"/namespaces/{namespace}/pods/{hostname}"
+        )
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        urllib.request.urlopen(req, context=ctx, timeout=5)
+        return True
+    except Exception as exc:
+        # 404 = pod definitively gone
+        if hasattr(exc, "code") and exc.code == 404:  # type: ignore[union-attr]
+            return False
+        # Any other error = inconclusive
+        return None
+
+
+def _holder_alive(holder: dict) -> bool:
+    """Check if the lock holder is still alive.
+
+    Uses a layered approach:
+    1. Same hostname: PID + incarnation identity check (kernel-level,
+       valid within the same PID namespace).
+    2. Different hostname with K8s API: authoritative pod existence
+       check via the Kubernetes API.  A 404 proves the pod is dead.
+    3. Different hostname without K8s API: fail closed (assume alive)
+       because os.kill only checks the local PID namespace.
+    """
+    holder_hostname = holder.get("hostname", "")
+    my_hostname = socket.gethostname()
+
+    if holder_hostname and holder_hostname != my_hostname:
+        # Cross-pod scenario: PID check is unreliable (different
+        # PID namespaces).  Use the Kubernetes API as the
+        # authoritative fence.
+        k8s_alive = _k8s_pod_exists(holder_hostname)
+        if k8s_alive is False:
+            # K8s API confirms the pod is gone.
+            return False
+        # k8s_alive is True (pod exists) or None (API unavailable).
+        # Either way, fail closed — do not assume the holder is dead.
+        return True
+
+    # Same hostname (or no hostname recorded): PID check is valid
+    # within this PID namespace.
     pid_value = holder.get("pid")
     if pid_value is None:
-        # Unknown metadata must fail closed.  It is not evidence that the
-        # kernel lock is stale.
         return True
     try:
         pid = int(pid_value)
@@ -73,17 +119,13 @@ def _holder_alive(holder: dict) -> bool:
     except PermissionError:
         pass
     except OSError:
-        # An inability to inspect the process is not proof that it is dead.
         return True
     # PID exists — verify it's the same incarnation.
     holder_identity = holder.get("process_start_identity", "")
     if not holder_identity:
-        # No identity recorded — can't verify, assume alive.
         return True
     current_identity = _process_start_identity(pid)
     if current_identity == str(pid) and holder_identity != str(pid):
-        # The platform-specific identity was unavailable, so do not treat a
-        # live lock holder as stale merely because verification was degraded.
         return True
     return current_identity == holder_identity
 
@@ -190,43 +232,27 @@ class PersistenceRootLock:
                 try:
                     filesystem.lock_descriptor(fd, fcntl.LOCK_EX)
                 except OSError:
-                    # Timeout or flock error — the lock is genuinely
-                    # stuck on the network filesystem.  The holder is
-                    # confirmed dead (_holder_alive returned False).
-                    # Force-acquire by closing the stuck FD, deleting
-                    # the stale file, and creating a fresh one.
+                    # Timeout — the flock is genuinely stuck on
+                    # the network filesystem.  Do NOT unlink and
+                    # recreate: that creates a second inode and
+                    # two processes could each lock a different
+                    # one (split-brain).  Raise so the operator
+                    # can intervene.
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
-                    logger.warning(
-                        "Stale flock not released after %ds "
-                        "(network filesystem) — force-replacing "
-                        "lock file",
-                        _STALE_FLOCK_TIMEOUT_SECS,
-                    )
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
-                    filesystem.unlink(path.name, missing_ok=True)
-                    fd = filesystem.open_descriptor(
-                        path.name,
-                        os.O_RDWR | os.O_CREAT,
-                        mode=0o600,
+                    detail = (
+                        json.dumps(holder, sort_keys=True) if holder else "unavailable"
                     )
-                    try:
-                        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        filesystem.forget_descriptor(fd)
-                        os.close(fd)
-                        detail = (
-                            json.dumps(holder, sort_keys=True)
-                            if holder
-                            else "unavailable"
-                        )
-                        raise PersistenceRootLockedError(
-                            f"state-store persistence root is "
-                            f"locked (even after stale lock "
-                            f"removal): {self.root} "
-                            f"(holder metadata: {detail})"
-                        ) from exc
+                    raise PersistenceRootLockedError(
+                        f"state-store persistence root is "
+                        f"locked (stale flock not released "
+                        f"after {_STALE_FLOCK_TIMEOUT_SECS}s "
+                        f"— manual lock file removal required): "
+                        f"{self.root} "
+                        f"(holder metadata: {detail})"
+                    ) from exc
                 finally:
                     signal.alarm(old_alarm)
                     signal.signal(signal.SIGALRM, old_handler)
