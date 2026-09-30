@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import signal
 import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Seconds to wait for a stale flock to release on network
+# filesystems (Ceph RBD, NFS) where kernel flocks may not
+# be released immediately when a pod is killed.
+_STALE_FLOCK_TIMEOUT_SECS = 30
 
 from paths import STATE_STORE_ID_PATH, STATE_STORE_LOCK_PATH
 from providers.execution import AuditedFilesystem
@@ -39,15 +48,13 @@ def _holder_alive(holder: dict) -> bool:
     Comparing the process_start_identity (kernel start-time
     tick) ensures we don't mistake a new process at the
     same PID for the original holder.
-    """
-    # Hostname check: in Kubernetes, each pod gets a unique
-    # hostname.  A lock from a different hostname is guaranteed
-    # stale — the old pod is dead.  This is the most reliable
-    # check for PVC deployments where PID-based detection fails.
-    holder_hostname = holder.get("hostname", "")
-    if holder_hostname and holder_hostname != socket.gethostname():
-        return False
 
+    This function intentionally does NOT check hostnames.
+    During rolling deployments, two pods with different
+    hostnames can overlap — a hostname mismatch is not
+    proof of death.  Only kernel-level evidence (PID
+    existence + incarnation identity) is authoritative.
+    """
     pid_value = holder.get("pid")
     if pid_value is None:
         # Unknown metadata must fail closed.  It is not evidence that the
@@ -154,60 +161,50 @@ class PersistenceRootLock:
             holder = _read_metadata(path=path)
             # If the holder process is no longer the same
             # incarnation, the lock is stale (e.g., container
-            # restart with PVC).  Force-acquire.
+            # restart with PVC).  Force-acquire by blocking
+            # on the SAME inode with a timeout.
             if not _holder_alive(holder):
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "Stale lock held by dead process %s — force-acquiring",
-                    holder.get("process_start_identity", holder.get("pid")),
+                logger.warning(
+                    "Stale lock held by dead process %s — "
+                    "waiting up to %ds for flock release",
+                    holder.get(
+                        "process_start_identity",
+                        holder.get("pid"),
+                    ),
+                    _STALE_FLOCK_TIMEOUT_SECS,
                 )
+                # Use a blocking flock with SIGALRM timeout.
+                # This avoids the unlink race: we never delete
+                # the lock file, so competing starters cannot
+                # acquire different inodes.  On local filesystems
+                # the flock is already released (the process is
+                # dead); on network filesystems (Ceph RBD) it
+                # may take a few seconds for the server to
+                # reclaim it.
+                old_handler = signal.signal(signal.SIGALRM, signal.SIG_DFL)
+                old_alarm = signal.alarm(_STALE_FLOCK_TIMEOUT_SECS)
                 try:
-                    # A kernel flock is released when its owning process dies;
-                    # retry non-blocking so a stale metadata file can never
-                    # make a contender hang behind a live lock.
-                    filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # On network filesystems (Ceph RBD, NFS), kernel flocks
-                    # may not be released when a pod is killed.  The process
-                    # is confirmed dead (_holder_alive returned False), so
-                    # delete the stale lock file and create a fresh one.
-                    # The old flock is orphaned on the old FD — closing it
-                    # and opening a new file gets a clean lock.
-                    logging.getLogger(__name__).warning(
-                        "Stale flock not released (network filesystem?) "
-                        "— deleting lock file and re-acquiring",
-                    )
+                    filesystem.lock_descriptor(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    # Timeout (SIGALRM raises or kills) or other
+                    # error — the lock is genuinely stuck.
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
-                    # Delete the stale lock file through the
-                    # audited filesystem.  Note: this has a
-                    # TOCTOU race if multiple processes attempt
-                    # recovery simultaneously — acceptable for
-                    # single-replica deployments.  Multi-replica
-                    # would need Kubernetes Leases instead.
-                    filesystem.unlink(path.name, missing_ok=True)
-                    fd = filesystem.open_descriptor(
-                        path.name,
-                        os.O_RDWR | os.O_CREAT,
-                        mode=0o600,
+                    detail = (
+                        json.dumps(holder, sort_keys=True) if holder else "unavailable"
                     )
-                    try:
-                        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        filesystem.forget_descriptor(fd)
-                        os.close(fd)
-                        detail = (
-                            json.dumps(holder, sort_keys=True)
-                            if holder
-                            else "unavailable"
-                        )
-                        raise PersistenceRootLockedError(
-                            f"state-store persistence root is locked "
-                            f"(even after stale lock removal): "
-                            f"{self.root} "
-                            f"(holder metadata: {detail})"
-                        ) from exc
+                    raise PersistenceRootLockedError(
+                        f"state-store persistence root is "
+                        f"locked (stale flock not released "
+                        f"after {_STALE_FLOCK_TIMEOUT_SECS}s): "
+                        f"{self.root} "
+                        f"(holder metadata: {detail})"
+                    ) from exc
+                finally:
+                    signal.alarm(old_alarm)
+                    signal.signal(signal.SIGALRM, old_handler)
             else:
                 filesystem.forget_descriptor(fd)
                 os.close(fd)
