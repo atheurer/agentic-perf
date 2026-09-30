@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -24,6 +25,8 @@ from providers.tracing import (
 )
 
 from .trace_migrations import migrate
+
+logger = logging.getLogger(__name__)
 
 
 class TraceStoreError(RuntimeError):
@@ -100,6 +103,29 @@ class TraceStore:
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             deadline = time.monotonic() + busy_timeout_ms / 1000
             self._startup_execute("PRAGMA journal_mode = WAL", deadline)
+            # Checkpoint aggressively to prevent WAL growth.
+            # The default (1000 pages / ~4MB) can't keep up with
+            # continuous trace writes.  100 pages (~400KB) keeps
+            # the WAL small and memory-mapped footprint low.
+            self._connection.execute("PRAGMA wal_autocheckpoint = 100")
+            # Reclaim WAL growth from a previous session.  Use PASSIVE
+            # mode so we never block concurrent store initializations
+            # (TRUNCATE/FULL require exclusive access and fail with
+            # "database is locked" when other connections hold reads).
+            try:
+                row = self._connection.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                # row = (busy_flag, pages_written, pages_checkpointed)
+                if row and row[0]:
+                    logger.debug(
+                        "startup WAL checkpoint was busy "
+                        "(pages written=%s, checkpointed=%s)",
+                        row[1],
+                        row[2],
+                    )
+            except Exception:
+                pass  # Non-fatal — best-effort reclamation
             check = self._startup_execute(
                 "PRAGMA integrity_check", deadline
             ).fetchone()[0]
@@ -140,6 +166,29 @@ class TraceStore:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(min(0.025, max(0, deadline - time.monotonic())))
+
+    def checkpoint(self) -> None:
+        """Force a WAL checkpoint to reclaim disk and memory.
+
+        Call periodically (e.g., every 5 minutes) to prevent the
+        WAL file from growing unbounded.  TRUNCATE mode resets
+        the WAL file to zero bytes after checkpointing.
+        """
+        with self._lock:
+            conn = getattr(self, "_connection", None)
+            if conn is not None:
+                try:
+                    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    # row = (busy_flag, pages_written, pages_checkpointed)
+                    if row and row[0]:
+                        logger.warning(
+                            "Periodic WAL checkpoint was busy "
+                            "(pages written=%s, checkpointed=%s)",
+                            row[1],
+                            row[2],
+                        )
+                except Exception:
+                    logger.warning("WAL checkpoint failed", exc_info=True)
 
     def close(self) -> None:
         """Close the connection; safe to call after a failed initialization."""
