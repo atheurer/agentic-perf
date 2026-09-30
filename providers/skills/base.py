@@ -18,6 +18,11 @@ from typing import Any
 EXECUTION_MODEL_CONTROLLER = "controller"
 EXECUTION_MODEL_DIRECT = "direct"
 
+# Harness that handles workflow_source tickets.  Defined here
+# so both AgentBase._effective_harness and catalog resolution
+# reference the same constant rather than hardcoding the name.
+WORKFLOW_HARNESS = "arcaflow-workflows"
+
 
 @dataclass
 class BenchmarkSuite:

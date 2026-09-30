@@ -166,7 +166,9 @@ async def resolve_ticket_execution_model(provider: Any, ticket: dict[str, Any]) 
     directives = custom_fields.get("directives", {})
     harness = directives.get("harness", "")
     if directives.get("workflow_source"):
-        harness = "arcaflow-workflows"
+        from providers.skills.base import WORKFLOW_HARNESS
+
+        harness = WORKFLOW_HARNESS
     elif not harness:
         harness = getattr(provider, "default_harness", "")
     # Normalize user-facing aliases to canonical provider names.
