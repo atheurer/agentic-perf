@@ -108,12 +108,24 @@ class TraceStore:
             # continuous trace writes.  100 pages (~400KB) keeps
             # the WAL small and memory-mapped footprint low.
             self._connection.execute("PRAGMA wal_autocheckpoint = 100")
-            # Truncate the WAL on startup to reclaim any growth
-            # from a previous session's uncheckpointed writes.
+            # Reclaim WAL growth from a previous session.  Use PASSIVE
+            # mode so we never block concurrent store initializations
+            # (TRUNCATE/FULL require exclusive access and fail with
+            # "database is locked" when other connections hold reads).
             try:
-                self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                row = self._connection.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                # row = (busy_flag, pages_written, pages_checkpointed)
+                if row and row[0]:
+                    logger.debug(
+                        "startup WAL checkpoint was busy "
+                        "(pages written=%s, checkpointed=%s)",
+                        row[1],
+                        row[2],
+                    )
             except Exception:
-                pass  # Non-fatal — checkpoint may fail if locked
+                pass  # Non-fatal — best-effort reclamation
             check = self._startup_execute(
                 "PRAGMA integrity_check", deadline
             ).fetchone()[0]
