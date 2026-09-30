@@ -127,6 +127,10 @@ def build_skill_provider(
             mcp_client=arcaflow_mcp_client,
         ),
     }
+    # "arcaflow" is the user-facing harness name used in ticket
+    # directives.  Register it as an alias so get_provider()
+    # resolves correctly for execution_model lookups.
+    harnesses["arcaflow"] = harnesses["arcaflow-plugins"]
 
     if catalog_only:
         harnesses["crucible"] = CrucibleCatalogSkillProvider(

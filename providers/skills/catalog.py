@@ -98,6 +98,14 @@ async def get_catalog_benchmark(provider: Any, name: str) -> dict[str, Any] | No
     return benchmark_entry(suite) if suite is not None else None
 
 
+# Canonical harness name aliases.  Ticket directives use the
+# short form ("arcaflow"); the provider registry may use the
+# long form ("arcaflow-plugins").  Normalize before lookup.
+_HARNESS_ALIASES: dict[str, str] = {
+    "arcaflow": "arcaflow-plugins",
+}
+
+
 async def resolve_execution_model(
     provider: Any,
     harness: str,
@@ -112,6 +120,8 @@ async def resolve_execution_model(
     This is the single source of truth for execution model — callers
     should not hardcode harness-to-model mappings.
     """
+    harness = _HARNESS_ALIASES.get(harness, harness)
+
     # Check standalone benchmarks (boot-time, etc.)
     for suite in STANDALONE_BENCHMARKS:
         if suite.harness == harness or suite.name == benchmark_name:
@@ -164,6 +174,7 @@ async def resolve_ticket_execution_model(provider: Any, ticket: dict[str, Any]) 
 
     directives = custom_fields.get("directives", {})
     harness = directives.get("harness", "")
+    harness = _HARNESS_ALIASES.get(harness, harness)
     if directives.get("workflow_source"):
         harness = "arcaflow-plugins"
     elif not harness:

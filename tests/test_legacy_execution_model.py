@@ -154,6 +154,27 @@ async def test_legacy_ticket_without_harness_uses_crucible_controller_model():
 
 
 @pytest.mark.asyncio
+async def test_arcaflow_short_name_resolves_to_direct():
+    """harness: 'arcaflow' in directives should resolve to direct model.
+
+    The provider is registered as 'arcaflow-plugins' but ticket directives
+    commonly use the short form 'arcaflow'.  The alias must resolve so
+    the execution model is 'direct', not the fallback 'controller'.
+    """
+    ticket = {
+        "custom_fields": {
+            "benchmark_suite": "stressng",
+            "directives": {"harness": "arcaflow"},
+        }
+    }
+
+    assert (
+        await resolve_ticket_execution_model(_skill_provider(), ticket)
+        == EXECUTION_MODEL_DIRECT
+    )
+
+
+@pytest.mark.asyncio
 async def test_explicit_execution_model_overrides_harness_metadata():
     ticket = {
         "custom_fields": {
