@@ -191,21 +191,42 @@ class PersistenceRootLock:
                     filesystem.lock_descriptor(fd, fcntl.LOCK_EX)
                 except OSError:
                     # Timeout or flock error — the lock is genuinely
-                    # stuck on the network filesystem.
+                    # stuck on the network filesystem.  The holder is
+                    # confirmed dead (_holder_alive returned False).
+                    # Force-acquire by closing the stuck FD, deleting
+                    # the stale file, and creating a fresh one.
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
+                    logger.warning(
+                        "Stale flock not released after %ds "
+                        "(network filesystem) — force-replacing "
+                        "lock file",
+                        _STALE_FLOCK_TIMEOUT_SECS,
+                    )
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
-                    detail = (
-                        json.dumps(holder, sort_keys=True) if holder else "unavailable"
+                    filesystem.unlink(path.name, missing_ok=True)
+                    fd = filesystem.open_descriptor(
+                        path.name,
+                        os.O_RDWR | os.O_CREAT,
+                        mode=0o600,
                     )
-                    raise PersistenceRootLockedError(
-                        f"state-store persistence root is "
-                        f"locked (stale flock not released "
-                        f"after {_STALE_FLOCK_TIMEOUT_SECS}s): "
-                        f"{self.root} "
-                        f"(holder metadata: {detail})"
-                    ) from exc
+                    try:
+                        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        filesystem.forget_descriptor(fd)
+                        os.close(fd)
+                        detail = (
+                            json.dumps(holder, sort_keys=True)
+                            if holder
+                            else "unavailable"
+                        )
+                        raise PersistenceRootLockedError(
+                            f"state-store persistence root is "
+                            f"locked (even after stale lock "
+                            f"removal): {self.root} "
+                            f"(holder metadata: {detail})"
+                        ) from exc
                 finally:
                     signal.alarm(old_alarm)
                     signal.signal(signal.SIGALRM, old_handler)
