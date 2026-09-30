@@ -447,6 +447,10 @@ _crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
 _validation_records: dict[str, dict[str, Any]] = {}
+_BENCHMARK_OPERATION_LEASE_TTL_SECONDS = 900.0
+_BENCHMARK_OPERATION_LEASE_RENEW_INTERVAL_SECONDS = 300.0
+_BENCHMARK_OPERATION_RENEW_RETRY_INITIAL_SECONDS = 1.0
+_BENCHMARK_OPERATION_RENEW_RETRY_MAX_SECONDS = 30.0
 
 
 def _benchmark_intent_identity(
@@ -492,6 +496,15 @@ class _BenchmarkOperation:
         self.owner = owner
         self._client = None
         self._local = None
+        self._renewal_stop: asyncio.Event | None = None
+        self._renewal_task: asyncio.Task[BaseException | None] | None = None
+        self._renewal_failure: BaseException | None = None
+        self._renewal_pending_failure: BaseException | None = None
+        self._initial_lease_deadline: float | None = None
+        self._renewal_inflight = False
+        self._renewal_state_changed: asyncio.Event | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     async def acquire(self) -> tuple[dict[str, Any], str]:
         from providers.tracing.client import TraceClient
@@ -500,9 +513,16 @@ class _BenchmarkOperation:
         url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
         if token:
             self._client = TraceClient(url, token)
+            self._initial_lease_deadline = (
+                asyncio.get_running_loop().time()
+                + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+            )
             try:
                 result = await asyncio.to_thread(
-                    self._client.operation_acquire, self.key, self.request_hash, 900
+                    self._client.operation_acquire,
+                    self.key,
+                    self.request_hash,
+                    _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
                 )
             except Exception as exc:
                 # Only a conflict proves that another worker owns the intent.
@@ -526,18 +546,201 @@ class _BenchmarkOperation:
         )
 
         self._local = TraceStore(TRACE_DB_PATH)
+        self._initial_lease_deadline = (
+            asyncio.get_running_loop().time() + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+        )
         try:
             operation, status = await asyncio.to_thread(
                 self._local.acquire_operation_result,
                 self.key,
                 self.request_hash,
                 self.owner,
-                900,
+                _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
             )
         except (OperationLeaseError, OperationTransitionError):
             operation = self._local.get_operation(self.key)
             return (operation.__dict__ if operation else {}), "in_progress"
         return operation.__dict__, status
+
+    async def start_renewal(self, operation: dict[str, Any]) -> None:
+        """Keep this fenced execution lease alive until terminalization.
+
+        The registry client is synchronous, so each renewal runs in a worker
+        thread while the Crucible process and progress callbacks use the event
+        loop. The completion callback also stops the heartbeat if the tool
+        exits through an unexpected exception or cancellation path.
+        """
+        if self._renewal_task is not None:
+            return
+        self._renewal_stop = asyncio.Event()
+        self._renewal_state_changed = asyncio.Event()
+        self._renewal_task = asyncio.create_task(
+            self._renew_operation_lease(operation, self._renewal_stop),
+            name=f"benchmark-operation-renew:{self.key}",
+        )
+        parent_task = asyncio.current_task()
+        if parent_task is not None:
+            stop = self._renewal_stop
+
+            def cleanup_after_parent(_task: asyncio.Task[Any]) -> None:
+                stop.set()
+                if self._closed:
+                    return
+
+                async def cleanup() -> None:
+                    try:
+                        await self.close()
+                    except Exception:
+                        logger.exception(
+                            "benchmark operation cleanup failed for %s", self.key
+                        )
+
+                self._cleanup_task = asyncio.create_task(
+                    cleanup(), name=f"benchmark-operation-cleanup:{self.key}"
+                )
+
+            parent_task.add_done_callback(cleanup_after_parent)
+
+    async def _renew_operation_lease(
+        self, operation: dict[str, Any], stop: asyncio.Event
+    ) -> BaseException | None:
+        loop = asyncio.get_running_loop()
+        lease_deadline = self._initial_lease_deadline or (
+            loop.time() + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+        )
+        interval = min(
+            _BENCHMARK_OPERATION_LEASE_RENEW_INTERVAL_SECONDS,
+            _BENCHMARK_OPERATION_LEASE_TTL_SECONDS / 3,
+        )
+        retry_delay: float | None = None
+        while True:
+            remaining = lease_deadline - loop.time()
+            if remaining <= 0:
+                failure = self._renewal_pending_failure or TimeoutError(
+                    "benchmark operation lease expired before renewal was confirmed"
+                )
+                self._renewal_failure = failure
+                self._renewal_state_changed.set()
+                return failure
+            wait_for = min(retry_delay or interval, remaining)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=wait_for)
+                return self._renewal_pending_failure
+            except asyncio.TimeoutError:
+                try:
+                    token = int(operation["fencing_generation"])
+                    renew_started = loop.time()
+                    self._renewal_inflight = True
+                    self._renewal_state_changed.set()
+                    if self._client is not None:
+                        renewal_result = await asyncio.to_thread(
+                            self._client.operation_transition,
+                            self.key,
+                            "renew",
+                            token,
+                            ttl_seconds=_BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                        )
+                    elif self._local is not None:
+                        renewal_result = await asyncio.to_thread(
+                            self._local.renew_operation,
+                            self.key,
+                            self.owner,
+                            token,
+                            _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                        )
+                    else:
+                        raise RuntimeError("benchmark operation registry unavailable")
+                    self._renewal_failure = None
+                    self._renewal_pending_failure = None
+                    lease_deadline = (
+                        renew_started + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+                    )
+                    renewed_operation = (
+                        renewal_result.get("operation", {})
+                        if isinstance(renewal_result, dict)
+                        else renewal_result.__dict__
+                    )
+                    renewed_expiry = renewed_operation.get("lease_expires_at")
+                    if renewed_expiry:
+                        try:
+                            expiry = datetime.fromisoformat(renewed_expiry)
+                            remaining = (
+                                expiry - datetime.now(timezone.utc)
+                            ).total_seconds()
+                            lease_deadline = min(
+                                lease_deadline,
+                                loop.time() + max(0.0, remaining),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    self._renewal_inflight = False
+                    self._renewal_state_changed.set()
+                    retry_delay = None
+                except Exception as exc:
+                    self._renewal_pending_failure = exc
+                    self._renewal_inflight = False
+                    self._renewal_state_changed.set()
+                    if self._authoritative_lease_rejection(exc):
+                        self._renewal_failure = exc
+                        return exc
+                    retry_delay = min(
+                        _BENCHMARK_OPERATION_RENEW_RETRY_INITIAL_SECONDS
+                        if retry_delay is None
+                        else retry_delay * 2,
+                        _BENCHMARK_OPERATION_RENEW_RETRY_MAX_SECONDS,
+                    )
+
+    @staticmethod
+    def _authoritative_lease_rejection(exc: BaseException) -> bool:
+        """Recognize registry responses proving this fencing lease is stale."""
+        cause: BaseException | None = exc
+        while cause is not None:
+            if type(cause).__name__ in {
+                "OperationLeaseError",
+                "OperationTransitionError",
+            }:
+                return True
+            status_code = getattr(getattr(cause, "response", None), "status_code", None)
+            if status_code == 409:
+                return True
+            cause = cause.__cause__
+        return False
+
+    async def _await_renewal_resolution(self) -> None:
+        """Let transient renewal failures retry before finalizing the operation."""
+        task = self._renewal_task
+        changed = self._renewal_state_changed
+        if task is None or changed is None:
+            return
+        while not task.done():
+            changed.clear()
+            if not self._renewal_inflight and self._renewal_pending_failure is None:
+                return
+            if task.done():
+                break
+            await changed.wait()
+
+    async def stop_renewal(self) -> BaseException | None:
+        """Stop and join renewal before mutating or closing the operation."""
+        task = self._renewal_task
+        stop = self._renewal_stop
+        if task is None or stop is None:
+            return self._renewal_failure or self._renewal_pending_failure
+        stop.set()
+        try:
+            failure = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Let an in-flight synchronous renewal finish before its client is
+            # closed. The caller's cancellation is still propagated.
+            try:
+                await task
+            finally:
+                self._renewal_task = None
+                self._renewal_stop = None
+            raise
+        self._renewal_task = None
+        self._renewal_stop = None
+        return failure or self._renewal_failure or self._renewal_pending_failure
 
     async def transition(
         self, action: str, operation: dict[str, Any], **kwargs: Any
@@ -571,10 +774,16 @@ class _BenchmarkOperation:
         return result.__dict__
 
     async def close(self) -> None:
-        if self._client is not None:
-            await asyncio.to_thread(self._client.close)
-        if self._local is not None:
-            self._local.close()
+        if self._closed:
+            return
+        await self.stop_renewal()
+        try:
+            if self._client is not None:
+                await asyncio.to_thread(self._client.close)
+            if self._local is not None:
+                self._local.close()
+        finally:
+            self._closed = True
 
     async def terminalize(
         self,
@@ -583,9 +792,48 @@ class _BenchmarkOperation:
         descriptor: dict[str, Any],
     ) -> bool:
         """Persist a terminal outcome; retry ambiguous writes as indeterminate."""
+        await self._await_renewal_resolution()
+        renewal_failure = await self.stop_renewal()
+        renewal_failed = renewal_failure is not None
+        if renewal_failed:
+            requested_outcome = outcome
+            benchmark_result = descriptor.get("benchmark_result")
+            outcome = "indeterminate"
+            failure_descriptor: dict[str, Any] = {
+                key: value
+                for key, value in descriptor.items()
+                if key not in {"outcome", "benchmark_result"}
+            }
+            failure_descriptor.update(
+                {
+                    "outcome": "lease_renewal_failed",
+                    "requested_outcome": requested_outcome,
+                    "renewal_error_type": type(renewal_failure).__name__,
+                }
+            )
+            if isinstance(benchmark_result, dict):
+                compact_result = {
+                    key: benchmark_result[key]
+                    for key in (
+                        "exit_code",
+                        "harness",
+                        "run_id",
+                        "run_dir",
+                        "validation_id",
+                    )
+                    if key in benchmark_result
+                }
+                compact_result.update(
+                    {
+                        "status": "indeterminate",
+                        "message": "Lease renewal was not confirmed; reconcile this run",
+                    }
+                )
+                failure_descriptor["benchmark_result"] = compact_result
+            descriptor = failure_descriptor
         try:
             await self.transition(outcome, operation, descriptor=descriptor)
-            return True
+            return not renewal_failed
         except Exception:
             logger.exception("benchmark operation terminal write failed")
             if outcome != "indeterminate":
@@ -598,10 +846,10 @@ class _BenchmarkOperation:
                             "terminal_write_failed": True,
                         },
                     )
-                    return True
+                    return False
                 except Exception:
                     logger.exception("benchmark operation indeterminate write failed")
-            return False
+        return False
 
 
 async def _ensure_init():
@@ -2605,6 +2853,8 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        if harness_name == "crucible":
+            await operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
@@ -3731,6 +3981,7 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        await operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
@@ -3964,6 +4215,7 @@ async def execute_benchmark(
                     "outcome": "indeterminate",
                     "external_id_persist_failed": True,
                     "error_type": type(exc).__name__,
+                    "known_external_ids": {"run_id": run_id, "run_dir": run_dir},
                 },
             )
             await operation_guard.close()
