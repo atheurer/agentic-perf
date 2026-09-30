@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import agents.benchmark.agent as benchmark_agent_module
 from agents.benchmark.agent import BenchmarkAgent
 from providers.llm.base import LLMResponse, ToolCall
 
@@ -179,6 +180,123 @@ async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellat
         "workflow_execution_cancel",
         {"execution_id": "late-execution-1"},
     ) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
+    monkeypatch,
+    caplog,
+):
+    class _HungLaunchWorkflowMCP(_WorkflowMCP):
+        def __init__(self):
+            super().__init__(exported_payload='{"duration":300}')
+            self.launch_started = asyncio.Event()
+            self.release_launch = asyncio.Event()
+            self.launch_finished = asyncio.Event()
+
+        async def call_tool(self, name: str, arguments: dict) -> str:
+            if name == "workflow_execute":
+                self.calls.append((name, arguments))
+                self.launch_started.set()
+                while not self.release_launch.is_set():
+                    try:
+                        await self.release_launch.wait()
+                    except asyncio.CancelledError:
+                        continue
+                self.launch_finished.set()
+                return json.dumps({"execution_id": "late-but-unreconciled"})
+            return await super().call_tool(name, arguments)
+
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    mcp = _HungLaunchWorkflowMCP()
+    agent._mcp = mcp
+    execution = asyncio.create_task(
+        agent._execute_arcaflow_workflow(
+            "https://example.test/workflow.yaml",
+            {"duration": "5m"},
+            "benchmark",
+        )
+    )
+
+    await mcp.launch_started.wait()
+    execution.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(execution, timeout=0.5)
+        assert "remote outcome is indeterminate" in caplog.text
+    finally:
+        mcp.release_launch.set()
+        await asyncio.wait_for(mcp.launch_finished.wait(), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
+    monkeypatch,
+    caplog,
+):
+    class _HungCancelWorkflowMCP(_WorkflowMCP):
+        def __init__(self):
+            super().__init__(exported_payload='{"duration":300}')
+            self.status_started = asyncio.Event()
+            self.release_cancel = asyncio.Event()
+            self.cancel_finished = asyncio.Event()
+
+        async def call_tool(self, name: str, arguments: dict) -> str:
+            if name == "workflow_execution_status":
+                self.calls.append((name, arguments))
+                self.status_started.set()
+                await asyncio.Event().wait()
+            if name == "workflow_execution_cancel":
+                self.calls.append((name, arguments))
+                while not self.release_cancel.is_set():
+                    try:
+                        await self.release_cancel.wait()
+                    except asyncio.CancelledError:
+                        continue
+                self.cancel_finished.set()
+                return json.dumps({"cancelled": True})
+            return await super().call_tool(name, arguments)
+
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    mcp = _HungCancelWorkflowMCP()
+    agent._mcp = mcp
+    execution = asyncio.create_task(
+        agent._execute_arcaflow_workflow(
+            "https://example.test/workflow.yaml",
+            {"duration": "5m"},
+            "benchmark",
+        )
+    )
+
+    await mcp.status_started.wait()
+    execution.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(execution, timeout=0.5)
+        assert "remote outcome is indeterminate" in caplog.text
+    finally:
+        mcp.release_cancel.set()
+        await asyncio.wait_for(mcp.cancel_finished.wait(), timeout=0.5)
 
 
 @pytest.mark.asyncio
