@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import AgentBase
-from agents.mcp_client import AgentMCPClient
+from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION, AgentMCPClient
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
@@ -717,13 +717,10 @@ class BenchmarkAgent(AgentBase):
             task: asyncio.Task[Any],
             *,
             operation: str,
+            deadline: float,
         ) -> bool:
             """Bound reconciliation, cancel late work, and observe its result."""
             loop = asyncio.get_running_loop()
-            deadline = (
-                loop.time()
-                + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
-            )
             while not task.done():
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -739,9 +736,9 @@ class BenchmarkAgent(AgentBase):
             if task.done():
                 return True
 
-            task.cancel("agentic-perf-arcaflow-reconciliation-timeout")
+            task.cancel(_MCP_TIMEOUT_CANCELLATION)
             stop_deadline = (
-                loop.time() + _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS
+                deadline + _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS
             )
             while not task.done():
                 remaining = stop_deadline - loop.time()
@@ -766,6 +763,8 @@ class BenchmarkAgent(AgentBase):
 
         async def _cancel_execution_after_cancellation(
             execution_id: str,
+            *,
+            deadline: float,
         ) -> None:
             cancel_task = asyncio.create_task(
                 mcp.call_tool(
@@ -773,7 +772,11 @@ class BenchmarkAgent(AgentBase):
                     {"execution_id": execution_id},
                 )
             )
-            if not await _wait_for_inflight(cancel_task, operation="cancel"):
+            if not await _wait_for_inflight(
+                cancel_task,
+                operation="cancel",
+                deadline=deadline,
+            ):
                 return
             try:
                 cancel_task.result()
@@ -830,9 +833,14 @@ class BenchmarkAgent(AgentBase):
             # The engine may have accepted the launch before cancellation
             # interrupted its response. Let the audited MCP call finish within
             # a bounded window so we can recover its execution ID and cancel.
+            reconciliation_deadline = (
+                asyncio.get_running_loop().time()
+                + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
+            )
             launch_finished = await _wait_for_inflight(
                 launch_task,
                 operation="launch",
+                deadline=reconciliation_deadline,
             )
             execution_id = ""
             if launch_finished:
@@ -848,8 +856,16 @@ class BenchmarkAgent(AgentBase):
                         "execution outcome is indeterminate (error_type=%s)",
                         type(e).__name__,
                     )
+            if launch_finished and not execution_id:
+                logger.warning(
+                    "Arcaflow launch completed without a usable execution ID "
+                    "after caller cancellation; remote outcome is indeterminate"
+                )
             if execution_id:
-                await _cancel_execution_after_cancellation(execution_id)
+                await _cancel_execution_after_cancellation(
+                    execution_id,
+                    deadline=reconciliation_deadline,
+                )
             raise launch_cancellation
         except Exception as e:
             return json.dumps(
@@ -900,7 +916,14 @@ class BenchmarkAgent(AgentBase):
             # successful return. Finish the audited cancel request before
             # re-raising caller cancellation.
             if execution_id:
-                await _cancel_execution_after_cancellation(execution_id)
+                deadline = (
+                    asyncio.get_running_loop().time()
+                    + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
+                )
+                await _cancel_execution_after_cancellation(
+                    execution_id,
+                    deadline=deadline,
+                )
             raise
 
         # 5. Get output

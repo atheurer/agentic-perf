@@ -7,6 +7,7 @@ import pytest
 
 import agents.benchmark.agent as benchmark_agent_module
 from agents.benchmark.agent import BenchmarkAgent
+from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION
 from providers.llm.base import LLMResponse, ToolCall
 
 
@@ -183,6 +184,83 @@ async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellat
 
 
 @pytest.mark.asyncio
+async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline(
+    monkeypatch,
+):
+    class _SharedDeadlineWorkflowMCP(_WorkflowMCP):
+        def __init__(self):
+            super().__init__(exported_payload='{"duration":300}')
+            self.launch_started = asyncio.Event()
+            self.release_launch = asyncio.Event()
+            self.cancel_started = asyncio.Event()
+            self.cancel_finished = asyncio.Event()
+            self.cancel_started_at = 0.0
+            self.cancel_finished_at = 0.0
+            self.cancel_reason: tuple = ()
+
+        async def call_tool(self, name: str, arguments: dict) -> str:
+            if name == "workflow_execute":
+                self.calls.append((name, arguments))
+                self.launch_started.set()
+                await self.release_launch.wait()
+                return json.dumps({"execution_id": "late-execution-2"})
+            if name == "workflow_execution_cancel":
+                self.calls.append((name, arguments))
+                self.cancel_started_at = asyncio.get_running_loop().time()
+                self.cancel_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as exc:
+                    self.cancel_reason = exc.args
+                    self.cancel_finished_at = asyncio.get_running_loop().time()
+                    self.cancel_finished.set()
+                    raise
+            return await super().call_tool(name, arguments)
+
+    reconciliation_timeout = 0.15
+    stop_grace = 0.03
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS",
+        reconciliation_timeout,
+    )
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
+        stop_grace,
+    )
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    mcp = _SharedDeadlineWorkflowMCP()
+    agent._mcp = mcp
+    execution = asyncio.create_task(
+        agent._execute_arcaflow_workflow(
+            "https://example.test/workflow.yaml",
+            {"duration": "5m"},
+            "benchmark",
+        )
+    )
+
+    async def release_late_launch() -> None:
+        await asyncio.sleep(0.1)
+        mcp.release_launch.set()
+
+    await mcp.launch_started.wait()
+    release_task = asyncio.create_task(release_late_launch())
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(execution, timeout=0.5)
+    await release_task
+
+    assert mcp.cancel_started.is_set()
+    assert mcp.cancel_finished.is_set()
+    assert mcp.cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
+    assert (
+        mcp.cancel_finished_at - mcp.cancel_started_at
+        < reconciliation_timeout * 0.75
+    )
+
+
+@pytest.mark.asyncio
 async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
     monkeypatch,
     caplog,
@@ -193,6 +271,7 @@ async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
             self.launch_started = asyncio.Event()
             self.release_launch = asyncio.Event()
             self.launch_finished = asyncio.Event()
+            self.launch_cancel_reason: tuple = ()
 
         async def call_tool(self, name: str, arguments: dict) -> str:
             if name == "workflow_execute":
@@ -201,7 +280,8 @@ async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
                 while not self.release_launch.is_set():
                     try:
                         await self.release_launch.wait()
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as exc:
+                        self.launch_cancel_reason = exc.args
                         continue
                 self.launch_finished.set()
                 return json.dumps({"execution_id": "late-but-unreconciled"})
@@ -234,6 +314,7 @@ async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(execution, timeout=0.5)
         assert "remote outcome is indeterminate" in caplog.text
+        assert mcp.launch_cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
     finally:
         mcp.release_launch.set()
         await asyncio.wait_for(mcp.launch_finished.wait(), timeout=0.5)
@@ -250,6 +331,7 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
             self.status_started = asyncio.Event()
             self.release_cancel = asyncio.Event()
             self.cancel_finished = asyncio.Event()
+            self.cancel_reason: tuple = ()
 
         async def call_tool(self, name: str, arguments: dict) -> str:
             if name == "workflow_execution_status":
@@ -261,7 +343,8 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
                 while not self.release_cancel.is_set():
                     try:
                         await self.release_cancel.wait()
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as exc:
+                        self.cancel_reason = exc.args
                         continue
                 self.cancel_finished.set()
                 return json.dumps({"cancelled": True})
@@ -294,6 +377,7 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(execution, timeout=0.5)
         assert "remote outcome is indeterminate" in caplog.text
+        assert mcp.cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
     finally:
         mcp.release_cancel.set()
         await asyncio.wait_for(mcp.cancel_finished.wait(), timeout=0.5)
