@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS = 30.0
 _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS = 1.0
+_ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS = 5.0
 
 
 def _filter_external_tools(
@@ -833,14 +834,26 @@ class BenchmarkAgent(AgentBase):
             # The engine may have accepted the launch before cancellation
             # interrupted its response. Let the audited MCP call finish within
             # a bounded window so we can recover its execution ID and cancel.
+            loop = asyncio.get_running_loop()
+            cancellation_started = loop.time()
             reconciliation_deadline = (
-                asyncio.get_running_loop().time()
+                cancellation_started
                 + _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS
+            )
+            launch_reserve = min(
+                _ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS,
+                _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS * 0.2,
+            )
+            launch_deadline = max(
+                cancellation_started,
+                reconciliation_deadline
+                - launch_reserve
+                - _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS,
             )
             launch_finished = await _wait_for_inflight(
                 launch_task,
                 operation="launch",
-                deadline=reconciliation_deadline,
+                deadline=launch_deadline,
             )
             execution_id = ""
             if launch_finished:

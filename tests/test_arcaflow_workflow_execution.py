@@ -184,7 +184,7 @@ async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellat
 
 
 @pytest.mark.asyncio
-async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline(
+async def test_arcaflow_late_launch_during_stop_grace_dispatches_cancel_before_deadline(
     monkeypatch,
 ):
     class _SharedDeadlineWorkflowMCP(_WorkflowMCP):
@@ -197,12 +197,17 @@ async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline
             self.cancel_started_at = 0.0
             self.cancel_finished_at = 0.0
             self.cancel_reason: tuple = ()
+            self.launch_cancel_reason: tuple = ()
 
         async def call_tool(self, name: str, arguments: dict) -> str:
             if name == "workflow_execute":
                 self.calls.append((name, arguments))
                 self.launch_started.set()
-                await self.release_launch.wait()
+                try:
+                    await self.release_launch.wait()
+                except asyncio.CancelledError as exc:
+                    self.launch_cancel_reason = exc.args
+                    await self.release_launch.wait()
                 return json.dumps({"execution_id": "late-execution-2"})
             if name == "workflow_execution_cancel":
                 self.calls.append((name, arguments))
@@ -219,6 +224,7 @@ async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline
 
     reconciliation_timeout = 0.15
     stop_grace = 0.03
+    launch_cancel_reserve = 0.03
     monkeypatch.setattr(
         benchmark_agent_module,
         "_ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS",
@@ -228,6 +234,11 @@ async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline
         benchmark_agent_module,
         "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
         stop_grace,
+    )
+    monkeypatch.setattr(
+        benchmark_agent_module,
+        "_ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS",
+        launch_cancel_reserve,
     )
     agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _SharedDeadlineWorkflowMCP()
@@ -241,11 +252,12 @@ async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline
     )
 
     async def release_late_launch() -> None:
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.105)
         mcp.release_launch.set()
 
     await mcp.launch_started.wait()
     release_task = asyncio.create_task(release_late_launch())
+    cancellation_started = asyncio.get_running_loop().time()
     execution.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(execution, timeout=0.5)
@@ -254,6 +266,8 @@ async def test_arcaflow_late_launch_and_cancel_share_one_reconciliation_deadline
     assert mcp.cancel_started.is_set()
     assert mcp.cancel_finished.is_set()
     assert mcp.cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
+    assert mcp.launch_cancel_reason == (_MCP_TIMEOUT_CANCELLATION,)
+    assert mcp.cancel_started_at < cancellation_started + reconciliation_timeout
     assert (
         mcp.cancel_finished_at - mcp.cancel_started_at
         < reconciliation_timeout * 0.75
