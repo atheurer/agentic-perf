@@ -22,6 +22,11 @@ class GateError(RuntimeError):
     """The live gate could not safely complete."""
 
 
+MAX_SLEEP_SECONDS = 20 * 60
+MIN_GATE_OVERHEAD_SECONDS = 20 * 60
+DEFAULT_TIMEOUT_SECONDS = 60 * 60
+
+
 @dataclass(frozen=True)
 class ClientTarget:
     """One approved Crucible client engine and host."""
@@ -41,7 +46,7 @@ class GateConfig:
     seconds: int = 5
     samples: int = 1
     poll_seconds: float = 2.0
-    timeout_seconds: int = 1800
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
     @classmethod
     def from_runtime(
@@ -51,7 +56,7 @@ class GateConfig:
         runtime: dict[str, Any],
         *,
         seconds: int = 5,
-        timeout_seconds: int = 1800,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> GateConfig:
         if not controller.strip() or not system_under_test.strip():
             raise GateError("controller and system-under-test hostnames are required")
@@ -73,8 +78,15 @@ class GateConfig:
             seconds=seconds,
             timeout_seconds=timeout_seconds,
         )
-        if not 1 <= config.seconds <= 30:
-            raise GateError("seconds must be between 1 and 30")
+        if not 1 <= config.seconds <= MAX_SLEEP_SECONDS:
+            raise GateError(
+                f"seconds must be between 1 and {MAX_SLEEP_SECONDS} for this live gate"
+            )
+        if config.timeout_seconds < config.seconds + MIN_GATE_OVERHEAD_SECONDS:
+            raise GateError(
+                "total timeout must leave at least "
+                f"{MIN_GATE_OVERHEAD_SECONDS} seconds for setup and teardown"
+            )
         if config.samples != 1:
             raise GateError("the live gate requires exactly one sample")
         if not re.fullmatch(r"[A-Za-z0-9._-]+", config.ssh_user):
@@ -245,6 +257,22 @@ def _pending_approval(ticket: dict[str, Any]) -> dict[str, Any]:
             f"approval pause must contain exactly one pending request, found {len(pending)}"
         )
     return pending[0]
+
+
+def _resume_after_approval(
+    client: httpx.Client, ticket_id: str, ticket: dict[str, Any]
+) -> None:
+    previous_status = ticket.get("previous_status")
+    if previous_status:
+        _request(
+            client,
+            "POST",
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": previous_status,
+                "comment": "Benchmark approval resolved; resuming pipeline",
+            },
+        )
 
 
 def _description(config: GateConfig) -> str:
@@ -549,6 +577,7 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                             ),
                         },
                     )
+                    _resume_after_approval(client, ticket_id, ticket)
                     approved = True
                 time.sleep(config.poll_seconds)
             if closed_with_claim:
@@ -613,7 +642,7 @@ def main() -> int:
     parser.add_argument("system_under_test", help="single remote system hostname")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--seconds", type=int, default=5)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--services-already-running",
         action="store_true",

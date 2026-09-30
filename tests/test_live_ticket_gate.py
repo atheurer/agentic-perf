@@ -35,6 +35,39 @@ def test_config_uses_runtime_ssh_settings() -> None:
     assert result.ssh_key_path == "/private/key"
 
 
+def test_config_allows_twenty_minute_sleep_with_gate_headroom() -> None:
+    result = gate.GateConfig.from_runtime(
+        "controller.invalid",
+        "client-one.invalid",
+        {"ssh_key": "/private/key"},
+        seconds=20 * 60,
+        timeout_seconds=60 * 60,
+    )
+    assert result.seconds == 1200
+    assert result.timeout_seconds == 3600
+
+
+def test_config_rejects_twenty_minute_sleep_without_gate_headroom() -> None:
+    with pytest.raises(gate.GateError, match="setup and teardown"):
+        gate.GateConfig.from_runtime(
+            "controller.invalid",
+            "client-one.invalid",
+            {"ssh_key": "/private/key"},
+            seconds=20 * 60,
+            timeout_seconds=2399,
+        )
+
+
+def test_config_rejects_sleep_longer_than_twenty_minutes() -> None:
+    with pytest.raises(gate.GateError, match="seconds must be between"):
+        gate.GateConfig.from_runtime(
+            "controller.invalid",
+            "client-one.invalid",
+            {"ssh_key": "/private/key"},
+            seconds=20 * 60 + 1,
+        )
+
+
 def test_config_rejects_hostnames_that_could_be_ssh_options() -> None:
     with pytest.raises(gate.GateError, match="unsupported characters"):
         gate.GateConfig.from_runtime(
@@ -158,6 +191,47 @@ def test_pending_approval_rejects_missing_request() -> None:
         gate._pending_approval({"custom_fields": {}})
 
 
+def test_resolved_approval_resumes_previous_ticket_status(monkeypatch) -> None:
+    requests = []
+    monkeypatch.setattr(
+        gate,
+        "_request",
+        lambda client, method, path, **kwargs: requests.append((method, path, kwargs)),
+    )
+
+    gate._resume_after_approval(
+        object(), "PERF-12345678", {"previous_status": "executing_benchmark"}
+    )
+
+    assert requests == [
+        (
+            "POST",
+            "/api/v1/tickets/PERF-12345678/transition",
+            {
+                "json": {
+                    "status": "executing_benchmark",
+                    "comment": "Benchmark approval resolved; resuming pipeline",
+                }
+            },
+        )
+    ]
+
+
+def test_resolved_approval_without_previous_status_does_not_transition(
+    monkeypatch,
+) -> None:
+    requests = []
+    monkeypatch.setattr(
+        gate,
+        "_request",
+        lambda *args, **kwargs: requests.append((args, kwargs)),
+    )
+
+    gate._resume_after_approval(object(), "PERF-12345678", {})
+
+    assert requests == []
+
+
 def safe_run_file() -> dict:
     return {
         "benchmarks": [
@@ -195,6 +269,22 @@ def safe_run_file() -> dict:
 
 def test_policy_accepts_exact_one_client_sleep_run() -> None:
     gate.validate_run_file(safe_run_file(), config())
+
+
+def test_policy_accepts_twenty_minute_sleep_run() -> None:
+    run_file = safe_run_file()
+    run_file["benchmarks"][0]["mv-params"]["global-options"][0]["params"][0]["vals"] = [
+        "1200"
+    ]
+    long_config = gate.GateConfig(
+        controller="controller.invalid",
+        client=gate.ClientTarget(1, "client-one.invalid"),
+        ssh_user="root",
+        ssh_key_path="/private/key",
+        seconds=1200,
+        timeout_seconds=3600,
+    )
+    gate.validate_run_file(run_file, long_config)
 
 
 @pytest.mark.parametrize("location", ["endpoint", "remote"])
