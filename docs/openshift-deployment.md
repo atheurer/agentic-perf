@@ -198,6 +198,21 @@ data:
     }
 ```
 
+## RBAC for Stale Lock Recovery
+
+When using PVC-backed persistence, the state store detects stale
+locks left by previous pods via the Kubernetes API. This requires
+narrowly scoped pod-read RBAC:
+
+```bash
+oc apply -f deploy/lock-recovery-rbac.yaml -n <namespace>
+```
+
+Without this, cross-pod lock recovery fails closed (the new pod
+cannot verify whether the previous pod is dead) and requires
+manual lock file removal. The Role grants only `get` on `pods` —
+no list, watch, or delete access.
+
 ## PVC
 
 ```yaml

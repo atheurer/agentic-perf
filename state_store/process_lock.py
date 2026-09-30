@@ -68,10 +68,20 @@ def _k8s_pod_exists(hostname: str) -> bool | None:
         urllib.request.urlopen(req, context=ctx, timeout=5)
         return True
     except Exception as exc:
+        code = getattr(exc, "code", None)
         # 404 = pod definitively gone
-        if hasattr(exc, "code") and exc.code == 404:  # type: ignore[union-attr]
+        if code == 404:
             return False
-        # Any other error = inconclusive
+        # 403 = RBAC not configured.  Log so operators know
+        # to apply deploy/lock-recovery-rbac.yaml.
+        if code == 403:
+            logger.warning(
+                "K8s pod check returned 403 Forbidden for '%s'. "
+                "Cross-pod stale lock recovery requires pod-read "
+                "RBAC. Apply deploy/lock-recovery-rbac.yaml to "
+                "enable automatic recovery.",
+                hostname,
+            )
         return None
 
 
