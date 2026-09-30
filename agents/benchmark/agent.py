@@ -740,7 +740,9 @@ class BenchmarkAgent(AgentBase):
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
-        harness = cf.get("directives", {}).get("harness", "crucible")
+        harness = self._effective_harness(
+            cf.get("directives", {}), self._skill_provider
+        )
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
         if harness != "crucible" and skills_dir.is_dir():
