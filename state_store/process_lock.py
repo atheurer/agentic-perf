@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import signal
 import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Seconds to wait for a stale flock to release on network
+# filesystems (Ceph RBD, NFS) where kernel flocks may not
+# be released immediately when a pod is killed.
+_STALE_FLOCK_TIMEOUT_SECS = 30
 
 from paths import STATE_STORE_ID_PATH, STATE_STORE_LOCK_PATH
 from providers.execution import AuditedFilesystem
@@ -32,18 +41,80 @@ def _process_start_identity(pid: int | None = None) -> str:
         return str(pid)
 
 
-def _holder_alive(holder: dict) -> bool:
-    """Check if the lock holder process is still the same incarnation.
+def _k8s_pod_exists(hostname: str) -> bool | None:
+    """Check whether a Kubernetes pod with the given name exists.
 
-    In containers, PIDs are recycled across restarts.
-    Comparing the process_start_identity (kernel start-time
-    tick) ensures we don't mistake a new process at the
-    same PID for the original holder.
+    Returns True if the pod exists, False if the API confirms it
+    does not (404), or None if the API is unavailable (not running
+    in K8s, no permissions, network error).
     """
+    token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    ca_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    ns_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+    if not token_path.exists():
+        return None
+    try:
+        token = token_path.read_text().strip()
+        namespace = ns_path.read_text().strip()
+        import ssl
+        import urllib.request
+
+        ctx = ssl.create_default_context(cafile=str(ca_path))
+        url = (
+            f"https://kubernetes.default.svc/api/v1"
+            f"/namespaces/{namespace}/pods/{hostname}"
+        )
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        urllib.request.urlopen(req, context=ctx, timeout=5)
+        return True
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        # 404 = pod definitively gone
+        if code == 404:
+            return False
+        # 403 = RBAC not configured.  Log so operators know
+        # to apply deploy/lock-recovery-rbac.yaml.
+        if code == 403:
+            logger.warning(
+                "K8s pod check returned 403 Forbidden for '%s'. "
+                "Cross-pod stale lock recovery requires pod-read "
+                "RBAC. Apply deploy/lock-recovery-rbac.yaml to "
+                "enable automatic recovery.",
+                hostname,
+            )
+        return None
+
+
+def _holder_alive(holder: dict) -> bool:
+    """Check if the lock holder is still alive.
+
+    Uses a layered approach:
+    1. Same hostname: PID + incarnation identity check (kernel-level,
+       valid within the same PID namespace).
+    2. Different hostname with K8s API: authoritative pod existence
+       check via the Kubernetes API.  A 404 proves the pod is dead.
+    3. Different hostname without K8s API: fail closed (assume alive)
+       because os.kill only checks the local PID namespace.
+    """
+    holder_hostname = holder.get("hostname", "")
+    my_hostname = socket.gethostname()
+
+    if holder_hostname and holder_hostname != my_hostname:
+        # Cross-pod scenario: PID check is unreliable (different
+        # PID namespaces).  Use the Kubernetes API as the
+        # authoritative fence.
+        k8s_alive = _k8s_pod_exists(holder_hostname)
+        if k8s_alive is False:
+            # K8s API confirms the pod is gone.
+            return False
+        # k8s_alive is True (pod exists) or None (API unavailable).
+        # Either way, fail closed — do not assume the holder is dead.
+        return True
+
+    # Same hostname (or no hostname recorded): PID check is valid
+    # within this PID namespace.
     pid_value = holder.get("pid")
     if pid_value is None:
-        # Unknown metadata must fail closed.  It is not evidence that the
-        # kernel lock is stale.
         return True
     try:
         pid = int(pid_value)
@@ -58,17 +129,13 @@ def _holder_alive(holder: dict) -> bool:
     except PermissionError:
         pass
     except OSError:
-        # An inability to inspect the process is not proof that it is dead.
         return True
     # PID exists — verify it's the same incarnation.
     holder_identity = holder.get("process_start_identity", "")
     if not holder_identity:
-        # No identity recorded — can't verify, assume alive.
         return True
     current_identity = _process_start_identity(pid)
     if current_identity == str(pid) and holder_identity != str(pid):
-        # The platform-specific identity was unavailable, so do not treat a
-        # live lock holder as stale merely because verification was degraded.
         return True
     return current_identity == holder_identity
 
@@ -146,29 +213,59 @@ class PersistenceRootLock:
             holder = _read_metadata(path=path)
             # If the holder process is no longer the same
             # incarnation, the lock is stale (e.g., container
-            # restart with PVC).  Force-acquire.
+            # restart with PVC).  Force-acquire by blocking
+            # on the SAME inode with a timeout.
             if not _holder_alive(holder):
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "Stale lock held by dead process %s — force-acquiring",
-                    holder.get("process_start_identity", holder.get("pid")),
+                logger.warning(
+                    "Stale lock held by dead process %s — "
+                    "waiting up to %ds for flock release",
+                    holder.get(
+                        "process_start_identity",
+                        holder.get("pid"),
+                    ),
+                    _STALE_FLOCK_TIMEOUT_SECS,
                 )
+
+                # Use a blocking flock with SIGALRM timeout.
+                # This avoids the unlink race: we never delete
+                # the lock file, so competing starters cannot
+                # acquire different inodes.  On local filesystems
+                # the flock is already released (the process is
+                # dead); on network filesystems (Ceph RBD) it
+                # may take a few seconds for the server to
+                # reclaim it.
+                def _alarm_handler(signum: int, frame: object) -> None:
+                    raise OSError("Timed out waiting for stale flock")
+
+                old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+                old_alarm = signal.alarm(_STALE_FLOCK_TIMEOUT_SECS)
                 try:
-                    # A kernel flock is released when its owning process dies;
-                    # retry non-blocking so a stale metadata file can never
-                    # make a contender hang behind a live lock.
-                    filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                    filesystem.lock_descriptor(fd, fcntl.LOCK_EX)
+                except OSError:
+                    # Timeout — the flock is genuinely stuck on
+                    # the network filesystem.  Do NOT unlink and
+                    # recreate: that creates a second inode and
+                    # two processes could each lock a different
+                    # one (split-brain).  Raise so the operator
+                    # can intervene.
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
                     filesystem.forget_descriptor(fd)
                     os.close(fd)
                     detail = (
                         json.dumps(holder, sort_keys=True) if holder else "unavailable"
                     )
                     raise PersistenceRootLockedError(
-                        f"state-store persistence root is locked: {self.root} "
+                        f"state-store persistence root is "
+                        f"locked (stale flock not released "
+                        f"after {_STALE_FLOCK_TIMEOUT_SECS}s "
+                        f"— manual lock file removal required): "
+                        f"{self.root} "
                         f"(holder metadata: {detail})"
                     ) from exc
+                finally:
+                    signal.alarm(old_alarm)
+                    signal.signal(signal.SIGALRM, old_handler)
             else:
                 filesystem.forget_descriptor(fd)
                 os.close(fd)
