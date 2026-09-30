@@ -721,7 +721,7 @@ class BenchmarkAgent(AgentBase):
 
         # 2. Export the validated input
         try:
-            await mcp.call_tool(
+            exported_result = await mcp.call_tool(
                 "workflow_input_export",
                 {"input": input},
             )
@@ -738,7 +738,7 @@ class BenchmarkAgent(AgentBase):
         try:
             exec_result = await mcp.call_tool(
                 "workflow_execute",
-                {"input": input},
+                {"input": exported_result},
             )
             exec_data = json.loads(exec_result)
         except Exception as e:
@@ -785,15 +785,27 @@ class BenchmarkAgent(AgentBase):
             )
 
         # 5. Get output
-        output = {}
         try:
             output_result = await mcp.call_tool(
                 "workflow_execution_output",
                 {"execution_id": execution_id},
             )
             output = json.loads(output_result)
-        except Exception:
-            pass
+        except Exception as e:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "harness": "arcaflow-workflows",
+                    "execution_id": execution_id,
+                    "workflow_source": workflow_source,
+                    "workflow_name": workflow_name or "",
+                    "execution_state": state,
+                    "output": None,
+                    "error": f"workflow_execution_output failed: {e}",
+                    "message": "Arcaflow workflow output retrieval failed",
+                }
+            )
 
         return json.dumps(
             {
