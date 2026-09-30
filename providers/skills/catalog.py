@@ -28,6 +28,7 @@ STANDALONE_BENCHMARKS = (
         min_hosts=1,
         harness="boot-time",
         execution_model=EXECUTION_MODEL_DIRECT,
+        self_installing=True,
     ),
 )
 

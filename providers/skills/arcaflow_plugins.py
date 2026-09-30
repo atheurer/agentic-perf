@@ -830,6 +830,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                     harness="arcaflow-plugins",
                     architectures=info.get("architectures", []),
                     execution_model=EXECUTION_MODEL_DIRECT,
+                    self_installing=True,
                 )
             )
         return results
@@ -849,6 +850,7 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             harness="arcaflow-plugins",
             architectures=info.get("architectures", []),
             execution_model=EXECUTION_MODEL_DIRECT,
+            self_installing=True,
         )
 
     async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:

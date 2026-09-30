@@ -32,6 +32,10 @@ class BenchmarkSuite:
     source: dict[str, Any] = field(default_factory=dict)
     architectures: list[str] = field(default_factory=list)
     execution_model: str = EXECUTION_MODEL_CONTROLLER
+    # True when the harness needs no host-side installation.
+    # The provisioning agent auto-completes for self-installing
+    # harnesses on Jumpstarter boards.
+    self_installing: bool = False
 
 
 @dataclass

@@ -94,13 +94,33 @@ class ProvisioningAgent(AgentBase):
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
 
-    # Harnesses that need no provisioning setup beyond
-    # flash + boot. These get a reduced tool set and
-    # provisioning_complete override. Extend this set
-    # when adding new self-contained harnesses.
-    _SELF_INSTALLING: frozenset[str] = frozenset(
-        {"boot-time", "arcaflow-plugins", "arcaflow-workflows"}
-    )
+    async def _is_self_installing(self, harness: str) -> bool:
+        """Check whether a harness needs host-side installation.
+
+        Queries the skill provider's BenchmarkSuite metadata.
+        Self-installing harnesses (containers, built-in tools)
+        need no provisioning beyond flash + boot.
+        """
+        provider = getattr(self, "_skill_provider", None)
+        if provider is not None:
+            harness_provider = None
+            if hasattr(provider, "get_provider"):
+                harness_provider = provider.get_provider(harness)
+            if harness_provider is not None:
+                try:
+                    suites = await harness_provider.list_benchmarks()
+                    if suites:
+                        return suites[0].self_installing
+                except Exception:
+                    pass
+        # Standalone benchmarks (boot-time) are checked via
+        # the catalog's STANDALONE_BENCHMARKS tuple.
+        from providers.skills.catalog import STANDALONE_BENCHMARKS
+
+        for suite in STANDALONE_BENCHMARKS:
+            if suite.harness == harness:
+                return suite.self_installing
+        return False
 
     _PROVISIONING_DENY_TOOLS: frozenset[str] = frozenset(
         {
@@ -366,11 +386,7 @@ class ProvisioningAgent(AgentBase):
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Hide install/config tools for self-installing harnesses."""
-        harness = self._effective_harness(
-            ticket.get("custom_fields", {}).get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
-        if harness in self._SELF_INSTALLING:
+        if getattr(self, "_harness_self_installing", False):
             self.tools = [
                 t for t in self.tools if t.name not in self._PROVISIONING_DENY_TOOLS
             ]
@@ -399,19 +415,18 @@ class ProvisioningAgent(AgentBase):
 
         self._mcp = mcp
 
-        # Check if this is a Jumpstarter ticket with a
-        # self-installing harness. The platform agent
-        # already handled flash/boot/verify — the
-        # provisioning agent just needs to confirm
-        # and advance.
+        # Resolve whether this harness is self-installing
+        # (no host-side provisioning needed). Cache it for
+        # use by _apply_tool_scoping and the auto-complete check.
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
         harness = self._effective_harness(
             cf.get("directives", {}), getattr(self, "_skill_provider", None)
         )
+        self._harness_self_installing = await self._is_self_installing(harness)
         is_jumpstarter = cf.get("resource_provider") == "jumpstarter"
 
-        if is_jumpstarter and (not harness or harness in self._SELF_INSTALLING):
+        if is_jumpstarter and (not harness or self._harness_self_installing):
             # Platform agent already provisioned the
             # board. For self-installing harnesses,
             # there's nothing more to do — unless
@@ -624,7 +639,7 @@ class ProvisioningAgent(AgentBase):
         prov_complete = result.get("provisioning_complete", False)
         if (
             not prov_complete
-            and harness in self._SELF_INSTALLING
+            and getattr(self, "_harness_self_installing", False)
             and result.get("hosts_provisioned")
         ):
             prov_complete = True

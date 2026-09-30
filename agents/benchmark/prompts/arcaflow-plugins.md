@@ -1,0 +1,19 @@
+## Arcaflow Plugin Execution
+
+This ticket uses a direct Arcaflow plugin container. The plugin
+runs via `podman run` on the target host (or locally when the
+target is the orchestrator node).
+
+1. Call `get_plugin_schema` with the plugin image to discover
+   available steps and input parameters.
+2. Build the input based on the schema and ticket parameters.
+3. Call `execute_benchmark` with a run_file containing:
+   - `plugin_image`: full container image ref
+   - `plugin_step`: step name (e.g. 'sysbenchcpu', 'uperf')
+   - `input`: plugin input parameters as a dict
+   The tool handles podman run, -s flag, stdin piping, and
+   result collection.
+
+Community plugins from quay.io/arcalot are typically multi-arch
+(amd64 + arm64). Do NOT manually install workload binaries on
+the host — the plugin container is self-contained.

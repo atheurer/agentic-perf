@@ -41,6 +41,7 @@ class TestProvisioningToolScoping:
 
     def test_boot_time_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "boot-time"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
@@ -56,6 +57,7 @@ class TestProvisioningToolScoping:
 
     def test_arcaflow_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "arcaflow-plugins"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}

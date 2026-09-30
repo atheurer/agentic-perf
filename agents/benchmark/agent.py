@@ -623,44 +623,13 @@ class BenchmarkAgent(AgentBase):
             )
         if harness_fragment:
             prompt += f"\n\n{harness_fragment}"
-        if harness == "arcaflow-workflows":
-            prompt += "\n\n" + self._workflow_instructions(directives)
+        # Workflow-specific instructions are now in the
+        # arcaflow-workflows.md prompt fragment loaded above.
+        # Ticket-specific values (workflow_source, workflow_name)
+        # are in the messages context.
         if fragments:
             prompt += f"\n\n{fragments}"
         return prompt
-
-    @staticmethod
-    def _workflow_instructions(directives: dict[str, Any]) -> str:
-        """Describe the required Arcaflow MCP execution path.
-
-        Workflow MCP tools are intentionally dispatched by the model because
-        their input schemas are supplied by the configured external server.
-        Keeping the directive here makes the ticket fields operational rather
-        than merely displaying them in the initial message.
-        """
-        source = directives.get("workflow_source", "")
-        name = directives.get("workflow_name")
-        name_line = f"\n- Workflow name/path: `{name}`" if name else ""
-        return (
-            "## Arcaflow Workflow Execution (mandatory)\n"
-            "This ticket supplies an Arcaflow workflow. Do not construct a "
-            "plugin-image run-file and do not call `execute_benchmark` for "
-            "this ticket. Use the configured Arcaflow MCP tools in this "
-            "order:\n"
-            "1. Call `workflow_load` for the supplied source (and workflow "
-            "name/path when present).\n"
-            "2. Use `workflow_input_build` to construct inputs from the "
-            "workflow schema and the ticket's requested parameters.\n"
-            "3. Call `workflow_input_validate`; correct any reported input "
-            "errors before continuing.\n"
-            "4. Call `workflow_input_export` to obtain the immutable input "
-            "payload, then call `workflow_execute` with the loaded workflow "
-            "and exported input.\n"
-            "5. Use the workflow status/output tools until execution reaches "
-            "a terminal state, then submit the result with its workflow run "
-            "ID.\n\n"
-            f"- Workflow source: `{source}`{name_line}"
-        )
 
     @staticmethod
     def _compute_params_fingerprint(cf: dict[str, Any]) -> str:
@@ -735,7 +704,11 @@ class BenchmarkAgent(AgentBase):
 
         directives = cf.get("directives", {})
         if directives.get("workflow_source"):
-            content += "\n" + self._workflow_instructions(directives) + "\n"
+            source = directives["workflow_source"]
+            content += f"\n## Workflow Source\n- Source: `{source}`\n"
+            wf_name = directives.get("workflow_name")
+            if wf_name:
+                content += f"- Workflow name: `{wf_name}`\n"
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 

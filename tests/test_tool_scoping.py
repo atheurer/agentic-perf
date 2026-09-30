@@ -190,6 +190,6 @@ class TestHarnessToolScoping:
         assert "workflow_input_validate" in prompt
         assert "workflow_input_export" in prompt
         assert "workflow_execute" in prompt
-        assert "https://example.test/workflow.yaml" in prompt
-        assert "fio-workflow" in prompt
         assert "do not call `execute_benchmark`" in prompt
+        # Ticket-specific values (workflow_source URL, workflow_name)
+        # are in the messages context, not the system prompt.
