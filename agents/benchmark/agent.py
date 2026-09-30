@@ -752,37 +752,59 @@ class BenchmarkAgent(AgentBase):
 
         # 4. Poll until terminal
         execution_id = exec_data.get("execution_id", "")
+        run_id = execution_id or f"arcaflow-wf-{run_uuid}"
         max_polls = 360  # 30 minutes at 5s intervals
-        for _ in range(max_polls):
-            try:
-                status_result = await mcp.call_tool(
-                    "workflow_execution_status",
-                    {"execution_id": execution_id},
+        try:
+            for _ in range(max_polls):
+                try:
+                    status_result = await mcp.call_tool(
+                        "workflow_execution_status",
+                        {"execution_id": execution_id},
+                    )
+                    status_data = json.loads(status_result)
+                    state = status_data.get("state", "")
+                    if state in ("completed", "failed", "cancelled"):
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+            else:
+                # Cancel the orphaned workflow before returning.
+                try:
+                    await mcp.call_tool(
+                        "workflow_execution_cancel",
+                        {"execution_id": execution_id},
+                    )
+                except Exception:
+                    pass
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "run_id": run_id,
+                        "execution_id": execution_id,
+                        "error": "Workflow execution timed out after 30 minutes",
+                    }
                 )
-                status_data = json.loads(status_result)
-                state = status_data.get("state", "")
-                if state in ("completed", "failed", "cancelled"):
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(5)
-        else:
-            # Cancel the orphaned workflow before returning.
-            try:
-                await mcp.call_tool(
-                    "workflow_execution_cancel",
-                    {"execution_id": execution_id},
-                )
-            except Exception:
-                pass
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "run_id": f"arcaflow-wf-{run_uuid}",
-                    "execution_id": execution_id,
-                    "error": "Workflow execution timed out after 30 minutes",
-                }
-            )
+        except asyncio.CancelledError:
+            # Best-effort cleanup must not turn caller cancellation into a
+            # successful return. Shield the cancel request from this task's
+            # cancellation, then re-raise the original cancellation.
+            if execution_id:
+                try:
+                    await asyncio.shield(
+                        mcp.call_tool(
+                            "workflow_execution_cancel",
+                            {"execution_id": execution_id},
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Arcaflow cancellation cleanup failed "
+                        "(execution_id=%s, error_type=%s)",
+                        execution_id,
+                        type(e).__name__,
+                    )
+            raise
 
         # 5. Get output
         try:
@@ -795,7 +817,7 @@ class BenchmarkAgent(AgentBase):
             return json.dumps(
                 {
                     "status": "failed",
-                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "run_id": run_id,
                     "harness": "arcaflow-workflows",
                     "execution_id": execution_id,
                     "workflow_source": workflow_source,
@@ -810,7 +832,7 @@ class BenchmarkAgent(AgentBase):
         return json.dumps(
             {
                 "status": "completed" if state == "completed" else "failed",
-                "run_id": f"arcaflow-wf-{run_uuid}",
+                "run_id": run_id,
                 "harness": "arcaflow-workflows",
                 "execution_id": execution_id,
                 "workflow_source": workflow_source,
