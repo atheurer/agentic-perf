@@ -2012,7 +2012,11 @@ class TicketStore:
         loaded = 0
         ticket_paths = sorted(self._persist_dir.glob("PERF-*.json"))
         total = len(ticket_paths)
+        if total:
+            logger.info("Found %d ticket files to load", total)
         for index, path in enumerate(ticket_paths, start=1):
+            if index % 100 == 0:
+                logger.info("Loading tickets: %d/%d processed", index, total)
             if index % 25 == 0 or index == total:
                 record_store_status(
                     "loading_tickets",
