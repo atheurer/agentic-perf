@@ -116,13 +116,20 @@ async def audited_stdio_client(
                     lines = (buffer + chunk).split("\n")
                     buffer = lines.pop()
                     for line in lines:
+                        if not line.strip():
+                            continue
                         try:
                             message = types.JSONRPCMessage.model_validate_json(line)
-                        except Exception as exc:  # pragma: no cover
-                            logger.exception(
-                                "Failed to parse JSONRPC message from server"
+                        except Exception:  # pragma: no cover
+                            # Non-JSONRPC lines on stdout are stray log
+                            # output from the MCP server subprocess
+                            # (e.g., FastMCP Rich-formatted startup
+                            # banners).  Log at debug to avoid flooding
+                            # pod logs with full tracebacks.
+                            logger.debug(
+                                "Ignoring non-JSONRPC line from server: %.120s",
+                                line,
                             )
-                            await read_writer.send(exc)
                             continue
                         await read_writer.send(SessionMessage(message))
         except anyio.ClosedResourceError:  # pragma: no cover

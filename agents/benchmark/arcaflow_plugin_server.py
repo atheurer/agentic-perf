@@ -117,8 +117,6 @@ async def _ensure_init() -> None:
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
 
-    _ssh = SSHExecutor()
-
     if ticket_id and store_url:
         try:
             from providers.execution import AuditedAsyncHTTPClient
@@ -130,15 +128,14 @@ async def _ensure_init() -> None:
         except Exception:
             logger.debug("Could not fetch ticket for arcaflow server init")
 
-    # Set SSH context from ticket
+    # Construct SSH executor with ticket credentials
+    ssh_key = None
+    ssh_user = "root"
     if _ticket:
         cf = _ticket.get("custom_fields", {})
         ssh_key = cf.get("ssh_key_path")
-        ssh_user = cf.get("ssh_user", "root")
-        if ssh_key:
-            _ssh.set_key_path(ssh_key)
-        if ssh_user:
-            _ssh.set_user(ssh_user)
+        ssh_user = cf.get("ssh_user", "root") or "root"
+    _ssh = SSHExecutor(user=ssh_user, key_path=ssh_key)
 
 
 # ---------------------------------------------------------------------------
