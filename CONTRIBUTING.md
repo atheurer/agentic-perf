@@ -43,6 +43,7 @@ you, and running it manually just duplicates the work.
 | `scripts/dev-setup.sh` | Install hooks + deps | Once after clone |
 | `scripts/lint.sh` | Run ruff lint + format check | Before commit |
 | `scripts/test.sh` | Run pytest with coverage | Before commit |
+| `scripts/audit.sh` | Run audit & trace verification suite | Periodic / before audit gate |
 | `scripts/validate.sh` | Run lint + test | Pre-commit hook calls this |
 
 These scripts are the source of truth — CI, hooks, and developers all
