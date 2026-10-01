@@ -136,6 +136,16 @@ async def _ensure_init() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Progress callback
+# ---------------------------------------------------------------------------
+
+
+def _plugin_progress(line: str) -> None:
+    """Log plugin execution output for observability."""
+    logger.info("[arcaflow/execute] %s", line.rstrip())
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -281,46 +291,87 @@ async def execute_arcaflow_plugin(
     except ImportError:
         input_content = json.dumps(input, indent=2)
 
-    # Check podman availability
-    podman_check = await _ssh.run(target, "which podman", timeout=10)
-    if podman_check.exit_code != 0:
-        return json.dumps(
-            {
-                "status": "failed",
-                "exit_code": -1,
-                "run_id": f"arcaflow-{run_uuid}",
-                "error": "podman not found on target host",
-            }
+    # Container args: -s step, -f - for stdin
+    container_args = ["-s", plugin_step, "-f", "-"]
+
+    # Local execution path: run podman directly when the
+    # target is localhost (dev/CI without SSH keys).
+    is_local = target in ("localhost", "127.0.0.1", "::1")
+
+    if is_local:
+        import shutil
+
+        from providers.execution import AuditedSubprocessRunner
+
+        logger.info("[arcaflow] Local execution: podman run %s", plugin_image)
+        podman_path = shutil.which("podman")
+        if not podman_path:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": -1,
+                    "run_id": f"arcaflow-{run_uuid}",
+                    "error": "podman not found locally",
+                }
+            )
+
+        proc = await AuditedSubprocessRunner().start(
+            [
+                podman_path,
+                "run",
+                "-i",
+                "--rm",
+                "--network=host",
+                plugin_image,
+                *container_args,
+            ],
+            stdin=input_content.encode(),
+            mutating=True,
+        )
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        exit_code = proc.returncode or 0
+        stdout_str = stdout_bytes.decode(errors="replace")
+        stderr_str = stderr_bytes.decode(errors="replace")
+    else:
+        # Remote execution via SSH
+        podman_check = await _ssh.run(target, "which podman", timeout=10)
+        if podman_check.exit_code != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": -1,
+                    "run_id": f"arcaflow-{run_uuid}",
+                    "error": "podman not found on target host",
+                }
+            )
+
+        input_path = f"/tmp/arcaflow-input-{run_uuid}.yaml"
+        await _ssh.run(
+            target,
+            f"cat > {input_path} << 'ARCAEOF'\n{input_content}\nARCAEOF",
         )
 
-    # Write input to temp file and pipe to podman
-    input_path = f"/tmp/arcaflow-input-{run_uuid}.yaml"
-    await _ssh.run(
-        target,
-        f"cat > {input_path} << 'ARCAEOF'\n{input_content}\nARCAEOF",
-    )
+        podman_args = [
+            "podman",
+            "run",
+            "-i",
+            "--rm",
+            plugin_image,
+            *container_args,
+        ]
+        cmd = f"cat {shlex.quote(input_path)} | {shlex.join(podman_args)} 2>&1"
+        logger.info("[arcaflow] Executing plugin via SSH: %s", cmd)
+        result = await _ssh.run_with_progress(
+            target,
+            cmd,
+            progress_callback=_plugin_progress,
+        )
+        exit_code = result.exit_code
+        stdout_str = result.stdout or ""
+        stderr_str = result.stderr or ""
 
-    podman_args = [
-        "podman",
-        "run",
-        "-i",
-        "--rm",
-        plugin_image,
-        "-s",
-        plugin_step,
-        "-f",
-        "-",
-    ]
-    cmd = f"cat {shlex.quote(input_path)} | {shlex.join(podman_args)} 2>&1"
-    logger.info("[arcaflow] Executing plugin via SSH: %s", cmd)
-    result = await _ssh.run(target, cmd, timeout=600)
-
-    exit_code = result.exit_code
-    stdout_str = result.stdout or ""
-    stderr_str = result.stderr or ""
-
-    # Clean up
-    await _ssh.run(target, f"rm -f {input_path}", timeout=10)
+        # Clean up
+        await _ssh.run(target, f"rm -f {input_path}", timeout=10)
 
     response: dict[str, Any] = {
         "status": "completed" if exit_code == 0 else "failed",
