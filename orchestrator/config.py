@@ -265,6 +265,18 @@ class OrchestratorConfig:
         )
         self.max_concurrent_agents: int = max(1, int(_max_agents_raw))
 
+        # Maximum number of concurrent teardown tasks. Teardowns
+        # (especially aborted runs) are resource intensive and
+        # can exhaust memory if executed in parallel. Defaults to 1
+        # for safe sequential execution.
+        _max_teardowns_raw = _env_or_cfg(
+            "MAX_CONCURRENT_TEARDOWNS",
+            cfg,
+            "max_concurrent_teardowns",
+            1,
+        )
+        self.max_concurrent_teardowns: int = max(1, int(_max_teardowns_raw))
+
         # Introspection agent: continuous passive observer.
         # Enable globally via config or env var. Can also be
         # enabled per-ticket via custom_fields.introspection_enabled.
@@ -486,6 +498,7 @@ def build_redacted_config(
             "agent_task_timeout": config.agent_task_timeout,
             "stale_task_timeout": config.stale_task_timeout,
             "max_concurrent_agents": config.max_concurrent_agents,
+            "max_concurrent_teardowns": config.max_concurrent_teardowns,
             "skip_teardown": config.skip_teardown,
             "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
             "leader_lease_renew_interval": config.leader_lease_renew_interval,

@@ -2181,6 +2181,18 @@ async def _poll_loop_after_lease(
                         at_capacity = True
                         break
 
+                    if status == "awaiting_teardown":
+                        active_teardowns = dispatcher.active_tasks_for_status(
+                            "awaiting_teardown"
+                        )
+                        if active_teardowns >= config.max_concurrent_teardowns:
+                            logger.info(
+                                f"Teardowns at capacity ({active_teardowns}/"
+                                f"{config.max_concurrent_teardowns})"
+                                f" — deferring remaining teardown tickets"
+                            )
+                            break
+
                     tid = ticket["id"]
                     if dispatcher.is_active(tid):
                         logger.info(f"Skipping {tid} at {status}: is_active")
@@ -2402,7 +2414,7 @@ async def _poll_loop_after_lease(
                             ticket_data=ticket,
                         )
                     )
-                    dispatcher.set_task(tid, task)
+                    dispatcher.set_task(tid, task, status=status)
 
             await _process_stop_requests(
                 dispatcher,

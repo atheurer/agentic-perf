@@ -283,8 +283,15 @@ class Dispatcher:
         if task is not None and not task.done():
             task.cancel()
 
-    def set_task(self, ticket_id: str, task: asyncio.Task) -> None:
+    def set_task(self, ticket_id: str, task: asyncio.Task, status: str = "") -> None:
         self._tasks[ticket_id] = task
+        statuses = getattr(self, "_task_statuses", None)
+        if statuses is None:
+            statuses = self._task_statuses = {}
+        if status:
+            statuses[ticket_id] = status
+        else:
+            statuses.pop(ticket_id, None)
 
     def mark_deposed(self) -> None:
         """Stop all agent work after losing the control-plane fence."""
@@ -430,12 +437,22 @@ class Dispatcher:
         """Return a snapshot of ticket_id → Task for non-done tasks."""
         # Clean up finished tasks while iterating.
         done = [tid for tid, task in self._tasks.items() if task.done()]
+        statuses = getattr(self, "_task_statuses", None)
         for tid in done:
             self._tasks.pop(tid, None)
+            if statuses is not None:
+                statuses.pop(tid, None)
         return dict(self._tasks)
+
+    def active_tasks_for_status(self, status: str) -> int:
+        """Return the count of non-done tasks currently running for a specific status."""
+        self.active_tasks()
+        statuses = getattr(self, "_task_statuses", {})
+        return sum(1 for tid in self._tasks if statuses.get(tid) == status)
 
     async def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
+        getattr(self, "_task_statuses", {}).pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
         self.stop_renewal(ticket_id)
         await self.release_claim(ticket_id)
