@@ -719,6 +719,12 @@ class TicketStore:
                 except Exception as e:
                     logger.exception(f"[store] Failed to emit status_change event: {e}")
 
+            if new_status == TicketStatus.CLOSED and self._trace_store is not None:
+                try:
+                    self._trace_store.migrate_ticket_traces(ticket_id)
+                except Exception as e:
+                    logger.exception(f"[store] Failed to migrate traces for closed ticket {ticket_id}: {e}")
+
             return ticket.model_copy()
 
     def update_fields(
@@ -1900,6 +1906,11 @@ class TicketStore:
                 ticket_id,
                 {"old_status": old_status, "comment": comment},
             )
+            if self._trace_store is not None:
+                try:
+                    self._trace_store.migrate_ticket_traces(ticket_id)
+                except Exception as e:
+                    logger.exception(f"[store] Failed to migrate traces on force_close for ticket {ticket_id}: {e}")
             return ticket.model_copy()
 
     def archive_ticket(self, ticket_id: str) -> dict:

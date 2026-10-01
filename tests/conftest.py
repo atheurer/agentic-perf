@@ -88,8 +88,11 @@ def isolate_trace_store(
     import paths
 
     digest = _hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
-    trace_path = Path(_TEST_HOME) / "trace-tests" / digest / "trace.db"
+    trace_dir = Path(_TEST_HOME) / "trace-tests" / digest
+    trace_path = trace_dir / "trace.db"
+    history_path = trace_dir / "trace-history.db"
     monkeypatch.setattr(paths, "TRACE_DB_PATH", trace_path)
+    monkeypatch.setattr(paths, "TRACE_HISTORY_DB_PATH", history_path)
 
 
 class MockSecretsProvider(SecretsProvider):
