@@ -14,8 +14,14 @@ import logging
 import os
 import re
 import shlex
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
+
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from agents.mcp_audit import create_ticket_mcp
 
@@ -400,3 +406,7 @@ async def execute_arcaflow_plugin(
         response["output"] = stdout_str[-3000:] if stdout_str else ""
         response["error"] = stderr_str[-1000:] if stderr_str else ""
     return json.dumps(response)
+
+
+if __name__ == "__main__":
+    mcp.run()
