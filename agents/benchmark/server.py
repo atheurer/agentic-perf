@@ -1601,11 +1601,11 @@ async def get_plugin_schema(
     plugin_image: str,
     host: str = "",
 ) -> str:
-    """Query an Arcaflow plugin container for its input schema.
+    """Query an Arcaflow plugin container for its full schema.
 
-    Runs the plugin with --json-schema input on the target host
-    via podman. Returns the JSON schema describing the plugin's
-    available steps and their input parameters.
+    Runs the plugin with --schema on the target host via podman.
+    Returns the complete schema (all steps, inputs, outputs) so
+    the caller can discover available steps and their parameters.
 
     Args:
         plugin_image: Full container image ref
@@ -1626,13 +1626,12 @@ async def get_plugin_schema(
     if not host_valid:
         return json.dumps({"error": host_error})
 
-    cmd = shlex.join(["podman", "run", "--rm", plugin_image, "--json-schema", "input"])
-    result = await _ssh.run(target, cmd, timeout=60)
-
-    if result.exit_code != 0:
-        # Try --schema as fallback (returns full schema)
-        cmd_full = shlex.join(["podman", "run", "--rm", plugin_image, "--schema"])
-        result = await _ssh.run(target, cmd_full, timeout=60)
+    # Use --schema first: it returns the complete plugin schema
+    # (all steps, inputs, outputs) as YAML without needing a
+    # step selector.  --json-schema input requires -s <step>
+    # which we don't know yet.
+    cmd = shlex.join(["podman", "run", "--rm", plugin_image, "--schema"])
+    result = await _ssh.run(target, cmd, timeout=120)
 
     if result.exit_code != 0:
         return json.dumps(
@@ -1641,14 +1640,33 @@ async def get_plugin_schema(
                 "stderr": result.stderr[:500] if result.stderr else "",
                 "hint": (
                     "The plugin image may not exist or may not "
-                    "support --json-schema. Check the image ref."
+                    "support --schema. Check the image ref."
                 ),
             }
         )
 
-    # Parse and return the schema
+    # --schema returns YAML.  Try to parse it for structured
+    # output; fall back to raw text if yaml isn't available.
+    stdout = result.stdout or ""
     try:
-        schema = json.loads(result.stdout)
+        import yaml
+
+        schema = yaml.safe_load(stdout)
+        return json.dumps(
+            {
+                "plugin_image": plugin_image,
+                "schema": schema,
+            }
+        )
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # YAML parsing unavailable or failed — try JSON in case
+    # a future SDK version returns JSON from --schema.
+    try:
+        schema = json.loads(stdout)
         return json.dumps(
             {
                 "plugin_image": plugin_image,
@@ -1656,13 +1674,16 @@ async def get_plugin_schema(
             }
         )
     except json.JSONDecodeError:
-        return json.dumps(
-            {
-                "plugin_image": plugin_image,
-                "raw_output": result.stdout[:2000],
-                "note": "Output was not valid JSON",
-            }
-        )
+        pass
+
+    # Return raw output — still useful for the LLM.
+    return json.dumps(
+        {
+            "plugin_image": plugin_image,
+            "raw_schema": stdout[:4000],
+            "format": "yaml",
+        }
+    )
 
 
 @mcp.tool()
