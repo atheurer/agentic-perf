@@ -96,7 +96,7 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir \
     --extra-index-url https://pkg.jumpstarter.dev/simple \
-    ".[jumpstarter]" && \
+    ".[jumpstarter,telemetry]" && \
     python3 -c 'from jumpstarter_driver_snmp.client import SNMPServerClient; print("SNMP driver: OK")' && \
     python3 -c 'from jumpstarter_driver_gpiod.client import DigitalOutputClient; print("GPIO driver: OK")'
 
