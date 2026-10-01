@@ -723,7 +723,9 @@ class TicketStore:
                 try:
                     self._trace_store.migrate_ticket_traces(ticket_id)
                 except Exception as e:
-                    logger.exception(f"[store] Failed to migrate traces for closed ticket {ticket_id}: {e}")
+                    logger.exception(
+                        f"[store] Failed to migrate traces for closed ticket {ticket_id}: {e}"
+                    )
 
             return ticket.model_copy()
 
@@ -1910,7 +1912,9 @@ class TicketStore:
                 try:
                     self._trace_store.migrate_ticket_traces(ticket_id)
                 except Exception as e:
-                    logger.exception(f"[store] Failed to migrate traces on force_close for ticket {ticket_id}: {e}")
+                    logger.exception(
+                        f"[store] Failed to migrate traces on force_close for ticket {ticket_id}: {e}"
+                    )
             return ticket.model_copy()
 
     def archive_ticket(self, ticket_id: str) -> dict:

@@ -5,9 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
-import paths
 from providers.events import EventBus
 from providers.tracing import (
     ActionDescriptor,
@@ -45,9 +42,11 @@ def test_migrate_ticket_traces_moves_events(tmp_path: Path) -> None:
         assert store.count_events("PERF-2") == 1
 
         # Check active db before migration
-        active_p1 = store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'"
-        ).fetchone()[0]
+        active_p1 = (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'")
+            .fetchone()[0]
+        )
         assert active_p1 == 2
 
         # Migrate PERF-1
@@ -55,19 +54,25 @@ def test_migrate_ticket_traces_moves_events(tmp_path: Path) -> None:
         assert migrated == 2
 
         # Check active db after migration: PERF-1 deleted, PERF-2 remains
-        active_p1_after = store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'"
-        ).fetchone()[0]
+        active_p1_after = (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'")
+            .fetchone()[0]
+        )
         assert active_p1_after == 0
-        active_p2_after = store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-2'"
-        ).fetchone()[0]
+        active_p2_after = (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-2'")
+            .fetchone()[0]
+        )
         assert active_p2_after == 1
 
         # Check history db: PERF-1 exists in history
-        history_p1 = store._open_history_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'"
-        ).fetchone()[0]
+        history_p1 = (
+            store._open_history_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-1'")
+            .fetchone()[0]
+        )
         assert history_p1 == 2
 
         # Transparent count_events
@@ -125,10 +130,14 @@ def test_transition_ticket_to_closed_triggers_migration(tmp_path: Path) -> None:
         event_bus.emit(tid, "agent", "tool_called", {"tool": "bash"})
 
         # Verify event in active db
-        active_count = trace_store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0]
+        active_count = (
+            trace_store._open_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+        )
         assert active_count > 0
 
         # Close ticket via transition_ticket
@@ -139,17 +148,25 @@ def test_transition_ticket_to_closed_triggers_migration(tmp_path: Path) -> None:
         )
 
         # Traces should now be migrated out of active db
-        active_count_after = trace_store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0]
+        active_count_after = (
+            trace_store._open_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+        )
         assert active_count_after == 0
 
         # And into history db
-        history_count = trace_store._open_history_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0]
+        history_count = (
+            trace_store._open_history_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+        )
         assert history_count > 0
 
         # Transparent reading works via event_bus and trace_store
@@ -181,30 +198,45 @@ def test_force_close_triggers_migration(tmp_path: Path) -> None:
 
     try:
         ticket = store.create_ticket(
-            CreateTicketRequest(summary="Test Ticket 20", description="Test Description 20")
+            CreateTicketRequest(
+                summary="Test Ticket 20", description="Test Description 20"
+            )
         )
         tid = ticket.id
         trace_store.insert_event(make_event(tid))
 
-        assert trace_store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0] > 0
+        assert (
+            trace_store._open_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+            > 0
+        )
 
         # Force close
         store.force_close(tid, comment="forced")
 
         # Events migrated
-        active_count = trace_store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0]
+        active_count = (
+            trace_store._open_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+        )
         assert active_count == 0
 
-        history_count = trace_store._open_history_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-            (tid,),
-        ).fetchone()[0]
+        history_count = (
+            trace_store._open_history_connection()
+            .execute(
+                "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                (tid,),
+            )
+            .fetchone()[0]
+        )
         assert history_count > 0
 
         assert trace_store.count_events(tid) == history_count
@@ -230,7 +262,9 @@ def test_backfill_script(tmp_path: Path) -> None:
         "status": "closed",
         "status_trail": ["open", "closed"],
     }
-    (ticket_dir / "PERF-30.json").write_text(json.dumps(closed_ticket), encoding="utf-8")
+    (ticket_dir / "PERF-30.json").write_text(
+        json.dumps(closed_ticket), encoding="utf-8"
+    )
 
     open_ticket = {
         "id": "PERF-31",
@@ -244,7 +278,11 @@ def test_backfill_script(tmp_path: Path) -> None:
         store.insert_event(make_event("PERF-30"))
         store.insert_event(make_event("PERF-31"))
 
-    script_path = Path(__file__).resolve().parents[1] / "scripts" / "migrate-closed-ticket-traces.py"
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "migrate-closed-ticket-traces.py"
+    )
     # Run dry-run
     cmd_dry = [
         sys.executable,
@@ -257,24 +295,36 @@ def test_backfill_script(tmp_path: Path) -> None:
         str(history_db_path),
     ]
     res_dry = subprocess.run(cmd_dry, capture_output=True, text=True, check=True)
-    assert "Dry run completed" in res_dry.stdout or "Dry run completed" in res_dry.stderr
+    assert (
+        "Dry run completed" in res_dry.stdout or "Dry run completed" in res_dry.stderr
+    )
 
     # Active DB still has events for both
     with TraceStore(db_path, history_db_path=history_db_path) as store:
-        assert store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-30'"
-        ).fetchone()[0] == 1
+        assert (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-30'")
+            .fetchone()[0]
+            == 1
+        )
 
     # Run with --apply and --vacuum
     cmd_apply = cmd_dry + ["--apply", "--vacuum"]
     res_apply = subprocess.run(cmd_apply, capture_output=True, text=True, check=True)
+    assert res_apply.returncode == 0
 
     # Active DB now has 0 for PERF-30 and 1 for PERF-31
     with TraceStore(db_path, history_db_path=history_db_path) as store:
-        assert store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-30'"
-        ).fetchone()[0] == 0
-        assert store._open_connection().execute(
-            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-31'"
-        ).fetchone()[0] == 1
+        assert (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-30'")
+            .fetchone()[0]
+            == 0
+        )
+        assert (
+            store._open_connection()
+            .execute("SELECT COUNT(*) FROM trace_events WHERE ticket_id = 'PERF-31'")
+            .fetchone()[0]
+            == 1
+        )
         assert store.count_events("PERF-30") == 1

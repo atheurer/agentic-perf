@@ -84,11 +84,15 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     if not args.trace_db.exists():
-        logger.info("Active trace DB %s does not exist. Nothing to migrate.", args.trace_db)
+        logger.info(
+            "Active trace DB %s does not exist. Nothing to migrate.", args.trace_db
+        )
         return 0
 
     closed_ticket_ids = find_closed_tickets(args.ticket_dir)
-    logger.info("Found %d closed tickets in %s", len(closed_ticket_ids), args.ticket_dir)
+    logger.info(
+        "Found %d closed tickets in %s", len(closed_ticket_ids), args.ticket_dir
+    )
 
     with TraceStore(args.trace_db, history_db_path=args.history_db) as store:
         total_migrated = 0
@@ -97,10 +101,14 @@ def main() -> int:
             # Check count in active store directly
             with store._lock:
                 try:
-                    row = store._open_connection().execute(
-                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
-                        (tid,),
-                    ).fetchone()
+                    row = (
+                        store._open_connection()
+                        .execute(
+                            "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                            (tid,),
+                        )
+                        .fetchone()
+                    )
                     active_count = row[0] if row else 0
                 except (sqlite3.Error, OSError):
                     active_count = 0
@@ -130,7 +138,11 @@ def main() -> int:
             total_migrated += migrated
             logger.info("  Migrated %d events for %s", migrated, tid)
 
-        logger.info("Successfully migrated %d trace events to %s", total_migrated, args.history_db)
+        logger.info(
+            "Successfully migrated %d trace events to %s",
+            total_migrated,
+            args.history_db,
+        )
 
         if args.vacuum:
             logger.info("Running VACUUM on active trace DB %s...", args.trace_db)

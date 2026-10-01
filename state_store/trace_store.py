@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from paths import TRACE_HISTORY_DB_PATH
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -23,8 +24,6 @@ from providers.tracing import (
     PayloadDescriptor,
     TraceEventV1,
 )
-
-from paths import TRACE_HISTORY_DB_PATH
 
 from .trace_migrations import migrate
 
@@ -93,7 +92,8 @@ class TraceStore:
             else (
                 TRACE_HISTORY_DB_PATH
                 if self.db_path.name == "trace.db"
-                else self.db_path.parent / f"{self.db_path.stem}-history{self.db_path.suffix}"
+                else self.db_path.parent
+                / f"{self.db_path.stem}-history{self.db_path.suffix}"
             )
         )
         # ASGI handlers may write concurrently while this store deliberately
@@ -445,13 +445,6 @@ class TraceStore:
                             tid for tid in ticket_ids if tid not in found_tickets
                         ]
                         if missing_ticket_ids:
-                            hist_predicates = list(predicates)
-                            # Replace the ticket_id IN predicate
-                            hist_values = [
-                                v
-                                for v in values
-                                if v not in ticket_ids
-                            ]
                             placeholders = ", ".join("?" for _ in missing_ticket_ids)
                             # Reconstruct predicates for missing tickets
                             h_preds: list[str] = []
