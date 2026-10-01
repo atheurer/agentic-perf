@@ -28,6 +28,10 @@ from providers.tracing import (
     reset_trace_context,
     trace_headers,
 )
+from state_store.status import (
+    clear_orchestrator_status,
+    record_orchestrator_status,
+)
 
 from .config import OrchestratorConfig, _provider_family
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
@@ -1850,6 +1854,8 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     write_effective_config(config)
     _ensure_state_store_environment(config)
 
+    from state_store.status import record_orchestrator_status
+
     from .leader_lease import LeaderLeaseClient
 
     leader_lease = LeaderLeaseClient(
@@ -1864,7 +1870,9 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     lease_renew_task: asyncio.Task | None = None
     lease_renewal_started = asyncio.Event()
     try:
+        record_orchestrator_status("acquiring_lease")
         await leader_lease.acquire()
+        record_orchestrator_status("lease_acquired")
         if leader_lease.epoch is None:
             raise RuntimeError("state store returned no leader fencing epoch")
         os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
@@ -2009,7 +2017,9 @@ async def _poll_loop_after_lease(
     llm.max_tokens = config.llm_max_tokens
     llm_factory = _make_llm_factory(config)
 
+    record_orchestrator_status("validating_models")
     await _validate_models(config, secrets)
+    record_orchestrator_status("initializing_providers")
 
     from providers.redaction import get_shared_redactor
 
@@ -2080,6 +2090,7 @@ async def _poll_loop_after_lease(
             f"poll={config.poll_interval}s, llm={config.llm_provider}, "
             f"max_agents={config.max_concurrent_agents})"
         )
+        record_orchestrator_status("running")
 
         # System-wide budget check (per orchestrator session)
         system_budget = None
@@ -2609,14 +2620,20 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    from state_store.status import record_orchestrator_status
+
+    clear_orchestrator_status()
+    record_orchestrator_status("acquiring_lock")
     _acquire_lock()
     _setup_api_token()
+    record_orchestrator_status("initializing_configuration")
     config = OrchestratorConfig()
     try:
         asyncio.run(poll_loop(config))
     except KeyboardInterrupt:
         logger.info("Orchestrator stopped")
     finally:
+        clear_orchestrator_status()
         try:
             AuditedSubprocessRunner.reset_default_recorder()
         except Exception:

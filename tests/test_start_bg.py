@@ -359,3 +359,179 @@ def test_start_waits_for_unverifiable_lock_owner_to_release(tmp_path: Path) -> N
     finally:
         process.send_signal(signal.SIGKILL)
         process.wait(timeout=5)
+
+
+def test_start_store_surfaces_crash_diagnostics_promptly(tmp_path: Path) -> None:
+    """If state store crashes immediately, launcher fails promptly and prints stderr diagnostics."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Mock python3 to immediately fail with a traceback when invoking uvicorn state_store.main:app
+    mock_python = fake_bin / "python3"
+    mock_python.write_text(
+        textwrap.dedent("""\
+        #!/usr/bin/env bash
+        if [[ "$*" == *"state_store.main:app"* ]]; then
+            echo "Traceback (most recent call last):" >&2
+            echo "  File \\"state_store/main.py\\", line 42, in <module>" >&2
+            echo "ZeroDivisionError: division by zero" >&2
+            exit 1
+        fi
+        exec /usr/bin/python3 "$@"
+    """)
+    )
+    mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_STORE_TIMEOUT": "20",
+        }
+    )
+
+    start = time.monotonic()
+    result = subprocess.run(
+        [str(SCRIPT), "start"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - start
+
+    assert result.returncode != 0
+    # Must exit promptly rather than waiting out the 20s timeout
+    assert elapsed < 5.0
+    assert "DIAGNOSTICS: State store" in result.stderr
+    assert "ZeroDivisionError: division by zero" in result.stderr
+
+
+def test_start_store_watchdog_resets_on_heartbeat(tmp_path: Path) -> None:
+    """State store startup watchdog resets inactivity timer when status updates arrive."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Mock python3 running state store to emit milestones and take 2 seconds, with START_BG_STORE_TIMEOUT=1
+    mock_python = fake_bin / "python3"
+    mock_python.write_text(
+        textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        if [[ "$*" == *"state_store.main:app"* ]]; then
+            exec -a "python3 -m uvicorn state_store.main:app" /usr/bin/python3 -c '
+import fcntl, json, os, sys, time
+home = "{home}"
+store_id = "{store_id}"
+status_file = f"{{home}}/state-store.status"
+lock_file = f"{{home}}/state-store.lock"
+
+with open(status_file, "w") as f:
+    json.dump({{"pid": os.getpid(), "phase": "initializing_trace_store", "detail": "", "updated_at": time.time()}}, f)
+    f.write("\\n")
+time.sleep(0.8)
+
+with open(status_file, "w") as f:
+    json.dump({{"pid": os.getpid(), "phase": "loading_tickets", "detail": "10/100", "updated_at": time.time()}}, f)
+    f.write("\\n")
+time.sleep(0.8)
+
+fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+fields = open(f"/proc/{{os.getpid()}}/stat").read().rsplit(") ", 1)[1].split()
+metadata = {{
+    "pid": os.getpid(),
+    "process_start_identity": f"{{os.getpid()}}:{{fields[19]}}",
+    "configured_port": 18903,
+    "store_id": store_id,
+}}
+os.ftruncate(fd, 0)
+os.write(fd, json.dumps(metadata).encode())
+os.fsync(fd)
+
+with open(status_file, "w") as f:
+    json.dump({{"pid": os.getpid(), "phase": "runtime_ready", "detail": "", "updated_at": time.time()}}, f)
+    f.write("\\n")
+
+time.sleep(300)
+'
+        fi
+        exec /usr/bin/python3 "$@"
+    """)
+    )
+    mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
+
+    curl = fake_bin / "curl"
+    curl.write_text(
+        textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        {_FAKE_LEASE_RESPONSE}
+        if [[ "$*" == *"/control/orchestrator-lease"* ]]; then
+            pid_file="{home}/orchestrator.pid"
+            if [ -f "$pid_file" ]; then
+                pid="$(tr -d '[:space:]' < "$pid_file")"
+                lease_response "$pid"
+            else
+                printf '{{"lease":null}}\\n'
+            fi
+            exit 0
+        fi
+        exec 9>>"{home}/state-store.lock"
+        if flock -n 9; then flock -u 9; exit 7; fi
+        printf '%s\\n' '{{"store_id":"{store_id}"}}'
+    """)
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+
+    orch_holder = tmp_path / "orch-holder"
+    _holder(
+        orch_holder,
+        role="orchestrator",
+        lock_path=home / "orchestrator.pid",
+        store_id=store_id,
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_STORE_TIMEOUT": "1",
+            "START_BG_INACTIVITY_TIMEOUT": "2",
+        }
+    )
+
+    orch_process = subprocess.Popen(
+        [str(orch_holder), str(home / "orchestrator.pid")], cwd=REPO, env=env
+    )
+    try:
+        result = subprocess.run(
+            [str(SCRIPT), "start"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "[state-store] initializing_trace_store" in result.stdout
+        assert "[state-store] loading_tickets" in result.stdout
+        assert "State store started" in result.stdout
+    finally:
+        orch_process.kill()
+        subprocess.run([str(SCRIPT), "stop"], cwd=REPO, env=env, check=False)

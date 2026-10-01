@@ -93,6 +93,9 @@ def mount_routers(
 
 def _initialize_runtime(app: FastAPI, port: int) -> None:
     """Construct writable runtime components only after the root lock is held."""
+    from .status import record_store_status
+
+    record_store_status("initializing_trace_store")
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
     app.state.trace_instance_id = get_instance_name()
     app.state.trace_health = {
@@ -225,11 +228,13 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     app.state.event_bus = EventBus(
         redactor=audit_redactor, trace_store=app.state.trace_store
     )
+    record_store_status("loading_tickets")
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,
         trace_store=app.state.trace_store,
     )
+    record_store_status("mounting_routers")
     mount_routers(app, auth, rate_limit_dep)
 
     chat_cfg = cfg.get("chat", {})
@@ -313,11 +318,14 @@ if hasattr(os, "register_at_fork"):
 
 def _start_runtime(app: FastAPI, port: int) -> None:
     """Acquire the root lock before constructing any writable backend."""
+    from .status import record_store_status
+
     if getattr(app.state, "runtime_initialized", False):
         if getattr(app.state, "runtime_pid", None) == os.getpid():
             return
         _discard_inherited_runtime(app)
     lock = _acquire_runtime_lock(port)
+    record_store_status("lock_acquired")
     app.state.process_lock = lock
     app.state.store_diagnostics = {
         "store_id": lock.store_id,
@@ -330,6 +338,7 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         _initialize_runtime(app, port)
         app.state.runtime_initialized = True
         app.state.runtime_pid = os.getpid()
+        record_store_status("runtime_ready")
         logger.info(
             "State store started: store_id=%s session_id=%s root=%s",
             lock.store_id,
@@ -357,6 +366,8 @@ def _discard_inherited_runtime(app: FastAPI) -> None:
 
 
 def _close_runtime(app: FastAPI) -> None:
+    from .status import clear_store_status
+
     if not getattr(app.state, "runtime_initialized", False):
         return
     if getattr(app.state, "runtime_pid", None) != os.getpid():
@@ -373,6 +384,7 @@ def _close_runtime(app: FastAPI) -> None:
     if lock is not None:
         _release_runtime_lock(lock)
         app.state.process_lock = None
+    clear_store_status()
 
 
 def create_app(*, initialize_immediately: bool = False) -> FastAPI:

@@ -30,9 +30,13 @@ STORE_LOG="$LOG_DIR/state-store.log"
 ORCH_LOCK="$AP_HOME/orchestrator.pid"
 ORCH_LOG="$LOG_DIR/orchestrator.log"
 LAUNCH_LOCK="$AP_HOME/state-store-launch.lock"
+STORE_STATUS_FILE="$AP_HOME/state-store.status"
+ORCH_STATUS_FILE="$AP_HOME/orchestrator.status"
 STORE_START_TIMEOUT="${START_BG_STORE_TIMEOUT:-20}"
 ORCH_START_TIMEOUT="${START_BG_ORCH_TIMEOUT:-45}"
 STOP_TIMEOUT="${START_BG_STOP_TIMEOUT:-10}"
+INACTIVITY_TIMEOUT="${START_BG_INACTIVITY_TIMEOUT:-20}"
+MAX_START_TIMEOUT="${START_BG_MAX_START_TIMEOUT:-180}"
 
 mkdir -p "$LOG_DIR"
 
@@ -48,6 +52,42 @@ revision() {
 }
 
 error() { echo "ERROR: $*" >&2; }
+
+dump_process_diagnostics() {
+    local log_path="$1" service_name="$2" pid="$3"
+    echo "================================================================================" >&2
+    echo "DIAGNOSTICS: $service_name (PID ${pid:-unknown}) startup failure" >&2
+    echo "Log file: $log_path" >&2
+    if [ -f "$log_path" ] && [ -s "$log_path" ]; then
+        echo "--- Last 25 lines of $log_path ---" >&2
+        tail -n 25 "$log_path" >&2
+        echo "--------------------------------------------------------------------------------" >&2
+    else
+        echo "Log file is empty or does not exist." >&2
+    fi
+    echo "================================================================================" >&2
+}
+
+read_status_info() {
+    local status_file="$1" expected_pid="$2"
+    [ -f "$status_file" ] || return 1
+    python3 - "$status_file" "$expected_pid" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+    expected_pid = int(sys.argv[2])
+    if int(data.get("pid", -1)) != expected_pid:
+        sys.exit(1)
+    phase = data.get("phase", "")
+    detail = data.get("detail", "")
+    updated_at = float(data.get("updated_at", 0.0))
+    print(f"{phase}\t{detail}\t{updated_at}")
+except Exception:
+    sys.exit(1)
+PY
+}
 
 read_port() {
     python3 - "$CONFIG" <<'PY'
@@ -189,39 +229,92 @@ endpoint_identity() {
 }
 
 wait_for_store() {
-    local pid="$1" deadline=$((SECONDS + STORE_START_TIMEOUT))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        # A forced or graceful stop may leave the lock held briefly while the
-        # old process unwinds.  Return immediately once that owner is gone so
-        # the caller can start a replacement instead of waiting blindly.  A
-        # newly launched process is expected not to have created its lock yet,
-        # so lock absence alone is not a readiness failure here.
+    local pid="$1"
+    local start_time="$SECONDS"
+    local max_deadline=$((start_time + MAX_START_TIMEOUT))
+    local inactivity_deadline=$((start_time + STORE_START_TIMEOUT))
+    local last_phase="" last_updated=0 status_raw phase detail updated_at
+
+    while [ "$SECONDS" -lt "$inactivity_deadline" ] && [ "$SECONDS" -lt "$max_deadline" ]; do
+        # If the launched process died, return immediately without waiting.
         if ! process_alive "$pid"; then
             return 2
         fi
+
+        # Authoritative readiness remains strictly endpoint identity and persistence lock.
         if store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)" \
             && [ "$(endpoint_identity || true)" = "this-store" ] \
             && [ "$(store_lock_pid || true)" = "$pid" ]; then
             return 0
         fi
+
+        # Advisory status monitoring & watchdog extension
+        if status_raw="$(read_status_info "$STORE_STATUS_FILE" "$pid" 2>/dev/null)" && [ -n "$status_raw" ]; then
+            IFS=$'\t' read -r phase detail updated_at <<< "$status_raw"
+            local cur_sec="${updated_at%.*}"
+            local prev_sec="${last_updated%.*}"
+            # If heartbeat timestamp or phase advanced, reset inactivity deadline
+            if [ "$phase" != "$last_phase" ] || [ "${cur_sec:-0}" -gt "${prev_sec:-0}" ]; then
+                inactivity_deadline=$((SECONDS + INACTIVITY_TIMEOUT))
+                if [ -n "$phase" ] && [ "$phase" != "$last_phase" ]; then
+                    if [ -n "$detail" ]; then
+                        echo "  [state-store] $phase: $detail"
+                    else
+                        echo "  [state-store] $phase"
+                    fi
+                fi
+                last_phase="$phase"
+                last_updated="$updated_at"
+            fi
+        fi
+
         sleep 0.2
     done
+
     return 1
 }
 
 wait_for_orchestrator() {
-    local pid="$1" deadline=$((SECONDS + ORCH_START_TIMEOUT))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        # The local PID lock is acquired before the state-store leader lease.
-        # A process that loses the lease race holds this lock briefly while it
-        # starts, so only the control-plane lease can establish readiness.
+    local pid="$1"
+    local start_time="$SECONDS"
+    local max_deadline=$((start_time + MAX_START_TIMEOUT))
+    local inactivity_deadline=$((start_time + ORCH_START_TIMEOUT))
+    local last_phase="" last_updated=0 status_raw phase detail updated_at
+
+    while [ "$SECONDS" -lt "$inactivity_deadline" ] && [ "$SECONDS" -lt "$max_deadline" ]; do
+        # Authoritative readiness remains control-plane lease and lock ownership.
         if orchestrator_owner_valid "$pid" && lock_is_held "$ORCH_LOCK" \
             && orchestrator_lease_owner_valid "$pid"; then
             return 0
         fi
-        process_alive "$pid" || return 1
+
+        # If the process died, return immediately.
+        if ! process_alive "$pid"; then
+            return 1
+        fi
+
+        # Advisory status monitoring & watchdog extension
+        if status_raw="$(read_status_info "$ORCH_STATUS_FILE" "$pid" 2>/dev/null)" && [ -n "$status_raw" ]; then
+            IFS=$'\t' read -r phase detail updated_at <<< "$status_raw"
+            local cur_sec="${updated_at%.*}"
+            local prev_sec="${last_updated%.*}"
+            if [ "$phase" != "$last_phase" ] || [ "${cur_sec:-0}" -gt "${prev_sec:-0}" ]; then
+                inactivity_deadline=$((SECONDS + INACTIVITY_TIMEOUT))
+                if [ -n "$phase" ] && [ "$phase" != "$last_phase" ]; then
+                    if [ -n "$detail" ]; then
+                        echo "  [orchestrator] $phase: $detail"
+                    else
+                        echo "  [orchestrator] $phase"
+                    fi
+                fi
+                last_phase="$phase"
+                last_updated="$updated_at"
+            fi
+        fi
+
         sleep 0.2
     done
+
     return 1
 }
 
@@ -440,6 +533,7 @@ start_store() {
         this-store) error "state-store endpoint is reachable without this instance's lock"; return 1 ;;
     esac
     echo "Starting state store on port $STORE_PORT..."
+    rm -f "$STORE_STATUS_FILE"
     STORE_PORT="$STORE_PORT" nohup python3 -m uvicorn state_store.main:app \
         --host 0.0.0.0 --port "$STORE_PORT" --log-level warning > "$STORE_LOG" 2>&1 &
     pid=$!
@@ -449,11 +543,12 @@ start_store() {
         return 0
     fi
     error "state store failed to become ready; see $STORE_LOG"
+    dump_process_diagnostics "$STORE_LOG" "State store" "$pid"
     if store_owner_valid "$pid" "$(store_lock_start_identity 2>/dev/null || true)"; then
         echo "Cleaning up failed state-store startup (PID $pid)..."
         terminate_process "$pid" store || true
     fi
-    rm -f "$STORE_PID_FILE"
+    rm -f "$STORE_PID_FILE" "$STORE_STATUS_FILE"
     return 1
 }
 
@@ -484,6 +579,7 @@ start_orchestrator() {
             rm -f "$ORCH_LOCK"
         fi
         echo "Starting orchestrator..."
+        rm -f "$ORCH_STATUS_FILE"
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
         for attempt in 1 2 3 4 5; do
@@ -508,12 +604,16 @@ start_orchestrator() {
             continue
         fi
         error "orchestrator failed to become ready; see $ORCH_LOG"
+        dump_process_diagnostics "$ORCH_LOG" "Orchestrator" "$pid"
+        rm -f "$ORCH_STATUS_FILE"
         if ! lock_is_held "$ORCH_LOCK"; then
             rm -f "$ORCH_LOCK"
         fi
         return 1
     done
     error "orchestrator did not become ready within ${ORCH_START_TIMEOUT}s; see $ORCH_LOG"
+    dump_process_diagnostics "$ORCH_LOG" "Orchestrator" "${pid:-unknown}"
+    rm -f "$ORCH_STATUS_FILE"
     return 1
 }
 
@@ -528,14 +628,21 @@ cmd_start() {
         orch_result=0
     else
         orch_result=$?
-        if [ "$orch_result" -eq 3 ]; then
+        if [ "$orch_result" -eq 2 ]; then
+            orch_result=0
+        elif [ "$orch_result" -eq 3 ]; then
             error "orchestrator startup cleanup is unconfirmed; leaving the state store running for safety"
-        elif [ "$orch_result" -ne 2 ] && [ "$store_started" -eq 1 ]; then
+            flock -u "$launch_fd" || true
+            return 1
+        elif [ "$store_started" -eq 1 ]; then
             error "orchestrator startup failed; rolling back the state store started by this invocation"
             stop_store || true
+            flock -u "$launch_fd" || true
+            return 1
+        else
+            flock -u "$launch_fd" || true
+            return 1
         fi
-        flock -u "$launch_fd" || true
-        return 1
     fi
     flock -u "$launch_fd" || true
     echo "Services running."

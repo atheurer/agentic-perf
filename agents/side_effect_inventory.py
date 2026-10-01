@@ -505,6 +505,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/main.py", "serve_dashboard", "filesystem"),
     ("state_store/process_lock.py", "acquire", "filesystem"),
     ("state_store/process_lock.py", "ensure_store_id", "filesystem"),
+    ("state_store/status.py", "clear_startup_status", "filesystem"),
+    ("state_store/status.py", "record_startup_status", "filesystem"),
     ("state_store/store.py", "__init__", "filesystem"),
     ("state_store/store.py", "_fsync_lease_directory", "filesystem"),
     ("state_store/store.py", "_lease_now", "filesystem"),
@@ -3185,6 +3187,18 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/process_lock.py:ensure_store_id",
+        "2027-12-31",
+    ),
+    ("state_store/status.py", "clear_startup_status", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/status.py:clear_startup_status",
+        "2027-12-31",
+    ),
+    ("state_store/status.py", "record_startup_status", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/status.py:record_startup_status",
         "2027-12-31",
     ),
     ("state_store/store.py", "__init__", "filesystem"): (
