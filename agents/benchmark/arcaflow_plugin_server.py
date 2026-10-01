@@ -14,8 +14,14 @@ import logging
 import os
 import re
 import shlex
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
+
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from agents.mcp_audit import create_ticket_mcp
 
@@ -105,34 +111,9 @@ async def _ensure_init() -> None:
         return
     _initialized = True
 
-    from providers.ssh import SSHExecutor
+    from agents.server_utils import build_ssh_from_ticket
 
-    ticket_id = os.environ.get("TICKET_ID", "")
-    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-
-    _ssh = SSHExecutor()
-
-    if ticket_id and store_url:
-        try:
-            from providers.execution import AuditedAsyncHTTPClient
-
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-                r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
-                _ticket = r.json()
-        except Exception:
-            logger.debug("Could not fetch ticket for arcaflow server init")
-
-    # Set SSH context from ticket
-    if _ticket:
-        cf = _ticket.get("custom_fields", {})
-        ssh_key = cf.get("ssh_key_path")
-        ssh_user = cf.get("ssh_user", "root")
-        if ssh_key:
-            _ssh.set_key_path(ssh_key)
-        if ssh_user:
-            _ssh.set_user(ssh_user)
+    _ssh, _ticket = await build_ssh_from_ticket()
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +381,7 @@ async def execute_arcaflow_plugin(
         response["output"] = stdout_str[-3000:] if stdout_str else ""
         response["error"] = stderr_str[-1000:] if stderr_str else ""
     return json.dumps(response)
+
+
+if __name__ == "__main__":
+    mcp.run()
