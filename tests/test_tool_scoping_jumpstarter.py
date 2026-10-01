@@ -153,7 +153,8 @@ class TestBenchmarkToolScoping:
         # arcaflow-plugins: direct plugin execution via podman
         plugins = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
         assert plugins is not None
-        assert "execute_benchmark" in plugins
+        assert "execute_arcaflow_plugin" in plugins
+        assert "execute_benchmark" not in plugins
         assert "get_plugin_schema" in plugins
         assert "plugin_list" in plugins
         assert "plugin_describe" in plugins

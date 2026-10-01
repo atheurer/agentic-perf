@@ -449,6 +449,9 @@ class BenchmarkAgent(AgentBase):
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
+        arcaflow_plugin_server = str(
+            Path(__file__).with_name("arcaflow_plugin_server.py")
+        )
 
         mcp = AgentMCPClient(trace_context=self.trace_context)
         await mcp.connect_ticket_server(
@@ -461,6 +464,13 @@ class BenchmarkAgent(AgentBase):
         await mcp.connect_ticket_server(
             infra_server,
             name="infra",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
+        await mcp.connect_ticket_server(
+            arcaflow_plugin_server,
+            name="arcaflow-plugins",
             ticket_id=ticket_id,
             state_store_url=self.store_url,
             agent_name=self.agent_name,
@@ -550,13 +560,13 @@ class BenchmarkAgent(AgentBase):
             "read_skills",
             "set_ssh_context",
             "check_host",
-            "get_execution_config",
-            "get_runfile_schema",
-            "get_benchmark_params",
+            # From arcaflow_plugin_server.py:
             "get_plugin_schema",
+            "execute_arcaflow_plugin",
+            # From external Arcaflow MCP (plugin discovery):
             "plugin_list",
             "plugin_describe",
-            "execute_benchmark",
+            # Core:
             "submit_benchmark_result",
             "request_clarification",
         },
