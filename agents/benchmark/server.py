@@ -353,15 +353,6 @@ _SHELL_INJECTION_RE = re.compile(
     r";|&&|\|\||`|\$\(|\|",
 )
 
-# Arcaflow plugin discovery is deliberately limited to the published
-# Arcaflow plugin namespace. Besides preventing accidental execution of an
-# unrelated image, this means the image can never contribute shell syntax to
-# the remote command used by the schema probe.
-_ARCAFLOW_PLUGIN_IMAGE_RE = re.compile(
-    r"^quay\.io/arcalot/arcaflow-plugin-[a-z0-9][a-z0-9._-]*"
-    r"(?::[a-zA-Z0-9][a-zA-Z0-9._-]*|@sha256:[0-9a-fA-F]{64})?$"
-)
-
 
 def _validate_run_command(
     run_command: str,
@@ -396,19 +387,6 @@ def _validate_run_command(
             f"(allowed: {', '.join(sorted(allowed))})"
         )
 
-    return True, "OK"
-
-
-def _validate_plugin_image(plugin_image: str) -> tuple[bool, str]:
-    """Validate an Arcaflow plugin image before using it in a remote command."""
-    if not isinstance(plugin_image, str) or not plugin_image.strip():
-        return False, "plugin_image must be a non-empty string"
-    if not _ARCAFLOW_PLUGIN_IMAGE_RE.fullmatch(plugin_image):
-        return (
-            False,
-            "plugin_image must be a quay.io/arcalot/arcaflow-plugin image "
-            "with an optional tag or sha256 digest",
-        )
     return True, "OK"
 
 
@@ -944,43 +922,6 @@ def _controller_host() -> str | None:
     return None
 
 
-def _authorized_plugin_hosts() -> set[str]:
-    """Return host identities assigned to this ticket for schema discovery."""
-    fields = _ticket.get("custom_fields", {}) if _ticket else {}
-    authorized: set[str] = set()
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value.strip():
-            authorized.add(value.strip().rstrip(".").lower())
-
-    add(_controller_host())
-    assigned = fields.get("assigned_hardware_ips", {})
-    if isinstance(assigned, dict):
-        add(assigned.get("controller"))
-        targets = assigned.get("targets", [])
-        if isinstance(targets, (list, tuple, set)):
-            for target in targets:
-                add(target)
-        else:
-            add(targets)
-
-    inventory = fields.get("host_inventory", {})
-    if isinstance(inventory, dict):
-        for host in inventory:
-            add(host)
-    return authorized
-
-
-def _validate_plugin_host(host: str) -> tuple[bool, str]:
-    """Check that a schema target is an assigned controller/inventory host."""
-    if not isinstance(host, str) or not host.strip():
-        return False, "No target host available"
-    normalized = host.strip().rstrip(".").lower()
-    if normalized not in _authorized_plugin_hosts():
-        return False, "Target host is not assigned to this ticket"
-    return True, "OK"
-
-
 async def _read_controller_file(host: str, path: str) -> str | None:
     """Read one allowlisted controller context file through the ticket SSH."""
     if _ssh is None:
@@ -1475,57 +1416,6 @@ async def get_execution_config(harness_name: str) -> str:
                 ),
             }
         )
-    # Arcaflow plugins are self-contained containers — no private
-    # execution config or harness installation is needed.
-    if harness_name == "arcaflow-plugins":
-        return json.dumps(
-            {
-                "harness": harness_name,
-                "found": True,
-                "controller_required": False,
-                "run_command": "podman run",
-                "endpoint_type": "remotehosts",
-                "endpoint_user": "root",
-                "run_file_format": "yaml",
-                "results_dir_pattern": "",
-                "default_image_registry": "quay.io/arcalot",
-                "image_naming": (
-                    "quay.io/arcalot/arcaflow-plugin-<workload> "
-                    "(community plugins; third-party plugins "
-                    "may use different registries)"
-                ),
-                "workflow": [
-                    "1. Call get_plugin_schema with the plugin image to discover available steps and input parameters",
-                    "2. Build the input YAML based on the schema and ticket parameters",
-                    "3. Call execute_benchmark with "
-                    "run_file containing: plugin_image, "
-                    "plugin_step (the step name, e.g. "
-                    "'uperf' or 'workload'), and input "
-                    "(the YAML parameters as a dict). "
-                    "The tool handles podman run, -s flag, "
-                    "stdin piping, and result collection.",
-                ],
-                "run_file_keys": {
-                    "plugin_image": "required — full container image ref",
-                    "plugin_step": "required — step name (e.g. 'workload', 'uperf')",
-                    "input": "required — plugin input parameters as a dict",
-                },
-                "note": (
-                    "Arcaflow plugins are containers. "
-                    "Community plugins from quay.io/arcalot "
-                    "are typically multi-arch (amd64 + arm64). "
-                    "Do NOT manually "
-                    "pull or run containers — use "
-                    "get_runfile_schema and "
-                    "execute_benchmark which handle "
-                    "image resolution and execution. "
-                    "Do NOT try to install workload "
-                    "binaries (uperf, fio, etc.) on the "
-                    "host — they run inside containers."
-                ),
-            }
-        )
-
     config = await _skill_provider.get_all_private_config(harness_name)
     execution = config.get("execution", {})
     if not execution:
@@ -1594,75 +1484,6 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
             }
         )
     return json.dumps({"found": True, "harness": harness_name, "schema": schema})
-
-
-@mcp.tool()
-async def get_plugin_schema(
-    plugin_image: str,
-    host: str = "",
-) -> str:
-    """Query an Arcaflow plugin container for its input schema.
-
-    Runs the plugin with --json-schema input on the target host
-    via podman. Returns the JSON schema describing the plugin's
-    available steps and their input parameters.
-
-    Args:
-        plugin_image: Full container image ref
-            (e.g., quay.io/arcalot/arcaflow-plugin-fio:0.5.0)
-        host: Target host IP. Uses the ticket's controller
-            if not specified.
-    """
-    await _ensure_init()
-    if _ssh is None:
-        return json.dumps({"error": "SSH not initialized"})
-
-    image_valid, image_error = _validate_plugin_image(plugin_image)
-    if not image_valid:
-        return json.dumps({"error": image_error})
-
-    target = host or _controller_host() or ""
-    host_valid, host_error = _validate_plugin_host(target)
-    if not host_valid:
-        return json.dumps({"error": host_error})
-
-    cmd = shlex.join(["podman", "run", "--rm", plugin_image, "--json-schema", "input"])
-    result = await _ssh.run(target, cmd, timeout=60)
-
-    if result.exit_code != 0:
-        # Try --schema as fallback (returns full schema)
-        cmd_full = shlex.join(["podman", "run", "--rm", plugin_image, "--schema"])
-        result = await _ssh.run(target, cmd_full, timeout=60)
-
-    if result.exit_code != 0:
-        return json.dumps(
-            {
-                "error": f"Failed to query plugin schema (exit {result.exit_code})",
-                "stderr": result.stderr[:500] if result.stderr else "",
-                "hint": (
-                    "The plugin image may not exist or may not "
-                    "support --json-schema. Check the image ref."
-                ),
-            }
-        )
-
-    # Parse and return the schema
-    try:
-        schema = json.loads(result.stdout)
-        return json.dumps(
-            {
-                "plugin_image": plugin_image,
-                "schema": schema,
-            }
-        )
-    except json.JSONDecodeError:
-        return json.dumps(
-            {
-                "plugin_image": plugin_image,
-                "raw_output": result.stdout[:2000],
-                "note": "Output was not valid JSON",
-            }
-        )
 
 
 @mcp.tool()
@@ -3753,169 +3574,6 @@ async def execute_benchmark(
         if result.exit_code != 0:
             response["output"] = result.stdout[-3000:] if result.stdout else ""
             response["error"] = result.stderr[-1000:] if result.stderr else ""
-        return json.dumps(response)
-
-    if harness_name == "arcaflow-plugins":
-        import asyncio as _asyncio
-        import shutil
-
-        plugin_image = run_file.get("plugin_image", "")
-        plugin_input = run_file.get("input", {})
-        # Accept key aliases — the LLM uses various
-        # names for the step parameter.
-        plugin_step = (
-            run_file.get("plugin_step")
-            or run_file.get("step")
-            or run_file.get("step_name")
-            or "workload"
-        )
-
-        if not plugin_image:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "exit_code": -1,
-                    "run_id": f"arcaflow-{run_uuid}",
-                    "harness": "arcaflow-plugins",
-                    "output": "",
-                    "error": "No plugin_image specified in run file",
-                    "message": "Missing plugin_image",
-                }
-            )
-
-        image_valid, image_error = _validate_plugin_image(plugin_image)
-        if not image_valid:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "exit_code": -1,
-                    "run_id": f"arcaflow-{run_uuid}",
-                    "output": "",
-                    "error": image_error,
-                    "message": "Invalid Arcaflow plugin image",
-                }
-            )
-
-        # Determine if we can run locally (no SSH needed)
-        is_local = controller in ("localhost", "127.0.0.1", "::1")
-
-        # Serialize input as YAML if pyyaml available, else JSON
-        try:
-            import yaml
-
-            input_content = yaml.dump(plugin_input, default_flow_style=False)
-        except ImportError:
-            input_content = json.dumps(plugin_input, indent=2)
-
-        # Build container args: optional -s step, then -f - for stdin
-        container_args = []
-        container_args += ["-s", plugin_step]
-        container_args += ["-f", "-"]
-
-        if is_local:
-            logger.info(f"[benchmark] Local execution: podman run {plugin_image}")
-            podman_path = shutil.which("podman")
-            if not podman_path:
-                return json.dumps(
-                    {
-                        "status": "failed",
-                        "exit_code": -1,
-                        "run_id": f"arcaflow-{run_uuid}",
-                        "harness": "arcaflow-plugins",
-                        "output": "",
-                        "error": "podman not found locally",
-                        "message": "Arcaflow plugins require podman",
-                    }
-                )
-
-            proc = await AuditedSubprocessRunner().start(
-                [
-                    podman_path,
-                    "run",
-                    "-i",
-                    "--rm",
-                    "--network=host",
-                    plugin_image,
-                    *container_args,
-                ],
-                stdin=input_content.encode(),
-                mutating=True,
-            )
-            stdout_bytes, stderr_bytes = await proc.communicate()
-            exit_code = proc.returncode or 0
-            stdout_str = stdout_bytes.decode(errors="replace")
-            stderr_str = stderr_bytes.decode(errors="replace")
-        else:
-            podman_check = await _ssh.run(controller, "which podman", timeout=10)
-            if podman_check.exit_code != 0:
-                return json.dumps(
-                    {
-                        "status": "failed",
-                        "exit_code": -1,
-                        "run_id": f"arcaflow-{run_uuid}",
-                        "harness": "arcaflow-plugins",
-                        "output": "",
-                        "error": "podman not found on target host",
-                        "message": "Arcaflow plugins require podman on the target host",
-                    }
-                )
-
-            input_path = f"/tmp/arcaflow-input-{run_uuid}.yaml"
-            await _ssh.run(
-                controller,
-                f"cat > {input_path} << 'ARCAEOF'\n{input_content}\nARCAEOF",
-            )
-
-            podman_args = [
-                "podman",
-                "run",
-                "-i",
-                "--rm",
-                plugin_image,
-                "-s",
-                plugin_step,
-                "-f",
-                "-",
-            ]
-            cmd = f"cat {shlex.quote(input_path)} | {shlex.join(podman_args)} 2>&1"
-            logger.info(f"[benchmark] Executing Arcaflow plugin via SSH: {cmd}")
-            result = await _ssh.run_with_progress(
-                controller,
-                cmd,
-                progress_callback=_benchmark_progress,
-            )
-            exit_code = result.exit_code
-            stdout_str = result.stdout or ""
-            stderr_str = result.stderr or ""
-
-            await _ssh.run(controller, f"rm -f {input_path}", timeout=10)
-
-        response = {
-            "status": "completed" if exit_code == 0 else "failed",
-            "exit_code": exit_code,
-            "run_id": f"arcaflow-{run_uuid}",
-            "harness": "arcaflow-plugins",
-            "plugin_image": plugin_image,
-            "execution_mode": "local" if is_local else "ssh",
-            "message": (
-                "Arcaflow plugin completed"
-                if exit_code == 0
-                else f"Arcaflow plugin failed (exit {exit_code})"
-            ),
-        }
-        if exit_code == 0 and stdout_str:
-            try:
-                response["result_summary"] = json.loads(stdout_str)
-            except json.JSONDecodeError:
-                try:
-                    import yaml
-
-                    response["result_summary"] = yaml.safe_load(stdout_str)
-                except Exception:
-                    response["result_summary"] = stdout_str[:3000]
-        if exit_code != 0:
-            response["output"] = stdout_str[-3000:] if stdout_str else ""
-            response["error"] = stderr_str[-1000:] if stderr_str else ""
         return json.dumps(response)
 
     # Default: crucible (and any unknown harness that uses JSON run-files)
