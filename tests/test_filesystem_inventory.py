@@ -25,6 +25,7 @@ EXCLUDED_SOURCE_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
     ".pytest_cache",
+    ".claude",
     "coverage",
 }
 MUTATING_ATTRIBUTES = {
