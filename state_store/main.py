@@ -223,8 +223,7 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     )
     app.state.audit_log = audit_log
     app.state.event_bus = EventBus(
-        redactor=audit_redactor,
-        trace_store=app.state.trace_store,
+        redactor=audit_redactor, trace_store=app.state.trace_store
     )
     app.state.store = TicketStore(
         audit_log=audit_log,
