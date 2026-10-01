@@ -287,15 +287,58 @@ class ReviewAgent(AgentBase):
         self.tools = mcp_tools + self.tools
 
         try:
+            ticket = await self._get_ticket(ticket_id)
+            self._apply_review_tool_scoping(ticket)
             await super().run(ticket_id)
         finally:
             await mcp.disconnect()
             self._mcp = None
 
+    # Crucible-specific tools that should be hidden for harnesses
+    # that return inline results (arcaflow-plugins, arcaflow-workflows,
+    # boot-time).  These tools require a controller with Crucible
+    # installed and fail with SSH/file errors on other harnesses.
+    _CRUCIBLE_ONLY_TOOLS: frozenset[str] = frozenset(
+        {
+            "get_crucible_benchmark_context",
+            "read_run_results",
+            "get_run_summary",
+            "cdm_api_requests",
+            "compare_results",
+            "run_crucible_command",
+            "list_benchmark_artifacts",
+            "read_benchmark_artifact",
+        }
+    )
+
+    def _apply_review_tool_scoping(self, ticket: dict[str, Any]) -> None:
+        """Hide Crucible-specific tools for non-Crucible harnesses."""
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
+        )
+        if harness != "crucible":
+            self.tools = [
+                t for t in self.tools if t.name not in self._CRUCIBLE_ONLY_TOOLS
+            ]
+
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
         prompt = REVIEW_SYSTEM_PROMPT
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
+        if harness in ("arcaflow-plugins", "arcaflow-workflows", "boot-time"):
+            prompt += (
+                "\n\n## Inline Results\n\n"
+                "This harness returns benchmark results inline in "
+                "the benchmark agent's ticket comments and the "
+                "run_file_used / benchmark_status custom fields. "
+                "There are no external result files or controller "
+                "artifacts to retrieve. Review the ticket comments "
+                "and custom_fields for the execution output."
+            )
         if directives.get("review_mode") == "interactive":
             prompt += (
                 "\n\n## Interactive Review Mode\n\n"
