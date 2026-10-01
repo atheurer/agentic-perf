@@ -70,17 +70,6 @@ class LeaderLeaseClient:
                     "ttl_seconds": self.ttl_seconds,
                 },
             )
-        if response.status_code == 409:
-            # Lease expired or was superseded.  Re-acquire a fresh
-            # lease instead of crashing.  This handles pod restarts
-            # where the state store still holds the old session's
-            # lease until its TTL expires.
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "Leader lease renewal rejected (409) — re-acquiring"
-            )
-            return await self.acquire()
         response.raise_for_status()
         return response.json()
 

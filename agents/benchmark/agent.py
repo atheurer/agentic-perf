@@ -468,22 +468,13 @@ class BenchmarkAgent(AgentBase):
             state_store_url=self.store_url,
             agent_name=self.agent_name,
         )
-        try:
-            await mcp.connect_ticket_server(
-                arcaflow_plugin_server,
-                name="arcaflow-plugins",
-                ticket_id=ticket_id,
-                state_store_url=self.store_url,
-                agent_name=self.agent_name,
-            )
-        except Exception:
-            # Non-fatal: arcaflow plugin tools won't be available
-            # but other harnesses can proceed. Tool scoping will
-            # filter out the missing tools.
-            logger.debug(
-                "Arcaflow plugin server not available",
-                exc_info=True,
-            )
+        await mcp.connect_ticket_server(
+            arcaflow_plugin_server,
+            name="arcaflow-plugins",
+            ticket_id=ticket_id,
+            state_store_url=self.store_url,
+            agent_name=self.agent_name,
+        )
 
         # Workflow harnesses may expose their discovery and execution tools
         # through a configured external MCP server (for example the Arcaflow
