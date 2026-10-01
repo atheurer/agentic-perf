@@ -212,9 +212,8 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     from providers.redaction import Redactor
 
     audit_redactor = Redactor()
-    # Compatibility adapters use independent SQLite connections to the same
-    # database, so API worker threads never interleave transactions on one
-    # connection while the TraceStore remains the sole persistence authority.
+    # EventBus and AuditLog reuse the authoritative app.state.trace_store
+    # instance to avoid opening redundant SQLite connections and repeated checks.
     # Security wiring: AuditLog(redactor=...) must remain connected to the
     # same redactor as EventBus so sensitive audit fields are scrubbed.
     audit_log = AuditLog(
@@ -223,7 +222,9 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
         process_identity=getattr(app.state, "store_diagnostics", {}),
     )
     app.state.audit_log = audit_log
-    app.state.event_bus = EventBus(redactor=audit_redactor)
+    app.state.event_bus = EventBus(
+        redactor=audit_redactor, trace_store=app.state.trace_store
+    )
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,

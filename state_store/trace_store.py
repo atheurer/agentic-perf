@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from paths import TRACE_HISTORY_DB_PATH
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -77,69 +78,46 @@ class OperationRecord:
 class TraceStore:
     """The authoritative SQLite store, with one connection per store instance."""
 
-    def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5_000) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        history_db_path: Path | None = None,
+        busy_timeout_ms: int = 5_000,
+    ) -> None:
         self.db_path = Path(db_path)
+        self.history_db_path = (
+            Path(history_db_path)
+            if history_db_path is not None
+            else (
+                TRACE_HISTORY_DB_PATH
+                if self.db_path.name == "trace.db"
+                else self.db_path.parent
+                / f"{self.db_path.stem}-history{self.db_path.suffix}"
+            )
+        )
         # ASGI handlers may write concurrently while this store deliberately
         # shares one SQLite connection. Serialize transaction ownership.
         self._write_lock = threading.RLock()
         from providers.execution import AuditedFilesystem
 
         AuditedFilesystem.system(self.db_path.parent).mkdir(".", mode=0o777)
+        if self.history_db_path.parent != self.db_path.parent:
+            AuditedFilesystem.system(self.history_db_path.parent).mkdir(".", mode=0o777)
         # Serialize all transaction-bearing operations on the
         # shared connection.  Multiple callers (audit log,
         # store mutations, API handlers) access this store
         # concurrently; without a lock the manual BEGIN/COMMIT
         # calls collide.
         self._lock = threading.RLock()
+        self._connection: sqlite3.Connection | None = None
+        self._history_connection: sqlite3.Connection | None = None
         try:
-            self._connection = sqlite3.connect(
-                self.db_path,
-                timeout=busy_timeout_ms / 1000,
-                isolation_level=None,
-                check_same_thread=False,
-            )
-            self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA foreign_keys = ON")
-            self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-            deadline = time.monotonic() + busy_timeout_ms / 1000
-            self._startup_execute("PRAGMA journal_mode = WAL", deadline)
-            # Checkpoint aggressively to prevent WAL growth.
-            # The default (1000 pages / ~4MB) can't keep up with
-            # continuous trace writes.  100 pages (~400KB) keeps
-            # the WAL small and memory-mapped footprint low.
-            self._connection.execute("PRAGMA wal_autocheckpoint = 100")
-            # Reclaim WAL growth from a previous session.  Use PASSIVE
-            # mode so we never block concurrent store initializations
-            # (TRUNCATE/FULL require exclusive access and fail with
-            # "database is locked" when other connections hold reads).
-            try:
-                row = self._connection.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                # row = (busy_flag, pages_written, pages_checkpointed)
-                if row and row[0]:
-                    logger.debug(
-                        "startup WAL checkpoint was busy "
-                        "(pages written=%s, checkpointed=%s)",
-                        row[1],
-                        row[2],
-                    )
-            except Exception:
-                pass  # Non-fatal — best-effort reclamation
-            check = self._startup_execute(
-                "PRAGMA integrity_check", deadline
-            ).fetchone()[0]
-            if check != "ok":
-                raise TraceStoreMigrationError(
-                    f"trace database integrity check failed: {check}"
+            self._connection = self._init_db_connection(self.db_path, busy_timeout_ms)
+            if self.history_db_path != self.db_path:
+                self._history_connection = self._init_db_connection(
+                    self.history_db_path, busy_timeout_ms
                 )
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                migrate(self._connection)
-                self._connection.commit()
-            except Exception:
-                self._connection.rollback()
-                raise
         except TraceStoreMigrationError:
             self.close()
             raise
@@ -149,13 +127,64 @@ class TraceStore:
                 "could not initialize trace database"
             ) from exc
 
-    def _startup_execute(self, statement: str, deadline: float) -> sqlite3.Cursor:
-        """Run startup pragmas while other processes initialize the same DB.
+    def _init_db_connection(
+        self, db_path: Path, busy_timeout_ms: int
+    ) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            db_path,
+            timeout=busy_timeout_ms / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        deadline = time.monotonic() + busy_timeout_ms / 1000
+        self._startup_execute(conn, "PRAGMA journal_mode = WAL", deadline)
+        conn.execute("PRAGMA wal_autocheckpoint = 100")
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            if row and row[0]:
+                logger.debug(
+                    "startup WAL checkpoint was busy "
+                    "(pages written=%s, checkpointed=%s)",
+                    row[1],
+                    row[2],
+                )
+        except Exception:
+            pass  # Non-fatal — best-effort reclamation
+        check = self._startup_execute(
+            conn, "PRAGMA integrity_check", deadline
+        ).fetchone()[0]
+        if check != "ok":
+            conn.close()
+            raise TraceStoreMigrationError(
+                f"trace database integrity check failed for {db_path}: {check}"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migrate(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        return conn
 
-        SQLite serializes the WAL mode transition independently of the migration
-        transaction.  Retrying only lock/busy failures keeps simultaneous first
-        opens reliable while retaining a finite, explicit startup failure.
-        """
+    def _startup_execute(
+        self, connection: sqlite3.Connection, statement: str, deadline: float
+    ) -> sqlite3.Cursor:
+        """Run startup pragmas while other processes initialize the same DB."""
+        while True:
+            try:
+                return connection.execute(statement)
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.025, max(0, deadline - time.monotonic())))
         while True:
             try:
                 return self._connection.execute(statement)
@@ -191,23 +220,33 @@ class TraceStore:
                     logger.warning("WAL checkpoint failed", exc_info=True)
 
     def close(self) -> None:
-        """Close the connection; safe to call after a failed initialization."""
+        """Close the connections; safe to call after a failed initialization."""
         with self._lock:
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 connection.close()
                 self._connection = None
+            history_connection = getattr(self, "_history_connection", None)
+            if history_connection is not None:
+                history_connection.close()
+                self._history_connection = None
 
     def _open_connection(self) -> sqlite3.Connection:
         if self._connection is None:
             raise TraceStoreWriteError("trace store is closed")
         return self._connection
 
+    def _open_history_connection(self) -> sqlite3.Connection | None:
+        return self._history_connection
+
     def _rollback_if_open(self) -> None:
         """Leave no transaction open when a pre-commit policy check raises."""
         connection = getattr(self, "_connection", None)
         if connection is not None and connection.in_transaction:
             connection.rollback()
+        history_connection = getattr(self, "_history_connection", None)
+        if history_connection is not None and history_connection.in_transaction:
+            history_connection.rollback()
 
     def __enter__(self) -> TraceStore:
         return self
@@ -331,7 +370,17 @@ class TraceStore:
                     )
                     .fetchone()
                 )
-                return row[0] if row else 0
+                active_count = row[0] if row else 0
+                if active_count > 0:
+                    return active_count
+                history_conn = self._open_history_connection()
+                if history_conn is not None:
+                    hist_row = history_conn.execute(
+                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchone()
+                    return hist_row[0] if hist_row else 0
+                return 0
             except (sqlite3.Error, OSError):
                 return 0
 
@@ -346,7 +395,6 @@ class TraceStore:
         """Return immutable events in their authoritative insertion order."""
         with self._lock:
             try:
-                query = "SELECT event_json FROM trace_events"
                 predicates: list[str] = []
                 values: list[str] = []
                 if ticket_id is not None:
@@ -367,15 +415,112 @@ class TraceStore:
                         "'$.attributes.legacy_event.event_type') = ?"
                     )
                     values.append(legacy_event_type)
+                where_clause = ""
                 if predicates:
-                    query += " WHERE " + " AND ".join(predicates)
-                query += " ORDER BY global_seq"
-                return [
-                    TraceEventV1.model_validate_json(row["event_json"])
+                    where_clause = " WHERE " + " AND ".join(predicates)
+
+                query = f"SELECT global_seq, event_json FROM trace_events{where_clause} ORDER BY global_seq"
+                raw_rows: list[tuple[int, str]] = [
+                    (row["global_seq"], row["event_json"])
                     for row in self._open_connection().execute(query, tuple(values))
+                ]
+
+                # Check history connection if configured
+                history_conn = self._open_history_connection()
+                if history_conn is not None:
+                    hist_rows: list[tuple[int, str]] = []
+                    if ticket_id is not None:
+                        # For a single ticket, if not in active, query history
+                        if not raw_rows:
+                            hist_rows = [
+                                (row["global_seq"], row["event_json"])
+                                for row in history_conn.execute(query, tuple(values))
+                            ]
+                    elif ticket_ids is not None:
+                        # Find which tickets had rows in active DB
+                        found_tickets = {
+                            json.loads(r[1]).get("ticket_id") for r in raw_rows
+                        }
+                        missing_ticket_ids = [
+                            tid for tid in ticket_ids if tid not in found_tickets
+                        ]
+                        if missing_ticket_ids:
+                            placeholders = ", ".join("?" for _ in missing_ticket_ids)
+                            # Reconstruct predicates for missing tickets
+                            h_preds: list[str] = []
+                            h_vals: list[str] = []
+                            h_preds.append(f"ticket_id IN ({placeholders})")
+                            h_vals.extend(missing_ticket_ids)
+                            if action_type is not None:
+                                h_preds.append("action_type = ?")
+                                h_vals.append(action_type)
+                            if legacy_event_type is not None:
+                                h_preds.append(
+                                    "json_extract(event_json, "
+                                    "'$.attributes.legacy_event.event_type') = ?"
+                                )
+                                h_vals.append(legacy_event_type)
+                            h_query = f"SELECT global_seq, event_json FROM trace_events WHERE {' AND '.join(h_preds)} ORDER BY global_seq"
+                            hist_rows = [
+                                (row["global_seq"], row["event_json"])
+                                for row in history_conn.execute(h_query, tuple(h_vals))
+                            ]
+                    if hist_rows:
+                        raw_rows.extend(hist_rows)
+                        raw_rows.sort(key=lambda item: item[0])
+
+                return [
+                    TraceEventV1.model_validate_json(event_json)
+                    for _, event_json in raw_rows
                 ]
             except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
                 raise TraceStoreWriteError("could not read trace events") from exc
+
+    def migrate_ticket_traces(self, ticket_id: str) -> int:
+        """Migrate all trace events for ticket_id from active store to history store.
+
+        Returns the number of events moved. If no events exist in active store,
+        returns 0.
+        """
+        history_conn = self._open_history_connection()
+        if history_conn is None:
+            return 0
+        with self._lock:
+            with self._write_lock:
+                active_conn = self._open_connection()
+                cursor = active_conn.execute(
+                    "SELECT event_id, content_hash, global_seq, ticket_id, ticket_seq, "
+                    "trace_id, invocation_id, action_id, parent_action_id, action_type, "
+                    "lifecycle_state, outcome, producer_component, occurred_at, event_json "
+                    "FROM trace_events WHERE ticket_id = ?",
+                    (ticket_id,),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    return 0
+
+                history_conn.execute("BEGIN IMMEDIATE")
+                active_conn.execute("BEGIN IMMEDIATE")
+                try:
+                    history_conn.executemany(
+                        "INSERT OR IGNORE INTO trace_events ("
+                        "event_id, content_hash, global_seq, ticket_id, ticket_seq, "
+                        "trace_id, invocation_id, action_id, parent_action_id, action_type, "
+                        "lifecycle_state, outcome, producer_component, occurred_at, event_json"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [tuple(r) for r in rows],
+                    )
+                    active_conn.execute(
+                        "DELETE FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    )
+                    history_conn.commit()
+                    active_conn.commit()
+                except Exception:
+                    history_conn.rollback()
+                    active_conn.rollback()
+                    raise
+                return len(rows)
 
     def put_payload_descriptor(self, descriptor: PayloadDescriptor) -> None:
         """Persist safe payload metadata only; payload bytes are never stored in SQLite."""
