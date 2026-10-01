@@ -46,6 +46,13 @@ from .trace_store import TraceStore
 STATIC_DIR = Path(__file__).parent / "static"
 
 logger = logging.getLogger(__name__)
+# Ensure startup logs are visible even when uvicorn uses
+# --log-level warning (which only affects uvicorn's loggers).
+if not logger.handlers and not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 _runtime_locks: dict[Path, tuple[PersistenceRootLock, int]] = {}
 _runtime_locks_guard = threading.Lock()
