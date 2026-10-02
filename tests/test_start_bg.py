@@ -8,6 +8,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import sys
 import textwrap
 import time
 import uuid
@@ -373,17 +374,22 @@ def test_start_store_surfaces_crash_diagnostics_promptly(tmp_path: Path) -> None
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     # Mock python3 to immediately fail with a traceback when invoking uvicorn state_store.main:app
+    real_python = sys.executable
     mock_python = fake_bin / "python3"
     mock_python.write_text(
-        textwrap.dedent("""\
+        textwrap.dedent(f"""\
         #!/usr/bin/env bash
-        if [[ "$*" == *"state_store.main:app"* ]]; then
-            echo "Traceback (most recent call last):" >&2
-            echo "  File \\"state_store/main.py\\", line 42, in <module>" >&2
-            echo "ZeroDivisionError: division by zero" >&2
-            exit 1
-        fi
-        exec /usr/bin/python3 "$@"
+        case "$*" in
+            *"state_store.main:app"*)
+                echo "Traceback (most recent call last):" >&2
+                echo "  File \\"state_store/main.py\\", line 42, in <module>" >&2
+                echo "ZeroDivisionError: division by zero" >&2
+                exit 1
+                ;;
+            *)
+                exec {shlex.quote(real_python)} "$@"
+                ;;
+        esac
     """)
     )
     mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
@@ -427,13 +433,14 @@ def test_start_store_watchdog_resets_on_heartbeat(tmp_path: Path) -> None:
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    # Mock python3 running state store to emit milestones and take 2 seconds, with START_BG_STORE_TIMEOUT=1
+    real_python = sys.executable
     mock_python = fake_bin / "python3"
     mock_python.write_text(
         textwrap.dedent(f"""\
         #!/usr/bin/env bash
-        if [[ "$*" == *"state_store.main:app"* ]]; then
-            exec -a "python3 -m uvicorn state_store.main:app" /usr/bin/python3 -c '
+        case "$*" in
+            *"state_store.main:app"*)
+                exec -a "python3 -m uvicorn state_store.main:app" {shlex.quote(real_python)} -c '
 import fcntl, json, os, sys, time
 home = "{home}"
 store_id = "{store_id}"
@@ -469,8 +476,11 @@ with open(status_file, "w") as f:
 
 time.sleep(300)
 '
-        fi
-        exec /usr/bin/python3 "$@"
+                ;;
+            *)
+                exec {shlex.quote(real_python)} "$@"
+                ;;
+        esac
     """)
     )
     mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
