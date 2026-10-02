@@ -76,7 +76,7 @@ _LOCAL_TOOLS = [
                     "type": ["object", "null"],
                     "description": (
                         "Provider-specific metadata for teardown. "
-                        "QUADS: {assignment_id, cloud_name}. "
+                        "QUADS: {assignment_id, cloud_name, ostype, wipe}. "
                         "AWS: {instance_ids, region, instance_type}."
                     ),
                 },

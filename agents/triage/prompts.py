@@ -34,6 +34,9 @@ Your job is to analyze a performance test request ticket and:
    Available optional fields: nic_speed (int, Gbps), min_cores (int),
    min_memory_gb (int), os (string), host (string). Only include specs the
    user actually requested.
+   For QUADS OS requests, copy the requested title and version exactly to each
+   provider-allocated host that should use it. One QUADS assignment applies one
+   OS to all allocated hosts; do not infer or substitute an OS version.
 
    **Existing hosts:** When the user names specific existing hosts (FQDNs or
    IP addresses), set the `host` field on the corresponding required_hosts
@@ -75,6 +78,7 @@ Your job is to analyze a performance test request ticket and:
    - "use zathras, not crucible" → harness: "zathras"
    - "don't ask me for approval" / "just run it" → user_pre_run_approval: false
    - "these are cloud instances, no cleanup needed" → host_cleanup: "skip"
+   - "don't wipe the QUADS hosts" / "preserve their existing OS" → quads_wipe: false
    - "use AWS" / "deploy on EC2" / "use cloud instances" → resource_provider: "aws"
    - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"
    - "run on kubernetes" / "use kube endpoints" / "run in pods" → endpoint_type: "kube"
