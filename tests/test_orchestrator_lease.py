@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -227,7 +228,9 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
     monkeypatch.setattr(orchestrator_main, "_sweep_orphaned_leases", no_op)
     monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
     monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
-    monkeypatch.setattr("providers.telemetry.setup_telemetry", lambda **_kwargs: None)
+    telemetry_module = ModuleType("providers.telemetry")
+    telemetry_module.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
     monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
 
     lease = Lease()
