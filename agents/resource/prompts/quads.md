@@ -31,3 +31,7 @@ QUADS provides dedicated bare-metal servers with no virtualization overhead.
 - Max 5-day lifetime
 - One OS title applies to every host in an assignment. Do not combine different
   per-host OS requirements in a single assignment.
+
+For a request such as "find 2 hosts in QUADS with 400G NICs and reserve them
+with RHEL 10.1," check that each selected host has a 400 Gbps interface, choose
+two distinct hosts, and pass the exact OS title in selection.os.
