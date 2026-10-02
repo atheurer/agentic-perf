@@ -46,6 +46,13 @@ from .trace_store import TraceStore
 STATIC_DIR = Path(__file__).parent / "static"
 
 logger = logging.getLogger(__name__)
+# Ensure startup logs are visible even when uvicorn uses
+# --log-level warning (which only affects uvicorn's loggers).
+if not logger.handlers and not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 _runtime_locks: dict[Path, tuple[PersistenceRootLock, int]] = {}
 _runtime_locks_guard = threading.Lock()
@@ -93,6 +100,7 @@ def mount_routers(
 
 def _initialize_runtime(app: FastAPI, port: int) -> None:
     """Construct writable runtime components only after the root lock is held."""
+    logger.info("Initializing trace store...")
     from .status import record_store_status
 
     record_store_status("initializing_trace_store")
@@ -229,6 +237,7 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
         redactor=audit_redactor, trace_store=app.state.trace_store
     )
     record_store_status("loading_tickets")
+    logger.info("Loading tickets from disk...")
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,
@@ -324,8 +333,10 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         if getattr(app.state, "runtime_pid", None) == os.getpid():
             return
         _discard_inherited_runtime(app)
+    logger.info("Acquiring persistence root lock...")
     lock = _acquire_runtime_lock(port)
     record_store_status("lock_acquired")
+    logger.info("Lock acquired (store_id=%s)", lock.store_id)
     app.state.process_lock = lock
     app.state.store_diagnostics = {
         "store_id": lock.store_id,
