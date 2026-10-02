@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -12,7 +13,13 @@ from fastapi import Depends, FastAPI
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.leader_lease import LeaderLeaseClient
-from orchestrator.main import _handle_shutdown_signal, _renew_leader_lease, poll_loop
+from orchestrator.main import (
+    _handle_shutdown_signal,
+    _LeaseLossGate,
+    _poll_loop_after_lease,
+    _renew_leader_lease,
+    poll_loop,
+)
 from state_store.api.health import health
 from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
@@ -81,6 +88,29 @@ async def test_cancelled_lease_renewal_releases_leader_lease():
     assert lease.released
 
 
+@pytest.mark.asyncio
+async def test_failed_lease_renewal_deposes_and_releases_immediately():
+    class Lease:
+        renew_count = 0
+        released = False
+
+        async def renew(self):
+            self.renew_count += 1
+            raise RuntimeError("state store unavailable")
+
+        async def release(self):
+            self.released = True
+
+    lease = Lease()
+    lost = []
+    with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
+        await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+
+    assert lease.renew_count == 1
+    assert lease.released
+    assert lost == [True]
+
+
 class _PollLoopLease:
     def __init__(self, *_args, **_kwargs):
         self.epoch = None
@@ -120,6 +150,107 @@ async def test_poll_loop_releases_lease_when_initialization_fails(
         await poll_loop(_poll_config())
 
     assert lease.release_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_receives_lease_before_first_poll_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import orchestrator.main as orchestrator_main
+
+    config = _poll_config()
+    config.poll_interval = 60
+    config.stale_task_timeout = 0
+    observed = asyncio.get_running_loop().create_future()
+    dispatchers = []
+    phases = []
+
+    class Lease(_PollLoopLease):
+        async def renew(self):
+            return {"epoch": self.epoch}
+
+    class Events:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class Dispatcher:
+        def __init__(self, *_args, **kwargs):
+            self._session_id = kwargs["session_id"]
+            self._fencing_epoch = kwargs["fencing_epoch"]
+            dispatchers.append(self)
+
+        def reconcile_handoff_blocked(self, _tickets):
+            pass
+
+        async def shutdown(self):
+            pass
+
+    async def validate_models(*_args):
+        pass
+
+    async def fetch_tickets(_url):
+        dispatcher = dispatchers[0]
+        observed.set_result(
+            (dispatcher._session_id, dispatcher._fencing_epoch, list(phases))
+        )
+        return []
+
+    async def no_op(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(orchestrator_main, "RepoCache", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main, "build_skill_provider", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(orchestrator_main, "LocalSecretsProvider", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_make_llm_provider",
+        lambda _config: SimpleNamespace(
+            default_timeout=None, reasoning_effort=None, max_tokens=None
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_make_llm_factory", lambda _config: object()
+    )
+    monkeypatch.setattr(orchestrator_main, "_validate_models", validate_models)
+    monkeypatch.setattr(orchestrator_main, "EventBus", Events)
+    monkeypatch.setattr(orchestrator_main, "Dispatcher", Dispatcher)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "record_orchestrator_status",
+        lambda phase, **_kwargs: phases.append(phase),
+    )
+    monkeypatch.setattr(orchestrator_main, "_process_stop_requests", no_op)
+    monkeypatch.setattr(orchestrator_main, "_sweep_orphaned_leases", no_op)
+    monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
+    monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
+    telemetry_module = ModuleType("providers.telemetry")
+    telemetry_module.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
+    monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
+
+    lease = Lease()
+    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    task = asyncio.create_task(
+        _poll_loop_after_lease(config, lease, _LeaseLossGate(), lease_state)
+    )
+    try:
+        session_id, epoch, recorded_phases = await asyncio.wait_for(observed, timeout=5)
+        assert session_id == str(lease.session_id)
+        assert epoch == lease.epoch == 7
+        assert recorded_phases[-3:] == [
+            "acquiring_lease",
+            "lease_acquired",
+            "running",
+        ]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio

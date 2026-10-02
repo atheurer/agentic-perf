@@ -1854,8 +1854,6 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     write_effective_config(config)
     _ensure_state_store_environment(config)
 
-    from state_store.status import record_orchestrator_status
-
     from .leader_lease import LeaderLeaseClient
 
     leader_lease = LeaderLeaseClient(
@@ -1867,50 +1865,50 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     # Bind a durable control trace before using the audited HTTP client; ticket
     # traces are created later by the dispatcher for individual work items.
     bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
-    lease_renew_task: asyncio.Task | None = None
-    lease_renewal_started = asyncio.Event()
+    # Mutable container so _poll_loop_after_lease can store
+    # the renewal task for cleanup in the finally block.
+    lease_state: dict[str, Any] = {
+        "renew_task": None,
+        "started": asyncio.Event(),
+    }
     try:
-        record_orchestrator_status("acquiring_lease")
-        await leader_lease.acquire()
-        record_orchestrator_status("lease_acquired")
-        if leader_lease.epoch is None:
-            raise RuntimeError("state store returned no leader fencing epoch")
-        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
-            leader_lease.session_id
-        )
-        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        # Lease acquisition is deferred until after initialization
+        # completes inside _poll_loop_after_lease.  Initialization
+        # (model checks, MCP connections, telemetry) can take 30+
+        # seconds on slow storage, which would expire a 30s TTL
+        # lease acquired here.
         lease_loss_gate = _LeaseLossGate()
-        lease_renew_task = asyncio.create_task(
-            _renew_leader_lease(
-                leader_lease,
-                config.leader_lease_renew_interval,
-                lease_loss_gate.mark_deposed,
-                lease_renewal_started,
-            )
-        )
         await _poll_loop_after_lease(
             config,
             leader_lease,
-            lease_renew_task,
             lease_loss_gate,
+            lease_state,
         )
     finally:
-        if lease_renew_task is None:
+        renew_task = lease_state["renew_task"]
+        started = lease_state["started"]
+        if renew_task is None:
             await leader_lease.release()
         else:
-            await _cancel_and_await(lease_renew_task)
-            if not lease_renewal_started.is_set():
+            await _cancel_and_await(renew_task)
+            if not started.is_set():
                 await leader_lease.release()
 
 
 async def _poll_loop_after_lease(
     config: OrchestratorConfig,
     leader_lease: Any,
-    lease_renew_task: asyncio.Task,
     lease_loss_gate: _LeaseLossGate,
+    lease_state: dict[str, Any],
 ) -> None:
+    """Initialize the orchestrator and run the poll loop.
+
+    Lease acquisition is deferred to after initialization completes
+    so the TTL doesn't expire during slow startup I/O.
+    """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
+    lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
     # Create an MCP client for arcaflow plugin discovery
@@ -2085,13 +2083,6 @@ async def _poll_loop_after_lease(
         )
         lease_loss_gate.bind(dispatcher)
 
-        logger.info(
-            f"Orchestrator started (store={config.state_store_url}, "
-            f"poll={config.poll_interval}s, llm={config.llm_provider}, "
-            f"max_agents={config.max_concurrent_agents})"
-        )
-        record_orchestrator_status("running")
-
         # System-wide budget check (per orchestrator session)
         system_budget = None
         if config.budget_session_cost_usd > 0:
@@ -2102,11 +2093,45 @@ async def _poll_loop_after_lease(
             )
             logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
 
+        # Acquire the leader lease now that initialization is
+        # complete.  The TTL clock starts here, not during the
+        # 30+ seconds of model checks and MCP connections.
+        record_orchestrator_status("acquiring_lease")
+        await leader_lease.acquire()
+        if leader_lease.epoch is None:
+            raise RuntimeError("state store returned no leader fencing epoch")
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
+            leader_lease.session_id
+        )
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        record_orchestrator_status("lease_acquired")
+        # Update the dispatcher with the real lease credentials.
+        # It was constructed before acquire() with placeholder values.
+        dispatcher._session_id = str(leader_lease.session_id)
+        dispatcher._fencing_epoch = leader_lease.epoch
+        lease_renewal_started = lease_state["started"]
+        lease_renew_task = asyncio.create_task(
+            _renew_leader_lease(
+                leader_lease,
+                config.leader_lease_renew_interval,
+                lease_loss_gate.mark_deposed,
+                lease_renewal_started,
+            )
+        )
+        lease_state["renew_task"] = lease_renew_task
+        logger.info(
+            "Orchestrator started (store=%s, poll=%ss, llm=%s, max_agents=%s)",
+            config.state_store_url,
+            config.poll_interval,
+            config.llm_provider,
+            config.max_concurrent_agents,
+        )
+        record_orchestrator_status("running")
+
         status_names = list(STATUS_AGENT_MAP)
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
-        trace_sweep_task: asyncio.Task | None = None
         repos_refreshed = False
 
         while True:
@@ -2414,6 +2439,8 @@ async def _poll_loop_after_lease(
                         tid,
                     )
 
+                    if lease_renew_task is not None and lease_renew_task.done():
+                        lease_renew_task.result()
                     logger.info(f"Dispatching {status} agent for ticket {tid}")
                     task = asyncio.create_task(
                         run_agent_task(
