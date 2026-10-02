@@ -1737,30 +1737,16 @@ async def _renew_leader_lease(
     """Keep the control-plane lease fenced while the poll loop is active."""
     if started is not None:
         started.set()
-    consecutive_failures = 0
-    max_failures = 3
     try:
         while True:
+            await asyncio.sleep(interval)
             try:
                 await lease.renew()
-                consecutive_failures = 0
             except Exception as exc:
-                consecutive_failures += 1
-                logger.error(
-                    "Orchestrator leader lease renewal failed (%d/%d): %s",
-                    consecutive_failures,
-                    max_failures,
-                    exc,
-                )
-                if consecutive_failures >= max_failures:
-                    logger.critical(
-                        "Leader lease lost after %d consecutive renewal failures",
-                        max_failures,
-                    )
-                    if on_lost is not None:
-                        on_lost()
-                    raise RuntimeError("orchestrator leader lease lost") from exc
-            await asyncio.sleep(interval)
+                logger.critical("Orchestrator leader lease renewal failed: %s", exc)
+                if on_lost is not None:
+                    on_lost()
+                raise RuntimeError("orchestrator leader lease lost") from exc
     finally:
         await lease.release()
 
@@ -1868,7 +1854,6 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     write_effective_config(config)
     _ensure_state_store_environment(config)
 
-
     from .leader_lease import LeaderLeaseClient
 
     leader_lease = LeaderLeaseClient(
@@ -1923,6 +1908,7 @@ async def _poll_loop_after_lease(
     """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
+    lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
     # Create an MCP client for arcaflow plugin discovery
@@ -2146,7 +2132,6 @@ async def _poll_loop_after_lease(
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
-        trace_sweep_task: asyncio.Task | None = None
         repos_refreshed = False
 
         while True:
@@ -2454,6 +2439,8 @@ async def _poll_loop_after_lease(
                         tid,
                     )
 
+                    if lease_renew_task is not None and lease_renew_task.done():
+                        lease_renew_task.result()
                     logger.info(f"Dispatching {status} agent for ticket {tid}")
                     task = asyncio.create_task(
                         run_agent_task(
