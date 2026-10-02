@@ -377,20 +377,19 @@ def test_start_store_surfaces_crash_diagnostics_promptly(tmp_path: Path) -> None
     real_python = sys.executable
     mock_python = fake_bin / "python3"
     mock_python.write_text(
-        textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        case "$*" in
-            *"state_store.main:app"*)
-                echo "Traceback (most recent call last):" >&2
-                echo "  File \\"state_store/main.py\\", line 42, in <module>" >&2
-                echo "ZeroDivisionError: division by zero" >&2
-                exit 1
-                ;;
-            *)
-                exec {shlex.quote(real_python)} "$@"
-                ;;
-        esac
-    """)
+        f"""#!/usr/bin/env bash
+case "$*" in
+    *"state_store.main:app"*)
+        echo "Traceback (most recent call last):" >&2
+        echo "  File \\"state_store/main.py\\", line 42, in <module>" >&2
+        echo "ZeroDivisionError: division by zero" >&2
+        exit 1
+        ;;
+    *)
+        exec {shlex.quote(real_python)} "$@"
+        ;;
+esac
+"""
     )
     mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
 
@@ -434,13 +433,7 @@ def test_start_store_watchdog_resets_on_heartbeat(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     real_python = sys.executable
-    mock_python = fake_bin / "python3"
-    mock_python.write_text(
-        textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        case "$*" in
-            *"state_store.main:app"*)
-                exec -a "python3 -m uvicorn state_store.main:app" {shlex.quote(real_python)} -c '
+    code = f"""
 import fcntl, json, os, sys, time
 home = "{home}"
 store_id = "{store_id}"
@@ -475,13 +468,19 @@ with open(status_file, "w") as f:
     f.write("\\n")
 
 time.sleep(300)
-'
-                ;;
-            *)
-                exec {shlex.quote(real_python)} "$@"
-                ;;
-        esac
-    """)
+"""
+    mock_python = fake_bin / "python3"
+    mock_python.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+    *"state_store.main:app"*)
+        exec -a "python3 -m uvicorn state_store.main:app" {shlex.quote(real_python)} -c {shlex.quote(code)}
+        ;;
+    *)
+        exec {shlex.quote(real_python)} "$@"
+        ;;
+esac
+"""
     )
     mock_python.chmod(mock_python.stat().st_mode | stat.S_IXUSR)
 
