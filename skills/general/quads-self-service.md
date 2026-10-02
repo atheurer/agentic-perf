@@ -14,10 +14,10 @@ owner      — username portion of email (before @)
 ssh_key_path — SSH key to inject into reserved hosts
 ```
 
-**Note:** The `api_host` in the config file may differ from the host used to
-query individual host records. Always query host availability using
-`quads.rdu2.scalelab.redhat.com` (no "2"). Use the `api_host` from config
-for authenticated operations.
+Use the configured `api_host` for availability, host records, and authenticated
+reservation operations. Do not hardcode a QUADS endpoint for another site; if a
+request names a site, make sure the configured endpoint serves that site before
+searching or reserving.
 
 ## Full Reservation Flow
 
@@ -36,7 +36,7 @@ All subsequent write requests require `-H "Authorization: Bearer $TOKEN"`.
 ### 2. Check host availability
 
 ```bash
-curl -s "https://quads.rdu2.scalelab.redhat.com/api/v3/hosts/<hostname>/" \
+curl -s "https://$API_HOST/api/v3/hosts/<hostname>/" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); \
     print('cloud:', d['cloud']['name'], 'can_self_schedule:', d['can_self_schedule'])"
 ```
@@ -49,12 +49,16 @@ A host is available when `cloud.name == "cloud01"` and `can_self_schedule == tru
 curl -s -k -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"description": "short description", "owner": "<owner>", "qinq": 0, "wipe": "true"}' \
+  -d '{"description": "short description", "owner": "<owner>", "qinq": 0, "wipe": "true", "ostype": "RHEL 10.1"}' \
   "https://$API_HOST/api/v3/assignments/self"
 ```
 
 Response includes `cloud.name` (e.g. `cloud23`) and `id` (assignment ID).
-The `wipe: true` flag reprovisiones the host with the selected OS.
+The `ostype` field selects the Foreman OS title for the assignment. The `wipe`
+field controls whether QUADS reprovisions hosts; it defaults to true in
+self-service scheduling. Set `wipe` to `false` only when the user explicitly
+requests preserving the current OS. A requested OS and `wipe: false` conflict,
+because QUADS cannot guarantee a new OS without reprovisioning.
 
 ### 4. Schedule each host into the assignment
 

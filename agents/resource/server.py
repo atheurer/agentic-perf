@@ -409,6 +409,21 @@ def _infer_os_from_ticket() -> str:
     return ""
 
 
+def _infer_quads_os_from_ticket() -> tuple[str | None, bool]:
+    """Return the single OS requested for provider-allocated QUADS hosts."""
+    required_hosts = _ticket.get("custom_fields", {}).get("required_hosts", [])
+    os_values = {
+        host["os"].strip()
+        for host in required_hosts
+        if not host.get("host")
+        and isinstance(host.get("os"), str)
+        and host["os"].strip()
+    }
+    if len(os_values) > 1:
+        return None, True
+    return (next(iter(os_values)), False) if os_values else (None, False)
+
+
 @mcp.tool()
 async def reserve_resources(
     provider: str,
@@ -417,12 +432,56 @@ async def reserve_resources(
     ticket_id: str | None = None,
     duration_hours: int = 36,
 ) -> str:
-    """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
+    """Reserve provider resources and return an ID for teardown.
+
+    For QUADS, selection may include hostnames, os (the exact Foreman OS
+    title), and wipe (boolean, default true). The requested OS and no-wipe
+    cannot be combined because no-wipe does not reprovision the host.
+    """
     await _ensure_init()
+    if provider == "quads":
+        selection = dict(selection)
+        requested_os, os_conflict = _infer_quads_os_from_ticket()
+        if os_conflict:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "provider": provider,
+                    "message": (
+                        "QUADS assigns one OS to all hosts in an assignment, "
+                        "but the allocated hosts have different OS requirements. "
+                        "Ask the user whether to use one OS for the hosts or "
+                        "make separate reservation requests."
+                    ),
+                }
+            )
+        if requested_os:
+            selection["os"] = requested_os
+
+        directives = _ticket.get("custom_fields", {}).get("directives", {})
+        wipe_directive = directives.get("quads_wipe")
+        if isinstance(wipe_directive, bool):
+            selection["wipe"] = wipe_directive
+        else:
+            selection["wipe"] = True
+
+        if selection.get("os") and selection.get("wipe") is False:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "provider": provider,
+                    "message": (
+                        "A requested QUADS OS requires reprovisioning, but the "
+                        "ticket also requests no-wipe. Ask the user whether to "
+                        "install the requested OS or preserve the current OS."
+                    ),
+                }
+            )
+
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
-    # in the provider regardless of LLM behavior.
-    if not selection.get("ami") and not selection.get("os"):
+    # in the AWS provider regardless of LLM behavior.
+    elif not selection.get("ami") and not selection.get("os"):
         os_name = _infer_os_from_ticket()
         if os_name:
             selection = dict(selection)
