@@ -27,6 +27,8 @@ TRACE_PAYLOAD_DIR = AGENTIC_PERF_HOME / "trace-payloads"
 TRACE_SPOOL_DIR = AGENTIC_PERF_HOME / "trace-spool"
 STATE_STORE_LOCK_PATH = AGENTIC_PERF_HOME / "state-store.lock"
 STATE_STORE_ID_PATH = AGENTIC_PERF_HOME / "state-store.id"
+STATE_STORE_STATUS_PATH = AGENTIC_PERF_HOME / "state-store.status"
+ORCHESTRATOR_STATUS_PATH = AGENTIC_PERF_HOME / "orchestrator.status"
 
 SECRETS_DIR = Path(
     os.environ.get("AGENTIC_PERF_SECRETS", AGENTIC_PERF_HOME / "secrets")

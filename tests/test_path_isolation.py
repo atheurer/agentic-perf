@@ -53,6 +53,8 @@ class TestPathIsolation:
             paths.TRACE_PAYLOAD_DIR,
             paths.TRACE_SPOOL_DIR,
             paths.TRACE_AUDIT_KEY_PATH,
+            paths.STATE_STORE_STATUS_PATH,
+            paths.ORCHESTRATOR_STATUS_PATH,
         ):
             assert path.resolve().is_relative_to(_SANDBOX)
 

@@ -2004,10 +2004,20 @@ class TicketStore:
     def _load_from_disk(self) -> None:
         if not self._persist_dir.exists():
             return
+        from state_store.status import record_store_status
+
+        record_store_status("loading_tickets", detail="discovering_tickets")
         terminal_values = {s.value for s in TERMINAL_STATUSES}
         deferred = 0
         loaded = 0
-        for path in sorted(self._persist_dir.glob("PERF-*.json")):
+        ticket_paths = sorted(self._persist_dir.glob("PERF-*.json"))
+        total = len(ticket_paths)
+        for index, path in enumerate(ticket_paths, start=1):
+            if index % 25 == 0 or index == total:
+                record_store_status(
+                    "loading_tickets",
+                    detail=f"{index}/{total} tickets processed ({loaded} active, {deferred} deferred)",
+                )
             try:
                 raw = path.read_text(encoding="utf-8")
                 # Fast status check before full validation.
