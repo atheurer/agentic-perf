@@ -3,15 +3,17 @@
 # Prices are per-token in USD. Input and output tokens are
 # priced differently for most models. These are approximate
 # planning estimates — treat as guidance, not invoices.
+# Multi-tier rates such as long-context pricing are not modeled;
+# tiered models use their standard short-context rates here.
 #
 # Model names use prefix matching: "claude-sonnet-4" matches
 # "claude-sonnet-4-6", "claude-sonnet-4-20260501", etc.
 #
-# Last updated: 2026-09-24
+# Last updated: 2026-10-03
 #
 # Pricing sources:
 #   Anthropic: https://www.anthropic.com/pricing
-#   OpenAI:    https://openai.com/api/pricing
+#   OpenAI:    https://developers.openai.com/api/docs/pricing
 #   Google:    https://ai.google.dev/pricing
 #
 # To update: edit this file with current per-token prices
@@ -187,6 +189,13 @@ models:
     output_per_token: 0.00005         # $50.00 / 1M tokens
     context_window: 1050000
 
+  gpt-6.1-sol:
+    input_per_token: 0.000002        # $2.00 / 1M tokens
+    cache_read_per_token: 0.0000001  # $0.10 / 1M tokens
+    cache_write_per_token: 0.0000025 # $2.50 / 1M tokens
+    output_per_token: 0.00001        # $10.00 / 1M tokens
+    context_window: 1050000
+
   gpt-6-sol:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
@@ -222,23 +231,83 @@ models:
     output_per_token: 0.0000012       # $1.20 / 1M tokens
     context_window: 1048576
 
+  gpt-5.6-cyber:
+    input_per_token: 0.0000125        # $12.50 / 1M tokens
+    cache_read_per_token: 0.00000125  # $1.25 / 1M tokens
+    cache_write_per_token: 0.000015625 # $15.625 / 1M tokens
+    output_per_token: 0.000075        # $75.00 / 1M tokens
+    context_window: 400000
+
   gpt-5.5:
     input_per_token: 0.000005         # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.00003         # $30.00 / 1M tokens
-    context_window: 256000
+    context_window: 1050000
+
+  gpt-5.5-pro:
+    input_per_token: 0.00003          # $30.00 / 1M tokens
+    output_per_token: 0.00018        # $180.00 / 1M tokens
+    context_window: 1050000
 
   gpt-5.4:
     input_per_token: 0.0000025        # $2.50 / 1M tokens
     cache_read_per_token: 0.00000025  # $0.25 / 1M tokens
     output_per_token: 0.000015        # $15.00 / 1M tokens
-    context_window: 256000
+    context_window: 1050000
+
+  gpt-5.4-pro:
+    input_per_token: 0.00003          # $30.00 / 1M tokens
+    output_per_token: 0.00018        # $180.00 / 1M tokens
+    context_window: 1050000
 
   gpt-5.4-mini:
     input_per_token: 0.00000075       # $0.75 / 1M tokens
     cache_read_per_token: 0.000000075 # $0.075 / 1M tokens
     output_per_token: 0.0000045       # $4.50 / 1M tokens
     context_window: 1048576
+
+  # Deprecated by OpenAI, but still available during its shutdown notice.
+  gpt-5.4-nano:
+    input_per_token: 0.0000002        # $0.20 / 1M tokens
+    cache_read_per_token: 0.00000002  # $0.02 / 1M tokens
+    output_per_token: 0.00000125      # $1.25 / 1M tokens
+    context_window: 400000
+
+  gpt-5.2:
+    input_per_token: 0.00000175       # $1.75 / 1M tokens
+    cache_read_per_token: 0.000000175 # $0.175 / 1M tokens
+    output_per_token: 0.000014        # $14.00 / 1M tokens
+    context_window: 400000
+
+  gpt-5.2-pro:
+    input_per_token: 0.000021         # $21.00 / 1M tokens
+    output_per_token: 0.000168        # $168.00 / 1M tokens
+    context_window: 400000
+
+  # Deprecated by OpenAI, but still available during its shutdown notice.
+  gpt-5.1:
+    input_per_token: 0.00000125       # $1.25 / 1M tokens
+    cache_read_per_token: 0.000000125 # $0.125 / 1M tokens
+    output_per_token: 0.00001         # $10.00 / 1M tokens
+    context_window: 400000
+
+  gpt-5.1-codex:
+    input_per_token: 0.00000125       # $1.25 / 1M tokens
+    cache_read_per_token: 0.000000125 # $0.125 / 1M tokens
+    output_per_token: 0.00001         # $10.00 / 1M tokens
+    context_window: 400000
+
+  gpt-5.1-codex-max:
+    input_per_token: 0.00000125       # $1.25 / 1M tokens
+    cache_read_per_token: 0.000000125 # $0.125 / 1M tokens
+    output_per_token: 0.00001         # $10.00 / 1M tokens
+    context_window: 400000
+
+  gpt-5.1-codex-mini:
+    input_per_token: 0.00000025       # $0.25 / 1M tokens
+    cache_read_per_token: 0.000000025 # $0.025 / 1M tokens
+    output_per_token: 0.000002        # $2.00 / 1M tokens
+    context_window: 400000
 
   gpt-5:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
@@ -251,6 +320,19 @@ models:
     cache_read_per_token: 0.000000025 # $0.025 / 1M tokens
     output_per_token: 0.000002        # $2.00 / 1M tokens
     context_window: 128000
+
+  # Deprecated by OpenAI, but still available during its shutdown notice.
+  gpt-5-nano:
+    input_per_token: 0.00000005       # $0.05 / 1M tokens
+    cache_read_per_token: 0.000000005 # $0.005 / 1M tokens
+    output_per_token: 0.0000004       # $0.40 / 1M tokens
+    context_window: 400000
+
+  # Deprecated by OpenAI, but still available during its shutdown notice.
+  gpt-5-pro:
+    input_per_token: 0.000015         # $15.00 / 1M tokens
+    output_per_token: 0.00012         # $120.00 / 1M tokens
+    context_window: 400000
 
   o3:
     input_per_token: 0.000002         # $2.00 / 1M tokens
@@ -309,6 +391,41 @@ models:
     input_per_token: 0.00001        # $10.00 / 1M tokens
     output_per_token: 0.00003       # $30.00 / 1M tokens
     context_window: 128000
+
+  # --- OpenAI specialized and alias text models ---
+  chat-latest:
+    input_per_token: 0.000005        # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005  # $0.50 / 1M tokens
+    output_per_token: 0.00003        # $30.00 / 1M tokens
+    context_window: 400000
+
+  # Deprecated by OpenAI; still available until its April 2027 shutdown.
+  gpt-5.3-codex:
+    input_per_token: 0.00000175      # $1.75 / 1M tokens
+    cache_read_per_token: 0.000000175 # $0.175 / 1M tokens
+    output_per_token: 0.000014       # $14.00 / 1M tokens
+    context_window: 400000
+
+  # Access-limited model; billing starts October 5, 2026.
+  gpt-rosalind-research:
+    input_per_token: 0.000005        # $5.00 / 1M tokens
+    cache_read_per_token: 0.0000005  # $0.50 / 1M tokens
+    output_per_token: 0.000025       # $25.00 / 1M tokens
+
+  # OpenAI documents these aliases as pointing to GPT-5.6 Sol and Cyber.
+  gpt-daybreak-blue-latest:
+    input_per_token: 0.000004         # $4.00 / 1M tokens
+    cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
+    cache_write_per_token: 0.000005   # $5.00 / 1M tokens
+    output_per_token: 0.00002         # $20.00 / 1M tokens
+    context_window: 1050000
+
+  gpt-daybreak-red-latest:
+    input_per_token: 0.0000125        # $12.50 / 1M tokens
+    cache_read_per_token: 0.00000125  # $1.25 / 1M tokens
+    cache_write_per_token: 0.000015625 # $15.625 / 1M tokens
+    output_per_token: 0.000075        # $75.00 / 1M tokens
+    context_window: 400000
 
   # --- Google ---
   # Source: https://ai.google.dev/pricing
