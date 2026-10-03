@@ -95,6 +95,42 @@ def test_openai_gpt6_model_pricing():
         )
 
 
+def test_openai_missing_text_model_pricing():
+    """Published OpenAI text model IDs and aliases use explicit rates."""
+    expected = {
+        "gpt-6.1-sol": 0.007,
+        "gpt-5.6-cyber": 0.05,
+        "gpt-5.5-pro": 0.12,
+        "gpt-5.4-pro": 0.12,
+        "gpt-5.4-nano": 0.000825,
+        "gpt-5.2": 0.00875,
+        "gpt-5.2-pro": 0.105,
+        "gpt-5.1": 0.00625,
+        "gpt-5.1-codex": 0.00625,
+        "gpt-5.1-codex-max": 0.00625,
+        "gpt-5.1-codex-mini": 0.00125,
+        "gpt-5-nano": 0.00025,
+        "gpt-5-pro": 0.075,
+        "gpt-5.3-codex": 0.00875,
+        "chat-latest": 0.02,
+        "gpt-rosalind-research": 0.0175,
+        "gpt-daybreak-blue-latest": 0.014,
+        "gpt-daybreak-red-latest": 0.05,
+    }
+    for model, cost in expected.items():
+        assert abs(estimate_cost(model, 1000, 500) - cost) < 1e-10
+
+    # The official GPT-6.1 Sol cache rates include cache writes at 1.25x input.
+    cached_sol = estimate_cost(
+        "gpt-6.1-sol",
+        1000,
+        500,
+        cache_read_input_tokens=800,
+        cache_creation_input_tokens=100,
+    )
+    assert abs(cached_sol - 0.00553) < 1e-10
+
+
 def test_google_model():
     """Google models have their own pricing."""
     c = estimate_cost("gemini-2.5-pro", 1000, 500)
