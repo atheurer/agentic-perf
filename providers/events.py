@@ -95,6 +95,7 @@ class CumulativeUsage:
         "llm_calls",
         "total_duration_ms",
         "models_used",
+        "estimated_cost_usd",
     )
 
     def __init__(self) -> None:
@@ -105,6 +106,7 @@ class CumulativeUsage:
         self.llm_calls: int = 0
         self.total_duration_ms: int = 0
         self.models_used: set[str] = set()
+        self.estimated_cost_usd: float = 0.0
 
     def record(
         self,
@@ -124,6 +126,15 @@ class CumulativeUsage:
         self.llm_calls += 1
         if model:
             self.models_used.add(model)
+        from providers.cost import estimate_cost
+
+        self.estimated_cost_usd += estimate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Snapshot of accumulated usage."""
@@ -136,6 +147,7 @@ class CumulativeUsage:
             "llm_calls": self.llm_calls,
             "total_duration_ms": self.total_duration_ms,
             "models_used": sorted(self.models_used),
+            "estimated_cost_usd": self.estimated_cost_usd,
         }
 
 
@@ -462,6 +474,7 @@ class EventBus:
                 total.cache_creation_input_tokens += usage.cache_creation_input_tokens
                 total.llm_calls += usage.llm_calls
                 total.total_duration_ms += usage.total_duration_ms
+                total.estimated_cost_usd += usage.estimated_cost_usd
                 total.models_used.update(usage.models_used)
             return total.to_dict()
 

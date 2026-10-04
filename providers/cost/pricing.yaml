@@ -3,18 +3,19 @@
 # Prices are per-token in USD. Input and output tokens are
 # priced differently for most models. These are approximate
 # planning estimates — treat as guidance, not invoices.
-# Multi-tier rates such as long-context pricing are not modeled;
-# tiered models use their standard short-context rates here.
+# Context-tier rates apply to the full request once a model's
+# documented input-token threshold is reached.
 #
 # Model names use prefix matching: "claude-sonnet-4" matches
 # "claude-sonnet-4-6", "claude-sonnet-4-20260501", etc.
 #
-# Last updated: 2026-10-03
+# Last updated: 2026-10-04
 #
 # Pricing sources:
 #   Anthropic: https://www.anthropic.com/pricing
 #   OpenAI:    https://developers.openai.com/api/docs/pricing
-#   Google:    https://ai.google.dev/pricing
+#   Google:    https://ai.google.dev/gemini-api/docs/pricing
+#   xAI:       https://docs.x.ai/developers/pricing
 #
 # To update: edit this file with current per-token prices
 # from the provider's pricing page. The system reloads this
@@ -188,6 +189,12 @@ models:
     cache_write_per_token: 0.0000125  # $12.50 / 1M tokens
     output_per_token: 0.00005         # $50.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.00002          # $20.00 / 1M tokens
+        cache_read_per_token: 0.000002    # $2.00 / 1M tokens
+        cache_write_per_token: 0.000025   # $25.00 / 1M tokens
+        output_per_token: 0.000075        # $75.00 / 1M tokens
 
   gpt-6.1-sol:
     input_per_token: 0.000002        # $2.00 / 1M tokens
@@ -195,6 +202,12 @@ models:
     cache_write_per_token: 0.0000025 # $2.50 / 1M tokens
     output_per_token: 0.00001        # $10.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000004        # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000002  # $0.20 / 1M tokens
+        cache_write_per_token: 0.000005  # $5.00 / 1M tokens
+        output_per_token: 0.000015       # $15.00 / 1M tokens
 
   gpt-6-sol:
     input_per_token: 0.000002         # $2.00 / 1M tokens
@@ -202,6 +215,12 @@ models:
     cache_write_per_token: 0.0000025  # $2.50 / 1M tokens
     output_per_token: 0.00001         # $10.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
+        cache_write_per_token: 0.000005   # $5.00 / 1M tokens
+        output_per_token: 0.000015        # $15.00 / 1M tokens
 
   gpt-6-luna:
     input_per_token: 0.0000001          # $0.10 / 1M tokens
@@ -209,6 +228,12 @@ models:
     cache_write_per_token: 0.000000125  # $0.125 / 1M tokens
     output_per_token: 0.0000005         # $0.50 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.0000002         # $0.20 / 1M tokens
+        cache_read_per_token: 0.00000002   # $0.02 / 1M tokens
+        cache_write_per_token: 0.00000025  # $0.25 / 1M tokens
+        output_per_token: 0.00000075       # $0.75 / 1M tokens
 
   gpt-5.6-sol:
     input_per_token: 0.000004         # $4.00 / 1M tokens
@@ -216,6 +241,26 @@ models:
     cache_write_per_token: 0.000005   # $5.00 / 1M tokens
     output_per_token: 0.00002         # $20.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000008         # $8.00 / 1M tokens
+        cache_read_per_token: 0.0000008  # $0.80 / 1M tokens
+        cache_write_per_token: 0.00001  # $10.00 / 1M tokens
+        output_per_token: 0.00003       # $30.00 / 1M tokens
+
+  # OpenAI documents gpt-5.6 as an alias for gpt-5.6-sol.
+  gpt-5.6:
+    input_per_token: 0.000004         # $4.00 / 1M tokens
+    cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
+    cache_write_per_token: 0.000005  # $5.00 / 1M tokens
+    output_per_token: 0.00002         # $20.00 / 1M tokens
+    context_window: 1048576
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000008         # $8.00 / 1M tokens
+        cache_read_per_token: 0.0000008  # $0.80 / 1M tokens
+        cache_write_per_token: 0.00001  # $10.00 / 1M tokens
+        output_per_token: 0.00003       # $30.00 / 1M tokens
 
   gpt-5.6-terra:
     input_per_token: 0.000002         # $2.00 / 1M tokens
@@ -223,6 +268,12 @@ models:
     cache_write_per_token: 0.0000025  # $2.50 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000004  # $0.40 / 1M tokens
+        cache_write_per_token: 0.000005 # $5.00 / 1M tokens
+        output_per_token: 0.000018       # $18.00 / 1M tokens
 
   gpt-5.6-luna:
     input_per_token: 0.0000002        # $0.20 / 1M tokens
@@ -230,6 +281,12 @@ models:
     cache_write_per_token: 0.00000025 # $0.25 / 1M tokens
     output_per_token: 0.0000012       # $1.20 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.0000004       # $0.40 / 1M tokens
+        cache_read_per_token: 0.00000004 # $0.04 / 1M tokens
+        cache_write_per_token: 0.0000005 # $0.50 / 1M tokens
+        output_per_token: 0.0000018      # $1.80 / 1M tokens
 
   gpt-5.6-cyber:
     input_per_token: 0.0000125        # $12.50 / 1M tokens
@@ -237,12 +294,23 @@ models:
     cache_write_per_token: 0.000015625 # $15.625 / 1M tokens
     output_per_token: 0.000075        # $75.00 / 1M tokens
     context_window: 400000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000025          # $25.00 / 1M tokens
+        cache_read_per_token: 0.0000025   # $2.50 / 1M tokens
+        cache_write_per_token: 0.00003125 # $31.25 / 1M tokens
+        output_per_token: 0.0001125       # $112.50 / 1M tokens
 
   gpt-5.5:
     input_per_token: 0.000005         # $5.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.00003         # $30.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.00001         # $10.00 / 1M tokens
+        cache_read_per_token: 0.000001   # $1.00 / 1M tokens
+        output_per_token: 0.000045      # $45.00 / 1M tokens
 
   gpt-5.5-pro:
     input_per_token: 0.00003          # $30.00 / 1M tokens
@@ -254,11 +322,20 @@ models:
     cache_read_per_token: 0.00000025  # $0.25 / 1M tokens
     output_per_token: 0.000015        # $15.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000005          # $5.00 / 1M tokens
+        cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
+        output_per_token: 0.0000225      # $22.50 / 1M tokens
 
   gpt-5.4-pro:
     input_per_token: 0.00003          # $30.00 / 1M tokens
     output_per_token: 0.00018        # $180.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.00006          # $60.00 / 1M tokens
+        output_per_token: 0.00027        # $270.00 / 1M tokens
 
   gpt-5.4-mini:
     input_per_token: 0.00000075       # $0.75 / 1M tokens
@@ -419,6 +496,12 @@ models:
     cache_write_per_token: 0.000005   # $5.00 / 1M tokens
     output_per_token: 0.00002         # $20.00 / 1M tokens
     context_window: 1050000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000008         # $8.00 / 1M tokens
+        cache_read_per_token: 0.0000008   # $0.80 / 1M tokens
+        cache_write_per_token: 0.00001    # $10.00 / 1M tokens
+        output_per_token: 0.00003         # $30.00 / 1M tokens
 
   gpt-daybreak-red-latest:
     input_per_token: 0.0000125        # $12.50 / 1M tokens
@@ -426,6 +509,12 @@ models:
     cache_write_per_token: 0.000015625 # $15.625 / 1M tokens
     output_per_token: 0.000075        # $75.00 / 1M tokens
     context_window: 400000
+    context_tiers:
+      - input_tokens_gt: 272000
+        input_per_token: 0.000025          # $25.00 / 1M tokens
+        cache_read_per_token: 0.0000025    # $2.50 / 1M tokens
+        cache_write_per_token: 0.00003125  # $31.25 / 1M tokens
+        output_per_token: 0.0001125        # $112.50 / 1M tokens
 
   # --- Google ---
   # Source: https://ai.google.dev/pricing
@@ -458,6 +547,11 @@ models:
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
     context_window: 2097152
+    context_tiers:
+      - input_tokens_gt: 200000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
+        output_per_token: 0.000018        # $18.00 / 1M tokens
 
   # Preview matches the base model pricing.
   # Prefix matching: gemini-3.1-pro-preview matches this entry.
@@ -466,12 +560,22 @@ models:
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000012        # $12.00 / 1M tokens
     context_window: 2097152
+    context_tiers:
+      - input_tokens_gt: 200000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000004   # $0.40 / 1M tokens
+        output_per_token: 0.000018        # $18.00 / 1M tokens
 
   gemini-2.5-pro:
     input_per_token: 0.00000125     # $1.25 / 1M tokens
-    cache_read_per_token: 0.000000315  # $0.315 / 1M tokens
+    cache_read_per_token: 0.000000125  # $0.125 / 1M tokens
     output_per_token: 0.00001       # $10.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gt: 200000
+        input_per_token: 0.0000025        # $2.50 / 1M tokens
+        cache_read_per_token: 0.00000025 # $0.25 / 1M tokens
+        output_per_token: 0.000015      # $15.00 / 1M tokens
 
   gemini-2.5-flash:
     input_per_token: 0.00000015     # $0.15 / 1M tokens
@@ -480,31 +584,62 @@ models:
     context_window: 1048576
 
   # --- xAI (Grok) ---
-  # Source: https://docs.x.ai/docs/overview
+  # Source: https://docs.x.ai/developers/pricing
   # Cache: 75% - 85% discount on reads
+  grok-4.7:
+    input_per_token: 0.000002       # $2.00 / 1M tokens
+    cache_read_per_token: 0.0000005 # $0.50 / 1M tokens
+    output_per_token: 0.000006      # $6.00 / 1M tokens
+    context_window: 500000
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.000004       # $4.00 / 1M tokens
+        cache_read_per_token: 0.000001  # $1.00 / 1M tokens
+        output_per_token: 0.000012      # $12.00 / 1M tokens
+
   grok-4.6:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000005   # $0.50 / 1M tokens
     output_per_token: 0.000006        # $6.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.000001   # $1.00 / 1M tokens
+        output_per_token: 0.000012        # $12.00 / 1M tokens
 
   grok-4.5:
     input_per_token: 0.000002         # $2.00 / 1M tokens
     cache_read_per_token: 0.0000003   # $0.30 / 1M tokens
     output_per_token: 0.000006        # $6.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.000004         # $4.00 / 1M tokens
+        cache_read_per_token: 0.0000006  # $0.60 / 1M tokens
+        output_per_token: 0.000012        # $12.00 / 1M tokens
 
   grok-4.3:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.0000025       # $2.50 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.0000025       # $2.50 / 1M tokens
+        cache_read_per_token: 0.0000004 # $0.40 / 1M tokens
+        output_per_token: 0.000005       # $5.00 / 1M tokens
 
   grok-4.20:
     input_per_token: 0.00000125       # $1.25 / 1M tokens
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.0000025       # $2.50 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.0000025       # $2.50 / 1M tokens
+        cache_read_per_token: 0.0000004 # $0.40 / 1M tokens
+        output_per_token: 0.000005       # $5.00 / 1M tokens
 
   grok-code-fast:
     input_per_token: 0.000001         # $1.00 / 1M tokens
@@ -517,6 +652,11 @@ models:
     cache_read_per_token: 0.0000002   # $0.20 / 1M tokens
     output_per_token: 0.000002        # $2.00 / 1M tokens
     context_window: 1048576
+    context_tiers:
+      - input_tokens_gte: 200000
+        input_per_token: 0.000002       # $2.00 / 1M tokens
+        cache_read_per_token: 0.0000004 # $0.40 / 1M tokens
+        output_per_token: 0.000004       # $4.00 / 1M tokens
 
   grok-3-mini:
     input_per_token: 0.0000003        # $0.30 / 1M tokens
