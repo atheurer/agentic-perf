@@ -24,4 +24,7 @@ is needed.
 
    The tool loads the workflow, exports the input, runs the
    Arcaflow engine, and polls until completion. It returns
-   the workflow output for `submit_benchmark_result`.
+   the workflow output for `submit_benchmark_result`. Copy the exact useful
+   measurements, units, sample counts, and any errors into its `notes` field.
+   The benchmark agent persists that concise summary as `benchmark_notes` for
+   the review agent; raw tool output is not retained as a retrievable artifact.

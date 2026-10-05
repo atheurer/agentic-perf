@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS = 30.0
 _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS = 1.0
 _ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS = 5.0
+_MAX_BENCHMARK_NOTES_CHARS = 4000
+
+
+def _bounded_benchmark_notes(notes: Any) -> str:
+    """Keep the result handoff useful without growing ticket context unbounded."""
+    if not isinstance(notes, str):
+        return ""
+    if len(notes) <= _MAX_BENCHMARK_NOTES_CHARS:
+        return notes
+    marker = "\n[benchmark notes truncated]"
+    return notes[: _MAX_BENCHMARK_NOTES_CHARS - len(marker)] + marker
 
 
 def _filter_external_tools(
@@ -48,6 +59,39 @@ def _filter_external_tools(
         or enabled_external.get(routing.get(tool.name)) is None
         or tool.name in (enabled_external.get(routing.get(tool.name)) or set())
     ]
+
+
+async def _connect_arcaflow_plugin_server(
+    mcp: AgentMCPClient,
+    server_script: str,
+    *,
+    ticket_id: str,
+    state_store_url: str,
+    agent_name: str,
+    required: bool,
+) -> None:
+    """Connect the plugin server, requiring it for the plugin harness."""
+    try:
+        await mcp.connect_ticket_server(
+            server_script,
+            name="arcaflow-plugins",
+            ticket_id=ticket_id,
+            state_store_url=state_store_url,
+            agent_name=agent_name,
+        )
+    except Exception:
+        if required:
+            try:
+                await mcp.disconnect()
+            except Exception:
+                logger.debug(
+                    "Failed to disconnect MCP servers after required Arcaflow "
+                    "plugin server startup failure",
+                    exc_info=True,
+                )
+            raise
+        # Other harnesses do not depend on the direct plugin tools.
+        logger.debug("Arcaflow plugin server not available", exc_info=True)
 
 
 _LOCAL_TOOLS = [
@@ -133,7 +177,14 @@ _LOCAL_TOOLS = [
                 },
                 "run_file_used": {"type": "object"},
                 "benchmark_duration": {"type": ["integer", "null"]},
-                "notes": {"type": "string"},
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Concise benchmark output summary for the review agent. "
+                        "For Arcaflow, include exact measured values, units, "
+                        "sample counts, and any errors from the tool output."
+                    ),
+                },
             },
             "required": ["run_id", "benchmark_status"],
         },
@@ -446,6 +497,11 @@ class BenchmarkAgent(AgentBase):
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
+        ticket = await self._get_ticket(ticket_id)
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
+        )
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -468,12 +524,13 @@ class BenchmarkAgent(AgentBase):
             state_store_url=self.store_url,
             agent_name=self.agent_name,
         )
-        await mcp.connect_ticket_server(
+        await _connect_arcaflow_plugin_server(
+            mcp,
             arcaflow_plugin_server,
-            name="arcaflow-plugins",
             ticket_id=ticket_id,
             state_store_url=self.store_url,
             agent_name=self.agent_name,
+            required=harness == "arcaflow-plugins",
         )
 
         # Workflow harnesses may expose their discovery and execution tools
@@ -502,7 +559,6 @@ class BenchmarkAgent(AgentBase):
         self.tools = all_tools + self.tools
 
         try:
-            ticket = await self._get_ticket(ticket_id)
             await self._prepare_legacy_execution_model(ticket)
 
             # Scope tools to the harness. Standalone
@@ -1238,6 +1294,7 @@ class BenchmarkAgent(AgentBase):
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "benchmark_duration": result.get("benchmark_duration"),
+            "benchmark_notes": _bounded_benchmark_notes(result.get("notes")),
         }
         validation_id = result.get("validation_id") or self._active_validation_id
         run_file_used = result.get("run_file_used", {})
@@ -1274,8 +1331,8 @@ class BenchmarkAgent(AgentBase):
         )
         if fields["benchmark_duration"]:
             summary += f"- **Duration:** {fields['benchmark_duration']}s\n"
-        if result.get("notes"):
-            summary += f"- **Notes:** {result['notes']}\n"
+        if fields["benchmark_notes"]:
+            summary += f"- **Notes:** {fields['benchmark_notes']}\n"
 
         await self._add_comment(ticket_id, summary)
 

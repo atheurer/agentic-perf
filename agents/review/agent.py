@@ -287,15 +287,71 @@ class ReviewAgent(AgentBase):
         self.tools = mcp_tools + self.tools
 
         try:
+            self._apply_review_tool_scoping(ticket)
             await super().run(ticket_id)
         finally:
             await mcp.disconnect()
             self._mcp = None
 
+    # Crucible-specific tools that require a controller with Crucible
+    # installed and fail with SSH/file errors on other harnesses.
+    _CRUCIBLE_ONLY_TOOLS: frozenset[str] = frozenset(
+        {
+            "get_crucible_benchmark_context",
+            "read_run_results",
+            "get_run_summary",
+            "cdm_api_requests",
+            "compare_results",
+            "run_crucible_command",
+        }
+    )
+
+    def _apply_review_tool_scoping(self, ticket: dict[str, Any]) -> None:
+        """Hide Crucible-specific tools for non-Crucible harnesses."""
+        harness = self._effective_harness(
+            ticket.get("custom_fields", {}).get("directives", {}),
+            getattr(self, "_skill_provider", None),
+        )
+        if harness != "crucible":
+            self.tools = [
+                t for t in self.tools if t.name not in self._CRUCIBLE_ONLY_TOOLS
+            ]
+
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
         prompt = REVIEW_SYSTEM_PROMPT
+        harness = self._effective_harness(
+            directives, getattr(self, "_skill_provider", None)
+        )
+        if harness in ("arcaflow-plugins", "arcaflow-workflows"):
+            if cf.get("benchmark_notes"):
+                prompt += (
+                    "\n\n## Arcaflow Results\n\n"
+                    "Use the concise execution summary in the "
+                    "benchmark_notes custom field as the available evidence. "
+                    "Raw tool output is not retained as a retrievable artifact, "
+                    "so do not assume the ticket comments contain it."
+                )
+            else:
+                prompt += (
+                    "\n\n## Arcaflow Results\n\n"
+                    "No benchmark_notes execution summary is available. Raw "
+                    "tool output is not retained as a retrievable artifact. "
+                    "Do not infer measurements or claim execution findings; "
+                    "state this evidence limitation in your review."
+                )
+        elif harness == "boot-time":
+            prompt += (
+                "\n\n## Boot-Time Results\n\n"
+                "The benchmark completion comment includes boot-time KPIs "
+                "and the local output_dir. When output_dir is set, use "
+                "list_benchmark_artifacts and read_benchmark_artifact to "
+                "inspect merged results and per-sample boot logs. Follow the "
+                "boot-time-review skill for artifact analysis; the ticket "
+                "summary alone may not include the evidence needed for root "
+                "cause analysis."
+            )
         if directives.get("review_mode") == "interactive":
             prompt += (
                 "\n\n## Interactive Review Mode\n\n"
@@ -367,6 +423,18 @@ class ReviewAgent(AgentBase):
 
         if cf.get("benchmark_status"):
             content += f"**Benchmark Status:** {cf['benchmark_status']}\n"
+        benchmark_notes = cf.get("benchmark_notes")
+        if isinstance(benchmark_notes, str) and benchmark_notes:
+            content += f"\n## Benchmark Output Summary\n{benchmark_notes[:4000]}\n"
+        elif self._effective_harness(
+            cf.get("directives", {}), getattr(self, "_skill_provider", None)
+        ) in ("arcaflow-plugins", "arcaflow-workflows"):
+            content += (
+                "\n## Benchmark Output Summary\n"
+                "No benchmark_notes execution summary is available. Raw tool "
+                "output is not retained, so state this evidence limitation "
+                "and do not infer measurements.\n"
+            )
         if cf.get("benchmark_suite"):
             content += f"**Benchmark Suite:** {cf['benchmark_suite']}\n"
 

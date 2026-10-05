@@ -8,6 +8,7 @@ import pytest
 import agents.benchmark.agent as benchmark_agent_module
 from agents.benchmark.agent import BenchmarkAgent
 from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION
+from agents.review.agent import ReviewAgent
 from providers.llm.base import LLMResponse, ToolCall
 
 
@@ -92,6 +93,10 @@ async def test_arcaflow_execution_passes_exported_input_to_engine():
                     input={
                         "run_id": result["run_id"],
                         "benchmark_status": "completed",
+                        "notes": (
+                            "Throughput: 27.4 Gbps; latency p99: 1.8 ms; "
+                            "samples: 5; errors: none."
+                        ),
                     },
                 )
             ],
@@ -99,6 +104,73 @@ async def test_arcaflow_execution_passes_exported_input_to_engine():
         ),
     )
     assert persisted_fields["run_id"] == "execution-1"
+    assert persisted_fields["benchmark_notes"] == (
+        "Throughput: 27.4 Gbps; latency p99: 1.8 ms; samples: 5; errors: none."
+    )
+
+    review = ReviewAgent.__new__(ReviewAgent)
+    review._skill_provider = None
+    review._repo_cache = None
+    review._referenced_artifacts = {}
+    review_ticket = {
+        "id": "ticket-1",
+        "summary": "Arcaflow workflow result",
+        "description": "Review workflow measurements.",
+        "custom_fields": {
+            "directives": {"harness": "arcaflow-workflows"},
+            **persisted_fields,
+        },
+        "comments": [
+            {
+                "author": "benchmark-agent",
+                "body": "Benchmark completed; run metadata only.",
+            }
+        ],
+    }
+    review_content = review._build_messages(review_ticket)[0]["content"]
+    assert "## Benchmark Output Summary" in review_content
+    assert "Throughput: 27.4 Gbps" in review_content
+    assert "latency p99: 1.8 ms" in review_content
+    assert "samples: 5" in review_content
+    assert "Benchmark completed; run metadata only." not in review_content
+
+
+def test_benchmark_notes_are_bounded_for_ticket_and_review_context():
+    from agents.benchmark.agent import (
+        _MAX_BENCHMARK_NOTES_CHARS,
+        _bounded_benchmark_notes,
+    )
+
+    bounded = _bounded_benchmark_notes("x" * (_MAX_BENCHMARK_NOTES_CHARS + 100))
+
+    assert len(bounded) == _MAX_BENCHMARK_NOTES_CHARS
+    assert bounded.endswith("[benchmark notes truncated]")
+
+
+@pytest.mark.parametrize("benchmark_notes", [None, ""])
+def test_arcaflow_review_reports_missing_execution_evidence(benchmark_notes):
+    review = ReviewAgent.__new__(ReviewAgent)
+    review._skill_provider = None
+    review._repo_cache = None
+    review._referenced_artifacts = {}
+    custom_fields = {"directives": {"harness": "arcaflow-plugins"}}
+    if benchmark_notes is not None:
+        custom_fields["benchmark_notes"] = benchmark_notes
+    ticket = {
+        "id": "ticket-no-summary",
+        "summary": "Review Arcaflow results",
+        "description": "Analyze the benchmark.",
+        "custom_fields": custom_fields,
+        "comments": [],
+    }
+
+    prompt = review._system_prompt(ticket)
+    content = review._build_messages(ticket)[0]["content"]
+
+    assert "No benchmark_notes execution summary is available" in prompt
+    assert "state this evidence limitation" in prompt
+    assert "No benchmark_notes execution summary is available" in content
+    assert "do not infer measurements" in content
 
 
 @pytest.mark.asyncio
