@@ -325,15 +325,22 @@ class ReviewAgent(AgentBase):
             directives, getattr(self, "_skill_provider", None)
         )
         if harness in ("arcaflow-plugins", "arcaflow-workflows"):
-            prompt += (
-                "\n\n## Inline Results\n\n"
-                "This harness returns benchmark results inline in "
-                "the benchmark agent's ticket comments and the "
-                "run_file_used / benchmark_status custom fields. "
-                "There are no external result files or controller "
-                "artifacts to retrieve. Review the ticket comments "
-                "and custom_fields for the execution output."
-            )
+            if cf.get("benchmark_notes"):
+                prompt += (
+                    "\n\n## Arcaflow Results\n\n"
+                    "Use the concise execution summary in the "
+                    "benchmark_notes custom field as the available evidence. "
+                    "Raw tool output is not retained as a retrievable artifact, "
+                    "so do not assume the ticket comments contain it."
+                )
+            else:
+                prompt += (
+                    "\n\n## Arcaflow Results\n\n"
+                    "No benchmark_notes execution summary is available. Raw "
+                    "tool output is not retained as a retrievable artifact. "
+                    "Do not infer measurements or claim execution findings; "
+                    "state this evidence limitation in your review."
+                )
         elif harness == "boot-time":
             prompt += (
                 "\n\n## Boot-Time Results\n\n"
@@ -416,6 +423,18 @@ class ReviewAgent(AgentBase):
 
         if cf.get("benchmark_status"):
             content += f"**Benchmark Status:** {cf['benchmark_status']}\n"
+        benchmark_notes = cf.get("benchmark_notes")
+        if isinstance(benchmark_notes, str) and benchmark_notes:
+            content += f"\n## Benchmark Output Summary\n{benchmark_notes[:4000]}\n"
+        elif self._effective_harness(
+            cf.get("directives", {}), getattr(self, "_skill_provider", None)
+        ) in ("arcaflow-plugins", "arcaflow-workflows"):
+            content += (
+                "\n## Benchmark Output Summary\n"
+                "No benchmark_notes execution summary is available. Raw tool "
+                "output is not retained, so state this evidence limitation "
+                "and do not infer measurements.\n"
+            )
         if cf.get("benchmark_suite"):
             content += f"**Benchmark Suite:** {cf['benchmark_suite']}\n"
 

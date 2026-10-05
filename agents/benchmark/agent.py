@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _ARCAFLOW_CANCELLATION_RECONCILIATION_TIMEOUT_SECONDS = 30.0
 _ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS = 1.0
 _ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS = 5.0
+_MAX_BENCHMARK_NOTES_CHARS = 4000
+
+
+def _bounded_benchmark_notes(notes: Any) -> str:
+    """Keep the result handoff useful without growing ticket context unbounded."""
+    if not isinstance(notes, str):
+        return ""
+    if len(notes) <= _MAX_BENCHMARK_NOTES_CHARS:
+        return notes
+    marker = "\n[benchmark notes truncated]"
+    return notes[: _MAX_BENCHMARK_NOTES_CHARS - len(marker)] + marker
 
 
 def _filter_external_tools(
@@ -166,7 +177,14 @@ _LOCAL_TOOLS = [
                 },
                 "run_file_used": {"type": "object"},
                 "benchmark_duration": {"type": ["integer", "null"]},
-                "notes": {"type": "string"},
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Concise benchmark output summary for the review agent. "
+                        "For Arcaflow, include exact measured values, units, "
+                        "sample counts, and any errors from the tool output."
+                    ),
+                },
             },
             "required": ["run_id", "benchmark_status"],
         },
@@ -1276,6 +1294,7 @@ class BenchmarkAgent(AgentBase):
             "run_id": result.get("run_id", "UNKNOWN"),
             "benchmark_status": result.get("benchmark_status", "unknown"),
             "benchmark_duration": result.get("benchmark_duration"),
+            "benchmark_notes": _bounded_benchmark_notes(result.get("notes")),
         }
         validation_id = result.get("validation_id") or self._active_validation_id
         run_file_used = result.get("run_file_used", {})
@@ -1312,8 +1331,8 @@ class BenchmarkAgent(AgentBase):
         )
         if fields["benchmark_duration"]:
             summary += f"- **Duration:** {fields['benchmark_duration']}s\n"
-        if result.get("notes"):
-            summary += f"- **Notes:** {result['notes']}\n"
+        if fields["benchmark_notes"]:
+            summary += f"- **Notes:** {fields['benchmark_notes']}\n"
 
         await self._add_comment(ticket_id, summary)
 
