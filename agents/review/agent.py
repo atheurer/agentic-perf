@@ -287,16 +287,13 @@ class ReviewAgent(AgentBase):
         self.tools = mcp_tools + self.tools
 
         try:
-            ticket = await self._get_ticket(ticket_id)
             self._apply_review_tool_scoping(ticket)
             await super().run(ticket_id)
         finally:
             await mcp.disconnect()
             self._mcp = None
 
-    # Crucible-specific tools that should be hidden for harnesses
-    # that return inline results (arcaflow-plugins, arcaflow-workflows,
-    # boot-time).  These tools require a controller with Crucible
+    # Crucible-specific tools that require a controller with Crucible
     # installed and fail with SSH/file errors on other harnesses.
     _CRUCIBLE_ONLY_TOOLS: frozenset[str] = frozenset(
         {
@@ -306,8 +303,6 @@ class ReviewAgent(AgentBase):
             "cdm_api_requests",
             "compare_results",
             "run_crucible_command",
-            "list_benchmark_artifacts",
-            "read_benchmark_artifact",
         }
     )
 
@@ -329,7 +324,7 @@ class ReviewAgent(AgentBase):
         harness = self._effective_harness(
             directives, getattr(self, "_skill_provider", None)
         )
-        if harness in ("arcaflow-plugins", "arcaflow-workflows", "boot-time"):
+        if harness in ("arcaflow-plugins", "arcaflow-workflows"):
             prompt += (
                 "\n\n## Inline Results\n\n"
                 "This harness returns benchmark results inline in "
@@ -338,6 +333,17 @@ class ReviewAgent(AgentBase):
                 "There are no external result files or controller "
                 "artifacts to retrieve. Review the ticket comments "
                 "and custom_fields for the execution output."
+            )
+        elif harness == "boot-time":
+            prompt += (
+                "\n\n## Boot-Time Results\n\n"
+                "The benchmark completion comment includes boot-time KPIs "
+                "and the local output_dir. When output_dir is set, use "
+                "list_benchmark_artifacts and read_benchmark_artifact to "
+                "inspect merged results and per-sample boot logs. Follow the "
+                "boot-time-review skill for artifact analysis; the ticket "
+                "summary alone may not include the evidence needed for root "
+                "cause analysis."
             )
         if directives.get("review_mode") == "interactive":
             prompt += (

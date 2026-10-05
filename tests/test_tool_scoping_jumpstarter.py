@@ -220,3 +220,33 @@ class TestBenchmarkToolScoping:
         assert allowed is not None
         assert "validate_benchmark" in allowed
         assert "execute_benchmark" in allowed
+
+
+@pytest.mark.asyncio
+async def test_arcaflow_plugin_server_failure_is_required_only_for_plugin_harness():
+    from agents.benchmark.agent import _connect_arcaflow_plugin_server
+
+    optional_mcp = AsyncMock()
+    optional_mcp.connect_ticket_server.side_effect = RuntimeError("startup failed")
+    await _connect_arcaflow_plugin_server(
+        optional_mcp,
+        "arcaflow_plugin_server.py",
+        ticket_id="PERF-OPTIONAL",
+        state_store_url="http://state-store.test",
+        agent_name="benchmark-agent",
+        required=False,
+    )
+    optional_mcp.disconnect.assert_not_awaited()
+
+    required_mcp = AsyncMock()
+    required_mcp.connect_ticket_server.side_effect = RuntimeError("startup failed")
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await _connect_arcaflow_plugin_server(
+            required_mcp,
+            "arcaflow_plugin_server.py",
+            ticket_id="PERF-PLUGINS",
+            state_store_url="http://state-store.test",
+            agent_name="benchmark-agent",
+            required=True,
+        )
+    required_mcp.disconnect.assert_awaited_once()
