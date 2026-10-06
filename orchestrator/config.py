@@ -25,12 +25,22 @@ def _provider_family(provider: str) -> str:
 
 
 def _load_config_file() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    """Load and parse config.json, failing fast on syntax errors."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        text = CONFIG_PATH.read_text()
+    except OSError as exc:
+        raise SystemExit(
+            f"FATAL: cannot read config file {CONFIG_PATH}: {exc}"
+        ) from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"FATAL: invalid JSON in {CONFIG_PATH} "
+            f"(line {exc.lineno}, column {exc.colno}): {exc.msg}"
+        ) from exc
 
 
 class OrchestratorConfig:

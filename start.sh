@@ -16,14 +16,19 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
+# Validate JSON syntax before proceeding.
+if ! python3 -c "import json; json.load(open('$CONFIG'))" 2>/tmp/config_parse_err.txt; then
+    echo "ERROR: Invalid JSON in $CONFIG"
+    cat /tmp/config_parse_err.txt
+    echo "Fix the syntax error and try again."
+    exit 1
+fi
+
 # Read port from config (default 8090); STORE_PORT is an explicit override.
 CONFIG_STORE_PORT=$(python3 -c "
 import json, sys
-try:
-    cfg = json.load(open('$CONFIG'))
-    print(cfg.get('state_store', {}).get('port', 8090))
-except Exception:
-    print(8090)
+cfg = json.load(open('$CONFIG'))
+print(cfg.get('state_store', {}).get('port', 8090))
 ")
 STORE_PORT="${STORE_PORT:-$CONFIG_STORE_PORT}"
 
