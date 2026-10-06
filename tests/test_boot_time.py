@@ -14,6 +14,37 @@ from providers.execution import AuditedSubprocessRunner
 from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
 
 
+def _make_mock_stream(data: bytes = b"") -> MagicMock:
+    """Create a mock async stream reader that yields data then EOF."""
+    lines = data.split(b"\n") if data else []
+    # readline returns each line (with newline), then b"" for EOF
+    returns = [line + b"\n" for line in lines if line] + [b""]
+    stream = MagicMock()
+    stream.readline = AsyncMock(side_effect=returns)
+    return stream
+
+
+def _make_mock_process(
+    returncode: int = 0,
+    stdout_data: bytes = b"",
+    stderr_data: bytes = b"",
+) -> MagicMock:
+    """Create a mock subprocess with async stream readers.
+
+    Provides both stream-based (stdout/stderr readline) and
+    communicate() interfaces since different code paths in
+    the benchmark server use each pattern.
+    """
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = _make_mock_stream(stdout_data)
+    proc.stderr = _make_mock_stream(stderr_data)
+    proc.wait = AsyncMock(return_value=returncode)
+    proc.communicate = AsyncMock(return_value=(stdout_data, stderr_data))
+    proc.pid = 12345
+    return proc
+
+
 @pytest.fixture(autouse=True)
 def _reset_boot_time_guard():
     """Reset the one-execution-per-session guard between tests."""
@@ -177,9 +208,7 @@ class TestBootTimeJumpstarterRecovery:
         (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
         mock_cache = MagicMock()
         mock_cache.get_path.return_value = tmp_path
-        mock_process = MagicMock()
-        mock_process.returncode = 0
-        mock_process.communicate = AsyncMock(return_value=(b"", b""))
+        mock_process = _make_mock_process()
         mock_runner = MagicMock()
         mock_runner.start = AsyncMock(return_value=mock_process)
         ticket = {
@@ -260,8 +289,7 @@ class TestBootTimePassiveSerialDefaults:
         }
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
-        benchmark_proc = MagicMock(returncode=0)
-        benchmark_proc.communicate = AsyncMock(return_value=(b"", b""))
+        benchmark_proc = _make_mock_process()
 
         async def start(argv, **_kwargs):
             return serial_proc if argv[0] == "jmp" else benchmark_proc
@@ -391,20 +419,14 @@ class TestBootTimeKPIExtraction:
         http_context.__aexit__.return_value = False
 
         async def mock_subprocess_exec(*args, **kwargs):
-            proc = MagicMock()
-            proc.returncode = 0
             # For the test script
             if "boot-timings-test.sh" in str(args):
-                proc.communicate = AsyncMock(return_value=(b"OK", b""))
+                return _make_mock_process(stdout_data=b"OK")
             # For the merge script
             else:
-                proc.communicate = AsyncMock(
-                    return_value=(
-                        json.dumps(merged_data).encode(),
-                        b"",
-                    )
+                return _make_mock_process(
+                    stdout_data=json.dumps(merged_data).encode(),
                 )
-            return proc
 
         async def emit(_event):
             """Keep this unit test local while preserving a ticket trace."""
@@ -528,8 +550,9 @@ class TestBootTimeSerialDiagnostics:
         }
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
-        benchmark_proc = MagicMock()
-        benchmark_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError())
+        benchmark_proc = _make_mock_process()
+        if failure == "cancel":
+            benchmark_proc.wait = AsyncMock(side_effect=asyncio.CancelledError())
 
         async def start(argv, **_kwargs):
             if argv[0] == "jmp":
@@ -564,8 +587,10 @@ class TestBootTimeSerialDiagnostics:
         assert runner.start.await_count == 2
         serial_proc.terminate.assert_called_once()
         serial_proc.wait.assert_awaited_once_with(timeout=10)
-        assert len(opened_streams) == 1
-        assert opened_streams[0].closed
+        # open_stream is called for both serial-capture.log
+        # and harness-output.log
+        assert len(opened_streams) == 2
+        assert all(s.closed for s in opened_streams)
 
     async def test_serial_tail_remains_in_artifact_but_not_service_log(
         self, tmp_path, monkeypatch, caplog
@@ -585,8 +610,7 @@ class TestBootTimeSerialDiagnostics:
         }
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
-        benchmark_proc = MagicMock(returncode=1)
-        benchmark_proc.communicate = AsyncMock(return_value=(b"", b"failed"))
+        benchmark_proc = _make_mock_process(returncode=1, stderr_data=b"failed")
 
         async def start(argv, **kwargs):
             if argv[0] == "jmp":

@@ -4589,6 +4589,7 @@ async def execute_boot_time_test(
 
     serial_proc = None
     serial_log_fh = None
+    harness_log_fh = None
     serial_log_path = output_dir / "serial-capture.log"
     try:
         if _ticket:
@@ -4662,6 +4663,15 @@ async def execute_boot_time_test(
         # capture-boot timed out but jmp shell child lingered).
         benchmark_timeout = (samples * 90) + 900
 
+        # Capture full subprocess output to an artifact log file.
+        # The tool result truncates stdout to the last 3000 bytes,
+        # which loses critical diagnostics (BOOT_CONFIG, power cycle
+        # results, error messages) when wait_for_sut_up spam fills
+        # the buffer. The log file preserves everything.
+        harness_log_fh = artifact_filesystem.open_stream(
+            "harness-output.log", mode=artifact_file_mode
+        )
+
         proc = await AuditedSubprocessRunner().start(
             cmd,
             cwd=str(output_dir),
@@ -4671,11 +4681,44 @@ async def execute_boot_time_test(
         _STALL_CHECK_INTERVAL = 60
         _STALL_TIMEOUT = 300
 
-        # Keep communicate() running for the whole lifetime of the process so
-        # stdout/stderr pipes are drained while we poll for artifact progress.
-        # Waiting on proc.wait() with PIPEs can deadlock when the child produces
-        # more output than the pipe buffer can hold.
-        communicate_task = _asyncio.create_task(proc.communicate())
+        # Drain stdout/stderr in background tasks that tee to both
+        # an in-memory buffer (for the tool result) and the log file
+        # (for full diagnostic capture).
+        _stdout_chunks: list[bytes] = []
+        _stderr_chunks: list[bytes] = []
+
+        async def _drain_stream(
+            stream: _asyncio.StreamReader | None,
+            chunks: list[bytes],
+            log_fh: Any,
+            prefix: bytes = b"",
+        ) -> None:
+            if stream is None:
+                return
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                chunks.append(line)
+                try:
+                    log_fh.write(prefix + line)
+                    log_fh.flush()
+                except Exception:
+                    pass
+
+        _drain_stdout = _asyncio.create_task(
+            _drain_stream(proc.stdout, _stdout_chunks, harness_log_fh)
+        )
+        _drain_stderr = _asyncio.create_task(
+            _drain_stream(proc.stderr, _stderr_chunks, harness_log_fh, b"STDERR: ")
+        )
+
+        async def _wait_drains() -> tuple[bytes, bytes]:
+            await _asyncio.gather(_drain_stdout, _drain_stderr)
+            await proc.wait()
+            return b"".join(_stdout_chunks), b"".join(_stderr_chunks)
+
+        communicate_task = _asyncio.create_task(_wait_drains())
         loop = _asyncio.get_running_loop()
         start_time = loop.time()
         deadline = start_time + benchmark_timeout
@@ -4845,6 +4888,8 @@ async def execute_boot_time_test(
         finally:
             if serial_log_fh is not None:
                 serial_log_fh.close()
+            if harness_log_fh is not None:
+                harness_log_fh.close()
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
