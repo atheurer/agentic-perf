@@ -37,6 +37,19 @@ from .config import OrchestratorConfig, _provider_family
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
 from .handoff import check_handoff
 from .poller import fetch_all_tickets
+from .retry_guard import (
+    DISPATCH_RETRY_BASE_SECONDS,
+    DISPATCH_RETRY_LIMIT,
+    DISPATCH_RETRY_MAX_SECONDS,
+    HANDOFF_RETRY_BASE_SECONDS,
+    HANDOFF_RETRY_LIMIT,
+    HANDOFF_RETRY_MAX_SECONDS,
+    RETRY_STATE_FIELD,
+    clear_retry_entry,
+    prune_stale_retry_entries,
+    record_retry_failure,
+    retry_is_suppressed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -596,6 +609,23 @@ async def _advance_plan(
             return
 
         if step.get("agent_type") == "provision":
+            if not cf.get("provisioning_complete", False):
+                hosts = cf.get("hosts_provisioned", [])
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": (
+                            "Provisioning did not report completion, so the "
+                            "execution plan cannot advance to benchmarking. "
+                            f"Hosts reported: {hosts}. Review the provisioning "
+                            "result and resume the ticket after resolving it."
+                        ),
+                    },
+                )
+                response.raise_for_status()
+                return
+
             missing = _missing_host_tuning(cf)
             if missing:
                 logger.warning(
@@ -792,6 +822,9 @@ async def run_agent_task(
 ):
     agent = None
     success = False
+    raw_claim_id = dispatcher._claim_ids.get(ticket_id)
+    claim_id = raw_claim_id if isinstance(raw_claim_id, str) and raw_claim_id else None
+    mutation_headers = _mutation_headers(claim_id)
 
     try:
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
@@ -1020,6 +1053,7 @@ async def run_agent_task(
                         ticket_id,
                         f"Agent task timed out after {agent_task_timeout}s",
                         event_bus=dispatcher.events,
+                        claim_id=claim_id,
                     )
             else:
                 await agent.run(ticket_id)
@@ -1031,7 +1065,7 @@ async def run_agent_task(
         if config:
             try:
                 async with AuditedAsyncHTTPClient(
-                    timeout=10.0, headers=_auth_headers()
+                    timeout=10.0, headers=mutation_headers
                 ) as client:
                     # Preserve max_iterations_override when the
                     # agent paused (awaiting_customer_guidance) so
@@ -1056,7 +1090,7 @@ async def run_agent_task(
         logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
         try:
             async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=_auth_headers()
+                timeout=10.0, headers=mutation_headers
             ) as client:
                 # Check if ticket was already force-closed before
                 # trying to transition — avoids reopening a closed
@@ -1114,6 +1148,7 @@ async def run_agent_task(
                 ticket_id,
                 reason,
                 event_bus=dispatcher.events,
+                claim_id=claim_id,
             )
         except Exception:
             logger.exception(
@@ -1151,7 +1186,7 @@ async def run_agent_task(
         if success and not deposed and status == "triage_pending":
             try:
                 async with AuditedAsyncHTTPClient(
-                    timeout=10.0, headers=_auth_headers()
+                    timeout=10.0, headers=mutation_headers
                 ) as _stop_client:
                     r = await _stop_client.get(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
@@ -1180,6 +1215,20 @@ async def run_agent_task(
             except Exception:
                 logger.exception(f"stop_after_step triage check failed for {ticket_id}")
 
+        try:
+            await _record_dispatch_retry_outcome(
+                dispatcher,
+                ticket_id,
+                status,
+                claim_id=claim_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not update dispatch retry state for %s at %s",
+                ticket_id,
+                status,
+            )
+
         dispatcher.clear_agent(ticket_id)
         await dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
@@ -1195,6 +1244,7 @@ async def _transition_to_guidance(
     ticket_id: str,
     comment: str,
     event_bus: EventBus | None = None,
+    claim_id: str | None = None,
 ) -> None:
     """Transition a ticket to awaiting_customer_guidance.
 
@@ -1208,7 +1258,7 @@ async def _transition_to_guidance(
     context_token = bind_trace_context(trace_context)
     try:
         async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=_auth_headers()
+            timeout=10.0, headers=_mutation_headers(claim_id)
         ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
@@ -1311,6 +1361,7 @@ async def _check_stale_tasks(
                     f" {round(idle_seconds)}s (threshold:"
                     f" {round(stale_timeout)}s)",
                     event_bus=event_bus,
+                    claim_id=dispatcher._claim_ids.get(tid),
                 )
                 task.cancel()
 
@@ -1415,7 +1466,9 @@ async def _redirect_to_investigation(
     path, the orchestrator corrects it here.
     """
 
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=_mutation_headers(None)
+    ) as client:
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -1470,12 +1523,13 @@ async def _block_handoff_failed(
     """Attempt to recover a handoff-blocked ticket to HITL.
 
     Returns True if the ticket was successfully transitioned to
-    awaiting_customer_guidance, False if the transition failed
-    and should be retried on the next poll cycle.
+    awaiting_customer_guidance, False if the transition failed.
     """
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=_mutation_headers(None)
+    ) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
@@ -1726,6 +1780,202 @@ async def _add_comment(
             )
     except Exception:
         logger.exception("Failed to add comment on %s", ticket_id)
+
+
+# Pending writes preserve safety limits during a state-store outage. Durable
+# ticket metadata remains authoritative once the write succeeds; this buffer
+# exists only to avoid immediately retrying a failed operation in this process.
+_pending_retry_writes: dict[str, tuple[dict[str, Any], float]] = {}
+_retry_write_locks: dict[str, asyncio.Lock] = {}
+
+
+def _overlay_pending_retry_state(ticket: dict[str, Any]) -> None:
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is None:
+        return
+    state, next_write_at = pending
+    state = prune_stale_retry_entries(
+        {RETRY_STATE_FIELD: state}, ticket.get("status", "")
+    )
+    if state is None:
+        _pending_retry_writes.pop(ticket_id, None)
+        return
+    _pending_retry_writes[ticket_id] = (state, next_write_at)
+    ticket.setdefault("custom_fields", {})[RETRY_STATE_FIELD] = state
+
+
+async def _reconcile_pending_retry_state(
+    store_url: str, ticket: dict[str, Any]
+) -> None:
+    """Apply unsaved limits and retry their durable write without hot looping."""
+    _overlay_pending_retry_state(ticket)
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is not None and time.time() >= pending[1]:
+        await _persist_retry_state(
+            store_url, ticket_id, pending[0], expected_pending=pending
+        )
+
+
+async def _persist_retry_state(
+    store_url: str,
+    ticket_id: str,
+    state: dict[str, Any] | None,
+    *,
+    claim_id: str | None = None,
+    trace_context: Any | None = None,
+    comment: str = "",
+    expected_pending: tuple[dict[str, Any], float] | None = None,
+) -> bool:
+    """Persist retry metadata without letting one ticket stop the poll loop.
+
+    A failed comment must not undo a stored retry limit. Cancellation still
+    propagates so shutdown and leader loss can stop in-flight recovery.
+    """
+    # A poller flush and an agent completion may overlap. Serialize their
+    # requests so an older PATCH cannot commit after a newer attempt count.
+    lock = _retry_write_locks.setdefault(ticket_id, asyncio.Lock())
+    async with lock:
+        if (
+            expected_pending is not None
+            and _pending_retry_writes.get(ticket_id) is not expected_pending
+        ):
+            return False
+        headers = _mutation_headers(claim_id)
+        if trace_context is not None:
+            headers.update(trace_headers(trace_context))
+        persisted = False
+        try:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {RETRY_STATE_FIELD: state}},
+                )
+                response.raise_for_status()
+                persisted = True
+                if comment:
+                    response = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                        json={"author": "orchestrator", "body": comment},
+                    )
+                    response.raise_for_status()
+        except Exception:
+            if not persisted and state is not None:
+                _pending_retry_writes[ticket_id] = (
+                    state,
+                    time.time() + HANDOFF_RETRY_BASE_SECONDS,
+                )
+            logger.exception(
+                "Could not %s for %s",
+                "post retry exhaustion comment" if persisted else "persist retry state",
+                ticket_id,
+            )
+        if persisted:
+            _pending_retry_writes.pop(ticket_id, None)
+        return persisted
+
+
+async def _prune_stale_retry_state(
+    store_url: str,
+    ticket: dict[str, Any],
+) -> None:
+    """Reset retry limits when a ticket moves away from the failed status."""
+    ticket_id = ticket.get("id", "")
+    custom_fields = ticket.get("custom_fields", {})
+    if not ticket_id or not isinstance(custom_fields, dict):
+        return
+
+    stored_state = custom_fields.get(RETRY_STATE_FIELD)
+    retry_state = prune_stale_retry_entries(custom_fields, ticket.get("status", ""))
+    if retry_state == stored_state:
+        return
+
+    try:
+        if await _persist_retry_state(store_url, ticket_id, retry_state):
+            custom_fields[RETRY_STATE_FIELD] = retry_state
+    except Exception:
+        logger.exception("Could not clear stale retry state for %s", ticket_id)
+
+
+async def _record_dispatch_retry_outcome(
+    dispatcher: Dispatcher,
+    ticket_id: str,
+    dispatched_status: str,
+    *,
+    claim_id: str | None,
+) -> None:
+    """Back off repeated agent failures and stop after the configured cap."""
+    if (
+        dispatcher.is_deposed()
+        or not claim_id
+        or dispatched_status not in PLAN_AGENT_STATUS.values()
+    ):
+        return
+
+    context = dispatcher._trace_contexts.get(ticket_id)
+    headers = _mutation_headers(claim_id)
+    if context is not None:
+        headers.update(trace_headers(context))
+
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        response = await client.get(
+            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+        )
+        if response.status_code != 200:
+            return
+        ticket = response.json()
+        ticket.setdefault("id", ticket_id)
+        _overlay_pending_retry_state(ticket)
+        custom_fields = ticket.get("custom_fields", {})
+        current_status = ticket.get("status", "")
+
+        if current_status != dispatched_status:
+            retry_state = clear_retry_entry(custom_fields, "dispatch")
+            if retry_state != custom_fields.get(RETRY_STATE_FIELD):
+                await _persist_retry_state(
+                    dispatcher.store_url,
+                    ticket_id,
+                    retry_state,
+                    claim_id=claim_id,
+                    trace_context=context,
+                )
+            return
+
+        retry_state, exhausted, attempts = record_retry_failure(
+            custom_fields,
+            "dispatch",
+            dispatched_status,
+            now=time.time(),
+            retry_limit=DISPATCH_RETRY_LIMIT,
+            base_seconds=DISPATCH_RETRY_BASE_SECONDS,
+            max_seconds=DISPATCH_RETRY_MAX_SECONDS,
+        )
+        comment = ""
+        if exhausted:
+            comment = (
+                f"**Automatic dispatch paused:** {DISPATCH_RETRY_LIMIT} "
+                f"consecutive failures at {dispatched_status}. The "
+                "orchestrator stopped retrying this stage to protect system "
+                "resources. Review the agent failure, then clear "
+                "orchestrator_retry_state or move the ticket to another "
+                "status before resuming."
+            )
+        await _persist_retry_state(
+            dispatcher.store_url,
+            ticket_id,
+            retry_state,
+            claim_id=claim_id,
+            trace_context=context,
+            comment=comment,
+        )
+        if exhausted:
+            logger.error(
+                "Stopped dispatching %s at %s after %d consecutive failures",
+                ticket_id,
+                dispatched_status,
+                attempts,
+            )
 
 
 async def _renew_leader_lease(
@@ -2181,6 +2431,14 @@ async def _poll_loop_after_lease(
                 await asyncio.sleep(config.poll_interval)
                 continue
 
+            # Clear retry limits as soon as any ticket leaves the status
+            # where its failures occurred. Guidance and terminal statuses
+            # are not dispatched below, so this must happen before filtering
+            # tickets by the dispatchable status list.
+            for ticket in all_fetched:
+                await _reconcile_pending_retry_state(config.state_store_url, ticket)
+                await _prune_stale_retry_state(config.state_store_url, ticket)
+
             # Reconcile against every fetched ticket before status filtering.
             # In particular, awaiting_customer_guidance is not dispatched, but
             # observing it must clear a block left at the previous source status.
@@ -2326,23 +2584,68 @@ async def _poll_loop_after_lease(
 
                     ok, reason = check_handoff(status, ticket)
                     if not ok:
+                        if retry_is_suppressed(cf, "handoff", status, now=time.time()):
+                            continue
                         if not dispatcher.is_handoff_blocked(tid, status):
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            recovered = await _block_handoff_failed(
-                                config.state_store_url,
-                                tid,
-                                reason,
-                                status,
-                                event_bus=dispatcher.events,
-                            )
-                            # Only mark as blocked if the HITL
-                            # transition succeeded. If it failed,
-                            # leave unblocked so we retry next cycle
-                            # instead of hanging forever.
+                            try:
+                                recovered = await _block_handoff_failed(
+                                    config.state_store_url,
+                                    tid,
+                                    reason,
+                                    status,
+                                    event_bus=dispatcher.events,
+                                )
+                            except Exception:
+                                logger.exception("Handoff recovery failed for %s", tid)
+                                recovered = False
                             if recovered:
                                 dispatcher.mark_handoff_blocked(tid, status)
+                                retry_state = clear_retry_entry(cf, "handoff")
+                                if retry_state != cf.get(RETRY_STATE_FIELD):
+                                    await _persist_retry_state(
+                                        config.state_store_url,
+                                        tid,
+                                        retry_state,
+                                    )
+                            else:
+                                retry_state, exhausted, attempts = record_retry_failure(
+                                    cf,
+                                    "handoff",
+                                    status,
+                                    now=time.time(),
+                                    retry_limit=HANDOFF_RETRY_LIMIT,
+                                    base_seconds=HANDOFF_RETRY_BASE_SECONDS,
+                                    max_seconds=HANDOFF_RETRY_MAX_SECONDS,
+                                )
+                                comment = ""
+                                if exhausted:
+                                    comment = (
+                                        "**Handoff recovery paused:** "
+                                        f"{HANDOFF_RETRY_LIMIT} recovery attempts "
+                                        f"failed at {status}. The ticket remains "
+                                        "at its current status for human review; "
+                                        "the orchestrator will not keep retrying "
+                                        "the same failed transitions. Move the "
+                                        "ticket to another status to clear this "
+                                        "retry limit before resuming."
+                                    )
+                                await _persist_retry_state(
+                                    config.state_store_url,
+                                    tid,
+                                    retry_state,
+                                    comment=comment,
+                                )
+                                if exhausted:
+                                    logger.error(
+                                        "Stopped handoff recovery for %s at %s "
+                                        "after %d failed attempts",
+                                        tid,
+                                        status,
+                                        attempts,
+                                    )
                         continue
 
                     # Per-user/group quota check (multi-user only).
@@ -2391,6 +2694,9 @@ async def _poll_loop_after_lease(
                                 continue
                         else:
                             dispatcher.clear_quota_blocked(tid)
+
+                    if retry_is_suppressed(cf, "dispatch", status, now=time.time()):
+                        continue
 
                     if not dispatcher.try_claim(tid, status):
                         logger.info(f"Skipping {tid} at {status}: claim held")
@@ -2596,6 +2902,20 @@ def _auth_headers() -> dict[str, str]:
                 "X-Agentic-Perf-Orchestrator-Epoch": epoch,
             }
         )
+    return headers
+
+
+def _mutation_headers(claim_id: str | None) -> dict[str, str]:
+    """Fence agent writes by claim and unclaimed recovery by the leader lease."""
+    headers = _auth_headers()
+    if (
+        "X-Agentic-Perf-Orchestrator-Session" in headers
+        and "X-Agentic-Perf-Orchestrator-Epoch" in headers
+    ):
+        if claim_id:
+            headers["X-Agentic-Perf-Claim-Id"] = claim_id
+        else:
+            headers["X-Agentic-Perf-Mutation-Scope"] = "leader"
     return headers
 
 

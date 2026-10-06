@@ -128,6 +128,11 @@ class TestBlockHandoffFailedRewindFallback:
         import orchestrator.main as mod
 
         monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+        monkeypatch.setenv(
+            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "4")
 
         post_calls: list[tuple[str, dict]] = []
 
@@ -154,14 +159,22 @@ class TestBlockHandoffFailedRewindFallback:
         with patch.object(
             mod,
             "AuditedAsyncHTTPClient",
-            lambda **kwargs: mock_client,
-        ):
+            side_effect=lambda **kwargs: mock_client,
+        ) as client_factory:
             await mod._block_handoff_failed(
                 store_url="http://store:8090",
                 ticket_id="PERF-TEST2",
                 reason="test reason",
                 current_status="evaluating_convergence",
             )
+
+        # Recovery runs before claiming a ticket, but must still be rejected
+        # after another leader takes over.
+        headers = client_factory.call_args.kwargs["headers"]
+        assert headers["X-Agentic-Perf-Orchestrator-Session"].endswith("0001")
+        assert headers["X-Agentic-Perf-Orchestrator-Epoch"] == "4"
+        assert headers["X-Agentic-Perf-Mutation-Scope"] == "leader"
+        assert "X-Agentic-Perf-Claim-Id" not in headers
 
         # 3 POSTs: rewind, comment, HITL transition
         assert len(post_calls) == 3

@@ -208,6 +208,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("orchestrator/main.py", "_apply_step_overrides", "mutating_http_state"),
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"),
     ("orchestrator/main.py", "_block_handoff_failed", "mutating_http_state"),
+    ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"),
     ("orchestrator/main.py", "_redirect_to_investigation", "mutating_http_state"),
     ("orchestrator/main.py", "_release_lock", "filesystem"),
@@ -510,6 +511,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/store.py", "__init__", "filesystem"),
     ("state_store/store.py", "_fsync_lease_directory", "filesystem"),
     ("state_store/store.py", "_lease_now", "filesystem"),
+    ("state_store/store.py", "_validate_mutation_fence", "filesystem"),
     ("state_store/store.py", "_validate_ticket_claim", "filesystem"),
     ("state_store/store.py", "_write_orchestrator_lease", "filesystem"),
     ("state_store/store.py", "archive_ticket", "filesystem"),
@@ -1705,6 +1707,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "orchestration-maintainers",
         "orchestrator/main.py:_block_handoff_failed",
+        "2027-12-31",
+    ),
+    ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/main.py:_persist_retry_state",
         "2027-12-31",
     ),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"): (
@@ -3217,6 +3225,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/store.py:_lease_now",
+        "2027-12-31",
+    ),
+    ("state_store/store.py", "_validate_mutation_fence", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/store.py:_validate_mutation_fence",
         "2027-12-31",
     ),
     ("state_store/store.py", "_validate_ticket_claim", "filesystem"): (
