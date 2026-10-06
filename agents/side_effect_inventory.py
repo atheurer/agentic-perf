@@ -511,6 +511,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/store.py", "__init__", "filesystem"),
     ("state_store/store.py", "_fsync_lease_directory", "filesystem"),
     ("state_store/store.py", "_lease_now", "filesystem"),
+    ("state_store/store.py", "_validate_mutation_fence", "filesystem"),
     ("state_store/store.py", "_validate_ticket_claim", "filesystem"),
     ("state_store/store.py", "_write_orchestrator_lease", "filesystem"),
     ("state_store/store.py", "archive_ticket", "filesystem"),
@@ -3224,6 +3225,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/store.py:_lease_now",
+        "2027-12-31",
+    ),
+    ("state_store/store.py", "_validate_mutation_fence", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/store.py:_validate_mutation_fence",
         "2027-12-31",
     ),
     ("state_store/store.py", "_validate_ticket_claim", "filesystem"): (

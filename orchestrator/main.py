@@ -1782,6 +1782,42 @@ async def _add_comment(
         logger.exception("Failed to add comment on %s", ticket_id)
 
 
+# Pending writes preserve safety limits during a state-store outage. Durable
+# ticket metadata remains authoritative once the write succeeds; this buffer
+# exists only to avoid immediately retrying a failed operation in this process.
+_pending_retry_writes: dict[str, tuple[dict[str, Any], float]] = {}
+_retry_write_locks: dict[str, asyncio.Lock] = {}
+
+
+def _overlay_pending_retry_state(ticket: dict[str, Any]) -> None:
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is None:
+        return
+    state, next_write_at = pending
+    state = prune_stale_retry_entries(
+        {RETRY_STATE_FIELD: state}, ticket.get("status", "")
+    )
+    if state is None:
+        _pending_retry_writes.pop(ticket_id, None)
+        return
+    _pending_retry_writes[ticket_id] = (state, next_write_at)
+    ticket.setdefault("custom_fields", {})[RETRY_STATE_FIELD] = state
+
+
+async def _reconcile_pending_retry_state(
+    store_url: str, ticket: dict[str, Any]
+) -> None:
+    """Apply unsaved limits and retry their durable write without hot looping."""
+    _overlay_pending_retry_state(ticket)
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is not None and time.time() >= pending[1]:
+        await _persist_retry_state(
+            store_url, ticket_id, pending[0], expected_pending=pending
+        )
+
+
 async def _persist_retry_state(
     store_url: str,
     ticket_id: str,
@@ -1790,23 +1826,54 @@ async def _persist_retry_state(
     claim_id: str | None = None,
     trace_context: Any | None = None,
     comment: str = "",
-) -> None:
-    """Persist retry metadata and an optional human-review comment."""
-    headers = _mutation_headers(claim_id)
-    if trace_context is not None:
-        headers.update(trace_headers(trace_context))
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-        response = await client.patch(
-            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": {RETRY_STATE_FIELD: state}},
-        )
-        response.raise_for_status()
-        if comment:
-            response = await client.post(
-                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
-                json={"author": "orchestrator", "body": comment},
+    expected_pending: tuple[dict[str, Any], float] | None = None,
+) -> bool:
+    """Persist retry metadata without letting one ticket stop the poll loop.
+
+    A failed comment must not undo a stored retry limit. Cancellation still
+    propagates so shutdown and leader loss can stop in-flight recovery.
+    """
+    # A poller flush and an agent completion may overlap. Serialize their
+    # requests so an older PATCH cannot commit after a newer attempt count.
+    lock = _retry_write_locks.setdefault(ticket_id, asyncio.Lock())
+    async with lock:
+        if (
+            expected_pending is not None
+            and _pending_retry_writes.get(ticket_id) is not expected_pending
+        ):
+            return False
+        headers = _mutation_headers(claim_id)
+        if trace_context is not None:
+            headers.update(trace_headers(trace_context))
+        persisted = False
+        try:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {RETRY_STATE_FIELD: state}},
+                )
+                response.raise_for_status()
+                persisted = True
+                if comment:
+                    response = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                        json={"author": "orchestrator", "body": comment},
+                    )
+                    response.raise_for_status()
+        except Exception:
+            if not persisted and state is not None:
+                _pending_retry_writes[ticket_id] = (
+                    state,
+                    time.time() + HANDOFF_RETRY_BASE_SECONDS,
+                )
+            logger.exception(
+                "Could not %s for %s",
+                "post retry exhaustion comment" if persisted else "persist retry state",
+                ticket_id,
             )
-            response.raise_for_status()
+        if persisted:
+            _pending_retry_writes.pop(ticket_id, None)
+        return persisted
 
 
 async def _prune_stale_retry_state(
@@ -1825,8 +1892,8 @@ async def _prune_stale_retry_state(
         return
 
     try:
-        await _persist_retry_state(store_url, ticket_id, retry_state)
-        custom_fields[RETRY_STATE_FIELD] = retry_state
+        if await _persist_retry_state(store_url, ticket_id, retry_state):
+            custom_fields[RETRY_STATE_FIELD] = retry_state
     except Exception:
         logger.exception("Could not clear stale retry state for %s", ticket_id)
 
@@ -1858,6 +1925,8 @@ async def _record_dispatch_retry_outcome(
         if response.status_code != 200:
             return
         ticket = response.json()
+        ticket.setdefault("id", ticket_id)
+        _overlay_pending_retry_state(ticket)
         custom_fields = ticket.get("custom_fields", {})
         current_status = ticket.get("status", "")
 
@@ -2367,6 +2436,7 @@ async def _poll_loop_after_lease(
             # are not dispatched below, so this must happen before filtering
             # tickets by the dispatchable status list.
             for ticket in all_fetched:
+                await _reconcile_pending_retry_state(config.state_store_url, ticket)
                 await _prune_stale_retry_state(config.state_store_url, ticket)
 
             # Reconcile against every fetched ticket before status filtering.
@@ -2520,13 +2590,17 @@ async def _poll_loop_after_lease(
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            recovered = await _block_handoff_failed(
-                                config.state_store_url,
-                                tid,
-                                reason,
-                                status,
-                                event_bus=dispatcher.events,
-                            )
+                            try:
+                                recovered = await _block_handoff_failed(
+                                    config.state_store_url,
+                                    tid,
+                                    reason,
+                                    status,
+                                    event_bus=dispatcher.events,
+                                )
+                            except Exception:
+                                logger.exception("Handoff recovery failed for %s", tid)
+                                recovered = False
                             if recovered:
                                 dispatcher.mark_handoff_blocked(tid, status)
                                 retry_state = clear_retry_entry(cf, "handoff")
@@ -2832,17 +2906,17 @@ def _auth_headers() -> dict[str, str]:
 
 
 def _mutation_headers(claim_id: str | None) -> dict[str, str]:
-    """Use a complete fence when claimed, otherwise authenticate as a user write."""
+    """Fence agent writes by claim and unclaimed recovery by the leader lease."""
     headers = _auth_headers()
     if (
-        claim_id
-        and "X-Agentic-Perf-Orchestrator-Session" in headers
+        "X-Agentic-Perf-Orchestrator-Session" in headers
         and "X-Agentic-Perf-Orchestrator-Epoch" in headers
     ):
-        headers["X-Agentic-Perf-Claim-Id"] = claim_id
-        return headers
-    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-    return {"Authorization": f"Bearer {token}"} if token else {}
+        if claim_id:
+            headers["X-Agentic-Perf-Claim-Id"] = claim_id
+        else:
+            headers["X-Agentic-Perf-Mutation-Scope"] = "leader"
+    return headers
 
 
 def _sweep_trace_spools() -> None:

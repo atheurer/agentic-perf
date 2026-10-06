@@ -533,11 +533,13 @@ class TicketStore:
         epoch: int | None = None,
         claim_id: str | None = None,
         reviewer_authorized: bool = False,
+        leader_only: bool = False,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
-            self._validate_claim_fence(session_id, epoch, ticket_id)
-            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
+            self._validate_mutation_fence(
+                ticket_id, session_id, epoch, claim_id, leader_only=leader_only
+            )
 
             new_status = request.status
             current = ticket.status
@@ -736,11 +738,13 @@ class TicketStore:
         session_id: uuid.UUID | None = None,
         epoch: int | None = None,
         claim_id: str | None = None,
+        leader_only: bool = False,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
-            self._validate_claim_fence(session_id, epoch, ticket_id)
-            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
+            self._validate_mutation_fence(
+                ticket_id, session_id, epoch, claim_id, leader_only=leader_only
+            )
             protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
             if protected:
                 raise ValueError(
@@ -1064,11 +1068,13 @@ class TicketStore:
         session_id: uuid.UUID | None = None,
         epoch: int | None = None,
         claim_id: str | None = None,
+        leader_only: bool = False,
     ) -> Comment:
         with self._lock:
             ticket = self._resolve(ticket_id)
-            self._validate_claim_fence(session_id, epoch, ticket_id)
-            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
+            self._validate_mutation_fence(
+                ticket_id, session_id, epoch, claim_id, leader_only=leader_only
+            )
             comment = Comment(
                 id=uuid.uuid4().hex[:8],
                 author=request.author,
@@ -1777,6 +1783,63 @@ class TicketStore:
             attributes={"reason": reason},
         )
         raise ClaimFenceError(reason, detail)
+
+    def _validate_mutation_fence(
+        self,
+        ticket_id: str,
+        session_id: uuid.UUID | None,
+        epoch: int | None,
+        claim_id: str | None,
+        *,
+        leader_only: bool,
+    ) -> None:
+        """Fence recovery writes atomically without taking over a running agent."""
+        self._validate_claim_fence(
+            session_id, epoch, ticket_id, require_active=leader_only
+        )
+        if not leader_only:
+            self._validate_ticket_claim(ticket_id, session_id, epoch, claim_id)
+            return
+        if claim_id:
+            self.reject_claim_fence(
+                ticket_id, "claim_malformed", "leader recovery cannot carry a claim"
+            )
+        ticket = self._tickets.get(ticket_id)
+        claim = ticket.custom_fields.get("claim") if ticket else None
+        if claim is None:
+            return
+        try:
+            expires = datetime.fromisoformat(claim["expires"])
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            self.reject_claim_fence(
+                ticket_id, "claim_malformed", "ticket claim expiry is malformed"
+            )
+        if expires <= self._lease_now():
+            return
+        if any(key in claim for key in ("session_id", "epoch", "claim_id")) and (
+            not isinstance(claim.get("session_id"), str)
+            or not claim["session_id"]
+            or not isinstance(claim.get("epoch"), int)
+            or isinstance(claim["epoch"], bool)
+            or claim["epoch"] <= 0
+            or not isinstance(claim.get("claim_id"), str)
+            or not claim["claim_id"]
+        ):
+            self.reject_claim_fence(
+                ticket_id, "claim_malformed", "ticket claim identity is malformed"
+            )
+        # A claim from a deposed session is already fenced by the lease. A live
+        # current claim (including legacy claims without identity) must finish
+        # before recovery can change its ticket.
+        if claim.get("session_id") not in (None, str(session_id)):
+            return
+        if claim.get("epoch") not in (None, epoch):
+            return
+        self.reject_claim_fence(
+            ticket_id, "claim_active", "ticket has an active dispatch claim"
+        )
 
     def _validate_ticket_claim(
         self,

@@ -129,7 +129,19 @@ context exists or would recursively audit the trace transport itself.
    context before LLM or tool execution.
 2. **Admission and fencing.** The state store validates the leader lease,
    ticket claim, session, epoch, and claim ID on mutating requests. A stale
-   worker receives a rejection instead of changing the ticket.
+   worker receives a rejection instead of changing the ticket. Unclaimed
+   orchestrator recovery uses the explicit `X-Agentic-Perf-Mutation-Scope:
+   leader` header with its session and epoch. The store requires service
+   authentication and checks the live lease under the mutation lock, rejecting
+   recovery while a current dispatch claim is active. Agent writes continue
+   to require their ticket claim ID.
+
+   Retry metadata failures are logged per ticket and do not stop dispatch for
+   other tickets. Unsaved retry limits remain in a process-local pending write
+   buffer, preserving backoff and exhaustion while the store is unavailable.
+   Persistence is retried at five-second intervals; a successful write or
+   status change clears the corresponding pending state. A restart during an
+   outage can recover only the last successfully stored retry metadata.
 3. **Start record.** The agent/tool/API boundary emits a `STARTED` event with
    action and operation descriptors. The event contains metadata and digests,
    not secret payloads.

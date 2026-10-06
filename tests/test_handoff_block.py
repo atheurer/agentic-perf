@@ -168,12 +168,13 @@ class TestBlockHandoffFailedRewindFallback:
                 current_status="evaluating_convergence",
             )
 
-        # Handoff recovery runs before a ticket claim exists. Sending only
-        # session/epoch without a claim ID makes the state store reject both
-        # transitions as an invalid mutation fence (HTTP 409).
+        # Recovery runs before claiming a ticket, but must still be rejected
+        # after another leader takes over.
         headers = client_factory.call_args.kwargs["headers"]
-        assert "X-Agentic-Perf-Orchestrator-Session" not in headers
-        assert "X-Agentic-Perf-Orchestrator-Epoch" not in headers
+        assert headers["X-Agentic-Perf-Orchestrator-Session"].endswith("0001")
+        assert headers["X-Agentic-Perf-Orchestrator-Epoch"] == "4"
+        assert headers["X-Agentic-Perf-Mutation-Scope"] == "leader"
+        assert "X-Agentic-Perf-Claim-Id" not in headers
 
         # 3 POSTs: rewind, comment, HITL transition
         assert len(post_calls) == 3
