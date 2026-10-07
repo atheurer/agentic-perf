@@ -57,6 +57,65 @@ async def test_mcp_grep_file_from_workspace(ws_env):
     assert "NIC reset" in resp["lines"][0]["content"]
 
 
+async def test_mcp_grep_compact_json_returns_individual_matches(ws_env):
+    """Compact (single-line) JSON should be pretty-printed before grepping
+    so that matches return individual fields, not the entire file blob."""
+    data = {f"key_{i}": f"value_{i}" for i in range(200)}
+    data["target_field"] = "needle_in_haystack"
+    compact_json = json.dumps(data)  # single line, no newlines
+    assert "\n" not in compact_json
+    assert len(compact_json) > 1000  # large enough to trigger pretty-print
+
+    ws_env.save_file("compact.json", compact_json)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://compact.json", pattern="needle_in_haystack"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] >= 1
+    # The matched line should be short (individual JSON field), not the whole file
+    matched_line = resp["lines"][0]["content"]
+    assert "needle_in_haystack" in matched_line
+    assert len(matched_line) < 200  # individual field line, not the whole blob
+
+
+async def test_mcp_grep_compact_json_multiple_matches(ws_env):
+    """Multiple fields matching a pattern in compact JSON should return
+    separate match entries."""
+    data = {f"padding_{i}": f"filler_{i}" for i in range(100)}
+    data["error_1"] = "connection timeout error"
+    data["error_2"] = "disk read error"
+    data["error_3"] = "memory allocation error"
+    compact = json.dumps(data)
+    assert len(compact) > 1000  # must exceed _GREP_LINE_LIMIT
+    ws_env.save_file("errors.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://errors.json", pattern="error"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    # Should find multiple separate matches, not just 1 giant line
+    assert resp["total_matches"] >= 3
+
+
+async def test_mcp_grep_normal_multiline_file_unaffected(ws_env):
+    """Normal multi-line text files should not be affected by the
+    compact JSON pretty-print logic."""
+    content = "line 1: hello\nline 2: world\nline 3: hello again\n"
+    ws_env.save_file("normal.txt", content)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://normal.txt", pattern="hello"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 2
+    assert resp["lines"][0]["content"] == "line 1: hello"
+    assert resp["lines"][1]["content"] == "line 3: hello again"
+
+
 async def test_mcp_read_file_from_workspace(ws_env):
     ws_env.save_file("test.txt", "Line 1\nLine 2\nLine 3\nLine 4\n")
 
