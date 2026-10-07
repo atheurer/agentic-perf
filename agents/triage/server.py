@@ -22,7 +22,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
-    build_skill_provider,
+    build_skill_provider_async,
     read_skill_documents,
 )
 from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
@@ -34,10 +34,10 @@ SKILLS_DIR = Path(_project_root) / "skills"
 _skill_provider = None
 
 
-def _get_provider():
+async def _get_provider():
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = build_skill_provider(
+        _skill_provider = await build_skill_provider_async(
             resolve_source=False,
             catalog_only=True,
             skill_phase="triage",
@@ -58,7 +58,7 @@ async def get_skill_context(
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     return await skill_context_gateway(
-        _get_provider(),
+        await _get_provider(),
         ticket_id=os.environ.get("TICKET_ID", ""),
         agent_name="triage-agent",
         phase="triage",
@@ -84,7 +84,7 @@ async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
     from providers.skills.catalog import list_benchmark_catalog
 
-    result, _unavailable = await list_benchmark_catalog(_get_provider())
+    result, _unavailable = await list_benchmark_catalog(await _get_provider())
     return json.dumps(result, indent=2)
 
 
@@ -93,7 +93,7 @@ async def get_benchmark_details(name: str) -> str:
     """Get detailed information about a specific benchmark suite including supported parameters and endpoint types."""
     from providers.skills.catalog import get_catalog_benchmark
 
-    detail = await get_catalog_benchmark(_get_provider(), name)
+    detail = await get_catalog_benchmark(await _get_provider(), name)
     if detail is None:
         return json.dumps({"error": f"Benchmark '{name}' not found"})
     # Arcaflow plugins: include the container image ref
@@ -131,7 +131,7 @@ async def resolve_benchmark(
                 }
             )
 
-    sp = _get_provider()
+    sp = await _get_provider()
     reqs: dict[str, Any] = {
         "description": description,
         "workload_type": workload_type,

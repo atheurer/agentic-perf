@@ -15,7 +15,7 @@ import json
 import os
 import posixpath
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -29,6 +29,7 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from providers.secrets.base import SecretsProvider
 from providers.skills.runtime_config import validate_runtime_config
 
 MAX_PAGE_BYTES = 16 * 1024
@@ -101,6 +102,8 @@ class OrganizationBinding:
     legacy_config: bool = False
     repository_root: Path | None = None
     override_identity: str = ""
+    source_identity: str = ""
+    source_revision: str = ""
 
     @property
     def identity(self) -> str:
@@ -108,7 +111,11 @@ class OrganizationBinding:
             # Adding a document/config counterpart changes a future capture,
             # while existing tickets retain their coherent pinned snapshot.
             return _digest(
-                [self.subject, str(self.repository_root), self.override_identity]
+                [
+                    self.subject,
+                    self.source_identity or str(self.repository_root),
+                    self.override_identity,
+                ]
             )
         return _digest(
             [self.subject, str(self.root), str(self.service_config), self.legacy_config]
@@ -380,6 +387,72 @@ class OrganizationSkillResolver:
             ) from None
         return cls(bindings, snapshot_root=snapshot_root, audit_emit=audit_emit)
 
+    @classmethod
+    async def from_instance_config_async(
+        cls,
+        raw_config: dict[str, Any] | None = None,
+        *,
+        snapshot_root: str | Path | None = None,
+        audit_emit: Any | None = None,
+        secrets_provider: SecretsProvider | None = None,
+    ) -> OrganizationSkillResolver:
+        """Resolve Git sources before using the synchronous local resolver."""
+        if raw_config is None:
+            try:
+                raw_config = (
+                    json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+                )
+            except (OSError, json.JSONDecodeError):
+                raise SkillGatewayError(
+                    "invalid_config", "Cannot read instance skill configuration"
+                ) from None
+        try:
+            organization = raw_config.get("skill_gateway", {}).get("organization", {})
+            source = organization.get("source")
+            if not isinstance(source, dict) or source.get("kind") != "git":
+                return cls.from_instance_config(
+                    raw_config,
+                    snapshot_root=snapshot_root,
+                    audit_emit=audit_emit,
+                )
+            from providers.skills.git_source import GitSourceError, prepare_git_source
+
+            try:
+                prepared = await prepare_git_source(
+                    source, secrets_provider=secrets_provider
+                )
+            except GitSourceError as exc:
+                raise SkillGatewayError(exc.code, str(exc)) from None
+            resolved_config = copy.deepcopy(raw_config)
+            resolved_config["skill_gateway"]["organization"]["source"] = {
+                "kind": "path",
+                "path": str(prepared.root),
+            }
+            resolver = cls.from_instance_config(
+                resolved_config,
+                snapshot_root=snapshot_root,
+                audit_emit=audit_emit,
+            )
+            bindings = {
+                subject: replace(
+                    binding,
+                    source_identity=prepared.identity,
+                    source_revision=prepared.commit,
+                )
+                for subject, binding in resolver.bindings.items()
+            }
+            return cls(
+                bindings,
+                snapshot_root=resolver.snapshot_root,
+                audit_emit=audit_emit,
+            )
+        except SkillGatewayError:
+            raise
+        except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
+            raise SkillGatewayError(
+                "invalid_config", "Invalid organization skill source binding"
+            ) from None
+
     def for_attempt(
         self, ticket_id: str, attempt_id: str, phase: str
     ) -> OrganizationSkillResolver:
@@ -574,6 +647,7 @@ class OrganizationSkillResolver:
                 "schema_version": 1,
                 "subject": binding.subject,
                 "binding": binding.identity,
+                "source_revision": binding.source_revision or None,
                 "revision": revision,
                 "name": name,
                 "service_configured": binding.service_config is not None,

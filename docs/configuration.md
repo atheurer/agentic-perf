@@ -45,12 +45,13 @@ Use `python3 cli.py config show` to print a redacted, machine-readable JSON
 snapshot. When the orchestrator is running, this reports its persisted startup
 configuration rather than the caller's shell environment, including the
 effective private-skills and secrets paths, allowlisted legacy harness policy
-values, and configured organization sources. Gateway diagnostics show the
-repository root, discovery status, discovered subject names/count, and explicit
-binding metadata without loading documents or service configuration. Discovery
-describes that recorded snapshot; it does not validate content or describe a
-ticket's pinned revision. Unreadable
-sources produce discovery errors, not a successfully empty subject list.
+values, and configured organization sources. Gateway diagnostics show a local
+repository path or the Git host/ref/auth method, discovery status, discovered
+subject names/count when available, and explicit binding metadata without
+loading documents or service configuration. Git discovery is offline in this
+command and reports `not_checked` until a worker initializes the source.
+Discovery does not describe a ticket's pinned revision. Unreadable sources
+produce discovery errors, not a successfully empty subject list.
 Organization documents and settings
 are pinned for the ticket lifetime; new tickets load updated source content on
 first use. Legacy private skill files remain cached until restart. Credentials,
@@ -58,25 +59,46 @@ tokens, organization settings, and private document contents are never included.
 
 ## Organization skill gateway
 
-An administrator configures one local organization repository root. Subjects
-are discovered by layout, so adding a package or service configuration does not
-require another instance configuration entry. The first integrated harness
-subject is `harness/crucible`.
+An administrator configures one organization source. Subjects are discovered by
+layout, so adding a package or service configuration does not require another
+instance configuration entry. The first integrated harness subject is
+`harness/crucible`. Use a Git URL for a shared organization repository; local
+paths remain supported for development.
 
 ```json
 {
   "skill_gateway": {
     "organization": {
       "source": {
-        "kind": "path",
-        "path": "/srv/agentic-perf/organization"
+        "kind": "git",
+        "url": "ssh://git@git.example.com/performance/organization-skills.git",
+        "ref": "main"
       }
     }
   }
 }
 ```
 
-The root must be absolute and accessible to workers. The repository layout is:
+For HTTPS token authentication, add an `auth` object with `kind: "https-token"`,
+an optional Git username, and a `secret_ref` managed by the existing secrets
+provider. For example, use `auth: {"kind":"https-token","username":"oauth2",
+"secret_ref":"organization/agentic-perf-skills-read-token"}`. The token itself
+must not appear in the URL or config. SSH uses the service account's existing
+OpenSSH identity/agent and known-hosts configuration with strict host-key
+checking; an organization-managed SSH key can instead use
+`auth: {"kind":"ssh-key-secret","secret_ref":"..."}`. HTTPS, `ssh://`,
+and standard `user@host:path` SSH clone URLs are accepted. HTTPS URL credentials,
+query strings, and fragments are rejected. A private-key secret must be usable
+non-interactively; passphrase-protected keys can use the existing SSH agent.
+
+Git sources refresh the configured branch during provider initialization and
+read from an immutable commit checkout. Existing ticket snapshots keep their
+revision. `config show` reports the configured host, ref, and auth method, but
+does not connect or expose the full URL or secret reference; discovery is marked
+`not_checked` until a worker initializes the source. Git content is cached under
+service storage, outside ticket workspaces, with restricted directory
+permissions and independent of the mutable mirror. For path sources, the root
+must be absolute and accessible to workers. The repository layout is:
 
 ```text
 skills/<namespace>/<name>/SKILL.md
@@ -115,21 +137,21 @@ a non-null explicit service configuration and `legacy_config: true` is invalid. 
 runtime settings are not pinned together with documents. There is no implicit
 merge of settings values from different configuration sources.
 
-A missing, unreadable, invalid, or empty configured repository is an explicit
-discovery error. A required unavailable subject prevents affected actions.
+A missing, unreadable, invalid, empty, or unauthenticated configured repository
+is an explicit discovery error. A required unavailable subject prevents affected actions.
 Organization documents
 and configuration are pinned together under the service-only `skill-snapshots/`
 directory on first use for the ticket lifetime. New tickets see source content
 updates; existing tickets keep their revision. Adding a document/configuration
-counterpart under the same root does not change an existing pin. Changing an
-explicit binding path or repository root causes an error for an existing pin.
+counterpart under the same source does not change an existing pin. Changing an
+explicit binding path, Git URL, or ref causes an error for an existing pin.
 Removing a previously pinned subject's binding reports unavailable instead of
 falling back to legacy settings. No refresh command is implemented.
 
 Gateway workers read the administrator binding when they construct their
 provider. This binding is instance configuration; it is not a ticket directive
-or a user identity. Git distribution and authenticated user packages are future
-extensions. See the [package and retrieval design](design-skill-gateway.md).
+or a user identity. User-scoped packages remain a future extension. See the
+[package and retrieval design](design-skill-gateway.md).
 
 ## Minimal Example
 

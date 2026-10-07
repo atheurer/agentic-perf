@@ -40,7 +40,7 @@ from agents.ethtool import (
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     read_skill_documents,
 )
@@ -83,10 +83,12 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider(
-        resolve_source=False, skill_phase="provisioning"
-    )
     _secrets_provider = build_secrets_provider()
+    _skill_provider = await build_skill_provider_async(
+        secrets_provider=_secrets_provider,
+        resolve_source=False,
+        skill_phase="provisioning",
+    )
     _initialized = True
 
 
