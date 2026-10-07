@@ -36,7 +36,7 @@ from agents.server_utils import (
     _public_context_result,
     build_crucible_context_gateway,
     build_repo_cache,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     controller_context_gateway,
     read_skill_documents,
@@ -843,7 +843,7 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider(skill_phase="benchmark")
+    _skill_provider = await build_skill_provider_async(skill_phase="benchmark")
     _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = await build_repo_cache()
