@@ -1296,7 +1296,16 @@ class AgentMCPClient:
         if self._audit_hook is not None:
             self._audit_hook(event)
         if self._trace_client is not None:
-            self._trace_client.record(event)
+            try:
+                self._trace_client.record(event)
+            except Exception as exc:
+                # Trace persistence is best-effort at this boundary. Logging
+                # exception text could leak provider data, so report only the
+                # exception class and let MCP execution continue.
+                logger.warning(
+                    "MCP trace recording failed; dispatch continues (error_type=%s)",
+                    type(exc).__name__,
+                )
         return True
 
     async def disconnect(self) -> None:

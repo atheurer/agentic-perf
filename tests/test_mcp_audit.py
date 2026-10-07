@@ -88,6 +88,80 @@ def test_client_connection_audit_generates_correlation_from_ticket_context():
     assert events[0].mcp.correlation_request_id
 
 
+@pytest.mark.asyncio
+async def test_trace_record_failure_on_request_boundary_does_not_block_dispatch(
+    caplog,
+):
+    secret = "trace-record-secret-sentinel"
+    session = AsyncMock()
+    session.call_tool.return_value = SimpleNamespace(
+        content=[SimpleNamespace(text="provider result")], isError=False
+    )
+    trace_client = MagicMock()
+    trace_client.record.side_effect = RuntimeError(secret)
+    client = AgentMCPClient(trace_client=trace_client)
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    with caplog.at_level("WARNING", logger="agents.mcp_client"):
+        result = await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert result == "provider result"
+    session.call_tool.assert_awaited_once()
+    assert trace_client.record.call_count == 2
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+    ]
+    assert "MCP trace recording failed; dispatch continues" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_trace_record_failure_on_failure_boundary_does_not_recurse(caplog):
+    secret = "failure-event-trace-secret-sentinel"
+    session = AsyncMock()
+    session.call_tool.side_effect = RuntimeError("provider failed")
+
+    def record(event):
+        if event.lifecycle.state == LifecycleState.FAILED:
+            raise RuntimeError(secret)
+
+    trace_client = MagicMock()
+    trace_client.record.side_effect = record
+    client = AgentMCPClient(trace_client=trace_client)
+    client._tool_routing["tool"] = "local"
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+    )
+
+    with caplog.at_level("WARNING", logger="agents.mcp_client"):
+        with pytest.raises(MCPToolCallError) as exc_info:
+            await client.call_tool("tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    assert session.call_tool.await_count == 1
+    assert trace_client.record.call_count == 2
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.FAILED,
+    ]
+    assert "MCP trace recording failed; dispatch continues" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
 @pytest.mark.skipif(
     sys.version_info >= (3, 14),
     reason="FastMCP stdio hangs on local Python 3.14; covered in CI 3.12/3.13",
