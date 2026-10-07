@@ -996,3 +996,91 @@ class TestArtifactGuidance:
         messages = agent._build_messages(ticket)
         content = messages[0]["content"]
         assert "list_benchmark_artifacts" not in content
+
+
+class TestFleetConvergence:
+    """Fleet exhaustion should trigger deterministic convergence."""
+
+    def test_fleet_exhausted_hard(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "partial"},
+                ],
+                "fleet_exhausted": {"hard": True},
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" in outcome
+        assert "2 tested" in outcome
+        assert "1 completed" in outcome
+        assert "1 partial" in outcome
+
+    def test_fleet_exhausted_soft(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "completed"},
+                    {"host_id": "board-03", "status": "completed"},
+                ],
+                "fleet_exhausted": {
+                    "soft": True,
+                    "unavailable_hosts": ["(duplicate assignment)"],
+                },
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" in outcome
+        assert "3 tested" in outcome
+
+    def test_fleet_not_exhausted_returns_empty(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                ],
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" not in outcome
+
+    def test_non_fleet_ticket_unaffected(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "convergence_criteria": {},
+            "iteration_results": [],
+        }
+        outcome = agent._check_deterministic(cf)
+        assert outcome == ""
