@@ -64,3 +64,12 @@ dependency is deliberate: trace storage is itself system-context data, and
 keeping its file mutations in the facade avoids an exception for the audit
 transport. SQLite's own on-disk writes remain the documented database-engine
 boundary.
+
+Organization skill attempt snapshots use the same critical facade with the
+logical `skill-service://` namespace. Their storage is under the instance's
+service-only `skill-snapshots` directory, outside ticket workspaces, artifact
+roots, and served skill directories. The private snapshot includes runtime
+configuration; only manifest-listed document projections leave the resolver.
+The sensitive snapshot filename suppresses content digests in filesystem trace
+attributes. A durable pin is written after the snapshot and verified on reads;
+an audited descriptor plus a process-shared file lock serializes initial pins.
