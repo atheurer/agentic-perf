@@ -71,6 +71,69 @@ async def test_generate_runfile_with_tags(provider: CrucibleSkillProvider):
 async def test_generate_runfile_no_endpoints(provider: CrucibleSkillProvider):
     result = await provider.generate_runfile("fio", {})
     assert "endpoints" not in result.template
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_generate_runfile_defaults_tags_to_object():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    result = await provider.generate_runfile("uperf", {})
+
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_requires_object_tags_without_controller_schema():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    missing = await provider.validate_runfile({"benchmarks": []})
+    malformed = await provider.validate_runfile({"benchmarks": [], "tags": ["network"]})
+
+    assert missing == {
+        "valid": False,
+        "errors": ["missing required top-level key: tags"],
+    }
+    assert malformed == {
+        "valid": False,
+        "errors": ["top-level tags must be an object"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_runfile_schema_requires_tags_without_mutating_source(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    schema = await provider.get_runfile_schema()
+
+    assert schema["properties"]["tags"] == {"type": "object", "default": {}}
+    assert schema["required"] == ["benchmarks", "tags"]
+    assert "tags" not in source_schema["properties"]
+    assert source_schema["required"] == ["benchmarks"]
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_uses_required_tags_schema_copy(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+        "additionalProperties": False,
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    validation = await provider.validate_runfile({"benchmarks": [], "tags": {}})
+
+    assert validation["valid"] is True
+    assert source_schema["required"] == ["benchmarks"]
+    assert "tags" not in source_schema["properties"]
 
 
 @pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
@@ -1751,6 +1814,59 @@ async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
             "offset_bytes",
         }
         assert tool.parameters["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_registered_controller_context_tool_includes_provider_runfile_contract(
+    tmp_path, monkeypatch
+):
+    import agents.benchmark.server as benchmark_server
+
+    provider = CrucibleSkillProvider(tmp_path / "missing-controller")
+    monkeypatch.setattr(benchmark_server, "_initialized", True)
+    monkeypatch.setattr(benchmark_server, "_crucible_context", provider)
+    monkeypatch.setattr(benchmark_server, "_ssh", object())
+    monkeypatch.setattr(
+        benchmark_server,
+        "_controller_host",
+        lambda: "controller.example.test",
+    )
+    calls = []
+
+    async def fake_controller_context_gateway(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "found": True,
+                "operation": "bootstrap",
+                "document": {"ref": "AGENTS.md", "content": "controller guidance"},
+            }
+        )
+
+    monkeypatch.setattr(
+        benchmark_server,
+        "controller_context_gateway",
+        fake_controller_context_gateway,
+    )
+
+    tools = await benchmark_server.mcp.list_tools()
+    assert any(tool.name == "get_crucible_benchmark_context" for tool in tools)
+
+    response = json.loads(
+        await benchmark_server._get_crucible_benchmark_context_tool(
+            operation="bootstrap"
+        )
+    )
+
+    assert response["document"]["content"] == "controller guidance"
+    assert response["runfile_contract"] == provider.get_runfile_contract()
+    assert response["runfile_contract"]["required_top_level_fields"] == ["tags"]
+    assert response["runfile_contract"]["properties"]["tags"] == {
+        "type": "object",
+        "default": {},
+    }
+    assert "Use {} when no tags apply" in response["runfile_contract"]["guidance"]
+    assert calls[0]["operation"] == "bootstrap"
 
 
 @pytest.mark.asyncio

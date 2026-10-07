@@ -48,6 +48,7 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from providers.skills.crucible import crucible_runfile_contract_errors
 
 logger = logging.getLogger(__name__)
 
@@ -1542,38 +1543,57 @@ async def _get_crucible_benchmark_context_tool(
     Source selection, phase policy, and provenance are server-managed.
     """
     await _ensure_init()
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
     if operation not in {"bootstrap", "read", "search"}:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "unsupported_operation",
-                "guidance": "Use bootstrap, read, or search.",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "unsupported_operation",
+                    "guidance": "Use bootstrap, read, or search.",
+                }
+            )
         )
     controller_host = _controller_host()
     if _ssh is None or not controller_host:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "controller_not_identified",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "controller_not_identified",
+                }
+            )
         )
-    return await controller_context_gateway(
-        ssh=_ssh,
-        controller_host=controller_host,
-        ticket_id=os.environ.get("TICKET_ID", ""),
-        agent_name="benchmark-agent",
-        phase="benchmark",
-        operation=operation,
-        path=path,
-        query=query,
-        benchmark="",
-        include_alternates=False,
-        max_bytes=max_bytes,
-        offset_bytes=offset_bytes,
+    return _with_crucible_runfile_contract(
+        await controller_context_gateway(
+            ssh=_ssh,
+            controller_host=controller_host,
+            ticket_id=os.environ.get("TICKET_ID", ""),
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation=operation,
+            path=path,
+            query=query,
+            benchmark="",
+            include_alternates=False,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
     )
+
+
+def _with_crucible_runfile_contract(response: str) -> str:
+    """Attach provider-owned run-file requirements to model-facing context."""
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
+    result = json.loads(response)
+    if not isinstance(result, dict):
+        raise ValueError("Crucible context response must be a JSON object")
+    result["runfile_contract"] = _crucible_context.get_runfile_contract()
+    return json.dumps(result)
 
 
 async def _legacy_get_crucible_benchmark_context(
@@ -2576,6 +2596,19 @@ async def execute_benchmark(
                 "message": "A runfile is required for this harness",
             }
         )
+    if harness_name == "crucible":
+        contract_errors = crucible_runfile_contract_errors(run_file)
+        if contract_errors:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "reason_code": "invalid_runfile_contract",
+                    "message": (
+                        f"Run-file failed schema validation: {contract_errors}"
+                    ),
+                }
+            )
 
     if run_command is not None:
         valid, reason = _validate_run_command(run_command, harness_name)
@@ -3974,6 +4007,17 @@ async def validate_benchmark(
                     f"Controller-side validation is not supported for harness "
                     f"'{harness_name}'"
                 ],
+            }
+        )
+
+    contract_errors = crucible_runfile_contract_errors(run_file)
+    if contract_errors:
+        return json.dumps(
+            {
+                "status": "invalid",
+                "valid": False,
+                "harness": harness_name,
+                "errors": contract_errors,
             }
         )
 

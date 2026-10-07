@@ -12,7 +12,7 @@ MOCK_SCHEMA = {
         "endpoints": {"type": "array"},
         "tags": {"type": "object"},
     },
-    "required": ["benchmarks"],
+    "required": ["benchmarks", "tags"],
     "additionalProperties": False,
 }
 
@@ -58,6 +58,7 @@ MOCK_UPERF_EXAMPLE = {
             "remotes": [],
         },
     ],
+    "tags": {},
 }
 
 
@@ -191,6 +192,7 @@ async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_s
     """execute_benchmark uses the exact runfile returned by validation."""
     llm_runfile = {
         "benchmarks": [{"name": "uperf", "ids": "1", "mv-params": {}}],
+        "tags": {},
         "endpoints": [
             {
                 "type": "remotehosts",

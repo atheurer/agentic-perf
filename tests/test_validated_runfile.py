@@ -94,6 +94,7 @@ async def _make_crucible_ssh(
 
 
 async def _validate_runfile(h, run_file, controller="test-host"):
+    run_file.setdefault("tags", {})
     result = await h["validate_benchmark"](
         controller=controller,
         run_file=run_file,
@@ -193,6 +194,30 @@ async def test_crucible_execution_rejects_unvalidated_runfile():
 
     assert result["status"] == "rejected"
     assert "validation_id" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_crucible_execution_rejects_legacy_validation_without_tags(monkeypatch):
+    import agents.benchmark.server as server
+
+    provider = _make_provider()
+    h, ssh = _make_handlers(provider)
+    monkeypatch.setattr(
+        server,
+        "_get_validated_runfile",
+        lambda *args: ({"benchmarks": []}, None),
+    )
+
+    result = await h["execute_benchmark"](
+        controller="test-host",
+        validation_id="legacy-validation",
+        harness="crucible",
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "invalid_runfile_contract"
+    assert "missing required top-level key: tags" in result["message"]
+    assert ssh.calls == []
 
 
 @pytest.mark.asyncio
