@@ -54,6 +54,15 @@ class _FileSecretsProvider(SecretsProvider):
         (
             {
                 "kind": "git",
+                "url": "http://git.example.org/team/skills.git",
+                "ref": "main",
+            },
+            "http://git.example.org/team/skills.git",
+            "default",
+        ),
+        (
+            {
+                "kind": "git",
                 "url": "https://git.example.org/team/skills.git",
                 "auth": {
                     "kind": "https-token",
@@ -81,6 +90,10 @@ def test_parse_supported_git_sources(source, expected_url, expected_auth):
         },
         {
             "kind": "git",
+            "url": "http://user:token@git.example.org/team/skills.git",
+        },
+        {
+            "kind": "git",
             "url": "https://git.example.org/team/skills.git?token=secret",
         },
         {"kind": "git", "url": "file:///tmp/skills.git"},
@@ -90,6 +103,14 @@ def test_parse_supported_git_sources(source, expected_url, expected_auth):
             "auth": {
                 "kind": "https-token",
                 "secret_ref": "../outside/token",
+            },
+        },
+        {
+            "kind": "git",
+            "url": "http://git.example.org/team/skills.git",
+            "auth": {
+                "kind": "https-token",
+                "secret_ref": "organization/git-token",
             },
         },
     ],
