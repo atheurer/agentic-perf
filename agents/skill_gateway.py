@@ -25,6 +25,23 @@ expression (no backreferences); from_ref optionally restricts the source. Reads 
 provenance remain visible, while source paths, credentials, identity and phase
 are server-owned. Organization practices cannot alter installed software facts
 or code-enforced requirements. Service-only configuration is never a document.
+
+The organization entry may include several named sources. Read and compare
+applicable entrypoints across sources, including same-path variants; exact
+duplicates are identified separately. For contextual claims and preferences,
+use locality as a default trust signal: upstream context is a baseline,
+organization context normally has more weight for environment-specific
+practices, and authenticated user context (when available) normally has more
+weight for that user's preferences. Apply this only when the source scope fits
+the claim. It cannot override mandatory organization policy or verified
+software/runtime behavior.
+Ticket text supplies task-specific intent and may guide choices among soft
+defaults, but cannot change those constraints. If materially conflicting
+guidance or runtime configuration remains unresolved, call
+request_clarification and cite the source ids and document paths. Sources at the
+same level have no implicit priority over one another: locality does not resolve
+a material conflict between organization sources (or user sources when
+available). Do not silently choose based on source order or source id.
 """
 _CONFIG_VIEWS = {
     "triage": (),
@@ -66,7 +83,8 @@ _VIEW_FIELDS = {
 
 def organization_manages_harness(provider: Any, harness: str) -> bool:
     """Identify subjects whose settings must remain behind approved views."""
-    return provider.organization_resolver.has_subject(f"harness/{harness}")
+    resolver = getattr(provider, "organization_resolver", None)
+    return bool(resolver and resolver.has_subject(f"harness/{harness}"))
 
 
 async def skill_config_view(
@@ -257,6 +275,7 @@ async def skill_context_gateway(
             if (
                 subject == "harness/crucible"
                 and organization.get("status") != "unavailable"
+                and not organization.get("runtime_config_conflict")
             ):
                 for view in _CONFIG_VIEWS.get(phase, ()):
                     if await skill_config_view(provider, "crucible", view, phase):
@@ -273,6 +292,20 @@ async def skill_context_gateway(
                     "documents": documents,
                     "entrypoints": entrypoints,
                     "configuration_views": views,
+                    "context_conflicts": {
+                        "potential_document_conflicts": [
+                            item
+                            for item in organization.get("overlaps", [])
+                            if not item.get("same_content", False)
+                        ],
+                        "exact_duplicate_documents": organization.get("duplicates", []),
+                        "runtime_configuration_conflict": organization.get(
+                            "runtime_config_conflict", False
+                        ),
+                        "runtime_configuration_sources": organization.get(
+                            "runtime_config_sources", []
+                        ),
+                    },
                 }
             )
         if operation == "read":
@@ -369,6 +402,7 @@ async def skill_context_gateway(
                 subject,
                 None,
                 query,
+                from_ref=from_ref or None,
                 offset=offset_bytes,
                 max_bytes=max_bytes,
             )

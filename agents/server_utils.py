@@ -160,7 +160,10 @@ async def build_skill_provider_async(
 ):
     """Build skills after resolving authenticated organization Git sources."""
     from paths import CONFIG_PATH
-    from providers.skills.gateway import OrganizationSkillResolver
+    from providers.skills.gateway import (
+        OrganizationSkillResolver,
+        organization_source_descriptors,
+    )
 
     raw_config = None
     try:
@@ -170,16 +173,18 @@ async def build_skill_provider_async(
         pass
     gateway = raw_config.get("skill_gateway") if isinstance(raw_config, dict) else None
     organization = gateway.get("organization") if isinstance(gateway, dict) else None
-    source = organization.get("source") if isinstance(organization, dict) else None
-    auth = source.get("auth", {}) if isinstance(source, dict) else {}
-    auth_kind = auth.get("kind", "default") if isinstance(auth, dict) else None
-    if (
-        secrets_provider is None
-        and isinstance(source, dict)
-        and source.get("kind") == "git"
-        and isinstance(auth_kind, str)
-        and auth_kind in {"https-token", "ssh-key-secret"}
-    ):
+    try:
+        sources = organization_source_descriptors(organization or {})
+    except (TypeError, ValueError):
+        sources = []
+    needs_secret_provider = any(
+        item["source"].get("kind") == "git"
+        and isinstance(item["source"].get("auth", {}), dict)
+        and item["source"].get("auth", {}).get("kind", "default")
+        in {"https-token", "ssh-key-secret"}
+        for item in sources
+    )
+    if secrets_provider is None and needs_secret_provider:
         secrets_provider = build_secrets_provider()
     resolver = await OrganizationSkillResolver.from_instance_config_async(
         raw_config=raw_config,
@@ -1216,9 +1221,7 @@ async def crucible_context_gateway(
 def build_secrets_provider():
     """Construct a SecretsProvider from environment and config.
 
-    Builds a local provider from env vars, then wraps it in a cascade
-    with a vault layer when Bitwarden Secrets Manager is configured
-    in ``~/.agentic-perf/config.json``.
+    Builds a local provider, then adds configured vault and Git-reference support.
     """
     from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
@@ -1234,6 +1237,7 @@ def build_secrets_provider():
     vault_config = _load_vault_config()
     bw_config = (vault_config or {}).get("bitwarden", {})
     shared_project_id = bw_config.get("shared_project_id")
+    provider = local
     if shared_project_id and bw_config.get("organization_id"):
         try:
             from providers.secrets.cascade import CascadingSecretsProvider
@@ -1251,22 +1255,20 @@ def build_secrets_provider():
                     ("vault:shared", vault),
                 ]
             )
-            ticket_id = os.environ.get("TICKET_ID")
-            return (
-                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
-                if ticket_id
-                else provider
-            )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
 
+    from providers.secrets.git import GitSecretsProvider
+
+    provider = GitSecretsProvider(fallback=provider)
+
     ticket_id = os.environ.get("TICKET_ID")
     return (
-        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
         if ticket_id
-        else local
+        else provider
     )
 
 
@@ -1843,6 +1845,7 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
             return {
                 "found": False,
                 "harness": "crucible",
+                "filename": filename,
                 "message": (
                     "Use get_skill_context(subject='harness/crucible') for "
                     "organization guidance and authoritative software references."

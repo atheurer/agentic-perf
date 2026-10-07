@@ -625,6 +625,9 @@ class Dispatcher:
                         secrets_root=self._secrets_root,
                         vault_config=self._vault_config,
                     )
+                    from providers.secrets.git import GitSecretsProvider
+
+                    provider = GitSecretsProvider(fallback=provider)
 
         if provider is not None and self._redactor is not None:
             ticket_id = (ticket_data or {}).get("id", "")

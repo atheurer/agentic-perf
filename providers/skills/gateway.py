@@ -104,6 +104,7 @@ class OrganizationBinding:
     override_identity: str = ""
     source_identity: str = ""
     source_revision: str = ""
+    source_id: str = "default"
 
     @property
     def identity(self) -> str:
@@ -113,17 +114,27 @@ class OrganizationBinding:
             return _digest(
                 [
                     self.subject,
+                    self.source_id,
                     self.source_identity or str(self.repository_root),
                     self.override_identity,
                 ]
             )
         return _digest(
-            [self.subject, str(self.root), str(self.service_config), self.legacy_config]
+            [
+                self.subject,
+                self.source_id,
+                str(self.root),
+                str(self.service_config),
+                self.legacy_config,
+            ]
         )
 
 
 def discover_organization_bindings(
-    repository_root: str | Path, *, required: bool = True
+    repository_root: str | Path,
+    *,
+    required: bool = True,
+    source_id: str = "default",
 ) -> dict[str, OrganizationBinding]:
     """Discover the exact package/config hierarchy without reading file contents.
 
@@ -134,6 +145,12 @@ def discover_organization_bindings(
     try:
         if not isinstance(required, bool):
             raise ValueError("required must be a boolean")
+        if (
+            not isinstance(source_id, str)
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", source_id)
+            or len(source_id) > 64
+        ):
+            raise ValueError("source id must be a lowercase identifier")
         root = Path(repository_root)
         if not root.is_absolute():
             raise ValueError("repository root must be absolute")
@@ -191,6 +208,7 @@ def discover_organization_bindings(
                             prior.service_config if prior else None,
                             required,
                             repository_root=root,
+                            source_id=source_id,
                         )
                     else:
                         if entry.suffix != ".json":
@@ -204,6 +222,7 @@ def discover_organization_bindings(
                             config,
                             required,
                             repository_root=root,
+                            source_id=source_id,
                         )
                     if len(bindings) > 256:
                         raise ValueError("repository subject count exceeds limit")
@@ -217,6 +236,45 @@ def discover_organization_bindings(
         ) from None
 
 
+def organization_source_descriptors(
+    organization: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Normalize the single-source shorthand and named source collection."""
+    if "source" in organization and "sources" in organization:
+        raise ValueError("configure source or sources, not both")
+    if "sources" in organization:
+        values = organization["sources"]
+        if not isinstance(values, list) or not 1 <= len(values) <= 32:
+            raise ValueError("sources must be a nonempty list of at most 32 entries")
+        descriptors = values
+        require_id = True
+    elif "source" in organization:
+        descriptors = [organization["source"]]
+        require_id = False
+    else:
+        return []
+
+    result = []
+    seen = set()
+    for index, descriptor in enumerate(descriptors):
+        if not isinstance(descriptor, dict):
+            raise ValueError("organization source must be an object")
+        source_id = descriptor.get("id", "default" if not require_id else None)
+        if (
+            not isinstance(source_id, str)
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", source_id)
+            or len(source_id) > 64
+            or source_id in seen
+        ):
+            raise ValueError("organization source ids must be unique identifiers")
+        seen.add(source_id)
+        source = {key: value for key, value in descriptor.items() if key != "id"}
+        if source.get("kind") not in {"path", "git"}:
+            raise ValueError("unsupported organization source")
+        result.append({"id": source_id, "source": source})
+    return result
+
+
 class OrganizationSkillResolver:
     """Resolve explicit exports, pinning documents and config for one attempt.
 
@@ -227,7 +285,12 @@ class OrganizationSkillResolver:
 
     def __init__(
         self,
-        bindings: dict[str, OrganizationBinding],
+        bindings: dict[
+            str,
+            OrganizationBinding
+            | list[OrganizationBinding]
+            | tuple[OrganizationBinding, ...],
+        ],
         *,
         snapshot_root: str | Path | None = None,
         audit_emit: Any | None = None,
@@ -235,7 +298,10 @@ class OrganizationSkillResolver:
         attempt_id: str = "",
         phase: str = "",
     ) -> None:
-        self.bindings = bindings
+        self.bindings = {
+            subject: tuple(value) if isinstance(value, (list, tuple)) else (value,)
+            for subject, value in bindings.items()
+        }
         self.snapshot_root = Path(
             snapshot_root or AGENTIC_PERF_HOME / "skill-snapshots"
         ).resolve()
@@ -244,18 +310,20 @@ class OrganizationSkillResolver:
                 raise SkillGatewayError(
                     "unsafe_snapshot_root", "Snapshot root must be service-only"
                 )
-        for binding in bindings.values():
-            if binding.root and self.snapshot_root.is_relative_to(binding.root):
-                raise SkillGatewayError(
-                    "unsafe_snapshot_root", "Snapshot root is inside a served source"
-                )
-            if binding.repository_root and self.snapshot_root.is_relative_to(
-                binding.repository_root / "skills"
-            ):
-                raise SkillGatewayError(
-                    "unsafe_snapshot_root",
-                    "Snapshot root is inside a served skills tree",
-                )
+        for group in self.bindings.values():
+            for binding in group:
+                if binding.root and self.snapshot_root.is_relative_to(binding.root):
+                    raise SkillGatewayError(
+                        "unsafe_snapshot_root",
+                        "Snapshot root is inside a served source",
+                    )
+                if binding.repository_root and self.snapshot_root.is_relative_to(
+                    binding.repository_root / "skills"
+                ):
+                    raise SkillGatewayError(
+                        "unsafe_snapshot_root",
+                        "Snapshot root is inside a served skills tree",
+                    )
         self.audit_emit = audit_emit
         self.ticket_id = ticket_id
         self.attempt_id = attempt_id
@@ -283,92 +351,152 @@ class OrganizationSkillResolver:
             subjects = organization.get("subjects", {})
             if not isinstance(subjects, dict):
                 raise ValueError("subjects must be an object")
-            bindings = {}
+            bindings: dict[str, list[OrganizationBinding]] = {}
             required_default = organization.get("required", True)
             if not isinstance(required_default, bool):
                 raise ValueError("required must be a boolean")
-            repository = organization.get("source")
-            repository_root = None
-            if "source" in organization:
-                if not isinstance(repository, dict) or repository.get("kind") != "path":
-                    raise ValueError("unsupported organization source")
-                bindings = discover_organization_bindings(
-                    repository["path"], required=required_default
+            descriptors = organization_source_descriptors(organization)
+            source_ids = {item["id"] for item in descriptors}
+            for descriptor in descriptors:
+                source_id = descriptor["id"]
+                repository = descriptor["source"]
+                if repository.get("kind") != "path":
+                    raise ValueError(
+                        "Git organization sources require async resolution"
+                    )
+                discovered = discover_organization_bindings(
+                    repository["path"],
+                    required=required_default,
+                    source_id=source_id,
                 )
-                repository_root = Path(repository["path"]).resolve()
+                for subject, binding in discovered.items():
+                    bindings.setdefault(subject, []).append(binding)
             for subject, value in subjects.items():
                 _subject(subject)
                 if not isinstance(value, dict):
                     raise ValueError("subject override must be an object")
-                prior = bindings.get(subject)
-                source = value.get("source")
-                if source is not None and source.get("kind") != "path":
-                    raise ValueError("unsupported organization source")
-                root = (
-                    (Path(source["path"]) if source else None)
-                    if "source" in value
-                    else prior.root
-                    if prior
-                    else None
+                prior_group = bindings.get(subject, [])
+                source_id = value.get("source_id")
+                if source_id is not None and (
+                    not isinstance(source_id, str) or source_id not in source_ids
+                ):
+                    raise ValueError("subject override selects unknown source id")
+                changes_source = any(
+                    key in value
+                    for key in ("source", "service_config", "legacy_config")
                 )
+                if source_id is not None:
+                    selected = [b for b in prior_group if b.source_id == source_id]
+                    if not selected and prior_group:
+                        raise ValueError(
+                            "subject override source does not contain subject"
+                        )
+                elif len(prior_group) == 1:
+                    selected = prior_group
+                elif len(prior_group) > 1 and changes_source:
+                    raise ValueError("ambiguous subject override requires source_id")
+                else:
+                    selected = prior_group
+                source = value.get("source")
+                if source is not None and (
+                    not isinstance(source, dict) or source.get("kind") != "path"
+                ):
+                    raise ValueError("unsupported organization source")
                 runtime = value.get("service_config")
                 if runtime is not None and (
                     not isinstance(runtime, dict)
                     or runtime.get("kind", "path") != "path"
                 ):
                     raise ValueError("unsupported service configuration source")
-                config = (
-                    (Path(runtime["path"]) if runtime is not None else None)
-                    if "service_config" in value
-                    else prior.service_config
-                    if prior
-                    else None
-                )
-                legacy = value.get("legacy_config", False)
-                if legacy and runtime is None:
-                    config = None
-                if (root and not root.is_absolute()) or (
-                    config and not config.is_absolute()
+                legacy = value.get("legacy_config")
+                if legacy is not None and not isinstance(legacy, bool):
+                    raise ValueError("legacy_config must be a boolean")
+                required = value.get("required")
+                if required is not None and not isinstance(required, bool):
+                    raise ValueError("required must be a boolean")
+                if not prior_group and not any(
+                    key in value for key in ("source", "service_config")
                 ):
-                    raise ValueError("administrator source paths must be absolute")
-                root = root.resolve() if root else None
-                config = config.resolve() if config else None
-                if config and root and config.is_relative_to(root):
-                    raise ValueError("service configuration is inside served root")
-                required = value.get(
-                    "required", prior.required if prior else required_default
-                )
-                if not isinstance(legacy, bool) or not isinstance(required, bool):
-                    raise ValueError("required and legacy_config must be booleans")
-                if legacy and config:
-                    raise ValueError("select one runtime configuration source")
-                if root is None and config is None:
                     raise ValueError("subject has no organization source")
-                bindings[subject] = OrganizationBinding(
-                    subject,
-                    root,
-                    config,
-                    required,
-                    legacy,
-                    repository_root=repository_root,
-                    override_identity=_digest(
-                        {
-                            "source": str(root) if source is not None else None,
-                            "service_config": str(config)
-                            if runtime is not None
-                            else None,
-                            "source_explicit": "source" in value,
-                            "service_config_explicit": "service_config" in value,
-                            "legacy_config": legacy,
-                        }
+                if not prior_group:
+                    new_id = source_id or "override"
+                    if new_id not in source_ids and source_id is not None:
+                        raise ValueError("unknown source_id")
+                    prior_group = [
+                        OrganizationBinding(
+                            subject,
+                            None,
+                            None,
+                            required_default,
+                            source_id=new_id,
+                        )
+                    ]
+                targets = selected or prior_group
+                updated = []
+                for prior in prior_group:
+                    if prior not in targets:
+                        updated.append(prior)
+                        continue
+                    root = (
+                        (Path(source["path"]) if source is not None else None)
+                        if "source" in value
+                        else prior.root
                     )
-                    if "source" in value or "service_config" in value or legacy
-                    else "",
-                )
-            for binding in bindings.values():
+                    config = (
+                        (Path(runtime["path"]) if runtime is not None else None)
+                        if "service_config" in value
+                        else prior.service_config
+                    )
+                    use_legacy = legacy if legacy is not None else prior.legacy_config
+                    if use_legacy and "service_config" not in value:
+                        config = None
+                    if (root and not root.is_absolute()) or (
+                        config and not config.is_absolute()
+                    ):
+                        raise ValueError("administrator source paths must be absolute")
+                    root = root.resolve() if root else None
+                    config = config.resolve() if config else None
+                    if config and root and config.is_relative_to(root):
+                        raise ValueError("service configuration is inside served root")
+                    if use_legacy and config:
+                        raise ValueError("select one runtime configuration source")
+                    if root is None and config is None and not use_legacy:
+                        raise ValueError("subject has no organization source")
+                    updated.append(
+                        replace(
+                            prior,
+                            root=root,
+                            service_config=config,
+                            required=required
+                            if required is not None
+                            else prior.required,
+                            legacy_config=use_legacy,
+                            override_identity=_digest(
+                                {
+                                    "source": str(root) if "source" in value else None,
+                                    "service_config": str(config)
+                                    if "service_config" in value
+                                    else None,
+                                    "source_explicit": "source" in value,
+                                    "service_config_explicit": "service_config"
+                                    in value,
+                                    "legacy_config": use_legacy,
+                                }
+                            )
+                            if changes_source
+                            else prior.override_identity,
+                        )
+                    )
+                if required is not None and not changes_source:
+                    updated = [replace(item, required=required) for item in updated]
+                bindings[subject] = updated
+            flat_bindings = [
+                binding for group in bindings.values() for binding in group
+            ]
+            for binding in flat_bindings:
                 if binding.service_config is None:
                     continue
-                for other in bindings.values():
+                for other in flat_bindings:
                     if other.root and binding.service_config.is_relative_to(other.root):
                         raise ValueError(
                             "service configuration is inside a served source"
@@ -408,8 +536,8 @@ class OrganizationSkillResolver:
                 ) from None
         try:
             organization = raw_config.get("skill_gateway", {}).get("organization", {})
-            source = organization.get("source")
-            if not isinstance(source, dict) or source.get("kind") != "git":
+            descriptors = organization_source_descriptors(organization)
+            if not any(item["source"].get("kind") == "git" for item in descriptors):
                 return cls.from_instance_config(
                     raw_config,
                     snapshot_root=snapshot_root,
@@ -417,29 +545,53 @@ class OrganizationSkillResolver:
                 )
             from providers.skills.git_source import GitSourceError, prepare_git_source
 
-            try:
-                prepared = await prepare_git_source(
-                    source, secrets_provider=secrets_provider
-                )
-            except GitSourceError as exc:
-                raise SkillGatewayError(exc.code, str(exc)) from None
+            prepared_sources = {}
+            resolved_sources = []
+            for item in descriptors:
+                source_id, source = item["id"], item["source"]
+                if source.get("kind") == "git":
+                    try:
+                        prepared = await prepare_git_source(
+                            source, secrets_provider=secrets_provider
+                        )
+                    except GitSourceError as exc:
+                        raise SkillGatewayError(exc.code, str(exc)) from None
+                    prepared_sources[source_id] = prepared
+                    resolved_sources.append(
+                        {
+                            "id": source_id,
+                            "kind": "path",
+                            "path": str(prepared.root),
+                        }
+                    )
+                else:
+                    resolved_sources.append({"id": source_id, **source})
             resolved_config = copy.deepcopy(raw_config)
-            resolved_config["skill_gateway"]["organization"]["source"] = {
-                "kind": "path",
-                "path": str(prepared.root),
-            }
+            resolved_organization = resolved_config["skill_gateway"]["organization"]
+            if "sources" in resolved_organization:
+                resolved_organization["sources"] = resolved_sources
+            else:
+                resolved_organization["source"] = {
+                    **resolved_sources[0],
+                    "id": resolved_sources[0]["id"],
+                }
             resolver = cls.from_instance_config(
                 resolved_config,
                 snapshot_root=snapshot_root,
                 audit_emit=audit_emit,
             )
             bindings = {
-                subject: replace(
-                    binding,
-                    source_identity=prepared.identity,
-                    source_revision=prepared.commit,
+                subject: tuple(
+                    replace(
+                        binding,
+                        source_identity=prepared_sources[binding.source_id].identity,
+                        source_revision=prepared_sources[binding.source_id].commit,
+                    )
+                    if binding.source_id in prepared_sources
+                    else binding
+                    for binding in group
                 )
-                for subject, binding in resolver.bindings.items()
+                for subject, group in resolver.bindings.items()
             }
             return cls(
                 bindings,
@@ -471,6 +623,18 @@ class OrganizationSkillResolver:
 
     def configured_subjects(self) -> list[str]:
         return sorted(self.bindings)
+
+    def uses_organization_config(self, subject: str) -> bool:
+        group = self.bindings.get(_subject(subject))
+        if group is not None:
+            return not any(binding.legacy_config for binding in group)
+        return self.has_subject(subject)
+
+    def uses_legacy_config(self, subject: str) -> bool:
+        return any(
+            binding.legacy_config
+            for binding in self.bindings.get(_subject(subject), ())
+        )
 
     def _pin_path(self, subject: str) -> Path:
         key = _digest([self.ticket_id, self.attempt_id, _subject(subject)])
@@ -529,8 +693,10 @@ class OrganizationSkillResolver:
             documents, exported = {}, []
             total = 0
             for entry in entries:
-                relative = _relative(entry["path"])
-                if not relative.endswith(".md") or relative in documents:
+                source_path = _relative(entry["path"])
+                if not source_path.endswith(".md") or source_path in {
+                    item.get("source_path") for item in exported
+                }:
                     raise ValueError("exports must be distinct Markdown documents")
                 phases = entry.get("phases", ["*"])
                 if (
@@ -540,16 +706,18 @@ class OrganizationSkillResolver:
                     or not isinstance(entry.get("entrypoint", False), bool)
                 ):
                     raise ValueError("invalid document applicability")
-                content = self._source_document(binding.root, relative)
+                content = self._source_document(binding.root, source_path)
                 if b"\x00" in content:
                     raise ValueError("document contains binary data")
                 if any(
                     other.service_config is not None
                     and other.service_config.exists()
-                    and (binding.root / relative).samefile(other.service_config)
-                    for other in self.bindings.values()
+                    and (binding.root / source_path).samefile(other.service_config)
+                    for group in self.bindings.values()
+                    for other in group
                 ):
                     raise ValueError("service configuration is exported as a document")
+                relative = f"sources/{binding.source_id}/{source_path}"
                 documents[relative] = content.decode("utf-8")
                 total += len(content)
                 if total > MAX_PACKAGE_BYTES:
@@ -557,13 +725,16 @@ class OrganizationSkillResolver:
                 exported.append(
                     {
                         "path": relative,
+                        "source_path": source_path,
+                        "source_id": binding.source_id,
+                        "source_revision": binding.source_revision or None,
                         "phases": phases,
                         "entrypoint": entry.get("entrypoint", False),
                         "size_bytes": len(content),
                         "digest": hashlib.sha256(content).hexdigest(),
                     }
                 )
-            skill = documents.get("SKILL.md", "")
+            skill = documents.get(f"sources/{binding.source_id}/SKILL.md", "")
             if not skill.startswith("---\n"):
                 raise ValueError("SKILL.md frontmatter missing")
             header = re.match(r"\A---\n(.*?)\n---(?:\n|$)", skill, re.DOTALL)
@@ -599,7 +770,7 @@ class OrganizationSkillResolver:
                 "Configured organization skill documents are missing or invalid",
             ) from None
 
-    def _capture(self, binding: OrganizationBinding) -> dict[str, Any]:
+    def _capture_source(self, binding: OrganizationBinding) -> dict[str, Any]:
         try:
             documents, exported, name, manifest_bytes = {}, [], None, None
             if binding.root:
@@ -630,9 +801,12 @@ class OrganizationSkillResolver:
                 and self._source_document(binding.root, "skill.json") != manifest_bytes
             ):
                 raise ValueError("manifest changed during capture")
-            for relative, content in documents.items():
+            for entry in exported:
                 assert binding.root is not None
-                if self._source_document(binding.root, relative) != content.encode():
+                if (
+                    self._source_document(binding.root, entry["source_path"])
+                    != documents[entry["path"]].encode()
+                ):
                     raise ValueError("document changed during capture")
             if (
                 binding.service_config
@@ -646,6 +820,7 @@ class OrganizationSkillResolver:
             return {
                 "schema_version": 1,
                 "subject": binding.subject,
+                "source_id": binding.source_id,
                 "binding": binding.identity,
                 "source_revision": binding.source_revision or None,
                 "revision": revision,
@@ -654,6 +829,7 @@ class OrganizationSkillResolver:
                 "documents": exported,
                 "content": documents,
                 "runtime_config": runtime,
+                "legacy_config": binding.legacy_config,
             }
         except (
             OSError,
@@ -670,9 +846,108 @@ class OrganizationSkillResolver:
                 "Configured organization skill is missing, invalid or changed",
             ) from None
 
+    def _capture(self, bindings: tuple[OrganizationBinding, ...]) -> dict[str, Any]:
+        """Capture every configured source for one subject without choosing a winner."""
+        bindings = tuple(sorted(bindings, key=lambda binding: binding.source_id))
+        captured = [self._capture_source(binding) for binding in bindings]
+        if not captured:
+            raise SkillGatewayError("subject_unconfigured", "Subject is unconfigured")
+
+        documents = [entry for item in captured for entry in item["documents"]]
+        content = {
+            path: text for item in captured for path, text in item["content"].items()
+        }
+        if (
+            sum(len(value.encode("utf-8")) for value in content.values())
+            > MAX_PACKAGE_BYTES
+        ):
+            raise SkillGatewayError(
+                "source_too_large", "Combined subject documents exceed the limit"
+            )
+        by_logical_path: dict[str, list[dict[str, Any]]] = {}
+        by_digest: dict[str, list[dict[str, Any]]] = {}
+        for entry in documents:
+            public = {
+                "source_id": entry["source_id"],
+                "path": entry["source_path"],
+                "digest": entry["digest"],
+            }
+            by_logical_path.setdefault(entry["source_path"], []).append(public)
+            by_digest.setdefault(entry["digest"], []).append(public)
+        overlaps = [
+            {
+                "path": path,
+                "same_content": len({entry["digest"] for entry in entries}) == 1,
+                "documents": entries,
+            }
+            for path, entries in sorted(by_logical_path.items())
+            if len({entry["source_id"] for entry in entries}) > 1
+        ]
+        duplicates = [
+            {"digest": digest, "documents": entries}
+            for digest, entries in sorted(by_digest.items())
+            if len({entry["source_id"] for entry in entries}) > 1
+        ]
+        runtime_sources = [
+            {
+                "source_id": item["source_id"],
+                "value": item["runtime_config"],
+            }
+            for item in captured
+            if item["service_configured"]
+        ]
+        runtime_values = [item["value"] for item in runtime_sources]
+        legacy_sources = [
+            item["source_id"] for item in captured if item["legacy_config"]
+        ]
+        has_runtime_conflict = len(runtime_values) > 1 and any(
+            value != runtime_values[0] for value in runtime_values[1:]
+        )
+        has_legacy_conflict = bool(legacy_sources and runtime_sources)
+        source_records = [
+            {
+                "id": item["source_id"],
+                "revision": item["source_revision"],
+                "package_revision": item["revision"],
+                "service_configured": item["service_configured"],
+                "legacy_config": item["legacy_config"],
+            }
+            for item in captured
+        ]
+        revision = _digest(
+            [
+                [item["source_id"], item["binding"], item["revision"]]
+                for item in captured
+            ]
+        )
+        names = sorted({item["name"] for item in captured if item["name"]})
+        runtime_config = (
+            runtime_values[0]
+            if runtime_values and not has_runtime_conflict and not has_legacy_conflict
+            else {}
+        )
+        return {
+            "schema_version": 1,
+            "subject": captured[0]["subject"],
+            "binding": _digest([item["binding"] for item in captured]),
+            "revision": revision,
+            "sources": source_records,
+            "name": names[0] if len(names) == 1 else None,
+            "service_configured": bool(runtime_sources),
+            "runtime_config": runtime_config,
+            "runtime_config_sources": [item["source_id"] for item in runtime_sources],
+            "runtime_config_conflict": has_runtime_conflict or has_legacy_conflict,
+            "legacy_config": bool(legacy_sources) and not runtime_sources,
+            "documents": documents,
+            "content": content,
+            "overlaps": overlaps,
+            "duplicates": duplicates,
+            "required": any(binding.required for binding in bindings),
+        }
+
     def _snapshot(self, subject: str) -> dict[str, Any] | None:
-        binding = self.bindings.get(_subject(subject))
-        if binding is None:
+        bindings = self.bindings.get(_subject(subject))
+        if bindings is None:
             if self.has_subject(subject):
                 raise SkillGatewayError(
                     "organization_subject_removed",
@@ -680,10 +955,11 @@ class OrganizationSkillResolver:
                 )
             return None
         if not self.ticket_id:
-            return self._capture(binding)
+            return self._capture(bindings)
         if not self.attempt_id:
             raise SkillGatewayError("missing_attempt", "Trusted attempt is required")
         key = _digest([self.ticket_id, self.attempt_id, subject])
+        binding_identity = _digest([binding.identity for binding in bindings])
         lock = None
         try:
             filesystem = AuditedFilesystem(
@@ -707,14 +983,14 @@ class OrganizationSkillResolver:
                     if hashlib.sha256(snapshot_bytes).hexdigest() != pin["digest"]:
                         raise ValueError("snapshot digest mismatch")
                     snapshot = json.loads(snapshot_bytes)
-                    if snapshot["binding"] != binding.identity:
+                    if snapshot["binding"] != binding_identity:
                         raise ValueError("administrator source binding changed")
                     return snapshot
                 except (OSError, ValueError, KeyError, TypeError, RecursionError):
                     raise SkillGatewayError(
                         "invalid_snapshot", "Pinned skill snapshot is unavailable"
                     ) from None
-            snapshot = self._capture(binding)
+            snapshot = self._capture(bindings)
             content = json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()
             filesystem.write(f"{key}/private-snapshot.json", content)
             filesystem.write(
@@ -751,8 +1027,8 @@ class OrganizationSkillResolver:
         return "*" in entry["phases"] or self.phase in entry["phases"]
 
     def bootstrap(self, subject: str) -> dict[str, Any]:
-        binding = self.bindings.get(_subject(subject))
-        if binding is None:
+        bindings = self.bindings.get(_subject(subject))
+        if bindings is None:
             if self.has_subject(subject):
                 return {
                     "subject": subject,
@@ -774,7 +1050,7 @@ class OrganizationSkillResolver:
                 "subject": subject,
                 "source": "organization",
                 "status": "unavailable",
-                "required": binding.required,
+                "required": any(binding.required for binding in bindings),
                 "error": exc.code,
                 "message": str(exc),
             }
@@ -789,10 +1065,15 @@ class OrganizationSkillResolver:
             "source": "organization",
             "scope": "organization",
             "status": "available",
-            "required": binding.required,
+            "required": snapshot["required"],
             "revision": snapshot["revision"],
             "name": snapshot["name"],
             "service_configured": snapshot.get("service_configured", False),
+            "sources": snapshot["sources"],
+            "overlaps": snapshot["overlaps"],
+            "duplicates": snapshot["duplicates"],
+            "runtime_config_conflict": snapshot["runtime_config_conflict"],
+            "runtime_config_sources": snapshot["runtime_config_sources"],
             "documents_available": bool(documents),
             "phase": self.phase,
             "documents": documents,
@@ -801,19 +1082,25 @@ class OrganizationSkillResolver:
 
     def get_runtime_config(self, subject: str) -> dict[str, Any] | None:
         """Service API only; never register this method as a model resource."""
-        binding = self.bindings.get(_subject(subject))
-        if binding is None:
+        bindings = self.bindings.get(_subject(subject))
+        if bindings is None:
             if self.has_subject(subject):
                 raise SkillGatewayError(
                     "organization_subject_removed",
                     "Pinned organization subject was removed",
                 )
             return None
-        if binding.legacy_config:
-            self._snapshot(subject)
-            return None
         snapshot = self._snapshot(subject)
         assert snapshot is not None
+        if snapshot["runtime_config_conflict"]:
+            source_ids = ", ".join(snapshot["runtime_config_sources"])
+            raise SkillGatewayError(
+                "organization_config_conflict",
+                "Multiple organization runtime configurations conflict for this subject"
+                + (f" (sources: {source_ids})" if source_ids else ""),
+            )
+        if snapshot["legacy_config"]:
+            return None
         return copy.deepcopy(snapshot["runtime_config"])
 
     def _document(
@@ -860,6 +1147,10 @@ class OrganizationSkillResolver:
                 if pointer.path
                 else origin_path
             )
+            if not relative.startswith(f"sources/{origin_entry['source_id']}/"):
+                raise SkillGatewayError(
+                    "invalid_ref", "Relative document pointer crossed source boundary"
+                )
             ref = self._ref(snapshot, _relative(relative))
         revision, ref_subject, relative = parse_organization_ref(ref)
         if revision != snapshot["revision"] or ref_subject != subject:
@@ -924,6 +1215,22 @@ class OrganizationSkillResolver:
         return {
             "subject": subject,
             "source": "organization",
+            "source_id": next(
+                (
+                    entry["source_id"]
+                    for entry in snapshot["documents"]
+                    if entry["path"] == relative
+                ),
+                None,
+            ),
+            "path": next(
+                (
+                    entry["source_path"]
+                    for entry in snapshot["documents"]
+                    if entry["path"] == relative
+                ),
+                relative,
+            ),
             "ref": self._ref(snapshot, relative),
             "revision": snapshot["revision"],
             **self._page(snapshot["content"][relative], offset, max_bytes),
@@ -948,11 +1255,27 @@ class OrganizationSkillResolver:
         snapshot = self._snapshot(subject)
         if snapshot is None:
             raise SkillGatewayError("subject_unconfigured", "Subject is unconfigured")
+        source_filter = None
         if ref:
             snapshot, relative = self._document(subject, ref, from_ref)
             paths = [relative]
         else:
-            paths = [d["path"] for d in snapshot["documents"] if self._visible(d)]
+            if from_ref:
+                self._document(subject, from_ref, None)
+                _, _, origin_path = parse_organization_ref(from_ref)
+                origin_entry = next(
+                    (d for d in snapshot["documents"] if d["path"] == origin_path),
+                    None,
+                )
+                if origin_entry is None:
+                    raise SkillGatewayError("invalid_origin", "Unknown search origin")
+                source_filter = origin_entry["source_id"]
+            paths = [
+                d["path"]
+                for d in snapshot["documents"]
+                if self._visible(d)
+                and (source_filter is None or d["source_id"] == source_filter)
+            ]
         lines, positions = [], []
         for path in paths:
             source_lines = snapshot["content"][path].split("\n")
@@ -1030,7 +1353,22 @@ class OrganizationSkillResolver:
                 matches.append(
                     {
                         "ref": self._ref(snapshot, path),
-                        "path": path,
+                        "source_id": next(
+                            (
+                                item["source_id"]
+                                for item in snapshot["documents"]
+                                if item["path"] == path
+                            ),
+                            None,
+                        ),
+                        "path": next(
+                            (
+                                item["source_path"]
+                                for item in snapshot["documents"]
+                                if item["path"] == path
+                            ),
+                            path,
+                        ),
                         "line": number,
                         "snippet": text.decode("utf-8")[:512],
                     }

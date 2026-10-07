@@ -80,6 +80,16 @@ Adding a new harness means adding a skill provider — no agent code changes.
 | **[Forge](https://github.com/openshift-psap/forge)** | LLM inference performance (RHAIIS/vLLM, LLM-D); 53+ model presets, FP8/W8A8/W4A16 quantization | Kubernetes (GPU) |
 | **[Arcaflow Plugins](https://github.com/arcalot/arcaflow-plugin-catalog)** | stress-ng, fio, sysbench, uperf, iperf3, CoreMark-PRO, and more — containerized benchmarks from the Arcalot community | remotehosts (podman) |
 
+## Context Gateway
+
+Agents often need several kinds of context about the same subject: upstream
+software documentation, facts from the installed version, and local operating
+guidance. The subject-based context gateway gives agents a shared, bounded way to
+retrieve applicable material with its source and scope visible. This helps keep
+agents consistent, preserve the difference between software behavior and local
+preferences, and identify conflicting guidance instead of silently choosing a
+copy. See the [context gateway overview and migration plan](docs/context-gateway.md).
+
 ## Resource Providers
 
 - **Null** — user provides hosts and SSH keys directly in the ticket
@@ -351,6 +361,7 @@ For end-to-end testing with real infrastructure, see
 - [Workspace and charts](docs/workspaces-and-charts.md) — current spill/chart contracts
 - [Fleet investigation](docs/fleet-investigation.md) — current fleet workflow
 - [Adding a harness](docs/adding-a-harness.md) — extension guide
+- [Context gateway](docs/context-gateway.md) — why it exists, current scope, and migration plan
 - [Design philosophy](docs/design-philosophy.md), [dataflow](docs/dataflow.md)
 - [Webhook ingestion](docs/webhook-ingestion.md), [Jira integration](docs/jira-polling-integration.md)
 - [TUI concept](docs/tui-concept.md) and [TUI implementation plan](docs/tui-implementation-plan.md) — draft/planning

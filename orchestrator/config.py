@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 
@@ -482,22 +483,90 @@ def _redacted_skill_gateway(raw_config: dict) -> dict:
             if key in binding:
                 value = binding[key]
                 safe_binding[key] = value if isinstance(value, bool) else None
+        if isinstance(binding.get("source_id"), str):
+            safe_binding["source_id"] = binding["source_id"]
         bindings[subject] = safe_binding
 
-    repository_configured = organization.get("source") is not None
     required = organization.get("required", True)
+    try:
+        from providers.skills.gateway import organization_source_descriptors
+
+        descriptors = organization_source_descriptors(organization)
+    except (TypeError, ValueError):
+        descriptors = []
+        source_config_invalid = "source" in organization or "sources" in organization
+    else:
+        source_config_invalid = False
     safe_organization: dict = {
         "required": required if isinstance(required, bool) else None,
         "subjects": bindings,
     }
-    if repository_configured:
-        raw_source = organization["source"]
-        safe_organization["source"] = _redacted_skill_source(raw_source)
-        safe_organization["discovery"] = _redacted_skill_discovery(raw_source, required)
+    if descriptors:
+        source_reports = []
+        discovered_subjects: dict[str, dict[str, Any]] = {}
+        for descriptor in descriptors:
+            source_id = descriptor["id"]
+            raw_source = descriptor["source"]
+            discovery = _redacted_skill_discovery(
+                raw_source, required, source_id=source_id
+            )
+            source_reports.append(
+                {
+                    "id": source_id,
+                    "source": _redacted_skill_source(raw_source),
+                    "discovery": discovery,
+                }
+            )
+            for subject, detail in discovery.get("subjects", {}).items():
+                item = discovered_subjects.setdefault(
+                    subject,
+                    {
+                        "sources": [],
+                        "document_package_discovered": False,
+                        "service_config_discovered": False,
+                    },
+                )
+                item["sources"].append(source_id)
+                for key in ("document_package_discovered", "service_config_discovered"):
+                    item[key] = item[key] or detail.get(key, False)
+        safe_organization["sources"] = source_reports
+        safe_organization["discovery"] = {
+            "status": "discovered"
+            if all(
+                item["discovery"].get("status") == "discovered"
+                for item in source_reports
+            )
+            else "partially_checked"
+            if any(
+                item["discovery"].get("status") == "discovered"
+                for item in source_reports
+            )
+            else "not_checked"
+            if all(
+                item["discovery"].get("status") == "not_checked"
+                for item in source_reports
+            )
+            else "error",
+            "source_count": len(source_reports),
+            "subject_count": len(discovered_subjects),
+            "subjects": discovered_subjects,
+        }
+        # Preserve the old short form in diagnostics for existing one-source
+        # configurations while exposing every source for multi-repo setups.
+        if len(source_reports) == 1 and "source" in organization:
+            safe_organization["source"] = source_reports[0]["source"]
+    elif source_config_invalid:
+        safe_organization["discovery"] = {
+            "status": "error",
+            "error": {
+                "code": "invalid_config",
+                "message": "Invalid organization source list",
+            },
+        }
     else:
         safe_organization["discovery"] = {"status": "not_configured"}
     return {
-        "configured": repository_configured or bool(bindings),
+        "configured": bool(descriptors) or bool(bindings) or source_config_invalid,
         "organization": safe_organization,
     }
 
@@ -534,7 +603,9 @@ def _redacted_skill_source(source: object) -> dict:
     return {"kind": "(unsupported)"}
 
 
-def _redacted_skill_discovery(source: dict, required: object) -> dict:
+def _redacted_skill_discovery(
+    source: dict, required: object, *, source_id: str = "default"
+) -> dict:
     """Inspect subject descriptors only; report failed catalogs explicitly."""
     from providers.skills.gateway import (
         SkillGatewayError,
@@ -573,7 +644,9 @@ def _redacted_skill_discovery(source: dict, required: object) -> dict:
     if not isinstance(required, bool):
         return failure
     try:
-        discovered = discover_organization_bindings(source["path"], required=required)
+        discovered = discover_organization_bindings(
+            source["path"], required=required, source_id=source_id
+        )
     except SkillGatewayError as exc:
         failure["error"] = {
             "code": exc.code,
