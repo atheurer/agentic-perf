@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import shlex
 import sys
@@ -42,6 +43,12 @@ from agents.server_utils import (
     build_skill_provider,
     build_ssh_from_ticket,
     read_skill_documents,
+)
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
 )
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
@@ -76,7 +83,9 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider(resolve_source=False)
+    _skill_provider = build_skill_provider(
+        resolve_source=False, skill_phase="provisioning"
+    )
     _secrets_provider = build_secrets_provider()
     _initialized = True
 
@@ -3076,10 +3085,51 @@ async def ensure_harness_installed(
     return json.dumps(_summarize(results))
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    return await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="provisioning-agent",
+        phase="provisioning",
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
+
+
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
-    """Fetch private configuration for a benchmark harness. Returns organization-specific data like install method, repo paths, registry URLs, and constraints (supported OS, prerequisites). Use key='constraints' to check OS and platform requirements before attempting installation."""
+    """Get approved harness installation or platform settings. For Crucible, key must be constraints, provisioning, or platform_contract; commands, secret bindings, and installation contracts remain service-only. Read operational guidance through get_skill_context."""
     await _ensure_init()
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            result = await skill_config_view(
+                _skill_provider, harness_name, key, "provisioning"
+            )
+        except Exception:
+            return json.dumps(
+                {"key": key, "value": None, "reason": "configuration_view_unavailable"}
+            )
+        return json.dumps({"key": key, "value": result})
     result = await _skill_provider.get_private_config(harness_name, key)
     if result is None:
         return json.dumps(

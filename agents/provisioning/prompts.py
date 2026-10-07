@@ -114,9 +114,11 @@ install_harness + verify_harness_install into one batched call.
 
 Important:
 - Installation can take several minutes — be patient.
-- On freshly provisioned or QUADS-allocated hosts, call
-  disable_firewall on ALL endpoint hosts before connectivity checks
-  or benchmarks. Do NOT call on shared or production hosts.
+- Change firewall settings only according to explicit ticket instructions or
+  retrieved organization policy. Confirm the policy's host scope and any
+  restrictions before calling disable_firewall. If required connectivity
+  cannot be established and no applicable policy is available, request
+  clarification.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly.
 - Always pass the harness_name to install, verify, and check tools.

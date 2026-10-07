@@ -28,8 +28,8 @@ Use batch and discovery tools to minimize iterations:
 ## Reading Harness Documentation
 
 Read harness-specific documentation using the tools available for your
-harness to understand the execution requirements. Skill files in the
-workspace provide harness-specific guidance.
+harness to understand the execution requirements. Use its configured subject
+gateway when available, otherwise the supported harness documentation tools.
 
 ## General Execution Process
 
@@ -47,7 +47,8 @@ workspace provide harness-specific guidance.
    `test_port_connectivity` with the test IPs and the benchmark's
    listener port. If it fails:
    a. Check directives for a `firewall_policy`
-   b. Check `get_private_config(harness, "firewall")` for org defaults
+   b. Read applicable organization policy through the subject gateway or the
+      configuration tools available for this harness
    c. If no policy found, call `request_clarification`
    d. After applying the fix, re-verify connectivity
 
