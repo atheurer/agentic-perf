@@ -94,6 +94,7 @@ def build_skill_provider(
     catalog_only: bool = False,
     arcaflow_mcp_client: Any | None = None,
     skill_phase: str = "",
+    organization_resolver: Any | None = None,
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -138,7 +139,7 @@ def build_skill_provider(
             build_crucible_context_gateway(catalog_only=True)
         )
 
-    private = PrivateSkillProvider()
+    private = PrivateSkillProvider(resolver=organization_resolver)
     ticket_id = os.environ.get("TICKET_ID", "")
     if ticket_id:
         phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
@@ -152,6 +153,39 @@ def build_skill_provider(
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
 
     return MultiHarnessSkillProvider(harnesses, private, default_harness="crucible")
+
+
+async def build_skill_provider_async(
+    *, secrets_provider: Any | None = None, **kwargs: Any
+):
+    """Build skills after resolving authenticated organization Git sources."""
+    from paths import CONFIG_PATH
+    from providers.skills.gateway import OrganizationSkillResolver
+
+    raw_config = None
+    try:
+        if CONFIG_PATH.exists():
+            raw_config = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    gateway = raw_config.get("skill_gateway") if isinstance(raw_config, dict) else None
+    organization = gateway.get("organization") if isinstance(gateway, dict) else None
+    source = organization.get("source") if isinstance(organization, dict) else None
+    auth = source.get("auth", {}) if isinstance(source, dict) else {}
+    auth_kind = auth.get("kind", "default") if isinstance(auth, dict) else None
+    if (
+        secrets_provider is None
+        and isinstance(source, dict)
+        and source.get("kind") == "git"
+        and isinstance(auth_kind, str)
+        and auth_kind in {"https-token", "ssh-key-secret"}
+    ):
+        secrets_provider = build_secrets_provider()
+    resolver = await OrganizationSkillResolver.from_instance_config_async(
+        raw_config=raw_config,
+        secrets_provider=secrets_provider,
+    )
+    return build_skill_provider(organization_resolver=resolver, **kwargs)
 
 
 def build_crucible_context_gateway(
