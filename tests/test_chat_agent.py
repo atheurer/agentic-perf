@@ -240,7 +240,9 @@ class TestToolExecution:
                 raise RuntimeError("catalog unavailable")
 
         monkeypatch.setattr(
-            tools, "_get_benchmark_catalog_provider", lambda: Provider()
+            tools,
+            "_get_benchmark_catalog_provider",
+            AsyncMock(return_value=Provider()),
         )
         client = AsyncMock()
         result = json.loads(

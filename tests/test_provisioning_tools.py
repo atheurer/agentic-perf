@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import json
+import subprocess
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from agents import server_utils
+from agents.provisioning import server as provisioning_server
 from agents.provisioning.server import (
     _parse_os_release,
     _summarize,
     _verify_harness_install_one,
     validate_platform_contract,
 )
+from providers.secrets import git as git_secrets_module
+from providers.secrets.local import LocalSecretsProvider
+from providers.skills.gateway import OrganizationSkillResolver
+from providers.skills.private import PrivateSkillProvider
 from tests.conftest import (
     MockSecretsProvider,
     MockSkillProvider,
@@ -272,6 +282,274 @@ async def test_contract_validation_fails_missing_secret(
         secret_path = config["secrets"][entry["secret_key"]]
         local = await mock_secrets_missing.get_secret_file(secret_path)
         assert local is None, f"Secret {entry['secret_key']} should be missing"
+
+
+def _organization_crucible_provider(
+    repository: Path,
+    secret_ref: str = "crucible/client-server-token.json",
+) -> PrivateSkillProvider:
+    package = repository / "skills" / "harness" / "crucible"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text(
+        "---\nname: crucible\ndescription: Test package\n"
+        "metadata:\n  subject: harness/crucible\n---\n"
+        "\nTest-only organization instructions.\n"
+    )
+    (package / "skill.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "subject": "harness/crucible",
+                "documents": [{"path": "SKILL.md", "entrypoint": True}],
+            }
+        )
+    )
+    service_config = repository / "service-config" / "harness" / "crucible.json"
+    service_config.parent.mkdir(parents=True)
+    service_config.write_text(
+        json.dumps(
+            {
+                "secrets": {"client_server_auth": secret_ref},
+                "install_contract": {
+                    "secret_files": [
+                        {
+                            "secret_key": "client_server_auth",
+                            "remote_path": "/root/client-server-token.json",
+                            "required": True,
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    resolver = OrganizationSkillResolver.from_instance_config(
+        {
+            "skill_gateway": {
+                "organization": {
+                    "sources": [
+                        {"id": "test-org", "kind": "path", "path": str(repository)}
+                    ]
+                }
+            }
+        }
+    )
+    return PrivateSkillProvider(resolver=resolver)
+
+
+def _create_git_secret_repo(root: Path) -> Path:
+    worktree = root / "secret-worktree"
+    worktree.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test Fixture"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    secret = worktree / "secrets" / "client-server-token.json"
+    secret.parent.mkdir()
+    secret.write_text('{"fixture-secret": "never logged"}\n')
+    subprocess.run(
+        ["git", "add", "secrets/client-server-token.json"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "Add test secret fixture"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    bare = root / "secret-source.git"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--bare", str(worktree), str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    return bare
+
+
+def _use_local_git_repo_for_test(monkeypatch, local_repo: Path) -> None:
+    from providers.skills.git_source import parse_git_source
+
+    parse_source = git_secrets_module.parse_git_source
+    git_argv = git_secrets_module._git_argv
+
+    def parse_local_test_source(source):
+        parsed = parse_source(source)
+        return replace(parsed, url=local_repo.as_uri())
+
+    def allow_file_protocol(*args):
+        argv = git_argv(*args)
+        return [argv[0], "-c", "protocol.file.allow=always", *argv[1:]]
+
+    monkeypatch.setattr(git_secrets_module, "parse_git_source", parse_local_test_source)
+    monkeypatch.setattr(git_secrets_module, "_git_argv", allow_file_protocol)
+    assert parse_git_source({"kind": "git", "url": "https://fixture.invalid/a.git"})
+
+
+def _build_git_secrets_provider(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"secrets": {}}))
+    import paths
+
+    monkeypatch.setattr(paths, "CONFIG_PATH", config_path)
+    monkeypatch.setenv("SECRETS_BACKEND", "local")
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "unused-secrets"))
+    monkeypatch.delenv("TICKET_ID", raising=False)
+    return server_utils.build_secrets_provider()
+
+
+@pytest.mark.asyncio
+async def test_org_service_config_secret_is_deployed_from_local_store(
+    tmp_path: Path, monkeypatch
+):
+    """Exercise org config, logical secret lookup, and contract SCP together."""
+    provider = _organization_crucible_provider(tmp_path / "org-skills")
+    private_config = await provider.get_all_private_config("crucible")
+    secrets_root = tmp_path / "secrets"
+    secret = secrets_root / "crucible" / "client-server-token.json"
+    secret.parent.mkdir(parents=True)
+    secret.write_text('{"test-only": true}\n')
+    ssh = MockSSHExecutor()
+    monkeypatch.setattr(provisioning_server, "_ssh", ssh)
+    monkeypatch.setattr(
+        provisioning_server,
+        "_secrets_provider",
+        LocalSecretsProvider(secrets_root),
+    )
+
+    result = await provisioning_server._validate_and_deploy_contract(
+        "controller", private_config
+    )
+
+    assert result["status"] == "ok", result
+    assert result["deployed_files"] == [
+        "client_server_auth -> /root/client-server-token.json"
+    ]
+    assert [call for call in ssh.calls if call["method"] == "copy_to"] == [
+        {
+            "method": "copy_to",
+            "host": "controller",
+            "local_path": str(secret),
+            "remote_path": "/root/client-server-token.json",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_org_service_config_missing_local_secret_fails_before_scp(
+    tmp_path: Path, monkeypatch
+):
+    """A dangling logical reference fails before any remote deployment."""
+    provider = _organization_crucible_provider(tmp_path / "org-skills")
+    private_config = await provider.get_all_private_config("crucible")
+    ssh = MockSSHExecutor()
+    monkeypatch.setattr(provisioning_server, "_ssh", ssh)
+    monkeypatch.setattr(
+        provisioning_server,
+        "_secrets_provider",
+        LocalSecretsProvider(tmp_path / "empty-secrets"),
+    )
+
+    result = await provisioning_server._validate_and_deploy_contract(
+        "controller", private_config
+    )
+
+    assert result["status"] == "failed"
+    assert "not found in secrets store" in result["message"]
+    assert not any(call["method"] == "copy_to" for call in ssh.calls)
+
+
+@pytest.mark.asyncio
+async def test_org_git_secret_pointer_is_deployed_and_cleaned_up(
+    tmp_path: Path, monkeypatch
+):
+    """Exercise the Git pointer from org service config through mock SCP."""
+    local_repo = _create_git_secret_repo(tmp_path)
+    _use_local_git_repo_for_test(monkeypatch, local_repo)
+    temp_root = tmp_path / "provider-temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(
+        git_secrets_module.tempfile, "gettempdir", lambda: str(temp_root)
+    )
+
+    provider = _organization_crucible_provider(
+        tmp_path / "org-skills",
+        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/client-server-token.json",
+    )
+    private_config = await provider.get_all_private_config("crucible")
+    secrets_provider = _build_git_secrets_provider(tmp_path, monkeypatch)
+
+    class ReadingSSHExecutor(MockSSHExecutor):
+        copied_content = b""
+
+        async def copy_to(self, host, local_path, remote_path, **kwargs):
+            self.copied_content = Path(local_path).read_bytes()
+            return await super().copy_to(host, local_path, remote_path, **kwargs)
+
+    ssh = ReadingSSHExecutor()
+    monkeypatch.setattr(provisioning_server, "_ssh", ssh)
+    monkeypatch.setattr(provisioning_server, "_secrets_provider", secrets_provider)
+
+    result = await provisioning_server._validate_and_deploy_contract(
+        "controller", private_config
+    )
+
+    assert result["status"] == "ok", result
+    assert result["deployed_files"] == [
+        "client_server_auth -> /root/client-server-token.json"
+    ]
+    copy_calls = [call for call in ssh.calls if call["method"] == "copy_to"]
+    assert len(copy_calls) == 1
+    assert copy_calls[0]["host"] == "controller"
+    assert copy_calls[0]["remote_path"] == "/root/client-server-token.json"
+    assert b'"fixture-secret"' in ssh.copied_content
+    assert not Path(copy_calls[0]["local_path"]).exists()
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_missing_org_git_secret_pointer_fails_before_scp(
+    tmp_path: Path, monkeypatch
+):
+    local_repo = _create_git_secret_repo(tmp_path)
+    _use_local_git_repo_for_test(monkeypatch, local_repo)
+    temp_root = tmp_path / "provider-temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(
+        git_secrets_module.tempfile, "gettempdir", lambda: str(temp_root)
+    )
+    provider = _organization_crucible_provider(
+        tmp_path / "org-skills",
+        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/missing-token.json",
+    )
+    private_config = await provider.get_all_private_config("crucible")
+    secrets_provider = _build_git_secrets_provider(tmp_path, monkeypatch)
+    ssh = MockSSHExecutor()
+    monkeypatch.setattr(provisioning_server, "_ssh", ssh)
+    monkeypatch.setattr(provisioning_server, "_secrets_provider", secrets_provider)
+
+    result = await provisioning_server._validate_and_deploy_contract(
+        "controller", private_config
+    )
+
+    assert result["status"] == "failed"
+    assert "not found in secrets store" in result["message"]
+    assert not any(call["method"] == "copy_to" for call in ssh.calls)
+    assert list(temp_root.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -685,6 +963,7 @@ async def test_all_tools_use_hosts_or_targets():
             "nm_verify_interface",
             "disable_firewall",
             "read_skills",
+            "get_skill_context",
             "tune_hosts",
             "open_firewall_port",
         )

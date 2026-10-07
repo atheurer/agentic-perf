@@ -1379,7 +1379,7 @@ async def get_skill_context(
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     await _ensure_init()
-    return await skill_context_gateway(
+    response = await skill_context_gateway(
         _skill_provider,
         ticket_id=os.environ.get("TICKET_ID", ""),
         agent_name="benchmark-agent",
@@ -1395,6 +1395,9 @@ async def get_skill_context(
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
     )
+    if subject == "harness/crucible":
+        return _with_crucible_runfile_contract(response)
+    return response
 
 
 @mcp.tool()
@@ -1429,8 +1432,6 @@ async def list_harness_docs(harness: str) -> str:
 async def read_harness_doc(harness: str, doc_path: str) -> str:
     """Read a documentation file from a benchmark harness repository (e.g. harness='crucible', doc_path='docs/how-run-files-work.md'). Use this to learn about run-file format, endpoint structure, benchmark parameters, or any other harness-specific details. Call list_harness_docs first to see available files."""
     await _ensure_init()
-    if not _repo_cache:
-        return json.dumps({"found": False, "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
     if harness == "crucible":
@@ -1440,6 +1441,8 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
             }
         )
+    if not _repo_cache:
+        return json.dumps({"found": False, "message": "No repo cache configured"})
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps(

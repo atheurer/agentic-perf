@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -1054,8 +1055,13 @@ async def run_agent_task(
     try:
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
-        ticket_skill_provider = await dispatcher.get_skill_provider_for_ticket(
+        skill_provider_result = dispatcher.get_skill_provider_for_ticket(
             ticket_id, agent_type
+        )
+        ticket_skill_provider = (
+            await skill_provider_result
+            if inspect.isawaitable(skill_provider_result)
+            else skill_provider_result
         )
         api_key = (
             await _resolve_api_key_secret(config, agent_type, ticket_secrets)
@@ -2660,6 +2666,10 @@ async def _poll_loop_after_lease(
     else:
         secrets = local_secrets
 
+    from providers.secrets.git import GitSecretsProvider
+
+    secrets = GitSecretsProvider(fallback=secrets)
+
     async def make_skill_provider(ticket_id: str = "", phase: str = ""):
         provider = await build_skill_provider_async(
             crucible_home=config.crucible_home,
@@ -2681,16 +2691,16 @@ async def _poll_loop_after_lease(
     organization_config = (
         gateway_config.get("organization") if isinstance(gateway_config, dict) else None
     )
-    organization_source = (
-        organization_config.get("source", {})
-        if isinstance(organization_config, dict)
-        else {}
-    )
+    from providers.skills.gateway import organization_source_descriptors
+
+    try:
+        organization_sources = organization_source_descriptors(
+            organization_config if isinstance(organization_config, dict) else {}
+        )
+    except (TypeError, ValueError):
+        organization_sources = []
     skill_provider_factory = None
-    if (
-        isinstance(organization_source, dict)
-        and organization_source.get("kind") == "git"
-    ):
+    if any(item["source"].get("kind") == "git" for item in organization_sources):
 
         async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
             if phase not in {

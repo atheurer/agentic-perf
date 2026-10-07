@@ -30,7 +30,7 @@ without a restart:
 - `agent_iterations.*` and `global_max_iterations`
 - `agent_task_timeout`
 
-Other service fields (poll_interval, legacy skills/repo-cache, secrets/vault,
+Other service fields (poll_interval, legacy skills/repo-cache, secrets providers,
 telemetry, budget, max_concurrent_agents, introspection) require a restart.
 Organization gateway workers read their binding when constructing a provider;
 source content updates affect new tickets, while existing ticket pins persist.
@@ -59,21 +59,31 @@ tokens, organization settings, and private document contents are never included.
 
 ## Organization skill gateway
 
-An administrator configures one organization source. Subjects are discovered by
-layout, so adding a package or service configuration does not require another
-instance configuration entry. The first integrated harness subject is
-`harness/crucible`. Use a Git URL for a shared organization repository; local
+An administrator can configure one organization source or a named list of
+sources maintained by different teams. Subjects are discovered by layout across
+all repositories, so adding a package or service configuration does not require
+a per-subject location entry. The first integrated harness subject is
+`harness/crucible`. Use Git URLs for shared organization repositories; local
 paths remain supported for development.
 
 ```json
 {
   "skill_gateway": {
     "organization": {
-      "source": {
-        "kind": "git",
-        "url": "ssh://git@git.example.com/performance/organization-skills.git",
-        "ref": "main"
-      }
+      "sources": [
+        {
+          "id": "crucible",
+          "kind": "git",
+          "url": "ssh://git@git.example.com/performance/crucible-skills.git",
+          "ref": "main"
+        },
+        {
+          "id": "zathras",
+          "kind": "git",
+          "url": "ssh://git@git.example.com/performance/zathras-skills.git",
+          "ref": "main"
+        }
+      ]
     }
   }
 }
@@ -91,9 +101,9 @@ and standard `user@host:path` SSH clone URLs are accepted. HTTPS URL credentials
 query strings, and fragments are rejected. A private-key secret must be usable
 non-interactively; passphrase-protected keys can use the existing SSH agent.
 
-Git sources refresh the configured branch during provider initialization and
-read from an immutable commit checkout. Existing ticket snapshots keep their
-revision. `config show` reports the configured host, ref, and auth method, but
+Each named source refreshes its configured branch during provider initialization
+and reads from an immutable commit checkout. Existing ticket snapshots keep
+their source revisions. `config show` reports each configured host, ref, and auth method, but
 does not connect or expose the full URL or secret reference; discovery is marked
 `not_checked` until a worker initializes the source. Git content is cached under
 service storage, outside ticket workspaces, with restricted directory
@@ -123,13 +133,13 @@ schema; this release supplies one for `harness/crucible`. Unconfigured subjects
 retain the existing legacy behavior.
 
 The optional `organization.subjects` map supports explicit exceptions through
-`source`, `service_config`, `required`, and `legacy_config`. Omitted fields
-inherit the discovered binding. For example, `{"required": false}` changes
-only that subject's policy; the repository's `organization.required` defaults
-to `true`. Explicit paths override the corresponding discovered paths. An
-explicit `source: null` or `service_config: null` removes that counterpart;
-at least one must remain. The repository-level `organization.source` cannot
-be null.
+`source`, `service_config`, `source_id`, `required`, and `legacy_config`. Omitted
+fields inherit the discovered binding. For example, `{"required": false}`
+changes only that subject's policy; the repository's `organization.required`
+defaults to `true`. Explicit paths override the corresponding discovered paths.
+When multiple sources contain a subject, a path or runtime-config override must
+name the affected `source_id`. An explicit `source: null` or
+`service_config: null` removes that counterpart; at least one must remain.
 
 For a temporary documents-only migration, `legacy_config: true` removes the
 discovered service configuration and selects legacy settings. Supplying both
@@ -145,6 +155,24 @@ directory on first use for the ticket lifetime. New tickets see source content
 updates; existing tickets keep their revision. Adding a document/configuration
 counterpart under the same source does not change an existing pin. Changing an
 explicit binding path, Git URL, or ref causes an error for an existing pin.
+Every configured repository must be fetchable before the service can discover
+its subjects. `required: false` applies after discovery; it does not make an
+unavailable repository optional, so a failed Git fetch or authentication attempt
+fails provider initialization even when a subject override is optional.
+
+### Multiple-source overlap and HITL
+
+The gateway preserves all applicable documents from named sources and identifies
+exact duplicates by content digest. If two sources publish the same document
+path with different content, bootstrap returns both source ids, paths, and
+digests as a potential conflict. It does not pick a winner by list order or
+claim to detect every semantic conflict. Ticket guidance can help the agent
+decide which material applies; verified software facts and mandatory org policy
+remain authoritative for their scope. When a material conflict remains
+unresolved, the agent asks for human guidance through HITL and names the sources
+and documents in question. Different service configurations for the same
+subject are a hard configuration conflict: they are not merged or exposed to the
+model, and runtime consumers stop until an administrator selects one.
 Removing a previously pinned subject's binding reports unavailable instead of
 falling back to legacy settings. No refresh command is implemented.
 
@@ -1204,11 +1232,12 @@ telemetry-export extra for the OTLP gRPC exporter.
 
 ---
 
-### `secrets` — Vault-Backed Secrets
+### `secrets` — Secret Sources
 
-Connect the secrets cascade to a Bitwarden Secrets Manager project.
-Vault layers are added behind local file layers — a file on disk
-always overrides the vault within the same tier.
+Configure an optional Bitwarden Secrets Manager project. Local files remain
+the default source. Service-only mappings can point directly to Git-backed
+files; those references carry their own repository location and need no
+additional instance-level source configuration.
 
 ```json
 {
@@ -1226,20 +1255,28 @@ always overrides the vault within the same tier.
 }
 ```
 
+In service-only configuration, refer to a repository file with a direct URI,
+such as `git-secret+ssh://git@git.example.com/team/credentials.git?ref=main&path=registry/auth.json`.
+Each URI identifies its Git repository, branch, and file path. Optional
+`auth_kind` and `auth_ref` query parameters select an HTTPS token or SSH private
+key through the local or Bitwarden secret provider. No separate Git repository
+location needs to be added to this configuration.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `organization_id` | string | yes | Bitwarden organization UUID |
-| `shared_project_id` | string | yes | SM project for deployment-shared secrets |
-| `group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
-| `server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
-| `cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
+| `bitwarden.organization_id` | string | yes | Bitwarden organization UUID |
+| `bitwarden.shared_project_id` | string | yes | SM project for deployment-shared secrets |
+| `bitwarden.group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
+| `bitwarden.server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
+| `bitwarden.cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
 
-Requires `pip install agentic-perf[bitwarden]` and a machine account
+Bitwarden requires `pip install agentic-perf[bitwarden]` and a machine account
 access token (env `AGENTIC_PERF_BWS_TOKEN` or file
 `~/.agentic-perf/secrets/bitwarden/access-token`).
 
-When this section is absent, vault layers are never constructed.
-See [Secrets Management](secrets.md) for full details.
+When `bitwarden` is absent, vault layers are never constructed. Git-backed
+service references use the local or Bitwarden provider for optional bootstrap
+credentials. See [Secrets Management](secrets.md) for full details.
 
 ---
 

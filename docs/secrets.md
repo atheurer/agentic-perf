@@ -61,6 +61,36 @@ that needs them. When a consumer requires a file path (e.g., for
 SCP), the `secret_file()` context manager materializes an ephemeral
 file (mode 0600 in a 0700 tmpdir) and deletes it on exit.
 
+### Git-backed service files
+
+Service-only secret mappings can point directly to a file in a Git repository.
+The reference contains the transport, repository URL, branch, and repository
+path, so an installation does not need a second repository-location setting:
+
+```json
+{
+  "secrets": {
+    "registry_auth": "git-secret+ssh://git@git.example.com/team/credentials.git?ref=main&path=registry/auth.json"
+  }
+}
+```
+
+Use `git-secret+https` or `git-secret+ssh` to select the transport. The query
+requires `path` and accepts `ref` (default `main`). Optional authentication
+fields are `auth_kind=https-token&auth_ref=<secret-reference>` with an optional
+`username`, or `auth_kind=ssh-key-secret&auth_ref=<secret-reference>`. With no
+`auth_kind`, HTTPS is anonymous and SSH uses the service's normal SSH identity
+or agent. Credentials are resolved from the existing local or Bitwarden secret
+provider; a Git repository cannot authenticate itself.
+
+The provider fetches only the requested branch into a private temporary
+workspace, materializes the requested regular file with mode 0600, and removes
+the workspace when the consumer exits `secret_file()`. Service configuration
+and model-facing skill context contain only the reference, never the secret
+contents. Git references do not participate in local/vault shadowing: the
+explicit URI selects one repository and one path. Git-backed references can be
+looked up directly but are not enumerated by an unqualified `list_secrets()`.
+
 **Requirements:**
 
 - The official Bitwarden Secrets Manager Python SDK:

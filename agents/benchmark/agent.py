@@ -584,6 +584,21 @@ class BenchmarkAgent(AgentBase):
     # are hidden from the LLM to prevent exploration and
     # scope creep (upstream #201).
     _HARNESS_TOOLS: dict[str, set[str]] = {
+        "crucible": {
+            "get_skill_context",
+            "get_execution_config",
+            "set_ssh_context",
+            "list_controller_userenvs",
+            "verify_ssh_path",
+            "setup_passwordless_ssh",
+            "validate_benchmark",
+            "execute_benchmark",
+            "get_run_logs",
+            "submit_benchmark_result",
+            "present_runfile_for_approval",
+            "resolve_benchmark_approval",
+            "request_clarification",
+        },
         "boot-time": {
             "read_skills",
             "execute_boot_time_test",
@@ -656,7 +671,6 @@ class BenchmarkAgent(AgentBase):
         excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
         if excluded is not None:
             self.tools = [t for t in self.tools if t.name not in excluded]
-            return
         allowed = self._HARNESS_TOOLS.get(harness)
         if allowed is not None:
             self.tools = [t for t in self.tools if t.name in allowed]

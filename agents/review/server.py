@@ -217,8 +217,6 @@ async def list_harness_docs(harness: str) -> str:
 async def read_harness_doc(harness: str, doc_path: str) -> str:
     """Read a documentation file from a benchmark harness repository (e.g. harness='crucible', doc_path='docs/how-run-files-work.md'). Use this to learn about result formats, metric interpretation, or any other harness-specific details."""
     await _ensure_init()
-    if not _repo_cache:
-        return json.dumps({"status": "error", "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
     if harness == "crucible":
@@ -228,6 +226,8 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
             }
         )
+    if not _repo_cache:
+        return json.dumps({"status": "error", "message": "No repo cache configured"})
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps({"status": "not_found", "harness": harness, "path": doc_path})
