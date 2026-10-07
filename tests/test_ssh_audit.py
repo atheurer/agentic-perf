@@ -360,6 +360,34 @@ async def test_explicit_no_ticket_read_only_ssh_remains_compatible(
     assert (await SSHExecutor().run("host", "echo ok", mutating=False)).stdout == "ok"
 
 
+async def test_ssh_run_is_detached_from_callers_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automation SSH must not inherit terminal input or request a remote PTY."""
+    captured: dict[str, object] = {}
+
+    class Process:
+        pid = 123
+        returncode = 0
+
+        async def communicate(self, input: bytes | None = None):
+            captured["input"] = input
+            return b"ok", b""
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Process()
+
+    monkeypatch.setattr("providers.ssh.asyncio.create_subprocess_exec", spawn)
+    result = await SSHExecutor().run("host", "true")
+
+    assert result.exit_code == 0
+    assert "-tt" not in captured["args"]
+    assert captured["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
+    assert captured["input"] is None
+
+
 async def test_explicit_ticket_read_only_records_resolved_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

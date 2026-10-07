@@ -195,7 +195,6 @@ class SSHExecutor:
         self,
         host: str,
         key_path: str | None = None,
-        allocate_pty: bool = False,
     ) -> list[str]:
         args = [
             "ssh",
@@ -218,8 +217,6 @@ class SSHExecutor:
         # StrictHostKeyChecking=no.
         if self.strict_host_key == "no":
             args.extend(["-o", "UserKnownHostsFile=/dev/null"])
-        if allocate_pty:
-            args.append("-tt")
         effective_key = key_path or self.key_path
         if effective_key:
             args.extend(["-i", effective_key])
@@ -232,13 +229,10 @@ class SSHExecutor:
         command: str,
         timeout: int = 300,
         key_path: str | None = None,
-        allocate_pty: bool = False,
         stdin_data: bytes | None = None,
         mutating: bool | None = None,
     ) -> SSHResult:
-        args = self._ssh_args(host, key_path=key_path, allocate_pty=allocate_pty) + [
-            command
-        ]
+        args = self._ssh_args(host, key_path=key_path) + [command]
         started = time.monotonic()
         trace = _SSHTraceAction(self, "ssh", host)
         resolved_mutating = self._resolved_mutation(trace, mutating)
@@ -262,7 +256,14 @@ class SSHExecutor:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
-                stdin=(asyncio.subprocess.PIPE if stdin_data is not None else None),
+                # SSH is an automation child, never an interactive terminal.
+                # Do not let a long-lived child inherit the service's stdin;
+                # explicit payloads still use a pipe below.
+                stdin=(
+                    asyncio.subprocess.PIPE
+                    if stdin_data is not None
+                    else asyncio.subprocess.DEVNULL
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
