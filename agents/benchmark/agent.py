@@ -9,6 +9,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION, AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
@@ -583,24 +584,6 @@ class BenchmarkAgent(AgentBase):
     # are hidden from the LLM to prevent exploration and
     # scope creep (upstream #201).
     _HARNESS_TOOLS: dict[str, set[str]] = {
-        "crucible": {
-            "read_skills",
-            "list_harness_docs",
-            "read_harness_doc",
-            "get_execution_config",
-            "get_runfile_schema",
-            "get_benchmark_params",
-            "get_tool_params",
-            "get_example_runfile",
-            "setup_passwordless_ssh",
-            "validate_benchmark",
-            "execute_benchmark",
-            "get_run_logs",
-            "submit_benchmark_result",
-            "present_runfile_for_approval",
-            "resolve_benchmark_approval",
-            "request_clarification",
-        },
         "boot-time": {
             "read_skills",
             "execute_boot_time_test",
@@ -652,11 +635,11 @@ class BenchmarkAgent(AgentBase):
             "read_skills",
             "list_harness_docs",
             "read_harness_doc",
-            "get_execution_config",
             "get_runfile_schema",
             "get_benchmark_params",
             "get_tool_params",
             "get_example_runfile",
+            "get_crucible_benchmark_context",
         },
     }
 
@@ -715,18 +698,19 @@ class BenchmarkAgent(AgentBase):
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
             resource_provider=provider,
-            endpoint_type=endpoint,
+            endpoint_type=None if harness == "crucible" else endpoint,
         )
 
-        # Load harness-specific prompt fragment (e.g., crucible.md,
-        # jumpstarter.md).  These contain harness-specific execution
-        # instructions that don't belong in the base prompt.
+        # Adapter tool contracts remain in fragments; runtime documentation
+        # for migrated subjects is retrieved through the gateway.
         harness_fragment = ""
         prompts_dir = Path(__file__).parent / "prompts"
         # For controller harnesses, also try the harness name
         harness_fragment = self._load_prompt_fragment(prompts_dir, harness)
 
         prompt = BENCHMARK_BASE_PROMPT
+        if harness == "crucible":
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
 
         if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
             prompt += (

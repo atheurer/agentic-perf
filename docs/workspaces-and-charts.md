@@ -48,39 +48,33 @@ blocks an alternate source snapshot. Pass the explicit `include_alternates`
 comparison option only when performing source drift/comparison work. Files
 without a policy-manifest entry remain visible for backward compatibility.
 
-## Context gateway
+## Skill gateway
 
-Harness context is retrieved through generic context primitives. For Crucible,
-agents use `get_crucible_benchmark_context` as follows:
+Crucible agents use `get_skill_context` with subject `harness/crucible`:
 
 ```json
-{"operation": "bootstrap"}
-{"operation": "search", "query": "perftest|multiplex.json"}
-{"operation": "read", "path": "subprojects/benchmarks/perftest/README.md"}
+{"subject": "harness/crucible", "operation": "bootstrap"}
+{"subject": "harness/crucible", "operation": "read", "ref": "<returned-ref>"}
+{"subject": "harness/crucible", "operation": "search", "query": "example|another"}
 ```
 
-`bootstrap` returns the source's entrypoint document, normally `AGENTS.md`.
-`search` performs bounded discovery across both file/directory names and file
-contents, returning grouped candidate paths and snippets. `read` returns the
-exact caller-selected path. The caller decides which documents to search for
-and read; the gateway does not interpret repository metadata, invent a
-namespace, curate subject areas, or translate benchmark names.
+Bootstrap advertises organization entrypoints, approved configuration views,
+and phase-compatible software references. Read returned refs, or follow a
+relative pointer with `from_ref` and `path`. Organization and software refs
+remain distinct. Triage retains bounded GitHub catalog discovery; execution
+and review use designated-controller documentation.
 
-Source selection, phase/audience visibility, path safety, workspace caching,
-provenance, and audit records are server-managed. The agent-facing request
-does not select a source, namespace, subject area, benchmark, or alternate
-source. Read operations persist source material and phase-owned context in the
-ticket workspace without exposing source-selection internals to the agent.
+Organization documents and service configuration are pinned together for the
+ticket lifetime. Raw configuration snapshots stay outside workspaces and
+artifacts. Source availability, phase visibility, path containment, controller
+caching, and audit records remain server-managed. Private administrator paths
+and secret bindings are not model-selected resources. See the
+[skill gateway design](design-skill-gateway.md).
 
-The legacy `list_harness_docs`, `read_harness_doc`, `read_skills`, and structured
-lookup tools remain available for migration and harnesses without a context
-gateway. They are not part of the Crucible context retrieval contract.
-
-Workspace files persist across agent handoffs and are included in the
-workspace manifest/context supplied to the next agent. They are removed only
-when the ticket data is cleaned up by the operator; they are not a general
-shared filesystem or an authorization bypass. Restrict filesystem permissions
-on the agent home and do not spill secrets deliberately.
+The legacy `list_harness_docs`, `read_harness_doc`, and `read_skills` tools
+remain available for other harnesses. They do not serve Crucible context.
+Workspace files persist across handoffs; filesystem permissions and artifact
+policy still apply to their contents.
 
 ## Charts
 

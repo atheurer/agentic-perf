@@ -11,6 +11,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from agents.server_utils import (
     build_skill_provider,
     read_skill_documents,
 )
+from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 
 mcp = create_ticket_mcp("triage-agent")
 
@@ -38,8 +40,37 @@ def _get_provider():
         _skill_provider = build_skill_provider(
             resolve_source=False,
             catalog_only=True,
+            skill_phase="triage",
         )
     return _skill_provider
+
+
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    return await skill_context_gateway(
+        _get_provider(),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="triage-agent",
+        phase="triage",
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
 
 
 @mcp.tool()

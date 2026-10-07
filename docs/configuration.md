@@ -30,9 +30,10 @@ without a restart:
 - `agent_iterations.*` and `global_max_iterations`
 - `agent_task_timeout`
 
-All other fields (poll_interval, skills/repo-cache, secrets/vault,
-telemetry, budget, max_concurrent_agents, introspection) require a
-restart.
+Other service fields (poll_interval, legacy skills/repo-cache, secrets/vault,
+telemetry, budget, max_concurrent_agents, introspection) require a restart.
+Organization gateway workers read their binding when constructing a provider;
+source content updates affect new tickets, while existing ticket pins persist.
 
 If `config.json` is malformed or unreadable at dispatch time, the
 orchestrator logs a warning and continues with the last successfully
@@ -43,10 +44,92 @@ loaded configuration.
 Use `python3 cli.py config show` to print a redacted, machine-readable JSON
 snapshot. When the orchestrator is running, this reports its persisted startup
 configuration rather than the caller's shell environment, including the
-effective private-skills and secrets paths and loaded harness policy values
-such as Crucible's `provisioning.on_existing_install`. Private skill files are
-cached for the service lifetime, so restart the orchestrator after changing
-one. Credentials, tokens, and private file contents are never included.
+effective private-skills and secrets paths, allowlisted legacy harness policy
+values, and configured organization sources. Gateway diagnostics show the
+repository root, discovery status, discovered subject names/count, and explicit
+binding metadata without loading documents or service configuration. Discovery
+describes that recorded snapshot; it does not validate content or describe a
+ticket's pinned revision. Unreadable
+sources produce discovery errors, not a successfully empty subject list.
+Organization documents and settings
+are pinned for the ticket lifetime; new tickets load updated source content on
+first use. Legacy private skill files remain cached until restart. Credentials,
+tokens, organization settings, and private document contents are never included.
+
+## Organization skill gateway
+
+An administrator configures one local organization repository root. Subjects
+are discovered by layout, so adding a package or service configuration does not
+require another instance configuration entry. The first integrated harness
+subject is `harness/crucible`.
+
+```json
+{
+  "skill_gateway": {
+    "organization": {
+      "source": {
+        "kind": "path",
+        "path": "/srv/agentic-perf/organization"
+      }
+    }
+  }
+}
+```
+
+The root must be absolute and accessible to workers. The repository layout is:
+
+```text
+skills/<namespace>/<name>/SKILL.md
+skills/<namespace>/<name>/skill.json
+service-config/<namespace>/<name>.json
+```
+
+Discovery combines document-package descriptors and service-configuration file
+names. Subjects can have documents only, configuration only, or both. A document
+package needs a standard `SKILL.md` and an explicit `skill.json` Markdown export
+manifest; its declared subject must match the directory layout. Metadata
+discovery does not read those files; content validation happens before use.
+
+Only manifest-listed package documents are served. The service-config tree is
+physically outside those packages and is never exposed as skill files.
+Configured organization settings
+are canonical and are not overlaid with legacy private JSON or harness defaults.
+Documents-only discovered subjects have empty service settings. Configuration-only
+subjects provide service settings without organization document entrypoints.
+Approved model-facing configuration views require a registered projection
+schema; this release supplies one for `harness/crucible`. Unconfigured subjects
+retain the existing legacy behavior.
+
+The optional `organization.subjects` map supports explicit exceptions through
+`source`, `service_config`, `required`, and `legacy_config`. Omitted fields
+inherit the discovered binding. For example, `{"required": false}` changes
+only that subject's policy; the repository's `organization.required` defaults
+to `true`. Explicit paths override the corresponding discovered paths. An
+explicit `source: null` or `service_config: null` removes that counterpart;
+at least one must remain. The repository-level `organization.source` cannot
+be null.
+
+For a temporary documents-only migration, `legacy_config: true` removes the
+discovered service configuration and selects legacy settings. Supplying both
+a non-null explicit service configuration and `legacy_config: true` is invalid. Legacy
+runtime settings are not pinned together with documents. There is no implicit
+merge of settings values from different configuration sources.
+
+A missing, unreadable, invalid, or empty configured repository is an explicit
+discovery error. A required unavailable subject prevents affected actions.
+Organization documents
+and configuration are pinned together under the service-only `skill-snapshots/`
+directory on first use for the ticket lifetime. New tickets see source content
+updates; existing tickets keep their revision. Adding a document/configuration
+counterpart under the same root does not change an existing pin. Changing an
+explicit binding path or repository root causes an error for an existing pin.
+Removing a previously pinned subject's binding reports unavailable instead of
+falling back to legacy settings. No refresh command is implemented.
+
+Gateway workers read the administrator binding when they construct their
+provider. This binding is instance configuration; it is not a ticket directive
+or a user identity. Git distribution and authenticated user packages are future
+extensions. See the [package and retrieval design](design-skill-gateway.md).
 
 ## Minimal Example
 

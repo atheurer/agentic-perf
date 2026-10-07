@@ -7,6 +7,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 from providers.skills.repo_cache import RepoCache
@@ -307,7 +308,7 @@ class ReviewAgent(AgentBase):
     )
 
     def _apply_review_tool_scoping(self, ticket: dict[str, Any]) -> None:
-        """Hide Crucible-specific tools for non-Crucible harnesses."""
+        """Limit runtime tools by harness and use gateway docs for Crucible."""
         harness = self._effective_harness(
             ticket.get("custom_fields", {}).get("directives", {}),
             getattr(self, "_skill_provider", None),
@@ -316,6 +317,13 @@ class ReviewAgent(AgentBase):
             self.tools = [
                 t for t in self.tools if t.name not in self._CRUCIBLE_ONLY_TOOLS
             ]
+        else:
+            legacy_docs = {
+                "get_crucible_benchmark_context",
+                "list_harness_docs",
+                "read_harness_doc",
+            }
+            self.tools = [t for t in self.tools if t.name not in legacy_docs]
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
@@ -324,6 +332,8 @@ class ReviewAgent(AgentBase):
         harness = self._effective_harness(
             directives, getattr(self, "_skill_provider", None)
         )
+        if harness == "crucible" and not cf.get("analysis_result"):
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
         if harness in ("arcaflow-plugins", "arcaflow-workflows"):
             if cf.get("benchmark_notes"):
                 prompt += (
@@ -534,7 +544,7 @@ class ReviewAgent(AgentBase):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
-        if skills_dir.is_dir():
+        if harness != "crucible" and skills_dir.is_dir():
             content += f"\n## {harness} Skills\n"
             content += "These contain lessons from prior runs that may help interpret results:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
