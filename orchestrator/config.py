@@ -491,10 +491,9 @@ def _redacted_skill_gateway(raw_config: dict) -> dict:
         "subjects": bindings,
     }
     if repository_configured:
-        safe_organization["source"] = _redacted_skill_source(organization["source"])
-        safe_organization["discovery"] = _redacted_skill_discovery(
-            safe_organization["source"], required
-        )
+        raw_source = organization["source"]
+        safe_organization["source"] = _redacted_skill_source(raw_source)
+        safe_organization["discovery"] = _redacted_skill_discovery(raw_source, required)
     else:
         safe_organization["discovery"] = {"status": "not_configured"}
     return {
@@ -507,13 +506,32 @@ def _redacted_skill_source(source: object) -> dict:
     """Allowlist supported repository descriptor fields for diagnostics."""
     if not isinstance(source, dict):
         return {"kind": "(invalid)"}
-    safe_source: dict = {
-        "kind": "path" if source.get("kind") == "path" else "(unsupported)",
-    }
-    source_path = source.get("path")
-    if isinstance(source_path, str) and Path(source_path).is_absolute():
-        safe_source["path"] = source_path
-    return safe_source
+    if source.get("kind") == "path":
+        safe_source: dict = {"kind": "path"}
+        source_path = source.get("path")
+        if isinstance(source_path, str) and Path(source_path).is_absolute():
+            safe_source["path"] = source_path
+        return safe_source
+    if source.get("kind") == "git":
+        from providers.skills.git_source import GitSourceError, parse_git_source
+
+        try:
+            git_source = parse_git_source(source)
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(git_source.url)
+            auth = source.get("auth", {})
+            auth_kind = auth.get("kind", "default")
+            return {
+                "kind": "git",
+                "host": parsed.hostname,
+                "ref": source.get("ref", "main"),
+                "auth_method": auth_kind,
+                "authentication_configured": auth_kind != "default",
+            }
+        except (GitSourceError, KeyError, TypeError):
+            return {"kind": "(invalid)"}
+    return {"kind": "(unsupported)"}
 
 
 def _redacted_skill_discovery(source: dict, required: object) -> dict:
@@ -532,7 +550,25 @@ def _redacted_skill_discovery(source: dict, required: object) -> dict:
             "message": "Invalid organization repository binding",
         },
     }
-    if source.get("kind") != "path" or "path" not in source:
+    if isinstance(source, dict) and source.get("kind") == "git":
+        from providers.skills.git_source import GitSourceError, parse_git_source
+
+        if not isinstance(required, bool):
+            return failure
+        try:
+            parse_git_source(source)
+        except (GitSourceError, KeyError, TypeError):
+            return failure
+        return {
+            "status": "not_checked",
+            "subject_count": None,
+            "subjects": {},
+        }
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != "path"
+        or "path" not in source
+    ):
         return failure
     if not isinstance(required, bool):
         return failure
