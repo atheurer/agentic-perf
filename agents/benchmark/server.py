@@ -1543,38 +1543,57 @@ async def _get_crucible_benchmark_context_tool(
     Source selection, phase policy, and provenance are server-managed.
     """
     await _ensure_init()
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
     if operation not in {"bootstrap", "read", "search"}:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "unsupported_operation",
-                "guidance": "Use bootstrap, read, or search.",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "unsupported_operation",
+                    "guidance": "Use bootstrap, read, or search.",
+                }
+            )
         )
     controller_host = _controller_host()
     if _ssh is None or not controller_host:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "controller_not_identified",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "controller_not_identified",
+                }
+            )
         )
-    return await controller_context_gateway(
-        ssh=_ssh,
-        controller_host=controller_host,
-        ticket_id=os.environ.get("TICKET_ID", ""),
-        agent_name="benchmark-agent",
-        phase="benchmark",
-        operation=operation,
-        path=path,
-        query=query,
-        benchmark="",
-        include_alternates=False,
-        max_bytes=max_bytes,
-        offset_bytes=offset_bytes,
+    return _with_crucible_runfile_contract(
+        await controller_context_gateway(
+            ssh=_ssh,
+            controller_host=controller_host,
+            ticket_id=os.environ.get("TICKET_ID", ""),
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation=operation,
+            path=path,
+            query=query,
+            benchmark="",
+            include_alternates=False,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
     )
+
+
+def _with_crucible_runfile_contract(response: str) -> str:
+    """Attach provider-owned run-file requirements to model-facing context."""
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
+    result = json.loads(response)
+    if not isinstance(result, dict):
+        raise ValueError("Crucible context response must be a JSON object")
+    result["runfile_contract"] = _crucible_context.get_runfile_contract()
+    return json.dumps(result)
 
 
 async def _legacy_get_crucible_benchmark_context(

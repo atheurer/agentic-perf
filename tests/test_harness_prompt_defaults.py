@@ -30,8 +30,6 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
 
     assert "## Crucible Benchmark Execution" in prompt
     assert "Read harness-specific documentation" in prompt
-    assert "tags` is a required top-level object" in prompt
-    assert "use `{}` when no tags apply" in prompt
     assert "list_harness_docs" not in prompt
     assert "read_harness_doc" not in prompt
     # Crucible's configured tool policy is applied in both cases.

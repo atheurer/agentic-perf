@@ -55,6 +55,7 @@ def crucible_runfile_schema(schema: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(tags_schema, dict):
         tags_schema = {}
     tags_schema["type"] = "object"
+    tags_schema["default"] = {}
     properties["tags"] = tags_schema
 
     required = effective_schema.get("required", [])
@@ -1640,6 +1641,17 @@ class CrucibleContextGateway:
     async def get_runfile_schema(self) -> dict[str, Any] | None:
         schema = self._load_schema()
         return crucible_runfile_schema(schema) if schema is not None else None
+
+    def get_runfile_contract(self) -> dict[str, Any]:
+        """Return agentic-perf's required top-level run-file fields."""
+        return {
+            "required_top_level_fields": ["tags"],
+            "properties": {"tags": {"type": "object", "default": {}}},
+            "guidance": (
+                "Every generated Crucible run-file must include top-level tags "
+                "as an object. Use {} when no tags apply."
+            ),
+        }
 
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         meta = self._load_benchmark_meta(benchmark)
