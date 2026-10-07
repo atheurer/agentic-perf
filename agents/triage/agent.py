@@ -23,6 +23,85 @@ logger = logging.getLogger(__name__)
 # _effective_harness.
 
 
+async def _validate_harness_and_suite(
+    harness: str,
+    benchmark_suite: str,
+    absent_suite: bool,
+    skill_provider: Any,
+) -> dict[str, Any] | None:
+    """Validate that harness and benchmark suite exist in the catalog.
+
+    Returns None when valid.  Returns a dict with 'error', 'available_harnesses',
+    and optionally 'correction' when the harness or suite is invalid.
+    """
+    from providers.skills.catalog import STANDALONE_BENCHMARKS
+
+    # Collect all known harness names.
+    known_harnesses: set[str] = set()
+    if hasattr(skill_provider, "list_harnesses"):
+        known_harnesses.update(skill_provider.list_harnesses())
+    # Standalone benchmark harnesses (e.g. "boot-time") are valid too.
+    for sb in STANDALONE_BENCHMARKS:
+        known_harnesses.add(sb.harness)
+    # Include aliases as accepted input (they resolve to canonical names).
+    from providers.skills.base import HARNESS_ALIASES
+
+    known_harnesses.update(HARNESS_ALIASES.keys())
+
+    available_list = sorted(known_harnesses)
+
+    # 1. Validate harness name exists.
+    if harness and harness not in known_harnesses:
+        return {
+            "error": (
+                f"Harness '{harness}' is not a recognized harness name. "
+                f"Available harnesses: {available_list}"
+            ),
+            "available_harnesses": available_list,
+        }
+
+    # 2. Validate benchmark suite exists in the catalog when
+    #    absent_suite is set (the LLM couldn't find it).
+    if absent_suite and benchmark_suite:
+        # Try to find the suite in the catalog — maybe the LLM
+        # built a wrong composite name (e.g. "jumpstarter-boot-time"
+        # instead of "boot-time").
+        from providers.skills.catalog import get_catalog_benchmark
+
+        found = await get_catalog_benchmark(skill_provider, benchmark_suite)
+        if found is not None:
+            # The suite does exist; the LLM was wrong about absent_suite.
+            return {
+                "correction": {
+                    "absent_suite": False,
+                    "benchmark_suite": benchmark_suite,
+                },
+            }
+        # Try stripping prefixes from suite name to auto-correct.
+        # e.g. "jumpstarter-boot-time" → "boot-time"
+        #      "kube-burner-uperf" → "uperf"
+        # Check all possible suffixes by progressively removing
+        # leading hyphen-delimited segments.
+        parts = benchmark_suite.split("-")
+        for i in range(1, len(parts)):
+            suffix = "-".join(parts[i:])
+            found = await get_catalog_benchmark(skill_provider, suffix)
+            if found is not None:
+                return {
+                    "correction": {
+                        "absent_suite": False,
+                        "benchmark_suite": suffix,
+                        "harness": found.get("harness", harness),
+                        "note": (
+                            f"Auto-corrected benchmark suite from "
+                            f"'{benchmark_suite}' to '{suffix}'"
+                        ),
+                    },
+                }
+
+    return None
+
+
 def _filter_direct_required_hosts(
     required_hosts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -779,13 +858,48 @@ class TriageAgent(AgentBase):
         # and the LLM see a consistent, resolvable value.
         if harness and harness != directives.get("harness"):
             directives["harness"] = harness
+
+        # --- Harness / suite validation (issue #1086) ---
+        # Code-enforced: reject or auto-correct invalid harness names
+        # and non-existent benchmark suites before they propagate.
+        benchmark_name = result.get("benchmark_suite", "")
+        absent_suite = result.get("absent_suite", False)
+        validation = await _validate_harness_and_suite(
+            harness, benchmark_name, absent_suite, self._skill_provider
+        )
+        if validation is not None:
+            if "error" in validation:
+                # Hard reject — harness doesn't exist at all.
+                await self._add_comment(
+                    ticket_id,
+                    f"**Triage validation failed:** {validation['error']}\n\n"
+                    f"Please update the ticket with a valid harness name.",
+                )
+                return
+            if "correction" in validation:
+                correction = validation["correction"]
+                if "benchmark_suite" in correction:
+                    result["benchmark_suite"] = correction["benchmark_suite"]
+                    benchmark_name = correction["benchmark_suite"]
+                if "absent_suite" in correction:
+                    result["absent_suite"] = correction["absent_suite"]
+                if "harness" in correction:
+                    harness = correction["harness"]
+                    directives["harness"] = harness
+                note = correction.get("note", "")
+                if note:
+                    existing_notes = result.get("notes", "")
+                    result["notes"] = (
+                        f"{existing_notes}\n{note}" if existing_notes else note
+                    )
+                    logger.info("[triage] %s", note)
+
         # Resolve execution model from the harness metadata.
         # This is a harness-level property declared in BenchmarkSuite,
         # not a per-ticket decision or a hardcoded list.
         from providers.skills.base import EXECUTION_MODEL_DIRECT
         from providers.skills.catalog import resolve_execution_model
 
-        benchmark_name = result.get("benchmark_suite", "")
         execution_model = await resolve_execution_model(
             self._skill_provider, harness, benchmark_name
         )
