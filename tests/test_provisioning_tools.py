@@ -286,7 +286,7 @@ async def test_contract_validation_fails_missing_secret(
 
 def _organization_crucible_provider(
     repository: Path,
-    secret_ref: str = "crucible/client-server-token.json",
+    secret_ref: str = "shared/access-token.json",
 ) -> PrivateSkillProvider:
     package = repository / "skills" / "harness" / "crucible"
     package.mkdir(parents=True)
@@ -309,12 +309,12 @@ def _organization_crucible_provider(
     service_config.write_text(
         json.dumps(
             {
-                "secrets": {"client_server_auth": secret_ref},
+                "secrets": {"access_token": secret_ref},
                 "install_contract": {
                     "secret_files": [
                         {
-                            "secret_key": "client_server_auth",
-                            "remote_path": "/root/client-server-token.json",
+                            "secret_key": "access_token",
+                            "remote_path": "/opt/access-token.json",
                             "required": True,
                         }
                     ]
@@ -357,11 +357,11 @@ def _create_git_secret_repo(root: Path) -> Path:
         check=True,
         capture_output=True,
     )
-    secret = worktree / "secrets" / "client-server-token.json"
+    secret = worktree / "secrets" / "access-token.json"
     secret.parent.mkdir()
     secret.write_text('{"fixture-secret": "never logged"}\n')
     subprocess.run(
-        ["git", "add", "secrets/client-server-token.json"],
+        ["git", "add", "secrets/access-token.json"],
         cwd=worktree,
         check=True,
         capture_output=True,
@@ -420,7 +420,7 @@ async def test_org_service_config_secret_is_deployed_from_local_store(
     provider = _organization_crucible_provider(tmp_path / "org-skills")
     private_config = await provider.get_all_private_config("crucible")
     secrets_root = tmp_path / "secrets"
-    secret = secrets_root / "crucible" / "client-server-token.json"
+    secret = secrets_root / "shared" / "access-token.json"
     secret.parent.mkdir(parents=True)
     secret.write_text('{"test-only": true}\n')
     ssh = MockSSHExecutor()
@@ -436,15 +436,13 @@ async def test_org_service_config_secret_is_deployed_from_local_store(
     )
 
     assert result["status"] == "ok", result
-    assert result["deployed_files"] == [
-        "client_server_auth -> /root/client-server-token.json"
-    ]
+    assert result["deployed_files"] == ["access_token -> /opt/access-token.json"]
     assert [call for call in ssh.calls if call["method"] == "copy_to"] == [
         {
             "method": "copy_to",
             "host": "controller",
             "local_path": str(secret),
-            "remote_path": "/root/client-server-token.json",
+            "remote_path": "/opt/access-token.json",
         }
     ]
 
@@ -488,7 +486,7 @@ async def test_org_git_secret_pointer_is_deployed_and_cleaned_up(
 
     provider = _organization_crucible_provider(
         tmp_path / "org-skills",
-        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/client-server-token.json",
+        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/access-token.json",
     )
     private_config = await provider.get_all_private_config("crucible")
     secrets_provider = _build_git_secrets_provider(tmp_path, monkeypatch)
@@ -509,13 +507,11 @@ async def test_org_git_secret_pointer_is_deployed_and_cleaned_up(
     )
 
     assert result["status"] == "ok", result
-    assert result["deployed_files"] == [
-        "client_server_auth -> /root/client-server-token.json"
-    ]
+    assert result["deployed_files"] == ["access_token -> /opt/access-token.json"]
     copy_calls = [call for call in ssh.calls if call["method"] == "copy_to"]
     assert len(copy_calls) == 1
     assert copy_calls[0]["host"] == "controller"
-    assert copy_calls[0]["remote_path"] == "/root/client-server-token.json"
+    assert copy_calls[0]["remote_path"] == "/opt/access-token.json"
     assert b'"fixture-secret"' in ssh.copied_content
     assert not Path(copy_calls[0]["local_path"]).exists()
     assert list(temp_root.iterdir()) == []
@@ -534,7 +530,7 @@ async def test_missing_org_git_secret_pointer_fails_before_scp(
     )
     provider = _organization_crucible_provider(
         tmp_path / "org-skills",
-        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/missing-token.json",
+        "git-secret+https://fixture.invalid/secrets.git?ref=main&path=secrets/missing.json",
     )
     private_config = await provider.get_all_private_config("crucible")
     secrets_provider = _build_git_secrets_provider(tmp_path, monkeypatch)

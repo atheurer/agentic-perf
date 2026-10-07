@@ -96,10 +96,13 @@ provider. For example, use `auth: {"kind":"https-token","username":"oauth2",
 must not appear in the URL or config. SSH uses the service account's existing
 OpenSSH identity/agent and known-hosts configuration with strict host-key
 checking; an organization-managed SSH key can instead use
-`auth: {"kind":"ssh-key-secret","secret_ref":"..."}`. HTTPS, `ssh://`,
-and standard `user@host:path` SSH clone URLs are accepted. HTTPS URL credentials,
-query strings, and fragments are rejected. A private-key secret must be usable
-non-interactively; passphrase-protected keys can use the existing SSH agent.
+`auth: {"kind":"ssh-key-secret","secret_ref":"..."}`. HTTP, HTTPS,
+`ssh://`, and standard `user@host:path` SSH clone URLs are accepted. HTTP and
+HTTPS sources can be read anonymously when the repository permits it. Plain
+HTTP is unencrypted and should only be used when the network is the intended
+access boundary. HTTP(S) URL credentials, query strings, and fragments are
+rejected. A private-key secret must be usable non-interactively;
+passphrase-protected keys can use the existing SSH agent.
 
 Each named source refreshes its configured branch during provider initialization
 and reads from an immutable commit checkout. Existing ticket snapshots keep

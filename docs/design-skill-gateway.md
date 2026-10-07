@@ -13,11 +13,12 @@ only to the authenticated user associated with a ticket.
 
 Use administrator-configured organization sources outside the public
 repository. The first release supports one or more local paths or Git URLs; a
-single-source shorthand keeps the common setup simple. Git
-authentication uses either the instance's existing OpenSSH identity/agent or
-a secret reference resolved by the existing secret provider. Implement
-organization scope first; reserve user and project extension points without
-enabling them prematurely.
+single-source shorthand keeps the common setup simple. Anonymous HTTP or
+HTTPS reads need no per-user GitLab identity when the repository is reachable
+and permits unauthenticated reads. Authenticated Git access uses either the
+instance's existing OpenSSH identity/agent or a secret reference resolved by
+the existing secret provider. Implement organization scope first; reserve
+user and project extension points without enabling them prematurely.
 
 The recommended first migration includes both guidance and structured Crucible
 runtime configuration. The draft includes this scope; a documents-only configuration
@@ -26,12 +27,14 @@ the existing secret providers.
 
 ## New-developer onboarding acceptance
 
-Before this work is ready to merge for team use, a developer with authorized
-read access to the organization repository must be able to start from a clean
-agentic-perf installation, configure the repository URL once, and use the
-integrated subject without manual cloning or extra subject-specific setup. The
-repository is separate from the public agentic-perf checkout and is maintained
-by the organization.
+Before this work is ready to merge for team use, an agentic-perf installation
+with network access to the organization repository must be able to start from a
+clean install, configure the repository URL once, and use the integrated
+subject without manual cloning or extra subject-specific setup. For an
+unauthenticated source, repository visibility and network access provide the
+read boundary. For a private repository, its read credential is configured
+once for the installation. The repository is separate from the public
+agentic-perf checkout and is maintained by the organization.
 
 The acceptance check must verify that one `skill_gateway.organization.source`
 setting discovers a repository's subjects and their paired documents and
@@ -226,10 +229,13 @@ source is a distinct state. A fresh installation
 can retrieve available software documentation without an organization package;
 operations requiring organization runtime settings report missing configuration.
 
-The Git source accepts HTTPS URLs, `ssh://` URLs, and standard
-`user@host:path` SSH clone URLs, with branch refs. It rejects embedded HTTPS
-credentials, query strings, fragments, and other URL schemes. HTTPS tokens and
-optional SSH private keys use administrator-managed secret references from the
+The Git source accepts HTTP and HTTPS URLs, `ssh://` URLs, and standard
+`user@host:path` SSH clone URLs, with branch refs. It rejects embedded
+HTTP(S) credentials, query strings, fragments, and other URL schemes. HTTP
+and HTTPS can be used for anonymous reads when the repository permits them.
+Plain HTTP is unencrypted and should only be used when the network is the
+intended access boundary. HTTPS tokens and optional SSH private keys use
+administrator-managed secret references from the
 existing secrets provider. A private-key secret must be usable
 non-interactively; passphrase-protected keys can use the existing SSH agent.
 SSH may instead use the service account's existing OpenSSH identity/agent and
@@ -488,8 +494,9 @@ references, and artifact APIs. These are prerequisites for adding user scope.
 
 Reuse the existing cascading secrets provider, which already has user, group,
 and deployment layers. Service-only configuration can also point directly to
-Git-backed secret files with a `git-secret+https://` or `git-secret+ssh://`
-reference that includes its repository, branch, and path. Secret values remain
+Git-backed secret files with `git-secret+http://`, `git-secret+https://`, or
+`git-secret+ssh://` references that include their repository, branch, and path.
+Secret values remain
 resolved inside services for a specific operation and never enter
 model-readable context documents.
 User-owned remote secret sources and conflict handling across secret scopes
@@ -588,7 +595,7 @@ and reported in diagnostics.
 
 This local review draft implements the path and Git organization sources,
 subject discovery, gateway retrieval, and Crucible software adapter described
-above. Git accepts HTTPS and SSH branch URLs. Authentication can use the
+above. Git accepts HTTP, HTTPS, and SSH branch URLs. Authentication can use the
 existing OpenSSH identity/agent, an HTTPS token secret reference, or an SSH key
 secret reference. Git fetches run through the audited subprocess provider;
 cache checkouts are independent of the mutable mirror, and ticket snapshots
@@ -625,9 +632,9 @@ Required checks before team rollout include:
   document responses, document searches, and model-readable snapshots.
 - Check audit/side-effect inventories and ensure other harnesses retain their
   existing prompt, tool, and private-config behavior.
-- Accept valid HTTPS and SSH branch sources; reject embedded HTTPS credentials,
-  URL queries/fragments, unsupported protocols, malformed refs, and unknown
-  authentication fields without exposing credential values.
+- Accept valid HTTP, HTTPS, and SSH branch sources; reject embedded HTTP(S)
+  credentials, URL queries/fragments, unsupported protocols, malformed refs,
+  and unknown authentication fields without exposing credential values.
 - Resolve HTTPS token and SSH key secret references through the existing
   secrets provider, and use strict host-key checking with the default SSH
   identity/agent path. Confirm tokens and key contents do not enter logs,

@@ -97,7 +97,7 @@ def parse_git_source(source: object) -> _GitSourceConfig:
             "invalid_config", "Invalid organization Git source URL"
         ) from None
     if (
-        parsed.scheme not in {"https", "ssh"}
+        parsed.scheme not in {"http", "https", "ssh"}
         or not parsed.hostname
         or parsed.query
         or parsed.fragment
@@ -106,7 +106,7 @@ def parse_git_source(source: object) -> _GitSourceConfig:
         or not parsed.path.strip("/")
     ):
         raise GitSourceError("invalid_config", "Invalid organization Git source URL")
-    if parsed.scheme == "https" and "@" in parsed.netloc:
+    if parsed.scheme in {"http", "https"} and "@" in parsed.netloc:
         raise GitSourceError(
             "invalid_config", "Git credentials must use a secret reference"
         )

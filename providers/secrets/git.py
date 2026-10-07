@@ -23,7 +23,7 @@ from providers.skills.git_source import (
 
 logger = logging.getLogger(__name__)
 
-_SECRET_REF_SCHEMES = {"git-secret+https", "git-secret+ssh"}
+_SECRET_REF_SCHEMES = {"git-secret+http", "git-secret+https", "git-secret+ssh"}
 _SECRET_PATH_PART = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
 _MAX_SECRET_BYTES = 8 * 1024 * 1024
@@ -32,16 +32,22 @@ _GIT_TIMEOUT = 180
 
 def _secret_ref_parts(reference: str) -> tuple[object, str] | None:
     """Parse a self-contained Git URI: transport, repo, branch, and file path."""
+    candidate_scheme, separator, remainder = reference.partition(":")
+    if not separator or not candidate_scheme.lower().startswith("git-secret+"):
+        return None
+    if not remainder.startswith("//"):
+        raise SecretsBackendError("Invalid Git secret reference")
     try:
         parsed = urlsplit(reference)
+    except ValueError:
+        raise SecretsBackendError("Invalid Git secret reference") from None
+    if parsed.scheme not in _SECRET_REF_SCHEMES:
+        raise SecretsBackendError("Invalid Git secret reference")
+    try:
         parsed.port
         query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         raise SecretsBackendError("Invalid Git secret reference") from None
-    if parsed.scheme not in _SECRET_REF_SCHEMES:
-        if parsed.scheme.startswith("git-secret+"):
-            raise SecretsBackendError("Invalid Git secret reference")
-        return None
     if (
         not parsed.hostname
         or parsed.fragment
@@ -232,7 +238,8 @@ class GitSecretsProvider(SecretsProvider):
                 ) from None
 
     async def list_secrets(self, prefix: str = "") -> list[str]:
-        if prefix.startswith(("git-secret+https://", "git-secret+ssh://")):
+        scheme, separator, _ = prefix.partition(":")
+        if separator and scheme.lower().startswith("git-secret+"):
             async with self.secret_file(prefix) as secret_path:
                 return [prefix] if secret_path is not None else []
         return await self._fallback.list_secrets(prefix)
