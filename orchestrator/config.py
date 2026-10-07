@@ -24,13 +24,40 @@ def _provider_family(provider: str) -> str:
     }.get(provider, provider)
 
 
-def _load_config_file() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+class ConfigFileError(ValueError):
+    """A config cannot be safely loaded; its message never includes contents."""
+
+
+def _load_config_file(*, strict: bool = False) -> dict:
+    """Read config, refusing invalid present files when auth depends on them."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ConfigFileError(
+                f"Invalid JSON in {CONFIG_PATH}: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno})"
+            ) from None
+        return {}
+    except UnicodeDecodeError:
+        if strict:
+            raise ConfigFileError(
+                f"Cannot read {CONFIG_PATH}: expected UTF-8"
+            ) from None
+        return {}
+    except OSError as exc:
+        if strict:
+            raise ConfigFileError(
+                f"Cannot read {CONFIG_PATH}: {exc.strerror or 'I/O error'}"
+            ) from None
+        return {}
+    if strict and not isinstance(cfg, dict):
+        raise ConfigFileError(
+            f"Invalid config in {CONFIG_PATH}: expected a JSON object"
+        )
+    return cfg
 
 
 class OrchestratorConfig:

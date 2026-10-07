@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from orchestrator.config import _load_config_file
+from orchestrator.config import ConfigFileError, _load_config_file
 from paths import (
     AGENTIC_PERF_HOME,
     TRACE_DB_PATH,
@@ -65,7 +65,7 @@ def _validate_positive_int(
     allow_zero: bool = True,
 ) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        raise ValueError(f"{name} must be a non-negative integer")
     if not allow_zero and value == 0:
         raise ValueError(f"{name} must be > 0, got 0")
     return value
@@ -98,7 +98,7 @@ def mount_routers(
     app.include_router(chat_router)
 
 
-def _initialize_runtime(app: FastAPI, port: int) -> None:
+def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     """Construct writable runtime components only after the root lock is held."""
     logger.info("Initializing trace store...")
     from .status import record_store_status
@@ -118,7 +118,6 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     app.state.benchmark_validator_token = load_or_generate_validator_token()
     app.state.benchmark_validation_capabilities = {}
 
-    cfg = _load_config_file()
     auth_cfg = cfg.get("auth", {})
     multi_user = auth_cfg.get("multi_user", False)
     anonymous_read = auth_cfg.get("anonymous_read", False)
@@ -333,6 +332,20 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         if getattr(app.state, "runtime_pid", None) == os.getpid():
             return
         _discard_inherited_runtime(app)
+    # Auth defaults are safe only when the config is absent. A present but
+    # unreadable config must never silently replace the configured policy.
+    try:
+        cfg = _load_config_file(strict=True)
+        auth_cfg = cfg.get("auth", {})
+        if not isinstance(auth_cfg, dict):
+            raise ConfigFileError("auth must be a JSON object")
+        for name in ("multi_user", "anonymous_read"):
+            if not isinstance(auth_cfg.get(name, False), bool):
+                raise ConfigFileError(f"auth.{name} must be a boolean")
+        _validate_positive_int(auth_cfg.get("token_ttl_days", 0), "auth.token_ttl_days")
+    except (ConfigFileError, ValueError) as exc:
+        logger.error("State store refused startup: %s", exc)
+        raise
     logger.info("Acquiring persistence root lock...")
     lock = _acquire_runtime_lock(port)
     record_store_status("lock_acquired")
@@ -346,7 +359,7 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         "process": lock.metadata,
     }
     try:
-        _initialize_runtime(app, port)
+        _initialize_runtime(app, port, cfg)
         app.state.runtime_initialized = True
         app.state.runtime_pid = os.getpid()
         record_store_status("runtime_ready")
