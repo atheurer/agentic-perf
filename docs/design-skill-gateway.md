@@ -11,11 +11,12 @@ documentation from the installed Crucible controller. Organization guidance is
 available to all users of an agentic-perf instance. A future user source applies
 only to the authenticated user associated with a ticket.
 
-Start with an administrator-configured filesystem source outside the public
-repository. Implement the subject and source interfaces so another harness or
-an authenticated repository source can be added without another agent-facing
-tool. Implement organization scope first; reserve the user and project extension
-points without enabling them prematurely.
+Use one administrator-configured organization source outside the public
+repository. The first release supports a local path and a Git URL. Git
+authentication uses either the instance's existing OpenSSH identity/agent or
+a secret reference resolved by the existing secret provider. Implement
+organization scope first; reserve user and project extension points without
+enabling them prematurely.
 
 The recommended first migration includes both guidance and structured Crucible
 runtime configuration. The draft includes this scope; a documents-only configuration
@@ -26,26 +27,28 @@ the existing secret providers.
 
 Before this work is ready to merge for team use, a developer with authorized
 read access to the organization repository must be able to start from a clean
-agentic-perf installation, make the organization repository available at one
-configured root, and use the integrated subject without extra subject-specific
-setup. The repository is separate from the public agentic-perf checkout and is
-maintained by the organization.
+agentic-perf installation, configure the repository URL once, and use the
+integrated subject without manual cloning or extra subject-specific setup. The
+repository is separate from the public agentic-perf checkout and is maintained
+by the organization.
 
 The acceptance check must verify that one `skill_gateway.organization.source`
 setting discovers the repository's subjects and their paired documents and
 service configuration. A clean Crucible ticket must obtain its organization
 context through the gateway. The developer must not need to copy private
 documents into `private-skills`, add per-subject source entries, edit prompts,
-or obtain undocumented instructions from the administrator. Setup instructions
-must state how the private repository is made available to the configured path
-and what access the developer needs; credentials must not be stored in the
-agentic-perf config file.
+or obtain undocumented instructions from the administrator. The Git URL and
+ref are configured once; credentials, when needed, are referenced from the
+existing secrets provider and never stored in agentic-perf configuration.
 
-This release implements a filesystem source, so the repository may be cloned
-or mounted at the configured root. It does not fetch an authenticated Git URL
-itself. Team onboarding is not complete until the private repository is hosted
-in an organization-controlled location, read access is available to another
-developer, and the clean-install acceptance check succeeds.
+For SSH URLs, the source uses the existing OpenSSH identity and known-hosts
+configuration with strict host-key checking. An administrator may instead
+reference an SSH private-key secret. HTTPS token authentication uses a secret
+reference and a short-lived askpass helper; credentials are not placed in the
+URL, process arguments, Git configuration, or logs. Team onboarding is not
+complete until the private repository is hosted in an organization-controlled
+location, read access is available to another developer, and the clean-install
+acceptance check succeeds.
 
 ```mermaid
 flowchart LR
@@ -152,15 +155,23 @@ relevance within that scope; authorization is enforced separately.
 
 ## Administrator configuration
 
-Configure one organization repository root for the instance:
+Configure one organization source for the instance. A local path remains
+available for development; a Git URL lets a new developer configure the shared
+private repository directly:
 
 ```json
 {
   "skill_gateway": {
     "organization": {
       "source": {
-        "kind": "path",
-        "path": "/srv/agentic-perf/organization"
+        "kind": "git",
+        "url": "https://git.example.com/performance/organization-skills.git",
+        "ref": "main",
+        "auth": {
+          "kind": "https-token",
+          "username": "oauth2",
+          "secret_ref": "organization/agentic-perf-skills-read-token"
+        }
       }
     }
   }
@@ -184,11 +195,12 @@ service configuration unless a non-null one is explicitly supplied, which is an
 invalid conflict. These are binding overrides, not merges of settings values.
 The repository's `organization.required` policy defaults to `true`.
 
-The administrator configures the root once for the instance. All worker processes
-must have read access to the configured source. The service reads the source;
-ordinary ticket submissions and user settings cannot replace this configuration.
-If a shared path is used across workers, deployment tooling is responsible for
-making the same revision available to them.
+The administrator configures the source once for the instance. All workers fetch
+the configured branch and resolve it to a commit before discovering subjects.
+The service reads the source; ordinary ticket submissions and user settings
+cannot replace this configuration. Local-path sources must be readable by all
+workers. Git checkouts are held in a private service cache outside ticket
+workspaces.
 
 An explicitly configured required source that is missing, unreadable, invalid,
 or inconsistent with its declared subject is an error before the affected
@@ -199,13 +211,22 @@ source is a distinct state. A fresh installation
 can retrieve available software documentation without an organization package;
 operations requiring organization runtime settings report missing configuration.
 
-A source interface should describe, snapshot, list, read, and search material.
-Later, a repository implementation can use a configured URL, ref, and credential
-reference. Private repository access must support authentication. Organization
-sources use administrator-managed credentials; future user sources use the
-appropriate user's credentials. Credentials and physical locations stay in
-server-side diagnostics and provenance. A remote source must not reintroduce
-cloning or refreshing Crucible repositories during catalog discovery.
+The Git source accepts HTTPS URLs, `ssh://` URLs, and standard
+`user@host:path` SSH clone URLs, with branch refs. It rejects embedded HTTPS
+credentials, query strings, fragments, and other URL schemes. HTTPS tokens and
+optional SSH private keys use administrator-managed secret references from the
+existing secrets provider. A private-key secret must be usable
+non-interactively; passphrase-protected keys can use the existing SSH agent.
+SSH may instead use the service account's existing OpenSSH identity/agent and
+known-hosts file; strict host-key checking is enabled. The local cache stores
+mirrors and independent,
+immutable commit checkouts under service storage with restricted directory
+permissions. Each agent provider initialization refreshes the configured
+branch; the exact commit and content snapshot stay server-side, and existing
+ticket pins remain stable. Git source discovery is deferred by offline
+`config show`; the first provider initialization reports fetch or authentication
+failures as required source errors. A remote skill source does not clone
+Crucible software repositories during catalog discovery.
 
 ## Organization repository and packages
 
@@ -390,7 +411,7 @@ account for validations and approvals that relied on previous settings.
 
 Adding a document/configuration counterpart under the same repository root
 affects new captures; existing tickets retain their pinned snapshot. Changing
-an explicit source path or repository root is an error for an existing pin.
+an explicit source binding or Git URL/ref is an error for an existing pin.
 Removing a pinned subject's binding reports unavailable rather than selecting
 legacy settings for that ticket.
 
@@ -523,26 +544,20 @@ one canonical config source; do not silently deep-merge a new organization
 package with stale legacy settings. Any temporary legacy fallback is explicit
 and reported in diagnostics.
 
-## Implementation sequence and acceptance
+## Implementation status and rollout acceptance
 
-Before implementation, complete the content inventory above, agree on ownership,
-and identify upstream documentation work and any temporary compatibility needs.
+This local review draft implements the path and Git organization sources,
+subject discovery, gateway retrieval, and Crucible software adapter described
+above. Git accepts HTTPS and SSH branch URLs. Authentication can use the
+existing OpenSSH identity/agent, an HTTPS token secret reference, or an SSH key
+secret reference. Git fetches run through the audited subprocess provider;
+cache checkouts are independent of the mutable mirror, and ticket snapshots
+retain their pinned content. Configuration diagnostics validate Git descriptors
+offline and report only the host, ref, and authentication method. Runtime
+activation, a hosted private organization repository, and team onboarding remain
+pending review.
 
-1. Define subject, binding, package manifest, document reference, and resolver
-   contracts. Add the path source and a Crucible software adapter around the
-   active controller gateway. Preserve bounded catalog discovery.
-2. Add administrator configuration and shared gateway registration. Generalize
-   workspace keys/manifests and pin organization revisions across phases.
-3. If runtime configuration is included, route existing Crucible config consumers
-   through the package resolver with validated service-only resources. Retain
-   the secret-resolution boundary and an explicit legacy transition.
-4. Prepare the external Crucible organization package and reconcile current
-   guidance. Cut over Crucible prompts and tools, including provisioning and
-   review. Leave generic agent reasoning and code-enforced invariants in place.
-5. Complete focused contract tests and isolated integration checks, then make
-   the organization package and config change reviewable before deployment.
-
-Required checks for implementation include:
+Required checks before team rollout include:
 
 - Configure once, and obtain the same organization subject/revision for tickets
   from different users; model-supplied identity or paths cannot alter the source.
@@ -563,10 +578,23 @@ Required checks for implementation include:
   document responses, document searches, and model-readable snapshots.
 - Check audit/side-effect inventories and ensure other harnesses retain their
   existing prompt, tool, and private-config behavior.
+- Accept valid HTTPS and SSH branch sources; reject embedded HTTPS credentials,
+  URL queries/fragments, unsupported protocols, malformed refs, and unknown
+  authentication fields without exposing credential values.
+- Resolve HTTPS token and SSH key secret references through the existing
+  secrets provider, and use strict host-key checking with the default SSH
+  identity/agent path. Confirm tokens and key contents do not enter logs,
+  subprocess arguments, Git configuration, or model-readable context.
+- Confirm concurrent initialization shares a safe cache, checkouts do not
+  depend on mutable mirror objects, branch advances are visible to new tickets,
+  and existing ticket pins remain stable.
+- Confirm `config show` does not fetch Git data or reveal the full URL or secret
+  reference.
 
-Planning work does not require starting services, touching the current private
-runtime files, or running tests. The implementation checks above are proposed
-acceptance criteria for the subsequent code change.
+These acceptance checks are not a claim that live Git credentials or a hosted
+organization repository have been validated. The private package remains in a
+local repository pending organization hosting and another developer's clean
+installation check.
 
 ## Initial implementation boundaries
 
@@ -582,7 +610,7 @@ software adapter semantics. Scope a paged organization search with `from_ref`
 and use that source's returned cursor; controller search is bounded discovery
 without a continuation cursor.
 
-Local administrator paths are implemented. Git sources, authenticated user
-packages, project packages, user-specific overrides, and credential distribution
-are future work. Existing secret references remain consumed by deterministic
-services; this slice does not introduce a secrets gateway.
+Local administrator paths and organization Git sources are implemented in this
+draft. Authenticated user packages, project packages, and user-specific
+overrides remain future work. Git credentials use the existing secrets provider;
+this slice does not introduce a secrets gateway.
