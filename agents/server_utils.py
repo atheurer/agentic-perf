@@ -93,6 +93,7 @@ def build_skill_provider(
     resolve_source: bool = True,
     catalog_only: bool = False,
     arcaflow_mcp_client: Any | None = None,
+    skill_phase: str = "",
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -137,17 +138,20 @@ def build_skill_provider(
             build_crucible_context_gateway(catalog_only=True)
         )
 
+    private = PrivateSkillProvider()
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if ticket_id:
+        phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
+        private.bind_attempt(ticket_id, "initial", phase)
+
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
     else:
-        private = PrivateSkillProvider()
         zathras_tests = private._load_config("zathras").get("tests")
         if zathras_tests:
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
 
-    return MultiHarnessSkillProvider(
-        harnesses, PrivateSkillProvider(), default_harness="crucible"
-    )
+    return MultiHarnessSkillProvider(harnesses, private, default_harness="crucible")
 
 
 def build_crucible_context_gateway(
@@ -362,7 +366,7 @@ def _emit_context_audit_event(
     emit_private_tool_audit_event(
         ticket_id,
         agent_name=agent_name,
-        tool_name="get_crucible_benchmark_context",
+        tool_name="get_skill_context",
         event_type="context_resolution",
         data={key: value for key, value in data.items() if value is not None},
     )
@@ -880,6 +884,7 @@ async def controller_context_gateway(
             ssh=ssh,
             controller_host=controller_host,
             query=query,
+            max_bytes=max_bytes,
         )
     else:
         result = {
@@ -1799,6 +1804,15 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
                 "harness": harness,
                 "filename": filename,
                 "message": "Invalid path",
+            }
+        if resolved.is_relative_to((skills_dir / "crucible").resolve()):
+            return {
+                "found": False,
+                "harness": "crucible",
+                "message": (
+                    "Use get_skill_context(subject='harness/crucible') for "
+                    "organization guidance and authoritative software references."
+                ),
             }
     except (OSError, ValueError):
         return {
