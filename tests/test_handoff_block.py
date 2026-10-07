@@ -345,3 +345,38 @@ def test_handoff_block_suppression_expires_after_hitl_resume() -> None:
     # When the user resumes to the original stage, it is eligible for retry.
     dispatcher.reconcile_handoff_blocked({ticket_id: source_status})
     assert not dispatcher.is_handoff_blocked(ticket_id, source_status)
+
+
+class TestFleetExhaustionBypassesHandoff:
+    """Fleet-exhausted tickets must pass the evaluating_convergence check
+    even without benchmark results (#1139)."""
+
+    def test_fleet_exhausted_bypasses_benchmark_check(self):
+        from orchestrator.handoff import check_handoff
+
+        ticket = {
+            "custom_fields": {
+                "fleet_investigation": {
+                    "enabled": True,
+                    "tested_hosts": [
+                        {"host_id": "board-01", "status": "partial"},
+                    ],
+                    "fleet_exhausted": {"soft": True},
+                },
+                # No run_id or benchmark_status — would normally block
+            },
+        }
+        ok, reason = check_handoff("evaluating_convergence", ticket)
+        assert ok, f"Fleet-exhausted ticket should pass handoff: {reason}"
+
+    def test_non_fleet_still_requires_benchmark(self):
+        from orchestrator.handoff import check_handoff
+
+        ticket = {
+            "custom_fields": {
+                # No fleet_investigation, no run_id, no benchmark_status
+            },
+        }
+        ok, reason = check_handoff("evaluating_convergence", ticket)
+        assert not ok
+        assert "benchmark" in reason.lower()

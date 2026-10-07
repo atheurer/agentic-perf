@@ -785,6 +785,30 @@ class ResourceAgent(AgentBase):
                 provider_metadata or reservation_metadata
             )
 
+        # Guard: managed providers require metadata from
+        # reserve_resources for downstream handoff.  The LLM
+        # may submit without calling reserve_resources, or may
+        # copy directives into the metadata field instead of
+        # the actual reservation result.  Validate that the
+        # metadata contains fields that only come from a real
+        # reservation (#1128).
+        rp = fields.get("resource_provider", "")
+        meta = fields.get("resource_provider_metadata") or {}
+        if rp and rp != "user_provided":
+            # These fields are set by the provider's reserve()
+            # method, never by directives or LLM reasoning.
+            has_reservation_fields = meta.get("lease_id") or meta.get("reservation_id")
+            if not has_reservation_fields:
+                await self._add_comment(
+                    ticket_id,
+                    "**Resource submission rejected:** The provider "
+                    "metadata is missing reservation fields "
+                    "(lease_id or reservation_id). You must call "
+                    "`reserve_resources` and include its result. "
+                    "Do not copy directives into metadata.",
+                )
+                return
+
         if reservation_metadata.get("ssh_user"):
             fields["ssh_user"] = reservation_metadata["ssh_user"]
         if reservation_metadata.get("ssh_key_path"):
