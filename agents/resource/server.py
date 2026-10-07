@@ -54,6 +54,16 @@ _registry = None
 # Set by check_available_resources, read by reserve_resources.
 _fleet_next_device: str | None = None
 
+# Guardrail: set to True after reserve_resources succeeds.
+# Prevents the LLM from looping through discovery calls
+# instead of calling submit_resource_result (#1128).
+_resources_allocated: bool = False
+
+# Track consecutive reservation failures so we can produce a
+# structured response instead of burning iterations (#1128).
+_reservation_failures: int = 0
+_MAX_RESERVATION_FAILURES: int = 3
+
 # Accumulates provider metadata across multiple reserve_resources calls
 # (e.g., separate calls for controller and endpoints).
 _last_reservation: dict[str, Any] = {}
@@ -241,6 +251,14 @@ async def parse_host_config(text: str) -> str:
 @mcp.tool()
 async def list_resource_providers() -> str:
     """List resource providers that are configured and available. Returns provider names and types (bare_metal, cloud). Call this first if no resource_provider directive is set."""
+    if _resources_allocated:
+        return json.dumps(
+            {
+                "error": "Resources already allocated. "
+                "Call submit_resource_result to complete.",
+                "already_allocated": True,
+            }
+        )
     await _ensure_init()
     providers = await _registry.list_configured_providers()
     return json.dumps(
@@ -258,6 +276,14 @@ async def check_available_resources(
     required_hosts: list[dict] | None = None,
 ) -> str:
     """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
+    if _resources_allocated:
+        return json.dumps(
+            {
+                "error": "Resources already allocated. "
+                "Call submit_resource_result to complete.",
+                "already_allocated": True,
+            }
+        )
     await _ensure_init()
     prov = await _registry.get_provider(provider)
 
@@ -456,6 +482,33 @@ async def reserve_resources(
     result = await prov.reserve(
         selection, description, duration_hours, ticket_id=ticket_id
     )
+
+    # Mark resources as allocated so discovery tools are blocked (#1128).
+    # The flag is set when the reservation succeeds (no error key or
+    # explicit success status).  Multi-call reservations (controller +
+    # endpoints) still work because reserve_resources itself is not
+    # blocked — only discovery tools are.
+    global _resources_allocated, _reservation_failures
+    if not result.get("error"):
+        _resources_allocated = True
+        _reservation_failures = 0
+    else:
+        _reservation_failures += 1
+        if _reservation_failures >= _MAX_RESERVATION_FAILURES:
+            result["repeated_failure"] = True
+            result["message"] = (
+                f"Reservation failed {_reservation_failures} consecutive "
+                f"times. The requested boards may be transiently "
+                f"unavailable (leased by other users). Call "
+                f"submit_resource_result with an error status, or "
+                f"retry later."
+            )
+        else:
+            result["retry_suggestion"] = (
+                "Reservation failed. Try reserving a different "
+                "board — do NOT call list_resource_providers or "
+                "check_available_resources again."
+            )
 
     # Accumulate provider_metadata across multiple reserve calls
     # (e.g., separate calls for controller and endpoints).
