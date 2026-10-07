@@ -6,6 +6,18 @@ optional — sensible defaults are used when a field is absent.
 The config path can be changed by setting the `AGENTIC_PERF_HOME`
 environment variable (defaults to `~/.agentic-perf`).
 
+The state store validates configuration before initializing its persistence
+lock, authentication, or writable backends. A malformed or unreadable existing
+file prevents startup. JSON syntax errors report the config path, parse reason,
+line, and column in the startup log without printing the file contents. The
+health endpoint and dashboard are unavailable until startup succeeds; fix the
+configuration and restart the service. An absent file uses secure defaults,
+including required bearer authentication and disabled anonymous reads.
+
+The config root and `auth` section must be JSON objects. `auth.multi_user` and
+`auth.anonymous_read` must be JSON booleans, and `auth.token_ttl_days` must be a
+non-negative integer.
+
 ### Live config updates
 
 The orchestrator re-reads `config.json` at each agent dispatch.
