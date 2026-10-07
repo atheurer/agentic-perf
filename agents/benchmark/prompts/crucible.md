@@ -114,7 +114,8 @@ f. **Choose remote hosts from verified SSH reachability.** For
 - For `remotehosts`, use the controller-verified SSH address in each
   remote's `config.host`; do not use a dataplane address unless it
   has independently been verified as the controller's SSH access path.
-- `tags` must be an object `{"key": "val"}`, NOT an array
+- `tags` is a required top-level object; use `{}` when no tags apply.
+  When present, it must be an object such as `{"key": "val"}`, NOT an array.
 - `ids` values must be strings: `"1"` not `1`
 - Do NOT set `controller-ip-address` unless crucible cannot resolve
   it itself. Setting the wrong IP breaks the run.

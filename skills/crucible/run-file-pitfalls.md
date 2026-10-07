@@ -11,6 +11,8 @@ validate it with `validate_benchmark`. Do not execute an unvalidated run file.
 ## General structural reminders
 
 - `benchmarks` and `endpoints` are top-level sections.
+- `tags` is a required top-level object. Use `{}` when there are no tags;
+  do not omit the key or use an array.
 - Every benchmark entry must include `mv-params` when required by the
   controller-sourced schema.
 - Tool arguments use the controller-sourced tool metadata format; do not invent

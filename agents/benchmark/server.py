@@ -48,6 +48,7 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from providers.skills.crucible import crucible_runfile_contract_errors
 
 logger = logging.getLogger(__name__)
 
@@ -2576,6 +2577,19 @@ async def execute_benchmark(
                 "message": "A runfile is required for this harness",
             }
         )
+    if harness_name == "crucible":
+        contract_errors = crucible_runfile_contract_errors(run_file)
+        if contract_errors:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "reason_code": "invalid_runfile_contract",
+                    "message": (
+                        f"Run-file failed schema validation: {contract_errors}"
+                    ),
+                }
+            )
 
     if run_command is not None:
         valid, reason = _validate_run_command(run_command, harness_name)
@@ -3974,6 +3988,17 @@ async def validate_benchmark(
                     f"Controller-side validation is not supported for harness "
                     f"'{harness_name}'"
                 ],
+            }
+        )
+
+    contract_errors = crucible_runfile_contract_errors(run_file)
+    if contract_errors:
+        return json.dumps(
+            {
+                "status": "invalid",
+                "valid": False,
+                "harness": harness_name,
+                "errors": contract_errors,
             }
         )
 

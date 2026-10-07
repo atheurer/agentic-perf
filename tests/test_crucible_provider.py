@@ -71,6 +71,69 @@ async def test_generate_runfile_with_tags(provider: CrucibleSkillProvider):
 async def test_generate_runfile_no_endpoints(provider: CrucibleSkillProvider):
     result = await provider.generate_runfile("fio", {})
     assert "endpoints" not in result.template
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_generate_runfile_defaults_tags_to_object():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    result = await provider.generate_runfile("uperf", {})
+
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_requires_object_tags_without_controller_schema():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    missing = await provider.validate_runfile({"benchmarks": []})
+    malformed = await provider.validate_runfile({"benchmarks": [], "tags": ["network"]})
+
+    assert missing == {
+        "valid": False,
+        "errors": ["missing required top-level key: tags"],
+    }
+    assert malformed == {
+        "valid": False,
+        "errors": ["top-level tags must be an object"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_runfile_schema_requires_tags_without_mutating_source(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    schema = await provider.get_runfile_schema()
+
+    assert schema["properties"]["tags"] == {"type": "object"}
+    assert schema["required"] == ["benchmarks", "tags"]
+    assert "tags" not in source_schema["properties"]
+    assert source_schema["required"] == ["benchmarks"]
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_uses_required_tags_schema_copy(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+        "additionalProperties": False,
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    validation = await provider.validate_runfile({"benchmarks": [], "tags": {}})
+
+    assert validation["valid"] is True
+    assert source_schema["required"] == ["benchmarks"]
+    assert "tags" not in source_schema["properties"]
 
 
 @pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")

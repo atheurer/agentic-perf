@@ -119,7 +119,7 @@ async def test_validate_benchmark_validates_on_controller_without_execution(hand
     )
     result = await handlers["validate_benchmark"](
         controller="10.0.0.1",
-        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}]},
+        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}], "tags": {}},
         harness="crucible",
     )
 
@@ -152,13 +152,35 @@ async def test_validate_benchmark_returns_structured_controller_errors():
         ),
     )
     result = await handlers["validate_benchmark"](
-        controller="10.0.0.1", run_file={"bad": True}, harness="crucible"
+        controller="10.0.0.1",
+        run_file={"bad": True, "tags": {}},
+        harness="crucible",
     )
 
     assert result["status"] == "invalid"
     assert result["valid"] is False
     assert result["errors"] == ["invalid endpoint schema"]
     assert result["exit_code"] == 2
+
+
+@pytest.mark.asyncio
+async def test_validate_benchmark_rejects_missing_tags_before_controller_io():
+    ssh = MockSSHExecutor()
+    handlers = make_benchmark_handlers(
+        ssh=ssh,
+        skill_provider=MockSkillProvider(),
+    )
+
+    result = await handlers["validate_benchmark"](
+        controller="10.0.0.1",
+        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}]},
+        harness="crucible",
+    )
+
+    assert result["status"] == "invalid"
+    assert result["valid"] is False
+    assert result["errors"] == ["missing required top-level key: tags"]
+    assert ssh.calls == []
 
 
 @pytest.mark.asyncio
@@ -263,7 +285,7 @@ async def test_crucible_missing_result_summary_marks_failed():
         validation_id=(
             await h["validate_benchmark"](
                 controller="test-host",
-                run_file={"benchmarks": []},
+                run_file={"benchmarks": [], "tags": {}},
                 harness="crucible",
             )
         )["validation_id"],
@@ -292,7 +314,7 @@ async def test_crucible_with_result_summary_marks_completed():
         validation_id=(
             await h["validate_benchmark"](
                 controller="test-host",
-                run_file={"benchmarks": []},
+                run_file={"benchmarks": [], "tags": {}},
                 harness="crucible",
             )
         )["validation_id"],

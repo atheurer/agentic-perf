@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,35 @@ KEYWORD_MAP = {
 }
 
 SKIP_RICKSHAW_KEYS = {"rickshaw-benchmark", "benchmark", "controller"}
+
+
+def crucible_runfile_contract_errors(run_file: dict[str, Any]) -> list[str]:
+    """Return deterministic violations of Crucible's required top-level fields."""
+    if "tags" not in run_file:
+        return ["missing required top-level key: tags"]
+    if not isinstance(run_file["tags"], dict):
+        return ["top-level tags must be an object"]
+    return []
+
+
+def crucible_runfile_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add agentic-perf's required tags contract to a controller schema copy."""
+    effective_schema = deepcopy(schema)
+    properties = effective_schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+        effective_schema["properties"] = properties
+    tags_schema = properties.get("tags")
+    if not isinstance(tags_schema, dict):
+        tags_schema = {}
+    tags_schema["type"] = "object"
+    properties["tags"] = tags_schema
+
+    required = effective_schema.get("required", [])
+    if not isinstance(required, list):
+        required = []
+    effective_schema["required"] = list(dict.fromkeys([*required, "tags"]))
+    return effective_schema
 
 
 def select_crucible_context(
@@ -1489,8 +1519,8 @@ class CrucibleContextGateway:
             else:
                 self._build_remotehosts_endpoints(template, params, endpoints)
 
-        if params.get("tags"):
-            template["tags"] = params["tags"]
+        tags = params.get("tags", template.get("tags"))
+        template["tags"] = {} if tags is None else tags
 
         if "tool-params" not in template:
             template["tool-params"] = [
@@ -1608,7 +1638,8 @@ class CrucibleContextGateway:
             return None
 
     async def get_runfile_schema(self) -> dict[str, Any] | None:
-        return self._load_schema()
+        schema = self._load_schema()
+        return crucible_runfile_schema(schema) if schema is not None else None
 
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
         meta = self._load_benchmark_meta(benchmark)
@@ -1633,7 +1664,12 @@ class CrucibleContextGateway:
     async def validate_runfile(
         self, run_file: dict[str, Any], harness: str | None = None
     ) -> dict[str, Any]:
-        schema = self._load_schema()
+        contract_errors = crucible_runfile_contract_errors(run_file)
+        if contract_errors:
+            return {"valid": False, "errors": contract_errors}
+
+        raw_schema = self._load_schema()
+        schema = crucible_runfile_schema(raw_schema) if raw_schema is not None else None
         if schema is None:
             return {
                 "valid": True,
