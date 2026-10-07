@@ -7,6 +7,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
@@ -510,10 +511,13 @@ class ProvisioningAgent(AgentBase):
             directives, getattr(self, "_skill_provider", None)
         )
 
+        # Cloud access requirements for this subject are configured guidance;
+        # provider fragments must not duplicate them or SSH phase ownership.
+        gateway_cloud_access = harness == "crucible" and provider == "aws"
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
-            resource_provider=provider,
-            endpoint_type=endpoint,
+            resource_provider=None if gateway_cloud_access else provider,
+            endpoint_type=None if harness == "crucible" else endpoint,
         )
 
         # Load harness-specific provisioning fragment.
@@ -523,6 +527,22 @@ class ProvisioningAgent(AgentBase):
         )
 
         prompt = PROVISIONING_BASE_PROMPT
+        if harness == "crucible":
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
+        if gateway_cloud_access:
+            prompt += (
+                "\n\n## Provisioning Access Contract\n\n"
+                "Before installation, verify that the ticket's current SSH "
+                "account can perform the operations required by the approved "
+                "settings and software documentation. If account setup is "
+                "needed, use an available authorized bootstrap tool and "
+                "verify access before continuing. Do not assume a tool's "
+                "user argument changes its ticket-bound SSH context. If "
+                "the required access cannot be established with available "
+                "tools, request clarification and report the missing "
+                "capability. Controller-to-endpoint key setup remains the "
+                "benchmark phase's responsibility."
+            )
         if harness_fragment:
             prompt += f"\n\n{harness_fragment}"
         if fragments:

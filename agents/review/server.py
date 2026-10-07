@@ -32,6 +32,12 @@ from agents.server_utils import (
     read_skill_documents,
     ticket_controller_host,
 )
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +60,7 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider()
+    _skill_provider = build_skill_provider(skill_phase="review")
     _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = await build_repo_cache()
@@ -68,14 +74,44 @@ async def _ensure_init():
 # ---------------------------------------------------------------------------
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    return await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="review-agent",
+        phase="review",
+        ssh=_ssh,
+        controller_host=ticket_controller_host(_ticket),
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
+
+
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'crucible', 'filename': 'result-parsing.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
+    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'zathras', 'filename': 'local-config-guide.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
     return json.dumps(read_skill_documents(SKILLS_DIR, docs))
 
 
-@mcp.tool(name="get_crucible_benchmark_context")
 async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
@@ -164,6 +200,13 @@ async def get_crucible_benchmark_context(*args, **kwargs) -> str:
 async def list_harness_docs(harness: str) -> str:
     """List documentation files available for a benchmark harness. Use this to discover reference material about result formats and interpretation."""
     await _ensure_init()
+    if harness == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     if not _repo_cache:
         return json.dumps({"status": "error", "message": "No repo cache configured"})
     docs = _repo_cache.list_docs(harness, subdirs=["docs", "config"])
@@ -178,6 +221,13 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
         return json.dumps({"status": "error", "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
+    if harness == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps({"status": "not_found", "harness": harness, "path": doc_path})
@@ -602,9 +652,27 @@ async def compare_results(
 
 @mcp.tool()
 async def get_review_config(harness_name: str) -> str:
-    """Get the review/results-retrieval configuration for a benchmark harness. Returns how to find and interpret results for this harness — result storage method, directory paths, API details, and guidance notes. Call this first to learn how to access results for the harness that ran the benchmark."""
+    """Get review/results-retrieval settings for the benchmark harness. Crucible returns approved method, port, and result-location fields; read interpretation guidance through get_skill_context. Check ticket artifacts before retrieving remote results."""
     await _ensure_init()
 
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            review = await skill_config_view(
+                _skill_provider, harness_name, "review", "review"
+            )
+        except Exception:
+            return json.dumps(
+                {"status": "error", "reason": "configuration_view_unavailable"}
+            )
+        return json.dumps(
+            {
+                "status": "ok" if review else "no_review_config",
+                "harness": harness_name,
+                "review_config": review,
+            }
+        )
     if not _skill_provider:
         return json.dumps(
             {

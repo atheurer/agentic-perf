@@ -8,6 +8,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
@@ -553,7 +554,14 @@ class TriageAgent(AgentBase):
             self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return TRIAGE_SYSTEM_PROMPT
+        return (
+            TRIAGE_SYSTEM_PROMPT
+            + "\n\nApply the following subject context instructions when the "
+            "request selects Crucible or catalog discovery selects that harness. "
+            "Keep using the typed catalog tools for benchmark discovery; "
+            "triage does not require a prepared controller.\n\n"
+            + skill_context_prompt("harness/crucible")
+        )
 
     def _has_external_data_tools(self) -> bool:
         """Check if external MCP data tools are configured."""
