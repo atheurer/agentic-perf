@@ -28,6 +28,49 @@ these terms to the correct `image_name` and `image_type`:
 | "qa image", "qa build" | `qa` | `regular` | QA test variant |
 | "fusa", "fusa-minimal" | `fusa-minimal` | `ostree` | Functional safety minimal |
 
+## EBBR (EFI Boot for Embedded Base)
+
+EBBR is a boot specification, not an image name or type. It
+describes how the board's firmware boots the OS — using UEFI
+standards for embedded systems. Multiple board families use
+EBBR, including NXP S32G and Renesas R-Car S4; others will
+in the future.
+
+When a user mentions "EBBR" (in directives, description, or
+conversation), they are indicating they want an EBBR-compatible
+image for their target board. This is valid intent but does
+not map directly to `image_name` or `image_type`:
+
+- EBBR boards can use both `ostree` and `regular` images
+- The EBBR distinction is in the release path (images are
+  published under an `EBBR/` directory), not in the catalog
+  variant name
+- For all currently known EBBR boards, the default image
+  resolution already selects the correct EBBR image
+
+Users may reference EBBR anywhere — in directives (e.g.,
+`image_name: "ebbr"`), in the ticket description, or in
+conversation. However it appears, "ebbr" is not a catalog
+variant and must not be passed literally to the image
+resolver. Instead:
+
+1. Recognize the user's intent to use an EBBR-compatible
+   image for their target board
+2. Use the appropriate `image_name` for the board (e.g.,
+   `ps` for ostree, `qa` for regular/package)
+3. Preserve whatever `image_type` the user specified
+4. If no `image_type` is specified, use the default for
+   the board
+
+If the user explicitly asks for "EBBR ostree" or "EBBR
+package mode", map accordingly:
+
+| User says | image_name | image_type |
+|---|---|---|
+| "EBBR", "EBBR image" | *(default for board)* | *(default for board)* |
+| "EBBR ostree" | `ps` | `ostree` |
+| "EBBR package", "EBBR regular" | `qa` | `regular` |
+
 ## Defaults
 
 When the user does not specify an image mode:

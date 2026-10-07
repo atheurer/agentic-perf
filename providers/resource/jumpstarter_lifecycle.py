@@ -276,8 +276,12 @@ async def resolve_images(
         if cf.get("resource_provider") != "jumpstarter":
             return
 
-        # Already resolved?
-        if cf.get("jumpstarter_flash"):
+        # Already resolved?  Skip only if the previous result was
+        # successful.  An error result (e.g. from a prior failed
+        # attempt) must NOT block re-resolution after the user
+        # corrects the directives.  See #1119.
+        flash = cf.get("jumpstarter_flash", {})
+        if flash and not flash.get("error"):
             return
 
         # Custom CAIB build: use the built image instead

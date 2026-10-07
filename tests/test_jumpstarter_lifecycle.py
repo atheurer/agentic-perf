@@ -99,3 +99,65 @@ async def test_image_version_suffix_and_string_fields_are_normalized(monkeypatch
     assert resolved["image_name"] == "developer-vm"
     assert resolved["image_type"] == "ostree"
     assert len(patches) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_error_does_not_block_re_resolution(monkeypatch):
+    """Regression test for #1119: a previous error in jumpstarter_flash
+    must not prevent re-resolution on retry."""
+    ticket = {
+        "custom_fields": {
+            "resource_provider": "jumpstarter",
+            "jumpstarter_flash": {
+                "error": "No OS image version specified.",
+            },
+            "directives": {
+                "image_version": "AutoSD-10",
+                "image_name": "developer-vm",
+            },
+        }
+    }
+    patches = _install_http_client(monkeypatch, ticket)
+    resolved = {}
+
+    async def resolve_image_urls(**kwargs):
+        resolved.update(kwargs)
+        return {"flash_targets": [{"partition": "default", "url": "https://img"}]}
+
+    monkeypatch.setattr(jumpstarter_images, "resolve_image_urls", resolve_image_urls)
+
+    await jumpstarter_lifecycle.resolve_images(
+        "https://store",
+        "PERF-TEST",
+        image_config={"server": "https://images.example/"},
+    )
+
+    # Should have proceeded to resolve (not returned early)
+    assert resolved.get("image_version") == "AutoSD-10"
+    # Should have stored a new (successful) result
+    assert len(patches) == 1
+    flash = patches[0]["fields"]["jumpstarter_flash"]
+    assert "error" not in flash
+
+
+@pytest.mark.asyncio
+async def test_successful_flash_result_skips_re_resolution(monkeypatch):
+    """A successful jumpstarter_flash should still cause early return."""
+    ticket = {
+        "custom_fields": {
+            "resource_provider": "jumpstarter",
+            "jumpstarter_flash": {
+                "flash_targets": [{"partition": "default", "url": "https://img"}],
+                "flash_command": "j storage flash https://img",
+            },
+            "directives": {
+                "image_version": "AutoSD-10",
+            },
+        }
+    }
+    patches = _install_http_client(monkeypatch, ticket)
+
+    await jumpstarter_lifecycle.resolve_images("https://store", "PERF-TEST")
+
+    # Should return early — no patches written
+    assert len(patches) == 0
