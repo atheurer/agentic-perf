@@ -924,6 +924,8 @@ class WorkspaceManager:
     # Prevents single-line JSON files from returning the
     # entire file as one match.
     _GREP_LINE_LIMIT = 1000
+    # Bound parsing and reformatting, which can expand compact JSON in memory.
+    _COMPACT_JSON_PARSE_MAX_CHARS = 4 * 1024 * 1024
     # Maximum total size of grep output in characters.
     _GREP_OUTPUT_LIMIT = 16_000
 
@@ -965,10 +967,14 @@ class WorkspaceManager:
 
         # Detect compact / minified JSON: very few lines but large content.
         # Pretty-print so grep returns individual fields, not the whole blob.
+        if path.suffix == ".json" and len(lines) <= 5:
+            candidate_chars = sum(len(line) for line in lines)
+        else:
+            candidate_chars = 0
         if (
-            path.suffix == ".json"
-            and len(lines) <= 5
-            and sum(len(line) for line in lines) > self._GREP_LINE_LIMIT
+            self._GREP_LINE_LIMIT
+            < candidate_chars
+            <= self._COMPACT_JSON_PARSE_MAX_CHARS
         ):
             try:
                 parsed = json.loads("".join(lines))

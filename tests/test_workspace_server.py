@@ -100,6 +100,32 @@ async def test_mcp_grep_compact_json_multiple_matches(ws_env):
     assert resp["total_matches"] >= 3
 
 
+def test_workspace_grep_skips_reformat_for_oversized_compact_json(ws_env, monkeypatch):
+    """Files over the parse cap still use ordinary bounded grep behavior."""
+    import providers.workspace.manager as manager_module
+
+    parse_limit = WorkspaceManager._COMPACT_JSON_PARSE_MAX_CHARS
+    padding = "x" * (parse_limit + 1)
+    compact = json.dumps({"needle": "oversized-match", "padding": padding})
+    assert len(compact) > parse_limit
+    ws_env.save_file("oversized.json", compact)
+    original_loads = json.loads
+
+    def reject_oversized_parse(value, *args, **kwargs):
+        if len(value) > parse_limit:
+            raise AssertionError("oversized compact JSON should not be parsed")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(manager_module.json, "loads", reject_oversized_parse)
+
+    result = ws_env.grep_file("workspace://oversized.json", "oversized-match")
+
+    assert result["status"] == "ok"
+    assert result["total_matches"] == 1
+    assert "oversized-match" in result["lines"][0]["content"]
+    assert result["lines"][0]["truncated"] is True
+
+
 async def test_mcp_grep_deep_compact_json_keeps_match_visible(ws_env):
     """Deep JSON indentation must not hide a matched value behind truncation."""
     compact = "[" * 1200 + '"deep-marker"' + "]" * 1200
