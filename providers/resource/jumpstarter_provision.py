@@ -404,7 +404,9 @@ async def _run_provision_steps(
         diag.append(f"Flash succeeded in {result.flash_duration_s:.0f}s")
     except Exception as exc:
         result.flash_duration_s = time.monotonic() - t0
-        diag.append(f"Flash failed: {exc}")
+        # Use repr() for ExceptionGroup/TaskGroup so sub-exception
+        # messages are visible in diagnostics, not just the group label.
+        diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {repr(exc)}")
         # Retry once
         logger.warning("[platform] Flash failed, retrying")
         diag.append("Retrying flash...")
@@ -414,7 +416,9 @@ async def _run_provision_steps(
             result.flash_duration_s = time.monotonic() - t0
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
-            diag.append(f"Flash retry failed: {exc2}")
+            diag.append(
+                f"Flash retry failed ({time.monotonic() - t0:.0f}s): {repr(exc2)}"
+            )
             result.diagnostics = diag
             return result
 
