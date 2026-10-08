@@ -15,7 +15,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from paths import AGENTIC_PERF_HOME
 from providers.execution import AuditedFilesystem, AuditedSubprocessRunner
@@ -86,20 +86,23 @@ def parse_git_source(source: object) -> _GitSourceConfig:
         scp_match = _SCP_GIT_URL.fullmatch(url)
         if scp_match:
             scp_path = scp_match.group("path")
+            # scp-style paths are literal input. Encode reserved characters
+            # before converting to ssh:// because Git URL-decodes that form.
+            encoded_scp_path = quote(scp_path, safe="/~")
             if scp_path.startswith("/"):
                 # SCP-style absolute paths remain absolute after conversion.
-                ssh_path = scp_path
+                ssh_path = encoded_scp_path
             elif scp_path.startswith("~"):
                 # Preserve explicit remote-home expansion (including ~user).
                 if scp_path == "~" or re.fullmatch(r"~[^/]+", scp_path):
                     raise GitSourceError(
                         "invalid_config", "Invalid organization Git source URL"
                     )
-                ssh_path = f"/{scp_path}"
+                ssh_path = f"/{encoded_scp_path}"
             else:
                 # A relative scp-style path is relative to the remote user's
                 # home. ssh:// needs an explicit /~/ path to retain that meaning.
-                ssh_path = f"/~/{scp_path}"
+                ssh_path = f"/~/{encoded_scp_path}"
             url = (
                 f"ssh://{scp_match.group('username')}@{scp_match.group('host')}"
                 f"{ssh_path}"

@@ -62,6 +62,16 @@ class _FileSecretsProvider(SecretsProvider):
             "default",
         ),
         (
+            {"kind": "git", "url": "git@git.example.org:team/%2Fskills.git"},
+            "ssh://git@git.example.org/~/team/%252Fskills.git",
+            "default",
+        ),
+        (
+            {"kind": "git", "url": "git@git.example.org:team/a:b@c;d.git"},
+            "ssh://git@git.example.org/~/team/a%3Ab%40c%3Bd.git",
+            "default",
+        ),
+        (
             {"kind": "git", "url": "git@git.example.org:/srv/team/skills.git"},
             "ssh://git@git.example.org/srv/team/skills.git",
             "default",
