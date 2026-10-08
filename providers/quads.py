@@ -203,23 +203,32 @@ class QuadsClient:
         return results
 
     async def create_assignment(
-        self, description: str, owner: str | None = None
+        self,
+        description: str,
+        owner: str | None = None,
+        os_name: str | None = None,
+        wipe: bool = True,
     ) -> dict[str, Any]:
+        assignment = {
+            "description": description,
+            "owner": owner or self.owner,
+            "qinq": 0,
+            "wipe": "true" if wipe else "false",
+        }
+        if os_name:
+            assignment["ostype"] = os_name
+
         r = await self._authed_request(
             "POST",
             "/api/v3/assignments/self",
-            json={
-                "description": description,
-                "owner": owner or self.owner,
-                "qinq": 0,
-                "wipe": "true",
-            },
+            json=assignment,
         )
         data = r.json()
         return {
             "id": data["id"],
             "cloud_name": data["cloud"]["name"],
             "ticket": data.get("ticket"),
+            "ostype": data.get("ostype"),
         }
 
     async def schedule_host(

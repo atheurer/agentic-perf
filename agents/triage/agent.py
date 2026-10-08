@@ -137,7 +137,11 @@ _LOCAL_TOOLS = [
                             },
                             "os": {
                                 "type": "string",
-                                "description": "OS requirement (e.g. 'RHEL9')",
+                                "description": (
+                                    "Requested OS title/version (e.g. 'RHEL 9.4' "
+                                    "or 'RHEL 10.1'); preserve the exact requested "
+                                    "version on every host that should use it."
+                                ),
                             },
                             "host": {
                                 "type": "string",
@@ -219,6 +223,15 @@ _LOCAL_TOOLS = [
                                 "Whether to clean up SSH keys and harness "
                                 "installations from hosts during teardown. "
                                 "Default: required."
+                            ),
+                        },
+                        "quads_wipe": {
+                            "type": "boolean",
+                            "description": (
+                                "Whether QUADS should reimage allocated hosts. "
+                                "Set false only when the user explicitly asks "
+                                "to preserve the existing OS or says not to wipe. "
+                                "Omit otherwise; QUADS defaults to wiping."
                             ),
                         },
                         "endpoint_type": {

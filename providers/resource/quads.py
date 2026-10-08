@@ -54,6 +54,18 @@ class QuadsResourceProvider(ResourceProvider):
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
         hostnames = selection["hostnames"]
+        if len(set(hostnames)) != len(hostnames):
+            return {
+                "status": "failed",
+                "reservation_id": "",
+                "hosts": [],
+                "ssh_user": "root",
+                "ssh_key_path": self._client.ssh_key_path,
+                "lease_expiration": None,
+                "provider": self.provider_name,
+                "provider_metadata": {},
+                "message": "QUADS reservation requires distinct hostnames",
+            }
         if len(hostnames) > 10:
             return {
                 "status": "failed",
@@ -67,8 +79,45 @@ class QuadsResourceProvider(ResourceProvider):
                 "message": "Max 10 hosts per QUADS assignment",
             }
 
+        os_name = selection.get("os")
+        if os_name is not None and (
+            not isinstance(os_name, str) or not os_name.strip()
+        ):
+            return {
+                "status": "failed",
+                "reservation_id": "",
+                "hosts": [],
+                "ssh_user": "root",
+                "ssh_key_path": self._client.ssh_key_path,
+                "lease_expiration": None,
+                "provider": self.provider_name,
+                "provider_metadata": {},
+                "message": "QUADS OS must be a non-empty operating-system title",
+            }
+
+        wipe = selection.get("wipe", True)
+        if not isinstance(wipe, bool):
+            return {
+                "status": "failed",
+                "reservation_id": "",
+                "hosts": [],
+                "ssh_user": "root",
+                "ssh_key_path": self._client.ssh_key_path,
+                "lease_expiration": None,
+                "provider": self.provider_name,
+                "provider_metadata": {},
+                "message": "QUADS wipe choice must be a boolean",
+            }
+
         logger.info(f"[quads-provider] Creating assignment: {description}")
-        assignment = await self._client.create_assignment(description)
+        assignment_options = {}
+        if os_name:
+            assignment_options["os_name"] = os_name.strip()
+        if "wipe" in selection:
+            assignment_options["wipe"] = wipe
+        assignment = await self._client.create_assignment(
+            description, **assignment_options
+        )
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
             f"cloud={assignment['cloud_name']}"
@@ -105,9 +154,19 @@ class QuadsResourceProvider(ResourceProvider):
                 "assignment_id": assignment["id"],
                 "cloud_name": assignment["cloud_name"],
                 "ticket": assignment.get("ticket"),
+                "ostype": assignment.get("ostype"),
+                "wipe": wipe,
                 "ssh_setup": ssh_result,
             },
-            "message": f"Reserved {len(hostnames)} hosts via QUADS",
+            "message": (
+                f"Reserved {len(hostnames)} hosts via QUADS"
+                + (
+                    f" with {assignment['ostype']}"
+                    if assignment.get("ostype")
+                    else ""
+                )
+                + (" (wiped)" if wipe else " (not wiped)")
+            ),
         }
 
     async def get_reservation_status(
