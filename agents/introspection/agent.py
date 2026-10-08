@@ -148,6 +148,16 @@ class IntrospectionAgent:
         """Request graceful shutdown of the observation loop."""
         self._stop_requested = True
 
+    def _remember_events(self, events: list[dict[str, Any]]) -> None:
+        """Append a cursor page and advance to its greatest event sequence."""
+        if not events:
+            return
+        self._all_events.extend(events)
+        self._last_seq = max(
+            (event.get("seq", self._last_seq) for event in events),
+            default=self._last_seq,
+        )
+
     async def close(self) -> None:
         """Clean up HTTP client."""
         await self._client.aclose()
@@ -236,12 +246,7 @@ class IntrospectionAgent:
                     _POLL_BATCH_SIZE,
                 )
 
-                if new_events:
-                    self._all_events.extend(new_events)
-                    self._last_seq = new_events[-1].get(
-                        "seq",
-                        self._last_seq,
-                    )
+                self._remember_events(new_events)
 
                 # Deterministic anomaly detection (runs even
                 # without new events so stale progress is caught).

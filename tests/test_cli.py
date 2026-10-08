@@ -48,6 +48,25 @@ def _args(message: str):
     )
 
 
+def test_read_events_advances_to_max_cursor_for_display_page(monkeypatch):
+    class FakeEventBus:
+        def get_events(self, ticket_id, *, since, limit):
+            assert ticket_id == "PERF-TEST"
+            assert since == 1
+            assert limit == 100_000
+            return [{"seq": 3}, {"seq": 2}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("providers.events.EventBus", FakeEventBus)
+
+    events, last_seq = cli._read_events("PERF-TEST", 1)
+
+    assert [event["seq"] for event in events] == [3, 2]
+    assert last_seq == 3
+
+
 def test_reply_resolves_pending_benchmark_approval(monkeypatch, capsys):
     approval_id = "apr-" + "a" * 32
     client = _FakeClient([{"approval_request_id": approval_id, "status": "pending"}])

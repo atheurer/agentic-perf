@@ -770,6 +770,19 @@ class TestSkillLoading:
 
 
 class TestIntrospectionAgent:
+    def test_remembers_max_cursor_across_chronologically_sorted_page(self) -> None:
+        agent = IntrospectionAgent(state_store_url="http://localhost:8090")
+        agent._last_seq = 1
+        events = [
+            _make_event(3, "tool_result"),
+            _make_event(2, "llm_request"),
+        ]
+
+        agent._remember_events(events)
+
+        assert agent._all_events == events
+        assert agent._last_seq == 3
+
     def test_builds_observation_with_anomalies(self) -> None:
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
