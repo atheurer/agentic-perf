@@ -83,7 +83,12 @@ def test_projection_distinguishes_activity_from_audit_records() -> None:
     }
 
 
-def test_backdated_trace_cannot_reorder_consumed_mixed_cursor(tmp_path: Path) -> None:
+def test_backdated_trace_sorts_chronologically(tmp_path: Path) -> None:
+    """A backdated event is placed at its chronological position.
+
+    Events are ordered by timestamp so that the reconstructed feed
+    reflects what actually happened (see #1077).
+    """
     ticket_id = "PERF-BACKDATED"
     logs = tmp_path / "logs"
     logs.mkdir()
@@ -91,14 +96,15 @@ def test_backdated_trace_cannot_reorder_consumed_mixed_cursor(tmp_path: Path) ->
     bus = EventBus(log_dir=logs)
     try:
         bus.emit(ticket_id, "new", "tool_called", {})
-        bus.get_events(ticket_id, limit=100)
         backdated = legacy_to_trace(ticket_id, "new", "tool_result", {}).model_copy(
             update={"occurred_at": datetime(1999, 1, 1, tzinfo=timezone.utc)}
         )
         bus._trace_store.insert_event(backdated)
-        unseen = bus.get_events(ticket_id, since=2, limit=100)
-        assert [event["event_type"] for event in unseen] == ["tool_result"]
-        assert unseen[0]["seq"] == 3
+        all_events = bus.get_events(ticket_id, since=0, limit=100)
+        types = [event["event_type"] for event in all_events]
+        # Backdated event (1999) sorts before legacy (2020) and live (~now)
+        assert types == ["tool_result", "llm_request", "tool_called"]
+        assert [event["seq"] for event in all_events] == [1, 2, 3]
     finally:
         bus.close()
 
@@ -240,6 +246,101 @@ def test_audit_legacy_history_respects_ticket_filter(tmp_path: Path) -> None:
         ]
     finally:
         audit.close()
+
+
+def test_events_sorted_by_timestamp_across_sources(tmp_path: Path) -> None:
+    """Events from legacy JSONL and the trace store are merged chronologically.
+
+    Regression test for #1077: events appeared in insertion order rather
+    than timestamp order, making it impossible to reconstruct the true
+    sequence of actions from the feed.
+    """
+    ticket_id = "PERF-CHRONO"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    # Write two legacy events out of chronological order relative to
+    # trace events we'll insert later.
+    jsonl = logs / f"{ticket_id}.jsonl"
+    records = [
+        {
+            "timestamp": "2024-06-01T10:00:00+00:00",
+            "ticket_id": ticket_id,
+            "agent": "a",
+            "event_type": "tool_called",
+            "data": {},
+        },
+        {
+            "timestamp": "2024-06-01T12:00:00+00:00",
+            "ticket_id": ticket_id,
+            "agent": "a",
+            "event_type": "tool_result",
+            "data": {},
+        },
+    ]
+    jsonl.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n",
+        encoding="utf-8",
+    )
+
+    bus = EventBus(log_dir=logs)
+    try:
+        # Insert a trace event whose timestamp falls between the two legacy events.
+        between = legacy_to_trace(ticket_id, "b", "llm_request", {}).model_copy(
+            update={"occurred_at": datetime(2024, 6, 1, 11, 0, tzinfo=timezone.utc)}
+        )
+        bus._trace_store.insert_event(between)
+
+        events = bus.get_events(ticket_id, since=0, limit=100)
+        timestamps = [e["timestamp"] for e in events]
+        assert timestamps == sorted(timestamps), (
+            f"Events are not in chronological order: {timestamps}"
+        )
+        assert [e["event_type"] for e in events] == [
+            "tool_called",
+            "llm_request",
+            "tool_result",
+        ]
+    finally:
+        bus.close()
+
+
+def test_event_order_key_sorts_by_timestamp() -> None:
+    """Unit test for the event_order_key sort function."""
+    from providers.event_projection import event_order_key
+
+    events = [
+        {"timestamp": "2024-06-01T12:00:00+00:00", "seq": 1, "schema_version": "v1"},
+        {"timestamp": "2024-06-01T10:00:00+00:00", "seq": 2, "schema_version": "v1"},
+        {
+            "timestamp": "2024-06-01T11:00:00+00:00",
+            "seq": 1,
+            "schema_version": "legacy_uncorrelated",
+        },
+    ]
+    sorted_events = sorted(events, key=event_order_key)
+    assert [e["timestamp"] for e in sorted_events] == [
+        "2024-06-01T10:00:00+00:00",
+        "2024-06-01T11:00:00+00:00",
+        "2024-06-01T12:00:00+00:00",
+    ]
+
+
+def test_same_timestamp_tiebreak_legacy_before_trace() -> None:
+    """When timestamps are equal, legacy events sort before trace events."""
+    from providers.event_projection import event_order_key
+
+    legacy = {
+        "timestamp": "2024-06-01T10:00:00+00:00",
+        "seq": 5,
+        "schema_version": "legacy_uncorrelated",
+    }
+    trace = {
+        "timestamp": "2024-06-01T10:00:00+00:00",
+        "seq": 1,
+        "schema_version": "v1",
+    }
+    assert event_order_key(legacy) < event_order_key(trace)
 
 
 def test_production_sources_do_not_append_per_ticket_jsonl() -> None:

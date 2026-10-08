@@ -102,14 +102,18 @@ def trace_to_audit(event: TraceEventV1) -> dict[str, Any] | None:
     }
 
 
-def event_order_key(event: dict[str, Any]) -> tuple[int, int]:
-    """Use immutable source identity and sequence, never mutable wall time.
+def event_order_key(event: dict[str, Any]) -> tuple[str, int, int]:
+    """Sort merged events chronologically by timestamp.
 
-    Historical JSONL precedes canonical records. Within each source, the
-    persisted line/ticket sequence is immutable, so later backdated events
-    cannot move an SSE cursor that has already been consumed.
+    Primary key is the ISO-8601 UTC timestamp so that events from
+    different sources (legacy JSONL, trace store) appear in the order
+    they actually occurred, regardless of insertion sequence.
+
+    Ties are broken by source identity (legacy before canonical) and
+    then by the persisted sequence number within that source.
     """
     return (
+        event.get("timestamp", ""),
         0 if event.get("schema_version") == "legacy_uncorrelated" else 1,
         event.get("seq", 0),
     )
