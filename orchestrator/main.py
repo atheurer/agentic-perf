@@ -22,6 +22,7 @@ from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import (
+    TraceContext,
     bind_trace_context,
     current_trace_context,
     new_trace_context,
@@ -1104,11 +1105,18 @@ async def run_agent_task(
             cancel_reason,
         )
         cancellation_reason = _cancellation_guidance_reason(cancel_reason)
+        cancellation_context = _cancellation_trace_context(
+            dispatcher, agent, ticket_id, status
+        )
+        cancellation_context_token = bind_trace_context(cancellation_context)
+        # The lost claim ID cannot authorize recovery. Leader-only fencing
+        # permits this write only if this process remains the active leader
+        # and no live claim now owns the ticket.
         cancellation_headers = (
             _mutation_headers(None)
             if cancellation_reason == "claim_lost"
             else mutation_headers
-        )
+        ) | trace_headers(cancellation_context)
         try:
             async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=cancellation_headers
@@ -1153,6 +1161,8 @@ async def run_agent_task(
             logger.exception(
                 "Failed to record cancellation guidance for ticket %s", ticket_id
             )
+        finally:
+            reset_trace_context(cancellation_context_token)
         if dispatcher.events:
             dispatcher.events.emit(
                 ticket_id,
@@ -1280,6 +1290,27 @@ def _cancellation_guidance_reason(cancel_reason: str) -> str:
     if cancel_reason == "Agent stopped: orchestrator claim lost":
         return "claim_lost"
     return "task_cancelled"
+
+
+def _cancellation_trace_context(
+    dispatcher: Dispatcher,
+    agent: Any,
+    ticket_id: str,
+    status: str,
+) -> TraceContext:
+    """Restore the ticket context after the agent's context token is reset."""
+    context = getattr(agent, "trace_context", None)
+    if not isinstance(context, TraceContext):
+        contexts = getattr(dispatcher, "_trace_contexts", None)
+        context = contexts.get(ticket_id) if isinstance(contexts, dict) else None
+    if not isinstance(context, TraceContext):
+        agent_id = getattr(agent, "agent_name", None)
+        if not isinstance(agent_id, str) or not agent_id:
+            agent_id = STATUS_AGENT_MAP.get(status, status) or "orchestrator"
+        context = new_trace_context(ticket_id=ticket_id, agent_id=agent_id)
+    elif context.ticket_id != ticket_id:
+        context = context.model_copy(update={"ticket_id": ticket_id})
+    return context
 
 
 def _build_cancellation_guidance_summary(

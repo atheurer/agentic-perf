@@ -346,3 +346,111 @@ class TestHardstopGuidanceIntegration:
             await asyncio.wait_for(task, timeout=5)
 
         assert store.get_ticket(ticket.id).status.value == "closed"
+
+    @pytest.mark.asyncio
+    async def test_claim_loss_mutations_keep_audited_trace_and_leader_fence(
+        self, monkeypatch
+    ):
+        """Claim-loss recovery uses the real audited wrapper with ticket context."""
+        import httpx
+
+        from orchestrator.main import run_agent_task
+        from providers.execution import (
+            AuditedAsyncHTTPClient as RealAuditedAsyncHTTPClient,
+        )
+        from providers.tracing import new_trace_context
+
+        ticket_id = "PERF-TRACE-LOSS"
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+        monkeypatch.setenv(
+            "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "1")
+
+        requests = []
+        ticket = {
+            "status": "executing_benchmark",
+            "comments": [
+                {"author": "benchmark-agent", "body": "Running fio"},
+            ],
+            "custom_fields": {},
+        }
+
+        def handle_request(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json=ticket)
+            return httpx.Response(200, json={})
+
+        transport = httpx.MockTransport(handle_request)
+        trace_events = []
+
+        async def record_trace(event):
+            trace_events.append(event)
+
+        clients = []
+
+        def audited_client_factory(*args, **kwargs):
+            wrapper = RealAuditedAsyncHTTPClient(
+                client=httpx.AsyncClient(
+                    *args,
+                    transport=transport,
+                    **kwargs,
+                ),
+                emit=record_trace,
+            )
+            clients.append(wrapper)
+            return wrapper
+
+        started = asyncio.Event()
+
+        async def hanging_run(_ticket_id):
+            started.set()
+            await asyncio.Future()
+
+        agent = MagicMock()
+        agent.agent_name = "benchmark-agent"
+        agent.trace_context = new_trace_context(
+            ticket_id=ticket_id,
+            agent_id="benchmark-agent",
+        )
+        agent.run = hanging_run
+        agent.close = AsyncMock()
+
+        dispatcher = MagicMock()
+        dispatcher.create_agent.return_value = agent
+        dispatcher.store_url = "http://ticket-store"
+        dispatcher.events = None
+        dispatcher._trace_contexts = {}
+        dispatcher._claim_ids = {ticket_id: "stale-claim-id"}
+        dispatcher.clear_agent = MagicMock()
+        dispatcher.mark_done = AsyncMock()
+        dispatcher.was_stopped_by_user.return_value = False
+        dispatcher.has_lost_claim.return_value = True
+        dispatcher.is_deposed.return_value = True
+
+        with patch(
+            "orchestrator.main.AuditedAsyncHTTPClient",
+            side_effect=audited_client_factory,
+        ):
+            task = asyncio.create_task(
+                run_agent_task(dispatcher, "executing_benchmark", ticket_id)
+            )
+            await started.wait()
+            task.cancel()
+            await task
+
+        mutating_requests = [
+            request for request in requests if request.method in ("PATCH", "POST")
+        ]
+        assert {request.method for request in mutating_requests} == {"PATCH", "POST"}
+        for request in mutating_requests:
+            assert request.headers["X-Agentic-Perf-Causal-Context"] == "v1"
+            assert request.headers["X-Agentic-Perf-Ticket-Id"] == ticket_id
+            assert request.headers["X-Agentic-Perf-Mutation-Scope"] == "leader"
+            assert "X-Agentic-Perf-Claim-Id" not in request.headers
+            assert request.headers["traceparent"].startswith("00-")
+        assert trace_events
+        assert {event.ticket_id for event in trace_events} == {ticket_id}
+        assert clients
