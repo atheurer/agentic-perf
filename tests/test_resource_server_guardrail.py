@@ -154,6 +154,40 @@ async def test_reserve_resources_error_does_not_set_flag():
     assert srv._resources_allocated is False
 
 
+@pytest.mark.asyncio
+async def test_status_only_reservation_failure_does_not_set_flag():
+    """A provider's failed status is failure even without an error field."""
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reserve = AsyncMock(
+        return_value={
+            "status": "failed",
+            "reservation_id": "",
+            "provider_metadata": {},
+            "message": "No capacity",
+        }
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"custom_fields": {}}
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["host-01"]},
+        description="test",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "failed"
+    assert srv._resources_allocated is False
+    assert srv._reservation_failures == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests: reserve_resources still works after flag is set (multi-call)
 # ---------------------------------------------------------------------------

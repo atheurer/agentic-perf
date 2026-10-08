@@ -3,6 +3,41 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+_RESERVATION_FAILURE_STATUSES = frozenset(
+    {"failed", "failure", "error", "rejected", "cancelled", "canceled"}
+)
+_PROVIDER_RESERVATION_KEYS = {
+    "jumpstarter": ("lease_id",),
+    "aws": ("instance_ids",),
+    "quads": ("assignment_id",),
+    "psap-cc": ("reservation_id",),
+}
+
+
+def reservation_failed(result: dict[str, Any]) -> bool:
+    """Return whether a provider reservation result reports failure."""
+    if result.get("error"):
+        return True
+    status = str(result.get("status", "")).strip().lower()
+    return status in _RESERVATION_FAILURE_STATUSES
+
+
+def has_reservation_metadata(provider: str, metadata: Any) -> bool:
+    """Check provider-specific metadata for evidence of an allocated resource."""
+    if not isinstance(metadata, dict):
+        return False
+    keys = _PROVIDER_RESERVATION_KEYS.get(provider, ("lease_id", "reservation_id"))
+    for key in (*keys, "reservation_id", "lease_id"):
+        value = metadata.get(key)
+        if key == "instance_ids":
+            if isinstance(value, (list, tuple, set)) and value:
+                return True
+            if isinstance(value, str) and value.strip():
+                return True
+        elif value is not None and str(value).strip():
+            return True
+    return False
+
 
 class ResourceProvider(ABC):
     """Base class for resource providers (QUADS, AWS EC2, GCP, etc.).

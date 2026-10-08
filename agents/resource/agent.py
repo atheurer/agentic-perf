@@ -18,6 +18,7 @@ from agents.server_utils import (
 from paths import get_default_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.resource.base import has_reservation_metadata, reservation_failed
 from providers.resource.registry import ResourceProviderRegistry
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
@@ -126,6 +127,281 @@ def _match_to_provider_ip(
         if extracted in reverse:
             return reverse[extracted], extracted
     return None
+
+
+def _auto_reservation_selection(
+    provider: str, ticket: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a complete provider selection from explicit ticket data.
+
+    Automatic reservation must not silently select a provider default. The
+    ticket must identify every provider-specific resource needed for this
+    fallback, except Jumpstarter's documented one-board selector behavior.
+    """
+    cf = ticket.get("custom_fields", {})
+    directives = cf.get("directives", {})
+    allowed_fields = {
+        "jumpstarter": {
+            "jumpstarter_selector",
+            "board_selector",
+            "count",
+            "lease_duration_seconds",
+            "exporter_name",
+        },
+        "aws": {
+            "instance_specs",
+            "instance_type",
+            "instance_count",
+            "count",
+            "ami",
+            "os",
+            "root_volume_gb",
+        },
+        "quads": {"hostnames", "duration_hours"},
+        "psap-cc": {"cluster_id", "duration_hours"},
+    }
+    if provider not in allowed_fields:
+        raise ValueError(
+            f"No safe auto-reservation selection for provider '{provider}'"
+        )
+
+    selection: dict[str, Any] = {}
+    sources: list[dict[str, Any]] = []
+    for source in (cf, directives):
+        for key in ("resource_selection", f"{provider}_selection", provider):
+            value = source.get(key)
+            if isinstance(value, dict):
+                provider_selection = value.get(provider)
+                sources.append(
+                    provider_selection
+                    if isinstance(provider_selection, dict)
+                    else value
+                )
+        sources.append(source)
+    for source in sources:
+        for key in allowed_fields[provider]:
+            if key in source and source[key] is not None:
+                selection[key] = source[key]
+
+    required_hosts = cf.get("required_hosts") or []
+    required_hosts = [host for host in required_hosts if isinstance(host, dict)]
+    managed_hosts = [host for host in required_hosts if not host.get("host")]
+
+    if provider == "jumpstarter":
+        selector = selection.get("jumpstarter_selector") or selection.get(
+            "board_selector"
+        )
+        if not isinstance(selector, str) or not selector.strip():
+            raise ValueError("ticket has no board_selector for Jumpstarter")
+        selection["jumpstarter_selector"] = selector
+        if len(managed_hosts) > 1:
+            raise ValueError(
+                "Jumpstarter auto-reservation can lease one device per call, "
+                f"but the ticket requires {len(managed_hosts)} hosts"
+            )
+        count = selection.get("count", 1)
+        if count != 1:
+            raise ValueError("Jumpstarter auto-reservation requires count=1")
+        return selection
+
+    if provider == "aws":
+        expected_count = len(managed_hosts) if required_hosts else None
+        specs = selection.get("instance_specs")
+        if not specs and managed_hosts:
+            derived_specs = []
+            for host in managed_hosts:
+                recommended = host.get("recommended") or {}
+                instance_type = host.get("instance_type") or recommended.get(
+                    "instance_type"
+                )
+                if not instance_type:
+                    derived_specs = []
+                    break
+                roles = host.get("roles") or []
+                if isinstance(roles, str):
+                    roles = [roles]
+                role = host.get("role") or (roles[0] if roles else None)
+                derived_specs.append(
+                    {"instance_type": instance_type, "count": 1, "role": role}
+                )
+            if derived_specs:
+                specs = derived_specs
+                selection["instance_specs"] = specs
+
+        if specs:
+            if not isinstance(specs, list) or not specs:
+                raise ValueError("AWS instance_specs must be a nonempty list")
+            normalized_specs = []
+            total_count = 0
+            for spec in specs:
+                if not isinstance(spec, dict) or not spec.get("instance_type"):
+                    raise ValueError(
+                        "each AWS instance_specs entry needs an instance_type"
+                    )
+                try:
+                    count = int(spec.get("count"))
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "each AWS instance_specs entry needs a positive count"
+                    ) from None
+                if count < 1:
+                    raise ValueError(
+                        "each AWS instance_specs entry needs a positive count"
+                    )
+                normalized_specs.append(
+                    {
+                        "instance_type": spec["instance_type"],
+                        "count": count,
+                        **({"role": spec["role"]} if spec.get("role") else {}),
+                    }
+                )
+                total_count += count
+            if expected_count is not None and total_count != expected_count:
+                raise ValueError(
+                    f"AWS selection covers {total_count} instance(s), "
+                    f"but the ticket requires {expected_count} managed host(s)"
+                )
+            selection["instance_specs"] = normalized_specs
+            selection.pop("instance_type", None)
+            selection.pop("instance_count", None)
+            selection.pop("count", None)
+            return selection
+
+        instance_type = selection.get("instance_type")
+        count = selection.get("count", selection.get("instance_count"))
+        if count is None:
+            count = expected_count or cf.get("min_hosts")
+        if not instance_type or count is None:
+            raise ValueError(
+                "AWS fallback needs instance_specs or an explicit instance_type "
+                "and count (or an exact required_hosts count)"
+            )
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise ValueError("AWS count must be a positive integer") from None
+        if count < 1 or (expected_count is not None and count != expected_count):
+            raise ValueError(
+                f"AWS count {count} does not match the ticket's "
+                f"{expected_count} managed host(s)"
+            )
+        selection["count"] = count
+        selection.pop("instance_count", None)
+        return selection
+
+    if provider == "quads":
+        hostnames = selection.get("hostnames")
+        if hostnames is None and managed_hosts:
+            hostnames = []
+            for host in managed_hosts:
+                recommended = host.get("recommended") or {}
+                hostname = (
+                    host.get("quads_hostname")
+                    or host.get("provider_hostname")
+                    or recommended.get("hostname")
+                )
+                if not hostname:
+                    hostnames = []
+                    break
+                hostnames.append(hostname)
+        if isinstance(hostnames, str):
+            hostnames = [name.strip() for name in hostnames.split(",") if name.strip()]
+        if not isinstance(hostnames, list) or not hostnames:
+            raise ValueError("QUADS fallback requires explicit hostnames")
+        if any(not isinstance(name, str) or not name.strip() for name in hostnames):
+            raise ValueError("QUADS hostnames must be nonempty strings")
+        hostnames = [name.strip() for name in hostnames]
+        if len(set(hostnames)) != len(hostnames):
+            raise ValueError("QUADS fallback selection contains duplicate hostnames")
+        expected_count = len(managed_hosts) if required_hosts else None
+        if expected_count is not None and len(hostnames) != expected_count:
+            raise ValueError(
+                f"QUADS selection has {len(hostnames)} hostname(s), "
+                f"but the ticket requires {expected_count} managed host(s)"
+            )
+        selection["hostnames"] = hostnames
+        return selection
+
+    if provider == "psap-cc":
+        cluster_id = selection.get("cluster_id")
+        if not cluster_id:
+            raise ValueError("PSAP-CC fallback requires an explicit cluster_id")
+        return selection
+
+    raise ValueError(f"No safe auto-reservation selection for provider '{provider}'")
+
+
+def _reservation_id_from_metadata(provider: str, metadata: dict[str, Any]) -> str:
+    """Return the provider reservation identifier used by teardown."""
+    if provider == "jumpstarter":
+        value = metadata.get("lease_id")
+    elif provider == "aws":
+        value = metadata.get("instance_ids")
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(item) for item in value if item)
+    elif provider == "quads":
+        value = metadata.get("assignment_id")
+    elif provider == "psap-cc":
+        value = metadata.get("reservation_id")
+    else:
+        value = metadata.get("reservation_id") or metadata.get("lease_id")
+    if not value:
+        value = metadata.get("reservation_id")
+    return str(value) if value is not None else ""
+
+
+def _assigned_hardware_from_reservation(
+    ticket: dict[str, Any], hosts: Any
+) -> dict[str, Any]:
+    """Map newly reserved provider hosts to the ticket's required roles."""
+    if not isinstance(hosts, list) or any(
+        not isinstance(host, str) or not host.strip() for host in hosts
+    ):
+        raise ValueError("provider did not return a list of host identifiers")
+    hosts = [host.strip() for host in hosts]
+    if len(set(hosts)) != len(hosts):
+        raise ValueError("provider returned duplicate host identifiers")
+
+    cf = ticket.get("custom_fields", {})
+    required_hosts = [
+        item for item in (cf.get("required_hosts") or []) if isinstance(item, dict)
+    ]
+    managed_hosts = [item for item in required_hosts if not item.get("host")]
+    if required_hosts and len(hosts) != len(managed_hosts):
+        raise ValueError(
+            f"provider returned {len(hosts)} host(s), but the ticket requires "
+            f"{len(managed_hosts)} managed host(s)"
+        )
+
+    controller = ""
+    targets: list[str] = []
+    host_iter = iter(hosts)
+    entries = required_hosts if required_hosts else [{} for _ in hosts]
+    assignments: list[tuple[str, list[str]]] = []
+    for item in entries:
+        host = item.get("host") or next(host_iter, "")
+        if not host:
+            continue
+        roles = item.get("roles") or []
+        if isinstance(roles, str):
+            roles = [roles]
+        assignments.append((host, roles))
+
+    if not required_hosts:
+        assignments = [(host, []) for host in hosts]
+
+    for host, roles in assignments:
+        if "controller" in roles and not controller:
+            controller = host
+        else:
+            targets.append(host)
+    if not controller and assignments:
+        controller = assignments[0][0]
+        targets = [host for host, _ in assignments[1:]]
+
+    if not controller:
+        raise ValueError("no controller host could be assigned")
+    return {"controller": controller, "targets": targets}
 
 
 class ResourceAgent(AgentBase):
@@ -752,31 +1028,50 @@ class ResourceAgent(AgentBase):
         # exhaustion result from check_available_resources.
         await self._check_fleet_exhaustion(str(result.get("notes", "")))
 
+        ticket_context = await self._get_ticket(ticket_id)
+        ticket_cf = ticket_context.get("custom_fields", {})
+        ticket_directives = ticket_cf.get("directives", {})
+        rp = (
+            result.get("resource_provider")
+            or ticket_cf.get("resource_provider")
+            or ticket_directives.get("resource_provider")
+            or "user_provided"
+        )
+        existing_reservation_id = ticket_cf.get("resource_reservation_id")
+        submitted_reservation_id = result.get("resource_reservation_id")
+
         fields: dict[str, Any] = {
             "assigned_hardware_ips": result.get("assigned_hardware_ips", {}),
             "ssh_user": result.get("ssh_user", "root"),
             "ssh_key_path": result.get("ssh_key_path") or get_default_ssh_key(),
             "lease_expiration": result.get("lease_expiration"),
-            "resource_provider": result.get("resource_provider", "user_provided"),
+            "resource_provider": rp,
         }
 
-        reservation_id = result.get("resource_reservation_id")
-        if reservation_id:
-            fields["resource_reservation_id"] = reservation_id
+        if existing_reservation_id:
+            fields["resource_reservation_id"] = existing_reservation_id
+        elif rp == "user_provided" and submitted_reservation_id:
+            fields["resource_reservation_id"] = submitted_reservation_id
 
-        provider_metadata = dict(result.get("resource_provider_metadata") or {})
+        submitted_metadata = dict(result.get("resource_provider_metadata") or {})
         reservation_metadata: dict[str, Any] = {}
         if self._mcp:
             try:
                 raw = await self._mcp.call_tool("get_accumulated_metadata", {})
-                reservation_metadata = json.loads(raw) if raw else {}
+                fetched_metadata = json.loads(raw) if raw else {}
+                if isinstance(fetched_metadata, dict):
+                    reservation_metadata = fetched_metadata
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
-        # The reservation server is the source of truth for metadata it
-        # received from the provider. Do not let LLM-supplied lease or
-        # selector values redirect later provisioning or teardown actions.
-        if reservation_metadata:
-            provider_metadata = reservation_metadata
+        # The reservation server is the source of truth for managed-provider
+        # metadata. Do not let LLM-supplied IDs or selectors suppress a needed
+        # reservation or redirect later provisioning and teardown actions.
+        if rp and rp != "user_provided":
+            provider_metadata = reservation_metadata or dict(
+                ticket_cf.get("resource_provider_metadata") or {}
+            )
+        else:
+            provider_metadata = submitted_metadata
         # Always set provider_metadata when we have a
         # reservation — downstream agents (platform,
         # provisioning) require it for lease operations.
@@ -784,57 +1079,164 @@ class ResourceAgent(AgentBase):
             fields["resource_provider_metadata"] = (
                 provider_metadata or reservation_metadata
             )
+        metadata_reservation_id = _reservation_id_from_metadata(rp, provider_metadata)
+        if not fields.get("resource_reservation_id") and metadata_reservation_id:
+            fields["resource_reservation_id"] = metadata_reservation_id
 
         # Invariant: managed providers must have a reservation.
         # If the LLM skipped reserve_resources, call it now
         # using the ticket's directives.  "LLM decides intent;
         # code enforces invariants" — the LLM chose the board,
         # but actually reserving it is not optional (#1128).
-        rp = fields.get("resource_provider", "")
         meta = fields.get("resource_provider_metadata") or {}
         if rp and rp != "user_provided":
-            has_reservation_fields = meta.get("lease_id") or meta.get("reservation_id")
-            if not has_reservation_fields and self._mcp:
+            has_reservation_fields = has_reservation_metadata(rp, meta) or bool(
+                existing_reservation_id
+            )
+            if not has_reservation_fields:
+                if not self._mcp:
+                    await self._add_comment(
+                        ticket_id,
+                        "**Resource submission rejected:** Could not verify a "
+                        f"{rp} reservation because the resource service is "
+                        "unavailable. No provider defaults were used.",
+                    )
+                    return
                 logger.warning(
                     "[resource] No reservation metadata — auto-reserving for %s via %s",
                     ticket_id,
                     rp,
                 )
-                ticket = await self._get_ticket(ticket_id)
-                tcf = ticket.get("custom_fields", {})
-                td = tcf.get("directives", {})
-                selector = td.get("board_selector", "")
                 try:
-                    raw = await self._mcp.call_tool(
-                        "reserve_resources",
-                        {
-                            "provider": rp,
-                            "selection": {
-                                "jumpstarter_selector": selector,
-                                "board_selector": selector,
-                            },
-                            "description": ticket.get("summary", ""),
-                            "ticket_id": ticket_id,
-                        },
+                    selection = _auto_reservation_selection(rp, ticket_context)
+                except ValueError as exc:
+                    await self._add_comment(
+                        ticket_id,
+                        "**Auto-reservation failed:** Cannot safely select "
+                        f"{rp} resources: {exc}. Add a complete provider "
+                        "selection to the ticket and retry.",
                     )
-                    reserve_result = json.loads(raw) if raw else {}
-                    if reserve_result.get("error"):
+                    return
+
+                duration_hours = selection.pop("duration_hours", None)
+                reserve_args: dict[str, Any] = {
+                    "provider": rp,
+                    "selection": selection,
+                    "description": ticket_context.get("summary", ""),
+                    "ticket_id": ticket_id,
+                }
+                if duration_hours is not None:
+                    reserve_args["duration_hours"] = duration_hours
+                try:
+                    raw = await self._mcp.call_tool("reserve_resources", reserve_args)
+                    parsed_result = json.loads(raw) if raw else {}
+                    reserve_result = (
+                        parsed_result if isinstance(parsed_result, dict) else {}
+                    )
+                    if reservation_failed(reserve_result):
+                        failure = (
+                            reserve_result.get("error")
+                            or reserve_result.get("message")
+                            or reserve_result.get("status")
+                            or "provider reported failure"
+                        )
                         await self._add_comment(
                             ticket_id,
-                            f"**Auto-reservation failed:** {reserve_result['error']}",
+                            f"**Auto-reservation failed:** {failure}",
                         )
                         return
-                    # Re-fetch accumulated metadata
-                    raw = await self._mcp.call_tool("get_accumulated_metadata", {})
-                    reservation_metadata = json.loads(raw) if raw else {}
+
+                    fallback_id = reserve_result.get(
+                        "reservation_id"
+                    ) or reserve_result.get("lease_id")
+                    if fallback_id and not fields.get("resource_reservation_id"):
+                        fields["resource_reservation_id"] = str(fallback_id)
+
+                    result_metadata = dict(
+                        reserve_result.get("provider_metadata") or {}
+                    )
+                    for key in (
+                        "lease_id",
+                        "instance_ids",
+                        "assignment_id",
+                        "reservation_id",
+                        "ssh_user",
+                        "ssh_key_path",
+                    ):
+                        if key in reserve_result and key not in result_metadata:
+                            result_metadata[key] = reserve_result[key]
+                    try:
+                        raw = await self._mcp.call_tool("get_accumulated_metadata", {})
+                        fetched_metadata = json.loads(raw) if raw else {}
+                        reservation_metadata = (
+                            fetched_metadata
+                            if isinstance(fetched_metadata, dict)
+                            else {}
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not re-fetch reservation metadata after reserve"
+                        )
+                    if not reservation_metadata:
+                        reservation_metadata = result_metadata
+                    if fallback_id and not has_reservation_metadata(
+                        rp, reservation_metadata
+                    ):
+                        if rp == "aws":
+                            reservation_metadata["instance_ids"] = str(
+                                fallback_id
+                            ).split(",")
+                        elif rp == "quads":
+                            try:
+                                reservation_metadata["assignment_id"] = int(fallback_id)
+                            except (TypeError, ValueError):
+                                reservation_metadata["assignment_id"] = fallback_id
+                        elif rp == "psap-cc":
+                            reservation_metadata["reservation_id"] = str(fallback_id)
+                        elif rp == "jumpstarter":
+                            reservation_metadata["lease_id"] = str(fallback_id)
+                    if not has_reservation_metadata(rp, reservation_metadata):
+                        await self._add_comment(
+                            ticket_id,
+                            "**Auto-reservation failed:** The provider did not "
+                            "return reservation metadata or an ID. Manual "
+                            "provider cleanup may be required.",
+                        )
+                        return
                     if reservation_metadata:
                         fields["resource_provider_metadata"] = reservation_metadata
                         if reservation_metadata.get("ssh_user"):
                             fields["ssh_user"] = reservation_metadata["ssh_user"]
+                        if reservation_metadata.get("ssh_key_path"):
+                            fields["ssh_key_path"] = reservation_metadata[
+                                "ssh_key_path"
+                            ]
+                    reservation_id = fields.get(
+                        "resource_reservation_id"
+                    ) or _reservation_id_from_metadata(rp, reservation_metadata)
+                    if reservation_id:
+                        fields["resource_reservation_id"] = reservation_id
+                    if rp in {"aws", "quads"} and reserve_result.get("hosts"):
+                        try:
+                            fields["assigned_hardware_ips"] = (
+                                _assigned_hardware_from_reservation(
+                                    ticket_context, reserve_result["hosts"]
+                                )
+                            )
+                        except ValueError as exc:
+                            await self._add_comment(
+                                ticket_id,
+                                "**Auto-reservation needs review:** Resources were "
+                                f"reserved, but host assignment failed: {exc}. "
+                                "The reservation ID and metadata were retained for "
+                                "teardown.",
+                            )
+                    fields["fresh_host"] = True
                     logger.info(
-                        "[resource] Auto-reservation succeeded for %s (lease=%s)",
+                        "[resource] Auto-reservation succeeded for %s (%s=%s)",
                         ticket_id,
-                        reservation_metadata.get("lease_id", "?"),
+                        rp,
+                        fields.get("resource_reservation_id", "?"),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -953,7 +1355,7 @@ class ResourceAgent(AgentBase):
         # Backward compat: write legacy QUADS fields when provider is quads
         provider = fields.get("resource_provider")
         if provider == "quads":
-            meta = provider_metadata or {}
+            meta = fields.get("resource_provider_metadata") or reservation_metadata
             if meta.get("assignment_id"):
                 fields["quads_assignment_id"] = meta["assignment_id"]
             elif result.get("quads_assignment_id"):

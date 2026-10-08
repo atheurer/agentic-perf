@@ -208,9 +208,14 @@ def _check_evaluating_convergence(
     """
     cf = ticket.get("custom_fields", {})
 
-    # Fleet exhaustion bypasses the benchmark-result requirement.
+    # Only a current, explicitly enabled fleet investigation with a
+    # confirmed hard/soft exhaustion result bypasses the benchmark gate.
     fleet = cf.get("fleet_investigation", {})
-    if fleet.get("fleet_exhausted"):
+    exhaustion = fleet.get("fleet_exhausted")
+    confirmed_exhaustion = isinstance(exhaustion, dict) and (
+        exhaustion.get("hard") is True or exhaustion.get("soft") is True
+    )
+    if fleet.get("enabled") is True and confirmed_exhaustion:
         return True, ""
 
     benchmark_status = cf.get("benchmark_status")

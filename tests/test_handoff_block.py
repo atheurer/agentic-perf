@@ -369,6 +369,25 @@ class TestFleetExhaustionBypassesHandoff:
         ok, reason = check_handoff("evaluating_convergence", ticket)
         assert ok, f"Fleet-exhausted ticket should pass handoff: {reason}"
 
+    @pytest.mark.parametrize(
+        "fleet",
+        [
+            {"enabled": False, "fleet_exhausted": {"hard": True}},
+            {"fleet_exhausted": {"soft": True}},
+            {"enabled": True, "fleet_exhausted": {"hard": False}},
+            {"enabled": True, "fleet_exhausted": {"soft": False}},
+            {"enabled": True, "fleet_exhausted": True},
+        ],
+    )
+    def test_unconfirmed_or_disabled_fleet_still_requires_benchmark(self, fleet):
+        from orchestrator.handoff import check_handoff
+
+        ok, reason = check_handoff(
+            "evaluating_convergence", {"custom_fields": {"fleet_investigation": fleet}}
+        )
+        assert not ok
+        assert "benchmark" in reason.lower()
+
     def test_non_fleet_still_requires_benchmark(self):
         from orchestrator.handoff import check_handoff
 

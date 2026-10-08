@@ -33,6 +33,7 @@ from agents.server_utils import (
     get_board_selector,
 )
 from paths import get_default_ssh_key
+from providers.resource.base import reservation_failed
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -484,12 +485,11 @@ async def reserve_resources(
     )
 
     # Mark resources as allocated so discovery tools are blocked (#1128).
-    # The flag is set when the reservation succeeds (no error key or
-    # explicit success status).  Multi-call reservations (controller +
-    # endpoints) still work because reserve_resources itself is not
-    # blocked — only discovery tools are.
+    # Providers use both error fields and status-only failure results.
+    # Multi-call reservations (controller + endpoints) still work because
+    # reserve_resources itself is not blocked — only discovery tools are.
     global _resources_allocated, _reservation_failures
-    if not result.get("error"):
+    if not reservation_failed(result):
         _resources_allocated = True
         _reservation_failures = 0
     else:
