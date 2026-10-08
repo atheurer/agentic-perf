@@ -1115,6 +1115,46 @@ class TestFleetConvergence:
         assert "1 completed" in outcome
         assert "1 partial" in outcome
 
+    @pytest.mark.parametrize("max_iterations_reached", [False, True])
+    def test_fleet_exhaustion_precedes_budget_and_max_iterations(
+        self,
+        max_iterations_reached,
+    ):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "partial"},
+                ],
+                "fleet_exhausted": {"hard": True},
+            },
+        }
+        if max_iterations_reached:
+            cf["convergence_criteria"] = {"max_iterations": 2}
+            cf["iteration_results"] = [
+                {"iteration": 0, "metric_value": 100.0},
+                {"iteration": 1, "metric_value": 99.0},
+            ]
+        ticket = {
+            "comments": [
+                {"author": "benchmark-agent", "body": "Budget exhausted"},
+            ],
+        }
+
+        outcome = agent._check_deterministic(cf, ticket=ticket)
+
+        assert "FLEET_COMPLETE" in outcome
+        assert "BUDGET_EXHAUSTED" not in outcome
+        assert "MAX_ITERATIONS" not in outcome
+
     def test_fleet_exhausted_soft(self):
         from agents.evaluate.agent import EvaluateAgent
         from providers.llm.mock import MockLLMProvider

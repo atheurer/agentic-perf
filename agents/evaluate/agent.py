@@ -204,6 +204,25 @@ class EvaluateAgent(AgentBase):
         Returns a human-readable outcome string if a gate fired,
         or empty string if no deterministic gate matched.
         """
+        # Fleet exhaustion takes precedence over generic convergence
+        # and stale budget signals. Once every eligible board has
+        # been tested, the fleet-level comparison is ready for review.
+        from providers.fleet import (
+            get_fleet_progress,
+            is_fleet_investigation,
+        )
+
+        if is_fleet_investigation(custom_fields):
+            progress = get_fleet_progress(custom_fields)
+            if progress["converged"]:
+                return (
+                    f"FLEET_COMPLETE — all available boards tested "
+                    f"({progress['tested']} tested: "
+                    f"{progress['completed']} completed, "
+                    f"{progress['partial']} partial). "
+                    f"Proceed to review for fleet-level analysis."
+                )
+
         try:
             from providers.convergence import (
                 ConvergenceOutcome,
@@ -243,27 +262,6 @@ class EvaluateAgent(AgentBase):
                 "partial results that were submitted "
                 "before the budget was exhausted."
             )
-
-        # Fleet exhaustion: if the fleet coordinator has
-        # marked all boards as tested, the investigation is
-        # complete. Treat successes and failures as data
-        # points — the review/synthesis agents will produce
-        # the fleet-level comparison report.
-        from providers.fleet import (
-            get_fleet_progress,
-            is_fleet_investigation,
-        )
-
-        if is_fleet_investigation(custom_fields):
-            progress = get_fleet_progress(custom_fields)
-            if progress["converged"]:
-                return (
-                    f"FLEET_COMPLETE — all available boards tested "
-                    f"({progress['tested']} tested: "
-                    f"{progress['completed']} completed, "
-                    f"{progress['partial']} partial). "
-                    f"Proceed to review for fleet-level analysis."
-                )
 
         return ""
 
