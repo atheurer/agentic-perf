@@ -122,7 +122,12 @@ async def _initialize_ssh_context(ticket_id: str) -> tuple[SSHExecutor, bool]:
             )
 
         state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-        ssh, ticket = await build_ssh_from_ticket(ticket_id, state_store_url)
+        # build_ssh_from_ticket binds the ticket launch trace context while it
+        # fetches credentials. Keep that binding inside a child task so it
+        # cannot replace the MCP request context for the rest of this call.
+        ssh, ticket = await asyncio.create_task(
+            build_ssh_from_ticket(ticket_id, state_store_url)
+        )
         fields = ticket.get("custom_fields", {})
         _ssh = ssh
         _ticket_id = ticket_id
@@ -220,22 +225,28 @@ async def set_ssh_context(ticket_id: str) -> str | ToolResult:
     ticket_id = ticket_id.strip()
     expected_ticket_id = os.environ.get("TICKET_ID", "").strip()
     if expected_ticket_id and ticket_id != expected_ticket_id:
-        return json.dumps(
-            {
-                "status": "rejected",
-                "error": "ticket_context_mismatch",
-            }
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
         )
     try:
         ssh, has_key = await _initialize_ssh_context(ticket_id)
     except _SSHContextRequiredError:
         return _ssh_context_required_result()
     except _SSHTicketContextMismatchError:
-        return json.dumps(
-            {
-                "status": "rejected",
-                "error": "ticket_context_mismatch",
-            }
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
         )
     return json.dumps(
         {

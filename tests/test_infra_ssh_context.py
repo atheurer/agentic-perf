@@ -9,6 +9,12 @@ import pytest
 from fastmcp.tools.base import ToolResult
 
 import agents.infra.server as srv
+from providers.tracing import (
+    bind_trace_context,
+    current_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 from tests.conftest import MockSSHExecutor
 
 
@@ -39,6 +45,54 @@ async def test_ssh_tool_lazily_initializes_from_ticket_identity(monkeypatch):
     build_ssh.assert_awaited_once_with("PERF-LAZY-SSH", "http://state-store.test")
     assert len(ssh.calls) == 2
     assert {call["host"] for call in ssh.calls} == {"sut.example"}
+
+
+@pytest.mark.asyncio
+async def test_lazy_ssh_initialization_preserves_active_mcp_trace_context(
+    monkeypatch,
+):
+    request_trace = new_trace_context(ticket_id="PERF-LAZY-SSH")
+    builder_trace = new_trace_context(ticket_id="PERF-LAZY-SSH")
+    ssh = MockSSHExecutor()
+
+    async def build_ssh(ticket_id, state_store_url):
+        assert ticket_id == "PERF-LAZY-SSH"
+        assert state_store_url == "http://localhost:8090"
+        # build_ssh_from_ticket binds its launch context while it fetches the
+        # ticket; initialization must not leak that binding into the MCP call.
+        bind_trace_context(builder_trace)
+        return ssh, {"custom_fields": {}}
+
+    monkeypatch.setenv("TICKET_ID", "PERF-LAZY-SSH")
+    monkeypatch.setattr(srv, "build_ssh_from_ticket", build_ssh)
+    token = bind_trace_context(request_trace)
+    try:
+        await srv._initialize_ssh_context("PERF-LAZY-SSH")
+        assert current_trace_context() == request_trace
+    finally:
+        reset_trace_context(token)
+
+
+@pytest.mark.parametrize("mismatch", ["environment", "already_bound"])
+@pytest.mark.asyncio
+async def test_set_ssh_context_ticket_mismatch_is_an_mcp_error(monkeypatch, mismatch):
+    build_ssh = AsyncMock()
+    monkeypatch.setattr(srv, "build_ssh_from_ticket", build_ssh)
+    if mismatch == "environment":
+        monkeypatch.setenv("TICKET_ID", "PERF-EXPECTED")
+    else:
+        monkeypatch.setattr(srv, "_ssh", MockSSHExecutor())
+        monkeypatch.setattr(srv, "_ticket_id", "PERF-BOUND")
+
+    result = await srv.set_ssh_context("PERF-OTHER")
+
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+    assert result.structured_content == {
+        "status": "rejected",
+        "error": "ticket_context_mismatch",
+    }
+    build_ssh.assert_not_awaited()
 
 
 @pytest.mark.asyncio
