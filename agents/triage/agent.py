@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,333 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
+def _known_harness_names(skill_provider: Any) -> set[str]:
+    """Return catalog harness names, standalone harnesses, and aliases."""
+    from providers.skills.base import HARNESS_ALIASES
+    from providers.skills.catalog import STANDALONE_BENCHMARKS
+
+    names = (
+        set(skill_provider.list_harnesses())
+        if hasattr(skill_provider, "list_harnesses")
+        else set()
+    )
+    names.update(suite.harness for suite in STANDALONE_BENCHMARKS)
+    names.update(HARNESS_ALIASES)
+    names.update(HARNESS_ALIASES.values())
+    return names
+
+
+@dataclass(frozen=True)
+class _HarnessIntent:
+    required: frozenset[str]
+    alternatives: tuple[frozenset[str], ...]
+    excluded: frozenset[str]
+
+
+def _description_harness_intent(
+    description: str,
+    harness_names: set[str],
+) -> _HarnessIntent:
+    """Extract required, alternative, and explicitly excluded harnesses."""
+    if not description:
+        return _HarnessIntent(frozenset(), (), frozenset())
+
+    from providers.skills.base import HARNESS_ALIASES
+
+    aliases = {alias.casefold(): target for alias, target in HARNESS_ALIASES.items()}
+    occurrences: list[dict[str, Any]] = []
+    for candidate in sorted(harness_names, key=len, reverse=True):
+        token = rf"(?<![\w-]){re.escape(candidate)}(?![\w-])"
+        canonical = aliases.get(candidate.casefold(), candidate)
+        for match in re.finditer(token, description, re.IGNORECASE):
+            clause_start = (
+                max(
+                    description.rfind(separator, 0, match.start())
+                    for separator in ".!?;\n"
+                )
+                + 1
+            )
+            occurrences.append(
+                {
+                    "start": match.start(),
+                    "end": match.end(),
+                    "clause_start": clause_start,
+                    "canonical": canonical,
+                }
+            )
+
+    occurrences.sort(key=lambda item: (item["start"], -item["end"]))
+    # A canonical name and alias may overlap in a name set. Keep only the
+    # longest match at a given location so it cannot create duplicate intent.
+    unique_occurrences: list[dict[str, Any]] = []
+    for occurrence in occurrences:
+        if (
+            unique_occurrences
+            and occurrence["start"] == unique_occurrences[-1]["start"]
+        ):
+            continue
+        unique_occurrences.append(occurrence)
+    occurrences = unique_occurrences
+
+    negative_patterns = (
+        r"\b(?:do\s+not|don't|dont|never|should\s+not|shouldn't)\s+"
+        r"(?:(?:use|using|with|via|choose|select|prefer)\s+)?"
+        r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
+        r"\bavoid\s+(?:(?:use|using)\s+)?"
+        r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
+        r"\bnot\s+(?:the\s+)?(?:harness\s+)?$",
+        r"\b(?:rather\s+than|instead\s+of)\s+(?:the\s+)?(?:harness\s+)?$",
+    )
+    positive_patterns = (
+        r"\b(?:use|using|with|via|choose|select|prefer)\s+"
+        r"(?:(?:the|either|only)\s+)?(?:harness\s+)?$",
+        r"\bharness\b\s*(?:(?:is|should\s+be|to)\s+|[:=]\s*)$",
+        r"\bbut\s+(?:(?:use|using|choose|select|prefer)\s+)?$",
+    )
+
+    def connector_between(left: dict[str, Any], right: dict[str, Any]) -> str | None:
+        between = description[left["end"] : right["start"]]
+        if re.fullmatch(r"[\s,]*or\s+(?:(?:the)\s+)?", between, re.I):
+            return "or"
+        if re.fullmatch(r"[\s,]*and\s+(?:(?:the)\s+)?", between, re.I):
+            return "and"
+        if re.fullmatch(r"\s*,\s*", between):
+            return "comma"
+        return None
+
+    for index, occurrence in enumerate(occurrences):
+        prefix = description[
+            max(occurrence["clause_start"], occurrence["start"] - 120) : occurrence[
+                "start"
+            ]
+        ]
+        if any(
+            re.search(pattern, prefix, re.IGNORECASE) for pattern in negative_patterns
+        ):
+            occurrence["polarity"] = "negative"
+            continue
+        if any(
+            re.search(pattern, prefix, re.IGNORECASE) for pattern in positive_patterns
+        ):
+            occurrence["polarity"] = "positive"
+            continue
+
+        # A name connected by "or" or "and" inherits the selection's
+        # polarity. This handles both "Use X or Y" and "Do not use X or Y".
+        previous = occurrences[index - 1] if index else None
+        if previous and previous["clause_start"] == occurrence["clause_start"]:
+            connector = connector_between(previous, occurrence)
+            if connector in {"or", "and"}:
+                occurrence["polarity"] = previous.get("polarity")
+                continue
+            if connector == "comma" and previous.get("polarity"):
+                # A comma-separated name inherits the list's polarity when a
+                # later item makes the list coordination explicit.
+                next_index = index + 1
+                while next_index < len(occurrences):
+                    following = occurrences[next_index]
+                    if following["clause_start"] != occurrence["clause_start"]:
+                        break
+                    later_connector = connector_between(
+                        occurrences[next_index - 1], following
+                    )
+                    if later_connector in {"or", "and"}:
+                        occurrence["polarity"] = previous["polarity"]
+                        break
+                    if later_connector != "comma":
+                        break
+                    next_index += 1
+                if occurrence.get("polarity"):
+                    continue
+        occurrence["polarity"] = None
+
+    excluded = {
+        occurrence["canonical"]
+        for occurrence in occurrences
+        if occurrence.get("polarity") == "negative"
+    }
+    required: set[str] = set()
+    alternatives: list[frozenset[str]] = []
+    index = 0
+    while index < len(occurrences):
+        occurrence = occurrences[index]
+        if occurrence.get("polarity") != "positive":
+            index += 1
+            continue
+
+        group = {occurrence["canonical"]}
+        next_index = index
+        has_or = False
+        while next_index + 1 < len(occurrences):
+            following = occurrences[next_index + 1]
+            if (
+                following.get("polarity") != "positive"
+                or following["clause_start"] != occurrence["clause_start"]
+            ):
+                break
+            connector = connector_between(occurrences[next_index], following)
+            if connector not in {"comma", "or"}:
+                break
+            has_or |= connector == "or"
+            group.add(following["canonical"])
+            next_index += 1
+        if next_index > index and has_or:
+            alternatives.append(frozenset(group))
+            index = next_index + 1
+        else:
+            required.add(occurrence["canonical"])
+            index += 1
+
+    return _HarnessIntent(frozenset(required), tuple(alternatives), frozenset(excluded))
+
+
+def _description_requested_harnesses(
+    description: str,
+    harness_names: set[str],
+) -> set[str]:
+    """Return all positively named selections, including alternatives."""
+    intent = _description_harness_intent(description, harness_names)
+    requested = set(intent.required)
+    for alternatives in intent.alternatives:
+        requested.update(alternatives)
+    return requested
+
+
+def _harness_intent_conflict(intent: _HarnessIntent, harness: str) -> str | None:
+    """Describe why a candidate harness violates explicit user intent."""
+    if harness and harness in intent.excluded:
+        return f"The request explicitly excludes harness '{harness}'."
+    if len(intent.required) > 1:
+        names = ", ".join(sorted(intent.required))
+        return f"The request names conflicting harnesses ({names})."
+    if intent.required:
+        required = next(iter(intent.required))
+        if required in intent.excluded:
+            return f"The request both selects and excludes harness '{required}'."
+        if harness != required:
+            return (
+                f"The request specifies harness '{required}', but triage selected "
+                f"'{harness or 'no harness'}'."
+            )
+    for choices in intent.alternatives:
+        permitted = choices - intent.excluded
+        if not permitted:
+            names = ", ".join(sorted(choices))
+            return f"The request excludes every listed harness alternative ({names})."
+        if harness not in permitted:
+            names = ", ".join(sorted(permitted))
+            return (
+                f"The request permits harness alternatives ({names}), but triage "
+                f"selected '{harness or 'no harness'}'."
+            )
+    return None
+
+
+def _description_requests_harness(description: str, harness: str) -> bool:
+    """Return whether the description explicitly selects this harness."""
+    from providers.skills.base import HARNESS_ALIASES
+
+    canonical = HARNESS_ALIASES.get(harness, harness)
+    candidates = {harness, canonical}
+    candidates.update(
+        alias for alias, target in HARNESS_ALIASES.items() if target == canonical
+    )
+    return canonical in _description_requested_harnesses(description, candidates)
+
+
 # _canonicalize_workflow_harness removed — workflow_source → harness
 # mapping is now handled by AgentBase._effective_harness, which is
 # the single source of truth for harness resolution.  The triage
 # agent writes the canonical name back to directives after calling
 # _effective_harness.
+
+
+async def _validate_harness_and_suite(
+    harness: str,
+    benchmark_suite: str,
+    absent_suite: bool,
+    skill_provider: Any,
+) -> dict[str, Any] | None:
+    """Validate that harness and benchmark suite exist in the catalog.
+
+    Returns None when valid.  Returns a dict with 'error', 'available_harnesses',
+    and optionally 'correction' when the harness or suite is invalid.
+    """
+    known_harnesses = _known_harness_names(skill_provider)
+
+    available_list = sorted(known_harnesses)
+
+    # 1. Validate harness name exists.
+    if harness and harness not in known_harnesses:
+        return {
+            "error": (
+                f"Harness '{harness}' is not a recognized harness name. "
+                f"Available harnesses: {available_list}"
+            ),
+            "available_harnesses": available_list,
+        }
+
+    # 2. Validate every nonempty benchmark suite. The LLM's absent_suite
+    #    flag is advisory; an invented suite must not reach dispatch.
+    if benchmark_suite:
+        # Try to find the suite in the catalog — maybe the LLM
+        # built a wrong composite name (e.g. "jumpstarter-boot-time"
+        # instead of "boot-time").
+        from providers.skills.catalog import get_catalog_benchmark
+
+        found = await get_catalog_benchmark(skill_provider, benchmark_suite)
+        if found is not None:
+            correction: dict[str, Any] = {}
+            if absent_suite:
+                # The suite exists; the LLM was wrong about absent_suite.
+                correction.update(
+                    absent_suite=False,
+                    benchmark_suite=benchmark_suite,
+                )
+            catalog_harness = found.get("harness")
+            if catalog_harness and catalog_harness != harness:
+                correction.update(
+                    benchmark_suite=benchmark_suite,
+                    harness=catalog_harness,
+                    note=(
+                        f"Using catalog harness '{catalog_harness}' for "
+                        f"benchmark suite '{benchmark_suite}'"
+                    ),
+                )
+            return {"correction": correction} if correction else None
+        # Strip only a recognized harness or resource-provider prefix.
+        # This accepts names such as "kube-burner-uperf" and
+        # "jumpstarter-boot-time" without treating arbitrary prefixes
+        # like "custom-uperf" as a valid correction.
+        from providers.resource.registry import PROVIDER_REGISTRY
+
+        recognized_prefixes = known_harnesses | set(PROVIDER_REGISTRY)
+        for prefix in sorted(recognized_prefixes, key=len, reverse=True):
+            prefix_marker = f"{prefix}-"
+            if not benchmark_suite.startswith(prefix_marker):
+                continue
+            suffix = benchmark_suite[len(prefix_marker) :]
+            if not suffix:
+                continue
+            found = await get_catalog_benchmark(skill_provider, suffix)
+            if found is not None:
+                return {
+                    "correction": {
+                        "absent_suite": False,
+                        "benchmark_suite": suffix,
+                        "harness": found.get("harness", harness),
+                        "note": (
+                            f"Auto-corrected benchmark suite from "
+                            f"'{benchmark_suite}' to '{suffix}'"
+                        ),
+                    },
+                }
+        if not absent_suite:
+            # Mark an unrecognized suite absent so the orchestrator's
+            # existing human-guidance path blocks execution.
+            return {"correction": {"absent_suite": True}}
+
+    return None
 
 
 def _filter_direct_required_hosts(
@@ -779,13 +1102,115 @@ class TriageAgent(AgentBase):
         # and the LLM see a consistent, resolvable value.
         if harness and harness != directives.get("harness"):
             directives["harness"] = harness
+
+        harness_intent = _description_harness_intent(
+            ticket.get("description") or "",
+            _known_harness_names(self._skill_provider),
+        )
+        requested_harnesses = set(harness_intent.required)
+        if user_directives.get("harness"):
+            requested_harnesses.add(
+                self._effective_harness(
+                    {"harness": user_directives["harness"]},
+                    self._skill_provider,
+                )
+            )
+        harness_intent = _HarnessIntent(
+            required=frozenset(requested_harnesses),
+            alternatives=harness_intent.alternatives,
+            excluded=harness_intent.excluded,
+        )
+
+        async def pause_for_harness_guidance(message: str) -> None:
+            await self._add_comment(
+                ticket_id,
+                f"**Triage validation failed:** {message}",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment="Triage validation failed; awaiting harness guidance.",
+            )
+
+        intent_conflict = _harness_intent_conflict(harness_intent, harness)
+        if intent_conflict:
+            await pause_for_harness_guidance(
+                f"{intent_conflict} Please clarify which harness to use."
+            )
+            return
+
+        # --- Harness / suite validation (issue #1086) ---
+        # Code-enforced: reject or auto-correct invalid harness names
+        # and non-existent benchmark suites before they propagate.
+        benchmark_name = result.get("benchmark_suite", "")
+        absent_suite = result.get("absent_suite", False)
+        validation = await _validate_harness_and_suite(
+            harness, benchmark_name, absent_suite, self._skill_provider
+        )
+        if validation is not None:
+            if "error" in validation:
+                # Hard reject — harness doesn't exist at all.
+                await self._add_comment(
+                    ticket_id,
+                    f"**Triage validation failed:** {validation['error']}\n\n"
+                    f"Please update the ticket with a valid harness name.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=("Triage validation failed; waiting for a valid harness."),
+                )
+                return
+            if "correction" in validation:
+                correction = validation["correction"]
+                catalog_harness = correction.get("harness")
+                correction_conflict = (
+                    _harness_intent_conflict(harness_intent, catalog_harness)
+                    if catalog_harness
+                    else None
+                )
+                if correction_conflict:
+                    corrected_suite = correction.get("benchmark_suite", benchmark_name)
+                    if len(harness_intent.required) == 1 and catalog_harness != next(
+                        iter(harness_intent.required)
+                    ):
+                        requested_harness = next(iter(harness_intent.required))
+                        conflict_message = (
+                            f"The requested harness '{requested_harness}' does not "
+                            f"match the catalog harness '{catalog_harness}' for "
+                            f"benchmark suite '{corrected_suite}'. Please update the "
+                            "harness or benchmark suite to continue."
+                        )
+                    else:
+                        conflict_message = (
+                            f"The catalog harness '{catalog_harness}' conflicts "
+                            f"with the request: {correction_conflict} Please update "
+                            "the harness or benchmark suite to continue."
+                        )
+                    await pause_for_harness_guidance(conflict_message)
+                    return
+                if "benchmark_suite" in correction:
+                    result["benchmark_suite"] = correction["benchmark_suite"]
+                    benchmark_name = correction["benchmark_suite"]
+                if "absent_suite" in correction:
+                    result["absent_suite"] = correction["absent_suite"]
+                if "harness" in correction:
+                    harness = correction["harness"]
+                    directives["harness"] = harness
+                note = correction.get("note", "")
+                if note:
+                    existing_notes = result.get("notes", "")
+                    result["notes"] = (
+                        f"{existing_notes}\n{note}" if existing_notes else note
+                    )
+                    logger.info("[triage] %s", note)
+
         # Resolve execution model from the harness metadata.
         # This is a harness-level property declared in BenchmarkSuite,
         # not a per-ticket decision or a hardcoded list.
         from providers.skills.base import EXECUTION_MODEL_DIRECT
         from providers.skills.catalog import resolve_execution_model
 
-        benchmark_name = result.get("benchmark_suite", "")
         execution_model = await resolve_execution_model(
             self._skill_provider, harness, benchmark_name
         )
