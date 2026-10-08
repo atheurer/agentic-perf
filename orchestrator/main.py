@@ -812,6 +812,15 @@ async def _advance_plan(
         response.raise_for_status()
 
 
+def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:
+    """Describe why a running agent received task cancellation."""
+    if dispatcher.was_stopped_by_user(ticket_id) is True:
+        return "Agent stopped by user request"
+    if dispatcher.has_lost_claim() is True:
+        return "Agent stopped: orchestrator claim lost"
+    return "Agent stopped: task cancelled"
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -1087,12 +1096,7 @@ async def run_agent_task(
             except Exception:
                 pass
     except asyncio.CancelledError:
-        if dispatcher.was_stopped_by_user(ticket_id):
-            cancel_reason = "Agent stopped by user request"
-        elif dispatcher.is_deposed():
-            cancel_reason = "Agent stopped: orchestrator claim lost"
-        else:
-            cancel_reason = "Agent stopped: task cancelled"
+        cancel_reason = _cancellation_reason(dispatcher, ticket_id)
         logger.warning(
             "Agent cancelled on ticket %s (status=%s): %s",
             ticket_id,
@@ -1645,8 +1649,9 @@ async def _process_stop_requests(
                     # — it doesn't notify the dispatcher to kill the
                     # running asyncio task.
                     if dispatcher.is_active(tid):
+                        # run_agent_task owns cleanup after its cancellation
+                        # handler reads the user-stop reason and exits.
                         dispatcher.stop_agent(tid, "hard")
-                        await dispatcher.mark_done(tid)
                         logger.info(f"Cancelled agent task for {tid}")
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/force-close",

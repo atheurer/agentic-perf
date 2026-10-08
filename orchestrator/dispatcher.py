@@ -96,6 +96,7 @@ class Dispatcher:
         self._session_id = session_id
         self._fencing_epoch = fencing_epoch
         self._deposed = False
+        self._claim_lost = False
         self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
         self._user_store = user_store
@@ -304,6 +305,7 @@ class Dispatcher:
     def mark_deposed(self) -> None:
         """Stop all agent work after losing the control-plane fence."""
         self._deposed = True
+        self._claim_lost = True
         for task in (
             list(self._tasks.values())
             + list(self._renewal_tasks.values())
@@ -351,6 +353,7 @@ class Dispatcher:
         self._introspection_agents.clear()
         self._claim_ids.clear()
         self._trace_contexts.clear()
+        self._stopped_tickets.clear()
         self._previous_invocations.clear()
         self._quota_blocked.clear()
         self._quota_warned.clear()
@@ -365,6 +368,10 @@ class Dispatcher:
 
     def is_deposed(self) -> bool:
         return self._deposed
+
+    def has_lost_claim(self) -> bool:
+        """Return whether work stopped because its orchestration claim was lost."""
+        return self._claim_lost
 
     def was_stopped_by_user(self, ticket_id: str) -> bool:
         """Return True if the ticket was hard-stopped by a user request."""

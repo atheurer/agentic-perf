@@ -114,50 +114,34 @@ def test_was_stopped_by_user_after_hard_stop():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_cancel_reason_user_stop(caplog):
-    """When was_stopped_by_user returns True, message says 'user request'."""
+def test_cancel_reason_user_stop():
+    """The production classifier reports user initiated cancellation."""
+    from orchestrator.main import _cancellation_reason
+
     d = _make_dispatcher()
     d._stopped_tickets.add("T-1")
 
-    # Import the function under test
-    # We'll test the logic directly by simulating what run_agent_task does
-    if d.was_stopped_by_user("T-1"):
-        cancel_reason = "Agent stopped by user request"
-    elif d.is_deposed():
-        cancel_reason = "Agent stopped: orchestrator claim lost"
-    else:
-        cancel_reason = "Agent stopped: task cancelled"
-
-    assert cancel_reason == "Agent stopped by user request"
+    assert _cancellation_reason(d, "T-1") == "Agent stopped by user request"
 
 
-@pytest.mark.asyncio
-async def test_cancel_reason_deposed():
-    """When dispatcher is deposed, message says 'claim lost'."""
+def test_cancel_reason_claim_lost():
+    """A lost control-plane claim is distinguished from generic cancellation."""
+    from orchestrator.main import _cancellation_reason
+
     d = _make_dispatcher()
     d.mark_deposed()
 
-    if d.was_stopped_by_user("T-1"):
-        cancel_reason = "Agent stopped by user request"
-    elif d.is_deposed():
-        cancel_reason = "Agent stopped: orchestrator claim lost"
-    else:
-        cancel_reason = "Agent stopped: task cancelled"
-
-    assert cancel_reason == "Agent stopped: orchestrator claim lost"
+    assert _cancellation_reason(d, "T-1") == "Agent stopped: orchestrator claim lost"
 
 
 @pytest.mark.asyncio
-async def test_cancel_reason_unknown():
-    """When neither stopped nor deposed, message says 'task cancelled'."""
+async def test_cancel_reason_shutdown_is_not_claim_loss():
+    """Normal dispatcher shutdown is a generic cancellation, not claim loss."""
+    from orchestrator.main import _cancellation_reason
+
     d = _make_dispatcher()
+    await d.shutdown()
 
-    if d.was_stopped_by_user("T-1"):
-        cancel_reason = "Agent stopped by user request"
-    elif d.is_deposed():
-        cancel_reason = "Agent stopped: orchestrator claim lost"
-    else:
-        cancel_reason = "Agent stopped: task cancelled"
-
-    assert cancel_reason == "Agent stopped: task cancelled"
+    assert d.is_deposed() is True
+    assert d.has_lost_claim() is False
+    assert _cancellation_reason(d, "T-1") == "Agent stopped: task cancelled"
