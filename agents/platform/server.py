@@ -163,18 +163,16 @@ async def _provision_jumpstarter(
         provision_jumpstarter,
     )
 
-    # Resolve artifact directory for serial capture
+    # Resolve the ticket artifact directory for flash diagnostics and the
+    # optional serial capture log.
     directives = cf.get("directives", {})
     serial_enabled = directives.get("serial_capture", False)
+    ticket_id = ticket_id or cf.get("ticket_id", "") or metadata.get("ticket_id", "")
     artifact_dir = ""
-    if serial_enabled:
-        ticket_id = (
-            ticket_id or cf.get("ticket_id", "") or metadata.get("ticket_id", "")
-        )
-        if ticket_id:
-            from paths import create_artifact_dir
+    if ticket_id:
+        from paths import create_artifact_dir
 
-            artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
+        artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
 
     provision_kwargs: dict[str, Any] = {
         "lease_name": lease_id,

@@ -269,7 +269,9 @@ class TestPlatformServerSerialPassthrough:
             assert kwargs.kwargs["lease_duration_seconds"] == 28_800
 
     @pytest.mark.asyncio
-    async def test_server_uses_provisioning_default_without_metadata_duration(self):
+    async def test_server_uses_artifact_dir_when_serial_capture_is_disabled(
+        self, tmp_path
+    ):
         """Older tickets fall back to the provisioning default duration."""
         from agents.platform import server
 
@@ -291,6 +293,7 @@ class TestPlatformServerSerialPassthrough:
                 new_callable=AsyncMock,
                 return_value=fake_result,
             ) as mock_provision,
+            patch("paths.create_artifact_dir", return_value=tmp_path) as create_dir,
             patch.object(
                 server,
                 "_ticket",
@@ -301,3 +304,38 @@ class TestPlatformServerSerialPassthrough:
             await server.provision_platform()
 
         assert "lease_duration_seconds" not in mock_provision.call_args.kwargs
+        assert mock_provision.call_args.kwargs["serial_capture"] is False
+        assert mock_provision.call_args.kwargs["artifact_dir"] == str(tmp_path)
+        create_dir.assert_called_once_with("PERF-TEST123", "platform-provision")
+
+    @pytest.mark.asyncio
+    async def test_no_ticket_without_serial_capture_keeps_artifact_dir_empty(self):
+        """No-ticket calls do not allocate an unused temporary artifact directory."""
+        from agents.platform import server
+
+        cf = {
+            "resource_provider": "jumpstarter",
+            "resource_provider_metadata": {"lease_id": "scratch-lease"},
+            "directives": {"serial_capture": False},
+            "jumpstarter_flash": {
+                "flash_targets": [{"url": "http://example.com/image.raw.xz"}],
+            },
+        }
+        fake_result = FakeProvisionResult(success=True, ip="10.0.0.1")
+
+        with (
+            patch(
+                "providers.resource.jumpstarter_provision.provision_jumpstarter",
+                new_callable=AsyncMock,
+                return_value=fake_result,
+            ) as mock_provision,
+            patch("paths.create_artifact_dir") as create_dir,
+            patch.object(server, "_ticket", {"id": "", "custom_fields": cf}),
+            patch.object(server, "_ensure_init", new_callable=AsyncMock),
+        ):
+            await server.provision_platform()
+
+        create_dir.assert_not_called()
+        assert mock_provision.call_args.kwargs["ticket_id"] == ""
+        assert mock_provision.call_args.kwargs["artifact_dir"] == ""
+        assert mock_provision.call_args.kwargs["serial_capture"] is False

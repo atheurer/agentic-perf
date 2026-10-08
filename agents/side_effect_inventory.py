@@ -350,6 +350,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     (
         "providers/resource/jumpstarter_provision.py",
+        "_redact_flash_detail",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
         "_provision_async",
         "cloud_resource",
     ),
@@ -361,6 +366,21 @@ INVENTORIED_SIDE_EFFECTS = (
     (
         "providers/resource/jumpstarter_provision.py",
         "_run_provision_steps",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "filesystem",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "strip_query",
         "cloud_resource",
     ),
     (
@@ -2357,6 +2377,16 @@ INVENTORY_DISPOSITIONS = {
     ),
     (
         "providers/resource/jumpstarter_provision.py",
+        "_redact_flash_detail",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_redact_flash_detail",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
         "_provision_async",
         "cloud_resource",
     ): (
@@ -2383,6 +2413,36 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_provision.py:_run_provision_steps",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "filesystem",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_write_flash_diagnostics",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_write_flash_diagnostics",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "strip_query",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:strip_query",
         "2027-12-31",
     ),
     (
