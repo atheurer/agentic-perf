@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import uuid
@@ -34,8 +35,10 @@ class LeaderLeaseClient:
         self.ttl_seconds = ttl_seconds
         self.session_id = session_id or uuid.uuid4()
         self.epoch: int | None = None
+        self.confirmed_deadline: float | None = None
 
     async def acquire(self) -> dict:
+        request_started = asyncio.get_running_loop().time()
         body = {
             "session_id": str(self.session_id),
             "instance_name": self.instance_name,
@@ -56,11 +59,13 @@ class LeaderLeaseClient:
         response.raise_for_status()
         lease = response.json()
         self.epoch = int(lease["epoch"])
+        self.confirmed_deadline = request_started + self.ttl_seconds
         return lease
 
     async def renew(self) -> dict:
         if self.epoch is None:
             raise RuntimeError("leader lease has not been acquired")
+        request_started = asyncio.get_running_loop().time()
         async with httpx.AsyncClient(timeout=10.0, headers=self._headers()) as client:
             response = await client.post(
                 f"{self.store_url}/api/v1/control/orchestrator-lease/renew",
@@ -71,7 +76,9 @@ class LeaderLeaseClient:
                 },
             )
         response.raise_for_status()
-        return response.json()
+        lease = response.json()
+        self.confirmed_deadline = request_started + self.ttl_seconds
+        return lease
 
     async def release(self) -> bool:
         if self.epoch is None:

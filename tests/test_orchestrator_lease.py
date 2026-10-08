@@ -32,6 +32,42 @@ from state_store.models import (
 from state_store.store import OrchestratorLeaseHeld, TicketStore
 
 
+class _RenewalLease:
+    def __init__(self, outcomes=(), *, ttl_seconds=5.0):
+        self.ttl_seconds = ttl_seconds
+        self.confirmed_deadline = asyncio.get_running_loop().time() + ttl_seconds
+        self.outcomes = list(outcomes)
+        self.attempts = []
+        self.released = 0
+        self.cancelled = False
+        self.recovered = asyncio.Event()
+
+    async def renew(self):
+        self.attempts.append(asyncio.get_running_loop().time())
+        outcome = self.outcomes.pop(0) if self.outcomes else None
+        if outcome == "hang":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        if isinstance(outcome, Exception):
+            raise outcome
+        self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
+        self.recovered.set()
+
+    async def release(self):
+        self.released += 1
+
+
+def _lease_http_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://state-store/renew")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"HTTP {status_code}", request=request, response=response
+    )
+
+
 @pytest.mark.asyncio
 async def test_leader_lease_acquire_is_control_plane_not_ticket_audited(
     monkeypatch: pytest.MonkeyPatch,
@@ -70,45 +106,146 @@ def test_sigterm_uses_asyncio_shutdown_path():
 
 @pytest.mark.asyncio
 async def test_cancelled_lease_renewal_releases_leader_lease():
-    class Lease:
-        released = False
-
-        async def renew(self):
-            await asyncio.sleep(60)
-
-        async def release(self):
-            self.released = True
-
-    lease = Lease()
-    task = asyncio.create_task(_renew_leader_lease(lease, 60))
-    await asyncio.sleep(0)
+    lease = _RenewalLease(["hang"])
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+    )
+    while not lease.attempts:
+        await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert lease.released
+    assert lease.cancelled
+    assert lease.released == 1
+    assert lost == []
 
 
 @pytest.mark.asyncio
 async def test_failed_lease_renewal_deposes_and_releases_immediately():
-    class Lease:
-        renew_count = 0
-        released = False
-
-        async def renew(self):
-            self.renew_count += 1
-            raise RuntimeError("state store unavailable")
-
-        async def release(self):
-            self.released = True
-
-    lease = Lease()
+    lease = _RenewalLease([RuntimeError("programming error")])
     lost = []
     with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
         await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
 
-    assert lease.renew_count == 1
-    assert lease.released
+    assert len(lease.attempts) == 1
+    assert lease.released == 1
     assert lost == [True]
+
+
+@pytest.mark.asyncio
+async def test_transient_lease_failure_retries_at_backoff_and_recovers():
+    request = httpx.Request("POST", "http://state-store/renew")
+    lease = _RenewalLease([httpx.ReadError("temporary read failure", request=request)])
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0.2, on_lost=lambda: lost.append(True))
+    )
+
+    await asyncio.wait_for(lease.recovered.wait(), timeout=1)
+    retry_delay = lease.attempts[1] - lease.attempts[0]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert 0.05 <= retry_delay < 0.3
+    assert len(lease.attempts) == 2
+    assert lost == []
+    assert lease.released == 1
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.WriteTimeout,
+        httpx.RemoteProtocolError,
+    ],
+)
+@pytest.mark.asyncio
+async def test_httpx_transport_errors_are_retryable(error_type):
+    request = httpx.Request("POST", "http://state-store/renew")
+    lease = _RenewalLease([error_type("temporary transport failure", request=request)])
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+    )
+
+    await asyncio.wait_for(lease.recovered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(lease.attempts) == 2
+    assert lost == []
+    assert lease.released == 1
+
+
+@pytest.mark.asyncio
+async def test_http_5xx_lease_renewal_is_retryable():
+    lease = _RenewalLease([_lease_http_error(503)])
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+    )
+
+    await asyncio.wait_for(lease.recovered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(lease.attempts) == 2
+    assert lost == []
+    assert lease.released == 1
+
+
+@pytest.mark.asyncio
+async def test_http_4xx_lease_renewal_fails_immediately():
+    lease = _RenewalLease([_lease_http_error(403)])
+    lost = []
+
+    with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
+        await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+
+    assert len(lease.attempts) == 1
+    assert lost == [True]
+    assert lease.released == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_marks_lease_lost_once():
+    request = httpx.Request("POST", "http://state-store/renew")
+    lease = _RenewalLease(
+        [httpx.ConnectError("temporary connection failure", request=request)] * 4
+    )
+    lost = []
+
+    with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
+        await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+
+    assert len(lease.attempts) == 3
+    assert lost == [True]
+    assert lease.released == 1
+
+
+@pytest.mark.asyncio
+async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
+    lease = _RenewalLease(["hang"], ttl_seconds=1.0)
+    deadline = lease.confirmed_deadline
+    lost_at = []
+
+    with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
+        await _renew_leader_lease(
+            lease,
+            0,
+            on_lost=lambda: lost_at.append(asyncio.get_running_loop().time()),
+        )
+
+    assert len(lease.attempts) == 1
+    assert lease.cancelled
+    assert lost_at[0] < deadline
+    assert lease.released == 1
 
 
 class _PollLoopLease:
@@ -116,9 +253,12 @@ class _PollLoopLease:
         self.epoch = None
         self.session_id = uuid4()
         self.release_count = 0
+        self.ttl_seconds = 30
+        self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
 
     async def acquire(self):
         self.epoch = 7
+        self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
         return {"epoch": self.epoch}
 
     async def release(self):
