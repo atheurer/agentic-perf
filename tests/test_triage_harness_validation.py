@@ -163,6 +163,13 @@ class TestHarnessValidation:
         assert excluded_alternatives.alternatives == ()
         assert excluded_alternatives.excluded == names
 
+        three_names = names | {"vstorm"}
+        excluded_list = _description_harness_intent(
+            "Do not use zathras, crucible, or vstorm", three_names
+        )
+        assert excluded_list.alternatives == ()
+        assert excluded_list.excluded == three_names
+
         avoid = _description_harness_intent("Avoid using zathras", names)
         assert avoid.excluded == {"zathras"}
 
@@ -189,6 +196,12 @@ class TestHarnessValidation:
         either_or = _description_harness_intent("Use either zathras or crucible", names)
         assert either_or.required == frozenset()
         assert either_or.alternatives == (frozenset(names),)
+
+        three_way = _description_harness_intent(
+            "Use either zathras, crucible, or vstorm", three_names
+        )
+        assert three_way.required == frozenset()
+        assert three_way.alternatives == (frozenset(three_names),)
 
         contrast = _description_harness_intent("Not zathras but crucible", names)
         assert contrast.required == {"crucible"}
@@ -475,6 +488,28 @@ class TestSuiteAutoCorrection:
         assert updated_fields["directives"]["harness"] == selected_harness
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected_harness", ["zathras", "crucible", "vstorm"])
+    async def test_three_way_or_request_accepts_each_listed_harness(
+        self, selected_harness
+    ):
+        suite = f"{selected_harness}-suite"
+        provider = _make_provider(
+            suites={suite: {"name": suite, "harness": selected_harness}}
+        )
+        _agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": True,
+                "directives": {"harness": selected_harness},
+            },
+            provider,
+            description="Use either zathras, crucible, or vstorm",
+        )
+
+        assert ticket["status"] == "awaiting_hardware"
+        assert updated_fields["directives"]["harness"] == selected_harness
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("selected_harness", ["zathras", "crucible"])
     async def test_negated_either_or_pauses_for_each_prohibited_harness(
         self, selected_harness
@@ -491,6 +526,32 @@ class TestSuiteAutoCorrection:
             },
             provider,
             description="Do not use either zathras or crucible",
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        assert (
+            f"explicitly excludes harness '{selected_harness}'"
+            in agent._add_comment.await_args.args[1]
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected_harness", ["zathras", "crucible", "vstorm"])
+    async def test_three_way_negated_list_pauses_for_each_prohibited_harness(
+        self, selected_harness
+    ):
+        suite = f"{selected_harness}-suite"
+        provider = _make_provider(
+            suites={suite: {"name": suite, "harness": selected_harness}}
+        )
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": True,
+                "directives": {"harness": selected_harness},
+            },
+            provider,
+            description="Do not use zathras, crucible, or vstorm",
         )
 
         assert ticket["status"] == "awaiting_customer_guidance"

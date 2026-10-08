@@ -101,6 +101,16 @@ def _description_harness_intent(
         r"\bbut\s+(?:(?:use|using|choose|select|prefer)\s+)?$",
     )
 
+    def connector_between(left: dict[str, Any], right: dict[str, Any]) -> str | None:
+        between = description[left["end"] : right["start"]]
+        if re.fullmatch(r"[\s,]*or\s+(?:(?:the)\s+)?", between, re.I):
+            return "or"
+        if re.fullmatch(r"[\s,]*and\s+(?:(?:the)\s+)?", between, re.I):
+            return "and"
+        if re.fullmatch(r"\s*,\s*", between):
+            return "comma"
+        return None
+
     for index, occurrence in enumerate(occurrences):
         prefix = description[
             max(occurrence["clause_start"], occurrence["start"] - 120) : occurrence[
@@ -122,10 +132,29 @@ def _description_harness_intent(
         # polarity. This handles both "Use X or Y" and "Do not use X or Y".
         previous = occurrences[index - 1] if index else None
         if previous and previous["clause_start"] == occurrence["clause_start"]:
-            between = description[previous["end"] : occurrence["start"]]
-            if re.fullmatch(r"[\s,]*(?:or|and)\s+(?:(?:the)\s+)?", between, re.I):
+            connector = connector_between(previous, occurrence)
+            if connector in {"or", "and"}:
                 occurrence["polarity"] = previous.get("polarity")
                 continue
+            if connector == "comma" and previous.get("polarity"):
+                # A comma-separated name inherits the list's polarity when a
+                # later item makes the list coordination explicit.
+                next_index = index + 1
+                while next_index < len(occurrences):
+                    following = occurrences[next_index]
+                    if following["clause_start"] != occurrence["clause_start"]:
+                        break
+                    later_connector = connector_between(
+                        occurrences[next_index - 1], following
+                    )
+                    if later_connector in {"or", "and"}:
+                        occurrence["polarity"] = previous["polarity"]
+                        break
+                    if later_connector != "comma":
+                        break
+                    next_index += 1
+                if occurrence.get("polarity"):
+                    continue
         occurrence["polarity"] = None
 
     excluded = {
@@ -144,6 +173,7 @@ def _description_harness_intent(
 
         group = {occurrence["canonical"]}
         next_index = index
+        has_or = False
         while next_index + 1 < len(occurrences):
             following = occurrences[next_index + 1]
             if (
@@ -151,12 +181,13 @@ def _description_harness_intent(
                 or following["clause_start"] != occurrence["clause_start"]
             ):
                 break
-            between = description[occurrences[next_index]["end"] : following["start"]]
-            if not re.fullmatch(r"[\s,]*or\s+(?:(?:the)\s+)?", between, re.I):
+            connector = connector_between(occurrences[next_index], following)
+            if connector not in {"comma", "or"}:
                 break
+            has_or |= connector == "or"
             group.add(following["canonical"])
             next_index += 1
-        if next_index > index:
+        if next_index > index and has_or:
             alternatives.append(frozenset(group))
             index = next_index + 1
         else:
