@@ -96,6 +96,8 @@ class Dispatcher:
         self._session_id = session_id
         self._fencing_epoch = fencing_epoch
         self._deposed = False
+        self._claim_lost = False
+        self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
         self._user_store = user_store
         self._secrets_root = secrets_root
@@ -235,6 +237,13 @@ class Dispatcher:
                         "claim_id": self._claim_ids.get(ticket_id),
                     },
                 )
+                if r.status_code != 200:
+                    logger.warning(
+                        "Claim renewal rejected for %s: HTTP %d: %s",
+                        ticket_id,
+                        r.status_code,
+                        r.text[:200],
+                    )
                 return r.status_code == 200
         except Exception as exc:
             logger.exception(f"Failed to renew claim on {ticket_id}")
@@ -296,6 +305,7 @@ class Dispatcher:
     def mark_deposed(self) -> None:
         """Stop all agent work after losing the control-plane fence."""
         self._deposed = True
+        self._claim_lost = True
         for task in (
             list(self._tasks.values())
             + list(self._renewal_tasks.values())
@@ -343,6 +353,7 @@ class Dispatcher:
         self._introspection_agents.clear()
         self._claim_ids.clear()
         self._trace_contexts.clear()
+        self._stopped_tickets.clear()
         self._previous_invocations.clear()
         self._quota_blocked.clear()
         self._quota_warned.clear()
@@ -357,6 +368,14 @@ class Dispatcher:
 
     def is_deposed(self) -> bool:
         return self._deposed
+
+    def has_lost_claim(self) -> bool:
+        """Return whether work stopped because its orchestration claim was lost."""
+        return self._claim_lost
+
+    def was_stopped_by_user(self, ticket_id: str) -> bool:
+        """Return True if the ticket was hard-stopped by a user request."""
+        return ticket_id in self._stopped_tickets
 
     def set_agent(self, ticket_id: str, agent: Any) -> None:
         self._agents[ticket_id] = agent
@@ -419,6 +438,7 @@ class Dispatcher:
         elif mode == "hard":
             task = self._tasks.get(ticket_id)
             if task is not None and not task.done():
+                self._stopped_tickets.add(ticket_id)
                 task.cancel()
                 if context is not None:
                     self._trace.record(
@@ -454,6 +474,7 @@ class Dispatcher:
         self._tasks.pop(ticket_id, None)
         getattr(self, "_task_statuses", {}).pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
+        getattr(self, "_stopped_tickets", set()).discard(ticket_id)
         self.stop_renewal(ticket_id)
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
