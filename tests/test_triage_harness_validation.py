@@ -67,6 +67,7 @@ def _make_provider(
 async def _complete_triage_result(
     result: dict,
     provider: _FakeSkillProvider,
+    custom_fields: dict | None = None,
 ) -> tuple[TriageAgent, dict, dict]:
     """Run completion against an in-memory ticket with legal transitions."""
     ticket = {
@@ -74,7 +75,7 @@ async def _complete_triage_result(
         "status": "triage_pending",
         "summary": "Benchmark request",
         "description": "Run a benchmark",
-        "custom_fields": {},
+        "custom_fields": custom_fields or {},
     }
     agent = TriageAgent(
         llm_provider=AsyncMock(),
@@ -215,6 +216,15 @@ class TestSuiteAutoCorrection:
         assert result == {"correction": {"absent_suite": True}}
 
     @pytest.mark.asyncio
+    async def test_unrecognized_prefix_is_not_stripped(self):
+        """Only known harness/provider prefixes may be removed from suite names."""
+        provider = _make_provider()
+        result = await _validate_harness_and_suite(
+            "crucible", "custom-uperf", False, provider
+        )
+        assert result == {"correction": {"absent_suite": True}}
+
+    @pytest.mark.asyncio
     async def test_correction_includes_harness_from_catalog(self):
         """Auto-correction should set the harness from the catalog entry."""
         provider = _make_provider()
@@ -286,6 +296,31 @@ class TestSuiteAutoCorrection:
         assert ticket["status"] == "awaiting_hardware"
         assert updated_fields["absent_suite"] is False
         assert updated_fields["directives"]["harness"] == "crucible"
+
+    @pytest.mark.asyncio
+    async def test_explicit_user_harness_conflict_pauses_for_guidance(self):
+        """Catalog correction must not override a user-selected harness."""
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {"harness": "crucible"},
+            },
+            _make_provider(),
+            custom_fields={"directives": {"harness": "zathras"}},
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        agent._transition_ticket.assert_awaited_once_with(
+            ticket["id"],
+            "awaiting_customer_guidance",
+            comment="Triage validation failed; awaiting harness guidance.",
+        )
+        comment = agent._add_comment.await_args.args[1]
+        assert "requested harness 'zathras'" in comment
+        assert "catalog harness 'crucible'" in comment
+        assert "benchmark suite 'uperf'" in comment
 
     @pytest.mark.asyncio
     async def test_invented_suite_is_written_absent_before_dispatch(self):

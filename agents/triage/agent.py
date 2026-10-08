@@ -88,14 +88,20 @@ async def _validate_harness_and_suite(
                     ),
                 )
             return {"correction": correction} if correction else None
-        # Try stripping prefixes from suite name to auto-correct.
-        # e.g. "jumpstarter-boot-time" → "boot-time"
-        #      "kube-burner-uperf" → "uperf"
-        # Check all possible suffixes by progressively removing
-        # leading hyphen-delimited segments.
-        parts = benchmark_suite.split("-")
-        for i in range(1, len(parts)):
-            suffix = "-".join(parts[i:])
+        # Strip only a recognized harness or resource-provider prefix.
+        # This accepts names such as "kube-burner-uperf" and
+        # "jumpstarter-boot-time" without treating arbitrary prefixes
+        # like "custom-uperf" as a valid correction.
+        from providers.resource.registry import PROVIDER_REGISTRY
+
+        recognized_prefixes = known_harnesses | set(PROVIDER_REGISTRY)
+        for prefix in sorted(recognized_prefixes, key=len, reverse=True):
+            prefix_marker = f"{prefix}-"
+            if not benchmark_suite.startswith(prefix_marker):
+                continue
+            suffix = benchmark_suite[len(prefix_marker) :]
+            if not suffix:
+                continue
             found = await get_catalog_benchmark(skill_provider, suffix)
             if found is not None:
                 return {
@@ -874,6 +880,12 @@ class TriageAgent(AgentBase):
         if harness and harness != directives.get("harness"):
             directives["harness"] = harness
 
+        explicit_user_harness = ""
+        if user_directives.get("harness"):
+            explicit_user_harness = self._effective_harness(
+                {"harness": user_directives["harness"]}, self._skill_provider
+            )
+
         # --- Harness / suite validation (issue #1086) ---
         # Code-enforced: reject or auto-correct invalid harness names
         # and non-existent benchmark suites before they propagate.
@@ -898,6 +910,29 @@ class TriageAgent(AgentBase):
                 return
             if "correction" in validation:
                 correction = validation["correction"]
+                catalog_harness = correction.get("harness")
+                if (
+                    explicit_user_harness
+                    and catalog_harness
+                    and catalog_harness != explicit_user_harness
+                ):
+                    corrected_suite = correction.get("benchmark_suite", benchmark_name)
+                    message = (
+                        f"The requested harness '{explicit_user_harness}' does not "
+                        f"match the catalog harness '{catalog_harness}' for "
+                        f"benchmark suite '{corrected_suite}'. Please update the "
+                        "harness or benchmark suite to continue."
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        f"**Triage validation failed:** {message}",
+                    )
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment="Triage validation failed; awaiting harness guidance.",
+                    )
+                    return
                 if "benchmark_suite" in correction:
                     result["benchmark_suite"] = correction["benchmark_suite"]
                     benchmark_name = correction["benchmark_suite"]
