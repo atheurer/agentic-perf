@@ -22,6 +22,7 @@ from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import (
+    TraceContext,
     bind_trace_context,
     current_trace_context,
     new_trace_context,
@@ -1103,9 +1104,22 @@ async def run_agent_task(
             status,
             cancel_reason,
         )
+        cancellation_reason = _cancellation_guidance_reason(cancel_reason)
+        cancellation_context = _cancellation_trace_context(
+            dispatcher, agent, ticket_id, status
+        )
+        cancellation_context_token = bind_trace_context(cancellation_context)
+        # The lost claim ID cannot authorize recovery. Leader-only fencing
+        # permits this write only if this process remains the active leader
+        # and no live claim now owns the ticket.
+        cancellation_headers = (
+            _mutation_headers(None)
+            if cancellation_reason == "claim_lost"
+            else mutation_headers
+        ) | trace_headers(cancellation_context)
         try:
             async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=mutation_headers
+                timeout=10.0, headers=cancellation_headers
             ) as client:
                 # Check if ticket was already force-closed before
                 # trying to transition — avoids reopening a closed
@@ -1121,19 +1135,34 @@ async def run_agent_task(
                             " skipping post-cancel transition"
                         )
                     else:
-                        await client.patch(
+                        fields = {
+                            "interrupted": True,
+                            "guidance_summary": _build_cancellation_guidance_summary(
+                                r.json(),
+                                status,
+                                cancellation_reason,
+                                agent_identity=getattr(agent, "agent_name", None),
+                            ),
+                        }
+                        response = await client.patch(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                            json={"fields": {"interrupted": True}},
+                            json={"fields": fields},
                         )
-                        await client.post(
+                        response.raise_for_status()
+                        response = await client.post(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
                             json={
                                 "status": "awaiting_customer_guidance",
                                 "comment": cancel_reason,
                             },
                         )
+                        response.raise_for_status()
         except Exception:
-            logger.exception(f"Failed to transition hard-stopped ticket {ticket_id}")
+            logger.exception(
+                "Failed to record cancellation guidance for ticket %s", ticket_id
+            )
+        finally:
+            reset_trace_context(cancellation_context_token)
         if dispatcher.events:
             dispatcher.events.emit(
                 ticket_id,
@@ -1252,6 +1281,90 @@ async def run_agent_task(
                 await agent.close()
             except Exception:
                 pass
+
+
+def _cancellation_guidance_reason(cancel_reason: str) -> str:
+    """Map the cancellation cause to the stable guidance reason."""
+    if cancel_reason == "Agent stopped by user request":
+        return "hard_stop"
+    if cancel_reason == "Agent stopped: orchestrator claim lost":
+        return "claim_lost"
+    return "task_cancelled"
+
+
+def _cancellation_trace_context(
+    dispatcher: Dispatcher,
+    agent: Any,
+    ticket_id: str,
+    status: str,
+) -> TraceContext:
+    """Restore the ticket context after the agent's context token is reset."""
+    context = getattr(agent, "trace_context", None)
+    if not isinstance(context, TraceContext):
+        contexts = getattr(dispatcher, "_trace_contexts", None)
+        context = contexts.get(ticket_id) if isinstance(contexts, dict) else None
+    if not isinstance(context, TraceContext):
+        agent_id = getattr(agent, "agent_name", None)
+        if not isinstance(agent_id, str) or not agent_id:
+            agent_id = STATUS_AGENT_MAP.get(status, status) or "orchestrator"
+        context = new_trace_context(ticket_id=ticket_id, agent_id=agent_id)
+    elif context.ticket_id != ticket_id:
+        context = context.model_copy(update={"ticket_id": ticket_id})
+    return context
+
+
+def _build_cancellation_guidance_summary(
+    ticket: dict[str, Any],
+    status: str,
+    reason: str,
+    *,
+    agent_identity: str | None = None,
+) -> dict[str, Any]:
+    """Build a guidance summary for a cancelled running agent.
+
+    Only comments authored by the running agent are included. If its identity
+    is unavailable, omit comment context rather than risk attributing a
+    multi-user comment to the agent.
+    """
+    agent = STATUS_AGENT_MAP.get(status, "unknown")
+
+    comments = ticket.get("comments", [])
+    last_agent_message = ""
+    if isinstance(agent_identity, str) and agent_identity:
+        for comment in reversed(comments):
+            author = comment.get("author", "")
+            body = comment.get("body", "")
+            is_agent_comment = author == agent_identity or (
+                isinstance(author, str) and author.startswith(f"{agent_identity}/")
+            )
+            if is_agent_comment and isinstance(body, str) and body:
+                last_agent_message = body[:2000]
+                break
+
+    custom_fields = ticket.get("custom_fields", {})
+    benchmark_results = custom_fields.get("benchmark_results")
+    partial_context = ""
+    if benchmark_results:
+        partial_context = " Partial benchmark results are available in the ticket."
+
+    details = f"The {agent} agent was interrupted before it could complete."
+    if last_agent_message:
+        # Truncate to keep the summary concise
+        snippet = last_agent_message[:500]
+        details += f" Last agent activity: {snippet}"
+    if partial_context:
+        details += partial_context
+
+    return {
+        "agent": agent,
+        "reason": reason,
+        "details": details,
+        "suggested_actions": [
+            "Retry — re-dispatch the ticket to resume from the current stage",
+            "Review partial results if any benchmark data was collected",
+            "Abort if the investigation is no longer needed",
+        ],
+    }
 
 
 async def _transition_to_guidance(
