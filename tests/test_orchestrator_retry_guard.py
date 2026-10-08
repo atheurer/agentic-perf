@@ -329,13 +329,24 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         return deepcopy(tickets)
 
     monkeypatch.setattr(main, "fetch_all_tickets", fetch)
-    lease = SimpleNamespace(session_id=uuid4(), epoch=None)
+    lease = SimpleNamespace(
+        session_id=uuid4(),
+        epoch=None,
+        ttl_seconds=config.leader_lease_ttl_seconds,
+        confirmed_deadline=(
+            asyncio.get_running_loop().time() + config.leader_lease_ttl_seconds
+        ),
+    )
 
     async def acquire():
         lease.epoch = 7
+        lease.confirmed_deadline = asyncio.get_running_loop().time() + lease.ttl_seconds
+
+    async def renew():
+        lease.confirmed_deadline = asyncio.get_running_loop().time() + lease.ttl_seconds
 
     lease.acquire = acquire
-    lease.renew = AsyncMock()
+    lease.renew = AsyncMock(side_effect=renew)
     lease.release = AsyncMock()
     lease_state = {"renew_task": None, "started": asyncio.Event()}
     task = asyncio.create_task(
