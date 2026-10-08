@@ -1053,3 +1053,12 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             errors.append("'input' must be a dictionary")
 
         return {"valid": len(errors) == 0, "errors": errors}
+
+    def get_directive_schema(self) -> dict[str, Any]:
+        return {
+            "recognized": {
+                "workflow_name",
+                "workflow_source",
+            },
+            "aliases": {},
+        }

@@ -234,6 +234,24 @@ If ambiguous, prefer code over prompts, and skills over hardcoded
 values in either. Never put harness-specific knowledge in agent
 prompts — that is always a skill provider's job.
 
+### Directive Normalization
+
+Users submit ticket directives using variable key names. The
+normalization framework (`providers/directives.py`) maps variant
+names to canonical forms before any agent processes them.
+
+Harness-specific directive keys and aliases belong with the
+harness, not in the normalization framework:
+
+- **Provider-backed harnesses**: implement `get_directive_schema()`
+  on the `SkillProvider` subclass
+- **Standalone harnesses**: create a module under `providers/skills/`
+  and call `register_directives()` at module load
+- **Core directives**: only orchestrator-level keys
+  (board_selector, harness, fleet, etc.) live in the framework
+
+See `docs/adding-a-harness.md` for details.
+
 ### Token Efficiency
 
 Tool results accumulate in conversation history and are re-sent

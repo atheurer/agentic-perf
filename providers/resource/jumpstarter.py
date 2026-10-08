@@ -32,7 +32,17 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+# ── Jumpstarter directive schema ──────────────────────────
+# Register Jumpstarter-specific directives so the
+# normalization framework recognizes them.
+from providers.directives import register_directives
+
 from .base import ResourceProvider
+
+register_directives(
+    recognized={"jumpstarter_serial"},
+    aliases={},
+)
 
 logger = logging.getLogger(__name__)
 

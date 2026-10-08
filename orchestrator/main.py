@@ -1901,7 +1901,7 @@ async def _add_comment(
     try:
         async with AuditedAsyncHTTPClient(
             timeout=10.0,
-            headers=_auth_headers(),
+            headers=_mutation_headers(None),
         ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
@@ -2408,6 +2408,16 @@ async def _poll_loop_after_lease(
         catalog_only=True,
         arcaflow_mcp_client=arcaflow_mcp,
     )
+
+    # Collect harness-contributed directive schemas so the
+    # normalization framework knows about harness-specific keys.
+    # Provider-backed harnesses register via get_directive_schema().
+    # Standalone harnesses register at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
 
@@ -2703,11 +2713,82 @@ async def _poll_loop_after_lease(
                         logger.info(f"Skipping {tid}: review already submitted")
                         continue
 
-                    # Deterministic enrichment for webhook tickets.
-                    # Resolve directives from run metadata before
-                    # any agent sees the ticket. Best-effort —
-                    # agents handle gaps if enrichment fails.
+                    # Normalize directive keys before any agent
+                    # sees the ticket.  Maps variant key names to
+                    # canonical forms and warns on unrecognized keys.
                     if status == "triage_pending":
+                        cf = ticket.get("custom_fields", {})
+                        raw_directives = cf.get("directives", {})
+                        if raw_directives:
+                            try:
+                                from providers.directives import (
+                                    format_normalization_report,
+                                    normalize_directives,
+                                )
+
+                                normalized, applied, unrecognized = (
+                                    normalize_directives(raw_directives)
+                                )
+                                if applied or unrecognized:
+                                    # Update the local ticket dict so the
+                                    # triage agent sees canonical keys
+                                    # in the same poll cycle.
+                                    cf["directives"] = normalized
+
+                                    # Surface to the event feed so
+                                    # normalization actions are visible
+                                    # in the dashboard.
+                                    if events is not None:
+                                        events.emit(
+                                            tid,
+                                            "orchestrator",
+                                            "directive_normalization",
+                                            {
+                                                "applied": applied,
+                                                "unrecognized": unrecognized,
+                                            },
+                                        )
+
+                                    async with AuditedAsyncHTTPClient(
+                                        timeout=10.0,
+                                        headers=_mutation_headers(None),
+                                    ) as client:
+                                        resp = await client.patch(
+                                            f"{config.state_store_url}"
+                                            f"/api/v1/tickets/{tid}/fields",
+                                            json={"fields": {"directives": normalized}},
+                                        )
+                                        if resp.status_code >= 400:
+                                            logger.warning(
+                                                "Directive normalization PATCH "
+                                                "failed for %s: HTTP %d",
+                                                tid,
+                                                resp.status_code,
+                                            )
+                                        report = format_normalization_report(
+                                            applied, unrecognized
+                                        )
+                                        if report:
+                                            await client.post(
+                                                f"{config.state_store_url}"
+                                                f"/api/v1/tickets/{tid}"
+                                                f"/comments",
+                                                json={
+                                                    "author": "orchestrator",
+                                                    "body": report,
+                                                },
+                                            )
+                            except Exception:
+                                logger.warning(
+                                    "Directive normalization failed for %s",
+                                    tid,
+                                    exc_info=True,
+                                )
+
+                        # Deterministic enrichment for webhook tickets.
+                        # Resolve directives from run metadata before
+                        # any agent sees the ticket. Best-effort —
+                        # agents handle gaps if enrichment fails.
                         cf = ticket.get("custom_fields", {})
                         if cf.get("trigger_source"):
                             try:
@@ -2976,7 +3057,7 @@ async def _poll_loop_after_lease(
             # tickets are closed or no longer active.
             await _sweep_orphaned_leases(
                 config.state_store_url,
-                auth_headers=_auth_headers(),
+                auth_headers=_mutation_headers(None),
             )
 
             # Stale-task watchdog: cancel tasks with no events
