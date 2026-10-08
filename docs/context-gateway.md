@@ -8,7 +8,9 @@ sources apply and preserves their scope and provenance.
 **Current status:** the active issue branch contains an implementation draft for
 administrator-managed organization sources and the initial `harness/crucible`
 subject. The wider migration across harnesses and other subjects is not complete.
-Authenticated user-level and project-level skill sources are future work. See
+The bundled local-document gateway adapter is not implemented yet and is
+required before retiring direct readers for subjects that still need local
+files. Authenticated user-owned skill sources are future work. See
 [configuration](configuration.md#organization-skill-gateway) for current setup
 and [the detailed design](design-skill-gateway.md) for contracts and
 implementation boundaries.
@@ -143,7 +145,7 @@ different purposes and should be inventoried before a subject is migrated:
 | Existing mechanism | Current role and migration treatment |
 | --- | --- |
 | Agent prompts | Include role instructions and, in some cases, harness-specific prose. Keep general reasoning and tool protocol here; classify reusable harness instructions before moving them. |
-| Repository `skills/` documents and `read_skills` | Provide static skill text for harnesses and domains. Migrate eligible material subject by subject; retain legacy access for subjects not yet migrated. |
+| Repository `skills/` documents and `read_skills` | Provide static skill text for harnesses and domains. During migration, keep needed documents in the local repository and expose them as a project-scoped gateway source. Once a subject uses the gateway, direct document readers are no longer the path for that subject; unmigrated subjects may retain their legacy path. |
 | `SkillProvider` and catalog tools | Supply structured benchmark discovery, templates, and harness-specific contracts. Keep typed discovery and validation behavior. Where their reference content needs shared scoped retrieval, connect the source through a subject adapter rather than turning operational contracts into free-form prose. |
 | Crucible controller documentation | The existing controller reader follows installed documentation pointers. The Crucible gateway adapter exposes the applicable controller entrypoint for benchmark and review phases. |
 | Upstream GitHub catalog access | Crucible triage retains bounded catalog and benchmark-detail operations that work before a controller is available. These structured operations remain distinct from full document retrieval. |
@@ -154,7 +156,18 @@ The migration target is for reusable subject knowledge to have a gateway path,
 even when a specialized tool remains the right interface for structured
 discovery or execution. The gateway can identify and retrieve the applicable
 reference; typed tools can continue to return benchmark catalogs, validated
-settings, or live data in their existing contracts.
+settings, or live data in their existing contracts. A local document adapter is
+distinct from an administrator-configured local path: the former serves
+versioned project documentation, while the latter is an organization-owned
+source configured by the administrator.
+
+The gateway implementation described by this PR currently combines
+organization guidance with Crucible controller documentation and bounded
+Crucible catalog operations. It does not yet expose arbitrary bundled
+`skills/<subject>/` files as a project-scoped source. Add that adapter before
+retiring direct readers for a subject whose required guidance is still only in
+the local repository. This is a migration capability, not a reason to copy
+local files into an organization package.
 
 For Crucible, the gateway currently combines organization guidance with the
 installed controller documentation where that phase has a controller. Triage
@@ -197,7 +210,25 @@ convenient. Keep private organization content and its detailed migration
 inventory in administrator-controlled storage; the public repository should
 describe generic contracts and link to authoritative software documentation.
 
-### 3. Prepare source packages and adapters
+### 3. Bridge local documents through the gateway
+
+Keep useful local documents in the project while their content is being
+verified and moved. Register them as a distinct project-scoped source, with a
+stable source id, local path, applicable subject/phase, and revision tied to the
+installed agentic-perf version or commit. The gateway should return these
+documents alongside applicable organization and software references, preserving
+their source and revision. Do not label bundled project material as
+organization-owned guidance or let repository ordering resolve conflicts.
+
+For each subject, switch agents to gateway retrieval only after the local source
+is available to every required phase and the gateway preserves provenance and
+conflicts. Until then, legacy direct readers may remain for that subject. Once
+the gateway path is validated, remove the direct document-loading path for that
+subject while keeping the local files in place as the temporary source. Typed
+tools for validation, execution, live state, and bulk data remain available;
+this step retires only tools whose purpose is to load reusable documents.
+
+### 4. Prepare replacement sources and adapters
 
 Place shared organization guidance and approved structured settings in an
 administrator-controlled source. Use the documented subject layout so the
@@ -206,7 +237,7 @@ upstream and installed software sources separate, version-aware, and explicit
 about what each establishes. Preserve specialized catalog interfaces when
 agents need structured results or controller-independent discovery.
 
-### 4. Wire every consumer for that subject
+### 5. Wire every consumer for that subject
 
 For every affected agent and phase, expose the same subject retrieval contract
 and ensure it receives the applicable entrypoints and provenance. Update the
@@ -216,7 +247,7 @@ references, audits, and diagnostics together; adding a document reader alone
 does not migrate a subject if runtime configuration or another agent still
 reads the old path.
 
-### 5. Compare old and new behavior before cutover
+### 6. Compare old and new behavior before cutover
 
 Run representative tickets through all consuming phases. Compare the context
 each phase receives, source revisions, software-version fit, structured
@@ -226,15 +257,18 @@ runtime-configuration conflict blocks use. Keep the legacy path enabled for
 that subject until the new path meets the agreed coverage; do not let an
 implicit fallback or merge obscure which source won.
 
-### 6. Retire old copies only after replacement is proven
+### 7. Retire local copies only after replacement is proven
 
-Remove duplicate prompt prose, skill files, and legacy configuration access
-only when every required consumer has a tested gateway path and the replacement
-source is available in all supported deployment phases. Preserve a migration
-record of moved content and links to authoritative software references. Other
-subjects continue using their current path until they complete the same process.
+After direct readers have been removed for a subject, keep its local documents
+as a gateway source until each section has a replacement in the appropriate
+upstream, organization, or (when available) user source. Delete a local copy
+only after representative tickets show that every required phase can retrieve
+the replacement, the source and version are visible, conflicts reach HITL when
+unresolved, and no consumer still depends on the local path. Preserve a migration
+record of moved content and links to authoritative references. Other subjects
+continue their own migration independently.
 
-### 7. Add user scope only after identity controls are ready
+### 8. Add user scope only after identity controls are ready
 
 User-level context is not merely another directory. The service must derive the
 user from authenticated ticket state, enforce self-or-admin access, and isolate
@@ -255,7 +289,8 @@ configurations are configuration errors rather than merge candidates.
 
 This does **not** mean that all agentic-perf context already uses the gateway.
 Other harnesses still have existing skill-provider, local-document, prompt, or
-private-settings paths. User-level and project-level packages, native workload
-software adapters beyond the current Crucible sources, and migration of every
-other subject remain future work. The [detailed design](design-skill-gateway.md)
-tracks the Crucible migration inventory and the checks required before rollout.
+private-settings paths. A gateway adapter for bundled local documents,
+user-owned packages, native workload software adapters beyond the current
+Crucible sources, and migration of every other subject remain future work. The
+[detailed design](design-skill-gateway.md) tracks the Crucible migration
+inventory and the checks required before rollout.
