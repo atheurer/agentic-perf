@@ -219,7 +219,7 @@ def _read_events(ticket_id, last_seq):
         events = bus.get_events(ticket_id, since=last_seq, limit=100_000)
     finally:
         bus.close()
-    new_seq = events[-1]["seq"] if events else last_seq
+    new_seq = max((event["seq"] for event in events), default=last_seq)
     return events, new_seq
 
 

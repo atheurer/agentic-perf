@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
+from providers.event_projection import event_order_key
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["stream"])
@@ -140,5 +142,5 @@ def _poll_events(
             if seq > cursors.get(tid, 0):
                 cursors[tid] = seq
 
-    results.sort(key=lambda e: (e.get("timestamp", ""), e.get("seq", 0)))
+    results.sort(key=event_order_key)
     return results

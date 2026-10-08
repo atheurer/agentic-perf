@@ -2521,7 +2521,7 @@ async function renderDetail(ticketId) {
       var initData = await api('/tickets/' + ticketId + '/transcript');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
-        lastSeq = initEvents[initEvents.length - 1].seq || 0;
+        lastSeq = maxEventSeq(initEvents);
         renderNewEvents(initEvents);
       }
     } catch (e) {
@@ -3817,13 +3817,18 @@ function renderEventStream() {
 
 function renderNewEvents(events) {
   var added = 0;
+  var priorMaxSeq = maxRenderedSeq;
+  var pageMaxSeq = priorMaxSeq;
+  var seenSeqs = new Set();
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
-    if (evt.seq <= maxRenderedSeq) continue;
-    maxRenderedSeq = evt.seq;
+    if (evt.seq <= priorMaxSeq || seenSeqs.has(evt.seq)) continue;
+    seenSeqs.add(evt.seq);
+    pageMaxSeq = Math.max(pageMaxSeq, evt.seq);
     eventRecords.push(evt);
     added++;
   }
+  maxRenderedSeq = pageMaxSeq;
   // Keep the browser-side projection bounded. Raw forensic records remain
   // available through the trace endpoint and are never deleted here.
   if (eventRecords.length > 10000) {
@@ -3833,6 +3838,12 @@ function renderNewEvents(events) {
   if (added > 0) {
     renderEventStream();
   }
+}
+
+function maxEventSeq(events) {
+  return events.reduce(function(maxSeq, evt) {
+    return Math.max(maxSeq, (evt && evt.seq) || 0);
+  }, 0);
 }
 
 function renderAuditEvent(evt) {
