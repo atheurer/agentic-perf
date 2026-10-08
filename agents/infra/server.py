@@ -19,6 +19,7 @@ import shlex
 import sys
 import tempfile
 from contextlib import AsyncExitStack
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -26,6 +27,7 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from fastmcp.tools.base import ToolResult
 from pydantic import BaseModel, ConfigDict
 
 from agents.ethtool import flow_rule_is_verifiable, parse_ethtool_flow_rules
@@ -53,8 +55,9 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 _ssh: SSHExecutor | None = None
 _ssh_key_stack: AsyncExitStack | None = None
 _secrets_provider = None
-_state_store_url: str | None = None
 _ticket_id: str | None = None
+_ssh_has_key = False
+_ssh_context_lock = asyncio.Lock()
 
 
 def _store_headers() -> dict[str, str]:
@@ -68,6 +71,95 @@ def _get_ssh() -> SSHExecutor:
     if _ssh is None:
         raise RuntimeError("SSH context not set. Call set_ssh_context() first.")
     return _ssh
+
+
+class _SSHContextRequiredError(RuntimeError):
+    """Raised when an SSH tool has no ticket identity to initialize from."""
+
+
+class _SSHTicketContextMismatchError(ValueError):
+    """Raised when a tool attempts to bind SSH to a different ticket."""
+
+
+def _ssh_context_required_result() -> ToolResult:
+    payload = {
+        "status": "precondition_required",
+        "error": "ssh_context_required",
+        "required_action": "set_ssh_context",
+        "retryable": True,
+        "message": (
+            "SSH context is unavailable because no ticket ID is configured. "
+            "Call set_ssh_context with the ticket ID, then retry this tool."
+        ),
+    }
+    return ToolResult(
+        content=json.dumps(payload, sort_keys=True),
+        structured_content=payload,
+        is_error=True,
+    )
+
+
+async def _initialize_ssh_context(ticket_id: str) -> tuple[SSHExecutor, bool]:
+    """Initialize the process SSH executor once for its owning ticket."""
+    global _ssh, _ssh_has_key, _ticket_id
+
+    ticket_id = ticket_id.strip()
+    if not ticket_id:
+        raise _SSHContextRequiredError
+
+    async with _ssh_context_lock:
+        if _ssh is not None:
+            if _ticket_id != ticket_id:
+                raise _SSHTicketContextMismatchError(
+                    "SSH context is already bound to another ticket"
+                )
+            return _ssh, _ssh_has_key
+
+        expected_ticket_id = os.environ.get("TICKET_ID", "").strip()
+        if expected_ticket_id and ticket_id != expected_ticket_id:
+            raise _SSHTicketContextMismatchError(
+                "SSH context ticket does not match this MCP session"
+            )
+
+        state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+        # build_ssh_from_ticket binds the ticket launch trace context while it
+        # fetches credentials. Keep that binding inside a child task so it
+        # cannot replace the MCP request context for the rest of this call.
+        ssh, ticket = await asyncio.create_task(
+            build_ssh_from_ticket(ticket_id, state_store_url)
+        )
+        fields = ticket.get("custom_fields", {})
+        _ssh = ssh
+        _ticket_id = ticket_id
+        _ssh_has_key = fields.get("ssh_key_path") is not None
+        return ssh, _ssh_has_key
+
+
+async def _ensure_ssh_context() -> SSHExecutor:
+    """Lazily initialize SSH from the ticket identity supplied to this server."""
+    if _ssh is not None:
+        return _ssh
+
+    ticket_id = _ticket_id or os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        raise _SSHContextRequiredError
+
+    ssh, _ = await _initialize_ssh_context(ticket_id)
+    return ssh
+
+
+def _requires_ssh_context(tool: Any) -> Any:
+    """Preflight SSH-dependent tools without leaking an uninitialized error."""
+
+    @wraps(tool)
+    async def wrapped(*args: Any, **kwargs: Any) -> str | ToolResult:
+        try:
+            await _ensure_ssh_context()
+        except _SSHContextRequiredError:
+            return _ssh_context_required_result()
+        return await tool(*args, **kwargs)
+
+    return wrapped
 
 
 def _get_secrets():
@@ -123,33 +215,50 @@ def _crucible_command(
 
 
 @mcp.tool()
-async def set_ssh_context(ticket_id: str) -> str:
-    """Set SSH credentials by reading them from a ticket's custom_fields.
+async def set_ssh_context(ticket_id: str) -> str | ToolResult:
+    """Set SSH credentials from a ticket's custom_fields; safe to call repeatedly.
 
-    Must be called before any SSH operations. Resolves ssh_key_path and
-    ssh_user from the ticket so credentials never appear in tool inputs.
+    SSH tools initialize this context automatically when the ticket ID is
+    available. This explicit operation remains available when that identity is
+    missing. Credentials never appear in tool inputs or results.
     """
-    global _ssh, _state_store_url, _ticket_id
-
-    _ticket_id = ticket_id
-
-    _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    # Use the ticket-owned constructor so SSH operations preserve the same
-    # durable trace context and recorder as every other local MCP server.
-    _ssh, ticket = await build_ssh_from_ticket(ticket_id, _state_store_url)
-    fields = ticket.get("custom_fields", {})
-    ssh_key = fields.get("ssh_key_path")
-    ssh_user = _ssh.user
+    ticket_id = ticket_id.strip()
+    expected_ticket_id = os.environ.get("TICKET_ID", "").strip()
+    if expected_ticket_id and ticket_id != expected_ticket_id:
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
+        )
+    try:
+        ssh, has_key = await _initialize_ssh_context(ticket_id)
+    except _SSHContextRequiredError:
+        return _ssh_context_required_result()
+    except _SSHTicketContextMismatchError:
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
+        )
     return json.dumps(
         {
             "status": "ok",
-            "ssh_user": ssh_user,
-            "has_key": ssh_key is not None,
+            "ssh_user": ssh.user,
+            "has_key": has_key,
         }
     )
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def check_host(host: str) -> str:
     """Test SSH connectivity and gather system info (OS, CPU, RAM, hostname)."""
     ssh = _get_ssh()
@@ -182,6 +291,7 @@ async def check_host(host: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def write_remote_file(host: str, remote_path: str, content: str) -> str:
     """Write content to a file on a remote host. Creates parent directories."""
     ssh = _get_ssh()
@@ -227,6 +337,7 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) -> str:
     """Read a file from a remote host. Truncates to max_bytes."""
     ssh = _get_ssh()
@@ -237,6 +348,7 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def list_controller_userenvs(controller: str) -> str:
     """List userenvs available from a running Crucible controller.
 
@@ -248,6 +360,7 @@ async def list_controller_userenvs(controller: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def run_crucible_command(
     controller: str,
     command: CrucibleCommand,
@@ -272,6 +385,7 @@ async def run_crucible_command(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
     """Copy a remote directory to a local temp directory.
 
@@ -379,6 +493,7 @@ def _filter_ethtool_data(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_ethtool_info(
     host: str,
     iface: str,
@@ -513,6 +628,7 @@ async def get_ethtool_info(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_sysctl_values(host: str, params: list[str]) -> str:
     """Read sysctl parameter values from a remote host as structured JSON.
 
@@ -552,6 +668,7 @@ async def get_sysctl_values(host: str, params: list[str]) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_hardware_topology(
     host: str,
     iface: str | None = None,
@@ -598,6 +715,7 @@ async def get_hardware_topology(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_cache_topology(
     host: str,
     socket: int | None = None,
@@ -637,6 +755,7 @@ async def get_cache_topology(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def verify_ssh_path(host: str, target_host: str) -> str:
     """Verify SSH reachability from one host to another.
 
@@ -662,6 +781,7 @@ async def verify_ssh_path(host: str, target_host: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def list_interfaces(host: str) -> str:
     """List network interfaces that are UP with their assigned IP addresses."""
     ssh = _get_ssh()
@@ -772,6 +892,7 @@ def _apply_iface_filters(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_interface_inventory(
     host: str,
     name_regex: str = "",
@@ -863,6 +984,7 @@ async def get_interface_inventory(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     """Deploy a secret file to a remote host.
 
@@ -903,6 +1025,7 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def transfer_file(
     host: str,
     local_path: str,
@@ -936,6 +1059,7 @@ async def transfer_file(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def check_hosts(hosts: list[str]) -> str:
     """Test SSH connectivity and gather system info for multiple hosts at once.
 
@@ -992,6 +1116,7 @@ async def check_hosts(hosts: list[str]) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def test_port_connectivity(
     server_ssh_host: str,
     client_ssh_host: str,
