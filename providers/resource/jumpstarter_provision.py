@@ -51,6 +51,49 @@ class ProvisionResult:
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
 
 
+def _write_flash_diagnostics(
+    artifact_dir: str,
+    ticket_id: str,
+    diag: list[str],
+) -> None:
+    """Write flash diagnostics to artifact file and log.
+
+    Called on flash failure so diagnostics are durable even
+    if the LLM is unavailable to process the tool result.
+    """
+    import json
+    from pathlib import Path
+
+    summary = "\n".join(diag)
+    logger.warning(
+        "[platform] Flash diagnostics for %s:\n%s",
+        ticket_id,
+        summary,
+    )
+    if artifact_dir:
+        try:
+            diag_path = Path(artifact_dir) / "flash-diagnostics.json"
+            diag_path.parent.mkdir(parents=True, exist_ok=True)
+            diag_path.write_text(
+                json.dumps(
+                    {
+                        "ticket_id": ticket_id,
+                        "diagnostics": diag,
+                    },
+                    indent=2,
+                )
+            )
+            logger.info(
+                "[platform] Flash diagnostics written to %s",
+                diag_path,
+            )
+        except Exception:
+            logger.warning(
+                "[platform] Failed to write flash diagnostics file",
+                exc_info=True,
+            )
+
+
 async def provision_jumpstarter(
     lease_name: str,
     flash_url: str | dict[str, str],
@@ -187,6 +230,8 @@ async def provision_jumpstarter(
             client_config_path,
             selector,
             lease_duration_seconds,
+            ticket_id,
+            artifact_dir,
         )
         result = prov_result
     except asyncio.CancelledError:
@@ -262,6 +307,8 @@ def _provision_sync(
     client_config_path: str,
     selector: str = "",
     lease_duration_seconds: int = _DEFAULT_PROVISION_LEASE_DURATION_SECONDS,
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Synchronous provisioning — runs in executor thread.
 
@@ -279,6 +326,8 @@ def _provision_sync(
         client_config_path,
         selector,
         lease_duration_seconds,
+        ticket_id,
+        artifact_dir,
     )
 
 
@@ -306,6 +355,8 @@ async def _provision_async(
     client_config_path: str,
     selector: str = "",
     lease_duration_seconds: int = _DEFAULT_PROVISION_LEASE_DURATION_SECONDS,
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Async provisioning using the Jumpstarter SDK."""
     from anyio.from_thread import BlockingPortal
@@ -356,6 +407,9 @@ async def _provision_async(
                             ssh_public_key,
                             result,
                             diag,
+                            board_name=board_name,
+                            ticket_id=ticket_id,
+                            artifact_dir=artifact_dir,
                         )
 
 
@@ -365,6 +419,10 @@ async def _run_provision_steps(
     ssh_public_key: str,
     result: ProvisionResult,
     diag: list[str],
+    *,
+    board_name: str = "",
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Execute the deterministic provision steps."""
     # ── Step 1: Flash ────────────────────────────────
@@ -407,6 +465,13 @@ async def _run_provision_steps(
         # Use repr() for ExceptionGroup/TaskGroup so sub-exception
         # messages are visible in diagnostics, not just the group label.
         diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {repr(exc)}")
+        logger.error(
+            "[platform] Flash failed for %s (%s) after %.0fs: %r",
+            board_name,
+            ticket_id,
+            result.flash_duration_s,
+            exc,
+        )
         # Retry once
         logger.warning("[platform] Flash failed, retrying")
         diag.append("Retrying flash...")
@@ -416,9 +481,19 @@ async def _run_provision_steps(
             result.flash_duration_s = time.monotonic() - t0
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
-            diag.append(
-                f"Flash retry failed ({time.monotonic() - t0:.0f}s): {repr(exc2)}"
+            retry_duration = time.monotonic() - t0
+            diag.append(f"Flash retry failed ({retry_duration:.0f}s): {repr(exc2)}")
+            logger.error(
+                "[platform] Flash retry failed for %s (%s) after %.0fs: %r",
+                board_name,
+                ticket_id,
+                retry_duration,
+                exc2,
             )
+            # Write diagnostics directly to artifact so they
+            # survive even if the LLM is unavailable to process
+            # the tool result.
+            _write_flash_diagnostics(artifact_dir, ticket_id, diag)
             result.diagnostics = diag
             return result
 
