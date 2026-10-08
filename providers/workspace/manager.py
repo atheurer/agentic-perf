@@ -924,6 +924,8 @@ class WorkspaceManager:
     # Prevents single-line JSON files from returning the
     # entire file as one match.
     _GREP_LINE_LIMIT = 1000
+    # Bound parsing and reformatting, which can expand compact JSON in memory.
+    _COMPACT_JSON_PARSE_MAX_CHARS = 4 * 1024 * 1024
     # Maximum total size of grep output in characters.
     _GREP_OUTPUT_LIMIT = 16_000
 
@@ -962,6 +964,38 @@ class WorkspaceManager:
                 "status": "error",
                 "error": f"Failed reading file: {e}",
             }
+
+        # Detect compact / minified JSON: very few lines but large content.
+        # Pretty-print so grep returns individual fields, not the whole blob.
+        if path.suffix == ".json" and len(lines) <= 5:
+            candidate_chars = sum(len(line) for line in lines)
+        else:
+            candidate_chars = 0
+        if (
+            self._GREP_LINE_LIMIT
+            < candidate_chars
+            <= self._COMPACT_JSON_PARSE_MAX_CHARS
+        ):
+
+            def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                values = {}
+                for key, value in pairs:
+                    if key in values:
+                        raise ValueError("duplicate JSON object key")
+                    values[key] = value
+                return values
+
+            try:
+                parsed = json.loads(
+                    "".join(lines), object_pairs_hook=reject_duplicate_keys
+                )
+                # Zero-width indentation still separates fields onto lines
+                # without creating overlong whitespace at deep nesting levels.
+                lines = json.dumps(parsed, indent=0, ensure_ascii=False).splitlines(
+                    True
+                )
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                pass  # Preserve source text when parsing cannot retain its content.
 
         matches: list[dict[str, Any]] = []
         matching_indices = [i for i, line in enumerate(lines) if compiled.search(line)]

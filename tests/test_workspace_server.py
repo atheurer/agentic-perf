@@ -57,6 +57,132 @@ async def test_mcp_grep_file_from_workspace(ws_env):
     assert "NIC reset" in resp["lines"][0]["content"]
 
 
+async def test_mcp_grep_compact_json_returns_individual_matches(ws_env):
+    """Compact (single-line) JSON should be pretty-printed before grepping
+    so that matches return individual fields, not the entire file blob."""
+    data = {f"key_{i}": f"value_{i}" for i in range(200)}
+    data["target_field"] = "needle_in_haystack"
+    compact_json = json.dumps(data)  # single line, no newlines
+    assert "\n" not in compact_json
+    assert len(compact_json) > 1000  # large enough to trigger pretty-print
+
+    ws_env.save_file("compact.json", compact_json)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://compact.json", pattern="needle_in_haystack"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] >= 1
+    # The matched line should be short (individual JSON field), not the whole file
+    matched_line = resp["lines"][0]["content"]
+    assert "needle_in_haystack" in matched_line
+    assert len(matched_line) < 200  # individual field line, not the whole blob
+
+
+async def test_mcp_grep_compact_json_multiple_matches(ws_env):
+    """Multiple fields matching a pattern in compact JSON should return
+    separate match entries."""
+    data = {f"padding_{i}": f"filler_{i}" for i in range(100)}
+    data["error_1"] = "connection timeout error"
+    data["error_2"] = "disk read error"
+    data["error_3"] = "memory allocation error"
+    compact = json.dumps(data)
+    assert len(compact) > 1000  # must exceed _GREP_LINE_LIMIT
+    ws_env.save_file("errors.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://errors.json", pattern="error"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    # Should find multiple separate matches, not just 1 giant line
+    assert resp["total_matches"] >= 3
+
+
+async def test_mcp_grep_compact_json_duplicate_keys_preserves_earlier_match(ws_env):
+    """Duplicate JSON keys must not hide earlier values during reformatting."""
+    compact = json.dumps(
+        {
+            "duplicate": "earlier-needle",
+            "padding": "x" * 1200,
+        }
+    )
+    # Add a later duplicate after the matching value in the compact source.
+    compact = compact[:-1] + ', "duplicate": "later-value"}'
+    assert len(compact) > WorkspaceManager._GREP_LINE_LIMIT
+    ws_env.save_file("duplicate-keys.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://duplicate-keys.json", pattern="earlier-needle"
+    )
+    resp = json.loads(raw_resp)
+
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 1
+    assert "earlier-needle" in resp["lines"][0]["content"]
+
+
+def test_workspace_grep_skips_reformat_for_oversized_compact_json(ws_env, monkeypatch):
+    """Files over the parse cap still use ordinary bounded grep behavior."""
+    import providers.workspace.manager as manager_module
+
+    parse_limit = WorkspaceManager._COMPACT_JSON_PARSE_MAX_CHARS
+    padding = "x" * (parse_limit + 1)
+    compact = json.dumps({"needle": "oversized-match", "padding": padding})
+    assert len(compact) > parse_limit
+    ws_env.save_file("oversized.json", compact)
+    original_loads = json.loads
+
+    def reject_oversized_parse(value, *args, **kwargs):
+        if len(value) > parse_limit:
+            raise AssertionError("oversized compact JSON should not be parsed")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(manager_module.json, "loads", reject_oversized_parse)
+
+    result = ws_env.grep_file("workspace://oversized.json", "oversized-match")
+
+    assert result["status"] == "ok"
+    assert result["total_matches"] == 1
+    assert "oversized-match" in result["lines"][0]["content"]
+    assert result["lines"][0]["truncated"] is True
+
+
+async def test_mcp_grep_deep_compact_json_keeps_match_visible(ws_env):
+    """Deep JSON indentation must not hide a matched value behind truncation."""
+    # Stay within Python 3.12/3.13 parser depth while making indent=2 exceed
+    # the 1,000-character grep line limit.
+    compact = "[" * 510 + '"deep-marker"' + "]" * 510
+    ws_env.save_file("deep.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://deep.json", pattern="deep-marker"
+    )
+    resp = json.loads(raw_resp)
+
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 1
+    assert "deep-marker" in resp["lines"][0]["content"]
+    assert not resp["lines"][0].get("truncated", False)
+
+
+async def test_mcp_grep_normal_multiline_file_unaffected(ws_env):
+    """Normal multi-line text files should not be affected by the
+    compact JSON pretty-print logic."""
+    content = "line 1: hello\nline 2: world\nline 3: hello again\n"
+    ws_env.save_file("normal.txt", content)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://normal.txt", pattern="hello"
+    )
+    resp = json.loads(raw_resp)
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 2
+    assert resp["lines"][0]["content"] == "line 1: hello"
+    assert resp["lines"][1]["content"] == "line 3: hello again"
+
+
 async def test_mcp_read_file_from_workspace(ws_env):
     ws_env.save_file("test.txt", "Line 1\nLine 2\nLine 3\nLine 4\n")
 
