@@ -35,8 +35,9 @@ passes through as-is.
 
 ## Notes
 
-- `ebbr` is a shared image type used across multiple boards
-  (e.g., R-Car S4, S32G). It is NOT a board type.
+- `ebbr` is the shared EBBR-compatible manifest target used by
+  multiple board families (e.g., R-Car S4, S32G). It is not a
+  Jumpstarter exporter board type, image name, or image type.
 - Board selection is handled by the resource agent using
   Jumpstarter exporter labels — no mapping config needed.
 - Image version derivation from `RHIVOS Release` is handled

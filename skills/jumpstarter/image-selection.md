@@ -28,7 +28,7 @@ these terms to the correct `image_name` and `image_type`:
 | "qa image", "qa build" | `qa` | `regular` | QA test variant |
 | "fusa", "fusa-minimal" | `fusa-minimal` | `ostree` | Functional safety minimal |
 
-## EBBR (EFI Boot for Embedded Base)
+## EBBR (Embedded Base Boot Requirements)
 
 EBBR is a boot specification, not an image name or type. It
 describes how the board's firmware boots the OS — using UEFI
@@ -41,12 +41,11 @@ conversation), they are indicating they want an EBBR-compatible
 image for their target board. This is valid intent but does
 not map directly to `image_name` or `image_type`:
 
-- EBBR boards can use both `ostree` and `regular` images
-- The EBBR distinction is in the release path (images are
-  published under an `EBBR/` directory), not in the catalog
-  variant name
-- For all currently known EBBR boards, the default image
-  resolution already selects the correct EBBR image
+- The resolver selects a manifest target for the board, then
+  matches the requested `image_name` and `image_type` there
+- Available variants depend on the target and release; use the
+  resolver's manifest results instead of assuming every
+  combination is published
 
 Users may reference EBBR anywhere — in directives (e.g.,
 `image_name: "ebbr"`), in the ticket description, or in
@@ -56,11 +55,11 @@ resolver. Instead:
 
 1. Recognize the user's intent to use an EBBR-compatible
    image for their target board
-2. Use the appropriate `image_name` for the board (e.g.,
-   `ps` for ostree, `qa` for regular/package)
+2. Use the appropriate `image_name` for the requested mode
+   (e.g., `ps` for ostree, `qa` for regular/package)
 3. Preserve whatever `image_type` the user specified
-4. If no `image_type` is specified, use the default for
-   the board
+4. If no `image_type` is specified, use the existing defaults
+   and run metadata for the ticket
 
 If the user explicitly asks for "EBBR ostree" or "EBBR
 package mode", map accordingly:

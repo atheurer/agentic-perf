@@ -280,8 +280,23 @@ async def resolve_images(
         # successful.  An error result (e.g. from a prior failed
         # attempt) must NOT block re-resolution after the user
         # corrects the directives.  See #1119.
-        flash = cf.get("jumpstarter_flash", {})
-        if flash and not flash.get("error"):
+        flash = cf.get("jumpstarter_flash")
+        flash_targets = flash.get("flash_targets") if isinstance(flash, dict) else None
+        flash_command = flash.get("flash_command") if isinstance(flash, dict) else None
+        has_flash_targets = isinstance(flash_targets, list) and any(
+            isinstance(target, dict)
+            and isinstance(target.get("url"), str)
+            and target["url"].strip()
+            for target in flash_targets
+        )
+        has_flash_command = isinstance(flash_command, str) and bool(
+            flash_command.strip()
+        )
+        if (
+            isinstance(flash, dict)
+            and not flash.get("error")
+            and (has_flash_targets or has_flash_command)
+        ):
             return
 
         # Custom CAIB build: use the built image instead

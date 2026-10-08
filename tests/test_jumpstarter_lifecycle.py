@@ -161,3 +161,29 @@ async def test_successful_flash_result_skips_re_resolution(monkeypatch):
 
     # Should return early — no patches written
     assert len(patches) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flash", ["stale result", {"status": "pending"}])
+async def test_malformed_flash_result_does_not_block_re_resolution(monkeypatch, flash):
+    """Non-object custom-field data is not mistaken for a resolved result."""
+    ticket = {
+        "custom_fields": {
+            "resource_provider": "jumpstarter",
+            "jumpstarter_flash": flash,
+            "directives": {"image_version": "AutoSD-10"},
+        }
+    }
+    patches = _install_http_client(monkeypatch, ticket)
+
+    async def resolve_image_urls(**_kwargs):
+        return {"flash_targets": [{"partition": "default", "url": "https://img"}]}
+
+    monkeypatch.setattr(jumpstarter_images, "resolve_image_urls", resolve_image_urls)
+
+    await jumpstarter_lifecycle.resolve_images("https://store", "PERF-TEST")
+
+    assert len(patches) == 1
+    assert patches[0]["fields"]["jumpstarter_flash"]["flash_targets"][0]["url"] == (
+        "https://img"
+    )
