@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -14,7 +15,7 @@ import time
 from typing import Any
 
 from agents.base import AgentAbortedError, HITLDriftError
-from agents.server_utils import build_skill_provider
+from agents.server_utils import build_skill_provider_async
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
@@ -829,6 +830,14 @@ async def run_agent_task(
     try:
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
+        skill_provider_result = dispatcher.get_skill_provider_for_ticket(
+            ticket_id, agent_type
+        )
+        ticket_skill_provider = (
+            await skill_provider_result
+            if inspect.isawaitable(skill_provider_result)
+            else skill_provider_result
+        )
         api_key = (
             await _resolve_api_key_secret(config, agent_type, ticket_secrets)
             if config
@@ -849,6 +858,7 @@ async def run_agent_task(
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
             secrets_provider=ticket_secrets,
+            skill_provider=ticket_skill_provider,
         )
         if agent is None:
             return
@@ -2192,16 +2202,6 @@ async def _poll_loop_after_lease(
                 arcaflow_mcp = None
             break
 
-    skills = build_skill_provider(
-        crucible_home=config.crucible_home,
-        repo_cache=repo_cache,
-        source_repo=config.raw.get("crucible_source_repo"),
-        source_url=config.harness_repos.get("crucible"),
-        zathras_home=config.zathras_home,
-        resolve_source=False,
-        catalog_only=True,
-        arcaflow_mcp_client=arcaflow_mcp,
-    )
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
 
@@ -2245,6 +2245,55 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    from providers.secrets.git import GitSecretsProvider
+
+    secrets = GitSecretsProvider(fallback=secrets)
+
+    async def make_skill_provider(ticket_id: str = "", phase: str = ""):
+        provider = await build_skill_provider_async(
+            crucible_home=config.crucible_home,
+            repo_cache=repo_cache,
+            source_repo=config.raw.get("crucible_source_repo"),
+            source_url=config.harness_repos.get("crucible"),
+            zathras_home=config.zathras_home,
+            resolve_source=False,
+            catalog_only=True,
+            arcaflow_mcp_client=arcaflow_mcp,
+            secrets_provider=secrets,
+        )
+        if ticket_id and hasattr(provider, "bind_attempt"):
+            provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
+        return provider
+
+    skills = await make_skill_provider()
+    gateway_config = config.raw.get("skill_gateway")
+    organization_config = (
+        gateway_config.get("organization") if isinstance(gateway_config, dict) else None
+    )
+    from providers.skills.gateway import organization_source_descriptors
+
+    try:
+        organization_sources = organization_source_descriptors(
+            organization_config if isinstance(organization_config, dict) else {}
+        )
+    except (TypeError, ValueError):
+        organization_sources = []
+    skill_provider_factory = None
+    if any(item["source"].get("kind") == "git" for item in organization_sources):
+
+        async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+            if phase not in {
+                "triage",
+                "platform",
+                "provisioning",
+                "benchmark",
+                "review",
+            }:
+                return skills
+            return await make_skill_provider(ticket_id, phase)
+
+        skill_provider_factory = refresh_ticket_skill_provider
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
@@ -2330,6 +2379,7 @@ async def _poll_loop_after_lease(
             introspection_llm=config.introspection_llm,
             session_id=str(leader_lease.session_id),
             fencing_epoch=leader_lease.epoch,
+            skill_provider_factory=skill_provider_factory,
         )
         lease_loss_gate.bind(dispatcher)
 
