@@ -244,7 +244,7 @@ class PlatformAgent(AgentBase):
                 ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
             if (
-                "board_name" not in result
+                not result.get("board_name")
                 and cf.get("resource_provider") == "jumpstarter"
             ):
                 board = (

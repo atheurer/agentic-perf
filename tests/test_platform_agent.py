@@ -284,7 +284,17 @@ class TestPlatformAgent:
             await agent._handle_completion("T-1", response)
             assert agent._transition_ticket.call_args[0][1] == "coordinating_fleet"
 
-    async def test_handle_completion_failure_fleet_uses_jumpstarter_exporter(self):
+    @pytest.mark.parametrize(
+        "board_fields",
+        [
+            pytest.param({}, id="omitted"),
+            pytest.param({"board_name": ""}, id="empty"),
+            pytest.param({"board_name": None}, id="none"),
+        ],
+    )
+    async def test_handle_completion_failure_fleet_uses_jumpstarter_exporter(
+        self, board_fields
+    ):
         """An early Jumpstarter failure still records the ticket's board."""
         agent = self._make_agent()
         response = AsyncMock()
@@ -295,6 +305,7 @@ class TestPlatformAgent:
                 input={
                     "platform_ready": False,
                     "diagnostics": "Image provisioning failed",
+                    **board_fields,
                 },
             )
         ]
