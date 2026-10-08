@@ -151,7 +151,9 @@ def test_workspace_grep_skips_reformat_for_oversized_compact_json(ws_env, monkey
 
 async def test_mcp_grep_deep_compact_json_keeps_match_visible(ws_env):
     """Deep JSON indentation must not hide a matched value behind truncation."""
-    compact = "[" * 1200 + '"deep-marker"' + "]" * 1200
+    # Stay within Python 3.12/3.13 parser depth while making indent=2 exceed
+    # the 1,000-character grep line limit.
+    compact = "[" * 510 + '"deep-marker"' + "]" * 510
     ws_env.save_file("deep.json", compact)
 
     raw_resp = await ws_server.grep_file_from_workspace(
