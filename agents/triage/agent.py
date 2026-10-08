@@ -495,9 +495,15 @@ _MONTH_NAMES: dict[str, str] = {
 # YYYYMM+ datestamp (6-12 digits starting with 20xx).
 # Used to detect when a ticket description references a
 # specific date but triage emitted a bare "monthly" release.
+_MONTH_NAME_PATTERN = "|".join(
+    rf"(?:{month[:3]}(?:{re.escape(month[3:])})?)" for month in _MONTH_NAMES
+)
 _DATE_REFERENCE_RE = re.compile(
-    r"\b(?:"
-    + "|".join(rf"(?:{m[:3]}(?:{re.escape(m[3:])})?)" for m in _MONTH_NAMES)
+    r"\bmonthly\s+from\s+(?:"
+    + _MONTH_NAME_PATTERN
+    + r")\b(?:\s+\d{4})?"
+    + r"|\b(?:"
+    + _MONTH_NAME_PATTERN
     + r")\b(?:\s+\d{4}|\s+(?:monthly|build|image|release))"
     + r"|\b20\d{2}(?:0[1-9]|1[0-2])\d{0,8}\b",
     re.IGNORECASE,

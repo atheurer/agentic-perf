@@ -20,6 +20,14 @@ class TestWarnBareMonthlyRelease:
         assert warning is not None
         assert "August" in warning
 
+    def test_bare_monthly_from_month_name(self):
+        warning = _warn_bare_monthly_release(
+            "Use monthly from August for the S32G image",
+            "monthly",
+        )
+        assert warning is not None
+        assert "monthly from August" in warning
+
     def test_bare_monthly_with_month_and_year(self):
         warning = _warn_bare_monthly_release(
             "Use the July 2026 monthly build",
