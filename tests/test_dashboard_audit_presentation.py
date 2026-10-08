@@ -55,6 +55,30 @@ assert.equal(maxEventSeq([]), 0);
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_dashboard_retains_descending_sequence_page_events() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function renderNewEvents(events)")
+    end = html.index("\nfunction maxEventSeq(events)", start)
+    renderer = html[start:end]
+    script = (
+        "let maxRenderedSeq = 0;\n"
+        "let eventRecords = [];\n"
+        "function renderEventStream() {}\n"
+        + renderer
+        + r"""
+const assert = require('node:assert/strict');
+renderNewEvents([{seq: 2}, {seq: 1}]);
+assert.deepEqual(eventRecords.map(function(evt) { return evt.seq; }), [2, 1]);
+assert.equal(maxRenderedSeq, 2);
+
+renderNewEvents([{seq: 1}, {seq: 2}, {seq: 3}, {seq: 3}]);
+assert.deepEqual(eventRecords.map(function(evt) { return evt.seq; }), [2, 1, 3]);
+assert.equal(maxRenderedSeq, 3);
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_dashboard_restores_expansion_by_stable_element_key() -> None:
     html = INDEX.read_text(encoding="utf-8")
     helpers = html[

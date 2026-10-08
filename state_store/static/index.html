@@ -3817,13 +3817,18 @@ function renderEventStream() {
 
 function renderNewEvents(events) {
   var added = 0;
+  var priorMaxSeq = maxRenderedSeq;
+  var pageMaxSeq = priorMaxSeq;
+  var seenSeqs = new Set();
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
-    if (evt.seq <= maxRenderedSeq) continue;
-    maxRenderedSeq = evt.seq;
+    if (evt.seq <= priorMaxSeq || seenSeqs.has(evt.seq)) continue;
+    seenSeqs.add(evt.seq);
+    pageMaxSeq = Math.max(pageMaxSeq, evt.seq);
     eventRecords.push(evt);
     added++;
   }
+  maxRenderedSeq = pageMaxSeq;
   // Keep the browser-side projection bounded. Raw forensic records remain
   // available through the trace endpoint and are never deleted here.
   if (eventRecords.length > 10000) {
