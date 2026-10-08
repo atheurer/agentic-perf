@@ -298,6 +298,8 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
 ):
     import orchestrator.main as orchestrator_main
 
+    monkeypatch.delenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", raising=False)
+    monkeypatch.delenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", raising=False)
     config = _poll_config()
     config.poll_interval = 60
     config.stale_task_timeout = 0
