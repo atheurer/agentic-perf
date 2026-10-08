@@ -419,9 +419,14 @@ async def prepare_git_source(
     *,
     secrets_provider: SecretsProvider | None = None,
     cache_root: str | Path | None = None,
+    pinned_commit: str | None = None,
 ) -> PreparedGitSource:
-    """Fetch a configured branch and return a private immutable commit tree."""
+    """Prepare an immutable commit tree, using an epoch pin without fetching."""
     config = parse_git_source(source)
+    if pinned_commit is not None and not re.fullmatch(r"[a-f0-9]{40,64}", pinned_commit):
+        raise GitSourceError(
+            "invalid_config", "Pinned organization repository revision is invalid"
+        )
     root = Path(cache_root or (AGENTIC_PERF_HOME / "organization-git")).resolve()
     home = AGENTIC_PERF_HOME.resolve()
     if not root.is_absolute() or not root.is_relative_to(home):
@@ -450,6 +455,78 @@ async def prepare_git_source(
 
     mirror_rel = relative_root / "mirrors" / f"{config.cache_key}.git"
     mirror = home / mirror_rel
+    if pinned_commit is not None:
+        checkout_rel = (
+            relative_root / "checkouts" / f"{config.cache_key}-{pinned_commit}"
+        )
+        checkout = home / checkout_rel
+        lock_acquired = False
+        try:
+            await _acquire_lock(lock_fd)
+            lock_acquired = True
+            if checkout.is_symlink() or not checkout.is_dir():
+                raise ValueError("pinned checkout is missing")
+            env = {
+                key: os.environ[key]
+                for key in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+                if key in os.environ
+            }
+            env.update(
+                {
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                }
+            )
+            runner = AuditedSubprocessRunner(output_limit=4096)
+            existing_commit = await _run_git(
+                runner,
+                _git_argv(
+                    "-C",
+                    str(checkout),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                ),
+                env,
+            )
+            status = await _run_git(
+                runner,
+                _git_argv(
+                    "-C",
+                    str(checkout),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ),
+                env,
+            )
+            if existing_commit != pinned_commit or status:
+                raise ValueError("pinned checkout is invalid")
+            return PreparedGitSource(
+                root=checkout,
+                commit=pinned_commit,
+                identity=config.identity,
+            )
+        except GitSourceError as exc:
+            if exc.code == "organization_source_unavailable":
+                raise GitSourceError(
+                    "organization_snapshot_unavailable",
+                    "Pinned organization repository snapshot is unavailable",
+                ) from None
+            raise
+        except Exception:
+            raise GitSourceError(
+                "organization_snapshot_unavailable",
+                "Pinned organization repository snapshot is unavailable",
+            ) from None
+        finally:
+            try:
+                if lock_acquired:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
     try:
         async with _git_environment(config, secrets_provider) as env:
             await _acquire_lock(lock_fd)

@@ -129,8 +129,13 @@ Only manifest-listed package documents are served. The service-config tree is
 physically outside those packages and is never exposed as skill files.
 Configured organization settings
 are canonical and are not overlaid with legacy private JSON or harness defaults.
-Documents-only discovered subjects have empty service settings. Configuration-only
-subjects provide service settings without organization document entrypoints.
+Document-only subjects do not bind organization runtime settings, so existing
+provider defaults remain available; local legacy private JSON is selected only
+when `legacy_config: true` is explicit. An explicitly configured empty `{}`
+remains a canonical runtime configuration and does not fall back, but does not
+mean all operation requirements are satisfied. Required absent values remain
+absent for the consuming operation to validate. Configuration-only subjects
+provide service settings without organization document entrypoints.
 Approved model-facing configuration views require a registered projection
 schema; this release supplies one for `harness/crucible`. Unconfigured subjects
 retain the existing legacy behavior.

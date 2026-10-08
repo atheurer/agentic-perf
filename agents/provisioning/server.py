@@ -1354,7 +1354,7 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 
 @mcp.tool()
 async def list_skill_docs(harness: str) -> str:
-    """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    """List legacy local skill documents for topics not yet routed through the context gateway. For general host-tuning, use get_skill_context(subject='general/host-tuning')."""
     harness_root = (
         harness.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
     )
@@ -1376,7 +1376,7 @@ async def list_skill_docs(harness: str) -> str:
 
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}]). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
+    """Read local legacy skill documents not yet exposed through the context gateway. Use get_skill_context for manifest-backed guidance such as general/host-tuning."""
     return json.dumps(read_skill_documents(_SKILLS_DIR, docs))
 
 
@@ -3130,7 +3130,7 @@ async def get_skill_context(
 
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
-    """Get approved harness installation or platform settings. For Crucible, key must be constraints, provisioning, or platform_contract; commands, secret bindings, and installation contracts remain service-only. Read operational guidance through get_skill_context."""
+    """Get legacy approved settings for a harness. For Crucible, use the matching configuration view returned by get_skill_context. Commands, secret bindings, and installation contracts remain service-only."""
     await _ensure_init()
     if harness_name == "crucible" or organization_manages_harness(
         _skill_provider, harness_name

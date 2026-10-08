@@ -1460,7 +1460,7 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 
 @mcp.tool()
 async def get_execution_config(harness_name: str) -> str:
-    """Get execution settings for the harness that owns the benchmark. Crucible returns approved controller, endpoint, and default fields; deterministic action tools consume service-only commands. Read applicable guidance through get_skill_context. Other organization subjects require an approved view schema; unconfigured harnesses retain their legacy response."""
+    """Get legacy execution settings for a harness. For Crucible, read the approved execution configuration view from get_skill_context instead. Deterministic action tools consume service-only commands."""
     await _ensure_init()
     if harness_name == "crucible" or organization_manages_harness(
         _skill_provider, harness_name

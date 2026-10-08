@@ -523,6 +523,9 @@ class OrganizationSkillResolver:
         snapshot_root: str | Path | None = None,
         audit_emit: Any | None = None,
         secrets_provider: SecretsProvider | None = None,
+        ticket_id: str = "",
+        attempt_id: str = "",
+        phase: str = "context",
     ) -> OrganizationSkillResolver:
         """Resolve Git sources before using the synchronous local resolver."""
         if raw_config is None:
@@ -538,25 +541,107 @@ class OrganizationSkillResolver:
             organization = raw_config.get("skill_gateway", {}).get("organization", {})
             descriptors = organization_source_descriptors(organization)
             if not any(item["source"].get("kind") == "git" for item in descriptors):
-                return cls.from_instance_config(
+                resolver = cls.from_instance_config(
                     raw_config,
                     snapshot_root=snapshot_root,
                     audit_emit=audit_emit,
                 )
-            from providers.skills.git_source import GitSourceError, prepare_git_source
+                return (
+                    resolver.for_attempt(ticket_id, attempt_id, phase)
+                    if ticket_id and attempt_id
+                    else resolver
+                )
+            from providers.skills.git_source import (
+                GitSourceError,
+                parse_git_source,
+                prepare_git_source,
+            )
+
+            epoch = None
+            if ticket_id and attempt_id:
+                from providers.skills.source_epoch import SourceEpoch
+
+                epoch = SourceEpoch(
+                    snapshot_root or AGENTIC_PERF_HOME / "skill-snapshots",
+                    ticket_id=ticket_id,
+                    attempt_id=attempt_id,
+                    audit_emit=audit_emit,
+                )
 
             prepared_sources = {}
             resolved_sources = []
+            prepared_by_repository = {}
             for item in descriptors:
                 source_id, source = item["id"], item["source"]
                 if source.get("kind") == "git":
-                    try:
-                        prepared = await prepare_git_source(
-                            source, secrets_provider=secrets_provider
+                    git_config = parse_git_source(source)
+                    pinned_commit = None
+                    if epoch is not None:
+                        pinned_source = epoch.read(
+                            f"git:{source_id}", git_config.identity
                         )
+                        if pinned_source is not None:
+                            pinned_commit = pinned_source.get("revision")
+                            if (
+                                pinned_source.get("source_identity")
+                                != git_config.identity
+                                or not isinstance(pinned_commit, str)
+                            ):
+                                raise SkillGatewayError(
+                                    "invalid_snapshot",
+                                    "Pinned organization Git revision is invalid",
+                                )
+                    prepared = prepared_by_repository.get(git_config.cache_key)
+                    if prepared is not None:
+                        if pinned_commit and prepared.commit != pinned_commit:
+                            raise SkillGatewayError(
+                                "source_binding_changed",
+                                "Organization Git sources disagree on the pinned revision",
+                            )
+                    elif epoch is not None and pinned_commit is None:
+                        for alias in descriptors:
+                            alias_source = alias["source"]
+                            if (
+                                alias["id"] == source_id
+                                or alias_source.get("kind") != "git"
+                            ):
+                                continue
+                            alias_config = parse_git_source(alias_source)
+                            if alias_config.cache_key != git_config.cache_key:
+                                continue
+                            alias_pin = epoch.read(
+                                f"git:{alias['id']}", alias_config.identity
+                            )
+                            if alias_pin is not None:
+                                alias_revision = alias_pin.get("revision")
+                                if (
+                                    alias_pin.get("source_identity")
+                                    != alias_config.identity
+                                    or not isinstance(alias_revision, str)
+                                ):
+                                    raise SkillGatewayError(
+                                        "invalid_snapshot",
+                                        "Pinned organization Git revision is invalid",
+                                    )
+                                if pinned_commit and pinned_commit != alias_revision:
+                                    raise SkillGatewayError(
+                                        "source_binding_changed",
+                                        "Organization Git sources disagree on the pinned revision",
+                                    )
+                                pinned_commit = alias_revision
+                    try:
+                        if prepared is None:
+                            prepared = await prepare_git_source(
+                                source,
+                                secrets_provider=secrets_provider,
+                                pinned_commit=pinned_commit,
+                            )
+                            prepared_by_repository[git_config.cache_key] = prepared
                     except GitSourceError as exc:
                         raise SkillGatewayError(exc.code, str(exc)) from None
-                    prepared_sources[source_id] = prepared
+                    prepared_sources[source_id] = replace(
+                        prepared, identity=git_config.identity
+                    )
                     resolved_sources.append(
                         {
                             "id": source_id,
@@ -593,11 +678,14 @@ class OrganizationSkillResolver:
                 )
                 for subject, group in resolver.bindings.items()
             }
-            return cls(
+            resolved = cls(
                 bindings,
                 snapshot_root=resolver.snapshot_root,
                 audit_emit=audit_emit,
             )
+            if ticket_id and attempt_id:
+                resolved = resolved.for_attempt(ticket_id, attempt_id, phase)
+            return resolved
         except SkillGatewayError:
             raise
         except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
@@ -612,7 +700,7 @@ class OrganizationSkillResolver:
             raise SkillGatewayError(
                 "missing_attempt", "Trusted ticket, attempt and phase are required"
             )
-        return type(self)(
+        bound = type(self)(
             self.bindings,
             snapshot_root=self.snapshot_root,
             audit_emit=self.audit_emit,
@@ -620,14 +708,98 @@ class OrganizationSkillResolver:
             attempt_id=attempt_id,
             phase=phase,
         )
+        bound._pin_git_sources()
+        return bound
+
+    def _source_epoch(self):
+        if not self.ticket_id or not self.attempt_id:
+            raise SkillGatewayError("missing_attempt", "Trusted attempt is required")
+        from providers.skills.source_epoch import SourceEpoch
+
+        return SourceEpoch(
+            self.snapshot_root,
+            ticket_id=self.ticket_id,
+            attempt_id=self.attempt_id,
+            audit_emit=self.audit_emit,
+        )
+
+    def pin_external_source(
+        self,
+        source_id: str,
+        identity: str,
+        capture: Any,
+    ) -> dict[str, Any]:
+        """Pin a local or project document capture into this ticket attempt."""
+        return self._source_epoch().get_or_capture(source_id, identity, capture)
+
+    def _pin_git_sources(self) -> None:
+        epoch = self._source_epoch()
+        by_source: dict[str, tuple[str, str]] = {}
+        for group in self.bindings.values():
+            for binding in group:
+                if not binding.source_identity or not binding.source_revision:
+                    continue
+                current = (binding.source_identity, binding.source_revision)
+                prior = by_source.setdefault(binding.source_id, current)
+                if prior != current:
+                    raise SkillGatewayError(
+                        "source_binding_changed",
+                        "Organization Git source changed within the ticket attempt",
+                    )
+        for source_id, (identity, revision) in by_source.items():
+            pinned = epoch.get_or_capture(
+                f"git:{source_id}",
+                identity,
+                lambda revision=revision, identity=identity: {
+                    "source_identity": identity,
+                    "revision": revision,
+                },
+            )
+            if (
+                pinned.get("source_identity") != identity
+                or pinned.get("revision") != revision
+            ):
+                raise SkillGatewayError(
+                    "source_binding_changed",
+                    "Organization Git revision changed within the ticket attempt",
+                )
 
     def configured_subjects(self) -> list[str]:
         return sorted(self.bindings)
 
     def uses_organization_config(self, subject: str) -> bool:
+        """Whether a canonical organization config binding exists for subject.
+
+        Document discovery is deliberately independent: a docs-only subject
+        must not suppress provider defaults or implicitly select the user's
+        legacy config file. An explicitly configured empty JSON file still
+        counts as a binding. For a ticket attempt, an existing validated pin
+        takes precedence over the current repository hierarchy.
+        """
+        subject = _subject(subject)
+        if self.ticket_id and self.attempt_id:
+            pin_path = self._pin_path(subject)
+            try:
+                if pin_path.exists():
+                    snapshot = self._snapshot(subject)
+                    return bool(snapshot and snapshot["service_configured"])
+                if pin_path.parent.exists():
+                    # A snapshot directory marks a started capture. A missing
+                    # pin is not permission to select today's mutable config.
+                    raise SkillGatewayError(
+                        "invalid_snapshot", "Pinned skill snapshot is unavailable"
+                    )
+            except SkillGatewayError:
+                raise
+            except (OSError, RuntimeError):
+                raise SkillGatewayError(
+                    "snapshot_unavailable", "Cannot inspect pinned skill source"
+                ) from None
         group = self.bindings.get(_subject(subject))
         if group is not None:
-            return not any(binding.legacy_config for binding in group)
+            return any(binding.service_config is not None for binding in group)
+        # A pinned subject that disappeared remains fail-closed. Callers must
+        # resolve it and surface the unavailable/removed error, not fall back.
         return self.has_subject(subject)
 
     def uses_legacy_config(self, subject: str) -> bool:
@@ -816,7 +988,9 @@ class OrganizationSkillResolver:
                 raise ValueError("configuration changed during capture")
             # Document and approved configuration-view refs identify one
             # canonical snapshot, including config-only administrator updates.
-            revision = _digest([exported, documents, runtime])
+            revision = _digest(
+                [exported, documents, binding.service_config is not None, runtime]
+            )
             return {
                 "schema_version": 1,
                 "subject": binding.subject,
@@ -1103,6 +1277,8 @@ class OrganizationSkillResolver:
                 + (f" (sources: {source_ids})" if source_ids else ""),
             )
         if snapshot["legacy_config"]:
+            return None
+        if not snapshot["service_configured"]:
             return None
         return copy.deepcopy(snapshot["runtime_config"])
 

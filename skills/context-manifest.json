@@ -2,6 +2,15 @@
   "schema_version": 1,
   "entries": [
     {
+      "id": "general-host-tuning",
+      "path": "skills/general/host-tuning.md",
+      "harness": "general",
+      "phases": ["provisioning", "review"],
+      "agents": ["provisioning-agent", "review-agent"],
+      "subjects": ["host-tuning"],
+      "entrypoint": true
+    },
+    {
       "id": "crucible-benchmark-discovery",
       "path": "skills/crucible/benchmark-discovery.md",
       "harness": "crucible",

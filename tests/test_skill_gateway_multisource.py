@@ -9,6 +9,9 @@ import pytest
 from agents.review.prompts import REVIEW_SYSTEM_PROMPT
 from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from providers.skills.gateway import OrganizationSkillResolver, SkillGatewayError
+from providers.skills.multi import MultiHarnessSkillProvider
+from providers.skills.private import PrivateSkillProvider
+from tests.conftest import MockSkillProvider
 
 
 def _write_package(
@@ -106,6 +109,149 @@ def test_named_sources_discover_subject_union(tmp_path: Path) -> None:
     assert shorthand.configured_subjects() == ["harness/crucible"]
 
 
+def test_docs_only_subject_preserves_defaults_without_selecting_legacy_config(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "org"
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Use the organization Crucible workflow.",
+    )
+    private_root = tmp_path / "private-skills"
+    private_root.mkdir()
+    (private_root / "crucible.json").write_text(
+        json.dumps({"execution": {"endpoint_type": "kube"}})
+    )
+    resolver = _resolver(("org", repository))
+    private = PrivateSkillProvider(private_root, resolver=resolver)
+
+    class DefaultsProvider(MockSkillProvider):
+        async def get_default_config(self) -> dict:
+            return {"execution": {"controller_required": True}}
+
+    provider = MultiHarnessSkillProvider(
+        {"crucible": DefaultsProvider()},
+        private=private,
+    )
+
+    assert resolver.has_subject("harness/crucible")
+    assert not resolver.uses_organization_config("harness/crucible")
+    assert resolver.get_runtime_config("harness/crucible") is None
+    assert asyncio.run(private.get_all_private_config("crucible")) == {}
+    assert asyncio.run(provider.get_all_private_config("crucible")) == {
+        "execution": {"controller_required": True}
+    }
+
+
+def test_explicit_empty_canonical_config_is_not_treated_as_docs_only(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "org"
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Use the organization Crucible workflow.",
+        runtime_config={},
+    )
+    private_root = tmp_path / "private-skills"
+    private_root.mkdir()
+    (private_root / "crucible.json").write_text(
+        json.dumps({"execution": {"endpoint_type": "kube"}})
+    )
+    resolver = _resolver(("org", repository))
+    private = PrivateSkillProvider(private_root, resolver=resolver)
+    provider = MultiHarnessSkillProvider({"crucible": MockSkillProvider()}, private)
+
+    assert resolver.has_subject("harness/crucible")
+    assert resolver.uses_organization_config("harness/crucible")
+    assert resolver.get_runtime_config("harness/crucible") == {}
+    assert asyncio.run(provider.get_all_private_config("crucible")) == {}
+
+
+def test_explicit_legacy_binding_keeps_legacy_config_with_docs(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "org"
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Use the organization Crucible workflow.",
+    )
+    private_root = tmp_path / "private-skills"
+    private_root.mkdir()
+    (private_root / "crucible.json").write_text(
+        json.dumps({"execution": {"endpoint_type": "remotehosts"}})
+    )
+    resolver = OrganizationSkillResolver.from_instance_config(
+        {
+            "skill_gateway": {
+                "organization": {
+                    "source": {"kind": "path", "path": str(repository)},
+                    "subjects": {"harness/crucible": {"legacy_config": True}},
+                }
+            }
+        }
+    )
+    private = PrivateSkillProvider(private_root, resolver=resolver)
+
+    assert resolver.has_subject("harness/crucible")
+    assert resolver.uses_legacy_config("harness/crucible")
+    assert not resolver.uses_organization_config("harness/crucible")
+    assert asyncio.run(private.get_all_private_config("crucible")) == {
+        "execution": {"endpoint_type": "remotehosts"}
+    }
+
+
+def test_unconfigured_subject_keeps_existing_legacy_config_behavior(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private-skills"
+    private_root.mkdir()
+    (private_root / "crucible.json").write_text(
+        json.dumps({"execution": {"endpoint_type": "remotehosts"}})
+    )
+    resolver = OrganizationSkillResolver.from_instance_config({})
+    private = PrivateSkillProvider(private_root, resolver=resolver)
+
+    assert not private.organization_resolver.has_subject("harness/crucible")
+    assert asyncio.run(private.get_all_private_config("crucible")) == {
+        "execution": {"endpoint_type": "remotehosts"}
+    }
+
+
+def test_unavailable_canonical_config_does_not_fall_back_to_legacy(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "org"
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Use the organization Crucible workflow.",
+        runtime_config={},
+    )
+    resolver = _resolver(("org", repository))
+    (repository / "service-config" / "harness" / "crucible.json").unlink()
+    private_root = tmp_path / "private-skills"
+    private_root.mkdir()
+    (private_root / "crucible.json").write_text(
+        json.dumps({"execution": {"endpoint_type": "remotehosts"}})
+    )
+    private = PrivateSkillProvider(private_root, resolver=resolver)
+
+    assert resolver.uses_organization_config("harness/crucible")
+    with pytest.raises(SkillGatewayError, match="organization skill is missing"):
+        asyncio.run(private.get_all_private_config("crucible"))
+
+
 def test_ticket_snapshot_read_handles_reverse_source_configuration_order(
     tmp_path: Path,
 ) -> None:
@@ -141,6 +287,105 @@ def test_ticket_snapshot_read_handles_reverse_source_configuration_order(
 
     document = resolver.read(subject, bootstrap["entrypoints"][0])
     assert "Crucible guidance from team A." in document["content"]
+
+
+def test_path_source_keeps_document_content_across_attempt_restart(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "organization-path"
+    subject = "harness/crucible"
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject=subject,
+        instruction="Path-backed guidance before restart.",
+    )
+    snapshot_root = tmp_path / "snapshots"
+    first = _resolver(("org", repository), snapshot_root=snapshot_root)
+    first.audit_emit = lambda _event: None
+    first = first.for_attempt("PERF-PATH-EPOCH", "attempt-1", "benchmark")
+    bootstrap = first.bootstrap(subject)
+    notes_ref = next(
+        item["ref"]
+        for item in bootstrap["documents"]
+        if item["source_path"] == "notes.md"
+    )
+    (repository / "skills" / "harness" / "crucible" / "notes.md").write_text(
+        "Changed after the initial attempt read.\n"
+    )
+
+    resumed = _resolver(("org", repository), snapshot_root=snapshot_root)
+    resumed.audit_emit = lambda _event: None
+    resumed = resumed.for_attempt("PERF-PATH-EPOCH", "attempt-1", "review")
+    document = resumed.read(subject, notes_ref)
+    assert document["content"] == "Shared note from maintainers.\n"
+
+
+def test_git_repository_revision_is_shared_across_subjects_and_resume(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from providers.skills.git_source import PreparedGitSource, parse_git_source
+
+    repository = tmp_path / "organization"
+    repository.mkdir()
+    _write_package(
+        repository,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Crucible source revision guidance.",
+    )
+    _write_package(
+        repository,
+        namespace="harness",
+        name="zathras",
+        subject="harness/zathras",
+        instruction="Zathras source revision guidance.",
+    )
+    revision = "a" * 40
+    prepared_revisions = []
+
+    async def prepare(source, *, pinned_commit=None, **_kwargs):
+        identity = parse_git_source(source).identity
+        prepared_revisions.append(pinned_commit)
+        return PreparedGitSource(repository, pinned_commit or revision, identity)
+
+    monkeypatch.setattr("providers.skills.git_source.prepare_git_source", prepare)
+    config = {
+        "skill_gateway": {
+            "organization": {
+                "sources": [
+                    {
+                        "id": "org",
+                        "kind": "git",
+                        "url": "https://git.example.org/team/context.git",
+                        "ref": "main",
+                    }
+                ]
+            }
+        }
+    }
+    common = {
+        "raw_config": config,
+        "snapshot_root": tmp_path / "pins",
+        "audit_emit": lambda _event: None,
+        "ticket_id": "PERF-GIT-EPOCH",
+        "attempt_id": "attempt-1",
+        "phase": "benchmark",
+    }
+
+    resolver = asyncio.run(OrganizationSkillResolver.from_instance_config_async(**common))
+    assert prepared_revisions == [None]
+    first = resolver.bootstrap("harness/crucible")
+    second = resolver.bootstrap("harness/zathras")
+    assert first["sources"][0]["revision"] == revision
+    assert second["sources"][0]["revision"] == revision
+
+    resumed = asyncio.run(OrganizationSkillResolver.from_instance_config_async(**common))
+    assert prepared_revisions == [None, revision]
+    assert resumed.bootstrap("harness/crucible")["sources"][0]["revision"] == revision
+    assert resumed.bootstrap("harness/zathras")["sources"][0]["revision"] == revision
 
 
 def test_overlapping_subjects_keep_provenance_and_report_variants(

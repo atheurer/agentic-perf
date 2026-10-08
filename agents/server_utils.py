@@ -95,6 +95,8 @@ def build_skill_provider(
     arcaflow_mcp_client: Any | None = None,
     skill_phase: str = "",
     organization_resolver: Any | None = None,
+    ticket_id: str | None = None,
+    attempt_id: str = "initial",
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -141,10 +143,10 @@ def build_skill_provider(
         )
 
     private = PrivateSkillProvider(resolver=organization_resolver)
-    ticket_id = os.environ.get("TICKET_ID", "")
+    ticket_id = ticket_id if ticket_id is not None else os.environ.get("TICKET_ID", "")
     if ticket_id:
         phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
-        private.bind_attempt(ticket_id, "initial", phase)
+        private.bind_attempt(ticket_id, attempt_id, phase)
 
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
@@ -169,13 +171,29 @@ def build_skill_provider(
 
 
 async def build_skill_provider_async(
-    *, secrets_provider: Any | None = None, **kwargs: Any
+    *,
+    secrets_provider: Any | None = None,
+    ticket_id: str | None = None,
+    attempt_id: str | None = None,
+    defer_organization_sources: bool = False,
+    **kwargs: Any,
 ):
-    """Build skills after resolving authenticated organization Git sources."""
+    """Build skills after resolving organization sources for a dispatch.
+
+    Startup callers can defer organization sources until dispatch so mutable
+    Git repositories are not fetched before an existing ticket pin is checked.
+    """
     from paths import CONFIG_PATH
     from providers.skills.gateway import (
         OrganizationSkillResolver,
         organization_source_descriptors,
+    )
+
+    ticket_id = ticket_id if ticket_id is not None else os.environ.get("TICKET_ID", "")
+    attempt_id = (
+        attempt_id
+        if attempt_id is not None
+        else os.environ.get("AGENTIC_PERF_ATTEMPT_ID", "initial")
     )
 
     raw_config = None
@@ -190,6 +208,15 @@ async def build_skill_provider_async(
         sources = organization_source_descriptors(organization or {})
     except (TypeError, ValueError):
         sources = []
+    resolver_config = raw_config
+    if defer_organization_sources:
+        if ticket_id:
+            raise ValueError("organization sources can only be deferred at startup")
+        # Startup only needs a fallback provider object. Ticket dispatch builds
+        # a fresh provider bound to its ticket and attempt, where the resolver
+        # can consult pins before attempting network access.
+        resolver_config = {"skill_gateway": {"organization": {}}}
+        sources = []
     needs_secret_provider = any(
         item["source"].get("kind") == "git"
         and isinstance(item["source"].get("auth", {}), dict)
@@ -200,10 +227,18 @@ async def build_skill_provider_async(
     if secrets_provider is None and needs_secret_provider:
         secrets_provider = build_secrets_provider()
     resolver = await OrganizationSkillResolver.from_instance_config_async(
-        raw_config=raw_config,
+        raw_config=resolver_config,
         secrets_provider=secrets_provider,
+        ticket_id=ticket_id,
+        attempt_id=attempt_id,
+        phase=kwargs.get("skill_phase") or "context",
     )
-    return build_skill_provider(organization_resolver=resolver, **kwargs)
+    return build_skill_provider(
+        organization_resolver=resolver,
+        ticket_id=ticket_id,
+        attempt_id=attempt_id,
+        **kwargs,
+    )
 
 
 def build_crucible_context_gateway(

@@ -9,12 +9,13 @@ import re
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from providers.skills.config_views import config_views_for, project_config_view
 from providers.skills.gateway import (
     OrganizationSkillResolver,
     SkillGatewayError,
     is_organization_ref,
 )
-from providers.skills.local_context import LocalContextSource
+from providers.skills.local_context import LocalContextSnapshot, LocalContextSource
 
 _SOFTWARE_PREFIX = "skill://software/controller/harness/crucible/"
 _PROJECT_PREFIX = "skill://project/"
@@ -33,7 +34,7 @@ path. Organization and project search use POSIX extended regular expressions
 (no backreferences); from_ref optionally restricts the source. Reads are bounded to
 16384 bytes; continue with next_offset_bytes. Subject, source availability,
 scope and provenance remain visible, while credentials, identity and phase are
-server-owned. Project documents describe agentic-perf workflow and contracts;
+server-owned. Project documents provide explicitly mapped, bundled guidance;
 organization documents describe organization practices; software references
 describe installed/upstream behavior. Organization practices cannot alter
 installed software facts or code-enforced requirements. Service-only
@@ -68,48 +69,44 @@ bundled project-local guidance with higher sources and report a material
 conflict for clarification instead of silently treating the local document as
 authoritative.
 """
-_CONFIG_VIEWS = {
-    "triage": (),
-    "provisioning": ("constraints", "provisioning", "platform_contract"),
-    "benchmark": ("execution", "firewall"),
-    "review": ("review",),
-}
-_VIEW_FIELDS = {
-    "constraints": {"supported_os", "controller_os_must_match"},
-    "provisioning": {
-        "method",
-        "install_method",
-        "on_existing_install",
-        "install_target_path",
-        "install_dir",
-    },
-    "platform_contract": {"supported_os", "required_packages"},
-    "execution": {
-        "controller_required",
-        "endpoint_type",
-        "endpoint_user",
-        "default_osruntime",
-        "default_userenv",
-        "run_file_format",
-        "run_file_location",
-        "results_dir_pattern",
-    },
-    "review": {
-        "method",
-        "results_method",
-        "cdm_port",
-        "result_summary_path",
-        "result_summary_file",
-        "results_dir_pattern",
-    },
-    "firewall": {"disable", "disable_firewall", "policy"},
-}
 
 
 def organization_manages_harness(provider: Any, harness: str) -> bool:
-    """Identify subjects whose settings must remain behind approved views."""
+    """Keep organization-managed subjects behind registered model-facing views."""
     resolver = getattr(provider, "organization_resolver", None)
     return bool(resolver and resolver.has_subject(f"harness/{harness}"))
+
+
+def _bind_provider_attempt(
+    provider: Any, *, ticket_id: str, phase: str
+) -> OrganizationSkillResolver:
+    """Bind every gateway caller to the provider's trusted ticket attempt."""
+    resolver = getattr(provider, "organization_resolver", None)
+    if not isinstance(resolver, OrganizationSkillResolver):
+        raise SkillGatewayError("context_unavailable", "Context resolver is unavailable")
+    attempt_id = (
+        resolver.attempt_id
+        if resolver.ticket_id == ticket_id and resolver.attempt_id
+        else "initial"
+    )
+    if (
+        resolver.ticket_id == ticket_id
+        and resolver.attempt_id == attempt_id
+        and resolver.phase == phase
+    ):
+        return resolver
+    binder = getattr(provider, "bind_attempt", None)
+    if callable(binder):
+        binder(ticket_id, attempt_id, phase)
+        rebound = getattr(provider, "organization_resolver", None)
+        if isinstance(rebound, OrganizationSkillResolver):
+            return rebound
+    rebound = resolver.for_attempt(ticket_id, attempt_id, phase)
+    try:
+        setattr(provider, "organization_resolver", rebound)
+    except (AttributeError, TypeError):
+        pass
+    return rebound
 
 
 async def skill_config_view(
@@ -119,36 +116,12 @@ async def skill_config_view(
     phase: str,
 ) -> dict[str, Any]:
     """Return an allowlisted view, never commands, secret bindings, or raw JSON."""
-    if harness != "crucible" or view not in _CONFIG_VIEWS.get(phase, ()):
+    if view not in config_views_for(harness, phase):
         raise SkillGatewayError(
             "configuration_view_denied", "No approved view for this subject and phase"
         )
     config = await provider.get_all_private_config(harness)
-    section = config.get(view)
-    if not isinstance(section, dict):
-        return {}
-    result = {k: v for k, v in section.items() if k in _VIEW_FIELDS[view]}
-    if view == "provisioning":
-        options = section.get("options_on_existing", [])
-        if isinstance(options, list):
-            result["options_on_existing"] = [
-                {"action": item["action"]}
-                for item in options
-                if isinstance(item, dict) and isinstance(item.get("action"), str)
-            ]
-    if view == "execution" and isinstance(section.get("kube"), dict):
-        result["kube"] = {
-            k: v
-            for k, v in section["kube"].items()
-            if k
-            in {
-                "min_root_volume_gb",
-                "self_ssh_required",
-                "selinux",
-                "tool_params_required",
-            }
-        }
-    return result
+    return project_config_view(harness, view, phase, config)
 
 
 def _software_ref(path: str) -> str:
@@ -191,15 +164,22 @@ def _software_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _project_ref(path: str, benchmark_scope: str | None = None) -> str:
+def _project_ref(
+    path: str, revision: str, benchmark_scope: str | None = None
+) -> str:
     ref = _PROJECT_PREFIX + quote(path, safe="/")
+    parameters = []
     if benchmark_scope:
-        ref += "?benchmark=" + quote(benchmark_scope, safe="")
+        parameters.append("benchmark=" + quote(benchmark_scope, safe=""))
+    parameters.append("revision=" + quote(revision, safe=""))
+    ref += "?" + "&".join(parameters)
     return ref
 
 
 def _project_document(
-    document: dict[str, Any], benchmark_scope: str | None = None
+    document: dict[str, Any],
+    revision: str,
+    benchmark_scope: str | None = None,
 ) -> dict[str, Any]:
     """Expose an explicitly mapped repository document with project provenance."""
     source_path = str(document.get("source_path", ""))
@@ -207,7 +187,7 @@ def _project_document(
     provenance = provenance if isinstance(provenance, dict) else {}
     safe_provenance = {
         "source_id": "agentic-perf",
-        "revision": provenance.get("revision"),
+        "revision": revision,
         "entry_id": provenance.get("entry_id"),
         "path": source_path,
         "harness": document.get("harness", "crucible"),
@@ -218,7 +198,7 @@ def _project_document(
     if provenance.get("reason"):
         safe_provenance["reason"] = provenance["reason"]
     subjects = document.get("subject_area")
-    ref = _project_ref(source_path, benchmark_scope)
+    ref = _project_ref(source_path, revision, benchmark_scope)
     return {
         "ref": ref,
         "uri": ref,
@@ -229,7 +209,7 @@ def _project_document(
         "scope": "project",
         "role": "project-guidance",
         "authority": "supplemental",
-        "revision": provenance.get("revision"),
+        "revision": revision,
         "provenance": safe_provenance,
         "benchmark": document.get("benchmark"),
         "benchmark_scope": benchmark_scope,
@@ -240,27 +220,61 @@ def _project_document(
 
 def _project_documents(
     provider: Any,
+    resolver: OrganizationSkillResolver,
     *,
     subject: str,
     phase: str,
     agent_name: str,
     benchmark: str | None,
 ) -> tuple[Any | None, list[dict[str, Any]]]:
-    if subject != "harness/crucible":
+    namespace, topic = subject.split("/", 1)
+    if namespace == "harness":
+        local_harness = topic
+        local_subject_area = "all"
+    else:
+        local_harness = namespace
+        local_subject_area = topic
+    if not local_harness or not local_subject_area:
         return None, []
     source = getattr(provider, "project_context_source", None)
     if source is None:
         return None, []
-    documents = source.list_documents(
-        harness="crucible",
+    try:
+        pinned = resolver.pin_external_source(
+            "local:agentic-perf-project",
+            source.binding_identity,
+            lambda: source.capture_snapshot().to_dict(),
+        )
+        snapshot = LocalContextSnapshot.from_dict(pinned)
+    except (OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, SkillGatewayError):
+            raise
+        raise SkillGatewayError(
+            "source_snapshot_unavailable", "Project context snapshot is unavailable"
+        ) from None
+    documents = snapshot.list_documents(
+        harness=local_harness,
         benchmark=benchmark,
         phase=phase,
         agent=agent_name,
-        subject_area="all",
+        subject_area=local_subject_area,
     )
-    exposed = [_project_document(item, benchmark) for item in documents]
+    exposed = [
+        _project_document(item, snapshot.revision, benchmark) for item in documents
+    ]
     exposed.sort(key=lambda item: item["path"])
-    return source, exposed
+    return snapshot, exposed
+
+
+def _project_source_revision(source: Any, documents: list[dict[str, Any]]) -> str | None:
+    """Read the revision from a pinned snapshot or a legacy source adapter."""
+    if documents:
+        revision = documents[0].get("revision")
+        return revision if isinstance(revision, str) else None
+    revision = getattr(source, "revision", None)
+    if callable(revision):
+        revision = revision()
+    return revision if isinstance(revision, str) else None
 
 
 def _project_benchmark_scope(ref: str) -> str | None:
@@ -276,8 +290,11 @@ def _project_benchmark_scope(ref: str) -> str | None:
         raise SkillGatewayError(
             "invalid_ref", "Project ref has invalid parameters"
         ) from exc
-    if set(parameters) - {"benchmark"}:
+    if set(parameters) - {"benchmark", "revision"}:
         raise SkillGatewayError("invalid_ref", "Project ref has unsupported parameters")
+    revision = parameters.get("revision", [])
+    if len(revision) != 1 or not re.fullmatch(r"[a-f0-9]{64}", revision[0]):
+        raise SkillGatewayError("invalid_ref", "Project ref has an invalid revision")
     values = parameters.get("benchmark", [])
     if len(values) > 1:
         raise SkillGatewayError("invalid_ref", "Project ref has an invalid benchmark")
@@ -503,7 +520,11 @@ async def skill_context_gateway(
             raise SkillGatewayError("invalid_page", "max_bytes must be 4 through 16384")
         if type(offset_bytes) is not int or offset_bytes < 0:
             raise SkillGatewayError("invalid_page", "offset_bytes must be nonnegative")
-        resolver = provider.organization_resolver
+        resolver = _bind_provider_attempt(
+            provider,
+            ticket_id=ticket_id,
+            phase=phase,
+        )
         organization = resolver.bootstrap(subject)
         if organization.get("status") == "unavailable" and organization.get("required"):
             return json.dumps(
@@ -524,6 +545,7 @@ async def skill_context_gateway(
             raise SkillGatewayError("invalid_benchmark", "Invalid benchmark identifier")
         project_source, project_documents = _project_documents(
             provider,
+            resolver,
             subject=subject,
             phase=phase,
             agent_name=agent_name,
@@ -594,10 +616,8 @@ async def skill_context_gateway(
                         "scope": "project",
                         "status": "available",
                         "document_count": len(project_documents),
-                        "revision": (
-                            project_documents[0]["revision"]
-                            if project_documents
-                            else getattr(project_source, "revision", lambda: None)()
+                        "revision": _project_source_revision(
+                            project_source, project_documents
                         ),
                     }
                 )
@@ -611,7 +631,7 @@ async def skill_context_gateway(
                 and organization.get("status") != "unavailable"
                 and not organization.get("runtime_config_conflict")
             ):
-                for view in _CONFIG_VIEWS.get(phase, ()):
+                for view in config_views_for("crucible", phase):
                     if await skill_config_view(provider, "crucible", view, phase):
                         views.append(
                             {"name": view, "ref": _config_ref(revision, subject, view)}
@@ -702,7 +722,7 @@ async def skill_context_gateway(
                 expected = (
                     {
                         _config_ref(revision, subject, view): view
-                        for view in _CONFIG_VIEWS.get(phase, ())
+                        for view in config_views_for("crucible", phase)
                     }
                     if subject == "harness/crucible"
                     else {}

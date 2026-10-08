@@ -2670,8 +2670,17 @@ async def _poll_loop_after_lease(
 
     secrets = GitSecretsProvider(fallback=secrets)
 
-    async def make_skill_provider(ticket_id: str = "", phase: str = ""):
+    async def make_skill_provider(
+        ticket_id: str = "",
+        phase: str = "",
+        *,
+        defer_organization_sources: bool = False,
+    ):
         provider = await build_skill_provider_async(
+            ticket_id=ticket_id,
+            attempt_id="initial",
+            defer_organization_sources=defer_organization_sources,
+            skill_phase=phase or "orchestrator",
             crucible_home=config.crucible_home,
             repo_cache=repo_cache,
             source_repo=config.raw.get("crucible_source_repo"),
@@ -2686,34 +2695,23 @@ async def _poll_loop_after_lease(
             provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
         return provider
 
-    skills = await make_skill_provider()
-    gateway_config = config.raw.get("skill_gateway")
-    organization_config = (
-        gateway_config.get("organization") if isinstance(gateway_config, dict) else None
-    )
-    from providers.skills.gateway import organization_source_descriptors
+    skills = await make_skill_provider(defer_organization_sources=True)
 
-    try:
-        organization_sources = organization_source_descriptors(
-            organization_config if isinstance(organization_config, dict) else {}
-        )
-    except (TypeError, ValueError):
-        organization_sources = []
-    skill_provider_factory = None
-    if any(item["source"].get("kind") == "git" for item in organization_sources):
+    async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+        if phase not in {
+            "triage",
+            "platform",
+            "provisioning",
+            "benchmark",
+            "review",
+        }:
+            return skills
+        return await make_skill_provider(ticket_id, phase)
 
-        async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
-            if phase not in {
-                "triage",
-                "platform",
-                "provisioning",
-                "benchmark",
-                "review",
-            }:
-                return skills
-            return await make_skill_provider(ticket_id, phase)
-
-        skill_provider_factory = refresh_ticket_skill_provider
+    # Each ticket gets a new resolver/provider, including path-only sources.
+    # This binds document and runtime-config snapshots consistently and avoids
+    # sharing mutable in-process state across concurrent tickets.
+    skill_provider_factory = refresh_ticket_skill_provider
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg

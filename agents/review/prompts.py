@@ -63,10 +63,11 @@ Check the ticket's harness_name field to identify which benchmark harness was us
 
 ## Step 2: Learn How to Retrieve Results
 
-Call get_review_config with the harness name. This returns harness-specific guidance
-on where results are stored and how to access them. Different harnesses store results
-differently — some use APIs, others store files on disk. The review config tells you
-which approach to use.
+For Crucible, bootstrap `get_skill_context(subject="harness/crucible")` and
+read the returned configuration view named `review`, along with the applicable
+review entrypoints. Do not call `get_review_config` for Crucible. For other
+harnesses, call `get_review_config` with the harness name; it returns guidance
+on where results are stored and how to access them.
 
 For Crucible, read the review entrypoints and source documentation through the
 skill gateway. Follow the returned pointers for the selected benchmark and

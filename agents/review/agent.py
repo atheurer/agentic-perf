@@ -558,7 +558,14 @@ class ReviewAgent(AgentBase):
         general_dir = (
             Path(__file__).resolve().parent.parent.parent / "skills" / "general"
         )
-        if general_dir.is_dir():
+        if harness == "crucible":
+            content += (
+                "\n## General Host-Tuning Guidance\n"
+                "When reviewing a run that involved host tuning, retrieve the "
+                "guidance with `get_skill_context(subject='general/host-tuning', "
+                "operation='bootstrap')` and read its returned entrypoint.\n"
+            )
+        elif general_dir.is_dir():
             general_files = sorted(general_dir.glob("*.md"))
             if general_files:
                 content += "\n## General Skills\n"

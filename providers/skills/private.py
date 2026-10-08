@@ -77,8 +77,14 @@ class PrivateSkillProvider(SkillProvider):
             config = self._resolver.get_runtime_config(f"harness/{suite_name}")
             assert config is not None
             return config
-        if self._resolver.uses_legacy_config(f"harness/{suite_name}"):
+        subject = f"harness/{suite_name}"
+        if self._resolver.uses_legacy_config(subject):
             self._resolver.get_runtime_config(f"harness/{suite_name}")
+        elif self._resolver.has_subject(subject):
+            # A docs-only organization package is not an implicit opt-in to
+            # local private JSON. Provider defaults remain available through
+            # the aggregate; legacy JSON requires legacy_config: true.
+            return {}
         if suite_name in self._cache:
             return self._cache[suite_name]
 

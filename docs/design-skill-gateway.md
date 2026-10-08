@@ -480,6 +480,18 @@ New tickets use the new revision. There is no refresh for an existing ticket
 in the first implementation. A later trusted attempt/refresh mechanism must
 account for validations and approvals that relied on previous settings.
 
+The runtime uses the existing `initial` attempt binding for current tickets.
+At provider binding it records each organization Git source identity and
+revision once for that ticket attempt. Provider startup on resume checks that
+pin before refreshing the mutable branch and opens the immutable cached
+checkout offline. A missing or corrupt pin, changed source identity, or
+unavailable pinned checkout fails explicitly. Manifest-backed project/local
+documents are captured as bounded content snapshots in the same ticket-attempt
+epoch; later reads and searches use those bytes, and project refs carry their
+captured content revision. This keeps retries and separate MCP/provider
+processes on the same source content without treating document discovery as a
+runtime configuration binding.
+
 Adding a document/configuration counterpart under the same repository root
 affects new captures; existing tickets retain their pinned snapshot. Changing
 an explicit source binding or Git URL/ref is an error for an existing pin.

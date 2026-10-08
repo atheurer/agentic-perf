@@ -1,9 +1,10 @@
 ## Benchmark Tool Contracts
 
-Retrieve the subject's phase guidance and software documentation through the
-skill gateway before constructing the run-file. Follow the returned pointers
-for the selected benchmark, endpoint, tools, and execution environment. Use
-`get_execution_config` for the approved execution settings view; verify runtime
+Retrieve the subject's phase guidance, software documentation, and approved
+execution configuration through the skill gateway before constructing the
+run-file. Read the returned configuration view named `execution`; do not call
+`get_execution_config` for Crucible. Follow the returned pointers for the
+selected benchmark, endpoint, tools, and execution environment. Verify live
 capabilities with the available controller discovery tools.
 When the benchmark name is known, include it in the bootstrap call so the
 gateway can apply any benchmark-specific project guidance.

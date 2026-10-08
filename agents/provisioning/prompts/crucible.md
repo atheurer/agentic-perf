@@ -1,9 +1,10 @@
 ## Provisioning Configuration and Host Scope
 
-Read the subject's provisioning entrypoints through the skill gateway.
-Use `get_private_config(harness_name="crucible", key="provisioning")`
-for the approved provisioning settings view. Installation choices come from
-configured guidance and settings; do not infer them from benchmark metadata.
+Bootstrap `get_skill_context(subject="harness/crucible")` and read the
+returned provisioning entrypoints and configuration view named
+`provisioning`. Do not call `get_private_config` for Crucible. Installation
+choices come from configured guidance and settings; do not infer them from
+benchmark metadata.
 
 When the ticket's execution model uses a dedicated controller, set
 `controller_host` on install, prerequisite, update, check, and verify tools.

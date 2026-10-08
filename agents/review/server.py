@@ -654,7 +654,7 @@ async def compare_results(
 
 @mcp.tool()
 async def get_review_config(harness_name: str) -> str:
-    """Get review/results-retrieval settings for the benchmark harness. Crucible returns approved method, port, and result-location fields; read interpretation guidance through get_skill_context. Check ticket artifacts before retrieving remote results."""
+    """Get legacy review settings for a harness. For Crucible, read the approved review configuration view from get_skill_context. Check ticket artifacts before retrieving remote results."""
     await _ensure_init()
 
     if harness_name == "crucible" or organization_manages_harness(
