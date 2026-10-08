@@ -526,6 +526,47 @@ class ResourceAgent(AgentBase):
             return
         self._ticket_id = ticket_id
 
+        from providers.tracing import (
+            bind_trace_context,
+            current_trace_context,
+            new_trace_context,
+            reset_trace_context,
+        )
+
+        trace_context = (
+            self.trace_context
+            or current_trace_context()
+            or new_trace_context(
+                ticket_id=ticket_id,
+                agent_id=self.agent_name,
+            )
+        )
+        self.trace_context = trace_context
+        trace_token = bind_trace_context(trace_context)
+        try:
+            ticket = await self._get_ticket(ticket_id)
+            ticket_fields = ticket.get("custom_fields", {})
+            if ticket_fields.get("resource_reservation_outcome_unknown") is True:
+                await self._add_comment(
+                    ticket_id,
+                    "**Resource allocation remains paused:** Reconcile the provider "
+                    "state for the interrupted reservation. If an allocation is "
+                    "active, record its verified reservation ID and provider "
+                    "metadata for teardown. If none is active, clear stale "
+                    "reservation ID and provider metadata. Then clear "
+                    "`resource_reservation_outcome_unknown`. No new allocation was "
+                    "attempted.",
+                )
+                if ticket.get("status") != "awaiting_customer_guidance":
+                    await self._transition_ticket(
+                        ticket_id,
+                        "awaiting_customer_guidance",
+                        comment="Provider reservation requires human reconciliation",
+                    )
+                return
+        finally:
+            reset_trace_context(trace_token)
+
         resource_server = str(Path(__file__).with_name("server.py"))
 
         mcp = AgentMCPClient()
@@ -1121,7 +1162,10 @@ class ResourceAgent(AgentBase):
                 ticket_metadata = ticket_cf.get("resource_provider_metadata") or {}
                 if isinstance(ticket_metadata, dict):
                     prior_metadata = dict(ticket_metadata)
-            review_fields: dict[str, Any] = {"resource_provider": rp}
+            review_fields: dict[str, Any] = {
+                "resource_provider": rp,
+                "resource_reservation_outcome_unknown": True,
+            }
             known_reservation_id = existing_reservation_id or (
                 _reservation_id_from_metadata(rp, prior_metadata)
             )
@@ -1133,8 +1177,10 @@ class ResourceAgent(AgentBase):
             message = (
                 "**Resource reservation outcome unknown:** The provider may have "
                 "allocated resources before an error. Automatic reservation is "
-                "paused to avoid duplicates. Inspect provider state and provide "
-                "a verified reservation ID before resuming."
+                "paused to avoid duplicates. If an allocation is active, record "
+                "its verified reservation ID and provider metadata for teardown. "
+                "If none is active, clear stale reservation ID and provider "
+                "metadata, then clear `resource_reservation_outcome_unknown`."
             )
             await self._add_comment(ticket_id, message)
             await self._transition_ticket(
@@ -1239,7 +1285,10 @@ class ResourceAgent(AgentBase):
                                 or reserve_result.get("lease_id")
                                 or _reservation_id_from_metadata(rp, unknown_metadata)
                             )
-                            review_fields: dict[str, Any] = {}
+                            review_fields: dict[str, Any] = {
+                                "resource_provider": rp,
+                                "resource_reservation_outcome_unknown": True,
+                            }
                             if unknown_id:
                                 review_fields["resource_reservation_id"] = str(
                                     unknown_id
@@ -1248,16 +1297,17 @@ class ResourceAgent(AgentBase):
                                 review_fields["resource_provider_metadata"] = (
                                     unknown_metadata
                                 )
-                            if review_fields:
-                                review_fields["resource_provider"] = rp
-                                await self._update_fields(ticket_id, review_fields)
+                            await self._update_fields(ticket_id, review_fields)
                             await self._add_comment(
                                 ticket_id,
                                 "**Resource reservation outcome unknown:** "
                                 f"{failure} The provider may have allocated "
                                 "resources before the error. Automatic retries "
-                                "are blocked; inspect provider state before "
-                                "resuming.",
+                                "are blocked. If an allocation is active, record "
+                                "its verified reservation ID and provider metadata "
+                                "for teardown. If none is active, clear stale "
+                                "reservation ID and provider metadata, then clear "
+                                "`resource_reservation_outcome_unknown`.",
                             )
                             await self._transition_ticket(
                                 ticket_id,

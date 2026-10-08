@@ -33,7 +33,7 @@ from agents.server_utils import (
     get_board_selector,
 )
 from paths import get_default_ssh_key
-from providers.resource.base import reservation_failed
+from providers.resource.base import has_reservation_metadata, reservation_failed
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -86,6 +86,66 @@ async def _ensure_init():
 
     _registry = ResourceProviderRegistry(secrets, instance_name=get_instance_name())
     _initialized = True
+    fields = _ticket.get("custom_fields", {})
+    if fields.get("resource_reservation_outcome_unknown") is True:
+        _latch_unknown_reservation()
+
+
+def _latch_unknown_reservation() -> None:
+    """Block allocation and discovery until a human reconciles provider state."""
+    global _resources_allocated, _reservation_uncertain
+    _resources_allocated = True
+    _reservation_uncertain = True
+
+
+def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]:
+    """Return the common fail-closed response for a persisted uncertainty marker."""
+    response: dict[str, Any] = {
+        "status": "unknown",
+        "allocation_unknown": True,
+        "retry_blocked": True,
+        "error": (
+            "Reservation outcome is unknown. Provider reconciliation is required "
+            "before discovery or another reservation can run."
+        ),
+        "message": (
+            "Reconcile provider state first. If an allocation is active, record its "
+            "verified reservation ID and provider metadata for teardown. If none is "
+            "active, clear stale reservation ID and provider metadata. Then clear "
+            "resource_reservation_outcome_unknown."
+        ),
+    }
+    if provider:
+        response["provider"] = provider
+    return response
+
+
+async def _persist_unknown_reservation_marker(ticket_id: str | None) -> None:
+    """Persist the fail-closed marker through the audited ticket state boundary."""
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "") or _ticket.get("id", "")
+    if not ticket_id:
+        raise RuntimeError(
+            "Cannot persist an unknown reservation outcome without a ticket ID"
+        )
+
+    custom_fields = _ticket.setdefault("custom_fields", {})
+    custom_fields["resource_reservation_outcome_unknown"] = True
+
+    from providers.execution import AuditedAsyncHTTPClient
+    from state_store.auth import read_token_from_file
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    token = read_token_from_file()
+    async with AuditedAsyncHTTPClient(
+        base_url=store_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10.0,
+    ) as client:
+        response = await client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"resource_reservation_outcome_unknown": True}},
+        )
+        response.raise_for_status()
 
 
 async def _persist_fleet_exhaustion_marker(ticket_id: str, exhausted: bool) -> None:
@@ -254,16 +314,7 @@ async def parse_host_config(text: str) -> str:
 async def list_resource_providers() -> str:
     """List resource providers that are configured and available. Returns provider names and types (bare_metal, cloud). Call this first if no resource_provider directive is set."""
     if _reservation_uncertain:
-        return json.dumps(
-            {
-                "error": (
-                    "Reservation outcome is unknown. Provider reconciliation "
-                    "is required before discovery can resume."
-                ),
-                "allocation_unknown": True,
-                "retry_blocked": True,
-            }
-        )
+        return json.dumps(_unknown_reservation_response())
     if _resources_allocated:
         return json.dumps(
             {
@@ -273,6 +324,8 @@ async def list_resource_providers() -> str:
             }
         )
     await _ensure_init()
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response())
     providers = await _registry.list_configured_providers()
     return json.dumps(
         {
@@ -290,16 +343,7 @@ async def check_available_resources(
 ) -> str:
     """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
     if _reservation_uncertain:
-        return json.dumps(
-            {
-                "error": (
-                    "Reservation outcome is unknown. Provider reconciliation "
-                    "is required before discovery can resume."
-                ),
-                "allocation_unknown": True,
-                "retry_blocked": True,
-            }
-        )
+        return json.dumps(_unknown_reservation_response(provider))
     if _resources_allocated:
         return json.dumps(
             {
@@ -309,6 +353,8 @@ async def check_available_resources(
             }
         )
     await _ensure_init()
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
     prov = await _registry.get_provider(provider)
 
     # Code-enforce the directive's board_selector for
@@ -470,23 +516,10 @@ async def reserve_resources(
     """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
     global _resources_allocated, _reservation_failures, _reservation_uncertain
     if _reservation_uncertain:
-        return json.dumps(
-            {
-                "status": "unknown",
-                "provider": provider,
-                "allocation_unknown": True,
-                "retry_blocked": True,
-                "error": (
-                    "A previous provider reservation has an unknown outcome. "
-                    "Manual reconciliation is required before retrying."
-                ),
-                "message": (
-                    "Do not retry or run discovery tools. Inspect provider state "
-                    "and resume only with a verified reservation."
-                ),
-            }
-        )
+        return json.dumps(_unknown_reservation_response(provider))
     await _ensure_init()
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
     # in the provider regardless of LLM behavior.
@@ -525,6 +558,43 @@ async def reserve_resources(
         result = await prov.reserve(
             selection, description, duration_hours, ticket_id=ticket_id
         )
+    except asyncio.CancelledError:
+        # Provider calls can be cancelled after creating an allocation. Persist
+        # the latch while the ticket trace context is still bound, then preserve
+        # cancellation so the MCP middleware records the cancelled operation.
+        logger.warning(
+            "[resource] Provider %s reservation cancelled; outcome unknown", provider
+        )
+        _latch_unknown_reservation()
+        _reservation_failures += 1
+        prior_metadata = dict(_last_reservation.get("provider_metadata") or {})
+        for key in ("lease_id", "instance_ids", "assignment_id", "reservation_id"):
+            if key in _last_reservation:
+                prior_metadata.setdefault(key, _last_reservation[key])
+        cancelled_result = {
+            "status": "unknown",
+            "provider": provider,
+            "allocation_unknown": True,
+            "retry_blocked": True,
+            "error": "Provider reserve was cancelled; allocation outcome is unknown.",
+            "message": (
+                "The provider may have allocated resources before cancellation. "
+                "Do not retry or run discovery. If an allocation is active, record "
+                "its verified reservation ID and provider metadata for teardown; "
+                "if none is active, clear stale reservation ID and provider "
+                "metadata before clearing the unknown marker."
+            ),
+            "provider_metadata": prior_metadata,
+        }
+        _last_reservation.clear()
+        _last_reservation.update(cancelled_result)
+        try:
+            await asyncio.shield(_persist_unknown_reservation_marker(ticket_id))
+        except Exception:
+            logger.exception(
+                "[resource] Failed to persist cancellation uncertainty marker"
+            )
+        raise
     except Exception as exc:
         # A provider can allocate resources before a later setup step raises.
         # Mark the outcome unknown to prevent duplicate allocations and
@@ -554,9 +624,22 @@ async def reserve_resources(
     unknown_outcome = result.get("allocation_unknown") is True or str(
         result.get("status", "")
     ).strip().lower() in {"unknown", "uncertain", "indeterminate"}
+    if not unknown_outcome and not reservation_failed(result):
+        has_identity = has_reservation_metadata(provider, result) or (
+            has_reservation_metadata(provider, result.get("provider_metadata"))
+        )
+        if not has_identity:
+            unknown_outcome = True
+            result["status"] = "unknown"
+            result["error"] = (
+                "Provider returned no verifiable reservation ID or allocation metadata."
+            )
+            result["message"] = (
+                "The provider response did not identify the allocation. Do not "
+                "retry or run discovery; inspect provider state before resuming."
+            )
     if unknown_outcome:
-        _resources_allocated = True
-        _reservation_uncertain = True
+        _latch_unknown_reservation()
     if not reservation_failed(result):
         _resources_allocated = True
         _reservation_failures = 0
@@ -605,6 +688,33 @@ async def reserve_resources(
             merged_map.update(new_meta.get("ip_mapping", {}))
             new_meta["ip_mapping"] = merged_map
         _last_reservation["provider_metadata"] = new_meta
+
+    if unknown_outcome:
+        try:
+            await _persist_unknown_reservation_marker(ticket_id)
+            result["marker_persisted"] = True
+            _last_reservation["marker_persisted"] = True
+        except Exception as exc:
+            # Keep the current process latched even if the state store is
+            # unavailable. The agent will make a second audited field update
+            # from the returned unknown result before it exits.
+            logger.exception("[resource] Failed to persist unknown reservation marker")
+            result["marker_persisted"] = False
+            result["error"] = (
+                f"{result.get('error', 'Reservation outcome unknown')} "
+                f"Ticket marker persistence failed ({type(exc).__name__})."
+            )
+            result["message"] = (
+                f"{result.get('message', '').strip()} The uncertainty marker "
+                "could not be saved; do not resume automated allocation."
+            ).strip()
+            _last_reservation.update(
+                {
+                    "marker_persisted": False,
+                    "error": result["error"],
+                    "message": result["message"],
+                }
+            )
 
     return json.dumps(result)
 

@@ -1627,6 +1627,7 @@ class TestProviderCorrectAutoReservation:
         fields = self._fields(agent)
         assert fields["resource_reservation_id"] == "known-lease"
         assert fields["resource_provider_metadata"] == {"lease_id": "known-lease"}
+        assert fields["resource_reservation_outcome_unknown"] is True
         assert "assigned_hardware_ips" not in fields
         transitions = [
             call
@@ -1668,7 +1669,8 @@ class TestProviderCorrectAutoReservation:
         await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
 
         assert calls.count("reserve_resources") == 1
-        agent._client.patch.assert_not_awaited()
+        fields = self._fields(agent)
+        assert fields["resource_reservation_outcome_unknown"] is True
         transitions = [
             call
             for call in agent._client.post.call_args_list
@@ -1676,6 +1678,44 @@ class TestProviderCorrectAutoReservation:
         ]
         assert len(transitions) == 1
         assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_with_unknown_marker_never_connects_resource_mcp(
+        self, monkeypatch
+    ):
+        from agents.resource import agent as resource_agent_module
+
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "executing_resource_agent",
+            "custom_fields": {"resource_reservation_outcome_unknown": True},
+        }
+
+        async def unexpected_mcp_call(*_args):
+            raise AssertionError("unknown reservation marker must gate MCP startup")
+
+        agent = self._make_agent(ticket, unexpected_mcp_call)
+        mcp_constructor = MagicMock(side_effect=AssertionError("MCP must stay closed"))
+        monkeypatch.setattr(resource_agent_module, "AgentMCPClient", mcp_constructor)
+
+        await agent.run("PERF-TEST")
+
+        mcp_constructor.assert_not_called()
+        agent._client.patch.assert_not_awaited()
+        post_payloads = [
+            call.kwargs.get("json", {}) for call in agent._client.post.call_args_list
+        ]
+        comments = [
+            payload.get("body", "") for payload in post_payloads if payload.get("body")
+        ]
+        assert any(
+            "if none is active, clear stale reservation id and provider metadata"
+            in comment.lower()
+            for comment in comments
+        )
+        transitions = [payload for payload in post_payloads if "status" in payload]
+        assert len(transitions) == 1
+        assert transitions[0]["status"] == "awaiting_customer_guidance"
 
     @pytest.mark.asyncio
     async def test_host_assignment_failure_saves_reservation_and_pauses(self):

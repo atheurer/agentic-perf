@@ -162,6 +162,16 @@ INVENTORIED_SIDE_EFFECTS = (
         "mutating_http_state",
     ),
     ("agents/resource/server.py", "_persist_fleet_exhaustion_marker", "cloud_resource"),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "mutating_http_state",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "cloud_resource",
+    ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"),
     (
         "agents/resource/server.py",
@@ -1469,6 +1479,26 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_persist_fleet_exhaustion_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_unknown_reservation_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_unknown_reservation_marker",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"): (
