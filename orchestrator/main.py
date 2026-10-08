@@ -1121,15 +1121,14 @@ async def run_agent_task(
                             " skipping post-cancel transition"
                         )
                     else:
-                        guidance = _build_hardstop_guidance_summary(r.json(), status)
+                        fields: dict[str, Any] = {"interrupted": True}
+                        if cancel_reason == "Agent stopped by user request":
+                            fields["guidance_summary"] = (
+                                _build_hardstop_guidance_summary(r.json(), status)
+                            )
                         await client.patch(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                            json={
-                                "fields": {
-                                    "interrupted": True,
-                                    "guidance_summary": guidance,
-                                }
-                            },
+                            json={"fields": fields},
                         )
                         await client.post(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
@@ -1262,7 +1261,7 @@ async def run_agent_task(
 
 def _build_hardstop_guidance_summary(
     ticket: dict[str, Any],
-    agent_status: str,
+    status: str,
 ) -> dict[str, Any]:
     """Build a guidance_summary for a hard-stopped ticket.
 
@@ -1270,9 +1269,8 @@ def _build_hardstop_guidance_summary(
     so that users see context about what happened and what to do
     when the ticket lands at ``awaiting_customer_guidance``.
     """
-    # Determine the last agent from the status (maps to the agent
-    # that was running when the cancellation occurred).
-    agent = agent_status or "unknown"
+    # Status is the dispatcher key; translate it to the actual agent type.
+    agent = STATUS_AGENT_MAP.get(status, "unknown")
 
     # Look at comments for additional context about what happened
     comments = ticket.get("comments", [])
