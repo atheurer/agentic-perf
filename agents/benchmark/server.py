@@ -4825,11 +4825,18 @@ async def execute_boot_time_test(
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            if not communicate_task.done():
-                communicate_task.cancel()
-            if not drain_task.done():
-                drain_task.cancel()
-            await _asyncio.gather(communicate_task, drain_task, return_exceptions=True)
+            # gather() can finish on one reader's error while its sibling is
+            # still blocked. Join each reader before closing the shared log.
+            for task in (communicate_task, _drain_stdout, _drain_stderr):
+                if not task.done():
+                    task.cancel()
+            await _asyncio.gather(
+                communicate_task,
+                _drain_stdout,
+                _drain_stderr,
+                drain_task,
+                return_exceptions=True,
+            )
             for _ in range(200):
                 if proc.returncode is not None:
                     break

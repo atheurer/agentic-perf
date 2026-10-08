@@ -147,6 +147,41 @@ class TestBootTimeOutputDrain:
             failed=False,
         )
 
+    async def test_reader_failure_cancels_sibling_before_log_close(self, tmp_path):
+        from agents.benchmark import server
+
+        sibling_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def blocked_read(_size):
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+
+        async def failing_read(_size):
+            await sibling_started.wait()
+            raise OSError("bad stdout pipe")
+
+        process = _make_mock_process(returncode=0)
+        process.stdout.read = AsyncMock(side_effect=failing_read)
+        process.stderr.read = AsyncMock(side_effect=blocked_read)
+        log = MagicMock()
+        cancelled_at_close: list[bool] = []
+        log.close.side_effect = lambda: cancelled_at_close.append(
+            sibling_cancelled.is_set()
+        )
+
+        with patch.object(server.AuditedFilesystem, "open_stream", return_value=log):
+            result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "failed"
+        assert "read failed: bad stdout pipe" in result["error"]
+        assert sibling_cancelled.is_set()
+        assert cancelled_at_close == [True]
+
     async def test_log_open_failure_keeps_benchmark_result(self, tmp_path, caplog):
         from agents.benchmark import server
 
