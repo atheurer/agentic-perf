@@ -96,6 +96,7 @@ class Dispatcher:
         self._session_id = session_id
         self._fencing_epoch = fencing_epoch
         self._deposed = False
+        self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
         self._user_store = user_store
         self._secrets_root = secrets_root
@@ -235,6 +236,13 @@ class Dispatcher:
                         "claim_id": self._claim_ids.get(ticket_id),
                     },
                 )
+                if r.status_code != 200:
+                    logger.warning(
+                        "Claim renewal rejected for %s: HTTP %d: %s",
+                        ticket_id,
+                        r.status_code,
+                        r.text[:200],
+                    )
                 return r.status_code == 200
         except Exception as exc:
             logger.exception(f"Failed to renew claim on {ticket_id}")
@@ -358,6 +366,10 @@ class Dispatcher:
     def is_deposed(self) -> bool:
         return self._deposed
 
+    def was_stopped_by_user(self, ticket_id: str) -> bool:
+        """Return True if the ticket was hard-stopped by a user request."""
+        return ticket_id in self._stopped_tickets
+
     def set_agent(self, ticket_id: str, agent: Any) -> None:
         self._agents[ticket_id] = agent
 
@@ -419,6 +431,7 @@ class Dispatcher:
         elif mode == "hard":
             task = self._tasks.get(ticket_id)
             if task is not None and not task.done():
+                self._stopped_tickets.add(ticket_id)
                 task.cancel()
                 if context is not None:
                     self._trace.record(
