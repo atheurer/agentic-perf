@@ -13,6 +13,7 @@ import pytest
 
 from agents.triage.agent import (
     TriageAgent,
+    _description_harness_intent,
     _description_requested_harnesses,
     _description_requests_harness,
     _validate_harness_and_suite,
@@ -147,6 +148,34 @@ class TestHarnessValidation:
             "zathras",
             "crucible",
         }
+
+    def test_description_harness_intent_preserves_exclusions_and_alternatives(self):
+        names = {"zathras", "crucible"}
+
+        excluded = _description_harness_intent("Do not use zathras", names)
+        assert excluded.required == frozenset()
+        assert excluded.excluded == {"zathras"}
+
+        avoid = _description_harness_intent("Avoid using zathras", names)
+        assert avoid.excluded == {"zathras"}
+
+        contrast = _description_harness_intent("Use zathras, not crucible", names)
+        assert contrast.required == {"zathras"}
+        assert contrast.excluded == {"crucible"}
+
+        rather_than = _description_harness_intent(
+            "Use zathras rather than crucible", names
+        )
+        assert rather_than.required == {"zathras"}
+        assert rather_than.excluded == {"crucible"}
+
+        either_or = _description_harness_intent("Use either zathras or crucible", names)
+        assert either_or.required == frozenset()
+        assert either_or.alternatives == (frozenset(names),)
+
+        contrast = _description_harness_intent("Not zathras but crucible", names)
+        assert contrast.required == {"crucible"}
+        assert contrast.excluded == {"zathras"}
 
     @pytest.mark.asyncio
     async def test_valid_harness_passes(self):
@@ -375,6 +404,76 @@ class TestSuiteAutoCorrection:
         comment = agent._add_comment.await_args.args[1]
         assert "specifies harness 'zathras'" in comment
         assert "selected 'crucible'" in comment
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("selected_harness", "catalog_harness"),
+        [("zathras", "zathras"), ("crucible", "zathras")],
+    )
+    async def test_excluded_harness_pauses_before_writing_fields(
+        self, selected_harness, catalog_harness
+    ):
+        """Neither triage nor suite correction may select an excluded harness."""
+        suite = "zperf"
+        provider = _make_provider(
+            suites={suite: {"name": suite, "harness": catalog_harness}}
+        )
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": True,
+                "directives": {"harness": selected_harness},
+            },
+            provider,
+            description="Do not use zathras",
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        assert (
+            "explicitly excludes harness 'zathras'"
+            in (agent._add_comment.await_args.args[1])
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected_harness", ["zathras", "crucible"])
+    async def test_either_or_request_accepts_each_listed_harness(
+        self, selected_harness
+    ):
+        suite = f"{selected_harness}-suite"
+        provider = _make_provider(
+            suites={suite: {"name": suite, "harness": selected_harness}}
+        )
+        _agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": True,
+                "directives": {"harness": selected_harness},
+            },
+            provider,
+            description="Use either zathras or crucible",
+        )
+
+        assert ticket["status"] == "awaiting_hardware"
+        assert updated_fields["directives"]["harness"] == selected_harness
+
+    @pytest.mark.asyncio
+    async def test_either_or_request_pauses_for_unlisted_harness(self):
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {"harness": "vstorm"},
+            },
+            _make_provider(),
+            description="Use either zathras or crucible",
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        comment = agent._add_comment.await_args.args[1]
+        assert "permits harness alternatives (crucible, zathras)" in comment
+        assert "selected 'vstorm'" in comment
 
     @pytest.mark.asyncio
     async def test_invented_suite_is_written_absent_before_dispatch(self):
