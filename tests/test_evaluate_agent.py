@@ -287,6 +287,96 @@ class TestDeterministicCheck:
 
 
 class TestHandleCompletion:
+    def _make_completion_agent(self, deterministic_outcome):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._deterministic_outcome = deterministic_outcome
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "execution_plan": {"steps": []},
+                    "investigation_ledger": [],
+                },
+            },
+        )
+        agent._append_ledger_entry = AsyncMock()
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        return agent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "llm_decision",
+        [
+            "converged",
+            "loop_plan",
+            "loop_provision",
+            "loop_analyze",
+            "loop_fleet",
+            "stalled",
+        ],
+    )
+    async def test_fleet_complete_normalizes_llm_decision_and_gate(self, llm_decision):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = self._make_completion_agent(
+            "FLEET_COMPLETE — all eligible hosts tested",
+        )
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_evaluation_result",
+                    input={
+                        "decision": llm_decision,
+                        "convergence_gate": "deterministic_threshold",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        saved_result = agent._update_fields.await_args.args[1]["evaluation_result"]
+        assert saved_result["decision"] == "converged"
+        assert saved_result["convergence_gate"] == "fleet_complete"
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_preserves_stalled_decision(self):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = self._make_completion_agent(
+            "BUDGET_EXHAUSTED — iteration budget reached",
+        )
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_evaluation_result",
+                    input={
+                        "decision": "stalled",
+                        "convergence_gate": "entropy_stall",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        saved_result = agent._update_fields.await_args.args[1]["evaluation_result"]
+        assert saved_result["decision"] == "stalled"
+        assert saved_result["convergence_gate"] == "entropy_stall"
+
     @pytest.mark.asyncio
     async def test_converged_transitions_to_synthesis(self):
         from agents.evaluate.agent import EvaluateAgent

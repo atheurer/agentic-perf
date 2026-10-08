@@ -363,16 +363,22 @@ class EvaluateAgent(AgentBase):
         root_cause = result.get("root_cause_summary", "")
         notes = result.get("notes", "")
 
-        # Enforce deterministic convergence — code overrides
-        # the LLM if a hard gate fired. The LLM's analysis
-        # is still captured in the ledger but the transition
-        # decision is code-enforced.
         det = getattr(self, "_deterministic_outcome", "")
-        # Enforce deterministic convergence — code overrides
-        # the LLM if a hard gate fired. The LLM's analysis
-        # is still captured in the ledger but the transition
-        # decision is code-enforced.
-        if det and decision != "converged":
+        # Fleet completion is authoritative even when the LLM
+        # independently chose convergence with a different gate.
+        # Preserve the prior budget behavior for loop decisions,
+        # without turning a stalled budget result into success.
+        apply_deterministic_outcome = bool(det) and (
+            "FLEET_COMPLETE" in det
+            or (
+                decision != "converged"
+                and (
+                    "BUDGET_EXHAUSTED" not in det
+                    or decision in ("loop_plan", "loop_provision")
+                )
+            )
+        )
+        if apply_deterministic_outcome:
             logger.info(
                 f"[{self.agent_name}] Overriding LLM decision "
                 f"'{decision}' with deterministic outcome: {det}"
