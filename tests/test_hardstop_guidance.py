@@ -1,7 +1,7 @@
-"""Tests for guidance_summary population on hard-stop (CancelledError).
+"""Tests for guidance_summary population after task cancellation.
 
-Covers issue #980: when a ticket is hard-stopped, the guidance_summary
-custom field should be populated so users see context about what happened.
+Covers issue #980: when an open ticket's agent is cancelled, the
+guidance_summary should identify the cancellation cause and agent activity.
 """
 
 from __future__ import annotations
@@ -12,15 +12,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.main import _build_hardstop_guidance_summary
+from orchestrator.main import _build_cancellation_guidance_summary
 
 
-class TestBuildHardstopGuidanceSummary:
-    """Unit tests for _build_hardstop_guidance_summary."""
+class TestBuildCancellationGuidanceSummary:
+    """Unit tests for _build_cancellation_guidance_summary."""
 
     def test_basic_fields(self):
         ticket: dict[str, Any] = {"comments": [], "custom_fields": {}}
-        summary = _build_hardstop_guidance_summary(ticket, "executing_benchmark")
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
         assert summary["agent"] == "benchmark"
         assert summary["reason"] == "hard_stop"
         assert "interrupted" in summary["details"]
@@ -33,34 +35,57 @@ class TestBuildHardstopGuidanceSummary:
             ],
             "custom_fields": {},
         }
-        summary = _build_hardstop_guidance_summary(ticket, "executing_benchmark")
+        summary = _build_cancellation_guidance_summary(
+            ticket,
+            "executing_benchmark",
+            "hard_stop",
+            agent_identity="benchmark-agent",
+        )
         assert "Running fio on board-3" in summary["details"]
 
-    def test_skips_system_and_user_comments(self):
+    def test_only_uses_comments_from_running_agent(self):
         ticket: dict[str, Any] = {
             "comments": [
-                {"author": "fleet-agent", "body": "Provisioning boards"},
+                {"author": "fleet-coordinator", "body": "Provisioning boards"},
                 {"author": "system", "body": "Status changed"},
-                {"author": "user-alice", "body": "Please hurry"},
+                {"author": "alice", "body": "Please use another board"},
             ],
             "custom_fields": {},
         }
-        summary = _build_hardstop_guidance_summary(ticket, "coordinating_fleet")
-        # Should pick fleet-agent, not system or user
+        summary = _build_cancellation_guidance_summary(
+            ticket,
+            "coordinating_fleet",
+            "hard_stop",
+            agent_identity="fleet-coordinator",
+        )
         assert summary["agent"] == "fleet_coordinator"
         assert "Provisioning boards" in summary["details"]
+        assert "Please use another board" not in summary["details"]
+
+    def test_omits_comment_context_without_agent_identity(self):
+        ticket: dict[str, Any] = {
+            "comments": [{"author": "alice", "body": "Please use another board"}],
+            "custom_fields": {},
+        }
+        summary = _build_cancellation_guidance_summary(
+            ticket, "coordinating_fleet", "claim_lost"
+        )
+        assert summary["reason"] == "claim_lost"
+        assert "Please use another board" not in summary["details"]
 
     def test_includes_benchmark_results_note(self):
         ticket: dict[str, Any] = {
             "comments": [],
             "custom_fields": {"benchmark_results": {"fio": {"iops": 1234}}},
         }
-        summary = _build_hardstop_guidance_summary(ticket, "executing_benchmark")
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
         assert "benchmark results" in summary["details"].lower()
 
     def test_empty_status_defaults_to_unknown(self):
         ticket: dict[str, Any] = {"comments": [], "custom_fields": {}}
-        summary = _build_hardstop_guidance_summary(ticket, "")
+        summary = _build_cancellation_guidance_summary(ticket, "", "hard_stop")
         assert summary["agent"] == "unknown"
 
     def test_long_message_truncated(self):
@@ -69,20 +94,26 @@ class TestBuildHardstopGuidanceSummary:
             "comments": [{"author": "analyze-agent", "body": long_body}],
             "custom_fields": {},
         }
-        summary = _build_hardstop_guidance_summary(ticket, "analyzing")
+        summary = _build_cancellation_guidance_summary(
+            ticket, "analyzing", "hard_stop", agent_identity="analyze-agent"
+        )
         # details should not include the full 3000-char message
         assert len(summary["details"]) < 1000
 
     def test_no_comments(self):
         ticket: dict[str, Any] = {"custom_fields": {}}
-        summary = _build_hardstop_guidance_summary(ticket, "triage_pending")
+        summary = _build_cancellation_guidance_summary(
+            ticket, "triage_pending", "hard_stop"
+        )
         assert summary["agent"] == "triage"
         assert summary["reason"] == "hard_stop"
         assert "suggested_actions" in summary
 
     def test_suggested_actions_content(self):
         ticket: dict[str, Any] = {"comments": [], "custom_fields": {}}
-        summary = _build_hardstop_guidance_summary(ticket, "executing_benchmark")
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
         actions = summary["suggested_actions"]
         # Should suggest retry, review, and abort
         assert any("retry" in a.lower() or "re-dispatch" in a.lower() for a in actions)
@@ -94,20 +125,34 @@ class TestHardstopGuidanceIntegration:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("user_stop", "claim_lost"),
-        [(True, False), (False, False), (False, True)],
+        ("user_stop", "claim_lost", "expected_reason", "expected_comment"),
+        [
+            (True, False, "hard_stop", "Agent stopped by user request"),
+            (False, False, "task_cancelled", "Agent stopped: task cancelled"),
+            (
+                False,
+                True,
+                "claim_lost",
+                "Agent stopped: orchestrator claim lost",
+            ),
+        ],
         ids=["user-hard-stop", "generic-cancellation", "claim-loss"],
     )
-    async def test_guidance_summary_only_for_user_hard_stop(
-        self, user_stop: bool, claim_lost: bool
+    async def test_open_ticket_gets_cause_accurate_guidance(
+        self,
+        user_stop: bool,
+        claim_lost: bool,
+        expected_reason: str,
+        expected_comment: str,
     ):
-        """Only a user hard-stop gets the hard-stop guidance reason."""
+        """Open tickets get guidance for every cancellation cause."""
         from orchestrator.main import run_agent_task
 
         async def hanging_run(tid):
             await asyncio.sleep(100)
 
         agent = MagicMock()
+        agent.agent_name = "benchmark-agent"
         agent.run = hanging_run
         agent.close = AsyncMock()
 
@@ -134,6 +179,7 @@ class TestHardstopGuidanceIntegration:
             "status": "executing_benchmark",
             "comments": [
                 {"author": "benchmark-agent", "body": "Running fio on board-3"},
+                {"author": "alice", "body": "Please switch to a different board"},
             ],
             "custom_fields": {},
         }
@@ -154,35 +200,28 @@ class TestHardstopGuidanceIntegration:
             # Should not raise — CancelledError is handled internally
             await task
 
-        # Verify the PATCH records the hard-stop summary only for a user stop.
+        # Open tickets receive guidance whose reason matches the cancellation.
         mock_client.patch.assert_awaited_once()
         patch_call = mock_client.patch.await_args
         fields = patch_call.kwargs.get(
             "json", patch_call.args[1] if len(patch_call.args) > 1 else {}
         ).get("fields", {})
-        if user_stop:
-            assert fields["interrupted"] is True
-            gs = fields["guidance_summary"]
-            assert gs["agent"] == "benchmark"
-            assert gs["reason"] == "hard_stop"
-            assert "Running fio" in gs["details"]
-            assert len(gs["suggested_actions"]) >= 1
-        else:
-            assert fields == {"interrupted": True}
+        assert fields["interrupted"] is True
+        gs = fields["guidance_summary"]
+        assert gs["agent"] == "benchmark"
+        assert gs["reason"] == expected_reason
+        assert "Running fio" in gs["details"]
+        assert "Please switch to a different board" not in gs["details"]
+        assert len(gs["suggested_actions"]) >= 1
 
-        if user_stop:
-            expected_reason = "Agent stopped by user request"
-        elif claim_lost:
-            expected_reason = "Agent stopped: orchestrator claim lost"
-        else:
-            expected_reason = "Agent stopped: task cancelled"
         mock_client.post.assert_awaited_once()
         transition = mock_client.post.await_args.kwargs["json"]
-        assert transition["comment"] == expected_reason
+        assert transition["status"] == "awaiting_customer_guidance"
+        assert transition["comment"] == expected_comment
 
     @pytest.mark.asyncio
     async def test_cancelled_error_skips_closed_ticket(self):
-        """When ticket is already closed, no guidance_summary is written."""
+        """Force-closed user hard stops do not get a guidance summary."""
         from orchestrator.main import run_agent_task
 
         async def hanging_run(tid):
@@ -200,6 +239,8 @@ class TestHardstopGuidanceIntegration:
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
         dispatcher._claim_ids = {}
+        dispatcher.was_stopped_by_user.return_value = True
+        dispatcher.has_lost_claim.return_value = False
 
         mock_client = MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -231,3 +272,77 @@ class TestHardstopGuidanceIntegration:
         # No PATCH or POST should have been made
         mock_client.patch.assert_not_awaited()
         mock_client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_active_hard_stop_keeps_ticket_force_closed(self, app, store):
+        """The real stop path still closes the ticket after cancelling its agent."""
+        import httpx
+
+        from orchestrator.dispatcher import Dispatcher
+        from orchestrator.main import _process_stop_requests, run_agent_task
+        from state_store.models import CreateTicketRequest, TransitionRequest
+
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="active hard stop", description="test")
+        )
+        for status in (
+            "triage_pending",
+            "awaiting_hardware",
+            "awaiting_provision",
+            "executing_benchmark",
+        ):
+            store.transition_ticket(ticket.id, TransitionRequest(status=status))
+        store.update_fields(
+            ticket.id,
+            {
+                "stop_requested": {
+                    "mode": "hard",
+                    "requested_at": "2026-01-01T00:00:00Z",
+                },
+            },
+        )
+
+        agent_started = asyncio.Event()
+
+        class BlockingAgent:
+            agent_name = "benchmark-agent"
+
+            async def run(self, ticket_id: str) -> None:
+                agent_started.set()
+                await asyncio.Future()
+
+            async def close(self) -> None:
+                return None
+
+        dispatcher = Dispatcher(
+            state_store_url="http://testserver",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+        )
+        dispatcher.events = None
+        dispatcher.create_agent = MagicMock(return_value=BlockingAgent())
+        dispatcher.release_claim = AsyncMock()
+
+        def make_client(**kwargs):
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+                headers=kwargs.get("headers", {}),
+            )
+
+        with (
+            patch(
+                "orchestrator.main._auth_headers",
+                return_value={"Authorization": f"Bearer {app.state.api_token}"},
+            ),
+            patch("orchestrator.main.AuditedAsyncHTTPClient", make_client),
+        ):
+            task = asyncio.create_task(
+                run_agent_task(dispatcher, "executing_benchmark", ticket.id)
+            )
+            dispatcher.set_task(ticket.id, task, status="executing_benchmark")
+            await agent_started.wait()
+            await _process_stop_requests(dispatcher, "http://testserver")
+            await asyncio.wait_for(task, timeout=5)
+
+        assert store.get_ticket(ticket.id).status.value == "closed"

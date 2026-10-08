@@ -1103,9 +1103,15 @@ async def run_agent_task(
             status,
             cancel_reason,
         )
+        cancellation_reason = _cancellation_guidance_reason(cancel_reason)
+        cancellation_headers = (
+            _mutation_headers(None)
+            if cancellation_reason == "claim_lost"
+            else mutation_headers
+        )
         try:
             async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=mutation_headers
+                timeout=10.0, headers=cancellation_headers
             ) as client:
                 # Check if ticket was already force-closed before
                 # trying to transition — avoids reopening a closed
@@ -1121,24 +1127,32 @@ async def run_agent_task(
                             " skipping post-cancel transition"
                         )
                     else:
-                        fields: dict[str, Any] = {"interrupted": True}
-                        if cancel_reason == "Agent stopped by user request":
-                            fields["guidance_summary"] = (
-                                _build_hardstop_guidance_summary(r.json(), status)
-                            )
-                        await client.patch(
+                        fields = {
+                            "interrupted": True,
+                            "guidance_summary": _build_cancellation_guidance_summary(
+                                r.json(),
+                                status,
+                                cancellation_reason,
+                                agent_identity=getattr(agent, "agent_name", None),
+                            ),
+                        }
+                        response = await client.patch(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
                             json={"fields": fields},
                         )
-                        await client.post(
+                        response.raise_for_status()
+                        response = await client.post(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
                             json={
                                 "status": "awaiting_customer_guidance",
                                 "comment": cancel_reason,
                             },
                         )
+                        response.raise_for_status()
         except Exception:
-            logger.exception(f"Failed to transition hard-stopped ticket {ticket_id}")
+            logger.exception(
+                "Failed to record cancellation guidance for ticket %s", ticket_id
+            )
         if dispatcher.events:
             dispatcher.events.emit(
                 ticket_id,
@@ -1259,29 +1273,43 @@ async def run_agent_task(
                 pass
 
 
-def _build_hardstop_guidance_summary(
+def _cancellation_guidance_reason(cancel_reason: str) -> str:
+    """Map the cancellation cause to the stable guidance reason."""
+    if cancel_reason == "Agent stopped by user request":
+        return "hard_stop"
+    if cancel_reason == "Agent stopped: orchestrator claim lost":
+        return "claim_lost"
+    return "task_cancelled"
+
+
+def _build_cancellation_guidance_summary(
     ticket: dict[str, Any],
     status: str,
+    reason: str,
+    *,
+    agent_identity: str | None = None,
 ) -> dict[str, Any]:
-    """Build a guidance_summary for a hard-stopped ticket.
+    """Build a guidance summary for a cancelled running agent.
 
-    Called from the ``CancelledError`` handler in ``run_agent_task``
-    so that users see context about what happened and what to do
-    when the ticket lands at ``awaiting_customer_guidance``.
+    Only comments authored by the running agent are included. If its identity
+    is unavailable, omit comment context rather than risk attributing a
+    multi-user comment to the agent.
     """
-    # Status is the dispatcher key; translate it to the actual agent type.
     agent = STATUS_AGENT_MAP.get(status, "unknown")
 
-    # Look at comments for additional context about what happened
     comments = ticket.get("comments", [])
     last_agent_message = ""
-    for c in reversed(comments):
-        author = c.get("author", "")
-        if author not in ("system", "") and not author.startswith("user"):
-            last_agent_message = c.get("body", "")[:2000]
-            break
+    if isinstance(agent_identity, str) and agent_identity:
+        for comment in reversed(comments):
+            author = comment.get("author", "")
+            body = comment.get("body", "")
+            is_agent_comment = author == agent_identity or (
+                isinstance(author, str) and author.startswith(f"{agent_identity}/")
+            )
+            if is_agent_comment and isinstance(body, str) and body:
+                last_agent_message = body[:2000]
+                break
 
-    # Check custom_fields for benchmark results
     custom_fields = ticket.get("custom_fields", {})
     benchmark_results = custom_fields.get("benchmark_results")
     partial_context = ""
@@ -1298,7 +1326,7 @@ def _build_hardstop_guidance_summary(
 
     return {
         "agent": agent,
-        "reason": "hard_stop",
+        "reason": reason,
         "details": details,
         "suggested_actions": [
             "Retry — re-dispatch the ticket to resume from the current stage",
