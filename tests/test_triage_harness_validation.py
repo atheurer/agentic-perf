@@ -13,6 +13,7 @@ import pytest
 
 from agents.triage.agent import (
     TriageAgent,
+    _description_requested_harnesses,
     _description_requests_harness,
     _validate_harness_and_suite,
 )
@@ -128,9 +129,24 @@ class TestHarnessValidation:
         assert _description_requests_harness("Use arcaflow", "arcaflow-plugins")
         assert not _description_requests_harness("Use zathras-like tooling", "zathras")
         assert not _description_requests_harness("Do not use zathras", "zathras")
+        assert not _description_requests_harness("Avoid using zathras", "zathras")
         assert not _description_requests_harness(
             "The prior run used zathras", "zathras"
         )
+        names = {"zathras", "crucible"}
+        assert _description_requested_harnesses("Use zathras, not crucible", names) == {
+            "zathras"
+        }
+        assert _description_requested_harnesses("Not zathras but crucible", names) == {
+            "crucible"
+        }
+        assert _description_requested_harnesses(
+            "Use zathras rather than crucible", names
+        ) == {"zathras"}
+        assert _description_requested_harnesses("Use zathras or crucible", names) == {
+            "zathras",
+            "crucible",
+        }
 
     @pytest.mark.asyncio
     async def test_valid_harness_passes(self):
@@ -338,12 +354,12 @@ class TestSuiteAutoCorrection:
 
     @pytest.mark.asyncio
     async def test_description_harness_conflict_pauses_for_guidance(self):
-        """An explicit harness request in the description remains authoritative."""
+        """A request must be checked even when triage selects another harness."""
         agent, ticket, updated_fields = await _complete_triage_result(
             {
                 "benchmark_suite": "uperf",
                 "absent_suite": False,
-                "directives": {"harness": "zathras"},
+                "directives": {"harness": "crucible"},
             },
             _make_provider(),
             description="Use zathras",
@@ -357,9 +373,8 @@ class TestSuiteAutoCorrection:
             comment="Triage validation failed; awaiting harness guidance.",
         )
         comment = agent._add_comment.await_args.args[1]
-        assert "requested harness 'zathras'" in comment
-        assert "catalog harness 'crucible'" in comment
-        assert "benchmark suite 'uperf'" in comment
+        assert "specifies harness 'zathras'" in comment
+        assert "selected 'crucible'" in comment
 
     @pytest.mark.asyncio
     async def test_invented_suite_is_written_absent_before_dispatch(self):
