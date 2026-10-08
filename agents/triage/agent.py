@@ -88,7 +88,7 @@ def _description_harness_intent(
     negative_patterns = (
         r"\b(?:do\s+not|don't|dont|never|should\s+not|shouldn't)\s+"
         r"(?:(?:use|using|with|via|choose|select|prefer)\s+)?"
-        r"(?:the\s+)?(?:harness\s+)?$",
+        r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
         r"\bavoid\s+(?:(?:use|using)\s+)?(?:the\s+)?(?:harness\s+)?$",
         r"\bnot\s+(?:the\s+)?(?:harness\s+)?$",
         r"\b(?:rather\s+than|instead\s+of)\s+(?:the\s+)?(?:harness\s+)?$",
