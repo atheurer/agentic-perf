@@ -976,15 +976,26 @@ class WorkspaceManager:
             < candidate_chars
             <= self._COMPACT_JSON_PARSE_MAX_CHARS
         ):
+
+            def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                values = {}
+                for key, value in pairs:
+                    if key in values:
+                        raise ValueError("duplicate JSON object key")
+                    values[key] = value
+                return values
+
             try:
-                parsed = json.loads("".join(lines))
+                parsed = json.loads(
+                    "".join(lines), object_pairs_hook=reject_duplicate_keys
+                )
                 # Zero-width indentation still separates fields onto lines
                 # without creating overlong whitespace at deep nesting levels.
                 lines = json.dumps(parsed, indent=0, ensure_ascii=False).splitlines(
                     True
                 )
             except (json.JSONDecodeError, ValueError, RecursionError):
-                pass  # not valid JSON, grep original content
+                pass  # Preserve source text when parsing cannot retain its content.
 
         matches: list[dict[str, Any]] = []
         matching_indices = [i for i, line in enumerate(lines) if compiled.search(line)]

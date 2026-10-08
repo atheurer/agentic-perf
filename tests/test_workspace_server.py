@@ -100,6 +100,29 @@ async def test_mcp_grep_compact_json_multiple_matches(ws_env):
     assert resp["total_matches"] >= 3
 
 
+async def test_mcp_grep_compact_json_duplicate_keys_preserves_earlier_match(ws_env):
+    """Duplicate JSON keys must not hide earlier values during reformatting."""
+    compact = json.dumps(
+        {
+            "duplicate": "earlier-needle",
+            "padding": "x" * 1200,
+        }
+    )
+    # Add a later duplicate after the matching value in the compact source.
+    compact = compact[:-1] + ', "duplicate": "later-value"}'
+    assert len(compact) > WorkspaceManager._GREP_LINE_LIMIT
+    ws_env.save_file("duplicate-keys.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://duplicate-keys.json", pattern="earlier-needle"
+    )
+    resp = json.loads(raw_resp)
+
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 1
+    assert "earlier-needle" in resp["lines"][0]["content"]
+
+
 def test_workspace_grep_skips_reformat_for_oversized_compact_json(ws_env, monkeypatch):
     """Files over the parse cap still use ordinary bounded grep behavior."""
     import providers.workspace.manager as manager_module
