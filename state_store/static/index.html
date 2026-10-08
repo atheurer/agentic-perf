@@ -1476,9 +1476,9 @@ th.col-right { text-align: right; }
 .chat-bar {
   display: flex;
   gap: 8px;
-  align-items: center;
+  align-items: flex-end;
 }
-.chat-bar input {
+.chat-bar textarea {
   flex: 1;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1487,8 +1487,13 @@ th.col-right { text-align: right; }
   padding: 8px 12px;
   font-size: 14px;
   font-family: inherit;
+  resize: none;
+  overflow-y: hidden;
+  min-height: 36px;
+  max-height: 150px;
+  line-height: 1.4;
 }
-.chat-bar input:focus { outline: none; border-color: var(--accent); }
+.chat-bar textarea:focus { outline: none; border-color: var(--accent); }
 .chat-bar button {
   background: var(--accent);
   color: #fff;
@@ -1611,7 +1616,7 @@ th.col-right { text-align: right; }
     <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
     <div class="chat-messages" id="chat-messages"></div>
     <div class="chat-bar">
-      <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
+      <textarea id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off" rows="1"></textarea>
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
     </div>
     <div class="chat-cost" id="chat-cost"></div>
@@ -2432,7 +2437,7 @@ async function renderDetail(ticketId) {
               '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
               '<div class="chat-messages" id="ticket-chat-messages"></div>' +
               '<div class="chat-bar">' +
-                '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
+                '<textarea id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off" rows="1"></textarea>' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
               '</div>' +
               '<div class="chat-cost" id="ticket-chat-cost"></div>' +
@@ -4502,6 +4507,7 @@ async function sendChatMessage() {
   if (!msg) return;
 
   input.value = '';
+  input.style.height = 'auto';
   btn.disabled = true;
   appendChatMessage('chat-messages', 'user', msg);
   appendChatMessage('chat-messages', 'system', 'Thinking...');
@@ -4550,6 +4556,7 @@ async function sendTicketChatMessage() {
   if (!msg || !currentTicketForChat) return;
 
   input.value = '';
+  input.style.height = 'auto';
   appendChatMessage('ticket-chat-messages', 'user', msg);
   appendChatMessage('ticket-chat-messages', 'system', 'Thinking...');
 
@@ -4582,7 +4589,7 @@ async function sendTicketChatMessage() {
   input.focus();
 }
 
-// Enter key support
+// Enter key support (Enter sends, Shift+Enter inserts newline)
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     if (e.target.id === 'chat-input') {
@@ -4592,6 +4599,15 @@ document.addEventListener('keydown', function(e) {
       e.preventDefault();
       sendTicketChatMessage();
     }
+  }
+});
+
+// Auto-resize textarea inputs
+document.addEventListener('input', function(e) {
+  if (e.target.id === 'chat-input' || e.target.id === 'ticket-chat-input') {
+    e.target.style.height = 'auto';
+    e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+    e.target.style.overflowY = e.target.scrollHeight > 150 ? 'auto' : 'hidden';
   }
 });
 
