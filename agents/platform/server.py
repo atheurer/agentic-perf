@@ -168,9 +168,11 @@ async def _provision_jumpstarter(
     directives = cf.get("directives", {})
     serial_enabled = directives.get("serial_capture", False)
     ticket_id = ticket_id or cf.get("ticket_id", "") or metadata.get("ticket_id", "")
-    from paths import create_artifact_dir
+    artifact_dir = ""
+    if ticket_id:
+        from paths import create_artifact_dir
 
-    artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
+        artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
 
     provision_kwargs: dict[str, Any] = {
         "lease_name": lease_id,
