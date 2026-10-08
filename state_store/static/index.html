@@ -2521,7 +2521,7 @@ async function renderDetail(ticketId) {
       var initData = await api('/tickets/' + ticketId + '/transcript');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
-        lastSeq = initEvents[initEvents.length - 1].seq || 0;
+        lastSeq = maxEventSeq(initEvents);
         renderNewEvents(initEvents);
       }
     } catch (e) {
@@ -3833,6 +3833,12 @@ function renderNewEvents(events) {
   if (added > 0) {
     renderEventStream();
   }
+}
+
+function maxEventSeq(events) {
+  return events.reduce(function(maxSeq, evt) {
+    return Math.max(maxSeq, (evt && evt.seq) || 0);
+  }, 0);
 }
 
 function renderAuditEvent(evt) {
