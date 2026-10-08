@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
@@ -250,26 +251,30 @@ async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
 
 
 @pytest.mark.asyncio
-async def test_slow_success_schedules_another_attempt_before_confirmed_deadline():
+async def test_slow_success_schedules_another_attempt_before_confirmed_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
     class SlowRenewalLease(_RenewalLease):
         def __init__(self):
             super().__init__(ttl_seconds=0.8)
-            self.confirmed_deadline = asyncio.get_running_loop().time() + 0.95
-            self.first_confirmed_deadline = None
-            self.second_started = asyncio.Event()
+            self.successful_deadline = None
+            self.third_started = asyncio.Event()
 
         async def renew(self):
             loop = asyncio.get_running_loop()
             request_started = loop.time()
             self.attempts.append(request_started)
             if len(self.attempts) == 1:
-                await asyncio.sleep(0.65)
+                request = httpx.Request("POST", "http://state-store/renew")
+                raise httpx.ReadError("temporary failure", request=request)
+            if len(self.attempts) == 2:
+                await asyncio.sleep(0.35)
                 self.confirmed_deadline = request_started + self.ttl_seconds
-                self.first_confirmed_deadline = self.confirmed_deadline
+                self.successful_deadline = self.confirmed_deadline
                 self.recovered.set()
                 return
 
-            self.second_started.set()
+            self.third_started.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -278,17 +283,27 @@ async def test_slow_success_schedules_another_attempt_before_confirmed_deadline(
 
     lease = SlowRenewalLease()
     lost = []
+    delayed_recovery_logs = []
+
+    def delay_recovery_log(message, *_args, **_kwargs):
+        if "renewal recovered" in message:
+            delayed_recovery_logs.append(True)
+            time.sleep(0.25)
+
+    monkeypatch.setattr("orchestrator.main.logger.info", delay_recovery_log)
     task = asyncio.create_task(
         _renew_leader_lease(lease, 0.2, on_lost=lambda: lost.append(True))
     )
+    try:
+        await asyncio.wait_for(lease.third_started.wait(), timeout=1.5)
+        third_started_at = lease.attempts[2]
+        assert third_started_at < lease.successful_deadline
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    await asyncio.wait_for(lease.second_started.wait(), timeout=1.5)
-    second_started_at = lease.attempts[1]
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert second_started_at < lease.first_confirmed_deadline
+    assert delayed_recovery_logs == [True]
     assert lease.cancelled
     assert lost == []
     assert lease.released == 1
