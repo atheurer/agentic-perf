@@ -2026,8 +2026,9 @@ async def _renew_leader_lease(
             if remaining <= 0:
                 fail_lost(RuntimeError("no confirmed lease time remains"))
             if next_delay >= remaining:
-                await asyncio.sleep(remaining)
-                fail_lost(RuntimeError("confirmed lease deadline reached"))
+                # Preserve time for a renewal attempt when the usual cadence
+                # would consume the remaining confirmed lease window.
+                next_delay = remaining / 2
             await asyncio.sleep(next_delay)
             remaining = safe_remaining()
             if remaining <= 0:

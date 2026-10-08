@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
@@ -248,6 +249,51 @@ async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
     assert lease.released == 1
 
 
+@pytest.mark.asyncio
+async def test_slow_success_schedules_another_attempt_before_confirmed_deadline():
+    class SlowRenewalLease(_RenewalLease):
+        def __init__(self):
+            super().__init__(ttl_seconds=0.8)
+            self.confirmed_deadline = asyncio.get_running_loop().time() + 0.95
+            self.first_confirmed_deadline = None
+            self.second_started = asyncio.Event()
+
+        async def renew(self):
+            loop = asyncio.get_running_loop()
+            request_started = loop.time()
+            self.attempts.append(request_started)
+            if len(self.attempts) == 1:
+                await asyncio.sleep(0.65)
+                self.confirmed_deadline = request_started + self.ttl_seconds
+                self.first_confirmed_deadline = self.confirmed_deadline
+                self.recovered.set()
+                return
+
+            self.second_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    lease = SlowRenewalLease()
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0.2, on_lost=lambda: lost.append(True))
+    )
+
+    await asyncio.wait_for(lease.second_started.wait(), timeout=1.5)
+    second_started_at = lease.attempts[1]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert second_started_at < lease.first_confirmed_deadline
+    assert lease.cancelled
+    assert lost == []
+    assert lease.released == 1
+
+
 class _PollLoopLease:
     def __init__(self, *_args, **_kwargs):
         self.epoch = None
@@ -298,8 +344,6 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
 ):
     import orchestrator.main as orchestrator_main
 
-    monkeypatch.delenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", raising=False)
-    monkeypatch.delenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", raising=False)
     config = _poll_config()
     config.poll_interval = 60
     config.stale_task_timeout = 0
@@ -391,8 +435,12 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
         ]
     finally:
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            os.environ.pop("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", None)
+            os.environ.pop("AGENTIC_PERF_ORCHESTRATOR_EPOCH", None)
 
 
 @pytest.mark.asyncio
