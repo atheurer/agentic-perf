@@ -16,6 +16,43 @@ from .prompts import TRIAGE_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
+def _description_requests_harness(description: str, harness: str) -> bool:
+    """Return whether the description explicitly selects this harness."""
+    if not description or not harness:
+        return False
+
+    from providers.skills.base import HARNESS_ALIASES
+
+    canonical = HARNESS_ALIASES.get(harness, harness)
+    candidates = {harness, canonical}
+    candidates.update(
+        alias for alias, target in HARNESS_ALIASES.items() if target == canonical
+    )
+    for candidate in sorted(candidates, key=len, reverse=True):
+        token = rf"(?<![\w-]){re.escape(candidate)}(?![\w-])"
+        if re.search(
+            rf"\b(?:do\s+not|don't|dont|never|should\s+not|shouldn't)\s+"
+            rf"(?:use|using|with|via)\s+(?:the\s+)?(?:harness\s+)?{token}"
+            rf"|\bavoid\s+(?:the\s+)?(?:harness\s+)?{token}",
+            description,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.search(
+            rf"\b(?:use|using|with|via)\s+(?:the\s+)?(?:harness\s+)?{token}",
+            description,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            rf"\bharness\b\s*(?:(?:is|should\s+be|to)\s+|[:=]\s*){token}",
+            description,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
 # _canonicalize_workflow_harness removed — workflow_source → harness
 # mapping is now handled by AgentBase._effective_harness, which is
 # the single source of truth for harness resolution.  The triage
@@ -885,6 +922,10 @@ class TriageAgent(AgentBase):
             explicit_user_harness = self._effective_harness(
                 {"harness": user_directives["harness"]}, self._skill_provider
             )
+        if not explicit_user_harness and _description_requests_harness(
+            ticket.get("description") or "", harness
+        ):
+            explicit_user_harness = harness
 
         # --- Harness / suite validation (issue #1086) ---
         # Code-enforced: reject or auto-correct invalid harness names

@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agents.triage.agent import TriageAgent, _validate_harness_and_suite
+from agents.triage.agent import (
+    TriageAgent,
+    _description_requests_harness,
+    _validate_harness_and_suite,
+)
 from providers.llm.base import LLMResponse, ToolCall
 from state_store.models import VALID_TRANSITIONS, TicketStatus
 
@@ -68,13 +72,14 @@ async def _complete_triage_result(
     result: dict,
     provider: _FakeSkillProvider,
     custom_fields: dict | None = None,
+    description: str = "Run a benchmark",
 ) -> tuple[TriageAgent, dict, dict]:
     """Run completion against an in-memory ticket with legal transitions."""
     ticket = {
         "id": "PERF-TRIAGE-VALIDATION",
         "status": "triage_pending",
         "summary": "Benchmark request",
-        "description": "Run a benchmark",
+        "description": description,
         "custom_fields": custom_fields or {},
     }
     agent = TriageAgent(
@@ -117,6 +122,15 @@ async def _complete_triage_result(
 
 class TestHarnessValidation:
     """Reject harness names that don't exist in the registry."""
+
+    def test_description_harness_detection_is_conservative_and_alias_aware(self):
+        assert _description_requests_harness("Use zathras", "zathras")
+        assert _description_requests_harness("Use arcaflow", "arcaflow-plugins")
+        assert not _description_requests_harness("Use zathras-like tooling", "zathras")
+        assert not _description_requests_harness("Do not use zathras", "zathras")
+        assert not _description_requests_harness(
+            "The prior run used zathras", "zathras"
+        )
 
     @pytest.mark.asyncio
     async def test_valid_harness_passes(self):
@@ -308,6 +322,31 @@ class TestSuiteAutoCorrection:
             },
             _make_provider(),
             custom_fields={"directives": {"harness": "zathras"}},
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        agent._transition_ticket.assert_awaited_once_with(
+            ticket["id"],
+            "awaiting_customer_guidance",
+            comment="Triage validation failed; awaiting harness guidance.",
+        )
+        comment = agent._add_comment.await_args.args[1]
+        assert "requested harness 'zathras'" in comment
+        assert "catalog harness 'crucible'" in comment
+        assert "benchmark suite 'uperf'" in comment
+
+    @pytest.mark.asyncio
+    async def test_description_harness_conflict_pauses_for_guidance(self):
+        """An explicit harness request in the description remains authoritative."""
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {"harness": "zathras"},
+            },
+            _make_provider(),
+            description="Use zathras",
         )
 
         assert ticket["status"] == "awaiting_customer_guidance"
