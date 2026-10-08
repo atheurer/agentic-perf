@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -359,6 +358,9 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
 ):
     import orchestrator.main as orchestrator_main
 
+    # Record even absent keys so monkeypatch removes values assigned by startup.
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
     config = _poll_config()
     config.poll_interval = 60
     config.stale_task_timeout = 0
@@ -450,12 +452,8 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
         ]
     finally:
         task.cancel()
-        try:
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        finally:
-            os.environ.pop("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", None)
-            os.environ.pop("AGENTIC_PERF_ORCHESTRATOR_EPOCH", None)
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio
