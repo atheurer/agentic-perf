@@ -114,6 +114,14 @@ def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
     if "platform_ready" in custom_fields:
         snapshot["platform_ready"] = custom_fields["platform_ready"]
 
+    # Board identity
+    platform_board = custom_fields.get("platform_board", "")
+    if platform_board:
+        snapshot["platform_board"] = platform_board
+    assigned_ips = custom_fields.get("assigned_hardware_ips")
+    if assigned_ips:
+        snapshot["assigned_hardware_ips"] = assigned_ips
+
     # Platform / provisioning
     platform_ip = custom_fields.get("platform_ip", "")
     if platform_ip:
@@ -151,7 +159,9 @@ def next_iteration_fields(custom_fields: dict[str, Any]) -> dict[str, Any]:
     """
     fields: dict[str, Any] = {
         "platform_ready": False,
+        "platform_board": "",
         "platform_ip": "",
+        "assigned_hardware_ips": {},
         "platform_flash_duration_s": None,
         "platform_boot_duration_s": None,
         "platform_serial_log": "",

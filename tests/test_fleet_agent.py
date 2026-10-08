@@ -61,6 +61,7 @@ class TestCoordinatorRecording:
         cf = ticket["custom_fields"]
         cf.update(
             {
+                "assigned_hardware_ips": {"targets": ["10.0.0.1"]},
                 "run_id": "run-board-01",
                 "benchmark_duration": 42,
                 "benchmark_notes": "board one notes",
@@ -111,6 +112,10 @@ class TestCoordinatorRecording:
         assert cf["output_dir"] == ""
         assert cf["output_dirs"] == ["/runs/board-01"]
         assert cf["jumpstarter_flash"] == {"command": "flash-board"}
+        # #1139: board identity fields must be cleared between iterations
+        assert cf["platform_board"] == ""
+        assert cf["assigned_hardware_ips"] == {}
+        assert cf["platform_ip"] == ""
 
         # The next board did not complete a benchmark and reports an
         # unrecognized status. No result from board 01 may bleed into it.

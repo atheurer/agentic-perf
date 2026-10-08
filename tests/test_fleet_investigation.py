@@ -470,6 +470,17 @@ class TestSnapshotIterationData:
         assert snap["serial_log_path"] == "/tmp/serial-capture.log"
         assert snap["output_dir"] == "/tmp/artifacts/run-123"
 
+    def test_captures_board_identity(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "platform_board": "nxp-s32g-vnp-rdb3-07",
+            "assigned_hardware_ips": {"targets": ["10.26.29.43"]},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["platform_board"] == "nxp-s32g-vnp-rdb3-07"
+        assert snap["assigned_hardware_ips"] == {"targets": ["10.26.29.43"]}
+
     def test_empty_fields_omitted(self):
         from providers.fleet import snapshot_iteration_data
 
@@ -491,3 +502,76 @@ class TestSnapshotIterationData:
 
         entry = build_tested_host_entry(host_id="board-01")
         assert "iteration_data" not in entry
+
+
+class TestNextIterationFields:
+    """next_iteration_fields clears stale state between fleet iterations (#1139)."""
+
+    def test_clears_benchmark_and_platform_fields(self):
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "platform_board": "nxp-s32g-vnp-rdb3-07",
+            "platform_ip": "10.26.29.43",
+            "assigned_hardware_ips": {"targets": ["10.26.29.43"]},
+            "run_id": "boot-time-cbf04406",
+            "benchmark_status": "completed",
+            "platform_ready": True,
+        }
+        fields = next_iteration_fields(cf)
+        assert fields["platform_board"] == ""
+        assert fields["platform_ip"] == ""
+        assert fields["assigned_hardware_ips"] == {}
+        assert fields["run_id"] == ""
+        assert fields["benchmark_status"] is None
+        assert fields["platform_ready"] is False
+
+    def test_clears_all_stale_fields(self):
+        """Every field that could bleed into the next iteration is reset."""
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "platform_board": "board-01",
+            "platform_ip": "10.0.0.1",
+            "assigned_hardware_ips": {"targets": ["10.0.0.1"]},
+            "run_id": "run-abc",
+            "benchmark_status": "completed",
+            "benchmark_notes": "all good",
+            "benchmark_duration": 120,
+            "run_file_used": {"block_size": "4k"},
+            "benchmark_kpis": {"avg_boot_s": 12.5},
+            "samples_collected": 8,
+            "output_dir": "/tmp/run-abc",
+            "platform_ready": True,
+            "platform_flash_duration_s": 45.0,
+            "platform_boot_duration_s": 20.0,
+            "platform_serial_log": "/tmp/serial.log",
+        }
+        fields = next_iteration_fields(cf)
+        # All benchmark/platform fields should be reset to empty/null
+        assert fields["platform_board"] == ""
+        assert fields["assigned_hardware_ips"] == {}
+        assert fields["run_id"] == ""
+        assert fields["benchmark_status"] is None
+        assert fields["benchmark_notes"] == ""
+        assert fields["benchmark_duration"] is None
+        assert fields["run_file_used"] == {}
+        assert fields["benchmark_kpis"] == {}
+        assert fields["samples_collected"] is None
+        assert fields["output_dir"] == ""
+        assert fields["platform_ready"] is False
+        assert fields["platform_flash_duration_s"] is None
+        assert fields["platform_boot_duration_s"] is None
+        assert fields["platform_serial_log"] == ""
+
+    def test_preserves_flash_config_but_clears_diagnostics(self):
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "jumpstarter_flash": {
+                "command": "flash-board",
+                "diagnostics": "board one diagnostics",
+            },
+        }
+        fields = next_iteration_fields(cf)
+        assert fields["jumpstarter_flash"] == {"command": "flash-board"}
