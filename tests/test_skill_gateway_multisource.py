@@ -49,7 +49,9 @@ def _write_package(
         config.write_text(json.dumps(runtime_config))
 
 
-def _resolver(*sources: tuple[str, Path]) -> OrganizationSkillResolver:
+def _resolver(
+    *sources: tuple[str, Path], snapshot_root: Path | None = None
+) -> OrganizationSkillResolver:
     return OrganizationSkillResolver.from_instance_config(
         {
             "skill_gateway": {
@@ -60,7 +62,8 @@ def _resolver(*sources: tuple[str, Path]) -> OrganizationSkillResolver:
                     ]
                 }
             }
-        }
+        },
+        snapshot_root=snapshot_root,
     )
 
 
@@ -101,6 +104,43 @@ def test_named_sources_discover_subject_union(tmp_path: Path) -> None:
         }
     )
     assert shorthand.configured_subjects() == ["harness/crucible"]
+
+
+def test_ticket_snapshot_read_handles_reverse_source_configuration_order(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    subject = "harness/crucible"
+    _write_package(
+        first,
+        namespace="harness",
+        name="crucible",
+        subject=subject,
+        instruction="Crucible guidance from team A.",
+    )
+    _write_package(
+        second,
+        namespace="harness",
+        name="crucible",
+        subject=subject,
+        instruction="Crucible guidance from team B.",
+    )
+    resolver = _resolver(
+        ("team-b", second),
+        ("team-a", first),
+        snapshot_root=tmp_path / "snapshots",
+    ).for_attempt("PERF-MULTISOURCE-SNAPSHOT", "attempt-1", "benchmark")
+    resolver.audit_emit = lambda _event: None
+
+    bootstrap = resolver.bootstrap(subject)
+    assert bootstrap["status"] == "available"
+    assert [source["id"] for source in bootstrap["sources"]] == [
+        "team-a",
+        "team-b",
+    ]
+
+    document = resolver.read(subject, bootstrap["entrypoints"][0])
+    assert "Crucible guidance from team A." in document["content"]
 
 
 def test_overlapping_subjects_keep_provenance_and_report_variants(

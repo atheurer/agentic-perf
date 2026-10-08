@@ -63,5 +63,12 @@ def test_crucible_review_always_uses_gateway_even_after_analysis():
         }
     )
 
-    assert 'get_skill_context(subject="harness/crucible"' in prompt
-    assert "temporary fallback with the lowest default authority" in prompt
+    normalized_prompt = " ".join(prompt.split())
+    assert 'get_skill_context(subject="harness/crucible"' in normalized_prompt
+    assert (
+        "authenticated user context before organization context, organization before"
+        in normalized_prompt
+    )
+    assert "upstream before bundled project-local docs" in normalized_prompt
+    assert "temporary fallback with the lowest default authority" in normalized_prompt
+    assert "does not yet load user-scoped skill packages" in normalized_prompt

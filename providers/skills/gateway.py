@@ -954,6 +954,9 @@ class OrganizationSkillResolver:
                     "Pinned organization subject was removed",
                 )
             return None
+        # Snapshots are captured in source-id order. Keep the identity check in
+        # that same canonical order so equivalent source lists pin consistently.
+        bindings = tuple(sorted(bindings, key=lambda binding: binding.source_id))
         if not self.ticket_id:
             return self._capture(bindings)
         if not self.attempt_id:

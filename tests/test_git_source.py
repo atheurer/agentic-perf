@@ -48,7 +48,22 @@ class _FileSecretsProvider(SecretsProvider):
                 "url": "git@git.example.org:team/skills.git",
                 "ref": "release/2026.10",
             },
-            "ssh://git@git.example.org/team/skills.git",
+            "ssh://git@git.example.org/~/team/skills.git",
+            "default",
+        ),
+        (
+            {"kind": "git", "url": "git@git.example.org:~/team/skills.git"},
+            "ssh://git@git.example.org/~/team/skills.git",
+            "default",
+        ),
+        (
+            {"kind": "git", "url": "git@git.example.org:~builder/team/skills.git"},
+            "ssh://git@git.example.org/~builder/team/skills.git",
+            "default",
+        ),
+        (
+            {"kind": "git", "url": "git@git.example.org:/srv/team/skills.git"},
+            "ssh://git@git.example.org/srv/team/skills.git",
             "default",
         ),
         (
@@ -113,6 +128,8 @@ def test_parse_supported_git_sources(source, expected_url, expected_auth):
                 "secret_ref": "organization/git-token",
             },
         },
+        {"kind": "git", "url": "git@git.example.org:~"},
+        {"kind": "git", "url": "git@git.example.org:~builder"},
     ],
 )
 def test_reject_unsafe_git_sources(source):

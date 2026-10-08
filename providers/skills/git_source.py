@@ -85,9 +85,24 @@ def parse_git_source(source: object) -> _GitSourceConfig:
     if "://" not in url:
         scp_match = _SCP_GIT_URL.fullmatch(url)
         if scp_match:
+            scp_path = scp_match.group("path")
+            if scp_path.startswith("/"):
+                # SCP-style absolute paths remain absolute after conversion.
+                ssh_path = scp_path
+            elif scp_path.startswith("~"):
+                # Preserve explicit remote-home expansion (including ~user).
+                if scp_path == "~" or re.fullmatch(r"~[^/]+", scp_path):
+                    raise GitSourceError(
+                        "invalid_config", "Invalid organization Git source URL"
+                    )
+                ssh_path = f"/{scp_path}"
+            else:
+                # A relative scp-style path is relative to the remote user's
+                # home. ssh:// needs an explicit /~/ path to retain that meaning.
+                ssh_path = f"/~/{scp_path}"
             url = (
-                f"ssh://{scp_match.group('username')}@{scp_match.group('host')}/"
-                f"{scp_match.group('path')}"
+                f"ssh://{scp_match.group('username')}@{scp_match.group('host')}"
+                f"{ssh_path}"
             )
     try:
         parsed = urlsplit(url)
