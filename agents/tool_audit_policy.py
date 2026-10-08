@@ -289,6 +289,7 @@ TOOL_AUDIT_POLICY = (
         "agents/benchmark/agent.py:present_runfile_for_approval",
         "agents/benchmark/agent.py:resolve_benchmark_approval",
         "agents/benchmark/agent.py:request_clarification",
+        "agents/analyze/agent.py:request_clarification",
         "agents/provisioning/agent.py:request_clarification",
         "agents/provisioning/agent.py:submit_provisioning_result",
         "agents/resource/agent.py:submit_resource_result",

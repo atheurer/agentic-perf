@@ -52,7 +52,9 @@ software documentation explains general software behavior. User preferences
 cannot override mandatory organization policy or deterministic security
 requirements. Compare local guides against higher sources and request
 clarification for material conflicts rather than silently treating local text as
-authoritative.
+authoritative. The current gateway does not yet load user-scoped skill packages;
+apply the user-first authority rule only to user guidance otherwise available
+in the ticket or session.
 
 ### Verified SSH Access
 

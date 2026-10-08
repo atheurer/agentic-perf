@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from agents.analyze.agent import AnalyzeAgent
 from state_store.models import (
     VALID_TRANSITIONS,
     CreateTicketRequest,
@@ -83,6 +84,74 @@ def test_analyzing_transitions():
     assert TicketStatus.AWAITING_REVIEW in allowed
     assert TicketStatus.AWAITING_HARDWARE in allowed
     assert TicketStatus.AWAITING_CUSTOMER_GUIDANCE in allowed
+
+
+@pytest.mark.asyncio
+async def test_analyze_request_clarification_pauses_until_user_reply(monkeypatch):
+    agent = AnalyzeAgent(llm_provider=None, state_store_url="http://unused")
+    agent._ticket_id = "PERF-ANALYZE-HITL"
+    agent._HITL_POLL_INTERVAL = 0
+    assert "request_clarification" in {tool.name for tool in agent.tools}
+
+    tickets = iter(
+        [
+            {"status": "analyzing", "comments": [], "custom_fields": {}},
+            {
+                "status": "analyzing",
+                "comments": [
+                    {"author": "user", "body": "Use the installed controller docs."}
+                ],
+                "custom_fields": {},
+            },
+        ]
+    )
+    transitions = []
+
+    async def get_ticket(_ticket_id):
+        return next(tickets)
+
+    async def add_comment(_ticket_id, body):
+        assert "conflict" in body
+
+    async def transition_ticket(_ticket_id, status, **_kwargs):
+        transitions.append(status)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(agent, "_get_ticket", get_ticket)
+    monkeypatch.setattr(agent, "_add_comment", add_comment)
+    monkeypatch.setattr(agent, "_transition_ticket", transition_ticket)
+    monkeypatch.setattr("agents.base.asyncio.sleep", no_sleep)
+
+    reply = await agent._tool_handlers["request_clarification"](
+        question="The context sources conflict. Which source should guide this analysis?"
+    )
+    assert reply == "Use the installed controller docs."
+    assert transitions == ["awaiting_customer_guidance"]
+    await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_analyze_mcp_tool_merge_reuses_stable_native_tools():
+    from providers.llm.base import ToolDefinition
+
+    agent = AnalyzeAgent(llm_provider=None, state_store_url="http://unused")
+    remote_tool = ToolDefinition(
+        name="get_skill_context",
+        description="Retrieve context.",
+        input_schema={"type": "object"},
+    )
+
+    agent._set_mcp_tools([remote_tool])
+    first_names = [tool.name for tool in agent.tools]
+    agent._set_mcp_tools([remote_tool])
+    second_names = [tool.name for tool in agent.tools]
+
+    assert first_names == second_names
+    assert first_names.count("request_clarification") == 1
+    assert first_names.count("get_skill_context") == 1
+    await agent.close()
 
 
 def test_triage_can_transition_to_analyzing():

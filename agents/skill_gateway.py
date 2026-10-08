@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import posixpath
 import re
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from providers.skills.gateway import (
     OrganizationSkillResolver,
@@ -20,6 +21,8 @@ _PROJECT_PREFIX = "skill://project/"
 _CONFIG_PREFIX = "skill://configuration/"
 SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software references.
 Include the benchmark name when known to return benchmark-scoped project documents.
+Returned project refs preserve their benchmark scope for later reads and searches;
+do not repeat the benchmark argument unless you intend to change scope.
 
 Bootstrap returns applicable project and organization entrypoints,
 phase-compatible software entrypoints, and approved configuration-view refs.
@@ -43,11 +46,12 @@ project, organization and software documents. Same-path and same-basename
 variants are reported as potential overlaps; differently named documents can
 also conflict, so compare claims rather than relying only on the overlap list.
 Exact duplicates are identified separately for organization sources. For soft
-contextual guidance and preferences, use this order when sources address the
-same claim: authenticated user, organization, upstream, then the bundled
-project-local documents. The bundled documents are temporary fallback material
-and have the lowest default authority. Apply this order only within the
-source's domain: installed controller/version evidence establishes what is
+contextual guidance and preferences, the authority order when user guidance is
+available is authenticated user, organization, upstream, then the bundled
+project-local documents. This gateway does not yet load user-scoped skill
+packages. The bundled documents are temporary fallback material and have the
+lowest default authority. Apply this order only within the source's domain:
+installed controller/version evidence establishes what is
 present and works on that controller; upstream software documentation explains
 general software behavior; organization context defines shared practice; user
 context expresses that user's preferences. A user preference cannot override
@@ -187,11 +191,16 @@ def _software_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _project_ref(path: str) -> str:
-    return _PROJECT_PREFIX + quote(path, safe="/")
+def _project_ref(path: str, benchmark_scope: str | None = None) -> str:
+    ref = _PROJECT_PREFIX + quote(path, safe="/")
+    if benchmark_scope:
+        ref += "?benchmark=" + quote(benchmark_scope, safe="")
+    return ref
 
 
-def _project_document(document: dict[str, Any]) -> dict[str, Any]:
+def _project_document(
+    document: dict[str, Any], benchmark_scope: str | None = None
+) -> dict[str, Any]:
     """Expose an explicitly mapped repository document with project provenance."""
     source_path = str(document.get("source_path", ""))
     provenance = document.get("provenance", {})
@@ -209,9 +218,10 @@ def _project_document(document: dict[str, Any]) -> dict[str, Any]:
     if provenance.get("reason"):
         safe_provenance["reason"] = provenance["reason"]
     subjects = document.get("subject_area")
+    ref = _project_ref(source_path, benchmark_scope)
     return {
-        "ref": _project_ref(source_path),
-        "uri": _project_ref(source_path),
+        "ref": ref,
+        "uri": ref,
         "path": source_path,
         "source_path": source_path,
         "source": "agentic-perf",
@@ -222,6 +232,7 @@ def _project_document(document: dict[str, Any]) -> dict[str, Any]:
         "revision": provenance.get("revision"),
         "provenance": safe_provenance,
         "benchmark": document.get("benchmark"),
+        "benchmark_scope": benchmark_scope,
         "subject_areas": LocalContextSource._values(subjects),
         "entrypoint": bool(document.get("entrypoint", True)),
     }
@@ -247,9 +258,51 @@ def _project_documents(
         agent=agent_name,
         subject_area="all",
     )
-    exposed = [_project_document(item) for item in documents]
+    exposed = [_project_document(item, benchmark) for item in documents]
     exposed.sort(key=lambda item: item["path"])
     return source, exposed
+
+
+def _project_benchmark_scope(ref: str) -> str | None:
+    """Return the benchmark inventory encoded in a returned project ref."""
+    if not ref.startswith(_PROJECT_PREFIX):
+        return None
+    parsed = urlsplit(ref)
+    if parsed.scheme != "skill" or parsed.netloc != "project" or parsed.fragment:
+        raise SkillGatewayError("invalid_ref", "Use a returned project document ref")
+    try:
+        parameters = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise SkillGatewayError(
+            "invalid_ref", "Project ref has invalid parameters"
+        ) from exc
+    if set(parameters) - {"benchmark"}:
+        raise SkillGatewayError("invalid_ref", "Project ref has unsupported parameters")
+    values = parameters.get("benchmark", [])
+    if len(values) > 1:
+        raise SkillGatewayError("invalid_ref", "Project ref has an invalid benchmark")
+    if not values:
+        return None
+    benchmark = values[0]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", benchmark):
+        raise SkillGatewayError("invalid_ref", "Project ref has an invalid benchmark")
+    return benchmark
+
+
+def _effective_project_benchmark(
+    benchmark: str | None, *, ref: str, from_ref: str
+) -> str | None:
+    scopes = {
+        scope
+        for candidate in (ref, from_ref)
+        if (scope := _project_benchmark_scope(candidate)) is not None
+    }
+    if len(scopes) > 1:
+        raise SkillGatewayError("invalid_ref", "Project refs have different scopes")
+    ref_scope = next(iter(scopes), None)
+    if benchmark and ref_scope and benchmark != ref_scope:
+        raise SkillGatewayError("invalid_ref", "Benchmark conflicts with project ref")
+    return ref_scope or benchmark
 
 
 def _project_read_target(
@@ -297,11 +350,17 @@ async def _search_project_documents(
         )
     lines: list[str] = []
     positions: list[tuple[dict[str, Any], int]] = []
+    input_size = 0
     for document in documents:
         content = source.read(document["source_path"])
         if content is None:
             continue
         for number, line in enumerate(content.splitlines(), 1):
+            input_size += len(line.encode("utf-8")) + 1
+            if input_size > 16 * 1024 * 1024:
+                raise SkillGatewayError(
+                    "source_too_large", "Project search is too large"
+                )
             lines.append(line)
             positions.append((document, number))
             if len(lines) > 200_000:
@@ -320,19 +379,30 @@ async def _search_project_documents(
 
     from providers.execution.subprocess import AuditedSubprocessRunner
 
-    result = await AuditedSubprocessRunner(output_limit=2 * 1024 * 1024).run(
+    search_input = ("\n".join(lines) + "\n").encode("utf-8")
+    runner = AuditedSubprocessRunner(output_limit=2 * 1024 * 1024)
+    process = await runner.start(
         ["grep", "-a", "-n", "-E", "-m", "4097", "--", query],
-        stdin=("\n".join(lines) + "\n").encode("utf-8"),
-        timeout=2.0,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        stdin_pipe=True,
+        stdin_size=len(search_input),
     )
-    if result.timed_out:
+    try:
+        stdout, _stderr = await process.communicate(
+            input=search_input,
+            timeout=2.0,
+        )
+    except asyncio.TimeoutError as exc:
+        raise SkillGatewayError("search_timeout", "Search exceeded time limit") from exc
+    output_truncated = len(stdout) > 2 * 1024 * 1024
+    stdout = stdout[: 2 * 1024 * 1024]
+    if process.returncode is None:
         raise SkillGatewayError("search_timeout", "Search exceeded time limit")
-    if result.returncode not in {0, 1}:
+    if process.returncode not in {0, 1}:
         raise SkillGatewayError("invalid_pattern", "Invalid search expression")
 
     matches = []
-    for item in result.stdout.split(b"\n"):
+    for item in stdout.split(b"\n"):
         if not item:
             continue
         line_number, snippet = item.split(b":", 1)
@@ -346,7 +416,7 @@ async def _search_project_documents(
                 "snippet": snippet.decode("utf-8", errors="replace")[:512],
             }
         )
-    limited = len(matches) > 4096
+    limited = len(matches) > 4096 or output_truncated
     matches = matches[:4096]
     records = [json.dumps(item, ensure_ascii=False) + "\n" for item in matches]
     size = sum(len(item.encode("utf-8")) for item in records)
@@ -450,7 +520,9 @@ async def skill_context_gateway(
             subject=subject,
             phase=phase,
             agent_name=agent_name,
-            benchmark=benchmark_name,
+            benchmark=_effective_project_benchmark(
+                benchmark_name, ref=ref, from_ref=from_ref
+            ),
         )
         software_allowed = subject == "harness/crucible" and phase in {
             "benchmark",
@@ -567,6 +639,7 @@ async def skill_context_gateway(
                                     "revision",
                                     "provenance",
                                     "benchmark",
+                                    "benchmark_scope",
                                     "entrypoint",
                                 )
                                 if key in item

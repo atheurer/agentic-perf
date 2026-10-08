@@ -16,9 +16,11 @@ phase entrypoint documents from each available source using
 `operation="read", ref=<returned-ref>`. Project workflow, organization
 guidance, and software documentation are separate scopes; bootstrap discovery
 does not load their document contents. For soft guidance about the same claim,
-use authenticated user context before organization context, organization before
-upstream guidance, and upstream before bundled project-local docs. Bundled
-project-local docs are a temporary fallback with the lowest default authority.
+the authority order, when user guidance is available, is authenticated user
+context before organization context, organization before upstream guidance, and
+upstream before bundled project-local docs. This gateway does not yet load
+user-scoped skill packages. Bundled project-local docs are a temporary fallback
+with the lowest default authority.
 Runtime facts have a separate domain: installed controller/version evidence
 establishes what is present and works there, while upstream software docs
 explain general behavior. User preferences cannot override mandatory
@@ -28,6 +30,8 @@ complete inventory of related software sources. An unconfigured subject means
 no guidance package was found under that ID, not that related software
 documentation is absent.
 Reuse retrieved documents instead of repeating bootstrap.
+Project refs preserve the benchmark filter used during bootstrap, so use the
+returned ref for later reads and searches without repeating the benchmark.
 
 Follow documentation pointers progressively. For a relative pointer, use
 `operation="read", from_ref=<origin-document-ref>, path=<documented-path>`.

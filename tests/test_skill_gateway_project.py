@@ -18,6 +18,7 @@ def test_context_prompt_states_guidance_hierarchy_and_separate_runtime_domain():
     )
     assert "upstream before bundled project-local docs" in prompt
     assert "temporary fallback with the lowest default authority" in prompt
+    assert "does not yet load user-scoped skill packages" in prompt
     assert "installed controller/version evidence" in prompt
     assert "mandatory organization policy" in prompt
 
@@ -170,6 +171,7 @@ def test_gateway_bootstraps_project_docs_with_distinct_provenance_and_overlaps(
     assert all("manifest" not in item["provenance"] for item in project_docs)
     assert all(item["entrypoint"] for item in project_docs)
     assert all(item["ref"].startswith("skill://project/") for item in project_docs)
+    assert all(item["benchmark_scope"] == "uperf" for item in project_docs)
     assert any(item["scope"] == "organization" for item in response["documents"])
     assert any(item["scope"] == "software" for item in response["documents"])
     inventory = response["context_manifest"]
@@ -183,6 +185,7 @@ def test_gateway_bootstraps_project_docs_with_distinct_provenance_and_overlaps(
     }
     assert {item["source_id"] for item in project_inventory} == {"agentic-perf"}
     assert all(item["authority"] == "supplemental" for item in project_inventory)
+    assert all(item["benchmark_scope"] == "uperf" for item in project_inventory)
     conflicts = response["context_conflicts"]
     assert conflicts["cross_source_comparison_required"] == {
         "project_vs_organization": True,
@@ -194,12 +197,41 @@ def test_gateway_bootstraps_project_docs_with_distinct_provenance_and_overlaps(
     )
 
 
-def test_gateway_reads_searches_and_enforces_project_scope(tmp_path: Path) -> None:
+def test_gateway_reads_searches_and_enforces_project_scope(
+    tmp_path: Path, monkeypatch
+) -> None:
     org_root = tmp_path / "org"
     org_root.mkdir()
     _write_org_package(org_root)
     provider = _Provider(org_root, _write_project_source(tmp_path / "project"))
-    ref = "skill://project/skills/crucible/run-file-pitfalls.md"
+
+    async def controller_context_gateway(**_kwargs):
+        return json.dumps({"found": False, "reason": "not_installed"})
+
+    monkeypatch.setattr(
+        "agents.server_utils.controller_context_gateway",
+        controller_context_gateway,
+    )
+    bootstrap = json.loads(
+        asyncio.run(
+            skill_context_gateway(
+                provider,
+                ticket_id="PERF-TEST",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/crucible",
+                operation="bootstrap",
+                benchmark="uperf",
+            )
+        )
+    )
+    project_refs = {
+        item["path"]: item["ref"]
+        for item in bootstrap["documents"]
+        if item["scope"] == "project"
+    }
+    ref = project_refs["skills/crucible/run-file-pitfalls.md"]
+    assert ref.endswith("?benchmark=uperf")
 
     read = json.loads(
         asyncio.run(
@@ -228,7 +260,6 @@ def test_gateway_reads_searches_and_enforces_project_scope(tmp_path: Path) -> No
                 operation="read",
                 from_ref=ref,
                 path="uperf.md",
-                benchmark="uperf",
             )
         )
     )
@@ -245,7 +276,6 @@ def test_gateway_reads_searches_and_enforces_project_scope(tmp_path: Path) -> No
                 operation="search",
                 from_ref=ref,
                 query="remotehost",
-                benchmark="uperf",
             )
         )
     )
@@ -269,6 +299,40 @@ def test_gateway_reads_searches_and_enforces_project_scope(tmp_path: Path) -> No
         )
     )
     assert denied["reason"] == "invalid_ref"
+
+
+def test_project_search_pumps_large_stdin_and_stdout_concurrently() -> None:
+    from agents.skill_gateway import _search_project_documents
+
+    class _Source:
+        @staticmethod
+        def read(_path: str) -> str:
+            return "\n".join(f"MATCH item-{index:05d}" for index in range(50_000))
+
+    documents = [
+        {
+            "ref": "skill://project/skills/crucible/results.md",
+            "path": "skills/crucible/results.md",
+            "source_path": "skills/crucible/results.md",
+        }
+    ]
+
+    async def _search():
+        return await asyncio.wait_for(
+            _search_project_documents(
+                _Source(),
+                documents,
+                "MATCH",
+                offset=0,
+                max_bytes=16384,
+            ),
+            timeout=5,
+        )
+
+    result = asyncio.run(_search())
+    assert result["matches_count"] == 4096
+    assert result["search_limited"] is True
+    assert result["matches"]
 
 
 def test_gateway_filters_project_docs_by_phase_and_agent(tmp_path: Path) -> None:

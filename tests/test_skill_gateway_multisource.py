@@ -199,6 +199,8 @@ def test_gateway_surfaces_conflicts_and_agents_can_raise_hitl(tmp_path: Path) ->
     assert "authenticated user, organization, upstream, then the bundled" in (
         SKILL_GATEWAY_TOOL_DESCRIPTION
     )
+    description = " ".join(SKILL_GATEWAY_TOOL_DESCRIPTION.split())
+    assert "does not yet load user-scoped skill packages" in description
     assert "mandatory organization policy" in SKILL_GATEWAY_TOOL_DESCRIPTION
     assert "mandatory organization policy" in SKILL_GATEWAY_TOOL_DESCRIPTION
     assert "call request_clarification before submitting" in REVIEW_SYSTEM_PROMPT

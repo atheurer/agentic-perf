@@ -18,11 +18,27 @@ from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
 from .prompts import ANALYZE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="request_clarification",
+        description=(
+            "Ask the user for guidance. Pauses the ticket until the user replies."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to ask"},
+            },
+            "required": ["question"],
+        },
+    ),
+]
 
 
 class AnalyzeAgent(AgentBase):
@@ -34,12 +50,29 @@ class AnalyzeAgent(AgentBase):
         state_store_url: str,
         event_bus: EventBus | None = None,
     ) -> None:
+        self._ticket_id: str | None = None
+
+        async def _request_clarification(question: str) -> str:
+            return await self._do_request_clarification(question)
+
         super().__init__(
             agent_name="analyze-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
+            tools=list(_LOCAL_TOOLS),
+            tool_handlers={"request_clarification": _request_clarification},
             event_bus=event_bus,
         )
+        self._local_tools = list(self.tools)
+
+    def _set_mcp_tools(self, mcp_tools: list[ToolDefinition]) -> None:
+        """Merge current MCP tools with stable native tools for each ticket run."""
+        self.tools = mcp_tools + self._local_tools
+
+    async def _do_request_clarification(self, question: str) -> str:
+        if self._ticket_id:
+            return await self._request_human_input(self._ticket_id, question)
+        return "No ticket context available."
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         prompt = ANALYZE_SYSTEM_PROMPT
@@ -125,6 +158,7 @@ class AnalyzeAgent(AgentBase):
 
     async def run(self, ticket_id: str) -> None:
         """Run the analysis agent with MCP tool connections."""
+        self._ticket_id = ticket_id
         # Connect the analysis agent's own MCP server
         server_path = str(Path(__file__).with_name("server.py"))
         mcp = AgentMCPClient()
@@ -150,7 +184,7 @@ class AnalyzeAgent(AgentBase):
             mcp_tools = filter_external_tools(
                 mcp_tools, mcp._tool_routing, connected_ext, ext_tools
             )
-        self.tools = mcp_tools
+        self._set_mcp_tools(mcp_tools)
 
         # Pre-fetch run info for cited run IDs so the LLM
         # has the data without needing to call get_run_info.
@@ -167,6 +201,7 @@ class AnalyzeAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
             self._prefetched_run_info = {}
+            self._ticket_id = None
 
     async def _prefetch_cited_runs(
         self,
