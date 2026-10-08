@@ -4,7 +4,17 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 _RESERVATION_FAILURE_STATUSES = frozenset(
-    {"failed", "failure", "error", "rejected", "cancelled", "canceled"}
+    {
+        "failed",
+        "failure",
+        "error",
+        "rejected",
+        "cancelled",
+        "canceled",
+        "unknown",
+        "uncertain",
+        "indeterminate",
+    }
 )
 _PROVIDER_RESERVATION_KEYS = {
     "jumpstarter": ("lease_id",),
@@ -16,6 +26,8 @@ _PROVIDER_RESERVATION_KEYS = {
 
 def reservation_failed(result: dict[str, Any]) -> bool:
     """Return whether a provider reservation result reports failure."""
+    if result.get("allocation_unknown") is True:
+        return True
     if result.get("error"):
         return True
     status = str(result.get("status", "")).strip().lower()

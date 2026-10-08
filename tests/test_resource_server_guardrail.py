@@ -23,6 +23,7 @@ def _reset_server_state():
     import agents.resource.server as srv
 
     srv._resources_allocated = False
+    srv._reservation_uncertain = False
     srv._reservation_failures = 0
     srv._initialized = False
     srv._registry = None
@@ -33,6 +34,7 @@ def _reset_server_state():
     srv._host_inventory = {}
     yield
     srv._resources_allocated = False
+    srv._reservation_uncertain = False
     srv._reservation_failures = 0
 
 
@@ -235,11 +237,13 @@ class TestReservationFailureTracking:
         import agents.resource.server as srv
 
         srv._resources_allocated = False
+        srv._reservation_uncertain = False
         srv._reservation_failures = 0
         srv._initialized = True
         srv._ticket = {"custom_fields": {}}
         yield
         srv._resources_allocated = False
+        srv._reservation_uncertain = False
         srv._reservation_failures = 0
 
     def _setup_registry(self, reserve_fn):
@@ -336,3 +340,63 @@ class TestReservationFailureTracking:
         )
         assert srv._reservation_failures == 0
         assert srv._resources_allocated is True
+
+    @pytest.mark.asyncio
+    async def test_provider_exception_marks_outcome_unknown_and_blocks_retry(self):
+        """An exception after side effects must not trigger duplicate allocation."""
+        import agents.resource.server as srv
+
+        side_effects = []
+
+        async def reserve_then_raise(*_args, **_kwargs):
+            side_effects.append("provider allocation started")
+            raise RuntimeError("post-allocation SSH setup failed")
+
+        self._setup_registry(reserve_then_raise)
+        srv._last_reservation.update(
+            {
+                "provider": "aws",
+                "reservation_id": "i-previous",
+                "provider_metadata": {"instance_ids": ["i-previous"]},
+            }
+        )
+
+        result = json.loads(
+            await srv.reserve_resources(
+                provider="aws",
+                selection={"instance_type": "m5.xlarge", "count": 1},
+                description="test uncertain allocation",
+                ticket_id="PERF-TEST",
+            )
+        )
+
+        assert result["status"] == "unknown"
+        assert result["allocation_unknown"] is True
+        assert result["retry_blocked"] is True
+        assert "may have allocated" in result["message"]
+        assert result["provider_metadata"]["instance_ids"] == ["i-previous"]
+        assert "retry_suggestion" not in result
+        assert side_effects == ["provider allocation started"]
+        assert srv._reservation_failures == 1
+        assert srv._reservation_uncertain is True
+        assert srv._resources_allocated is True
+
+        listing = json.loads(await srv.list_resource_providers())
+        discovery = json.loads(await srv.check_available_resources(provider="aws"))
+        retry = json.loads(
+            await srv.reserve_resources(
+                provider="aws",
+                selection={"instance_type": "m5.xlarge", "count": 1},
+                description="must not duplicate",
+                ticket_id="PERF-TEST",
+            )
+        )
+        metadata = json.loads(await srv.get_accumulated_metadata())
+
+        assert listing["allocation_unknown"] is True
+        assert discovery["allocation_unknown"] is True
+        assert retry["allocation_unknown"] is True
+        assert retry["retry_blocked"] is True
+        assert side_effects == ["provider allocation started"]
+        assert metadata["allocation_unknown"] is True
+        assert metadata["instance_ids"] == ["i-previous"]

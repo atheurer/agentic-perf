@@ -1595,6 +1595,154 @@ class TestProviderCorrectAutoReservation:
         return calls[0].kwargs["json"]["fields"]
 
     @pytest.mark.asyncio
+    async def test_accumulated_unknown_outcome_pauses_without_re_reserving(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "unknown provider result",
+            "custom_fields": {"resource_provider": "jumpstarter"},
+        }
+        calls = []
+
+        async def mcp_call(name, _arguments):
+            calls.append(name)
+            if name == "get_accumulated_metadata":
+                return json.dumps(
+                    {
+                        "lease_id": "known-lease",
+                        "allocation_unknown": True,
+                        "retry_blocked": True,
+                    }
+                )
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        response = self._response("jumpstarter")
+        response.tool_calls[0].input["assigned_hardware_ips"] = {
+            "controller": "untrusted.example.com",
+            "targets": [],
+        }
+        await agent._handle_completion("PERF-TEST", response)
+
+        assert calls == ["get_accumulated_metadata"]
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "known-lease"
+        assert fields["resource_provider_metadata"] == {"lease_id": "known-lease"}
+        assert "assigned_hardware_ips" not in fields
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_unknown_auto_reservation_result_does_not_retry(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "unknown provider result",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "board_selector": "board-type=ride4",
+            },
+        }
+        calls = []
+
+        async def mcp_call(name, _arguments):
+            calls.append(name)
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                return json.dumps(
+                    {
+                        "status": "unknown",
+                        "allocation_unknown": True,
+                        "retry_blocked": True,
+                        "error": "provider outcome unknown",
+                        "message": "Manual provider reconciliation required.",
+                    }
+                )
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
+
+        assert calls.count("reserve_resources") == 1
+        agent._client.patch.assert_not_awaited()
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_host_assignment_failure_saves_reservation_and_pauses(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "test reservation",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "required_hosts": [
+                    {"roles": ["controller"]},
+                    {"roles": ["target"]},
+                ],
+                "instance_specs": [
+                    {"instance_type": "m6i.large", "count": 1, "role": "controller"},
+                    {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                ],
+            },
+        }
+        reserve_calls = []
+
+        async def mcp_call(name, arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                reserve_calls.append(arguments)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "i-controller,i-target",
+                        "provider_metadata": {
+                            "instance_ids": ["i-controller", "i-target"]
+                        },
+                        "hosts": ["10.0.0.11"],
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        response = self._response("aws")
+        response.tool_calls[0].input["assigned_hardware_ips"] = {
+            "controller": "attacker.example.com",
+            "targets": ["untrusted.example.com"],
+        }
+        await agent._handle_completion("PERF-TEST", response)
+
+        assert len(reserve_calls) == 1
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "i-controller,i-target"
+        assert fields["resource_provider_metadata"]["instance_ids"] == [
+            "i-controller",
+            "i-target",
+        ]
+        assert fields["assigned_hardware_ips"] == {"controller": "", "targets": []}
+        assert fields["ssh_hardware_ips"] == {"controller": "", "targets": []}
+        assert "untrusted.example.com" not in json.dumps(fields)
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+        assert "preparing_platform" not in str(transitions[0])
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "custom_fields",
         [

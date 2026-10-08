@@ -55,10 +55,11 @@ _registry = None
 # Set by check_available_resources, read by reserve_resources.
 _fleet_next_device: str | None = None
 
-# Guardrail: set to True after reserve_resources succeeds.
-# Prevents the LLM from looping through discovery calls
-# instead of calling submit_resource_result (#1128).
+# Guardrail: set after a successful or uncertain reservation outcome.
+# Prevents discovery after allocation and duplicate attempts when the provider
+# may have allocated resources before returning an error.
 _resources_allocated: bool = False
+_reservation_uncertain: bool = False
 
 # Track consecutive reservation failures so we can produce a
 # structured response instead of burning iterations (#1128).
@@ -252,6 +253,17 @@ async def parse_host_config(text: str) -> str:
 @mcp.tool()
 async def list_resource_providers() -> str:
     """List resource providers that are configured and available. Returns provider names and types (bare_metal, cloud). Call this first if no resource_provider directive is set."""
+    if _reservation_uncertain:
+        return json.dumps(
+            {
+                "error": (
+                    "Reservation outcome is unknown. Provider reconciliation "
+                    "is required before discovery can resume."
+                ),
+                "allocation_unknown": True,
+                "retry_blocked": True,
+            }
+        )
     if _resources_allocated:
         return json.dumps(
             {
@@ -277,6 +289,17 @@ async def check_available_resources(
     required_hosts: list[dict] | None = None,
 ) -> str:
     """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
+    if _reservation_uncertain:
+        return json.dumps(
+            {
+                "error": (
+                    "Reservation outcome is unknown. Provider reconciliation "
+                    "is required before discovery can resume."
+                ),
+                "allocation_unknown": True,
+                "retry_blocked": True,
+            }
+        )
     if _resources_allocated:
         return json.dumps(
             {
@@ -445,6 +468,24 @@ async def reserve_resources(
     duration_hours: int = 36,
 ) -> str:
     """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
+    global _resources_allocated, _reservation_failures, _reservation_uncertain
+    if _reservation_uncertain:
+        return json.dumps(
+            {
+                "status": "unknown",
+                "provider": provider,
+                "allocation_unknown": True,
+                "retry_blocked": True,
+                "error": (
+                    "A previous provider reservation has an unknown outcome. "
+                    "Manual reconciliation is required before retrying."
+                ),
+                "message": (
+                    "Do not retry or run discovery tools. Inspect provider state "
+                    "and resume only with a verified reservation."
+                ),
+            }
+        )
     await _ensure_init()
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
@@ -480,21 +521,56 @@ async def reserve_resources(
         logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
-    result = await prov.reserve(
-        selection, description, duration_hours, ticket_id=ticket_id
-    )
+    try:
+        result = await prov.reserve(
+            selection, description, duration_hours, ticket_id=ticket_id
+        )
+    except Exception as exc:
+        # A provider can allocate resources before a later setup step raises.
+        # Mark the outcome unknown to prevent duplicate allocations and
+        # preserve any prior reservation metadata for eventual cleanup.
+        logger.exception(
+            "[resource] Provider %s raised during reservation; outcome unknown",
+            provider,
+        )
+        result = {
+            "status": "unknown",
+            "provider": provider,
+            "allocation_unknown": True,
+            "retry_blocked": True,
+            "error": f"Provider reserve raised {type(exc).__name__}.",
+            "message": (
+                "The provider may have allocated resources before the error. "
+                "Do not retry or run discovery tools; manual provider review "
+                "is required."
+            ),
+            "provider_metadata": dict(_last_reservation.get("provider_metadata") or {}),
+        }
 
     # Mark resources as allocated so discovery tools are blocked (#1128).
     # Providers use both error fields and status-only failure results.
     # Multi-call reservations (controller + endpoints) still work because
     # reserve_resources itself is not blocked — only discovery tools are.
-    global _resources_allocated, _reservation_failures
+    unknown_outcome = result.get("allocation_unknown") is True or str(
+        result.get("status", "")
+    ).strip().lower() in {"unknown", "uncertain", "indeterminate"}
+    if unknown_outcome:
+        _resources_allocated = True
+        _reservation_uncertain = True
     if not reservation_failed(result):
         _resources_allocated = True
         _reservation_failures = 0
     else:
         _reservation_failures += 1
-        if _reservation_failures >= _MAX_RESERVATION_FAILURES:
+        if unknown_outcome:
+            result["allocation_unknown"] = True
+            result["retry_blocked"] = True
+            result["message"] = (
+                f"{result.get('message', '').strip()} "
+                "The allocation outcome is unknown; do not retry or discover. "
+                "Manual provider reconciliation is required."
+            ).strip()
+        elif _reservation_failures >= _MAX_RESERVATION_FAILURES:
             result["repeated_failure"] = True
             result["message"] = (
                 f"Reservation failed {_reservation_failures} consecutive "
@@ -513,9 +589,11 @@ async def reserve_resources(
     # Accumulate provider_metadata across multiple reserve calls
     # (e.g., separate calls for controller and endpoints).
     prev_meta = _last_reservation.get("provider_metadata", {})
+    if unknown_outcome and not result.get("provider_metadata") and prev_meta:
+        result["provider_metadata"] = dict(prev_meta)
     _last_reservation.clear()
     _last_reservation.update(result)
-    if prev_meta:
+    if prev_meta and not unknown_outcome:
         new_meta = result.get("provider_metadata", {})
         for key in ("public_ips", "private_ips"):
             if key in prev_meta:

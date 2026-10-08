@@ -1111,6 +1111,38 @@ class ResourceAgent(AgentBase):
                     reservation_metadata = fetched_metadata
             except Exception:
                 logger.debug("get_accumulated_metadata unavailable, skipping")
+        if reservation_metadata.get("allocation_unknown") is True:
+            prior_metadata = {
+                key: value
+                for key, value in reservation_metadata.items()
+                if key not in {"allocation_unknown", "retry_blocked"}
+            }
+            if not prior_metadata:
+                ticket_metadata = ticket_cf.get("resource_provider_metadata") or {}
+                if isinstance(ticket_metadata, dict):
+                    prior_metadata = dict(ticket_metadata)
+            review_fields: dict[str, Any] = {"resource_provider": rp}
+            known_reservation_id = existing_reservation_id or (
+                _reservation_id_from_metadata(rp, prior_metadata)
+            )
+            if known_reservation_id:
+                review_fields["resource_reservation_id"] = known_reservation_id
+            if prior_metadata:
+                review_fields["resource_provider_metadata"] = prior_metadata
+            await self._update_fields(ticket_id, review_fields)
+            message = (
+                "**Resource reservation outcome unknown:** The provider may have "
+                "allocated resources before an error. Automatic reservation is "
+                "paused to avoid duplicates. Inspect provider state and provide "
+                "a verified reservation ID before resuming."
+            )
+            await self._add_comment(ticket_id, message)
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment="Resource reservation outcome is unknown; manual review required",
+            )
+            return
         # The reservation server is the source of truth for managed-provider
         # metadata. Do not let LLM-supplied IDs or selectors suppress a needed
         # reservation or redirect later provisioning and teardown actions.
@@ -1188,6 +1220,51 @@ class ResourceAgent(AgentBase):
                             or reserve_result.get("status")
                             or "provider reported failure"
                         )
+                        if reserve_result.get("allocation_unknown") is True:
+                            unknown_metadata = dict(
+                                reserve_result.get("provider_metadata") or {}
+                            )
+                            for key in (
+                                "lease_id",
+                                "instance_ids",
+                                "assignment_id",
+                                "reservation_id",
+                            ):
+                                if key in reserve_result:
+                                    unknown_metadata.setdefault(
+                                        key, reserve_result[key]
+                                    )
+                            unknown_id = (
+                                reserve_result.get("reservation_id")
+                                or reserve_result.get("lease_id")
+                                or _reservation_id_from_metadata(rp, unknown_metadata)
+                            )
+                            review_fields: dict[str, Any] = {}
+                            if unknown_id:
+                                review_fields["resource_reservation_id"] = str(
+                                    unknown_id
+                                )
+                            if unknown_metadata:
+                                review_fields["resource_provider_metadata"] = (
+                                    unknown_metadata
+                                )
+                            if review_fields:
+                                review_fields["resource_provider"] = rp
+                                await self._update_fields(ticket_id, review_fields)
+                            await self._add_comment(
+                                ticket_id,
+                                "**Resource reservation outcome unknown:** "
+                                f"{failure} The provider may have allocated "
+                                "resources before the error. Automatic retries "
+                                "are blocked; inspect provider state before "
+                                "resuming.",
+                            )
+                            await self._transition_ticket(
+                                ticket_id,
+                                "awaiting_customer_guidance",
+                                comment="Provider allocation outcome is unknown",
+                            )
+                            return
                         await self._add_comment(
                             ticket_id,
                             f"**Auto-reservation failed:** {failure}",
@@ -1274,13 +1351,36 @@ class ResourceAgent(AgentBase):
                                 )
                             )
                         except ValueError as exc:
-                            await self._add_comment(
-                                ticket_id,
+                            review_fields = {
+                                "resource_provider": rp,
+                                "resource_reservation_id": fields.get(
+                                    "resource_reservation_id"
+                                ),
+                                "resource_provider_metadata": reservation_metadata,
+                                "assigned_hardware_ips": {
+                                    "controller": "",
+                                    "targets": [],
+                                },
+                                "ssh_hardware_ips": {
+                                    "controller": "",
+                                    "targets": [],
+                                },
+                            }
+                            await self._update_fields(ticket_id, review_fields)
+                            message = (
                                 "**Auto-reservation needs review:** Resources were "
                                 f"reserved, but host assignment failed: {exc}. "
-                                "The reservation ID and metadata were retained for "
-                                "teardown.",
+                                "The verified reservation ID and metadata were "
+                                "saved; host mappings were cleared. Confirm the "
+                                "provider assignment before resuming."
                             )
+                            await self._add_comment(ticket_id, message)
+                            await self._transition_ticket(
+                                ticket_id,
+                                "awaiting_customer_guidance",
+                                comment="Auto-reserved hosts need manual assignment review",
+                            )
+                            return
                     if rp in {"aws", "quads", "jumpstarter"}:
                         fields["fresh_host"] = True
                     logger.info(
