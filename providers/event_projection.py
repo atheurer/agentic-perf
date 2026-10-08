@@ -113,15 +113,17 @@ def event_order_key(event: dict[str, Any]) -> tuple[int, datetime, str, int, int
     raw_timestamp = event.get("timestamp", "")
     timestamp_text = raw_timestamp if isinstance(raw_timestamp, str) else ""
     try:
-        parsed = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+        if timestamp_text.endswith("Z"):
+            timestamp_text = timestamp_text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(timestamp_text)
     except ValueError:
         parsed = None
 
     if parsed is None:
-        timestamp_key = (1, datetime.min.replace(tzinfo=timezone.utc), timestamp_text)
+        timestamp_key = (1, datetime(1, 1, 1, tzinfo=timezone.utc), timestamp_text)
     else:
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = datetime.fromisoformat(parsed.isoformat() + "+00:00")
         timestamp_key = (0, parsed.astimezone(timezone.utc), "")
 
     try:
