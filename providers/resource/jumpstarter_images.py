@@ -342,7 +342,7 @@ async def resolve_image_urls(
                 except Exception:
                     pass
 
-        if r.status_code == 404 and release != "nightly":
+        if r.status_code == 404 and release != "nightly" and not date_qualified_monthly:
             fallback_release = f"latest-{image_version}"
             fallback_url = (
                 f"{base_url}/{image_version}/{fallback_release}"

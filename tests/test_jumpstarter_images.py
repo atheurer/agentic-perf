@@ -197,6 +197,7 @@ def _install_monthly_fake_client(
     *,
     listing: str,
     dated_manifest_url: str,
+    dated_manifest_status: int = 200,
 ) -> list[str]:
     manifest = {
         "board": [{"image_name": "ps", "image_type": "regular", "path": "image.img"}]
@@ -219,7 +220,11 @@ def _install_monthly_fake_client(
             if url.endswith("/AutoSD-10/monthly/"):
                 return httpx.Response(200, text=listing, request=request)
             if url == dated_manifest_url:
-                return httpx.Response(200, json=manifest, request=request)
+                return httpx.Response(
+                    dated_manifest_status,
+                    json=manifest,
+                    request=request,
+                )
             if url.endswith("/latest-AutoSD-10/info/test_images_info.json"):
                 return httpx.Response(200, json=manifest, request=request)
             return httpx.Response(404, request=request)
@@ -283,6 +288,40 @@ async def test_monthly_year_month_without_match_does_not_fall_back_to_latest(
 
     assert "error" in result
     assert calls == [f"{base_url}/AutoSD-10/monthly/"]
+    assert latest_manifest_url not in calls
+
+
+@pytest.mark.asyncio
+async def test_monthly_match_with_missing_manifest_does_not_fall_back_to_latest(
+    monkeypatch,
+):
+    base_url = "https://autosd.sig.centos.org"
+    dated_manifest_url = (
+        f"{base_url}/AutoSD-10/monthly/autosd10-202608010205/info/test_images_info.json"
+    )
+    latest_manifest_url = (
+        f"{base_url}/AutoSD-10/latest-AutoSD-10/info/test_images_info.json"
+    )
+    calls = _install_monthly_fake_client(
+        monkeypatch,
+        listing='<a href="autosd10-202608010205/">August</a>',
+        dated_manifest_url=dated_manifest_url,
+        dated_manifest_status=404,
+    )
+
+    result = await resolve_image_urls(
+        base_url=base_url,
+        image_version="AutoSD-10",
+        release="monthly/autosd10-202608",
+        board_target="board",
+    )
+
+    assert result["error"].startswith("Failed to fetch manifest: 404")
+    assert result["manifest_url"] == dated_manifest_url
+    assert calls == [
+        f"{base_url}/AutoSD-10/monthly/",
+        dated_manifest_url,
+    ]
     assert latest_manifest_url not in calls
 
 
