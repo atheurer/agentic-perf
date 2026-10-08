@@ -204,6 +204,25 @@ class EvaluateAgent(AgentBase):
         Returns a human-readable outcome string if a gate fired,
         or empty string if no deterministic gate matched.
         """
+        # Fleet exhaustion takes precedence over generic convergence
+        # and stale budget signals. Once every eligible board has
+        # been tested, the fleet-level comparison is ready for review.
+        from providers.fleet import (
+            get_fleet_progress,
+            is_fleet_investigation,
+        )
+
+        if is_fleet_investigation(custom_fields):
+            progress = get_fleet_progress(custom_fields)
+            if progress["converged"]:
+                return (
+                    f"FLEET_COMPLETE — all available boards tested "
+                    f"({progress['tested']} tested: "
+                    f"{progress['completed']} completed, "
+                    f"{progress['partial']} partial). "
+                    f"Proceed to review for fleet-level analysis."
+                )
+
         try:
             from providers.convergence import (
                 ConvergenceOutcome,
@@ -342,16 +361,22 @@ class EvaluateAgent(AgentBase):
         root_cause = result.get("root_cause_summary", "")
         notes = result.get("notes", "")
 
-        # Enforce deterministic convergence — code overrides
-        # the LLM if a hard gate fired. The LLM's analysis
-        # is still captured in the ledger but the transition
-        # decision is code-enforced.
         det = getattr(self, "_deterministic_outcome", "")
-        # Enforce deterministic convergence — code overrides
-        # the LLM if a hard gate fired. The LLM's analysis
-        # is still captured in the ledger but the transition
-        # decision is code-enforced.
-        if det and decision in ("loop_plan", "loop_provision"):
+        # Fleet completion is authoritative even when the LLM
+        # independently chose convergence with a different gate.
+        # Preserve the prior budget behavior for loop decisions,
+        # without turning a stalled budget result into success.
+        apply_deterministic_outcome = bool(det) and (
+            "FLEET_COMPLETE" in det
+            or (
+                decision != "converged"
+                and (
+                    "BUDGET_EXHAUSTED" not in det
+                    or decision in ("loop_plan", "loop_provision")
+                )
+            )
+        )
+        if apply_deterministic_outcome:
             logger.info(
                 f"[{self.agent_name}] Overriding LLM decision "
                 f"'{decision}' with deterministic outcome: {det}"
@@ -364,6 +389,10 @@ class EvaluateAgent(AgentBase):
                     f"LLM wanted to {result.get('decision')}: "
                     f"{notes}"
                 )
+            elif "FLEET_COMPLETE" in det:
+                decision = "converged"
+                gate = "fleet_complete"
+                notes = f"Deterministic override: {det}. {notes}"
             else:
                 decision = "converged"
                 gate = "deterministic_threshold"

@@ -95,10 +95,11 @@ async def test_tracked_communicate_timeout_escalates_and_is_timed_out() -> None:
             [
                 sys.executable,
                 "-c",
-                "import signal,time;signal.signal(signal.SIGTERM, lambda *_: None);time.sleep(5)",
+                "import signal,time;signal.signal(signal.SIGTERM, lambda *_: None);print('ready', flush=True);time.sleep(5)",
             ]
         )
-        await asyncio.sleep(0.05)  # let the child install its SIGTERM handler
+        ready = await asyncio.wait_for(process.stdout.readline(), timeout=10.0)
+        assert ready == b"ready\n"
         with pytest.raises(asyncio.TimeoutError):
             await process.communicate(timeout=0.01)
     finally:
