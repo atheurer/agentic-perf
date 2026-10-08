@@ -1121,9 +1121,15 @@ async def run_agent_task(
                             " skipping post-cancel transition"
                         )
                     else:
+                        guidance = _build_hardstop_guidance_summary(r.json(), status)
                         await client.patch(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                            json={"fields": {"interrupted": True}},
+                            json={
+                                "fields": {
+                                    "interrupted": True,
+                                    "guidance_summary": guidance,
+                                }
+                            },
                         )
                         await client.post(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
@@ -1252,6 +1258,56 @@ async def run_agent_task(
                 await agent.close()
             except Exception:
                 pass
+
+
+def _build_hardstop_guidance_summary(
+    ticket: dict[str, Any],
+    agent_status: str,
+) -> dict[str, Any]:
+    """Build a guidance_summary for a hard-stopped ticket.
+
+    Called from the ``CancelledError`` handler in ``run_agent_task``
+    so that users see context about what happened and what to do
+    when the ticket lands at ``awaiting_customer_guidance``.
+    """
+    # Determine the last agent from the status (maps to the agent
+    # that was running when the cancellation occurred).
+    agent = agent_status or "unknown"
+
+    # Look at comments for additional context about what happened
+    comments = ticket.get("comments", [])
+    last_agent_message = ""
+    for c in reversed(comments):
+        author = c.get("author", "")
+        if author not in ("system", "") and not author.startswith("user"):
+            last_agent_message = c.get("body", "")[:2000]
+            break
+
+    # Check custom_fields for benchmark results
+    custom_fields = ticket.get("custom_fields", {})
+    benchmark_results = custom_fields.get("benchmark_results")
+    partial_context = ""
+    if benchmark_results:
+        partial_context = " Partial benchmark results are available in the ticket."
+
+    details = f"The {agent} agent was interrupted before it could complete."
+    if last_agent_message:
+        # Truncate to keep the summary concise
+        snippet = last_agent_message[:500]
+        details += f" Last agent activity: {snippet}"
+    if partial_context:
+        details += partial_context
+
+    return {
+        "agent": agent,
+        "reason": "hard_stop",
+        "details": details,
+        "suggested_actions": [
+            "Retry — re-dispatch the ticket to resume from the current stage",
+            "Review partial results if any benchmark data was collected",
+            "Abort if the investigation is no longer needed",
+        ],
+    }
 
 
 async def _transition_to_guidance(
