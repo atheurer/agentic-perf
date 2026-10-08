@@ -474,6 +474,62 @@ def merge_image_build(
     return merged
 
 
+# Month names → two-digit month number for release date extraction.
+_MONTH_NAMES: dict[str, str] = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
+
+# Matches month names (full or common 3-letter abbreviation)
+# optionally followed by a 4-digit year, or a standalone
+# YYYYMM+ datestamp (6-12 digits starting with 20xx).
+# Used to detect when a ticket description references a
+# specific date but triage emitted a bare "monthly" release.
+_DATE_REFERENCE_RE = re.compile(
+    r"(?:"
+    + "|".join(rf"(?:{m[:3]}(?:{re.escape(m[3:])})?)" for m in _MONTH_NAMES)
+    + r")(?:\s+\d{4})?"
+    + r"|\b20\d{2}(?:0[1-9]|1[0-2])\d{0,8}\b",
+    re.IGNORECASE,
+)
+
+
+def _warn_bare_monthly_release(
+    description: str,
+    release: str,
+) -> str | None:
+    """Return a warning string if the description mentions a specific
+    month or date but the release directive is a bare ``"monthly"``
+    without a date qualifier.
+
+    Returns ``None`` when no warning is needed.
+    """
+    if release != "monthly":
+        return None
+    match = _DATE_REFERENCE_RE.search(description)
+    if not match:
+        return None
+    ref = match.group(0).strip()
+    return (
+        f"\u26a0\ufe0f **Release date mismatch:** The description "
+        f'mentions "{ref}" but the release directive is bare '
+        f'`"monthly"`, which resolves to the **latest** monthly '
+        f"build. If a specific month was intended, the release "
+        f"should include a date qualifier "
+        f"(e.g., `monthly/autosd10-YYYYMM`)."
+    )
+
+
 class TriageAgent(AgentBase):
     def __init__(
         self,
@@ -946,6 +1002,15 @@ class TriageAgent(AgentBase):
                 summary += f"- **Scoped Context:** {', '.join(agents_with_context)}\n"
         if result.get("notes"):
             summary += f"- **Notes:** {result['notes']}\n"
+
+        # Warn if the description mentions a specific month/date
+        # but triage produced a bare "monthly" release directive.
+        release_warning = _warn_bare_monthly_release(
+            ticket.get("description", ""),
+            directives.get("release", ""),
+        )
+        if release_warning:
+            summary += f"\n{release_warning}\n"
 
         await self._add_comment(ticket_id, summary)
 

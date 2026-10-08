@@ -105,6 +105,18 @@ Your job is to analyze a performance test request ticket and:
    to learn the
    correct `image_name` and `image_type` directive values.
 
+   **Release version extraction:** When setting the `release` directive, extract
+   any date or version qualifier the user mentions. A bare `release: "monthly"`
+   resolves to the LATEST monthly build, which is wrong when the user asked for
+   a specific month. Examples:
+   - "August monthly image" → release: "monthly/autosd10-202608"
+   - "monthly from July 2026" → release: "monthly/autosd10-202607"
+   - "the 202608010205 build" → release: "monthly/autosd10-202608010205"
+   - "latest monthly" (no specific date) → release: "monthly"
+   The image resolver supports partial datestamp matching, so
+   `monthly/autosd10-202608` will find the correct August build.
+   Read the image-selection skill doc for the full release path format reference.
+
    **Echoing directives:** When the user provides explicit directives in
    custom_fields, confirm them in your triage result notes (e.g., "Using
    user-specified board_selector: board-type=qc8775"). Do not
