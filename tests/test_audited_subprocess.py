@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 
 import pytest
@@ -156,6 +157,61 @@ async def test_repeated_wait_emits_one_terminal_and_binary_output_is_bounded() -
         "started",
         "completed",
     ]
+
+
+async def test_streamed_output_preserves_terminal_metadata_and_incomplete_failure() -> (
+    None
+):
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        runner = AuditedSubprocessRunner(emit, output_limit=3)
+        for complete in (True, False):
+            process = await runner.start(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys;sys.stdout.buffer.write(b'abcdef');sys.stderr.buffer.write(b'err!')",
+                ]
+            )
+            stdout, stderr = await process._process.communicate()
+            await process.finish_streamed_output(
+                stdout, stderr, drain_complete=complete
+            )
+            await process.finish_streamed_output(
+                stdout, stderr, drain_complete=complete
+            )
+            terminal = events[-1]
+            assert terminal.lifecycle.state.value == (
+                "completed" if complete else "failed"
+            )
+            assert terminal.attributes["stdout_size"] == 6
+            assert terminal.attributes["stderr_size"] == 4
+            assert (
+                terminal.attributes["stdout_digest"]
+                == hashlib.sha256(stdout).hexdigest()[:16]
+            )
+            assert (
+                terminal.attributes["stderr_digest"]
+                == hashlib.sha256(stderr).hexdigest()[:16]
+            )
+            assert terminal.attributes["stdout_truncated"] is True
+            assert terminal.attributes["stderr_truncated"] is True
+            assert terminal.attributes["output_incomplete"] is not complete
+        assert [event.lifecycle.state.value for event in events] == [
+            "requested",
+            "started",
+            "completed",
+            "requested",
+            "started",
+            "failed",
+        ]
+    finally:
+        reset_trace_context(token)
 
 
 async def test_mutating_spawn_requires_critical_recorder() -> None:

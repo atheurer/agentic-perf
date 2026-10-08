@@ -57,6 +57,7 @@ mcp = create_ticket_mcp("benchmark-agent")
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
+_BOOT_TIME_DRAIN_TIMEOUT = 10.0
 
 
 def _write_ticket_staging_file(
@@ -4668,9 +4669,12 @@ async def execute_boot_time_test(
         # which loses critical diagnostics (BOOT_CONFIG, power cycle
         # results, error messages) when wait_for_sut_up spam fills
         # the buffer. The log file preserves everything.
-        harness_log_fh = artifact_filesystem.open_stream(
-            "harness-output.log", mode=artifact_file_mode
-        )
+        try:
+            harness_log_fh = artifact_filesystem.open_stream(
+                "harness-output.log", mode=artifact_file_mode
+            )
+        except Exception as exc:
+            logger.warning("[boot-time] Cannot open harness output log: %s", exc)
 
         proc = await AuditedSubprocessRunner().start(
             cmd,
@@ -4681,42 +4685,52 @@ async def execute_boot_time_test(
         _STALL_CHECK_INTERVAL = 60
         _STALL_TIMEOUT = 300
 
-        # Drain stdout/stderr in background tasks that tee to both
-        # an in-memory buffer (for the tool result) and the log file
-        # (for full diagnostic capture).
+        # Drain bounded chunks so an unterminated line cannot exceed the
+        # StreamReader line limit and strand the benchmark subprocess.
         _stdout_chunks: list[bytes] = []
         _stderr_chunks: list[bytes] = []
+        harness_log_failed = False
 
         async def _drain_stream(
             stream: _asyncio.StreamReader | None,
             chunks: list[bytes],
-            log_fh: Any,
             prefix: bytes = b"",
         ) -> None:
+            nonlocal harness_log_failed
             if stream is None:
                 return
             while True:
-                line = await stream.readline()
-                if not line:
+                chunk = await stream.read(65536)
+                if not chunk:
                     break
-                chunks.append(line)
-                try:
-                    log_fh.write(prefix + line)
-                    log_fh.flush()
-                except Exception:
-                    pass
+                chunks.append(chunk)
+                if harness_log_fh is not None and not harness_log_failed:
+                    try:
+                        harness_log_fh.write(prefix + chunk)
+                        harness_log_fh.flush()
+                    except Exception as exc:
+                        harness_log_failed = True
+                        logger.warning(
+                            "[boot-time] Cannot write harness output log: %s", exc
+                        )
 
-        _drain_stdout = _asyncio.create_task(
-            _drain_stream(proc.stdout, _stdout_chunks, harness_log_fh)
-        )
+        _drain_stdout = _asyncio.create_task(_drain_stream(proc.stdout, _stdout_chunks))
         _drain_stderr = _asyncio.create_task(
-            _drain_stream(proc.stderr, _stderr_chunks, harness_log_fh, b"STDERR: ")
+            _drain_stream(proc.stderr, _stderr_chunks, b"STDERR: ")
         )
+        drain_task = _asyncio.gather(_drain_stdout, _drain_stderr)
 
-        async def _wait_drains() -> tuple[bytes, bytes]:
-            await _asyncio.gather(_drain_stdout, _drain_stderr)
-            await proc.wait()
-            return b"".join(_stdout_chunks), b"".join(_stderr_chunks)
+        async def _wait_drains() -> None:
+            # asyncio Process.wait() can itself wait for pipe EOF. The parent
+            # returncode is set independently, even when a descendant holds
+            # an inherited write end open.
+            while proc.returncode is None:
+                if drain_task.done() and drain_task.exception() is not None:
+                    await drain_task
+                await _asyncio.sleep(0.05)
+            await _asyncio.wait_for(
+                _asyncio.shield(drain_task), timeout=_BOOT_TIME_DRAIN_TIMEOUT
+            )
 
         communicate_task = _asyncio.create_task(_wait_drains())
         loop = _asyncio.get_running_loop()
@@ -4728,64 +4742,108 @@ async def execute_boot_time_test(
             last_file_count = 0
         last_progress_time = start_time
         stall_killed = False
+        timed_out = False
+        drain_complete = False
+        cancelled = False
+        drain_error = ""
 
-        while not communicate_task.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.warning(
-                    "[boot-time] Subprocess timed out after %ds, killing",
-                    benchmark_timeout,
-                )
-                proc.kill()
-                break
-
-            try:
-                await _asyncio.wait_for(
-                    _asyncio.shield(communicate_task),
-                    timeout=min(_STALL_CHECK_INTERVAL, remaining),
-                )
-                break
-            except _asyncio.TimeoutError:
-                now = loop.time()
-                try:
-                    file_count = sum(
-                        1 for path in output_dir.rglob("*") if path.is_file()
-                    )
-                except OSError:
-                    file_count = last_file_count
-
-                if file_count > last_file_count:
-                    last_file_count = file_count
-                    last_progress_time = now
-                elif now - last_progress_time >= _STALL_TIMEOUT:
+        try:
+            while not communicate_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
                     logger.warning(
-                        "[boot-time] No new artifacts for %ds (stall detected at "
-                        "%d files), killing subprocess",
-                        int(now - last_progress_time),
-                        file_count,
+                        "[boot-time] Subprocess timed out after %ds, killing",
+                        benchmark_timeout,
                     )
-                    proc.kill()
-                    stall_killed = True
+                    timed_out = True
+                    if proc.returncode is None:
+                        proc.kill()
                     break
 
-        # The communicate task continues draining output after kill. Bound the
-        # cleanup in case a descendant inherited one of the pipe file descriptors.
-        try:
-            stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-                _asyncio.shield(communicate_task),
-                timeout=10,
-            )
-        except _asyncio.TimeoutError:
-            communicate_task.cancel()
-            try:
-                await communicate_task
-            except _asyncio.CancelledError:
-                pass
-            stdout_bytes, stderr_bytes = b"", b""
+                try:
+                    await _asyncio.wait_for(
+                        _asyncio.shield(communicate_task),
+                        timeout=min(_STALL_CHECK_INTERVAL, remaining),
+                    )
+                    break
+                except _asyncio.TimeoutError:
+                    now = loop.time()
+                    try:
+                        file_count = sum(
+                            1 for path in output_dir.rglob("*") if path.is_file()
+                        )
+                    except OSError:
+                        file_count = last_file_count
 
-        exit_code = proc.returncode or 0
+                    if file_count > last_file_count:
+                        last_file_count = file_count
+                        last_progress_time = now
+                    elif now - last_progress_time >= _STALL_TIMEOUT:
+                        logger.warning(
+                            "[boot-time] No new artifacts for %ds (stall detected at "
+                            "%d files), killing subprocess",
+                            int(now - last_progress_time),
+                            file_count,
+                        )
+                        if proc.returncode is None:
+                            proc.kill()
+                        stall_killed = True
+                        break
+                except Exception as exc:
+                    drain_error = f"subprocess output read failed: {exc}"
+                    break
+
+            if not drain_error:
+                try:
+                    await _asyncio.wait_for(
+                        _asyncio.shield(communicate_task),
+                        timeout=_BOOT_TIME_DRAIN_TIMEOUT,
+                    )
+                    drain_complete = True
+                except _asyncio.TimeoutError:
+                    drain_error = "subprocess output pipes remained open after exit"
+                except Exception as exc:
+                    drain_error = f"subprocess output read failed: {exc}"
+        except _asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            if not communicate_task.done():
+                communicate_task.cancel()
+            if not drain_task.done():
+                drain_task.cancel()
+            await _asyncio.gather(communicate_task, drain_task, return_exceptions=True)
+            for _ in range(200):
+                if proc.returncode is not None:
+                    break
+                await _asyncio.sleep(0.05)
+            if proc.returncode is None:
+                logger.warning("[boot-time] Benchmark did not exit after kill")
+            stdout_bytes = b"".join(_stdout_chunks)
+            stderr_bytes = b"".join(_stderr_chunks)
+            if drain_error:
+                logger.warning("[boot-time] %s", drain_error)
+            await proc.finish_streamed_output(
+                stdout_bytes,
+                stderr_bytes,
+                drain_complete=drain_complete,
+                timed_out=timed_out,
+                cancelled=cancelled,
+                failed=stall_killed,
+            )
+
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if not drain_complete or timed_out or stall_killed:
+            exit_code = exit_code or 1
         stdout_str = stdout_bytes.decode(errors="replace")
         stderr_str = stderr_bytes.decode(errors="replace")
+        if drain_error:
+            stderr_str += f"\n[agentic-perf] {drain_error}"
         if stall_killed:
             stderr_str += (
                 "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
@@ -4889,7 +4947,12 @@ async def execute_boot_time_test(
             if serial_log_fh is not None:
                 serial_log_fh.close()
             if harness_log_fh is not None:
-                harness_log_fh.close()
+                try:
+                    harness_log_fh.close()
+                except Exception as exc:
+                    logger.warning(
+                        "[boot-time] Cannot close harness output log: %s", exc
+                    )
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:

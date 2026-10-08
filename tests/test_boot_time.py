@@ -16,11 +16,9 @@ from providers.tracing import bind_trace_context, new_trace_context, reset_trace
 
 def _make_mock_stream(data: bytes = b"") -> MagicMock:
     """Create a mock async stream reader that yields data then EOF."""
-    lines = data.split(b"\n") if data else []
-    # readline returns each line (with newline), then b"" for EOF
-    returns = [line + b"\n" for line in lines if line] + [b""]
+    returns = [data[i : i + 65536] for i in range(0, len(data), 65536)] + [b""]
     stream = MagicMock()
-    stream.readline = AsyncMock(side_effect=returns)
+    stream.read = AsyncMock(side_effect=returns)
     return stream
 
 
@@ -31,9 +29,8 @@ def _make_mock_process(
 ) -> MagicMock:
     """Create a mock subprocess with async stream readers.
 
-    Provides both stream-based (stdout/stderr readline) and
-    communicate() interfaces since different code paths in
-    the benchmark server use each pattern.
+    Provides both stream-based and communicate() interfaces since different
+    code paths in the benchmark server use each pattern.
     """
     proc = MagicMock()
     proc.returncode = returncode
@@ -41,8 +38,124 @@ def _make_mock_process(
     proc.stderr = _make_mock_stream(stderr_data)
     proc.wait = AsyncMock(return_value=returncode)
     proc.communicate = AsyncMock(return_value=(stdout_data, stderr_data))
+    proc.finish_streamed_output = AsyncMock()
     proc.pid = 12345
     return proc
+
+
+async def _run_mock_benchmark(tmp_path: Path, process: MagicMock) -> dict:
+    from agents.benchmark import server
+
+    (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+    cache = MagicMock()
+    cache.get_path.return_value = tmp_path
+    runner = MagicMock()
+    runner.start = AsyncMock(return_value=process)
+    with (
+        patch.object(server, "_initialized", True),
+        patch.object(server, "_repo_cache", cache),
+        patch.object(server, "_ticket", None),
+        patch.object(server, "_BOOT_TIME_DRAIN_TIMEOUT", 0.05),
+        patch("paths.create_artifact_dir", return_value=tmp_path),
+        patch("socket.create_connection", return_value=MagicMock()),
+        patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+    ):
+        return json.loads(
+            await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+        )
+
+
+class TestBootTimeOutputDrain:
+    async def test_long_unterminated_output_is_logged_and_audited(self, tmp_path):
+        payload = b"x" * 70000
+        stream = asyncio.StreamReader()
+        stream.feed_data(payload)
+        stream.feed_eof()
+        process = _make_mock_process()
+        process.stdout = stream
+
+        result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "completed"
+        assert (tmp_path / "harness-output.log").read_bytes() == payload
+        process.finish_streamed_output.assert_awaited_once_with(
+            payload,
+            b"",
+            drain_complete=True,
+            timed_out=False,
+            cancelled=False,
+            failed=False,
+        )
+
+    async def test_inherited_pipe_fails_without_discarding_partial_output(
+        self, tmp_path
+    ):
+        stream = asyncio.StreamReader()
+        stream.feed_data(b"partial output")
+        process = _make_mock_process(returncode=0)
+        process.stdout = stream
+
+        result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "failed"
+        assert result["exit_code"] != 0
+        assert "remained open" in result["error"]
+        assert (tmp_path / "harness-output.log").read_bytes() == b"partial output"
+        process.finish_streamed_output.assert_awaited_once_with(
+            b"partial output",
+            b"",
+            drain_complete=False,
+            timed_out=False,
+            cancelled=False,
+            failed=False,
+        )
+
+    async def test_read_failure_fails_and_records_partial_output(self, tmp_path):
+        process = _make_mock_process(returncode=0)
+        process.stdout.read = AsyncMock(side_effect=[b"partial", OSError("bad pipe")])
+
+        result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "failed"
+        assert "read failed: bad pipe" in result["error"]
+        process.finish_streamed_output.assert_awaited_once_with(
+            b"partial",
+            b"",
+            drain_complete=False,
+            timed_out=False,
+            cancelled=False,
+            failed=False,
+        )
+
+    async def test_log_open_failure_keeps_benchmark_result(self, tmp_path, caplog):
+        from agents.benchmark import server
+
+        process = _make_mock_process(stdout_data=b"success")
+        with patch.object(
+            server.AuditedFilesystem,
+            "open_stream",
+            side_effect=OSError("disk unavailable"),
+        ):
+            result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "completed"
+        assert "Cannot open harness output log: disk unavailable" in caplog.text
+
+    async def test_log_write_and_close_failures_keep_benchmark_result(
+        self, tmp_path, caplog
+    ):
+        from agents.benchmark import server
+
+        log = MagicMock()
+        log.write.side_effect = OSError("write failed")
+        log.close.side_effect = OSError("close failed")
+        process = _make_mock_process(stdout_data=b"success")
+        with patch.object(server.AuditedFilesystem, "open_stream", return_value=log):
+            result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "completed"
+        assert "Cannot write harness output log: write failed" in caplog.text
+        assert "Cannot close harness output log: close failed" in caplog.text
 
 
 @pytest.fixture(autouse=True)
@@ -552,7 +665,7 @@ class TestBootTimeSerialDiagnostics:
         serial_proc.wait = AsyncMock(return_value=0)
         benchmark_proc = _make_mock_process()
         if failure == "cancel":
-            benchmark_proc.wait = AsyncMock(side_effect=asyncio.CancelledError())
+            benchmark_proc.stdout.read = AsyncMock(side_effect=asyncio.CancelledError())
 
         async def start(argv, **_kwargs):
             if argv[0] == "jmp":
