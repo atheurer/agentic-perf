@@ -396,6 +396,13 @@ async def _search_project_documents(
         raise SkillGatewayError("search_timeout", "Search exceeded time limit") from exc
     output_truncated = len(stdout) > 2 * 1024 * 1024
     stdout = stdout[: 2 * 1024 * 1024]
+    if output_truncated:
+        # The bounded output can end in the middle of a grep record. Keep only
+        # complete records so a partial line cannot be mistaken for a match.
+        last_complete_record = stdout.rfind(b"\n")
+        stdout = (
+            stdout[: last_complete_record + 1] if last_complete_record >= 0 else b""
+        )
     if process.returncode is None:
         raise SkillGatewayError("search_timeout", "Search exceeded time limit")
     if process.returncode not in {0, 1}:

@@ -335,6 +335,42 @@ def test_project_search_pumps_large_stdin_and_stdout_concurrently() -> None:
     assert result["matches"]
 
 
+def test_project_search_discards_incomplete_truncated_grep_record() -> None:
+    from agents.skill_gateway import _search_project_documents
+
+    class _Source:
+        @staticmethod
+        def read(_path: str) -> str:
+            # The first grep record ends one byte before the 2 MiB output cap.
+            # The next record is therefore clipped to its line-number digit,
+            # which has no ':' and used to crash the record parser.
+            output_cap = 2 * 1024 * 1024
+            first_line = "MATCH " + ("x" * (output_cap - 10))
+            return first_line + "\nMATCH second\n"
+
+    documents = [
+        {
+            "ref": "skill://project/skills/crucible/results.md",
+            "path": "skills/crucible/results.md",
+            "source_path": "skills/crucible/results.md",
+        }
+    ]
+    result = asyncio.run(
+        _search_project_documents(
+            _Source(),
+            documents,
+            "MATCH",
+            offset=0,
+            max_bytes=16384,
+        )
+    )
+
+    assert result["matches_count"] == 1
+    assert result["matches"][0]["line"] == 1
+    assert result["matches"][0]["snippet"].startswith("MATCH ")
+    assert result["search_limited"] is True
+
+
 def test_gateway_filters_project_docs_by_phase_and_agent(tmp_path: Path) -> None:
     org_root = tmp_path / "org"
     org_root.mkdir()

@@ -1145,11 +1145,19 @@ class AgentBase(ABC):
                 # context is consumed regardless of tool type.
                 self._hitl_just_resumed = False
 
+                clarification_call = next(
+                    (
+                        tc
+                        for tc in response.tool_calls
+                        if tc.name == "request_clarification"
+                    ),
+                    None,
+                )
                 submit_call = next(
                     (tc for tc in response.tool_calls if tc.name.startswith("submit_")),
                     None,
                 )
-                if submit_call:
+                if submit_call and clarification_call is None:
                     logger.info(
                         f"[{self.agent_name}] submit_* call detected: "
                         f"{submit_call.name} (iter {iteration})"
@@ -1261,32 +1269,32 @@ class AgentBase(ABC):
                 messages.append({"role": "assistant", "content": response.raw_content})
 
                 calls_to_run = response.tool_calls
-                if len(calls_to_run) > 1:
-                    non_clarify = [
-                        tc for tc in calls_to_run if tc.name != "request_clarification"
-                    ]
-                    if non_clarify:
-                        skipped = [tc for tc in calls_to_run if tc not in non_clarify]
-                        for tc in skipped:
-                            skipped_context = tool_contexts[tc.id]
-                            self._trace.record(
-                                skipped_context,
-                                ActionType.TOOL,
-                                LifecycleState.SHORT_CIRCUITED,
-                                phase=tc.name,
-                                duration_ms=0,
-                                outcome=OperationOutcome.SUCCESS,
-                                attributes={"reason": "other tools executed first"},
-                            )
-                            self._emit(
-                                ticket_id,
-                                "tool_skipped",
-                                {
-                                    "tool": tc.name,
-                                    "reason": "other tools executed first",
-                                },
-                            )
-                        calls_to_run = non_clarify
+                skipped_tool_message = "Skipped: other tools executed first"
+                if clarification_call is not None:
+                    calls_to_run = [clarification_call]
+                    skipped_tool_message = (
+                        "Skipped because request_clarification takes precedence. "
+                        "Wait for the user's reply, then retry this call if needed."
+                    )
+                    for tc in response.tool_calls:
+                        if tc.id == clarification_call.id:
+                            continue
+                        skipped_context = tool_contexts[tc.id]
+                        reason = "request_clarification takes precedence"
+                        self._trace.record(
+                            skipped_context,
+                            ActionType.TOOL,
+                            LifecycleState.SHORT_CIRCUITED,
+                            phase=tc.name,
+                            duration_ms=0,
+                            outcome=OperationOutcome.SUCCESS,
+                            attributes={"reason": reason},
+                        )
+                        self._emit(
+                            ticket_id,
+                            "tool_skipped",
+                            {"tool": tc.name, "reason": reason},
+                        )
 
                 try:
                     pre_tool_ticket = await self._get_ticket(
@@ -1391,7 +1399,7 @@ class AgentBase(ABC):
                             {
                                 "type": "tool_result",
                                 "tool_use_id": tc.id,
-                                "content": "Skipped: other tools executed first",
+                                "content": skipped_tool_message,
                                 "is_error": False,
                             }
                         )

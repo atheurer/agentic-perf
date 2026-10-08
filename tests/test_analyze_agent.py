@@ -154,6 +154,193 @@ async def test_analyze_mcp_tool_merge_reuses_stable_native_tools():
     await agent.close()
 
 
+@pytest.mark.asyncio
+async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from agents.base import AgentBase
+    from providers.llm.base import LLMResponse, ToolCall, ToolDefinition
+    from providers.tracing import ActionType, LifecycleState, TraceRecorder
+
+    ticket_id = "PERF-ANALYZE-MIXED-HITL"
+    agent = AnalyzeAgent(llm_provider=None, state_store_url="http://unused")
+    # Exercise AgentBase's dispatch loop directly while preserving the ticket
+    # context normally set by AnalyzeAgent.run before it connects to MCP.
+    agent._ticket_id = ticket_id
+    agent.max_iterations = 3
+    agent._tool_min_interval = 0
+    agent._client = SimpleNamespace(headers={}, aclose=AsyncMock())
+    agent.tools.extend(
+        [
+            ToolDefinition(
+                name="other_probe",
+                description="Probe that must wait for user guidance.",
+                input_schema={"type": "object"},
+            ),
+            ToolDefinition(
+                name="submit_analysis_result",
+                description="Submit analysis.",
+                input_schema={"type": "object"},
+            ),
+        ]
+    )
+    ticket = {
+        "id": ticket_id,
+        "summary": "Context conflict test",
+        "description": "Investigate the result.",
+        "status": "analyzing",
+        "custom_fields": {"global_max_iterations_override": 3},
+    }
+    hitl_started = asyncio.Event()
+    user_replied = asyncio.Event()
+    completion_calls = []
+    trace_events = []
+    transitions = []
+    other_calls = []
+    llm_messages = []
+
+    first_turn = LLMResponse(
+        text=None,
+        tool_calls=[
+            ToolCall(
+                id="submit-same-turn",
+                name="submit_analysis_result",
+                input={"conclusive": False, "finding": "premature"},
+            ),
+            ToolCall(
+                id="other-same-turn",
+                name="other_probe",
+                input={},
+            ),
+            ToolCall(
+                id="clarify-same-turn",
+                name="request_clarification",
+                input={"question": "Which conflicting source should guide this?"},
+            ),
+        ],
+        stop_reason="tool_use",
+        raw_content=[],
+    )
+    after_guidance = LLMResponse(
+        text=None,
+        tool_calls=[
+            ToolCall(
+                id="submit-after-reply",
+                name="submit_analysis_result",
+                input={"conclusive": False, "finding": "guided"},
+            )
+        ],
+        stop_reason="tool_use",
+        raw_content=[],
+    )
+    responses = [first_turn, after_guidance]
+
+    class _LLM:
+        async def complete(self, **kwargs):
+            llm_messages.append(kwargs["messages"])
+            return responses.pop(0)
+
+    agent.llm = _LLM()
+    agent._trace = TraceRecorder(client=SimpleNamespace(record=trace_events.append))
+    agent._get_ticket = AsyncMock(return_value=ticket)
+    agent._check_interject = AsyncMock(return_value=None)
+    agent._check_drift = lambda: None
+    agent._get_previous_iteration_counts = lambda _ticket_id: (0, 0)
+    agent._tool_handlers["other_probe"] = AsyncMock(side_effect=other_calls.append)
+
+    async def request_human_input(_ticket_id, _question):
+        hitl_started.set()
+        await user_replied.wait()
+        return "Use the installed controller evidence."
+
+    async def update_fields(_ticket_id, _fields):
+        assert user_replied.is_set()
+        completion_calls.append("analysis_result")
+
+    async def add_comment(_ticket_id, _comment):
+        assert user_replied.is_set()
+
+    async def plan_controls_next_transition(_ticket_id):
+        return False
+
+    async def transition(_ticket_id, status, **_kwargs):
+        assert user_replied.is_set()
+        transitions.append(status)
+
+    agent._request_human_input = request_human_input
+    agent._update_fields = update_fields
+    agent._add_comment = add_comment
+    agent._plan_controls_next_transition = plan_controls_next_transition
+    agent._transition_ticket = transition
+
+    class _Workspace:
+        def __init__(self, *, ticket_id, agent_name):
+            assert ticket_id == ticket_id_arg
+            assert agent_name == "analyze-agent"
+
+        def list_effective_files(self):
+            return []
+
+        def read_effective_context(self):
+            return ""
+
+    ticket_id_arg = ticket_id
+    monkeypatch.setattr("providers.workspace.manager.WorkspaceManager", _Workspace)
+
+    run_task = asyncio.create_task(AgentBase.run(agent, ticket_id))
+    await asyncio.wait_for(hitl_started.wait(), timeout=5)
+    assert completion_calls == []
+    assert transitions == []
+    assert other_calls == []
+
+    user_replied.set()
+    await asyncio.wait_for(run_task, timeout=5)
+    await agent.close()
+
+    assert completion_calls == ["analysis_result"]
+    assert transitions == ["awaiting_hardware"]
+    assert other_calls == []
+    result_messages = [
+        item
+        for message in llm_messages[1]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for item in message["content"]
+    ]
+    results_by_call_id = {item["tool_use_id"]: item for item in result_messages}
+    assert (
+        "request_clarification takes precedence"
+        in results_by_call_id["submit-same-turn"]["content"]
+    )
+    assert (
+        "request_clarification takes precedence"
+        in results_by_call_id["other-same-turn"]["content"]
+    )
+
+    tool_events = [
+        event for event in trace_events if event.action.type == ActionType.TOOL
+    ]
+    states_by_call_id = {}
+    for event in tool_events:
+        states_by_call_id.setdefault(event.tool_call_id, []).append(
+            event.lifecycle.state
+        )
+    assert states_by_call_id["clarify-same-turn"] == [
+        LifecycleState.PROPOSED,
+        LifecycleState.STARTED,
+        LifecycleState.COMPLETED,
+    ]
+    assert states_by_call_id["submit-same-turn"] == [
+        LifecycleState.PROPOSED,
+        LifecycleState.SHORT_CIRCUITED,
+    ]
+    assert states_by_call_id["other-same-turn"] == [
+        LifecycleState.PROPOSED,
+        LifecycleState.SHORT_CIRCUITED,
+    ]
+
+
 def test_triage_can_transition_to_analyzing():
     """Triage can route directly to analyzing."""
     allowed = VALID_TRANSITIONS[TicketStatus.TRIAGE_PENDING]
