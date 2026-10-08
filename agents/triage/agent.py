@@ -89,13 +89,14 @@ def _description_harness_intent(
         r"\b(?:do\s+not|don't|dont|never|should\s+not|shouldn't)\s+"
         r"(?:(?:use|using|with|via|choose|select|prefer)\s+)?"
         r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
-        r"\bavoid\s+(?:(?:use|using)\s+)?(?:the\s+)?(?:harness\s+)?$",
+        r"\bavoid\s+(?:(?:use|using)\s+)?"
+        r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
         r"\bnot\s+(?:the\s+)?(?:harness\s+)?$",
         r"\b(?:rather\s+than|instead\s+of)\s+(?:the\s+)?(?:harness\s+)?$",
     )
     positive_patterns = (
         r"\b(?:use|using|with|via|choose|select|prefer)\s+"
-        r"(?:(?:the|either)\s+)?(?:harness\s+)?$",
+        r"(?:(?:the|either|only)\s+)?(?:harness\s+)?$",
         r"\bharness\b\s*(?:(?:is|should\s+be|to)\s+|[:=]\s*)$",
         r"\bbut\s+(?:(?:use|using|choose|select|prefer)\s+)?$",
     )

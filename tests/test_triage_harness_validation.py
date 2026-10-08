@@ -166,6 +166,16 @@ class TestHarnessValidation:
         avoid = _description_harness_intent("Avoid using zathras", names)
         assert avoid.excluded == {"zathras"}
 
+        avoid_alternatives = _description_harness_intent(
+            "Avoid using either zathras or crucible", names
+        )
+        assert avoid_alternatives.required == frozenset()
+        assert avoid_alternatives.alternatives == ()
+        assert avoid_alternatives.excluded == names
+
+        only = _description_harness_intent("Use only zathras", names)
+        assert only.required == {"zathras"}
+
         contrast = _description_harness_intent("Use zathras, not crucible", names)
         assert contrast.required == {"zathras"}
         assert contrast.excluded == {"crucible"}
@@ -489,6 +499,50 @@ class TestSuiteAutoCorrection:
             f"explicitly excludes harness '{selected_harness}'"
             in agent._add_comment.await_args.args[1]
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected_harness", ["zathras", "crucible"])
+    async def test_avoided_either_or_pauses_for_each_prohibited_harness(
+        self, selected_harness
+    ):
+        suite = f"{selected_harness}-suite"
+        provider = _make_provider(
+            suites={suite: {"name": suite, "harness": selected_harness}}
+        )
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": True,
+                "directives": {"harness": selected_harness},
+            },
+            provider,
+            description="Avoid using either zathras or crucible",
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        assert (
+            f"explicitly excludes harness '{selected_harness}'"
+            in agent._add_comment.await_args.args[1]
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_harness_request_rejects_other_triage_selection(self):
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {"harness": "crucible"},
+            },
+            _make_provider(),
+            description="Use only zathras",
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        comment = agent._add_comment.await_args.args[1]
+        assert "specifies harness 'zathras'" in comment
+        assert "selected 'crucible'" in comment
 
     @pytest.mark.asyncio
     async def test_either_or_request_pauses_for_unlisted_harness(self):
