@@ -108,6 +108,43 @@ class AuditedProcess:
         )
         return result
 
+    async def finish_streamed_output(
+        self,
+        stdout: bytes,
+        stderr: bytes,
+        *,
+        drain_complete: bool,
+        timed_out: bool = False,
+        cancelled: bool = False,
+        failed: bool = False,
+    ) -> None:
+        """Record one terminal event after a caller has drained the process pipes.
+
+        Streaming callers can observe ``returncode`` before descendants release
+        inherited pipes. They must bound the drain and report incomplete output.
+        """
+        if (
+            drain_complete
+            and not (timed_out or cancelled or failed)
+            and self.returncode is None
+        ):
+            raise RuntimeError("cannot finish a running subprocess")
+        state = (
+            LifecycleState.CANCELLED
+            if cancelled
+            else LifecycleState.TIMED_OUT
+            if timed_out
+            else LifecycleState.COMPLETED
+            if self.returncode == 0 and drain_complete and not failed
+            else LifecycleState.FAILED
+        )
+        await self._finish(
+            state,
+            **self._runner._output_descriptors(stdout, stderr),
+            output_incomplete=not drain_complete,
+            **({"timed_out": True} if timed_out else {}),
+        )
+
     def terminate(self) -> None:
         self._signal = "terminate"
         self._process.terminate()
