@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run full validation: lint + tests.
-# Called by git hooks and CI. Also useful for manual pre-commit checks.
+# Full serial local validation. The pre-commit hook runs scoped checks, and
+# CI runs scripts/lint.sh plus scripts/test-parallel.sh.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
