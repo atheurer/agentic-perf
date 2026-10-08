@@ -189,6 +189,11 @@ def _side_effect_category(path: str, call: str) -> str | None:
         "delete",
     }:
         return "mutating_http_state"
+    if (
+        path == "providers/resource/jumpstarter_provision.py"
+        and call == "filesystem.write"
+    ):
+        return "filesystem"
     if "image_build" in path or "image_builder" in path:
         return "image"
     if "resource/" in path or "boto3" in lowered or "ec2" in lowered:

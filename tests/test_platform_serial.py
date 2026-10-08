@@ -269,7 +269,9 @@ class TestPlatformServerSerialPassthrough:
             assert kwargs.kwargs["lease_duration_seconds"] == 28_800
 
     @pytest.mark.asyncio
-    async def test_server_uses_provisioning_default_without_metadata_duration(self):
+    async def test_server_uses_artifact_dir_when_serial_capture_is_disabled(
+        self, tmp_path
+    ):
         """Older tickets fall back to the provisioning default duration."""
         from agents.platform import server
 
@@ -291,6 +293,7 @@ class TestPlatformServerSerialPassthrough:
                 new_callable=AsyncMock,
                 return_value=fake_result,
             ) as mock_provision,
+            patch("paths.create_artifact_dir", return_value=tmp_path) as create_dir,
             patch.object(
                 server,
                 "_ticket",
@@ -301,3 +304,6 @@ class TestPlatformServerSerialPassthrough:
             await server.provision_platform()
 
         assert "lease_duration_seconds" not in mock_provision.call_args.kwargs
+        assert mock_provision.call_args.kwargs["serial_capture"] is False
+        assert mock_provision.call_args.kwargs["artifact_dir"] == str(tmp_path)
+        create_dir.assert_called_once_with("PERF-TEST123", "platform-provision")

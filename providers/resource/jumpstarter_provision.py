@@ -13,6 +13,7 @@ No LLM reasoning. Structured error capture at each step.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -22,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import AuditedSubprocessRunner, FilesystemAuditError
 
 logger = logging.getLogger(__name__)
 
@@ -61,37 +62,81 @@ def _write_flash_diagnostics(
     Called on flash failure so diagnostics are durable even
     if the LLM is unavailable to process the tool result.
     """
-    import json
-    from pathlib import Path
+    from providers.execution import (
+        AuditedFilesystem,
+        RootedPath,
+        durable_filesystem_emitter,
+    )
+    from providers.redaction import get_shared_redactor
 
-    summary = "\n".join(diag)
+    redactor = get_shared_redactor()
+    safe_diagnostics = [
+        _redact_flash_detail(ticket_id, item, redactor=redactor) for item in diag
+    ]
+    summary = "\n".join(safe_diagnostics)
     logger.warning(
         "[platform] Flash diagnostics for %s:\n%s",
         ticket_id,
         summary,
     )
     if artifact_dir:
+        payload = json.dumps(
+            {
+                "ticket_id": ticket_id,
+                "diagnostics": safe_diagnostics,
+            },
+            indent=2,
+        )
+        if ticket_id:
+            filesystem = AuditedFilesystem(
+                RootedPath(
+                    artifact_dir,
+                    "artifact",
+                    logical_prefix="platform-provision",
+                ),
+                ticket_id=ticket_id,
+                emit=durable_filesystem_emitter(),
+                critical=True,
+            )
+        else:
+            filesystem = AuditedFilesystem.system(artifact_dir)
+        filesystem.write("flash-diagnostics.json", payload, mode=0o600)
+        logger.info(
+            "[platform] Flash diagnostics written to %s",
+            f"{artifact_dir}/flash-diagnostics.json",
+        )
+
+
+def _redact_flash_detail(
+    ticket_id: str,
+    detail: str,
+    *,
+    redactor: Any | None = None,
+) -> str:
+    """Redact exception text and remove potentially signed URL parameters."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    from providers.redaction import get_shared_redactor
+
+    safe_detail = (redactor or get_shared_redactor()).redact_string(ticket_id, detail)
+    url_pattern = re.compile(r"\b(?:https?|s3|gs)://[^\s\"'<>]+", re.IGNORECASE)
+    trailing_punctuation = ".,;:!?)]}"
+
+    def strip_query(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        suffix = ""
+        while candidate and candidate[-1] in trailing_punctuation:
+            suffix = candidate[-1] + suffix
+            candidate = candidate[:-1]
         try:
-            diag_path = Path(artifact_dir) / "flash-diagnostics.json"
-            diag_path.parent.mkdir(parents=True, exist_ok=True)
-            diag_path.write_text(
-                json.dumps(
-                    {
-                        "ticket_id": ticket_id,
-                        "diagnostics": diag,
-                    },
-                    indent=2,
-                )
-            )
-            logger.info(
-                "[platform] Flash diagnostics written to %s",
-                diag_path,
-            )
-        except Exception:
-            logger.warning(
-                "[platform] Failed to write flash diagnostics file",
-                exc_info=True,
-            )
+            parts = urlsplit(candidate)
+        except ValueError:
+            return "[REDACTED:url]" + suffix
+        if parts.query or parts.fragment:
+            candidate = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return candidate + suffix
+
+    return url_pattern.sub(strip_query, safe_detail)
 
 
 async def provision_jumpstarter(
@@ -237,6 +282,10 @@ async def provision_jumpstarter(
     except asyncio.CancelledError:
         # Cancellation is a control-flow signal.  The finally block still
         # stops serial capture, but the caller must observe cancellation.
+        raise
+    except FilesystemAuditError:
+        # A critical ticket artifact must not be reported as safely handled
+        # when its audit record could not be durably delivered.
         raise
     except Exception as exc:
         # Unwrap ExceptionGroup/TaskGroup to expose the
@@ -464,13 +513,14 @@ async def _run_provision_steps(
         result.flash_duration_s = time.monotonic() - t0
         # Use repr() for ExceptionGroup/TaskGroup so sub-exception
         # messages are visible in diagnostics, not just the group label.
-        diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {repr(exc)}")
+        safe_exc = _redact_flash_detail(ticket_id, repr(exc))
+        diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {safe_exc}")
         logger.error(
-            "[platform] Flash failed for %s (%s) after %.0fs: %r",
+            "[platform] Flash failed for %s (%s) after %.0fs: %s",
             board_name,
             ticket_id,
             result.flash_duration_s,
-            exc,
+            safe_exc,
         )
         # Retry once
         logger.warning("[platform] Flash failed, retrying")
@@ -482,13 +532,14 @@ async def _run_provision_steps(
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
             retry_duration = time.monotonic() - t0
-            diag.append(f"Flash retry failed ({retry_duration:.0f}s): {repr(exc2)}")
+            safe_exc2 = _redact_flash_detail(ticket_id, repr(exc2))
+            diag.append(f"Flash retry failed ({retry_duration:.0f}s): {safe_exc2}")
             logger.error(
-                "[platform] Flash retry failed for %s (%s) after %.0fs: %r",
+                "[platform] Flash retry failed for %s (%s) after %.0fs: %s",
                 board_name,
                 ticket_id,
                 retry_duration,
-                exc2,
+                safe_exc2,
             )
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process

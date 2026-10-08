@@ -365,6 +365,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     (
         "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "filesystem",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
         "_parse_exporter_address",
         "cloud_resource",
     ),
@@ -2383,6 +2388,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_provision.py:_run_provision_steps",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_write_flash_diagnostics",
+        "filesystem",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_write_flash_diagnostics",
         "2027-12-31",
     ),
     (

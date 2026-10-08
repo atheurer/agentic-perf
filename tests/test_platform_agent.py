@@ -477,6 +477,138 @@ class TestProvisionJumpstarterSDK:
         assert any("U-Boot" in d for d in r.diagnostics)
 
     @pytest.mark.asyncio
+    async def test_flash_retry_diagnostics_are_audited_and_redacted(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Both flash exceptions stay useful without leaking registered or URL secrets."""
+        import json
+
+        from providers.redaction import Redactor
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _run_provision_steps,
+        )
+
+        ticket_id = "PERF-FLASH-REDACTION"
+        registered_secret = "flash-provider-token-secret"
+        initial_signature = "initial-signed-url-secret"
+        retry_signature = "retry-signed-url-secret"
+        redactor = Redactor()
+        redactor.register(ticket_id, "jumpstarter/flash-token", registered_secret)
+        events = []
+        monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: redactor)
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter", lambda: events.append
+        )
+
+        client = MagicMock()
+        client.storage.flash = MagicMock(
+            side_effect=[
+                ExceptionGroup(
+                    "initial flash group",
+                    [
+                        RuntimeError(
+                            "initial failure "
+                            f"{registered_secret} "
+                            "https://images.example/flash"
+                            f"?X-Amz-Signature={initial_signature}"
+                        )
+                    ],
+                ),
+                RuntimeError(
+                    "retry failure "
+                    f"{registered_secret} "
+                    "https://images.example/flash"
+                    f"?X-Amz-Signature={retry_signature}"
+                ),
+            ]
+        )
+
+        with (
+            caplog.at_level("ERROR"),
+            patch(
+                "providers.resource.jumpstarter_provision.asyncio.sleep",
+                return_value=None,
+            ),
+        ):
+            result = await _run_provision_steps(
+                client,
+                "https://images.example/flash",
+                "",
+                ProvisionResult(board_name="test-board"),
+                [],
+                ticket_id=ticket_id,
+                artifact_dir=str(tmp_path),
+            )
+
+        artifact_path = tmp_path / "flash-diagnostics.json"
+        artifact = json.loads(artifact_path.read_text())
+        output = caplog.text + artifact_path.read_text()
+        assert not result.success
+        assert client.storage.flash.call_count == 2
+        assert "initial flash group" in output
+        assert "initial failure" in output
+        assert "retry failure" in output
+        assert "RuntimeError" in output
+        assert "images.example/flash" in output
+        for secret in (registered_secret, initial_signature, retry_signature):
+            assert secret not in output
+        assert "X-Amz-Signature" not in output
+        assert [item.lifecycle.state.value for item in events] == [
+            "requested",
+            "completed",
+        ]
+        assert events[0].ticket_id == ticket_id
+        assert events[0].action.target == (
+            "artifact://platform-provision/flash-diagnostics.json"
+        )
+        assert artifact["ticket_id"] == ticket_id
+        assert any("initial failure" in item for item in artifact["diagnostics"])
+        assert any("retry failure" in item for item in artifact["diagnostics"])
+
+    def test_flash_diagnostics_audit_failure_blocks_ticket_write(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed durable audit request must not permit a ticket file mutation."""
+        from providers.execution import FilesystemAuditError
+        from providers.resource.jumpstarter_provision import _write_flash_diagnostics
+
+        def fail_delivery(_event):
+            raise OSError("spool unavailable")
+
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter",
+            lambda: fail_delivery,
+        )
+
+        with pytest.raises(FilesystemAuditError):
+            _write_flash_diagnostics(str(tmp_path), "PERF-AUDIT-FAIL", ["failure"])
+
+        assert not (tmp_path / "flash-diagnostics.json").exists()
+
+    def test_flash_diagnostics_use_system_context_only_without_ticket(
+        self, tmp_path, monkeypatch
+    ):
+        """No-ticket scratch writes remain explicit system-context mutations."""
+        import json
+
+        from providers.resource.jumpstarter_provision import _write_flash_diagnostics
+
+        def fail_delivery(_event):
+            raise OSError("spool unavailable")
+
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter",
+            lambda: fail_delivery,
+        )
+
+        _write_flash_diagnostics(str(tmp_path), "", ["scratch diagnostic"])
+
+        artifact = json.loads((tmp_path / "flash-diagnostics.json").read_text())
+        assert artifact["ticket_id"] == ""
+        assert artifact["diagnostics"] == ["scratch diagnostic"]
+
+    @pytest.mark.asyncio
     async def test_ip_discovery_failure_retries(self):
         """TCP address fails, power cycles, retries."""
         from unittest.mock import MagicMock
