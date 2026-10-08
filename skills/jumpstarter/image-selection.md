@@ -13,7 +13,7 @@ intent is clear but the directives are incomplete.
 | `image_name` | Build variant | `ps`, `qa`, `fusa-minimal` |
 | `image_type` | Image format | `regular`, `ostree` |
 | `board_selector` | Jumpstarter board label selector | `board-type=nxp-s32g-vnp-rdb3` |
-| `release` | Build release | `nightly`, `monthly/autosd10-202608010205` |
+| `release` | Build release | `nightly`, `monthly`, `monthly/autosd10-202608010205` |
 
 ## Image Mode Mapping
 
@@ -69,6 +69,39 @@ package mode", map accordingly:
 | "EBBR", "EBBR image" | *(default for board)* | *(default for board)* |
 | "EBBR ostree" | `ps` | `ostree` |
 | "EBBR package", "EBBR regular" | `qa` | `regular` |
+
+## Release Path Formats
+
+The `release` directive controls which build the image resolver fetches.
+Bare values resolve to the latest available build in that stream;
+qualified paths pin to a specific dated build.
+
+| Value | Resolves to |
+|---|---|
+| `nightly` | Latest nightly build |
+| `monthly` | Latest monthly build (any month) |
+| `monthly/autosd10-202608010205` | Specific August 2026 monthly build |
+| `latest-RHIVOS-2` | Latest RHIVOS 2.x release |
+| `latest-RHIVOS-2.1-202607240103` | Specific RHIVOS 2.1 build |
+
+### Extracting release dates from natural language
+
+When the user references a specific month or date, the `release`
+directive MUST include the date qualifier — otherwise the image
+resolver picks the latest build, ignoring the user's intent.
+
+| User says | release directive |
+|---|---|
+| "latest monthly" / "monthly image" | `monthly` |
+| "August monthly" / "monthly from August" | `monthly/autosd10-202608` (partial match — resolver finds the closest build) |
+| "June 2026 nightly" / "nightly from June 15" | `nightly` with a note that specific nightly dating is not supported |
+| "the 202608010205 build" | `monthly/autosd10-202608010205` |
+| "monthly build 202607" | `monthly/autosd10-202607` |
+
+The image resolver supports partial datestamp matching: if the
+exact path 404s, it searches the directory listing for entries
+containing the datestamp. So `monthly/autosd10-202608` will
+match `monthly/autosd10-202608010205`.
 
 ## Defaults
 

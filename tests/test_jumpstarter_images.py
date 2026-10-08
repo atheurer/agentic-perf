@@ -190,3 +190,159 @@ async def test_fallback_listing_and_manifest_requests_use_redirect_helper(monkey
         "https://autosd.sig.centos.org/RHIVOS-2/latest-RHIVOS-2.1-202607240103/info/test_images_info.json",
         "https://autosd.sig.centos.org/RHIVOS-2/latest-RHIVOS-2/info/test_images_info.json",
     ]
+
+
+def _install_monthly_fake_client(
+    monkeypatch,
+    *,
+    listing: str,
+    dated_manifest_url: str,
+    dated_manifest_status: int = 200,
+) -> list[str]:
+    manifest = {
+        "board": [{"image_name": "ps", "image_type": "regular", "path": "image.img"}]
+    }
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def get(self, url: str, **_: object) -> httpx.Response:
+            calls.append(url)
+            request = httpx.Request("GET", url)
+            if url.endswith("/AutoSD-10/monthly/"):
+                return httpx.Response(200, text=listing, request=request)
+            if url == dated_manifest_url:
+                return httpx.Response(
+                    dated_manifest_status,
+                    json=manifest,
+                    request=request,
+                )
+            if url.endswith("/latest-AutoSD-10/info/test_images_info.json"):
+                return httpx.Response(200, json=manifest, request=request)
+            return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(jumpstarter_images, "AuditedAsyncHTTPClient", FakeClient)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_monthly_year_month_resolves_to_matching_dated_directory(monkeypatch):
+    base_url = "https://autosd.sig.centos.org"
+    dated_manifest_url = (
+        f"{base_url}/AutoSD-10/monthly/autosd10-202608010205/info/test_images_info.json"
+    )
+    calls = _install_monthly_fake_client(
+        monkeypatch,
+        listing=(
+            '<a href="autosd10-202608010205/">August</a>'
+            '<a href="autosd10-202609010205/">September</a>'
+        ),
+        dated_manifest_url=dated_manifest_url,
+    )
+
+    result = await resolve_image_urls(
+        base_url=base_url,
+        image_version="AutoSD-10",
+        release="monthly/autosd10-202608",
+        board_target="board",
+    )
+
+    assert result["manifest_url"] == dated_manifest_url
+    assert result["flash_targets"][0]["url"].endswith(
+        "/monthly/autosd10-202608010205/image.img"
+    )
+    assert calls == [
+        f"{base_url}/AutoSD-10/monthly/",
+        dated_manifest_url,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_monthly_year_month_without_match_does_not_fall_back_to_latest(
+    monkeypatch,
+):
+    base_url = "https://autosd.sig.centos.org"
+    latest_manifest_url = (
+        f"{base_url}/AutoSD-10/latest-AutoSD-10/info/test_images_info.json"
+    )
+    calls = _install_monthly_fake_client(
+        monkeypatch,
+        listing='<a href="autosd10-202607010205/">July</a>',
+        dated_manifest_url=latest_manifest_url,
+    )
+
+    result = await resolve_image_urls(
+        base_url=base_url,
+        image_version="AutoSD-10",
+        release="monthly/autosd10-202608",
+        board_target="board",
+    )
+
+    assert "error" in result
+    assert calls == [f"{base_url}/AutoSD-10/monthly/"]
+    assert latest_manifest_url not in calls
+
+
+@pytest.mark.asyncio
+async def test_monthly_match_with_missing_manifest_does_not_fall_back_to_latest(
+    monkeypatch,
+):
+    base_url = "https://autosd.sig.centos.org"
+    dated_manifest_url = (
+        f"{base_url}/AutoSD-10/monthly/autosd10-202608010205/info/test_images_info.json"
+    )
+    latest_manifest_url = (
+        f"{base_url}/AutoSD-10/latest-AutoSD-10/info/test_images_info.json"
+    )
+    calls = _install_monthly_fake_client(
+        monkeypatch,
+        listing='<a href="autosd10-202608010205/">August</a>',
+        dated_manifest_url=dated_manifest_url,
+        dated_manifest_status=404,
+    )
+
+    result = await resolve_image_urls(
+        base_url=base_url,
+        image_version="AutoSD-10",
+        release="monthly/autosd10-202608",
+        board_target="board",
+    )
+
+    assert result["error"].startswith("Failed to fetch manifest: 404")
+    assert result["manifest_url"] == dated_manifest_url
+    assert calls == [
+        f"{base_url}/AutoSD-10/monthly/",
+        dated_manifest_url,
+    ]
+    assert latest_manifest_url not in calls
+
+
+@pytest.mark.asyncio
+async def test_full_dated_monthly_release_stays_direct(monkeypatch):
+    base_url = "https://autosd.sig.centos.org"
+    dated_manifest_url = (
+        f"{base_url}/AutoSD-10/monthly/autosd10-202608010205/info/test_images_info.json"
+    )
+    calls = _install_monthly_fake_client(
+        monkeypatch,
+        listing="",
+        dated_manifest_url=dated_manifest_url,
+    )
+
+    result = await resolve_image_urls(
+        base_url=base_url,
+        image_version="AutoSD-10",
+        release="monthly/autosd10-202608010205",
+        board_target="board",
+    )
+
+    assert result["manifest_url"] == dated_manifest_url
+    assert calls == [dated_manifest_url]
