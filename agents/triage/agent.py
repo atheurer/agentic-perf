@@ -60,9 +60,9 @@ async def _validate_harness_and_suite(
             "available_harnesses": available_list,
         }
 
-    # 2. Validate benchmark suite exists in the catalog when
-    #    absent_suite is set (the LLM couldn't find it).
-    if absent_suite and benchmark_suite:
+    # 2. Validate every nonempty benchmark suite. The LLM's absent_suite
+    #    flag is advisory; an invented suite must not reach dispatch.
+    if benchmark_suite:
         # Try to find the suite in the catalog — maybe the LLM
         # built a wrong composite name (e.g. "jumpstarter-boot-time"
         # instead of "boot-time").
@@ -70,13 +70,24 @@ async def _validate_harness_and_suite(
 
         found = await get_catalog_benchmark(skill_provider, benchmark_suite)
         if found is not None:
-            # The suite does exist; the LLM was wrong about absent_suite.
-            return {
-                "correction": {
-                    "absent_suite": False,
-                    "benchmark_suite": benchmark_suite,
-                },
-            }
+            correction: dict[str, Any] = {}
+            if absent_suite:
+                # The suite exists; the LLM was wrong about absent_suite.
+                correction.update(
+                    absent_suite=False,
+                    benchmark_suite=benchmark_suite,
+                )
+            catalog_harness = found.get("harness")
+            if catalog_harness and catalog_harness != harness:
+                correction.update(
+                    benchmark_suite=benchmark_suite,
+                    harness=catalog_harness,
+                    note=(
+                        f"Using catalog harness '{catalog_harness}' for "
+                        f"benchmark suite '{benchmark_suite}'"
+                    ),
+                )
+            return {"correction": correction} if correction else None
         # Try stripping prefixes from suite name to auto-correct.
         # e.g. "jumpstarter-boot-time" → "boot-time"
         #      "kube-burner-uperf" → "uperf"
@@ -98,6 +109,10 @@ async def _validate_harness_and_suite(
                         ),
                     },
                 }
+        if not absent_suite:
+            # Mark an unrecognized suite absent so the orchestrator's
+            # existing human-guidance path blocks execution.
+            return {"correction": {"absent_suite": True}}
 
     return None
 
@@ -874,6 +889,11 @@ class TriageAgent(AgentBase):
                     ticket_id,
                     f"**Triage validation failed:** {validation['error']}\n\n"
                     f"Please update the ticket with a valid harness name.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=("Triage validation failed; waiting for a valid harness."),
                 )
                 return
             if "correction" in validation:
