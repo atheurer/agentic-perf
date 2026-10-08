@@ -1087,7 +1087,18 @@ async def run_agent_task(
             except Exception:
                 pass
     except asyncio.CancelledError:
-        logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
+        if dispatcher.was_stopped_by_user(ticket_id):
+            cancel_reason = "Agent stopped by user request"
+        elif dispatcher.is_deposed():
+            cancel_reason = "Agent stopped: orchestrator claim lost"
+        else:
+            cancel_reason = "Agent stopped: task cancelled"
+        logger.warning(
+            "Agent cancelled on ticket %s (status=%s): %s",
+            ticket_id,
+            status,
+            cancel_reason,
+        )
         try:
             async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=mutation_headers
@@ -1114,7 +1125,7 @@ async def run_agent_task(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
                             json={
                                 "status": "awaiting_customer_guidance",
-                                "comment": "Agent hard-stopped by user request",
+                                "comment": cancel_reason,
                             },
                         )
         except Exception:
