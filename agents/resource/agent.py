@@ -351,7 +351,7 @@ def _reservation_id_from_metadata(provider: str, metadata: dict[str, Any]) -> st
 
 
 def _assigned_hardware_from_reservation(
-    ticket: dict[str, Any], hosts: Any
+    ticket: dict[str, Any], hosts: Any, selection: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Map newly reserved provider hosts to the ticket's required roles."""
     if not isinstance(hosts, list) or any(
@@ -375,20 +375,57 @@ def _assigned_hardware_from_reservation(
 
     controller = ""
     targets: list[str] = []
-    host_iter = iter(hosts)
-    entries = required_hosts if required_hosts else [{} for _ in hosts]
-    assignments: list[tuple[str, list[str]]] = []
-    for item in entries:
-        host = item.get("host") or next(host_iter, "")
-        if not host:
-            continue
-        roles = item.get("roles") or []
-        if isinstance(roles, str):
-            roles = [roles]
-        assignments.append((host, roles))
+    provider_roles: list[str] = []
+    instance_specs = (selection or {}).get("instance_specs")
+    if isinstance(instance_specs, list):
+        for spec in instance_specs:
+            if not isinstance(spec, dict) or not spec.get("role"):
+                provider_roles = []
+                break
+            try:
+                count = int(spec.get("count", 1))
+            except (TypeError, ValueError):
+                provider_roles = []
+                break
+            if count < 1:
+                provider_roles = []
+                break
+            provider_roles.extend([str(spec["role"])] * count)
+        if len(provider_roles) != len(hosts):
+            provider_roles = []
 
-    if not required_hosts:
-        assignments = [(host, []) for host in hosts]
+    assignments: list[tuple[str, list[str]]] = []
+    if required_hosts:
+        unassigned = set(range(len(hosts)))
+        for item in required_hosts:
+            roles = item.get("roles") or []
+            if isinstance(roles, str):
+                roles = [roles]
+            host = item.get("host")
+            if not host and unassigned:
+                if provider_roles and roles:
+                    matching = [
+                        index
+                        for index in sorted(unassigned)
+                        if provider_roles[index] in roles
+                    ]
+                    if not matching:
+                        raise ValueError(
+                            "AWS instance_specs roles do not match the ticket's "
+                            f"required host roles {roles}"
+                        )
+                    index = matching[0]
+                else:
+                    index = min(unassigned)
+                host = hosts[index]
+                unassigned.remove(index)
+            if host:
+                assignments.append((host, roles))
+    else:
+        assignments = [
+            (host, [provider_roles[index]] if provider_roles else [])
+            for index, host in enumerate(hosts)
+        ]
 
     for host, roles in assignments:
         if "controller" in roles and not controller:
@@ -1031,10 +1068,21 @@ class ResourceAgent(AgentBase):
         ticket_context = await self._get_ticket(ticket_id)
         ticket_cf = ticket_context.get("custom_fields", {})
         ticket_directives = ticket_cf.get("directives", {})
+        configured_provider = ticket_cf.get("resource_provider")
+        directed_provider = ticket_directives.get("resource_provider")
+        managed_ticket_provider = next(
+            (
+                provider
+                for provider in (configured_provider, directed_provider)
+                if provider and provider != "user_provided"
+            ),
+            None,
+        )
         rp = (
-            result.get("resource_provider")
-            or ticket_cf.get("resource_provider")
-            or ticket_directives.get("resource_provider")
+            managed_ticket_provider
+            or configured_provider
+            or directed_provider
+            or result.get("resource_provider")
             or "user_provided"
         )
         existing_reservation_id = ticket_cf.get("resource_reservation_id")
@@ -1220,7 +1268,9 @@ class ResourceAgent(AgentBase):
                         try:
                             fields["assigned_hardware_ips"] = (
                                 _assigned_hardware_from_reservation(
-                                    ticket_context, reserve_result["hosts"]
+                                    ticket_context,
+                                    reserve_result["hosts"],
+                                    selection,
                                 )
                             )
                         except ValueError as exc:
@@ -1231,7 +1281,8 @@ class ResourceAgent(AgentBase):
                                 "The reservation ID and metadata were retained for "
                                 "teardown.",
                             )
-                    fields["fresh_host"] = True
+                    if rp in {"aws", "quads", "jumpstarter"}:
+                        fields["fresh_host"] = True
                     logger.info(
                         "[resource] Auto-reservation succeeded for %s (%s=%s)",
                         ticket_id,
@@ -1265,7 +1316,7 @@ class ResourceAgent(AgentBase):
             except Exception:
                 logger.debug("get_host_inventory unavailable, skipping")
 
-        if result.get("fresh_host"):
+        if result.get("fresh_host") and rp != "psap-cc":
             fields["fresh_host"] = True
 
         ip_mapping = reservation_metadata.get("ip_mapping", {})

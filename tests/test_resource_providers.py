@@ -1596,6 +1596,111 @@ class TestProviderCorrectAutoReservation:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        "custom_fields",
+        [
+            {"resource_provider": "aws"},
+            {"directives": {"resource_provider": "aws"}},
+        ],
+    )
+    async def test_ticket_managed_provider_cannot_be_overridden_by_user_provided(
+        self, custom_fields
+    ):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "managed reservation required",
+            "custom_fields": custom_fields,
+        }
+
+        async def unused_mcp_call(_name, _arguments):
+            raise AssertionError("managed reservation should fail closed without MCP")
+
+        agent = self._make_agent(ticket, unused_mcp_call)
+        agent._mcp = None
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {
+                            "controller": "1.1.1.1",
+                            "targets": [],
+                        },
+                        "ssh_user": "root",
+                        "resource_provider": "user_provided",
+                        "resource_reservation_id": "forged-id",
+                        "resource_provider_metadata": {"instance_ids": ["i-forged"]},
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        agent._client.patch.assert_not_awaited()
+        assert (
+            "Could not verify a aws reservation"
+            in (agent._client.post.await_args.kwargs["json"]["body"])
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_fleet_iteration_reserves_new_board_not_stale_lease(self):
+        from providers.fleet import next_iteration_fields
+
+        previous_fields = {
+            "resource_provider": "jumpstarter",
+            "resource_reservation_id": "old-lease",
+            "resource_provider_metadata": {"lease_id": "old-lease"},
+            "board_selector": "board-type=ride4",
+            "assigned_hardware_ips": {"controller": "old-board", "targets": []},
+        }
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "fleet iteration",
+            "custom_fields": {
+                **previous_fields,
+                **next_iteration_fields(previous_fields),
+            },
+        }
+        reserve_calls = []
+
+        async def mcp_call(name, arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                reserve_calls.append(arguments)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "new-lease",
+                        "lease_id": "new-lease",
+                        "provider_metadata": {
+                            "lease_id": "new-lease",
+                            "board_target": "ride4",
+                        },
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
+
+        assert len(reserve_calls) == 1
+        assert (
+            reserve_calls[0]["selection"]["jumpstarter_selector"] == "board-type=ride4"
+        )
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "new-lease"
+        assert fields["resource_provider_metadata"]["lease_id"] == "new-lease"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("provider", "metadata", "expected_id"),
         [
             ("aws", {"instance_ids": ["i-123"]}, "i-123"),
@@ -1710,6 +1815,8 @@ class TestProviderCorrectAutoReservation:
             "reserve_result",
             "expected_selection",
             "expected_id",
+            "expected_hardware",
+            "fresh_host",
         ),
         [
             (
@@ -1720,31 +1827,33 @@ class TestProviderCorrectAutoReservation:
                         {"roles": ["target"]},
                     ],
                     "instance_specs": [
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
                         {
                             "instance_type": "m6i.large",
                             "count": 1,
                             "role": "controller",
                         },
-                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
                     ],
                 },
                 {
                     "status": "success",
-                    "reservation_id": "i-controller,i-target",
-                    "provider_metadata": {"instance_ids": ["i-controller", "i-target"]},
-                    "hosts": ["10.0.0.1", "10.0.0.2"],
+                    "reservation_id": "i-target,i-controller",
+                    "provider_metadata": {"instance_ids": ["i-target", "i-controller"]},
+                    "hosts": ["10.0.0.2", "10.0.0.1"],
                 },
                 {
                     "instance_specs": [
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
                         {
                             "instance_type": "m6i.large",
                             "count": 1,
                             "role": "controller",
                         },
-                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
                     ]
                 },
-                "i-controller,i-target",
+                "i-target,i-controller",
+                {"controller": "10.0.0.1", "targets": ["10.0.0.2"]},
+                True,
             ),
             (
                 "quads",
@@ -1763,11 +1872,37 @@ class TestProviderCorrectAutoReservation:
                 },
                 {"hostnames": ["host-a", "host-b"]},
                 "73",
+                {"controller": "host-a", "targets": ["host-b"]},
+                True,
+            ),
+            (
+                "psap-cc",
+                {"cluster_id": "cluster-7"},
+                {
+                    "status": "success",
+                    "reservation_id": "psap-101",
+                    "provider_metadata": {
+                        "cluster_id": "cluster-7",
+                        "reservation_id": "psap-101",
+                    },
+                    "hosts": [],
+                },
+                {"cluster_id": "cluster-7"},
+                "psap-101",
+                {"controller": "", "targets": []},
+                False,
             ),
         ],
     )
     async def test_auto_reservation_persists_id_and_maps_hosts(
-        self, provider, ticket_fields, reserve_result, expected_selection, expected_id
+        self,
+        provider,
+        ticket_fields,
+        reserve_result,
+        expected_selection,
+        expected_id,
+        expected_hardware,
+        fresh_host,
     ):
         ticket = {
             "id": "PERF-TEST",
@@ -1787,17 +1922,17 @@ class TestProviderCorrectAutoReservation:
             raise AssertionError(f"unexpected MCP call {name}")
 
         agent = self._make_agent(ticket, mcp_call)
-        await agent._handle_completion("PERF-TEST", self._response(provider))
+        response = self._response(provider)
+        if provider == "psap-cc":
+            response.tool_calls[0].input["fresh_host"] = True
+        await agent._handle_completion("PERF-TEST", response)
 
         assert len(calls) == 1
         assert calls[0]["selection"] == expected_selection
         fields = self._fields(agent)
         assert fields["resource_reservation_id"] == expected_id
-        assert fields["fresh_host"] is True
-        assert fields["assigned_hardware_ips"] == {
-            "controller": reserve_result["hosts"][0],
-            "targets": [reserve_result["hosts"][1]],
-        }
+        assert fields.get("fresh_host", False) is fresh_host
+        assert fields["assigned_hardware_ips"] == expected_hardware
         if provider == "quads":
             assert (
                 fields["quads_assignment_id"]
