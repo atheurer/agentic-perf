@@ -17,8 +17,11 @@ single-source shorthand keeps the common setup simple. Anonymous HTTP or
 HTTPS reads need no per-user GitLab identity when the repository is reachable
 and permits unauthenticated reads. Authenticated Git access uses either the
 instance's existing OpenSSH identity/agent or a secret reference resolved by
-the existing secret provider. Implement organization scope first; reserve
-user and project extension points without enabling them prematurely.
+the existing secret provider. Implement organization scope first and reserve
+user scope until authenticated identity and isolation are ready. A distinct
+project-scoped source for documents bundled with agentic-perf is the migration
+bridge for local skills; it must not be confused with an administrator's
+organization path source.
 
 The recommended first migration includes both guidance and structured Crucible
 runtime configuration. The draft includes this scope; a documents-only configuration
@@ -104,9 +107,9 @@ These are separate concepts:
 | --- | --- | --- |
 | Subject | Stable topic requested by an agent or configured by an administrator | `harness/crucible` |
 | Scope | Who owns guidance and whom it applies to | Organization; future user/project |
-| Source | How the gateway obtains material | Configured directory or Crucible controller |
+| Source | How the gateway obtains material | Bundled project docs, configured organization repository/path, or Crucible controller |
 | Role | How to use the material | Operational guidance, software reference, runtime configuration |
-| Revision | Exact material used by a ticket | Content digest; future repository commit |
+| Revision | Exact material used by a ticket | Content digest, installed project version/commit, or source repository commit |
 
 Subject identifiers are exact registered names with a namespace and name.
 Other examples are `harness/zathras` or `domain/networking`. A subject is a
@@ -158,6 +161,24 @@ an organization source root, repository credentials, or a different deployment.
 The instance configuration grants organization scope. A manifest cannot grant
 itself a different scope or claim another user. Phase and agent selectors control
 relevance within that scope; authorization is enforced separately.
+
+### Local documents as a migration bridge
+
+Legacy documents can remain in the agentic-perf repository while their content
+is audited and moved. The gateway should expose such files through a built-in,
+read-only project source keyed by subject, with source id, path, phase/audience,
+and a revision tied to the installed agentic-perf version or commit. This source
+is separate from administrator-configured organization paths and from software
+documentation. The gateway response must retain all of those identities so an
+agent can tell which local baseline it read and compare it with organization
+guidance and installed/upstream software references.
+
+This PR currently implements organization sources and the Crucible software
+adapter; it does not yet load arbitrary bundled `skills/<subject>/` files
+through the gateway. Add that project-source adapter before removing direct
+document readers for a subject whose needed material still exists only in the
+local repository. Keep direct readers only for subjects that have not yet
+completed this gateway cutover.
 
 ## Administrator configuration
 
@@ -516,7 +537,7 @@ should apply only to that agentic-perf user.
 | `agents/provisioning/prompts/crucible.md` | Organization installation choices; software facts move to upstream references; agentic-perf tool/workflow contracts stay in prompts or code |
 | `agents/benchmark/prompts/crucible.md` | Organization benchmark defaults and practices; software facts move to upstream references; gateway/tool protocol and execution contracts stay in prompts or code |
 | Crucible sections in review/base prompts | Organization review practices where applicable; software facts move to upstream references; common reasoning stays in agent prompts |
-| `skills/crucible/*.md` | Section-level classification: upstream software references, organization practices, confirmed personal preferences, or agentic-perf contracts; remove redundant copies after replacement coverage is available |
+| `skills/crucible/*.md` | Audit by section; expose any needed interim local content through the project-scoped gateway source, then move software facts upstream, shared practices to organization scope, personal preferences to user scope when supported, and agentic-perf contracts to prompts/code |
 | Legacy private harness guidance | Classify by meaning and intended audience; organization or user documents only where that ownership is established |
 | Legacy private harness settings | Validated runtime config consumed through the same package resolver, implemented in this first slice |
 | Secret references in private settings | Service-consumed bindings to the existing secret resolver |
@@ -561,6 +582,29 @@ home. This includes run-file schemas, tool parameter formats, userenv mechanics,
 and result/metric API behavior. Version-sensitive workarounds need a reason,
 affected version, and removal condition if temporarily retained locally.
 
+Use this staged path for each subject:
+
+1. Keep the local document in the project and make it retrievable through the
+   project-scoped gateway source. Pin its identity and revision with the ticket.
+2. Move software facts to upstream documentation, shared practices to the
+   organization source, and confirmed personal preferences to a user source
+   once user identity and isolation are supported. Keep agent role/tool
+   contracts in prompts or deterministic code.
+3. Compare all applicable sources. Preserve their scope and revisions; do not
+   silently prefer a local copy or source ordering. Material unresolved
+   conflicts must reach HITL, including conflicts between the temporary local
+   source and its replacement.
+4. Once gateway retrieval has parity for that subject across its required
+   agents and phases, remove its direct document-loading tools and callers.
+   Keep the local document as a gateway source while replacement coverage is
+   still being established. Typed execution, validation, and live-data tools
+   remain separate.
+5. Delete the local document only after representative ticket coverage shows
+   that the replacement source is available in every required deployment and
+   phase, carries the needed provenance/version, and leaves no consumer
+   depending on the local path. If a gap appears, restore the document to the
+   gateway source rather than creating a new direct-reading path.
+
 Check both upstream GitHub coverage and the documentation available on installed
 controllers. A newly merged upstream change does not imply that existing
 controllers provide it. Remove required local guidance only when the gateway can
@@ -602,7 +646,10 @@ cache checkouts are independent of the mutable mirror, and ticket snapshots
 retain their pinned content. Configuration diagnostics validate Git descriptors
 offline and report only the host, ref, and authentication method. Runtime
 activation, a hosted private organization repository, and team onboarding remain
-pending review.
+pending review. The bundled project-document adapter described in the migration
+plan is not implemented in this draft. It is required before direct readers can
+be retired for subjects whose guidance still resides only in local files; this
+draft leaves non-Crucible legacy behavior in place.
 
 Required checks before team rollout include:
 
