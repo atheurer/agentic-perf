@@ -785,29 +785,69 @@ class ResourceAgent(AgentBase):
                 provider_metadata or reservation_metadata
             )
 
-        # Guard: managed providers require metadata from
-        # reserve_resources for downstream handoff.  The LLM
-        # may submit without calling reserve_resources, or may
-        # copy directives into the metadata field instead of
-        # the actual reservation result.  Validate that the
-        # metadata contains fields that only come from a real
-        # reservation (#1128).
+        # Invariant: managed providers must have a reservation.
+        # If the LLM skipped reserve_resources, call it now
+        # using the ticket's directives.  "LLM decides intent;
+        # code enforces invariants" — the LLM chose the board,
+        # but actually reserving it is not optional (#1128).
         rp = fields.get("resource_provider", "")
         meta = fields.get("resource_provider_metadata") or {}
         if rp and rp != "user_provided":
-            # These fields are set by the provider's reserve()
-            # method, never by directives or LLM reasoning.
             has_reservation_fields = meta.get("lease_id") or meta.get("reservation_id")
-            if not has_reservation_fields:
-                await self._add_comment(
+            if not has_reservation_fields and self._mcp:
+                logger.warning(
+                    "[resource] No reservation metadata — auto-reserving for %s via %s",
                     ticket_id,
-                    "**Resource submission rejected:** The provider "
-                    "metadata is missing reservation fields "
-                    "(lease_id or reservation_id). You must call "
-                    "`reserve_resources` and include its result. "
-                    "Do not copy directives into metadata.",
+                    rp,
                 )
-                return
+                ticket = await self._get_ticket(ticket_id)
+                tcf = ticket.get("custom_fields", {})
+                td = tcf.get("directives", {})
+                selector = td.get("board_selector", "")
+                try:
+                    raw = await self._mcp.call_tool(
+                        "reserve_resources",
+                        {
+                            "provider": rp,
+                            "selection": {
+                                "jumpstarter_selector": selector,
+                                "board_selector": selector,
+                            },
+                            "description": ticket.get("summary", ""),
+                            "ticket_id": ticket_id,
+                        },
+                    )
+                    reserve_result = json.loads(raw) if raw else {}
+                    if reserve_result.get("error"):
+                        await self._add_comment(
+                            ticket_id,
+                            f"**Auto-reservation failed:** {reserve_result['error']}",
+                        )
+                        return
+                    # Re-fetch accumulated metadata
+                    raw = await self._mcp.call_tool("get_accumulated_metadata", {})
+                    reservation_metadata = json.loads(raw) if raw else {}
+                    if reservation_metadata:
+                        fields["resource_provider_metadata"] = reservation_metadata
+                        if reservation_metadata.get("ssh_user"):
+                            fields["ssh_user"] = reservation_metadata["ssh_user"]
+                    logger.info(
+                        "[resource] Auto-reservation succeeded for %s (lease=%s)",
+                        ticket_id,
+                        reservation_metadata.get("lease_id", "?"),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[resource] Auto-reservation failed: %s",
+                        exc,
+                    )
+                    await self._add_comment(
+                        ticket_id,
+                        "**Auto-reservation failed:** Could not "
+                        "reserve resources automatically. "
+                        f"Error: {exc}",
+                    )
+                    return
 
         if reservation_metadata.get("ssh_user"):
             fields["ssh_user"] = reservation_metadata["ssh_user"]
