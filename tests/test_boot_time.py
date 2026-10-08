@@ -87,6 +87,26 @@ class TestBootTimeOutputDrain:
             failed=False,
         )
 
+    async def test_stderr_lines_keep_one_prefix_across_read_boundaries(self, tmp_path):
+        long_line = b"x" * (65536 - len(b"first\n"))
+        stderr = b"first\n" + long_line + b"\nthird\n\nlast"
+        stream = asyncio.StreamReader()
+        stream.feed_data(stderr)
+        stream.feed_eof()
+        process = _make_mock_process()
+        process.stderr = stream
+
+        result = await _run_mock_benchmark(tmp_path, process)
+
+        assert result["status"] == "completed"
+        assert (tmp_path / "harness-output.log").read_bytes() == (
+            b"STDERR: first\n"
+            + b"STDERR: "
+            + long_line
+            + b"\nSTDERR: third\nSTDERR: \nSTDERR: last"
+        )
+        assert process.finish_streamed_output.await_args.args[1] == stderr
+
     async def test_inherited_pipe_fails_without_discarding_partial_output(
         self, tmp_path
     ):
@@ -700,6 +720,9 @@ class TestBootTimeSerialDiagnostics:
         assert runner.start.await_count == 2
         serial_proc.terminate.assert_called_once()
         serial_proc.wait.assert_awaited_once_with(timeout=10)
+        if failure == "cancel":
+            benchmark_proc.finish_streamed_output.assert_awaited_once()
+            assert benchmark_proc.finish_streamed_output.await_args.kwargs["cancelled"]
         # open_stream is called for both serial-capture.log
         # and harness-output.log
         assert len(opened_streams) == 2

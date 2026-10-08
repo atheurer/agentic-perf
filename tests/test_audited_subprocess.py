@@ -214,6 +214,42 @@ async def test_streamed_output_preserves_terminal_metadata_and_incomplete_failur
         reset_trace_context(token)
 
 
+async def test_streamed_output_timeout_and_cancellation_emit_one_terminal() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        runner = AuditedSubprocessRunner(emit)
+        for state, options in (
+            ("timed_out", {"timed_out": True}),
+            ("cancelled", {"cancelled": True}),
+        ):
+            process = await runner.start([sys.executable, "-c", "pass"])
+            await process._process.communicate()
+            for _ in range(2):
+                await process.finish_streamed_output(
+                    b"partial", b"", drain_complete=False, **options
+                )
+            terminal = events[-1]
+            assert terminal.lifecycle.state.value == state
+            assert terminal.attributes["stdout_size"] == len(b"partial")
+            assert terminal.attributes["output_incomplete"] is True
+            assert terminal.attributes.get("timed_out", False) is (state == "timed_out")
+        assert [event.lifecycle.state.value for event in events] == [
+            "requested",
+            "started",
+            "timed_out",
+            "requested",
+            "started",
+            "cancelled",
+        ]
+    finally:
+        reset_trace_context(token)
+
+
 async def test_mutating_spawn_requires_critical_recorder() -> None:
     token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
     try:

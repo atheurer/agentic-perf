@@ -4699,6 +4699,7 @@ async def execute_boot_time_test(
             nonlocal harness_log_failed
             if stream is None:
                 return
+            at_line_start = True
             while True:
                 chunk = await stream.read(65536)
                 if not chunk:
@@ -4706,7 +4707,18 @@ async def execute_boot_time_test(
                 chunks.append(chunk)
                 if harness_log_fh is not None and not harness_log_failed:
                     try:
-                        harness_log_fh.write(prefix + chunk)
+                        # A line may span reads. Prefix each stderr line once,
+                        # including empty lines and lines beyond 64 KiB.
+                        if prefix:
+                            tagged = (prefix if at_line_start else b"") + chunk.replace(
+                                b"\n", b"\n" + prefix
+                            )
+                            if chunk.endswith(b"\n"):
+                                tagged = tagged[: -len(prefix)]
+                            at_line_start = chunk.endswith(b"\n")
+                        else:
+                            tagged = chunk
+                        harness_log_fh.write(tagged)
                         harness_log_fh.flush()
                     except Exception as exc:
                         harness_log_failed = True
