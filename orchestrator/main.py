@@ -1984,16 +1984,68 @@ async def _renew_leader_lease(
     on_lost: Any | None = None,
     started: asyncio.Event | None = None,
 ) -> None:
-    """Keep the control-plane lease fenced while the poll loop is active."""
+    """Keep the control-plane lease fenced while the poll loop is active.
+
+    Retries transient failures (timeouts, connection errors) with
+    bounded backoff while enough confirmed lease time remains.
+    Only declares lease loss on a confirmed fencing rejection
+    (HTTP 4xx) or when retries are exhausted.
+    """
+    import httpx
+
     if started is not None:
         started.set()
+
+    # Transient errors that should be retried.
+    _TRANSIENT = (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.PoolTimeout,
+        OSError,
+        ConnectionError,
+    )
+    _MAX_CONSECUTIVE_FAILURES = 3
+    consecutive_failures = 0
+
     try:
         while True:
             await asyncio.sleep(interval)
             try:
                 await lease.renew()
+                if consecutive_failures > 0:
+                    logger.info(
+                        "Orchestrator lease renewal recovered "
+                        "after %d transient failure(s)",
+                        consecutive_failures,
+                    )
+                consecutive_failures = 0
+            except _TRANSIENT as exc:
+                consecutive_failures += 1
+                logger.warning(
+                    "Orchestrator lease renewal transient failure %d/%d: %s",
+                    consecutive_failures,
+                    _MAX_CONSECUTIVE_FAILURES,
+                    exc,
+                )
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    logger.critical(
+                        "Orchestrator lease renewal failed "
+                        "%d consecutive times — declaring "
+                        "lease lost",
+                        consecutive_failures,
+                    )
+                    if on_lost is not None:
+                        on_lost()
+                    raise RuntimeError("orchestrator leader lease lost") from exc
+                # Retry sooner than the normal interval
+                await asyncio.sleep(min(2.0 * consecutive_failures, interval))
             except Exception as exc:
-                logger.critical("Orchestrator leader lease renewal failed: %s", exc)
+                # Non-transient (fencing rejection, etc.) — fail immediately
+                logger.critical(
+                    "Orchestrator leader lease renewal rejected: %s",
+                    exc,
+                )
                 if on_lost is not None:
                     on_lost()
                 raise RuntimeError("orchestrator leader lease lost") from exc
