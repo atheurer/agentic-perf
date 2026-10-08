@@ -313,6 +313,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     (
         "providers/resource/jumpstarter_images.py",
+        "_resolve_monthly_prefix",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_images.py",
         "resolve_image_urls",
         "cloud_resource",
     ),
@@ -2288,6 +2293,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_images.py:_resolve_latest_monthly",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_images.py",
+        "_resolve_monthly_prefix",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_images.py:_resolve_monthly_prefix",
         "2027-12-31",
     ),
     (
