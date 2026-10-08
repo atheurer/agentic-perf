@@ -1355,6 +1355,16 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 @mcp.tool()
 async def list_skill_docs(harness: str) -> str:
     """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    harness_root = (
+        harness.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
+    )
+    if harness_root == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     skill_dir = _SKILLS_DIR / harness
     if not skill_dir.is_dir():
         return json.dumps(
@@ -3090,6 +3100,7 @@ async def ensure_harness_installed(
 @mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
 async def get_skill_context(
     subject: str,
+    benchmark: str = "",
     operation: str = "bootstrap",
     ref: str = "",
     path: str = "",
@@ -3106,6 +3117,7 @@ async def get_skill_context(
         agent_name="provisioning-agent",
         phase="provisioning",
         subject=subject,
+        benchmark=benchmark,
         operation=operation,
         ref=ref,
         path=path,

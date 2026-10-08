@@ -5,6 +5,8 @@ skill gateway before constructing the run-file. Follow the returned pointers
 for the selected benchmark, endpoint, tools, and execution environment. Use
 `get_execution_config` for the approved execution settings view; verify runtime
 capabilities with the available controller discovery tools.
+When the benchmark name is known, include it in the bootstrap call so the
+gateway can apply any benchmark-specific project guidance.
 
 ### Benchmark-specific parameter guidance
 
@@ -40,6 +42,17 @@ validation confirms schema and parameter validation, not that every supplied
 argument is semantically needed. If the benchmark-specific documentation is
 unavailable or unclear, request clarification rather than infer arguments from
 a generic example.
+
+For soft guidance about the same claim, prefer authenticated user guidance,
+then organization guidance, upstream guidance, and finally bundled project-local
+guides. The bundled guides are temporary fallback material with the lowest
+default authority. Keep that preference order within its domain: installed
+controller/version evidence establishes Crucible runtime behavior, and upstream
+software documentation explains general software behavior. User preferences
+cannot override mandatory organization policy or deterministic security
+requirements. Compare local guides against higher sources and request
+clarification for material conflicts rather than silently treating local text as
+authoritative.
 
 ### Verified SSH Access
 

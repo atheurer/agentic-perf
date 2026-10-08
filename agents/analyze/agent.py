@@ -16,6 +16,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
@@ -41,7 +42,13 @@ class AnalyzeAgent(AgentBase):
         )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return ANALYZE_SYSTEM_PROMPT
+        prompt = ANALYZE_SYSTEM_PROMPT
+        harness = (
+            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
+        )
+        if harness.lower() == "crucible":
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
+        return prompt
 
     def _build_messages(
         self,
@@ -310,13 +317,20 @@ class AnalyzeAgent(AgentBase):
 
         harness = directives.get("harness", "")
         if harness:
-            parts.append(
-                f"**Harness:** {harness} — start by reading "
-                f"the investigation methodology skill: "
-                f"`list_skill_docs('{harness}')` then "
-                f"`read_skills(docs=[{{'harness': '{harness}', "
-                f"'filename': 'investigation-methodology.md'}}])`"
-            )
+            if harness.lower() == "crucible":
+                parts.append(
+                    "**Harness:** Crucible — retrieve applicable context through "
+                    "`get_skill_context(subject='harness/crucible', "
+                    "operation='bootstrap')`."
+                )
+            else:
+                parts.append(
+                    f"**Harness:** {harness} — start by reading "
+                    f"the investigation methodology skill: "
+                    f"`list_skill_docs('{harness}')` then "
+                    f"`read_skills(docs=[{{'harness': '{harness}', "
+                    f"'filename': 'investigation-methodology.md'}}])`"
+                )
             parts.append("")
 
         parts.append(

@@ -588,6 +588,17 @@ class BenchmarkAgent(AgentBase):
             "get_skill_context",
             "get_execution_config",
             "set_ssh_context",
+            # The Crucible prompt requires reuse of prior assignment artifacts
+            # and host discovery before building a run file.
+            "jq_file_from_workspace",
+            "grep_file_from_workspace",
+            "read_file_from_workspace",
+            "list_files_from_workspace",
+            "get_hardware_topology",
+            "get_cache_topology",
+            "check_hosts",
+            "test_port_connectivity",
+            "list_interfaces",
             "list_controller_userenvs",
             "verify_ssh_path",
             "setup_passwordless_ssh",

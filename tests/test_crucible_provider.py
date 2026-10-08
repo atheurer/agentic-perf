@@ -1439,6 +1439,26 @@ def test_build_skill_provider_never_resolves_crucible_source(tmp_path, monkeypat
     assert provider.get_provider("crucible") is None
 
 
+def test_build_skill_provider_exposes_manifest_scoped_project_docs():
+    from agents.server_utils import build_skill_provider
+
+    provider = build_skill_provider(resolve_source=False)
+    source = provider.project_context_source
+    assert source is not None
+    documents = source.list_documents(
+        harness="crucible",
+        phase="benchmark",
+        agent="benchmark-agent",
+    )
+    assert {item["provenance"]["entry_id"] for item in documents} == {
+        "crucible-benchmark-discovery",
+        "crucible-kube-endpoints",
+        "crucible-run-file-pitfalls",
+        "crucible-tool-params",
+        "crucible-userenv-guide",
+    }
+
+
 def test_build_skill_provider_catalog_only_registers_crucible_catalog(tmp_path):
     from agents.server_utils import build_skill_provider
 
@@ -1798,14 +1818,25 @@ class TestEndpointUserEnforcement:
 
 @pytest.mark.asyncio
 async def test_skill_gateway_mcp_schema_exposes_subject_scoped_request_fields():
+    import agents.analyze.server as analyze_server
     import agents.benchmark.server as benchmark_server
+    import agents.provisioning.server as provisioning_server
     import agents.review.server as review_server
+    import agents.triage.server as triage_server
 
-    for server in (benchmark_server, review_server):
+    for server in (
+        benchmark_server,
+        review_server,
+        triage_server,
+        provisioning_server,
+        analyze_server,
+    ):
         tools = await server.mcp.list_tools()
         tool = next(item for item in tools if item.name == "get_skill_context")
+        assert not any(item.name == "get_crucible_benchmark_context" for item in tools)
         assert set(tool.parameters["properties"]) == {
             "subject",
+            "benchmark",
             "operation",
             "ref",
             "path",
@@ -1860,7 +1891,7 @@ async def test_registered_skill_gateway_tool_includes_provider_runfile_contract(
 
     response = json.loads(
         await benchmark_server.get_skill_context(
-            subject="harness/crucible", operation="bootstrap"
+            subject="harness/crucible", benchmark="uperf", operation="bootstrap"
         )
     )
 
@@ -1873,6 +1904,7 @@ async def test_registered_skill_gateway_tool_includes_provider_runfile_contract(
     }
     assert "Use {} when no tags apply" in response["runfile_contract"]["guidance"]
     assert calls[0]["subject"] == "harness/crucible"
+    assert calls[0]["benchmark"] == "uperf"
     assert calls[0]["operation"] == "bootstrap"
 
 

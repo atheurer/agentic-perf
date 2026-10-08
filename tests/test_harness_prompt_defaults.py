@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agents.analyze.agent import AnalyzeAgent
 from agents.benchmark.agent import BenchmarkAgent
 from agents.provisioning.agent import ProvisioningAgent
 
@@ -53,6 +54,17 @@ def test_provisioning_crucible_prompt_with_default_or_explicit_harness(
 
     assert "## Provisioning Configuration and Host Scope" in prompt
     assert "get_skill_context" in prompt
+
+
+def test_analyze_crucible_prompt_uses_gateway_not_direct_skill_readers():
+    agent = AnalyzeAgent.__new__(AnalyzeAgent)
+    ticket = {"custom_fields": {"directives": {"harness": "crucible"}}}
+
+    prompt = agent._system_prompt(ticket)
+
+    assert 'get_skill_context(subject="harness/crucible"' in prompt
+    assert "bundled project-local docs" in prompt
+    assert "list_skill_docs` with the non-Crucible harness category" in prompt
 
 
 def test_non_crucible_ticket_keeps_available_harness_documentation_guidance():

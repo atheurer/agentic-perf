@@ -17,7 +17,8 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from agents.mcp_audit import create_ticket_mcp
-from agents.server_utils import read_skill_documents
+from agents.server_utils import build_skill_provider_async, read_skill_documents
+from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from providers.skills.base import HARNESS_ALIASES
 
 mcp = create_ticket_mcp("analyze-agent")
@@ -26,6 +27,17 @@ SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
 
 _STORE_URL = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
 _AUTH_TOKEN = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+_skill_provider = None
+
+
+async def _get_skill_provider():
+    global _skill_provider
+    if _skill_provider is None:
+        _skill_provider = await build_skill_provider_async(
+            resolve_source=False,
+            skill_phase="analyze",
+        )
+    return _skill_provider
 
 
 def _headers() -> dict[str, str]:
@@ -33,6 +45,36 @@ def _headers() -> dict[str, str]:
     if _AUTH_TOKEN:
         h["Authorization"] = f"Bearer {_AUTH_TOKEN}"
     return h
+
+
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    benchmark: str = "",
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    return await skill_context_gateway(
+        await _get_skill_provider(),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="analyze-agent",
+        phase="analyze",
+        subject=subject,
+        benchmark=benchmark,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
 
 
 @mcp.tool()
@@ -48,6 +90,16 @@ async def list_skill_docs(category: str) -> str:
     Args:
         category: Skill category (e.g., 'boot-time', 'jumpstarter').
     """
+    category_root = (
+        category.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
+    )
+    if category_root == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     skill_dir = SKILLS_DIR / category
     if not skill_dir.is_dir():
         return json.dumps(

@@ -196,8 +196,10 @@ def test_gateway_surfaces_conflicts_and_agents_can_raise_hitl(tmp_path: Path) ->
         "team-b",
     }
     assert "request_clarification" in SKILL_GATEWAY_TOOL_DESCRIPTION
-    assert "upstream context is a baseline" in SKILL_GATEWAY_TOOL_DESCRIPTION
-    assert "user context (when available)" in SKILL_GATEWAY_TOOL_DESCRIPTION
+    assert "authenticated user, organization, upstream, then the bundled" in (
+        SKILL_GATEWAY_TOOL_DESCRIPTION
+    )
+    assert "mandatory organization policy" in SKILL_GATEWAY_TOOL_DESCRIPTION
     assert "mandatory organization policy" in SKILL_GATEWAY_TOOL_DESCRIPTION
     assert "call request_clarification before submitting" in REVIEW_SYSTEM_PROMPT
     assert "does not break ties between peer sources" in REVIEW_SYSTEM_PROMPT

@@ -90,6 +90,7 @@ def _side_effecting(
 # names, rather than Python function names, make FastMCP aliases first-class.
 TOOL_AUDIT_POLICY = (
     *_read_only(
+        "agents/analyze/server.py:get_skill_context",
         "agents/analyze/server.py:read_skills",
         "agents/analyze/server.py:list_skill_docs",
         "agents/analyze/server.py:get_ticket_results",

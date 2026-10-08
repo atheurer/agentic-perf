@@ -71,19 +71,20 @@ flowchart LR
     Tools --> Secrets[Existing secret resolver]
 ```
 
-## Baseline before this migration
+## Current source wiring
 
-- Benchmark and review register `get_crucible_benchmark_context`, whose current
-  MCP implementation calls `controller_context_gateway` in
-  `agents/server_utils.py`. Its bootstrap reads the controller's `AGENTS.md`,
-  then agents follow documentation pointers using bounded reads and searches.
-- The older `CrucibleContextGateway` provider has a manifest-backed
-  `LocalContextSource`, but that adapter is not the organization overlay for
-  the current controller-direct MCP tool. `skills/context-manifest.json` also
-  has no entries.
-- The Crucible benchmark agent excludes legacy `read_skills` and repository
-  lookup tools. Review still advertises `skills/crucible/*.md`, exposes
-  `read_skills`, and requests local skills in its prompt.
+- Benchmark, review, triage, provisioning, and analysis register
+  `get_skill_context`. The gateway returns organization guidance, any applicable
+  bundled Crucible fallback docs, and phase-appropriate software references;
+  benchmark/review follow the controller's documentation pointers, and triage
+  retains bounded catalog discovery.
+- A manifest-backed `LocalContextSource` exposes the eight audited Crucible
+  guides through the model-facing gateway. Each retains a distinct project
+  scope, source id, content revision, and phase/agent/optional-benchmark filter.
+- Crucible benchmark scoping excludes legacy `read_skills` and repository
+  lookup tools. Review removes the direct Crucible document lookup tools and
+  uses the gateway. `read_skills` remains for other harnesses; direct Crucible
+  reads and listings are routed to the gateway across agents.
 - `PrivateSkillProvider` reads instance-wide JSON from `PRIVATE_SKILLS_DIR`,
   normally `$AGENTIC_PERF_HOME/private-skills`. Provisioning tools consume
   sections such as `provisioning`, `constraints`, `platform_contract`, and
@@ -167,18 +168,24 @@ relevance within that scope; authorization is enforced separately.
 Legacy documents can remain in the agentic-perf repository while their content
 is audited and moved. The gateway should expose such files through a built-in,
 read-only project source keyed by subject, with source id, path, phase/audience,
-and a revision tied to the installed agentic-perf version or commit. This source
+and a content revision over the manifest and mapped files (or the installed
+agentic-perf commit). This source
 is separate from administrator-configured organization paths and from software
 documentation. The gateway response must retain all of those identities so an
 agent can tell which local baseline it read and compare it with organization
 guidance and installed/upstream software references.
 
-This PR currently implements organization sources and the Crucible software
-adapter; it does not yet load arbitrary bundled `skills/<subject>/` files
-through the gateway. Add that project-source adapter before removing direct
-document readers for a subject whose needed material still exists only in the
-local repository. Keep direct readers only for subjects that have not yet
-completed this gateway cutover.
+The Crucible project-source adapter is now implemented for the documents listed
+in `skills/context-manifest.json`. It returns only the entries allowed for the
+current phase and agent, with an optional benchmark filter, and preserves
+project provenance in both the document inventory and a content-free
+`context_manifest`. It does not scan arbitrary files. Treat these bundled docs
+as a temporary fallback and the lowest default authority for overlapping soft
+guidance; compare them with user, organization, and upstream sources. The
+generic adapter and manifest scope for other `skills/<subject>/` directories
+remain migration work. Keep legacy readers only for subjects that have not
+completed the gateway cutover; Crucible benchmark and review use the gateway
+path.
 
 ## Administrator configuration
 
@@ -357,15 +364,17 @@ private repository.
 Use one shared tool definition, provisionally `get_skill_context`, for example:
 
 ```json
-{"subject":"harness/crucible","operation":"bootstrap"}
+{"subject":"harness/crucible","benchmark":"uperf","operation":"bootstrap"}
 {"subject":"harness/crucible","operation":"read","ref":"<returned-ref>"}
 {"subject":"harness/crucible","operation":"search","query":"ethtool|multiplex"}
 ```
 
-Bootstrap returns the applicable organization entrypoints and, when available
-for this phase, the software entrypoint. It reports each source's availability.
-Provisioning can bootstrap organization guidance before a controller exists.
-Benchmark and review can additionally bootstrap the controller's `AGENTS.md`.
+Bootstrap returns applicable project and organization entrypoints and, when
+available for this phase, the software entrypoint. It reports each source's
+availability and a content-free context manifest. Supplying a benchmark name
+allows project docs scoped to that benchmark to be included. Provisioning and
+analysis can bootstrap organization guidance without a controller. Benchmark
+and review can additionally bootstrap the controller's `AGENTS.md`.
 Required installed-runtime information remains a prerequisite for operations
 that depend on it; missing controller context does not become an inferred schema.
 
@@ -419,32 +428,31 @@ required to validate or execute a run.
 
 ## Priority and conflicts
 
-Use locality as an informative default for contextual claims and preferences,
-not as a universal authority ordering. Upstream context supplies baseline
-knowledge. Organization context is more local to the shared deployment and
-normally carries more weight for environment-specific procedures and defaults.
-Authenticated user context, when configured, is more local to that user and
-normally carries more weight for that user's preferences. Ticket text gives
-task-specific intent and can guide choices among soft defaults. Each source
-must still be evaluated for the scope of the claim it makes.
+For soft guidance addressing the same claim, the intended order is
+authenticated user, organization, upstream, then bundled project-local
+documents. Project-local documents are a temporary fallback and have the lowest
+default authority. Apply this order only within the scope each source owns.
+Installed controller/version evidence separately establishes behavior present
+on that system; upstream documentation describes general software behavior.
+Ticket text gives task-specific intent and can guide choices among compatible
+soft defaults.
 
 | Content | Resolution rule |
 | --- | --- |
-| Verified software/runtime facts | Runtime evidence and version-matched software documentation establish supported behavior. General upstream or local prose cannot change a schema or installed capability. |
-| Upstream context | Baseline knowledge, including general product and benchmark information. Use version-matched authoritative documentation for software behavior. |
-| Organization context | Applies to users of the configured instance. Normally takes precedence over upstream defaults for local procedures, environment details, and preferences. |
-| Authenticated user context | Applies only to that user's tickets. When available, normally takes precedence over organization defaults for personal preferences, unless those conflict with mandatory organization policy or verified behavior. |
+| Verified software/runtime facts | Installed controller/version evidence establishes what is present and works there. General upstream or local prose cannot change an observed schema or installed capability. |
+| Authenticated user context | Applies only to that user's tickets. For soft guidance, it takes precedence over organization, upstream, and bundled project-local guidance. It cannot override mandatory organization policy, deterministic security requirements, or verified runtime behavior. |
+| Organization context | Applies to users of the configured instance. For soft guidance, it takes precedence over upstream and bundled project-local defaults. |
+| Upstream context | Baseline knowledge, including general product and benchmark behavior. Use authoritative version-matched sources where available. |
+| Bundled project-local context | Temporary migration fallback, with the lowest default authority for overlapping soft guidance. It can still provide agentic-perf workflow contracts and identified gaps. |
 | Ticket guidance | Describes the current task and may select among compatible soft defaults or clarify which scoped source applies. It cannot waive mandatory policy or alter software capability. |
 | Hard requirements | Enforce through validated configuration or code. A Markdown instruction by itself is not a security or correctness boundary. |
 
-This feature implements multiple organization sources and the installed
-software/documentation source. Authenticated user-level skill sources are a
-future layer; the locality rule above defines the intended resolution behavior
-when they are added, and does not imply they are loaded today.
-
-Project scope is a future extension. Resolve project-specific defaults and
-requirements explicitly when implementing it; do not bake the previous
-conversation's tentative project/user ordering into the first release.
+This feature implements multiple organization sources, the installed
+software/documentation source, and the bundled Crucible project fallback.
+Authenticated user-level skill sources are a future layer; the order above
+defines intended resolution once they are implemented and does not imply user
+documents are loaded today. Mandatory organization policy and deterministic
+security controls remain constraints on user preferences.
 
 Documents remain distinct with scope, source id, revision, and role metadata.
 Arbitrary prose is not deep-merged. The gateway identifies exact duplicate
@@ -537,21 +545,24 @@ should apply only to that agentic-perf user.
 | `agents/provisioning/prompts/crucible.md` | Organization installation choices; software facts move to upstream references; agentic-perf tool/workflow contracts stay in prompts or code |
 | `agents/benchmark/prompts/crucible.md` | Organization benchmark defaults and practices; software facts move to upstream references; gateway/tool protocol and execution contracts stay in prompts or code |
 | Crucible sections in review/base prompts | Organization review practices where applicable; software facts move to upstream references; common reasoning stays in agent prompts |
-| `skills/crucible/*.md` | Audit by section; expose any needed interim local content through the project-scoped gateway source, then move software facts upstream, shared practices to organization scope, personal preferences to user scope when supported, and agentic-perf contracts to prompts/code |
+| `skills/crucible/*.md` | The eight audited guides are exposed through the Crucible project source; move software facts upstream, shared practices to organization scope, personal preferences to user scope when supported, and agentic-perf contracts to prompts/code |
 | Legacy private harness guidance | Classify by meaning and intended audience; organization or user documents only where that ownership is established |
 | Legacy private harness settings | Validated runtime config consumed through the same package resolver, implemented in this first slice |
 | Secret references in private settings | Service-consumed bindings to the existing secret resolver |
 | Controller `AGENTS.md`, schemas, benchmark/tool docs | Crucible software adapter inside the skill gateway |
 | Triage catalog discovery | Existing small catalog provider; it does not become a full controller bootstrap |
 
-The eight baseline public Crucible documents were `benchmark-discovery.md`,
+The eight baseline public Crucible documents are `benchmark-discovery.md`,
 `cdm-query-guide.md`, `kube-endpoints.md`, `result-parsing.md`,
 `review-methodology.md`, `run-file-pitfalls.md`, `tool-params.md`, and
-`userenv-guide.md`. Audit each document's advice against current prompts and
-installed-source responsibilities before moving it. Consolidate duplicates and
-resolve contradictory result-retrieval guidance. Prefer pointers to authoritative
-software documentation for software facts; preserve useful compatibility
-guidance with its reason and provenance.
+`userenv-guide.md`. They are now available as project-scoped, manifest-selected
+documents; their content has been narrowed to verified agentic-perf workflow and
+transitional guidance rather than static software manuals. Continue to review
+their advice against current prompts and installed-source responsibilities as
+replacement coverage grows. Consolidate duplicates and resolve contradictory
+result-retrieval guidance. Prefer pointers to authoritative software
+documentation for software facts; preserve useful compatibility guidance with
+its reason and provenance.
 
 ### Content audit and upstream documentation
 
@@ -637,19 +648,19 @@ and reported in diagnostics.
 
 ## Implementation status and rollout acceptance
 
-This local review draft implements the path and Git organization sources,
-subject discovery, gateway retrieval, and Crucible software adapter described
-above. Git accepts HTTP, HTTPS, and SSH branch URLs. Authentication can use the
+This branch implements the path and Git organization sources, subject
+discovery, gateway retrieval, the manifest-scoped Crucible project source, and
+the Crucible software adapter described above. Git accepts HTTP, HTTPS, and SSH branch URLs. Authentication can use the
 existing OpenSSH identity/agent, an HTTPS token secret reference, or an SSH key
 secret reference. Git fetches run through the audited subprocess provider;
 cache checkouts are independent of the mutable mirror, and ticket snapshots
 retain their pinned content. Configuration diagnostics validate Git descriptors
 offline and report only the host, ref, and authentication method. Runtime
 activation, a hosted private organization repository, and team onboarding remain
-pending review. The bundled project-document adapter described in the migration
-plan is not implemented in this draft. It is required before direct readers can
-be retired for subjects whose guidance still resides only in local files; this
-draft leaves non-Crucible legacy behavior in place.
+pending review. The bundled project-document adapter currently covers the
+Crucible documents listed in the manifest. Other subjects still need their own
+inventory, scope entries, and gateway cutover before their direct readers can
+be retired.
 
 Required checks before team rollout include:
 

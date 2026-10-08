@@ -332,7 +332,7 @@ class ReviewAgent(AgentBase):
         harness = self._effective_harness(
             directives, getattr(self, "_skill_provider", None)
         )
-        if harness == "crucible" and not cf.get("analysis_result"):
+        if harness == "crucible":
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
         if harness in ("arcaflow-plugins", "arcaflow-workflows"):
             if cf.get("benchmark_notes"):

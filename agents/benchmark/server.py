@@ -1369,6 +1369,7 @@ def _controller_snapshot_documents(
 @mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
 async def get_skill_context(
     subject: str,
+    benchmark: str = "",
     operation: str = "bootstrap",
     ref: str = "",
     path: str = "",
@@ -1387,6 +1388,7 @@ async def get_skill_context(
         ssh=_ssh,
         controller_host=_controller_host(),
         subject=subject,
+        benchmark=benchmark,
         operation=operation,
         ref=ref,
         path=path,

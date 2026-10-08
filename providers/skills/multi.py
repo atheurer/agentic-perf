@@ -4,6 +4,7 @@ from typing import Any
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
 from .gateway import OrganizationSkillResolver
+from .local_context import LocalContextSource
 from .private import PrivateSkillProvider
 
 
@@ -32,10 +33,12 @@ class MultiHarnessSkillProvider(SkillProvider):
         harnesses: dict[str, SkillProvider],
         private: PrivateSkillProvider | None = None,
         default_harness: str = "crucible",
+        project_context_source: LocalContextSource | None = None,
     ) -> None:
         self._harnesses = harnesses
         self._private = private or PrivateSkillProvider()
         self._default = default_harness
+        self._project_context_source = project_context_source
 
     @property
     def default_harness(self) -> str:
@@ -55,6 +58,11 @@ class MultiHarnessSkillProvider(SkillProvider):
     @property
     def organization_resolver(self) -> OrganizationSkillResolver:
         return self._private.organization_resolver
+
+    @property
+    def project_context_source(self) -> LocalContextSource | None:
+        """Return the manifest-scoped documents bundled with this project."""
+        return self._project_context_source
 
     def get_source_provenance(self, harness: str = "crucible") -> dict[str, Any]:
         """Return source resolution provenance for ticket recording."""

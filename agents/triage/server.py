@@ -48,6 +48,7 @@ async def _get_provider():
 @mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
 async def get_skill_context(
     subject: str,
+    benchmark: str = "",
     operation: str = "bootstrap",
     ref: str = "",
     path: str = "",
@@ -63,6 +64,7 @@ async def get_skill_context(
         agent_name="triage-agent",
         phase="triage",
         subject=subject,
+        benchmark=benchmark,
         operation=operation,
         ref=ref,
         path=path,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,28 @@ class LocalContextSource:
         if not isinstance(entries, list):
             return []
         return [entry for entry in entries if isinstance(entry, dict)]
+
+    def revision(self) -> str | None:
+        """Return a content revision for the manifest and its mapped files."""
+        try:
+            manifest = self.manifest_path.read_bytes()
+        except OSError:
+            return None
+        digest = hashlib.sha256(manifest)
+        mapped = []
+        for entry in self._entries():
+            safe = self._safe_path(entry.get("path", entry.get("file")))
+            if safe is not None:
+                mapped.append((safe[0], safe[1]))
+        try:
+            for relative, path in sorted(mapped, key=lambda item: item[0]):
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
+        except OSError:
+            return None
+        return digest.hexdigest()[:16]
 
     def _safe_path(self, relative: Any) -> tuple[str, Path] | None:
         if (
@@ -117,6 +140,7 @@ class LocalContextSource:
     ) -> list[dict[str, Any]]:
         """Return mapped documents matching the requested gateway scope."""
         documents: list[dict[str, Any]] = []
+        revision = self.revision()
         for index, entry in enumerate(self._entries()):
             if not self._matches_scope(
                 entry,
@@ -135,7 +159,7 @@ class LocalContextSource:
             provenance = {
                 "source": "local",
                 "source_reason": "explicit_manifest_entry",
-                "manifest": str(self.manifest_path),
+                "revision": revision,
                 "entry_id": entry_id,
                 "path": relative,
                 "harness": harness,
@@ -157,6 +181,7 @@ class LocalContextSource:
                     "authority": "supplemental",
                     "provenance": provenance,
                     "benchmark": entry.get("benchmark"),
+                    "entrypoint": bool(entry.get("entrypoint", False)),
                     "subject_area": entry.get(
                         "subject_area", entry.get("subjects", entry.get("subject"))
                     ),

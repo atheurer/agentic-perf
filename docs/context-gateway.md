@@ -5,12 +5,13 @@ subject-specific guidance and software references. It lets an agent request the
 knowledge relevant to its subject and phase, while the service controls which
 sources apply and preserves their scope and provenance.
 
-**Current status:** the active issue branch contains an implementation draft for
-administrator-managed organization sources and the initial `harness/crucible`
-subject. The wider migration across harnesses and other subjects is not complete.
-The bundled local-document gateway adapter is not implemented yet and is
-required before retiring direct readers for subjects that still need local
-files. Authenticated user-owned skill sources are future work. See
+**Current status:** the active branch implements administrator-managed
+organization sources, the initial `harness/crucible` subject, and a
+manifest-scoped project source for the eight audited Crucible workflow guides
+in this repository. The wider migration across harnesses and other subjects is
+not complete: the bundled project adapter currently serves Crucible only, and
+other subjects still need their sources inventoried and connected. Authenticated
+user-owned skill sources are future work. See
 [configuration](configuration.md#organization-skill-gateway) for current setup
 and [the detailed design](design-skill-gateway.md) for contracts and
 implementation boundaries.
@@ -56,15 +57,17 @@ received different instructions. A gateway helps by:
   sources support independently maintained repositories without adding a
   location setting for every subject.
 
-For contextual claims and preferences, locality is a useful default signal:
-upstream context is the baseline, organization context normally carries more
-weight for shared environment-specific practices, and authenticated user
-context is intended to carry more weight for that user's preferences. This is
-not a universal authority order. Verified software behavior and mandatory
-organization policy remain constraints, ticket text can clarify the task, and
-conflicts between sources at the same level have no implicit winner. If a
-material conflict remains unresolved, the agent should ask for human guidance
-and identify the competing sources.
+For soft guidance addressing the same claim, the intended order is
+authenticated user, organization, upstream, then bundled project-local
+documents. Project-local documents are a temporary fallback and have the lowest
+default authority. This order applies only within each source's domain:
+organization guidance sets shared practice, upstream references describe
+general software behavior, and installed controller/version evidence
+establishes behavior present on that system. A user preference cannot override
+mandatory organization policy or deterministic security requirements. Ticket
+text can clarify task intent but cannot waive those constraints. Sources at the
+same level have no implicit winner; unresolved material conflicts should reach
+HITL with the source ids and document paths.
 
 ## Examples: why this improves on separate readers
 
@@ -161,16 +164,18 @@ distinct from an administrator-configured local path: the former serves
 versioned project documentation, while the latter is an organization-owned
 source configured by the administrator.
 
-The gateway implementation described by this PR currently combines
-organization guidance with Crucible controller documentation and bounded
-Crucible catalog operations. It does not yet expose arbitrary bundled
-`skills/<subject>/` files as a project-scoped source. Add that adapter before
-retiring direct readers for a subject whose required guidance is still only in
-the local repository. This is a migration capability, not a reason to copy
-local files into an organization package.
+The gateway combines Crucible project guidance with organization guidance and
+controller documentation; triage also retains bounded Crucible catalog
+operations. The project adapter reads only documents explicitly listed in
+`skills/context-manifest.json` and scopes them by phase, agent, and optional
+benchmark. This first adapter handles Crucible; extending it to other
+`skills/<subject>/` directories remains part of the inventory and migration
+plan. Do not copy project workflow guides into an organization package unless
+their ownership audit says they are organization practices.
 
-For Crucible, the gateway currently combines organization guidance with the
-installed controller documentation where that phase has a controller. Triage
+For Crucible, the gateway currently combines manifest-scoped project guidance,
+organization guidance, and the installed controller documentation where that
+phase has a controller. Triage
 can use the bounded upstream Crucible catalog before a controller exists. A
 Crucible benchmark that uses a named workload can require both Crucible's
 benchmark integration documentation and, when needed, the native workload's
@@ -209,13 +214,15 @@ copy upstream documentation into an organization package merely because it is
 convenient. Keep private organization content and its detailed migration
 inventory in administrator-controlled storage; the public repository should
 describe generic contracts and link to authoritative software documentation.
+Track the full file-to-subject-to-agent inventory and migration sequence in
+[issue #1153](https://github.com/atheurer/agentic-perf/issues/1153).
 
 ### 3. Bridge local documents through the gateway
 
 Keep useful local documents in the project while their content is being
 verified and moved. Register them as a distinct project-scoped source, with a
-stable source id, local path, applicable subject/phase, and revision tied to the
-installed agentic-perf version or commit. The gateway should return these
+stable source id, local path, applicable subject/phase, and content revision
+over the manifest and mapped files (or the installed agentic-perf commit). The gateway should return these
 documents alongside applicable organization and software references, preserving
 their source and revision. Do not label bundled project material as
 organization-owned guidance or let repository ordering resolve conflicts.
@@ -279,18 +286,20 @@ user sources at the same level still need HITL when material and unresolved.
 
 ## Crucible is the first migration, not the final coverage
 
-The current issue's implementation draft supports one or more administrator
-organization sources (local paths or Git URLs), subject discovery, source
-provenance, duplicate and same-path conflict reporting, and ticket-scoped
-organization snapshots. The Crucible subject also retains phase-appropriate
-software sources: the installed controller documentation for benchmark/review
-and bounded upstream catalog tools for triage. Conflicting organization runtime
-configurations are configuration errors rather than merge candidates.
+The current branch supports one or more administrator organization sources
+(local paths or Git URLs), subject discovery, source provenance, duplicate and
+same-path conflict reporting, and ticket-scoped organization snapshots. For
+Crucible, it also routes eight audited local guides through a manifest-scoped
+project source, alongside phase-appropriate installed controller references
+for benchmark/review and bounded upstream catalog tools for triage. Conflicting
+organization runtime configurations are configuration errors rather than merge
+candidates.
 
 This does **not** mean that all agentic-perf context already uses the gateway.
-Other harnesses still have existing skill-provider, local-document, prompt, or
-private-settings paths. A gateway adapter for bundled local documents,
-user-owned packages, native workload software adapters beyond the current
-Crucible sources, and migration of every other subject remain future work. The
-[detailed design](design-skill-gateway.md) tracks the Crucible migration
-inventory and the checks required before rollout.
+Other harnesses and subjects still have existing skill-provider,
+local-document, prompt, or private-settings paths. Extending the project source
+to their manifests, adding user-owned packages, adding native workload software
+adapters beyond the current Crucible sources, and migrating each remaining
+subject are future work. [Issue #1153](https://github.com/atheurer/agentic-perf/issues/1153)
+tracks the detailed inventory and checks required before rollout; the
+[design](design-skill-gateway.md) describes the source contracts.
