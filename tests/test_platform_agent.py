@@ -196,6 +196,7 @@ class TestPlatformAgent:
             fields = mock_fields.call_args[0][1]
             assert fields["platform_ready"] is True
             assert fields["hosts_provisioned"] == ["10.0.0.1"]
+            assert fields["platform_board"] == "rcar-05"
             agent._transition_ticket.assert_called_once()
             assert agent._transition_ticket.call_args[0][1] == "awaiting_provision"
 
@@ -226,10 +227,18 @@ class TestPlatformAgent:
                 agent,
                 "_get_ticket",
                 new_callable=AsyncMock,
-                return_value={"custom_fields": {}},
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "aws",
+                        "resource_provider_metadata": {
+                            "exporter_name": "must-not-be-used",
+                        },
+                    },
+                },
             ),
         ):
             await agent._handle_completion("T-1", response)
+            assert "platform_board" not in agent._update_fields.call_args.args[1]
             assert (
                 agent._transition_ticket.call_args[0][1] == "awaiting_customer_guidance"
             )
@@ -274,6 +283,60 @@ class TestPlatformAgent:
         ):
             await agent._handle_completion("T-1", response)
             assert agent._transition_ticket.call_args[0][1] == "coordinating_fleet"
+
+    async def test_handle_completion_failure_fleet_uses_jumpstarter_exporter(self):
+        """An early Jumpstarter failure still records the ticket's board."""
+        agent = self._make_agent()
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={
+                    "platform_ready": False,
+                    "diagnostics": "Image provisioning failed",
+                },
+            )
+        ]
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {
+                    "exporter_name": "board-03",
+                },
+                "fleet_investigation": {
+                    "enabled": True,
+                    "tested_hosts": [],
+                },
+            },
+        }
+
+        with (
+            patch.object(
+                agent, "_update_fields", new_callable=AsyncMock
+            ) as update_fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ) as transition,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value=ticket,
+            ) as get_ticket,
+        ):
+            await agent._handle_completion("T-1", response)
+
+        assert update_fields.call_args.args[1]["platform_board"] == "board-03"
+        transition.assert_awaited_once_with(
+            "T-1",
+            "coordinating_fleet",
+            comment="Fleet: board-03 provisioning failed, coordinating",
+        )
+        get_ticket.assert_awaited_once_with("T-1")
 
 
 class TestProvisionJumpstarter:

@@ -185,6 +185,7 @@ class PlatformAgent(AgentBase):
 
         platform_ready = result.get("platform_ready", False)
         hosts = result.get("hosts_provisioned", [])
+        ticket: dict[str, Any] | None = None
 
         fields: dict[str, Any] = {
             "platform_ready": platform_ready,
@@ -199,7 +200,7 @@ class PlatformAgent(AgentBase):
                 ticket = await self._get_ticket(ticket_id)
                 provider = ticket.get("custom_fields", {}).get("resource_provider", "")
             except Exception:
-                ticket = {}
+                ticket = None
                 provider = ""
             if provider == "jumpstarter":
                 cf = ticket.get("custom_fields", {})
@@ -234,6 +235,25 @@ class PlatformAgent(AgentBase):
             fields["ssh_key_path"] = result["ssh_key_path"]
         if result.get("board_name"):
             fields["platform_board"] = result["board_name"]
+
+        board = result.get("board_name", "unknown")
+        if not platform_ready:
+            # The ticket owns the authoritative Jumpstarter exporter name.
+            # Early provisioning failures may not return a board name.
+            if ticket is None:
+                ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if (
+                "board_name" not in result
+                and cf.get("resource_provider") == "jumpstarter"
+            ):
+                board = (
+                    cf.get("resource_provider_metadata", {}).get("exporter_name")
+                    or "unknown"
+                )
+                if board != "unknown":
+                    fields["platform_board"] = board
+
         if result.get("flash_duration_s"):
             fields["platform_flash_duration_s"] = result["flash_duration_s"]
         if result.get("boot_duration_s"):
@@ -259,7 +279,6 @@ class PlatformAgent(AgentBase):
                 )
         else:
             diag = result.get("diagnostics", "No details")
-            board = result.get("board_name", "unknown")
             summary = f"**Platform Setup Failed**\n\n- **Diagnostics:** {diag}\n"
             if board != "unknown":
                 summary += f"- **Board:** {board}\n"
@@ -269,7 +288,6 @@ class PlatformAgent(AgentBase):
             # recording and routing to next board.
             from providers.fleet import is_fleet_investigation
 
-            ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
             if is_fleet_investigation(cf):
                 await self._transition_ticket(
