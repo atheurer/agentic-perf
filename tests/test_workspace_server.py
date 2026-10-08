@@ -100,6 +100,22 @@ async def test_mcp_grep_compact_json_multiple_matches(ws_env):
     assert resp["total_matches"] >= 3
 
 
+async def test_mcp_grep_deep_compact_json_keeps_match_visible(ws_env):
+    """Deep JSON indentation must not hide a matched value behind truncation."""
+    compact = "[" * 1200 + '"deep-marker"' + "]" * 1200
+    ws_env.save_file("deep.json", compact)
+
+    raw_resp = await ws_server.grep_file_from_workspace(
+        file_ref="workspace://deep.json", pattern="deep-marker"
+    )
+    resp = json.loads(raw_resp)
+
+    assert resp["status"] == "ok"
+    assert resp["total_matches"] == 1
+    assert "deep-marker" in resp["lines"][0]["content"]
+    assert not resp["lines"][0].get("truncated", False)
+
+
 async def test_mcp_grep_normal_multiline_file_unaffected(ws_env):
     """Normal multi-line text files should not be affected by the
     compact JSON pretty-print logic."""

@@ -956,28 +956,29 @@ class WorkspaceManager:
 
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                raw_text = f.read()
+                lines = f.readlines()
         except OSError as e:
             return {
                 "status": "error",
                 "error": f"Failed reading file: {e}",
             }
 
-        lines_raw = raw_text.split("\n")
         # Detect compact / minified JSON: very few lines but large content.
         # Pretty-print so grep returns individual fields, not the whole blob.
         if (
-            len(lines_raw) <= 5
-            and len(raw_text) > self._GREP_LINE_LIMIT
-            and path.suffix == ".json"
+            path.suffix == ".json"
+            and len(lines) <= 5
+            and sum(len(line) for line in lines) > self._GREP_LINE_LIMIT
         ):
             try:
-                parsed = json.loads(raw_text)
-                raw_text = json.dumps(parsed, indent=2, ensure_ascii=False)
-            except (json.JSONDecodeError, ValueError):
+                parsed = json.loads("".join(lines))
+                # Zero-width indentation still separates fields onto lines
+                # without creating overlong whitespace at deep nesting levels.
+                lines = json.dumps(parsed, indent=0, ensure_ascii=False).splitlines(
+                    True
+                )
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 pass  # not valid JSON, grep original content
-
-        lines = raw_text.splitlines(True)
 
         matches: list[dict[str, Any]] = []
         matching_indices = [i for i, line in enumerate(lines) if compiled.search(line)]
