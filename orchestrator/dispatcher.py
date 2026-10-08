@@ -474,7 +474,7 @@ class Dispatcher:
         self._tasks.pop(ticket_id, None)
         getattr(self, "_task_statuses", {}).pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
-        self._stopped_tickets.discard(ticket_id)
+        getattr(self, "_stopped_tickets", set()).discard(ticket_id)
         self.stop_renewal(ticket_id)
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
