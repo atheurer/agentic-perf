@@ -496,9 +496,9 @@ _MONTH_NAMES: dict[str, str] = {
 # Used to detect when a ticket description references a
 # specific date but triage emitted a bare "monthly" release.
 _DATE_REFERENCE_RE = re.compile(
-    r"(?:"
+    r"\b(?:"
     + "|".join(rf"(?:{m[:3]}(?:{re.escape(m[3:])})?)" for m in _MONTH_NAMES)
-    + r")(?:\s+\d{4})?"
+    + r")\b(?:\s+\d{4}|\s+(?:monthly|build|image|release))"
     + r"|\b20\d{2}(?:0[1-9]|1[0-2])\d{0,8}\b",
     re.IGNORECASE,
 )
