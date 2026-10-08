@@ -64,6 +64,52 @@ conflicts between sources at the same level have no implicit winner. If a
 material conflict remains unresolved, the agent should ask for human guidance
 and identify the competing sources.
 
+## Examples: why this improves on separate readers
+
+### One task needs several kinds of knowledge
+
+**Before:** Each agent or phase can load a different subset of prompt text,
+local skills, and software documentation. It can be hard to tell whether a
+difference comes from the source, the installed version, or that agent's
+retrieval path.
+
+**With the gateway:** The agent requests a subject such as `harness/crucible`.
+The service returns applicable organization and installed-software sources with
+their scope and provenance kept distinct. Deterministic tools still enforce
+schemas and runtime behavior.
+
+### Two organization sources disagree
+
+**Before:** Guidance may be copied together or one reader may happen to win,
+hiding where the advice came from.
+
+**With the gateway:** The response preserves each source. It identifies
+duplicates, surfaces conflicting material, and does not use source order to
+choose a winner. Unresolved material conflicts can go to HITL; runtime
+configuration conflicts block use.
+
+### A ticket passes from execution to review while guidance changes
+
+**Before:** A later phase may read a newer copy than the phase being reviewed,
+making the result hard to reproduce.
+
+**With the gateway:** The ticket uses its captured organization revision across
+phases. New tickets can capture later revisions.
+
+### A new installation needs organization guidance
+
+**Before:** Administrators may need to provision local files or per-topic paths
+on every install, creating dependencies that are easy to miss.
+
+**With the gateway:** The administrator configures the organization source once.
+The gateway discovers subjects by the documented directory layout and reports
+source availability.
+
+These examples describe retrieval and source-management behavior, not a claim
+that the gateway replaces all tools. Agents still use typed APIs for live ticket
+state, execution, metrics, and large artifacts, and installed software remains
+authoritative for what it can actually do.
+
 ## What belongs behind the gateway
 
 Use the gateway for reusable instructions and reference material whose
