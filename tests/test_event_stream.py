@@ -349,6 +349,41 @@ class TestTranscriptEndpoint:
         assert data["ticket"]["summary"] == "quiet"
 
 
+class TestEventsEndpoint:
+    def test_latest_seq_is_max_cursor_for_display_sorted_page(self, app, event_bus):
+        from datetime import datetime, timezone
+
+        from fastapi.testclient import TestClient
+
+        from providers.event_projection import legacy_to_trace
+
+        tid = "PERF-EVENT-PAGE"
+        trace_events = [
+            legacy_to_trace(tid, "agent", name, {}).model_copy(
+                update={"occurred_at": timestamp}
+            )
+            for name, timestamp in (
+                ("first", datetime(2024, 1, 1, 12, tzinfo=timezone.utc)),
+                ("second", datetime(2024, 1, 1, 10, tzinfo=timezone.utc)),
+                ("third", datetime(2024, 1, 1, 11, tzinfo=timezone.utc)),
+            )
+        ]
+        for event in trace_events:
+            event_bus._trace_store.insert_event(event)
+
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {app.state.api_token}"
+            page = client.get(f"/api/v1/tickets/{tid}/events?limit=2").json()
+            assert [event["seq"] for event in page["events"]] == [2, 1]
+            assert page["latest_seq"] == 2
+
+            next_page = client.get(
+                f"/api/v1/tickets/{tid}/events?since={page['latest_seq']}&limit=2"
+            ).json()
+        assert [event["seq"] for event in next_page["events"]] == [3]
+        assert next_page["latest_seq"] == 3
+
+
 class TestPollEventsInternal:
     """Unit tests for the internal _poll_events function."""
 
@@ -369,6 +404,33 @@ class TestPollEventsInternal:
         events = _poll_events(event_bus, [tid], cursors, None)
         assert len(events) == 2
         assert all(e["seq"] > 2 for e in events)
+
+    def test_poll_delivers_backdated_event_after_saved_cursor_once(self, event_bus):
+        from datetime import datetime, timezone
+
+        from providers.event_projection import legacy_to_trace
+        from state_store.api.stream import _poll_events
+
+        tid = "PERF-POLL-BACKDATED"
+        original = event_bus.emit(tid, "agent", "tool_called", {})
+        cursors = {tid: original.seq}
+        before = event_bus.get_events(tid, since=0, limit=100)
+        late = legacy_to_trace(tid, "agent", "tool_result", {}).model_copy(
+            update={"occurred_at": datetime(1999, 1, 1, tzinfo=timezone.utc)}
+        )
+        event_bus._trace_store.insert_event(late)
+
+        new_events = _poll_events(event_bus, [tid], cursors, None)
+        assert [event["event_type"] for event in new_events] == ["tool_result"]
+        assert [event["seq"] for event in new_events] == [2]
+        assert cursors[tid] == 2
+        assert _poll_events(event_bus, [tid], cursors, None) == []
+
+        after = event_bus.get_events(tid, since=0, limit=100)
+        original_after = next(
+            event for event in after if event["event_type"] == "tool_called"
+        )
+        assert original_after["seq"] == before[0]["seq"] == original.seq
 
     def test_poll_with_type_filter(self, event_bus, ticket_with_events):
         from state_store.api.stream import _poll_events

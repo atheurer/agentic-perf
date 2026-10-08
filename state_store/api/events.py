@@ -31,7 +31,7 @@ def get_events(
     if event_bus is None:
         return {"events": [], "latest_seq": 0, "terminal_events": []}
     events = event_bus.get_events(ticket_id, since=since, limit=limit)
-    latest_seq = events[-1]["seq"] if events else since
+    latest_seq = max((event["seq"] for event in events), default=since)
     terminal_events = event_bus.get_terminal_events(ticket_id)
     return {
         "events": events,

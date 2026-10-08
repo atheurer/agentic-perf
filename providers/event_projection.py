@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from providers.tracing import (
@@ -102,18 +102,34 @@ def trace_to_audit(event: TraceEventV1) -> dict[str, Any] | None:
     }
 
 
-def event_order_key(event: dict[str, Any]) -> tuple[str, int, int]:
-    """Sort merged events chronologically by timestamp.
+def event_order_key(event: dict[str, Any]) -> tuple[int, datetime, str, int, int]:
+    """Sort display events by timestamp while comparing instants in UTC.
 
-    Primary key is the ISO-8601 UTC timestamp so that events from
-    different sources (legacy JSONL, trace store) appear in the order
-    they actually occurred, regardless of insertion sequence.
-
-    Ties are broken by source identity (legacy before canonical) and
-    then by the persisted sequence number within that source.
+    Naive timestamps are interpreted as UTC. Malformed or missing timestamps
+    sort after parseable timestamps, using their original text as a stable
+    fallback. Ties are broken by source identity (legacy before canonical)
+    and then by the cursor sequence.
     """
+    raw_timestamp = event.get("timestamp", "")
+    timestamp_text = raw_timestamp if isinstance(raw_timestamp, str) else ""
+    try:
+        parsed = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is None:
+        timestamp_key = (1, datetime.min.replace(tzinfo=timezone.utc), timestamp_text)
+    else:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp_key = (0, parsed.astimezone(timezone.utc), "")
+
+    try:
+        seq = int(event.get("seq", 0))
+    except (TypeError, ValueError):
+        seq = 0
     return (
-        event.get("timestamp", ""),
+        *timestamp_key,
         0 if event.get("schema_version") == "legacy_uncorrelated" else 1,
-        event.get("seq", 0),
+        seq,
     )

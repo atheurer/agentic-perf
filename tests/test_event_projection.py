@@ -102,9 +102,9 @@ def test_backdated_trace_sorts_chronologically(tmp_path: Path) -> None:
         bus._trace_store.insert_event(backdated)
         all_events = bus.get_events(ticket_id, since=0, limit=100)
         types = [event["event_type"] for event in all_events]
-        # Backdated event (1999) sorts before legacy (2020) and live (~now)
+        # Display order is chronological, while seq remains source ordered.
         assert types == ["tool_result", "llm_request", "tool_called"]
-        assert [event["seq"] for event in all_events] == [1, 2, 3]
+        assert [event["seq"] for event in all_events] == [3, 1, 2]
     finally:
         bus.close()
 
@@ -301,6 +301,7 @@ def test_events_sorted_by_timestamp_across_sources(tmp_path: Path) -> None:
             "llm_request",
             "tool_result",
         ]
+        assert [e["seq"] for e in events] == [1, 3, 2]
     finally:
         bus.close()
 
@@ -324,6 +325,21 @@ def test_event_order_key_sorts_by_timestamp() -> None:
         "2024-06-01T11:00:00+00:00",
         "2024-06-01T12:00:00+00:00",
     ]
+
+
+def test_event_order_key_normalizes_offsets_and_handles_timestamp_fallbacks() -> None:
+    from providers.event_projection import event_order_key
+
+    events = [
+        {"timestamp": "2024-06-01T08:00:00+00:00", "seq": 4},
+        {"timestamp": "2024-06-01T04:00:00-04:00", "seq": 3},
+        {"timestamp": "2024-06-01T07:30:00Z", "seq": 2},
+        {"timestamp": "2024-06-01T08:15:00", "seq": 5},
+        {"timestamp": "not-a-timestamp", "seq": 6},
+    ]
+
+    sorted_events = sorted(events, key=event_order_key)
+    assert [event["seq"] for event in sorted_events] == [2, 3, 4, 5, 6]
 
 
 def test_same_timestamp_tiebreak_legacy_before_trace() -> None:

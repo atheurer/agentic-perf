@@ -189,8 +189,8 @@ class EventBus:
         self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
         self._legacy_usage_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
         self._legacy_usage_cache_lock = threading.Lock()
-        # Per-ticket merged event cache.  Each entry is
-        # (jsonl_mtime_ns, jsonl_size, trace_count, merged_events)
+        # Per-ticket merged event cache. Each entry is
+        # (jsonl_mtime_ns, jsonl_size, trace_count, cursor_ordered_events)
         # and invalidates when the JSONL file or trace store changes.
         # Bounded to _MAX_CACHED_TICKETS to prevent unbounded growth.
         self._merged_event_cache: dict[
@@ -511,7 +511,11 @@ class EventBus:
                 trace_to_legacy(event)
                 for event in self._trace_store.list_events(ticket_id)
             ]
-        merged = sorted(legacy + traces, key=event_order_key)
+        # Cursor values follow each source's immutable sequence: JSONL line
+        # order first, then the trace store's per-ticket insertion order. New
+        # backdated traces therefore cannot renumber events already delivered.
+        traces.sort(key=lambda item: item["seq"])
+        merged = legacy + traces
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
 
@@ -535,10 +539,17 @@ class EventBus:
         since: int = 0,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
+        """Return the next cursor page in chronological display order.
+
+        Cursor selection happens before display sorting so a late or backdated
+        event cannot move an already delivered event across the ``since``
+        boundary. Callers should advance to the greatest returned ``seq``.
+        """
         merged = self._get_merged_events(ticket_id)
-        # Return shallow copies — callers (e.g. api/stream.py)
-        # may mutate the dicts, which would corrupt the cache.
-        return [dict(item) for item in merged if item["seq"] > since][:limit]
+        # Select by stable cursor before sorting for display. Return shallow
+        # copies because callers (e.g. api/stream.py) may mutate the dicts.
+        page = [dict(item) for item in merged if item["seq"] > since][:limit]
+        return sorted(page, key=event_order_key)
 
     def get_usage_events(
         self,
