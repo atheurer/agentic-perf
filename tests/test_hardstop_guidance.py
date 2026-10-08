@@ -184,8 +184,8 @@ class TestHardstopGuidanceIntegration:
             "custom_fields": {},
         }
         mock_client.get = AsyncMock(return_value=ticket_response)
-        mock_client.patch = AsyncMock()
-        mock_client.post = AsyncMock()
+        mock_client.patch = AsyncMock(return_value=MagicMock())
+        mock_client.post = AsyncMock(return_value=MagicMock())
 
         with patch(
             "orchestrator.main.AuditedAsyncHTTPClient",
@@ -274,14 +274,19 @@ class TestHardstopGuidanceIntegration:
         mock_client.post.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_active_hard_stop_keeps_ticket_force_closed(self, app, store):
+    async def test_active_hard_stop_keeps_ticket_force_closed(self, tmp_path):
         """The real stop path still closes the ticket after cancelling its agent."""
         import httpx
 
         from orchestrator.dispatcher import Dispatcher
         from orchestrator.main import _process_stop_requests, run_agent_task
+        from state_store.main import create_app
         from state_store.models import CreateTicketRequest, TransitionRequest
+        from state_store.store import TicketStore
 
+        store = TicketStore(persist_dir=tmp_path)
+        app = create_app(initialize_immediately=True)
+        app.state.store = store
         ticket = store.create_ticket(
             CreateTicketRequest(summary="active hard stop", description="test")
         )
