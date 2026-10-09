@@ -21,6 +21,86 @@ from orchestrator.retry_guard import (
 )
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("sample_count", True, None),
+        ("reboot_count", 0, None),
+        ("sample_count", 2.0, 2),
+        ("reboot_count", "3", 3),
+    ],
+)
+def test_invalid_sample_counts_are_removed_from_triage_payload(
+    key: str, value: object, expected: int | None
+) -> None:
+    from orchestrator.main import _directives_for_triage
+    from providers.directives import normalize_directives
+    from providers.skills import boot_time  # noqa: F401
+
+    normalized, _applied, unrecognized = normalize_directives({key: value})
+    triage_directives = _directives_for_triage(normalized, unrecognized)
+
+    if expected is None:
+        assert normalized["sample_count"] == value
+        assert "sample_count" not in triage_directives
+        assert any("expected an integer" in note for note in unrecognized)
+    else:
+        assert triage_directives["sample_count"] == expected
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_directive_patch_waits_for_canonical_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+    from providers.execution import AmbiguousHTTPReplayError
+
+    raw = {"power_off_delay_seconds": 5, "unknown_option": "keep"}
+    canonical = {"power_off_delay": 5, "unknown_option": "keep"}
+    delivery_states = {}
+    events = MagicMock()
+
+    class Client:
+        patch_calls = 0
+        post_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            self.patch_calls += 1
+            raise AmbiguousHTTPReplayError(
+                "response lost", request=httpx.Request("PATCH", url)
+            )
+
+        async def post(self, url, *, json):
+            self.post_calls += 1
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+
+    first_directives, first_ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-ambiguous", raw, events, delivery_states
+    )
+    assert first_directives == {}
+    assert first_ready is False
+    events.emit.assert_not_called()
+    assert client.post_calls == 0
+
+    next_directives, next_ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-ambiguous", canonical, events, delivery_states
+    )
+    assert next_ready is True
+    assert next_directives == canonical
+    assert client.patch_calls == 1
+    assert client.post_calls == 1
+    events.emit.assert_called_once()
+
+
 def test_handoff_backoff_is_exponential_and_bounded() -> None:
     custom_fields: dict = {}
     delays = []
@@ -383,7 +463,17 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_path",
-    ["none", "event", "comment", "event_exhausted", "comment_exhausted"],
+    [
+        "none",
+        "event",
+        "comment_response",
+        "comment_pre_send",
+        "comment_pre_send_exhausted",
+        "comment_ambiguous",
+        "event_exhausted",
+        "patch_response",
+        "patch_ambiguous",
+    ],
 )
 async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     monkeypatch: pytest.MonkeyPatch,
@@ -391,6 +481,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
 ) -> None:
     import orchestrator.main as main
     from orchestrator.config import OrchestratorConfig
+    from providers.execution import AmbiguousHTTPReplayError
     from providers.tracing import (
         bind_trace_context,
         current_trace_context,
@@ -429,6 +520,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     request_contexts = []
     comment_bodies = []
     comment_statuses = []
+    patch_statuses = []
 
     class Client:
         async def __aenter__(self):
@@ -439,6 +531,18 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
 
         async def patch(self, url, *, json):
             request_contexts.append(("PATCH", current_trace_context().ticket_id))
+            if failure_path == "patch_response":
+                patch_statuses.append(503)
+                return httpx.Response(503, request=httpx.Request("PATCH", url))
+            if failure_path == "patch_ambiguous" and not patch_statuses:
+                patch_statuses.append("ambiguous")
+                ticket["custom_fields"]["directives"] = deepcopy(
+                    json["fields"]["directives"]
+                )
+                raise AmbiguousHTTPReplayError(
+                    "after send", request=httpx.Request("PATCH", url)
+                )
+            patch_statuses.append(200)
             ticket["custom_fields"]["directives"] = deepcopy(
                 json["fields"]["directives"]
             )
@@ -447,9 +551,17 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
         async def post(self, url, *, json):
             request_contexts.append(("POST", current_trace_context().ticket_id))
             comment_bodies.append(json["body"])
-            comment_fails = failure_path == "comment" and not comment_statuses
-            comment_fails = comment_fails or failure_path == "comment_exhausted"
-            status_code = 503 if comment_fails else 200
+            request = httpx.Request("POST", url)
+            if failure_path == "comment_pre_send" and not comment_statuses:
+                comment_statuses.append("connect_error")
+                raise httpx.ConnectError("connection failed", request=request)
+            if failure_path == "comment_pre_send_exhausted":
+                comment_statuses.append("connect_error")
+                raise httpx.ConnectError("connection failed", request=request)
+            if failure_path == "comment_ambiguous":
+                comment_statuses.append("ambiguous")
+                raise AmbiguousHTTPReplayError("after send", request=request)
+            status_code = 503 if failure_path == "comment_response" else 200
             comment_statuses.append(status_code)
             return httpx.Response(status_code, request=httpx.Request("POST", url))
 
@@ -487,7 +599,11 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     async def fetch(_url):
         nonlocal fetch_count
         fetch_count += 1
-        required_polls = 5 if failure_path.endswith("_exhausted") else 3
+        required_polls = (
+            5
+            if failure_path.endswith("_exhausted") or failure_path == "patch_response"
+            else 3
+        )
         if fetch_count >= required_polls:
             third_poll.set()
         return [deepcopy(ticket)]
@@ -517,35 +633,55 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     )
     try:
         await asyncio.wait_for(third_poll.wait(), timeout=5)
-        expected_contexts = [
-            ("PATCH", "PERF-normalize"),
-            ("POST", "PERF-normalize"),
-        ]
+        patch_failed = failure_path == "patch_response"
+        expected_patches = 5 if patch_failed else 1
         expected_comment_attempts = {
-            "comment": 2,
-            "comment_exhausted": 3,
-        }.get(failure_path, 1)
-        expected_contexts.extend(
-            [("POST", "PERF-normalize") for _ in range(expected_comment_attempts - 1)]
-        )
+            "comment_pre_send": 2,
+            "comment_pre_send_exhausted": 3,
+            "comment_ambiguous": 1,
+            "comment_response": 1,
+        }.get(failure_path, 0 if patch_failed else 1)
+        expected_contexts = [("PATCH", "PERF-normalize")] * expected_patches
+        if not patch_failed:
+            expected_contexts.append(("POST", "PERF-normalize"))
+            expected_contexts.extend(
+                [
+                    ("POST", "PERF-normalize")
+                    for _ in range(expected_comment_attempts - 1)
+                ]
+            )
         assert request_contexts == expected_contexts
         expected_event_attempts = {
             "event": 2,
             "event_exhausted": 3,
-        }.get(failure_path, 1)
+        }.get(failure_path, 0 if patch_failed else 1)
         assert events.emit.call_count == expected_event_attempts
-        assert len(set(comment_bodies)) == 1
+        assert len(set(comment_bodies)) <= 1
         expected_comment_statuses = {
-            "comment": [503, 200],
-            "comment_exhausted": [503, 503, 503],
-        }.get(failure_path, [200])
+            "comment_response": [503],
+            "comment_pre_send": ["connect_error", 200],
+            "comment_pre_send_exhausted": [
+                "connect_error",
+                "connect_error",
+                "connect_error",
+            ],
+            "comment_ambiguous": ["ambiguous"],
+        }.get(failure_path, [] if patch_failed else [200])
         assert comment_statuses == expected_comment_statuses
-        assert ticket["custom_fields"]["directives"] == {
-            "power_off_delay": 5,
-            "sample_count": 3,
-            "misspelled_directive": "value",
-        }
-        assert "converted to an integer" in comment_bodies[0]
+        if patch_failed:
+            assert ticket["custom_fields"]["directives"] == {
+                "power_off_delay_seconds": 5,
+                "sample_count": "3",
+                "misspelled_directive": "value",
+            }
+            dispatcher.try_claim.assert_not_called()
+        else:
+            assert ticket["custom_fields"]["directives"] == {
+                "power_off_delay": 5,
+                "sample_count": 3,
+                "misspelled_directive": "value",
+            }
+            assert "converted to an integer" in comment_bodies[0]
         for call in events.emit.call_args_list[1:]:
             assert events.emit.call_args_list[0].args == call.args
     finally:

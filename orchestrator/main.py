@@ -13,11 +13,17 @@ import sys
 import time
 from typing import Any
 
+import httpx
+
 from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
-from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
+from providers.execution import (
+    AmbiguousHTTPReplayError,
+    AuditedAsyncHTTPClient,
+    AuditedSubprocessRunner,
+)
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
@@ -58,6 +64,194 @@ logger = logging.getLogger(__name__)
 # and the Responses API requires max_output_tokens to be at least 16.
 MODEL_CHECK_MAX_TOKENS = 1024
 _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS = 3
+
+
+def _directives_for_triage(
+    directives: dict[str, Any], unrecognized: list[str]
+) -> dict[str, Any]:
+    """Keep invalid sample counts out of triage and benchmark inputs."""
+    result = dict(directives)
+    if any(
+        note.startswith("Invalid value for 'sample_count'") for note in unrecognized
+    ):
+        result.pop("sample_count", None)
+    return result
+
+
+async def _normalize_ticket_directives(
+    store_url: str,
+    ticket_id: str,
+    raw_directives: dict[str, Any],
+    events: Any,
+    delivery_states: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Persist normalized directives before feedback or triage can use them."""
+    from providers.directives import format_normalization_report, normalize_directives
+
+    normalized, applied, unrecognized = normalize_directives(raw_directives)
+    fingerprint_payload = json.dumps(
+        {"directives": normalized, "unrecognized": unrecognized},
+        sort_keys=True,
+        default=str,
+    )
+    fingerprint = hashlib.sha256(fingerprint_payload.encode()).hexdigest()
+    delivery = delivery_states.get(ticket_id)
+    has_feedback = bool(applied or unrecognized)
+
+    if delivery is not None and raw_directives == delivery["normalized"]:
+        # An earlier PATCH may have committed even if its response was lost.
+        # Keep the original report while a later poll confirms persisted state.
+        delivery["patch_confirmed"] = True
+        normalized = delivery["normalized"]
+        applied = delivery["event_payload"]["applied"]
+        unrecognized = delivery["event_payload"]["unrecognized"]
+        has_feedback = bool(applied or unrecognized)
+    elif delivery is not None and delivery["fingerprint"] != fingerprint:
+        if has_feedback or normalized != raw_directives:
+            delivery = None
+        else:
+            delivery_states.pop(ticket_id, None)
+            delivery = None
+
+    if delivery is None and (has_feedback or normalized != raw_directives):
+        comment_body = format_normalization_report(applied, unrecognized)
+        delivery = {
+            "fingerprint": fingerprint,
+            "normalized": normalized,
+            "patch_confirmed": normalized == raw_directives,
+            "event_attempts": 0,
+            "event_delivered": not has_feedback,
+            "event_payload": {"applied": applied, "unrecognized": unrecognized},
+            "comment_attempts": 0,
+            "comment_delivered": comment_body is None,
+            "comment_terminal": comment_body is None,
+            "comment_body": comment_body,
+        }
+        delivery_states[ticket_id] = delivery
+        for hint in unrecognized:
+            logger.warning("[directives] %s", hint)
+
+    if delivery is None:
+        return _directives_for_triage(normalized, unrecognized), True
+
+    if normalized != raw_directives and not delivery["patch_confirmed"]:
+        context_token = bind_trace_context(
+            new_trace_context(ticket_id=ticket_id, agent_id="orchestrator")
+        )
+        try:
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=_mutation_headers(None),
+            ) as client:
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"directives": normalized}},
+                )
+        except Exception:
+            # Keep the delivery state so an ambiguous response can be
+            # reconciled against the next fetched ticket snapshot.
+            logger.warning(
+                "Directive normalization PATCH failed for %s",
+                ticket_id,
+                exc_info=True,
+            )
+            return {}, False
+        finally:
+            reset_trace_context(context_token)
+
+        if not 200 <= response.status_code < 300:
+            logger.warning(
+                "Directive normalization PATCH failed for %s: HTTP %d",
+                ticket_id,
+                response.status_code,
+            )
+            return {}, False
+        delivery["patch_confirmed"] = True
+
+    if not delivery["patch_confirmed"]:
+        return {}, False
+
+    event_needed = (
+        events is not None
+        and not delivery["event_delivered"]
+        and delivery["event_attempts"] < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
+    )
+    if event_needed:
+        delivery["event_attempts"] += 1
+        try:
+            events.emit(
+                ticket_id,
+                "orchestrator",
+                "directive_normalization",
+                delivery["event_payload"],
+            )
+        except Exception:
+            logger.warning(
+                "Failed to emit directive normalization event for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        else:
+            delivery["event_delivered"] = True
+
+    comment_needed = (
+        delivery["comment_body"] is not None
+        and not delivery["comment_delivered"]
+        and not delivery["comment_terminal"]
+        and delivery["comment_attempts"] < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
+    )
+    if comment_needed:
+        delivery["comment_attempts"] += 1
+        context_token = bind_trace_context(
+            new_trace_context(ticket_id=ticket_id, agent_id="orchestrator")
+        )
+        try:
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=_mutation_headers(None),
+            ) as client:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                    json={
+                        "author": "orchestrator",
+                        "body": delivery["comment_body"],
+                    },
+                )
+        except AmbiguousHTTPReplayError:
+            delivery["comment_terminal"] = True
+            logger.warning(
+                "Directive normalization comment outcome is ambiguous for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            logger.warning(
+                "Directive normalization comment failed before send for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        except Exception:
+            delivery["comment_terminal"] = True
+            logger.warning(
+                "Directive normalization comment failed after an unknown outcome "
+                "for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        else:
+            delivery["comment_terminal"] = True
+            if 200 <= response.status_code < 300:
+                delivery["comment_delivered"] = True
+            else:
+                logger.warning(
+                    "Directive normalization comment failed for %s: HTTP %d",
+                    ticket_id,
+                    response.status_code,
+                )
+        finally:
+            reset_trace_context(context_token)
+
+    return _directives_for_triage(normalized, unrecognized), True
 
 
 def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
@@ -2119,7 +2313,6 @@ async def _renew_leader_lease(
     Retry transient transport and server errors with bounded backoff, but
     stop before the last confirmed lease expiration if renewal cannot succeed.
     """
-    import httpx
 
     if started is not None:
         started.set()
@@ -2600,7 +2793,7 @@ async def _poll_loop_after_lease(
         was_at_capacity = False
         last_trace_sweep = 0.0
         repos_refreshed = False
-        normalization_feedback_deliveries: dict[str, dict[str, Any]] = {}
+        normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
         while True:
             if lease_renew_task is not None and lease_renew_task.done():
@@ -2715,187 +2908,33 @@ async def _poll_loop_after_lease(
                         logger.info(f"Skipping {tid}: review already submitted")
                         continue
 
-                    # Normalize directive keys before any agent
-                    # sees the ticket.  Maps variant key names to
-                    # canonical forms and warns on unrecognized keys.
+                    # Normalize directive keys before any agent sees the ticket.
+                    # A failed PATCH keeps raw persisted values out of triage.
                     if status == "triage_pending":
                         cf = ticket.get("custom_fields", {})
                         raw_directives = cf.get("directives", {})
-                        if raw_directives:
+                        if raw_directives or tid in normalization_delivery_states:
                             try:
-                                from providers.directives import (
-                                    format_normalization_report,
-                                    normalize_directives,
+                                (
+                                    triage_directives,
+                                    normalization_ready,
+                                ) = await _normalize_ticket_directives(
+                                    config.state_store_url,
+                                    tid,
+                                    raw_directives,
+                                    events,
+                                    normalization_delivery_states,
                                 )
-
-                                normalized, applied, unrecognized = (
-                                    normalize_directives(raw_directives)
-                                )
-                                if applied or unrecognized:
-                                    # Update the local ticket dict so the
-                                    # triage agent sees canonical keys
-                                    # in the same poll cycle.
-                                    cf["directives"] = normalized
-
-                                    # Track event and comment delivery separately
-                                    # so a successful output is not repeated when
-                                    # its sibling output needs another attempt.
-                                    fingerprint_payload = json.dumps(
-                                        {
-                                            "directives": normalized,
-                                            "unrecognized": unrecognized,
-                                        },
-                                        sort_keys=True,
-                                        default=str,
-                                    )
-                                    fingerprint = hashlib.sha256(
-                                        fingerprint_payload.encode()
-                                    ).hexdigest()
-                                    delivery = normalization_feedback_deliveries.get(
-                                        tid
-                                    )
-                                    if (
-                                        delivery is None
-                                        or delivery["fingerprint"] != fingerprint
-                                    ):
-                                        comment_body = format_normalization_report(
-                                            applied, unrecognized
-                                        )
-                                        delivery = {
-                                            "fingerprint": fingerprint,
-                                            "event_attempts": 0,
-                                            "event_delivered": False,
-                                            "event_payload": {
-                                                "applied": applied,
-                                                "unrecognized": unrecognized,
-                                            },
-                                            "comment_attempts": 0,
-                                            "comment_delivered": comment_body is None,
-                                            "comment_body": comment_body,
-                                        }
-                                        normalization_feedback_deliveries[tid] = (
-                                            delivery
-                                        )
-                                        for hint in unrecognized:
-                                            logger.warning("[directives] %s", hint)
-
-                                    event_needed = (
-                                        events is not None
-                                        and not delivery["event_delivered"]
-                                        and delivery["event_attempts"]
-                                        < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
-                                    )
-                                    if event_needed:
-                                        delivery["event_attempts"] += 1
-                                        try:
-                                            events.emit(
-                                                tid,
-                                                "orchestrator",
-                                                "directive_normalization",
-                                                delivery["event_payload"],
-                                            )
-                                        except Exception:
-                                            logger.warning(
-                                                "Failed to emit directive "
-                                                "normalization event for %s",
-                                                tid,
-                                                exc_info=True,
-                                            )
-                                        else:
-                                            delivery["event_delivered"] = True
-
-                                    report = delivery["comment_body"]
-                                    comment_needed = (
-                                        report is not None
-                                        and not delivery["comment_delivered"]
-                                        and delivery["comment_attempts"]
-                                        < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
-                                    )
-                                    should_patch = normalized != raw_directives
-                                    if should_patch or comment_needed:
-                                        if comment_needed:
-                                            delivery["comment_attempts"] += 1
-                                        context_token = bind_trace_context(
-                                            new_trace_context(
-                                                ticket_id=tid,
-                                                agent_id="orchestrator",
-                                            )
-                                        )
-                                        try:
-                                            async with AuditedAsyncHTTPClient(
-                                                timeout=10.0,
-                                                headers=_mutation_headers(None),
-                                            ) as client:
-                                                if should_patch:
-                                                    try:
-                                                        resp = await client.patch(
-                                                            f"{config.state_store_url}"
-                                                            f"/api/v1/tickets/{tid}/fields",
-                                                            json={
-                                                                "fields": {
-                                                                    "directives": normalized
-                                                                }
-                                                            },
-                                                        )
-                                                    except Exception:
-                                                        logger.warning(
-                                                            "Directive normalization "
-                                                            "PATCH raised for %s",
-                                                            tid,
-                                                            exc_info=True,
-                                                        )
-                                                    else:
-                                                        if resp.status_code >= 400:
-                                                            logger.warning(
-                                                                "Directive normalization "
-                                                                "PATCH failed for %s: "
-                                                                "HTTP %d",
-                                                                tid,
-                                                                resp.status_code,
-                                                            )
-                                                if comment_needed:
-                                                    try:
-                                                        comment_response = await client.post(
-                                                            f"{config.state_store_url}"
-                                                            f"/api/v1/tickets/{tid}"
-                                                            f"/comments",
-                                                            json={
-                                                                "author": "orchestrator",
-                                                                "body": report,
-                                                            },
-                                                        )
-                                                    except Exception:
-                                                        logger.warning(
-                                                            "Directive normalization "
-                                                            "comment raised for %s",
-                                                            tid,
-                                                            exc_info=True,
-                                                        )
-                                                    else:
-                                                        if (
-                                                            200
-                                                            <= comment_response.status_code
-                                                            < 300
-                                                        ):
-                                                            delivery[
-                                                                "comment_delivered"
-                                                            ] = True
-                                                        else:
-                                                            logger.warning(
-                                                                "Directive normalization "
-                                                                "comment failed for %s: "
-                                                                "HTTP %d",
-                                                                tid,
-                                                                comment_response.status_code,
-                                                            )
-                                        finally:
-                                            reset_trace_context(context_token)
                             except Exception:
                                 logger.warning(
                                     "Directive normalization failed for %s",
                                     tid,
                                     exc_info=True,
                                 )
+                                continue
+                            if not normalization_ready:
+                                continue
+                            cf["directives"] = triage_directives
 
                         # Deterministic enrichment for webhook tickets.
                         # Resolve directives from run metadata before

@@ -79,6 +79,7 @@ _DURATION_SUFFIXES = (
     "_ms",
     "_s",
 )
+_DURATION_DIRECTIVES = {"power_off_delay"}
 _COUNT_SUFFIXES = ("_count", "_num")
 _STRIP_PREFIXES = ("jumpstarter_",)
 
@@ -139,7 +140,7 @@ def _strip_suffixes(key: str, recognized: set[str]) -> str | None:
     for suffix in _DURATION_SUFFIXES:
         if key.endswith(suffix):
             base = key[: -len(suffix)]
-            if base in recognized and _is_duration_key(base):
+            if base in recognized and base in _DURATION_DIRECTIVES:
                 return base
     for suffix in _COUNT_SUFFIXES:
         if key.endswith(suffix):
@@ -154,16 +155,11 @@ def _strip_prefixes(key: str, recognized: set[str]) -> str | None:
     for prefix in _STRIP_PREFIXES:
         if key.startswith(prefix):
             base = key[len(prefix) :]
-            if base in recognized and (_is_duration_key(base) or _is_count_key(base)):
+            if base in recognized and (
+                base in _DURATION_DIRECTIVES or _is_count_key(base)
+            ):
                 return base
     return None
-
-
-def _is_duration_key(key: str) -> bool:
-    """Return whether a canonical key describes a duration value."""
-    return key in {"duration", "timeout"} or key.endswith(
-        ("_duration", "_delay", "_timeout", "_seconds", "_sec", "_ms", "_s")
-    )
 
 
 def _is_count_key(key: str) -> bool:
@@ -193,13 +189,19 @@ def _coerce_sample_count(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
+        return value if value > 0 else None
     if isinstance(value, str):
         try:
-            return int(value)
+            count = int(value)
         except (ValueError, OverflowError):
             return None
-    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return count if count > 0 else None
+    if (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
+        and value > 0
+    ):
         return int(value)
     return None
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
 # Import harness modules to trigger their directive registrations.
 import providers.skills.boot_time  # noqa: F401
 from providers.directives import (
@@ -71,6 +73,22 @@ class TestNormalizeKey:
         canonical, reason = normalize_key("skip_teardown_s")
         assert canonical == "skip_teardown_s"
         assert reason is None
+
+    def test_millisecond_suffix_does_not_rewrite_boolean_timeout(self):
+        normalized, applied, unrecognized = normalize_directives(
+            {"disable_hitl_timeout_ms": 1000}
+        )
+        assert normalized == {"disable_hitl_timeout_ms": 1000}
+        assert applied == []
+        assert len(unrecognized) == 1
+
+    def test_prefix_does_not_rewrite_boolean_timeout(self):
+        normalized, applied, unrecognized = normalize_directives(
+            {"jumpstarter_disable_hitl_timeout": True}
+        )
+        assert normalized == {"jumpstarter_disable_hitl_timeout": True}
+        assert applied == []
+        assert len(unrecognized) == 1
 
     def test_prefix_does_not_rewrite_unrelated_directives(self):
         canonical, reason = normalize_key("jumpstarter_skip_teardown")
@@ -160,6 +178,27 @@ class TestNormalizeDirectives:
         normalized, applied, unrecognized = normalize_directives({"sample_count": 2.5})
         assert normalized["sample_count"] == 2.5
         assert applied == []
+        assert any("expected an integer" in note for note in unrecognized)
+
+    @pytest.mark.parametrize("value", [True, 2.5, 0, -1, "0", "-2"])
+    def test_non_positive_or_non_integral_sample_counts_are_reported(self, value):
+        normalized, applied, unrecognized = normalize_directives(
+            {"sample_count": value}
+        )
+        assert normalized["sample_count"] == value
+        assert applied == []
+        assert any("expected an integer" in note for note in unrecognized)
+
+    def test_positive_integral_sample_count_number_is_accepted(self):
+        normalized, applied, unrecognized = normalize_directives({"sample_count": 2.0})
+        assert normalized["sample_count"] == 2
+        assert any("converted to an integer" in note for note in applied)
+        assert unrecognized == []
+
+    def test_invalid_sample_count_alias_is_preserved_and_reported(self):
+        normalized, applied, unrecognized = normalize_directives({"reboot_count": 0})
+        assert normalized["sample_count"] == 0
+        assert any("alias" in note for note in applied)
         assert any("expected an integer" in note for note in unrecognized)
 
     def test_millisecond_duration_converts_to_seconds(self):
