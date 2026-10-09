@@ -381,6 +381,148 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
 
 
 @pytest.mark.asyncio
+async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+    from orchestrator.config import OrchestratorConfig
+    from providers.tracing import (
+        bind_trace_context,
+        current_trace_context,
+        new_trace_context,
+        reset_trace_context,
+    )
+
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    config = OrchestratorConfig(
+        state_store_url="http://store", raw_config={"llm": {"provider": "mock"}}
+    )
+    config.poll_interval = 0.01
+    config.stale_task_timeout = 0
+    ticket = {
+        "id": "PERF-normalize",
+        "status": "triage_pending",
+        "custom_fields": {
+            "directives": {
+                "power_off_delay_seconds": 5,
+                "sample_count": "3",
+                "misspelled_directive": "value",
+            }
+        },
+    }
+    dispatcher = MagicMock()
+    dispatcher.active_tasks.return_value = []
+    dispatcher.is_active.return_value = False
+    dispatcher.try_claim.return_value = False
+    dispatcher.shutdown = AsyncMock()
+    events = MagicMock()
+    request_contexts = []
+    comment_bodies = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            request_contexts.append(("PATCH", current_trace_context().ticket_id))
+            ticket["custom_fields"]["directives"] = deepcopy(
+                json["fields"]["directives"]
+            )
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            request_contexts.append(("POST", current_trace_context().ticket_id))
+            comment_bodies.append(json["body"])
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
+    monkeypatch.setattr(main, "RepoCache", lambda: object())
+    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
+    monkeypatch.setattr(
+        main,
+        "_make_llm_provider",
+        lambda _config: SimpleNamespace(
+            default_timeout=None, reasoning_effort=None, max_tokens=None
+        ),
+    )
+    monkeypatch.setattr(main, "_make_llm_factory", lambda _config: object())
+    monkeypatch.setattr(main, "_validate_models", AsyncMock())
+    monkeypatch.setattr(main, "EventBus", lambda **_kwargs: events)
+    monkeypatch.setattr(
+        main, "record_orchestrator_status", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(main, "_process_stop_requests", AsyncMock())
+    monkeypatch.setattr(main, "_sweep_orphaned_leases", AsyncMock())
+    monkeypatch.setattr(main, "_sweep_trace_spools", lambda: None)
+    monkeypatch.setattr(main, "check_handoff", lambda *_args: (True, ""))
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+    telemetry = ModuleType("providers.telemetry")
+    telemetry.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry)
+    monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
+
+    third_poll = asyncio.Event()
+    fetch_count = 0
+
+    async def fetch(_url):
+        nonlocal fetch_count
+        fetch_count += 1
+        if fetch_count >= 3:
+            third_poll.set()
+        return [deepcopy(ticket)]
+
+    monkeypatch.setattr(main, "fetch_all_tickets", fetch)
+    lease = SimpleNamespace(
+        session_id=uuid4(),
+        epoch=None,
+        ttl_seconds=config.leader_lease_ttl_seconds,
+        confirmed_deadline=(
+            asyncio.get_running_loop().time() + config.leader_lease_ttl_seconds
+        ),
+    )
+
+    async def acquire():
+        lease.epoch = 7
+
+    lease.acquire = acquire
+    lease.renew = AsyncMock()
+    lease.release = AsyncMock()
+    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    previous_context = current_trace_context()
+    control_context = new_trace_context(ticket_id="control", agent_id="orchestrator")
+    control_token = bind_trace_context(control_context)
+    task = asyncio.create_task(
+        main._poll_loop_after_lease(config, lease, main._LeaseLossGate(), lease_state)
+    )
+    try:
+        await asyncio.wait_for(third_poll.wait(), timeout=5)
+        assert request_contexts == [
+            ("PATCH", "PERF-normalize"),
+            ("POST", "PERF-normalize"),
+        ]
+        events.emit.assert_called_once()
+        assert ticket["custom_fields"]["directives"] == {
+            "power_off_delay": 5,
+            "sample_count": 3,
+            "misspelled_directive": "value",
+        }
+        assert "converted to an integer" in comment_bodies[0]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        reset_trace_context(control_token)
+
+    assert current_trace_context() == previous_context
+
+
+@pytest.mark.asyncio
 async def test_retry_persistence_cancellation_propagates() -> None:
     import orchestrator.main as main
 

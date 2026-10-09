@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 # Import harness modules to trigger their directive registrations.
 import providers.skills.boot_time  # noqa: F401
 from providers.directives import (
@@ -63,6 +66,16 @@ class TestNormalizeKey:
         canonical, reason = normalize_key("jumpstarter_power_off_delay_seconds")
         assert canonical == "power_off_delay"
         assert "prefix" in reason and "suffix" in reason
+
+    def test_suffix_does_not_rewrite_safety_directives(self):
+        canonical, reason = normalize_key("skip_teardown_s")
+        assert canonical == "skip_teardown_s"
+        assert reason is None
+
+    def test_prefix_does_not_rewrite_unrelated_directives(self):
+        canonical, reason = normalize_key("jumpstarter_skip_teardown")
+        assert canonical == "jumpstarter_skip_teardown"
+        assert reason is None
 
 
 class TestNormalizeDirectives:
@@ -131,9 +144,42 @@ class TestNormalizeDirectives:
         assert normalized["sample_count"] == 50
 
     def test_sample_count_coerced_to_int(self):
-        directives = {"reboot_count": "25"}
+        directives = {"sample_count": "25"}
         normalized, applied, unrecognized = normalize_directives(directives)
         assert normalized["sample_count"] == 25
+        assert any("converted to an integer" in note for note in applied)
+
+    def test_millisecond_duration_converts_to_seconds(self):
+        normalized, applied, unrecognized = normalize_directives(
+            {"power_off_delay_ms": "2500"}
+        )
+        assert normalized["power_off_delay"] == 2.5
+        assert any("milliseconds to seconds" in note for note in applied)
+        assert unrecognized == []
+
+    def test_invalid_millisecond_duration_stays_unrecognized(self):
+        normalized, applied, unrecognized = normalize_directives(
+            {"power_off_delay_ms": "not-a-number"}
+        )
+        assert normalized["power_off_delay_ms"] == "not-a-number"
+        assert applied == []
+        assert len(unrecognized) == 1
+
+    def test_jumpstarter_directive_is_available_without_resource_import(self):
+        script = (
+            "import sys; "
+            "from providers.directives import normalize_directives; "
+            "assert 'providers.resource.jumpstarter' not in sys.modules; "
+            "result = normalize_directives({'jumpstarter_serial': True}); "
+            "assert result == ({'jumpstarter_serial': True}, [], [])"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
 
     def test_empty_directives(self):
         normalized, applied, unrecognized = normalize_directives({})

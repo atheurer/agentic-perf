@@ -21,6 +21,7 @@ in code.
 from __future__ import annotations
 
 import logging
+import math
 from difflib import get_close_matches
 from typing import Any
 
@@ -58,6 +59,9 @@ _CORE_DIRECTIVES: set[str] = {
     "host_cleanup",
     "system_config",
     "update_harness",
+    # This resource directive must be known to the orchestrator even when the
+    # Jumpstarter provider is imported lazily in a separate resource process.
+    "jumpstarter_serial",
 }
 
 _CORE_ALIASES: dict[str, str] = {
@@ -66,7 +70,15 @@ _CORE_ALIASES: dict[str, str] = {
 
 # ── Suffix / prefix normalization ─────────────────────────
 
-_DURATION_SUFFIXES = ("_seconds", "_sec", "_ms", "_s")
+_DURATION_SUFFIXES = (
+    "_milliseconds",
+    "_millisecond",
+    "_seconds",
+    "_second",
+    "_sec",
+    "_ms",
+    "_s",
+)
 _COUNT_SUFFIXES = ("_count", "_num")
 _STRIP_PREFIXES = ("jumpstarter_",)
 
@@ -123,11 +135,16 @@ def _get_all_aliases() -> dict[str, str]:
 
 
 def _strip_suffixes(key: str, recognized: set[str]) -> str | None:
-    """Try stripping known suffixes to find a recognized base key."""
-    for suffix in _DURATION_SUFFIXES + _COUNT_SUFFIXES:
+    """Strip unit/count suffixes only when they match the key's meaning."""
+    for suffix in _DURATION_SUFFIXES:
         if key.endswith(suffix):
             base = key[: -len(suffix)]
-            if base in recognized:
+            if base in recognized and _is_duration_key(base):
+                return base
+    for suffix in _COUNT_SUFFIXES:
+        if key.endswith(suffix):
+            base = key[: -len(suffix)]
+            if base in recognized and _is_count_key(base):
                 return base
     return None
 
@@ -137,9 +154,38 @@ def _strip_prefixes(key: str, recognized: set[str]) -> str | None:
     for prefix in _STRIP_PREFIXES:
         if key.startswith(prefix):
             base = key[len(prefix) :]
-            if base in recognized:
+            if base in recognized and (_is_duration_key(base) or _is_count_key(base)):
                 return base
     return None
+
+
+def _is_duration_key(key: str) -> bool:
+    """Return whether a canonical key describes a duration value."""
+    return key in {"duration", "timeout"} or key.endswith(
+        ("_duration", "_delay", "_timeout", "_seconds", "_sec", "_ms", "_s")
+    )
+
+
+def _is_count_key(key: str) -> bool:
+    """Return whether a canonical key describes a count value."""
+    return key in {"count", "sample", "samples"} or key.endswith(
+        ("_count", "_num", "_samples")
+    )
+
+
+def _convert_milliseconds(value: Any) -> int | float | None:
+    """Convert a numeric millisecond value to canonical seconds."""
+    if isinstance(value, bool):
+        return None
+    try:
+        milliseconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(milliseconds):
+        return None
+
+    seconds = milliseconds / 1000
+    return int(seconds) if seconds.is_integer() else seconds
 
 
 def normalize_key(key: str) -> tuple[str, str | None]:
@@ -199,6 +245,20 @@ def normalize_directives(
 
     for key, value in directives.items():
         canonical, reason = normalize_key(key)
+        conversion_note = None
+
+        if reason and key.endswith(("_ms", "_millisecond", "_milliseconds")):
+            converted = _convert_milliseconds(value)
+            if converted is None:
+                # Keep malformed or unsupported millisecond values visible to
+                # the user instead of silently treating them as seconds.
+                canonical = key
+                reason = None
+            else:
+                value = converted
+                conversion_note = (
+                    f"'{key}' value converted from milliseconds to seconds"
+                )
 
         if canonical in recognized:
             # Handle value semantics for special cases
@@ -209,10 +269,14 @@ def normalize_directives(
                     applied.append(f"'{key}'=false skipped (no reboot method to infer)")
                     continue
             if canonical == "sample_count":
+                original_value = value
                 try:
                     value = int(value)
                 except (TypeError, ValueError):
                     pass
+                else:
+                    if type(original_value) is not int:
+                        conversion_note = "'sample_count' value converted to an integer"
 
             if canonical in normalized:
                 logger.warning(
@@ -227,6 +291,9 @@ def normalize_directives(
             if reason:
                 applied.append(reason)
                 logger.info("[directives] %s", reason)
+            if conversion_note:
+                applied.append(conversion_note)
+                logger.info("[directives] %s", conversion_note)
         else:
             suggestions = get_close_matches(key, recognized, n=3, cutoff=0.5)
             if suggestions:
@@ -237,7 +304,6 @@ def normalize_directives(
             else:
                 hint = f"Unrecognized directive '{key}' — no close match found"
             unrecognized.append(hint)
-            logger.warning("[directives] %s", hint)
             normalized[key] = value
 
     return normalized, applied, unrecognized

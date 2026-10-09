@@ -2599,6 +2599,7 @@ async def _poll_loop_after_lease(
         was_at_capacity = False
         last_trace_sweep = 0.0
         repos_refreshed = False
+        normalization_feedback_fingerprints: dict[str, str] = {}
 
         while True:
             if lease_renew_task is not None and lease_renew_task.done():
@@ -2735,10 +2736,35 @@ async def _poll_loop_after_lease(
                                     # in the same poll cycle.
                                     cf["directives"] = normalized
 
+                                    # Preserve one normalization report per
+                                    # effective directive content, even when a
+                                    # ticket is deferred across many polls.
+                                    fingerprint_payload = json.dumps(
+                                        {
+                                            "directives": normalized,
+                                            "unrecognized": unrecognized,
+                                        },
+                                        sort_keys=True,
+                                        default=str,
+                                    )
+                                    fingerprint = hashlib.sha256(
+                                        fingerprint_payload.encode()
+                                    ).hexdigest()
+                                    report_needed = (
+                                        normalization_feedback_fingerprints.get(tid)
+                                        != fingerprint
+                                    )
+                                    if report_needed:
+                                        normalization_feedback_fingerprints[tid] = (
+                                            fingerprint
+                                        )
+                                        for hint in unrecognized:
+                                            logger.warning("[directives] %s", hint)
+
                                     # Surface to the event feed so
                                     # normalization actions are visible
                                     # in the dashboard.
-                                    if events is not None:
+                                    if report_needed and events is not None:
                                         events.emit(
                                             tid,
                                             "orchestrator",
@@ -2749,35 +2775,56 @@ async def _poll_loop_after_lease(
                                             },
                                         )
 
-                                    async with AuditedAsyncHTTPClient(
-                                        timeout=10.0,
-                                        headers=_mutation_headers(None),
-                                    ) as client:
-                                        resp = await client.patch(
-                                            f"{config.state_store_url}"
-                                            f"/api/v1/tickets/{tid}/fields",
-                                            json={"fields": {"directives": normalized}},
-                                        )
-                                        if resp.status_code >= 400:
-                                            logger.warning(
-                                                "Directive normalization PATCH "
-                                                "failed for %s: HTTP %d",
-                                                tid,
-                                                resp.status_code,
-                                            )
-                                        report = format_normalization_report(
+                                    report = (
+                                        format_normalization_report(
                                             applied, unrecognized
                                         )
-                                        if report:
-                                            await client.post(
-                                                f"{config.state_store_url}"
-                                                f"/api/v1/tickets/{tid}"
-                                                f"/comments",
-                                                json={
-                                                    "author": "orchestrator",
-                                                    "body": report,
-                                                },
+                                        if report_needed
+                                        else None
+                                    )
+                                    should_patch = normalized != raw_directives
+                                    if should_patch or report:
+                                        context_token = bind_trace_context(
+                                            new_trace_context(
+                                                ticket_id=tid,
+                                                agent_id="orchestrator",
                                             )
+                                        )
+                                        try:
+                                            async with AuditedAsyncHTTPClient(
+                                                timeout=10.0,
+                                                headers=_mutation_headers(None),
+                                            ) as client:
+                                                if should_patch:
+                                                    resp = await client.patch(
+                                                        f"{config.state_store_url}"
+                                                        f"/api/v1/tickets/{tid}/fields",
+                                                        json={
+                                                            "fields": {
+                                                                "directives": normalized
+                                                            }
+                                                        },
+                                                    )
+                                                    if resp.status_code >= 400:
+                                                        logger.warning(
+                                                            "Directive normalization "
+                                                            "PATCH failed for %s: "
+                                                            "HTTP %d",
+                                                            tid,
+                                                            resp.status_code,
+                                                        )
+                                                if report:
+                                                    await client.post(
+                                                        f"{config.state_store_url}"
+                                                        f"/api/v1/tickets/{tid}"
+                                                        f"/comments",
+                                                        json={
+                                                            "author": "orchestrator",
+                                                            "body": report,
+                                                        },
+                                                    )
+                                        finally:
+                                            reset_trace_context(context_token)
                             except Exception:
                                 logger.warning(
                                     "Directive normalization failed for %s",
