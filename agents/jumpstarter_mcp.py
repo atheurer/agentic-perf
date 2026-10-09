@@ -147,6 +147,11 @@ class _JmpCallHook:
             dispatch_task.cancel(_MCP_TIMEOUT_CANCELLATION)
             with contextlib.suppress(asyncio.CancelledError):
                 await dispatch_task
+            request_sent = audit_state.request_sent
+            retry_classification = audit_state.retry_classification
+            if request_sent is None or retry_classification is None:
+                request_sent = True
+                retry_classification = "ambiguous_after_send"
             return MCPHookResult(
                 content=json.dumps(
                     {
@@ -162,9 +167,9 @@ class _JmpCallHook:
                     }
                 ),
                 is_error=True,
-                request_sent=True,
-                retry_classification="ambiguous_after_send",
-                audit_recorded=True,
+                request_sent=request_sent,
+                retry_classification=retry_classification,
+                audit_recorded=audit_state.terminal_recorded,
             )
         except asyncio.CancelledError as outer_exc:
             if "dispatch_task" in locals():

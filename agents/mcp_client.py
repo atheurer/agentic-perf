@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED
 
 from agents.mcp_stdio import audited_stdio_client
 from providers.llm.base import ToolDefinition
@@ -35,7 +37,7 @@ from providers.tracing import (
     reset_trace_context,
     trace_context_environment,
 )
-from providers.tracing.client import TraceClient
+from providers.tracing.client import TraceClient, TraceDeliveryError
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,75 @@ class _MCPDispatchAuditState:
     """Mutable ownership handoff for a provider-owned dispatch task."""
 
     terminal_recorded: bool = False
+    request_sent: bool | None = None
+    retry_classification: (
+        Literal[
+            "validation",
+            "intentional_agent_retry",
+            "transport_before_send",
+            "ambiguous_after_send",
+        ]
+        | None
+    ) = None
+
+
+# Exception types that indicate an MCP subprocess or network transport has
+# disconnected.  When one of these is raised during ``call_tool`` / session
+# interaction we attempt an automatic reconnect instead of failing immediately.
+_DISCONNECT_ERRORS: tuple[type[BaseException], ...] = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    EOFError,
+)
+
+
+def _is_disconnect_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transport-level disconnection."""
+    # MCP reports an abruptly closed stdio peer as a JSON-RPC error instead
+    # of letting the underlying stream exception escape from call_tool.
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _DISCONNECT_ERRORS):
+            return True
+        if isinstance(current, McpError) and current.error.code == CONNECTION_CLOSED:
+            return True
+        # anyio / asyncio may wrap the real error; inspect the full chain.
+        if type(current).__name__ in {
+            "BrokenResourceError",
+            "ClosedResourceError",
+            "ClosedResourceSendError",
+            "EndOfStream",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+@dataclass
+class _ConnectParams:
+    """Immutable snapshot of the arguments needed to re-establish a connection.
+
+    The args and env may contain credentials. __repr__ is overridden to
+    prevent accidental exposure in logs or crash dumps.
+    """
+
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    ticket_id: str | None
+    agent_id: str | None
+
+    def __repr__(self) -> str:
+        return (
+            f"_ConnectParams(command={self.command!r}, "
+            f"args=<{len(self.args)} args>, env=<{len(self.env)} vars>, "
+            f"ticket_id={self.ticket_id!r}, "
+            f"agent_id={self.agent_id!r})"
+        )
 
 
 @dataclass
@@ -99,6 +170,7 @@ class _ServerConnection:
     transport: str = "unknown"
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     reconnect_generation: int = 0
+    _reconnect_origin_session_id: str | None = None
     endpoint: str | None = None
     client_process_identity: str | None = None
     subprocess_pid: int | None = None
@@ -108,6 +180,8 @@ class _ServerConnection:
     connected: bool = False
     _shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     _task: asyncio.Task[None] | None = None
+    _connect_params: _ConnectParams | None = None
+    _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class AgentMCPClient:
@@ -134,6 +208,15 @@ class AgentMCPClient:
     ) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
+        self._lifecycle_lock = asyncio.Lock()
+        self._disconnect_lock = asyncio.Lock()
+        self._disconnect_requests = 0
+        self._disconnect_group_completed = False
+        self._closing = False
+        self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
+        self._connection_startup_tasks: set[asyncio.Task[None]] = set()
+        self._retiring_connection_tasks: set[asyncio.Task[None]] = set()
+        self._connection_startup_locks: dict[str, asyncio.Lock] = {}
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
         # Jumpstarter connect guards). It may return a string for a local
@@ -144,17 +227,27 @@ class AgentMCPClient:
         self.post_call_hook: Any = None
         self.audit_events: list[TraceEventV1] = []
         self._audit_hook = audit_hook
+        self._injected_trace_client = trace_client
         self._trace_client = trace_client
         self._owns_trace_client = False
-        if self._trace_client is None:
-            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            url = os.environ.get("STATE_STORE_URL", "")
-            if token and url:
-                self._trace_client = TraceClient(url, token)
-                self._owns_trace_client = True
+        self._ensure_trace_client()
         from agents.fencing import current_fence_context
 
         self._fence_context = current_fence_context()
+
+    def _ensure_trace_client(self) -> None:
+        """Attach the configured recorder when the client is in use."""
+        if self._trace_client is not None:
+            return
+        if self._injected_trace_client is not None:
+            self._trace_client = self._injected_trace_client
+            self._owns_trace_client = False
+            return
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        url = os.environ.get("STATE_STORE_URL", "")
+        if token and url:
+            self._trace_client = TraceClient(url, token)
+            self._owns_trace_client = True
 
     async def connect(
         self,
@@ -247,6 +340,8 @@ class AgentMCPClient:
         env: dict[str, str] | None = None,
         ticket_id: str | None = None,
         agent_id: str | None = None,
+        _expected_connection: _ServerConnection | None = None,
+        _expected_generation: int | None = None,
     ) -> None:
         """Connect to an MCP server started by an arbitrary command.
 
@@ -273,10 +368,11 @@ class AgentMCPClient:
                 f"{project_root}{os.pathsep}{existing}" if existing else project_root
             )
         merged_env = {**base_env, **(env or {})}
+        args_snapshot = list(args) if args is not None else []
 
         params = StdioServerParameters(
             command=command,
-            args=args or [],
+            args=args_snapshot.copy(),
             env=merged_env,
         )
         process_holder: list[Any] = []
@@ -284,6 +380,13 @@ class AgentMCPClient:
             stdio_client(params)
             if stdio_client is not _SDK_STDIO_CLIENT
             else audited_stdio_client(params, process_holder.append)
+        )
+        connect_params = _ConnectParams(
+            command=command,
+            args=args_snapshot.copy(),
+            env=merged_env,
+            ticket_id=ticket_id,
+            agent_id=agent_id,
         )
         await self._connect_transport(
             name,
@@ -293,6 +396,9 @@ class AgentMCPClient:
             ticket_id=ticket_id,
             agent_id=agent_id,
             subprocess_process_holder=process_holder,
+            connect_params=connect_params,
+            expected_connection=_expected_connection,
+            expected_generation=_expected_generation,
         )
 
     async def connect_sse(
@@ -402,6 +508,62 @@ class AgentMCPClient:
         ticket_id: str | None = None,
         agent_id: str | None = None,
         subprocess_process_holder: list[Any] | None = None,
+        connect_params: _ConnectParams | None = None,
+        expected_connection: _ServerConnection | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("MCP connection startup requires an asyncio task")
+
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise asyncio.CancelledError()
+            self._ensure_trace_client()
+            startup_lock = self._connection_startup_locks.setdefault(
+                name, asyncio.Lock()
+            )
+            self._connection_startup_tasks.add(task)
+
+        try:
+            async with startup_lock:
+                if expected_connection is not None:
+                    async with self._lifecycle_lock:
+                        if self._closing:
+                            raise asyncio.CancelledError()
+                        current = self._servers.get(name)
+                        if (
+                            current is not expected_connection
+                            or current.reconnect_generation != expected_generation
+                        ):
+                            return
+                await self._connect_transport_impl(
+                    name,
+                    transport_cm,
+                    transport=transport,
+                    endpoint=endpoint,
+                    ticket_id=ticket_id,
+                    agent_id=agent_id,
+                    subprocess_process_holder=subprocess_process_holder,
+                    connect_params=connect_params,
+                    expected_connection=expected_connection,
+                )
+        finally:
+            async with self._lifecycle_lock:
+                self._connection_startup_tasks.discard(task)
+
+    async def _connect_transport_impl(
+        self,
+        name: str,
+        transport_cm: Any,
+        *,
+        transport: str,
+        endpoint: str | None,
+        ticket_id: str | None = None,
+        agent_id: str | None = None,
+        subprocess_process_holder: list[Any] | None = None,
+        connect_params: _ConnectParams | None = None,
+        expected_connection: _ServerConnection | None = None,
     ) -> None:
         """Shared connection logic for all transports.
 
@@ -412,21 +574,13 @@ class AgentMCPClient:
         whenever the agent awaits asyncio.to_thread (LLM calls),
         burning 100% CPU on one core.
         """
-        previous = self._servers.pop(name, None)
+        previous = self._servers.get(name)
         generation = 0
+        previous_routes: set[str] = set()
         if previous is not None:
             generation = previous.reconnect_generation + 1
-            self._record_boundary(previous, LifecycleState.DISCONNECTED)
-            previous.connected = False
-            previous._shutdown.set()
-            if previous._task is not None:
-                previous._task.cancel()
-                with contextlib.suppress(Exception, BaseException):
-                    await previous._task
-            self._tool_routing = {
-                tool: server
-                for tool, server in self._tool_routing.items()
-                if server != name
+            previous_routes = {
+                tool for tool, server in self._tool_routing.items() if server == name
             }
         ready: asyncio.Future[ClientSession] = (
             asyncio.get_running_loop().create_future()
@@ -438,6 +592,11 @@ class AgentMCPClient:
             transport=transport,
             session_id=uuid.uuid4().hex,
             reconnect_generation=generation,
+            _reconnect_origin_session_id=(
+                expected_connection.session_id
+                if expected_connection is not None
+                else None
+            ),
             endpoint=endpoint,
             client_process_identity=f"pid:{os.getpid()}",
             ticket_id=ticket_id,
@@ -446,10 +605,14 @@ class AgentMCPClient:
                 "pending" if transport == "stdio" else "not_applicable"
             ),
             _shutdown=shutdown,
+            _connect_params=connect_params,
         )
         self._record_boundary(conn, LifecycleState.CONNECTING)
         startup_terminal_recorded = False
         startup_cancellation_state = LifecycleState.CANCELLED
+        conflicting_tool: str | None = None
+        conflicting_server: str | None = None
+        previous_task: asyncio.Task[None] | None = None
 
         def _cancellation_state(exc: asyncio.CancelledError) -> LifecycleState:
             return (
@@ -530,16 +693,17 @@ class AgentMCPClient:
         task = asyncio.create_task(_hold_connection(), name=f"mcp:{name}")
 
         async def _cleanup_connection() -> None:
-            if self._servers.get(name) is conn:
-                if conn.connected:
-                    self._record_boundary(conn, LifecycleState.DISCONNECTED)
-                    conn.connected = False
+            owns_current_connection = self._servers.get(name) is conn
+            if conn.connected:
+                self._record_boundary(conn, LifecycleState.DISCONNECTED)
+                conn.connected = False
+            if owns_current_connection:
                 self._servers.pop(name, None)
-            self._tool_routing = {
-                tool: server
-                for tool, server in self._tool_routing.items()
-                if server != name
-            }
+                self._tool_routing = {
+                    tool: server
+                    for tool, server in self._tool_routing.items()
+                    if server != name
+                }
             conn._shutdown.set()
             if not task.done():
                 task.cancel()
@@ -570,19 +734,67 @@ class AgentMCPClient:
             raise
 
         try:
-            conn.session = session
-            self._servers[name] = conn
-            self._record_boundary(conn, LifecycleState.CONNECTED)
-            # The connection is installed before the initial tool discovery
-            # request. Cleanup must therefore close this CONNECTED boundary
-            # if list_tools is cancelled, fails, or finds a conflict.
-            conn.connected = True
-            if generation:
-                self._record_boundary(conn, LifecycleState.RECONNECTED)
-            self._record_boundary(
-                conn, LifecycleState.REQUEST_SENT, tool_name="list_tools"
-            )
+            async with self._lifecycle_lock:
+                connection_rejected = (
+                    self._closing or self._servers.get(name) is not previous
+                )
+                if not connection_rejected:
+                    conn.session = session
+                    self._record_boundary(conn, LifecycleState.CONNECTED)
+                    conn.connected = True
+                    if generation:
+                        self._record_boundary(conn, LifecycleState.RECONNECTED)
+                    self._record_boundary(
+                        conn, LifecycleState.REQUEST_SENT, tool_name="list_tools"
+                    )
+            if connection_rejected:
+                raise asyncio.CancelledError()
             result = await session.list_tools()
+            async with self._lifecycle_lock:
+                if self._closing or self._servers.get(name) is not previous:
+                    raise asyncio.CancelledError()
+                self._record_boundary(
+                    conn,
+                    LifecycleState.RESPONSE_RECEIVED,
+                    tool_name="list_tools",
+                    outcome=OperationOutcome.SUCCESS,
+                )
+                seen_tools: set[str] = set()
+                for tool in result.tools:
+                    if tool.name in seen_tools:
+                        conflicting_tool = tool.name
+                        conflicting_server = name
+                        break
+                    seen_tools.add(tool.name)
+                    existing_server = self._tool_routing.get(tool.name)
+                    if existing_server is not None and not (
+                        existing_server == name and tool.name in previous_routes
+                    ):
+                        conflicting_tool = tool.name
+                        conflicting_server = existing_server
+                        break
+                if conflicting_tool is None:
+                    if previous is not None:
+                        if previous.connected:
+                            self._record_boundary(previous, LifecycleState.DISCONNECTED)
+                        previous.connected = False
+                        previous._shutdown.set()
+                        previous_task = previous._task
+                        if previous_task is not None and not previous_task.done():
+                            self._retiring_connection_tasks.add(previous_task)
+                            previous_task.add_done_callback(
+                                self._retiring_connection_tasks.discard
+                            )
+                            previous_task.cancel()
+                    self._servers[name] = conn
+                    self._tool_routing = {
+                        tool_name: server
+                        for tool_name, server in self._tool_routing.items()
+                        if server != name
+                    }
+                    for tool in result.tools:
+                        self._tool_routing[tool.name] = name
+                    conn._task = task
         except asyncio.CancelledError as exc:
             cancellation_state = _cancellation_state(exc)
             self._record_boundary(
@@ -608,24 +820,16 @@ class AgentMCPClient:
             )
             await _cleanup_connection()
             raise
-        self._record_boundary(
-            conn,
-            LifecycleState.RESPONSE_RECEIVED,
-            tool_name="list_tools",
-            outcome=OperationOutcome.SUCCESS,
-        )
-        for t in result.tools:
-            if t.name in self._tool_routing:
-                existing_server = self._tool_routing[t.name]
-                await _cleanup_connection()
-                raise ValueError(
-                    f"Tool {t.name!r} from server "
-                    f"{name!r} conflicts with server "
-                    f"{existing_server!r}"
-                )
-            self._tool_routing[t.name] = name
+        if conflicting_tool is not None:
+            await _cleanup_connection()
+            raise ValueError(
+                f"Tool {conflicting_tool!r} from server "
+                f"{name!r} conflicts with server "
+                f"{conflicting_server!r}"
+            )
 
-        conn._task = task
+        if previous_task is not None:
+            await asyncio.shield(asyncio.gather(previous_task, return_exceptions=True))
         logger.info(
             "MCP client connected to %s (%d tools)",
             name,
@@ -647,7 +851,10 @@ class AgentMCPClient:
         """
         tools = []
         for conn in self._servers.values():
-            result = await conn.session.list_tools()
+            session = conn.session
+            if session is None:
+                continue
+            result = await session.list_tools()
             for t in result.tools:
                 if include is not None and t.name not in include:
                     continue
@@ -830,6 +1037,112 @@ class AgentMCPClient:
             audit_state=audit_state,
         )
 
+    async def _reconnect_server(
+        self,
+        conn: _ServerConnection,
+    ) -> bool:
+        """Attempt to re-establish a broken stdio subprocess connection.
+
+        Returns True if reconnection succeeded and the server's tools are
+        available again.  Returns False (never raises) if reconnection is
+        not possible — e.g. because the original connection parameters were
+        not stored or the subprocess cannot be relaunched.
+        """
+        async with conn._reconnect_lock:
+            async with self._lifecycle_lock:
+                if self._closing:
+                    return False
+
+                current = self._servers.get(conn.name)
+                if current is not conn:
+                    return (
+                        current is not None
+                        and current._reconnect_origin_session_id == conn.session_id
+                        and current.connected
+                        and current.session is not None
+                    )
+                params = conn._connect_params
+                if params is None:
+                    logger.warning(
+                        "Cannot reconnect MCP server %s: no stored connection parameters",
+                        conn.name,
+                    )
+                    return False
+
+                if conn.connected:
+                    conn.connected = False
+                conn.session = None
+                previous_task = conn._task
+                conn._shutdown.set()
+
+            if previous_task is not None:
+                await asyncio.gather(previous_task, return_exceptions=True)
+
+            async with self._lifecycle_lock:
+                if self._closing:
+                    return False
+
+                current = self._servers.get(conn.name)
+                if current is not conn:
+                    return (
+                        current is not None
+                        and current._reconnect_origin_session_id == conn.session_id
+                        and current.connected
+                        and current.session is not None
+                    )
+
+                connect_task = asyncio.create_task(
+                    self.connect_command(
+                        command=params.command,
+                        args=params.args,
+                        name=conn.name,
+                        env=params.env,
+                        ticket_id=params.ticket_id,
+                        agent_id=params.agent_id,
+                        _expected_connection=conn,
+                        _expected_generation=conn.reconnect_generation,
+                    ),
+                    name=f"mcp-reconnect:{conn.name}",
+                )
+                self._reconnect_startup_tasks.add(connect_task)
+
+            logger.info(
+                "Attempting to reconnect MCP server %s (generation %d)",
+                conn.name,
+                conn.reconnect_generation + 1,
+            )
+            try:
+                await connect_task
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconnect MCP server %s (error_type=%s)",
+                    conn.name,
+                    type(exc).__name__,
+                )
+                return False
+            finally:
+                async with self._lifecycle_lock:
+                    self._reconnect_startup_tasks.discard(connect_task)
+
+            async with self._lifecycle_lock:
+                if self._closing:
+                    return False
+                new_conn = self._servers.get(conn.name)
+                if (
+                    new_conn is None
+                    or new_conn._reconnect_origin_session_id != conn.session_id
+                    or not new_conn.connected
+                    or new_conn.session is None
+                ):
+                    return False
+
+                logger.info(
+                    "Successfully reconnected MCP server %s (generation %d)",
+                    new_conn.name,
+                    new_conn.reconnect_generation,
+                )
+                return True
+
     async def _dispatch_mcp_request(
         self,
         conn: _ServerConnection,
@@ -838,7 +1151,74 @@ class AgentMCPClient:
         context: TraceContext,
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
-        if conn.session is None:
+        def record_reconnect_cancellation(
+            exc: asyncio.CancelledError,
+            retry_kind: RetryKind,
+        ) -> None:
+            cancellation_state = (
+                LifecycleState.TIMED_OUT
+                if exc.args == (_MCP_TIMEOUT_CANCELLATION,)
+                else LifecycleState.CANCELLED
+            )
+            terminal_recorded = self._record_boundary(
+                conn,
+                cancellation_state,
+                context=context,
+                tool_name=name,
+                outcome=(
+                    OperationOutcome.TIMED_OUT
+                    if cancellation_state == LifecycleState.TIMED_OUT
+                    else OperationOutcome.CANCELLED
+                ),
+                retry_kind=retry_kind,
+                error=exc,
+            )
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
+                audit_state.retry_classification = (
+                    "ambiguous_after_send"
+                    if audit_state.request_sent
+                    else "transport_before_send"
+                )
+            if terminal_recorded:
+                # Provider hook wrappers use this marker to leave ownership of
+                # the terminal event with the internal dispatch.
+                setattr(exc, "mcp_audit_recorded", True)
+
+        session = conn.session
+        if session is None:
+            # Attempt reconnect if we have stored connection parameters.
+            if conn._connect_params is not None:
+                logger.warning(
+                    "MCP session closed for %s before tool %s; attempting reconnect",
+                    conn.name,
+                    name,
+                )
+                try:
+                    reconnected = await self._reconnect_server(conn)
+                except asyncio.CancelledError as exc:
+                    record_reconnect_cancellation(
+                        exc,
+                        RetryKind.TRANSPORT_BEFORE_SEND,
+                    )
+                    raise
+                if reconnected:
+                    new_conn = self._servers.get(conn.name)
+                    if (
+                        new_conn is not None
+                        and new_conn.session is not None
+                        and new_conn._reconnect_origin_session_id == conn.session_id
+                        and self._tool_routing.get(name) == new_conn.name
+                    ):
+                        return await self._dispatch_mcp_request(
+                            new_conn,
+                            name,
+                            arguments,
+                            context,
+                            audit_state=audit_state,
+                        )
+
             error = RuntimeError("MCP session closed before tool dispatch")
             terminal_recorded = self._record_boundary(
                 conn,
@@ -851,6 +1231,8 @@ class AgentMCPClient:
             )
             if audit_state is not None:
                 audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = False
+                audit_state.retry_classification = "transport_before_send"
             return MCPHookResult(
                 content=self._redact_client_message(conn, context, str(error)),
                 is_error=True,
@@ -863,7 +1245,7 @@ class AgentMCPClient:
             self._record_boundary(
                 conn, LifecycleState.REQUEST_SENT, context=context, tool_name=name
             )
-            result = await conn.session.call_tool(
+            result = await session.call_tool(
                 name,
                 arguments,
                 meta=self._mcp_metadata(conn, context),
@@ -893,6 +1275,8 @@ class AgentMCPClient:
             )
             if audit_state is not None and terminal_recorded:
                 audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = True
+                audit_state.retry_classification = "ambiguous_after_send"
             # An internal provider dispatch is awaited inside the pre-call
             # hook. Mark the cancellation so call_tool does not record the
             # same terminal boundary again in its hook wrapper.
@@ -900,6 +1284,71 @@ class AgentMCPClient:
                 setattr(exc, "mcp_audit_recorded", True)
             raise
         except Exception as exc:
+            # Detect transport-level disconnection and attempt reconnect
+            # before reporting a terminal failure.
+            if _is_disconnect_error(exc) and conn._connect_params is not None:
+                self._record_boundary(
+                    conn,
+                    LifecycleState.DISCONNECTED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.FAILURE,
+                    retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
+                    error=exc,
+                )
+                conn.connected = False
+                conn.session = None
+                logger.warning(
+                    "MCP server %s disconnected during tool %s; attempting reconnect",
+                    conn.name,
+                    name,
+                )
+                # Reconnect for future calls, but do NOT retry
+                # this call — the previous request state is
+                # ambiguous (AMBIGUOUS_AFTER_SEND) and retrying
+                # non-idempotent tools could duplicate side effects.
+                try:
+                    reconnected = await self._reconnect_server(conn)
+                except asyncio.CancelledError as cancel_exc:
+                    record_reconnect_cancellation(
+                        cancel_exc,
+                        RetryKind.AMBIGUOUS_AFTER_SEND,
+                    )
+                    raise
+                if reconnected:
+                    message = (
+                        f"MCP server {conn.name!r} disconnected during "
+                        f"tool {name!r}. Reconnected for future calls, "
+                        f"but this call was not retried (ambiguous state)."
+                    )
+                else:
+                    message = (
+                        f"MCP server {conn.name!r} disconnected and "
+                        f"reconnection failed: {exc}"
+                    )
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    LifecycleState.FAILED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.FAILURE,
+                    retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
+                    error=message,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                return MCPHookResult(
+                    content=self._redact_client_message(
+                        conn,
+                        context,
+                        message,
+                    ),
+                    is_error=True,
+                    request_sent=True,
+                    retry_classification="ambiguous_after_send",
+                    audit_recorded=terminal_recorded,
+                )
+
             terminal_recorded = self._record_boundary(
                 conn,
                 LifecycleState.FAILED,
@@ -1309,25 +1758,73 @@ class AgentMCPClient:
         return True
 
     async def disconnect(self) -> None:
-        for conn in list(self._servers.values()):
-            self._record_boundary(conn, LifecycleState.DISCONNECTED)
-            conn.connected = False
-            conn._shutdown.set()
-            if conn._task is not None and not conn._task.done():
-                try:
-                    await asyncio.wait_for(conn._task, timeout=3)
-                except TimeoutError:
-                    conn._task.cancel()
-                    await conn._task
-                except (Exception, BaseException):
-                    pass
-        self._servers.clear()
-        self._tool_routing.clear()
-        if self._trace_client is not None and self._owns_trace_client:
-            self._trace_client.close()
-        self._trace_client = None
-        self._owns_trace_client = False
-        logger.info("MCP client disconnected all servers")
+        async with self._lifecycle_lock:
+            if self._disconnect_requests == 0:
+                self._disconnect_group_completed = False
+            self._disconnect_requests += 1
+            self._closing = True
+
+        completed = False
+        try:
+            async with self._disconnect_lock:
+                close_error = await self._disconnect_impl()
+            completed = True
+            if close_error is not None:
+                raise close_error
+        finally:
+            async with self._lifecycle_lock:
+                if completed:
+                    self._disconnect_group_completed = True
+                self._disconnect_requests -= 1
+                if self._disconnect_requests == 0:
+                    if self._disconnect_group_completed:
+                        self._closing = False
+                    self._disconnect_group_completed = False
+
+    async def _disconnect_impl(self) -> TraceDeliveryError | None:
+        async with self._lifecycle_lock:
+            self._closing = True
+            startup_tasks = tuple(
+                self._reconnect_startup_tasks | self._connection_startup_tasks
+            )
+            retiring_tasks = tuple(self._retiring_connection_tasks)
+
+        for task in startup_tasks:
+            task.cancel()
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks, return_exceptions=True)
+        if retiring_tasks:
+            await asyncio.gather(*retiring_tasks, return_exceptions=True)
+
+        async with self._lifecycle_lock:
+            self._reconnect_startup_tasks.difference_update(startup_tasks)
+            self._connection_startup_tasks.difference_update(startup_tasks)
+            self._retiring_connection_tasks.difference_update(retiring_tasks)
+            for conn in list(self._servers.values()):
+                self._record_boundary(conn, LifecycleState.DISCONNECTED)
+                conn.connected = False
+                conn._shutdown.set()
+                if conn._task is not None and not conn._task.done():
+                    try:
+                        await asyncio.wait_for(conn._task, timeout=3)
+                    except TimeoutError:
+                        conn._task.cancel()
+                        await conn._task
+                    except (Exception, BaseException):
+                        pass
+            self._servers.clear()
+            self._tool_routing.clear()
+            trace_close_error = None
+            try:
+                if self._trace_client is not None and self._owns_trace_client:
+                    self._trace_client.close()
+            except TraceDeliveryError as exc:
+                trace_close_error = exc
+            finally:
+                self._trace_client = None
+                self._owns_trace_client = False
+            logger.info("MCP client disconnected all servers")
+            return trace_close_error
 
 
 async def connect_external_servers(

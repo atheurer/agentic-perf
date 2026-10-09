@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp.server.middleware import MiddlewareContext
@@ -28,6 +28,7 @@ from agents.mcp_client import (
     AgentMCPClient,
     MCPHookResult,
     MCPToolCallError,
+    _ConnectParams,
     _ServerConnection,
 )
 from providers.redaction import get_shared_redactor
@@ -40,7 +41,7 @@ from providers.tracing import (
     new_trace_context,
     reset_trace_context,
 )
-from providers.tracing.client import TraceClient
+from providers.tracing.client import TraceClient, TraceDeliveryError
 from state_store.trace_store import TraceStore
 
 
@@ -827,6 +828,140 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_reconnect_cancellation_before_send_has_one_boundary():
+    reconnect_started = asyncio.Event()
+
+    async def block_reconnect(*args, **kwargs):
+        reconnect_started.set()
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    with patch.object(client, "connect_command", side_effect=block_reconnect):
+        task = asyncio.create_task(
+            client.call_tool(
+                "jmp_connect",
+                {"lease_id": "lease-1"},
+                TraceContext(ticket_id="PERF-1"),
+            )
+        )
+        await reconnect_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.CANCELLED,
+    ]
+    assert (
+        sum(
+            event.lifecycle.state
+            in {
+                LifecycleState.FAILED,
+                LifecycleState.CANCELLED,
+                LifecycleState.TIMED_OUT,
+                LifecycleState.REJECTED,
+                LifecycleState.SHORT_CIRCUITED,
+                LifecycleState.RESPONSE_RECEIVED,
+            }
+            for event in client.audit_events
+        )
+        == 1
+    )
+    assert client.audit_events[-1].outcome == OperationOutcome.CANCELLED
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
+async def test_jumpstarter_reconnect_cancellation_after_send_is_ambiguous_once():
+    reconnect_started = asyncio.Event()
+    session = AsyncMock()
+    session.call_tool = AsyncMock(side_effect=BrokenPipeError("pipe closed"))
+
+    async def block_reconnect(*args, **kwargs):
+        reconnect_started.set()
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    with patch.object(client, "connect_command", side_effect=block_reconnect):
+        task = asyncio.create_task(
+            client.call_tool(
+                "jmp_connect",
+                {"lease_id": "lease-1"},
+                TraceContext(ticket_id="PERF-1"),
+            )
+        )
+        await reconnect_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.DISCONNECTED,
+        LifecycleState.CANCELLED,
+    ]
+    assert (
+        sum(
+            event.lifecycle.state
+            in {
+                LifecycleState.FAILED,
+                LifecycleState.CANCELLED,
+                LifecycleState.TIMED_OUT,
+                LifecycleState.REJECTED,
+                LifecycleState.SHORT_CIRCUITED,
+                LifecycleState.RESPONSE_RECEIVED,
+            }
+            for event in client.audit_events
+        )
+        == 1
+    )
+    assert client.audit_events[-1].outcome == OperationOutcome.CANCELLED
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
+    )
+
+
+@pytest.mark.asyncio
 async def test_jumpstarter_completed_dispatch_is_not_reclassified_as_cancelled(
     monkeypatch,
 ):
@@ -1015,6 +1150,48 @@ async def test_jumpstarter_connect_timeout_has_one_timed_out_boundary(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_reconnect_timeout_is_pre_send_transport_failure(monkeypatch):
+    async def block_reconnect(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+    monkeypatch.setattr(jumpstarter_mcp, "_JMP_CONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr(client, "connect_command", block_reconnect)
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+
+    assert exc_info.value.retry_classification == "transport_before_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.TIMED_OUT,
+    ]
+    assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
 async def test_client_audits_hook_rejection_without_request():
     client = AgentMCPClient()
     client._tool_routing["tool"] = "local"
@@ -1140,6 +1317,308 @@ class _TestClientSession:
 
 
 @pytest.mark.asyncio
+async def test_reused_client_resumes_injected_trace_recording(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(name="test_tool")])
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(content=[SimpleNamespace(text="ok")], isError=False)
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    recorder = SimpleNamespace(record=MagicMock(), close=MagicMock())
+    client = AgentMCPClient(trace_client=recorder)
+
+    await client.disconnect()
+    recorder.record.assert_not_called()
+    assert client._trace_client is None
+
+    await client.connect_command(
+        command="python",
+        args=["server.py"],
+        name="local",
+        ticket_id="PERF-1",
+    )
+    await client.call_tool("test_tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert client._trace_client is recorder
+    assert recorder.record.call_count >= 4
+    recorder.close.assert_not_called()
+    await client.disconnect()
+    recorder.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reused_client_recreates_owned_trace_recording(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(name="test_tool")])
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(content=[SimpleNamespace(text="ok")], isError=False)
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setenv("STATE_STORE_URL", "https://state-store.invalid")
+    recorders = []
+
+    def _make_recorder(url, token):
+        recorder = SimpleNamespace(record=MagicMock(), close=MagicMock())
+        recorders.append((url, token, recorder))
+        return recorder
+
+    monkeypatch.setattr(mcp_client_module, "TraceClient", _make_recorder)
+    client = AgentMCPClient()
+    first_recorder = client._trace_client
+
+    await client.disconnect()
+
+    assert first_recorder is recorders[0][2]
+    first_recorder.close.assert_called_once_with()
+    assert client._trace_client is None
+
+    await client.connect_command(
+        command="python",
+        args=["server.py"],
+        name="local",
+        ticket_id="PERF-1",
+    )
+    await client.call_tool("test_tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert len(recorders) == 2
+    assert recorders[1][:2] == (
+        "https://state-store.invalid",
+        "test-token",
+    )
+    assert client._trace_client is recorders[1][2]
+    assert recorders[1][2].record.call_count >= 4
+    await client.disconnect()
+    recorders[1][2].close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_owned_trace_flush_failure_still_allows_client_reuse(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    class _Recorder:
+        def __init__(self, fail_close):
+            self.record = MagicMock()
+            self.fail_close = fail_close
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            if self.fail_close:
+                raise TraceDeliveryError("trace spool delivery failed")
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setenv("STATE_STORE_URL", "https://state-store.invalid")
+    recorders = []
+
+    def _make_recorder(_url, _token):
+        recorder = _Recorder(fail_close=not recorders)
+        recorders.append(recorder)
+        return recorder
+
+    monkeypatch.setattr(mcp_client_module, "TraceClient", _make_recorder)
+    client = AgentMCPClient()
+    first_recorder = client._trace_client
+
+    try:
+        await client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            ticket_id="PERF-1",
+        )
+        with pytest.raises(TraceDeliveryError, match="trace spool delivery failed"):
+            await client.disconnect()
+
+        assert first_recorder is recorders[0]
+        assert first_recorder.closed
+        assert client._trace_client is None
+        assert client._servers == {}
+        assert client._tool_routing == {}
+        assert not client._closing
+
+        await client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            ticket_id="PERF-1",
+        )
+
+        assert len(recorders) == 2
+        assert client._trace_client is recorders[1]
+        assert recorders[1].record.call_count >= 2
+    finally:
+        await client.disconnect()
+    assert recorders[1].closed
+
+
+@pytest.mark.asyncio
+async def test_overlapping_disconnects_keep_startup_blocked_until_both_finish(
+    monkeypatch,
+):
+    first_disconnect_started = asyncio.Event()
+    release_first_disconnect = asyncio.Event()
+    second_disconnect_finished = asyncio.Event()
+    release_second_disconnect = asyncio.Event()
+
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    client = AgentMCPClient()
+    original_disconnect_impl = client._disconnect_impl
+    disconnect_impl_calls = 0
+
+    async def _gated_disconnect_impl():
+        nonlocal disconnect_impl_calls
+        disconnect_impl_calls += 1
+        if disconnect_impl_calls == 1:
+            first_disconnect_started.set()
+            await release_first_disconnect.wait()
+            await original_disconnect_impl()
+        else:
+            await original_disconnect_impl()
+            second_disconnect_finished.set()
+            await release_second_disconnect.wait()
+
+    monkeypatch.setattr(client, "_disconnect_impl", _gated_disconnect_impl)
+    first_disconnect = asyncio.create_task(client.disconnect())
+    second_disconnect = None
+    try:
+        await asyncio.wait_for(first_disconnect_started.wait(), timeout=1)
+        second_disconnect = asyncio.create_task(client.disconnect())
+
+        async def _wait_for_two_disconnects():
+            while client._disconnect_requests != 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_for_two_disconnects(), timeout=1)
+        release_first_disconnect.set()
+        await asyncio.wait_for(second_disconnect_finished.wait(), timeout=1)
+        assert client._closing
+
+        with pytest.raises(asyncio.CancelledError):
+            await client._connect_transport(
+                "late",
+                _ReadyTransport(),
+                transport="stdio",
+                endpoint="late-server.py",
+            )
+        assert client._servers == {}
+        assert client._tool_routing == {}
+
+        release_second_disconnect.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_disconnect, second_disconnect), timeout=1
+        )
+        assert not client._closing
+        assert client._disconnect_requests == 0
+
+        await client._connect_transport(
+            "after-disconnects",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="server.py",
+        )
+        assert "after-disconnects" in client._servers
+    finally:
+        release_first_disconnect.set()
+        release_second_disconnect.set()
+        tasks = [first_disconnect]
+        if second_disconnect is not None:
+            tasks.append(second_disconnect)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_disconnect_reopens_after_group_teardown(monkeypatch):
+    second_waiting_for_lock = asyncio.Event()
+    allow_second_lock_acquire = asyncio.Event()
+    first_teardown_finished = asyncio.Event()
+    allow_first_disconnect_to_return = asyncio.Event()
+
+    class _SecondAcquireGate:
+        def __init__(self):
+            self._lock = asyncio.Lock()
+            self._acquire_count = 0
+
+        async def __aenter__(self):
+            self._acquire_count += 1
+            if self._acquire_count == 2:
+                second_waiting_for_lock.set()
+                await allow_second_lock_acquire.wait()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_args):
+            self._lock.release()
+
+    client = AgentMCPClient()
+    monkeypatch.setattr(client, "_disconnect_lock", _SecondAcquireGate())
+    original_disconnect_impl = client._disconnect_impl
+
+    async def _pause_after_teardown():
+        result = await original_disconnect_impl()
+        first_teardown_finished.set()
+        await allow_first_disconnect_to_return.wait()
+        return result
+
+    monkeypatch.setattr(client, "_disconnect_impl", _pause_after_teardown)
+    first_disconnect = asyncio.create_task(client.disconnect())
+    second_disconnect = None
+    try:
+        await asyncio.wait_for(first_teardown_finished.wait(), timeout=1)
+        second_disconnect = asyncio.create_task(client.disconnect())
+        await asyncio.wait_for(second_waiting_for_lock.wait(), timeout=1)
+
+        allow_first_disconnect_to_return.set()
+        await asyncio.wait_for(first_disconnect, timeout=1)
+        assert client._disconnect_requests == 1
+        assert client._closing
+
+        second_disconnect.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second_disconnect
+
+        assert client._disconnect_requests == 0
+        assert not client._closing
+        assert not client._disconnect_group_completed
+    finally:
+        allow_first_disconnect_to_return.set()
+        if second_disconnect is not None and not second_disconnect.done():
+            second_disconnect.cancel()
+        await asyncio.gather(
+            first_disconnect,
+            *([second_disconnect] if second_disconnect is not None else []),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_client_cancellation_during_connect_cleans_up_task():
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1169,6 +1648,402 @@ async def test_client_cancellation_during_connect_cleans_up_task():
         child.get_name() == "mcp:local" and not child.done()
         for child in asyncio.all_tasks()
     )
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_reconnect_stuck_in_initialize(monkeypatch):
+    initialize_started = asyncio.Event()
+    client = AgentMCPClient()
+    params = _ConnectParams(
+        command="python",
+        args=["server.py"],
+        env={},
+        ticket_id="PERF-1",
+        agent_id="test-agent",
+    )
+    conn = _ServerConnection(
+        name="local",
+        session=None,
+        transport="stdio",
+        ticket_id="PERF-1",
+        agent_id="test-agent",
+        connected=True,
+        _connect_params=params,
+    )
+    client._servers["local"] = conn
+    client._tool_routing["check_host"] = "local"
+
+    class _HangingInitializeSession(_TestClientSession):
+        async def initialize(self):
+            initialize_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingInitializeSession,
+    )
+
+    reconnect_task = asyncio.create_task(client._reconnect_server(conn))
+    await asyncio.wait_for(initialize_started.wait(), timeout=1)
+    assert client._servers["local"] is conn
+    assert client._tool_routing["check_host"] == "local"
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect_task
+
+    assert client._reconnect_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+            LifecycleState.RESPONSE_RECEIVED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert terminal_events[0].outcome == OperationOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_direct_connect_stuck_in_initialize(monkeypatch):
+    initialize_started = asyncio.Event()
+    client = AgentMCPClient()
+
+    class _HangingInitializeSession(_TestClientSession):
+        async def initialize(self):
+            initialize_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingInitializeSession,
+    )
+
+    connect_task = asyncio.create_task(
+        client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            env={},
+            ticket_id="PERF-1",
+        )
+    )
+    await asyncio.wait_for(initialize_started.wait(), timeout=1)
+    assert connect_task in client._connection_startup_tasks
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    assert client._connection_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    assert not any(
+        child.get_name() == "mcp:local" and not child.done()
+        for child in asyncio.all_tasks()
+    )
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert terminal_events[0].outcome == OperationOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_direct_connect_stuck_in_list_tools(monkeypatch):
+    list_tools_started = asyncio.Event()
+    cancellation_suppressed = asyncio.Event()
+    client = AgentMCPClient()
+
+    class _HangingListToolsSession(_TestClientSession):
+        async def list_tools(self):
+            list_tools_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_suppressed.set()
+            return SimpleNamespace(tools=[SimpleNamespace(name="late_tool")])
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingListToolsSession,
+    )
+
+    connect_task = asyncio.create_task(
+        client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            env={},
+            ticket_id="PERF-1",
+        )
+    )
+    await asyncio.wait_for(list_tools_started.wait(), timeout=1)
+    assert connect_task in client._connection_startup_tasks
+    assert "local" not in client._servers
+    assert "late_tool" not in client._tool_routing
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    assert cancellation_suppressed.is_set()
+    assert client._connection_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert not any(
+        child.get_name() == "mcp:local" and not child.done()
+        for child in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch):
+    first_initialize_started = asyncio.Event()
+    release_first_initialize = asyncio.Event()
+    first_list_tools_started = asyncio.Event()
+    release_first_list_tools = asyncio.Event()
+    second_list_tools_started = asyncio.Event()
+    release_second_list_tools = asyncio.Event()
+    session_count = 0
+
+    class _OverlappingSession(_TestClientSession):
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+            self.generation = session_count
+
+        async def initialize(self):
+            if self.generation == 1:
+                first_initialize_started.set()
+                await release_first_initialize.wait()
+
+        async def list_tools(self):
+            if self.generation == 1:
+                first_list_tools_started.set()
+                await release_first_list_tools.wait()
+                tool_name = "old_tool"
+            else:
+                second_list_tools_started.set()
+                await release_second_list_tools.wait()
+                tool_name = "replacement_tool"
+            return SimpleNamespace(tools=[SimpleNamespace(name=tool_name)])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _OverlappingSession)
+    client = AgentMCPClient()
+    first_startup = asyncio.create_task(
+        client._connect_transport(
+            "local",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="old-server.py",
+        )
+    )
+    second_startup = None
+    try:
+        await asyncio.wait_for(first_initialize_started.wait(), timeout=1)
+        second_startup = asyncio.create_task(
+            client._connect_transport(
+                "local",
+                _ReadyTransport(),
+                transport="stdio",
+                endpoint="replacement-server.py",
+            )
+        )
+        await asyncio.sleep(0)
+        assert second_startup in client._connection_startup_tasks
+        assert session_count == 1
+
+        release_first_initialize.set()
+        await asyncio.wait_for(first_list_tools_started.wait(), timeout=1)
+        assert session_count == 1
+        assert "local" not in client._servers
+
+        release_first_list_tools.set()
+        await first_startup
+        await asyncio.wait_for(second_list_tools_started.wait(), timeout=1)
+        old_connection = client._servers["local"]
+        assert session_count == 2
+        assert client._tool_routing == {"old_tool": "local"}
+
+        release_second_list_tools.set()
+        await second_startup
+
+        replacement_connection = client._servers["local"]
+        assert replacement_connection is not old_connection
+        assert replacement_connection.endpoint == "replacement-server.py"
+        assert client._tool_routing == {"replacement_tool": "local"}
+        assert old_connection._task is not None and old_connection._task.done()
+        live_server_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "mcp:local" and not task.done()
+        ]
+        assert live_server_tasks == [replacement_connection._task]
+    finally:
+        release_first_initialize.set()
+        release_first_list_tools.set()
+        release_second_list_tools.set()
+        startup_tasks = [first_startup]
+        if second_startup is not None:
+            startup_tasks.append(second_startup)
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+        await client.disconnect()
+        orphaned_server_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and task.get_name() == "mcp:local"
+            and not task.done()
+        ]
+        for task in orphaned_server_tasks:
+            task.cancel()
+        if orphaned_server_tasks:
+            await asyncio.gather(*orphaned_server_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancellation_propagates_during_previous_cleanup(monkeypatch):
+    previous_exit_started = asyncio.Event()
+    release_previous_exit = asyncio.Event()
+    replacement_initialize_started = asyncio.Event()
+    release_replacement_initialize = asyncio.Event()
+    session_count = 0
+
+    class _CleanupSession(_TestClientSession):
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+            self.generation = session_count
+
+        async def __aexit__(self, *_):
+            if self.generation == 1 and asyncio.current_task().cancelling():
+                previous_exit_started.set()
+                while not release_previous_exit.is_set():
+                    try:
+                        await release_previous_exit.wait()
+                    except asyncio.CancelledError:
+                        continue
+            return False
+
+        async def initialize(self):
+            if self.generation == 2:
+                replacement_initialize_started.set()
+                await release_replacement_initialize.wait()
+
+        async def list_tools(self):
+            tool_name = "previous_tool" if self.generation == 1 else "replacement_tool"
+            return SimpleNamespace(tools=[SimpleNamespace(name=tool_name)])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _CleanupSession)
+    client = AgentMCPClient()
+    await client._connect_transport(
+        "local",
+        _ReadyTransport(),
+        transport="stdio",
+        endpoint="previous-server.py",
+    )
+    previous_connection = client._servers["local"]
+    replacement_startup = asyncio.create_task(
+        client._connect_transport(
+            "local",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="replacement-server.py",
+        )
+    )
+    disconnect_task = None
+    try:
+        await asyncio.wait_for(replacement_initialize_started.wait(), timeout=1)
+        assert client._servers["local"] is previous_connection
+
+        release_replacement_initialize.set()
+        await asyncio.wait_for(previous_exit_started.wait(), timeout=1)
+        replacement_connection = client._servers["local"]
+        assert replacement_connection is not previous_connection
+        assert replacement_connection.endpoint == "replacement-server.py"
+        assert client._tool_routing == {"replacement_tool": "local"}
+
+        disconnect_task = asyncio.create_task(client.disconnect())
+        await asyncio.sleep(0)
+        assert replacement_startup.cancelling() > 0
+        release_previous_exit.set()
+
+        await asyncio.wait_for(disconnect_task, timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await replacement_startup
+
+        assert previous_connection._task is not None
+        assert previous_connection._task.done()
+        assert replacement_connection._task is not None
+        assert replacement_connection._task.done()
+        assert client._servers == {}
+        assert client._tool_routing == {}
+        assert client._connection_startup_tasks == set()
+        assert not any(
+            task.get_name() == "mcp:local" and not task.done()
+            for task in asyncio.all_tasks()
+        )
+    finally:
+        release_previous_exit.set()
+        release_replacement_initialize.set()
+        await asyncio.gather(
+            *([disconnect_task] if disconnect_task is not None else []),
+            replacement_startup,
+            return_exceptions=True,
+        )
+        await client.disconnect()
 
 
 @pytest.mark.asyncio
