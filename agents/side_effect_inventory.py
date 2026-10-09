@@ -258,8 +258,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("orchestrator/main.py", "_apply_step_overrides", "mutating_http_state"),
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"),
     ("orchestrator/main.py", "_block_handoff_failed", "mutating_http_state"),
+    ("orchestrator/main.py", "_normalize_ticket_directives", "mutating_http_state"),
     ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"),
-    ("orchestrator/main.py", "_poll_loop_after_lease", "mutating_http_state"),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"),
     ("orchestrator/main.py", "_redirect_to_investigation", "mutating_http_state"),
     ("orchestrator/main.py", "_release_lock", "filesystem"),
@@ -1914,10 +1914,10 @@ INVENTORY_DISPOSITIONS = {
         "orchestrator/main.py:_persist_retry_state",
         "2027-12-31",
     ),
-    ("orchestrator/main.py", "_poll_loop_after_lease", "mutating_http_state"): (
+    ("orchestrator/main.py", "_normalize_ticket_directives", "mutating_http_state"): (
         "system_only",
         "orchestration-maintainers",
-        "orchestrator/main.py:_poll_loop_after_lease",
+        "orchestrator/main.py:_normalize_ticket_directives",
         "2027-12-31",
     ),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"): (
