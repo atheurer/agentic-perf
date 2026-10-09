@@ -179,12 +179,11 @@ def _combined_reservation_outcome(
     set rather than inventing an unsupported composite identifier.
     """
     previous = _last_reservation
-    previous_provider = previous.get("provider")
-    if previous_provider and previous_provider != provider:
+    previous_identity = _reservation_identity(previous)
+    if previous_identity is None and reservation_failed(previous):
         # A definitive no-allocation failure releases the provider choice. Its
-        # diagnostic metadata must not leak into a later provider's outcome.
-        if _reservation_identity(previous) is None:
-            previous = {}
+        # diagnostic metadata must not leak into a later reservation outcome.
+        previous = {}
     previous_metadata = previous.get("provider_metadata")
     previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
     current_metadata = result.get("provider_metadata")

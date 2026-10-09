@@ -673,6 +673,56 @@ async def test_failed_no_allocation_does_not_pin_provider_choice():
 
 
 @pytest.mark.asyncio
+async def test_same_provider_retry_discards_failed_attempt_metadata():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    responses = iter(
+        [
+            {
+                "status": "failed",
+                "message": "No capacity",
+                "provider_metadata": {"diagnostic_region": "stale"},
+            },
+            {
+                "status": "success",
+                "reservation_id": "i-current",
+                "instance_ids": ["i-current"],
+                "provider_metadata": {"instance_ids": ["i-current"]},
+            },
+        ]
+    )
+    mock_provider.reserve = AsyncMock(side_effect=lambda *_a, **_kw: next(responses))
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
+
+    await srv.reserve_resources(
+        provider="aws",
+        selection={"instance_type": "m5.xlarge", "count": 1},
+        description="failed attempt",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(
+        await srv.reserve_resources(
+            provider="aws",
+            selection={"instance_type": "m5.xlarge", "count": 1},
+            description="retry on same provider",
+            ticket_id="PERF-TEST",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["provider_metadata"] == {"instance_ids": ["i-current"]}
+    assert (
+        "diagnostic_region"
+        not in srv._ticket["custom_fields"]["resource_provider_metadata"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_reserve_resources_allowed_after_first_allocation():
     """reserve_resources is NOT blocked by the guardrail (multi-call support)."""
     import agents.resource.server as srv
