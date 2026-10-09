@@ -734,7 +734,7 @@ class TestRunAgentTaskTimeout:
     @pytest.mark.asyncio
     async def test_no_timeout_when_zero(self):
         """agent_task_timeout=0 should not wrap with wait_for."""
-        from orchestrator.main import run_agent_task
+        import orchestrator.main as main
 
         agent = MagicMock()
         agent.run = AsyncMock()
@@ -746,9 +746,22 @@ class TestRunAgentTaskTimeout:
         dispatcher.events = None
         dispatcher.mark_done = AsyncMock()
 
-        await run_agent_task(
-            dispatcher, "executing_benchmark", "FAST-001", agent_task_timeout=0
-        )
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "id": "FAST-001",
+            "status": "executing_benchmark",
+            "custom_fields": {},
+        }
+        response.raise_for_status = MagicMock()
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client):
+            await main.run_agent_task(
+                dispatcher, "executing_benchmark", "FAST-001", agent_task_timeout=0
+            )
 
         agent.run.assert_called_once_with("FAST-001")
 

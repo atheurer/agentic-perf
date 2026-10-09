@@ -2614,6 +2614,73 @@ class TestProviderCorrectAutoReservation:
             )
 
     @pytest.mark.asyncio
+    async def test_auto_reservation_preserves_normalized_selection_history(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "infer operating system",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "required_hosts": [
+                    {
+                        "roles": ["target"],
+                        "os": "rhel-9",
+                        "recommended": {"instance_type": "m5.xlarge"},
+                    }
+                ],
+            },
+        }
+        normalized_selection = {
+            "instance_specs": [
+                {"instance_type": "m5.xlarge", "count": 1, "role": "target"}
+            ],
+            "os": "rhel-9",
+            "duration_hours": 36,
+        }
+        provider_metadata = {
+            "instance_ids": ["i-123"],
+            "instance_types": {"target": "m5.xlarge"},
+            "reservation_selections": [normalized_selection],
+        }
+        metadata_reads = 0
+
+        async def mcp_call(name, arguments):
+            nonlocal metadata_reads
+            if name == "get_accumulated_metadata":
+                metadata_reads += 1
+                return json.dumps(provider_metadata) if metadata_reads == 2 else "{}"
+            if name == "reserve_resources":
+                assert arguments["selection"] == {
+                    "instance_specs": [
+                        {"instance_type": "m5.xlarge", "count": 1, "role": "target"}
+                    ]
+                }
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "i-123",
+                        "provider_metadata": provider_metadata,
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("aws"))
+
+        fields = self._fields(agent)
+        history = fields["resource_provider_metadata"]["reservation_selections"]
+        assert history == [normalized_selection]
+
+        from agents.resource.agent import _provider_selection_changed
+
+        current_fields = {
+            **ticket["custom_fields"],
+            "resource_provider_metadata": fields["resource_provider_metadata"],
+        }
+        assert not _provider_selection_changed("aws", current_fields, {})
+
+    @pytest.mark.asyncio
     async def test_status_only_provider_failure_does_not_complete_allocation(self):
         ticket = {
             "id": "PERF-TEST",

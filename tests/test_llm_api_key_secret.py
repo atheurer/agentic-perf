@@ -218,7 +218,13 @@ class TestAPIKeySecretHandoff:
 
         dispatcher.create_agent.side_effect = create_agent
 
-        response = MagicMock(status_code=404)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "id": "PERF-123",
+            "status": "executing_benchmark",
+            "custom_fields": {},
+        }
+        response.raise_for_status = MagicMock()
         client = MagicMock()
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
@@ -265,6 +271,7 @@ class TestAPIKeySecretHandoff:
         secrets.get_secret = AsyncMock(return_value="ticket-key")
         ticket = {
             "id": "PERF-123",
+            "status": "executing_benchmark",
             "custom_fields": {
                 "llm_override": {
                     **({"provider": override_provider} if override_provider else {}),
@@ -307,6 +314,7 @@ class TestAPIKeySecretHandoff:
 
         response = MagicMock(status_code=200)
         response.json.return_value = ticket
+        response.raise_for_status = MagicMock()
         client = MagicMock()
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)

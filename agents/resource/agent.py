@@ -2009,7 +2009,15 @@ class ResourceAgent(AgentBase):
                         if isinstance(selection_history, list)
                         else []
                     )
-                    if selection_record not in selection_history:
+                    if not selection_history:
+                        result_history = result_metadata.get("reservation_selections")
+                        if isinstance(result_history, list):
+                            selection_history = list(result_history)
+                    if not selection_history:
+                        # The resource server persists its normalized request
+                        # (including inferred OS and provider defaults). Keep
+                        # that history authoritative; this fallback supports
+                        # older servers that return no selection history.
                         selection_history.append(selection_record)
                     reservation_metadata["reservation_selections"] = selection_history
                     if fallback_id and not has_reservation_metadata(
