@@ -1139,6 +1139,7 @@ async def _reply_to_guidance(
             json={"decision": decision, "comment": message},
         )
         resolved.raise_for_status()
+        await _emit_user_reply(client, store_url, headers, ticket_id, message)
         ticket_response = await client.get(
             f"{store_url}/api/v1/tickets/{ticket_id}",
             headers=headers,
@@ -1155,7 +1156,6 @@ async def _reply_to_guidance(
                 },
             )
             resumed.raise_for_status()
-        await _emit_user_reply(client, store_url, headers, ticket_id, message)
         if decision != "approved":
             return json.dumps({"status": "approval_resolved", "decision": decision})
         return json.dumps({"status": "approval_resolved", "decision": decision})
@@ -1188,11 +1188,13 @@ async def _reply_to_guidance(
                     break
 
     # Add comment
-    await client.post(
+    comment_response = await client.post(
         f"{store_url}/api/v1/tickets/{ticket_id}/comments",
         headers=headers,
         json={"author": "chat-agent", "body": message},
     )
+    comment_response.raise_for_status()
+    await _emit_user_reply(client, store_url, headers, ticket_id, message)
 
     if resume_status:
         r = await client.post(
@@ -1201,8 +1203,6 @@ async def _reply_to_guidance(
             json={"status": resume_status},
         )
         r.raise_for_status()
-
-    await _emit_user_reply(client, store_url, headers, ticket_id, message)
 
     if resume_status:
         return json.dumps(

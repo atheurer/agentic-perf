@@ -355,7 +355,7 @@ class TestAgentInterjectPickup:
         assert result is None
 
 
-async def test_approval_reply_is_emitted_after_resolution_and_resume() -> None:
+async def test_approval_reply_is_emitted_before_resume() -> None:
     import json
 
     import httpx
@@ -402,8 +402,106 @@ async def test_approval_reply_is_emitted_after_resolution_and_resume() -> None:
         )
 
     assert json.loads(result) == {"status": "approval_resolved", "decision": "approved"}
-    assert [call[1].rsplit("/", 1)[-1] for call in calls[-2:]] == [
-        "transition",
-        "user-reply",
-    ]
-    assert calls[-1][2] == {"message": "approved"}
+    paths = [call[1] for call in calls]
+    resolve_index = next(i for i, path in enumerate(paths) if path.endswith("/resolve"))
+    reply_index = next(
+        i for i, path in enumerate(paths) if path.endswith("/user-reply")
+    )
+    transition_index = next(
+        i for i, path in enumerate(paths) if path.endswith("/transition")
+    )
+    assert resolve_index < reply_index < transition_index
+    assert calls[reply_index][2] == {"message": "approved"}
+
+
+async def test_approval_reply_event_survives_failed_resume() -> None:
+    import json
+
+    import httpx
+
+    from agents.chat.tools import _reply_to_guidance
+
+    ticket_id = "PERF-APPROVAL-2"
+    approval_id = "apr-456"
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, payload))
+        if request.url.path.endswith("/approvals"):
+            return httpx.Response(
+                200,
+                json={
+                    "approvals": [
+                        {"approval_request_id": approval_id, "status": "pending"}
+                    ]
+                },
+            )
+        if request.url.path.endswith(f"/approvals/{approval_id}/resolve"):
+            return httpx.Response(200, json={"status": "approved"})
+        if request.method == "GET" and request.url.path.endswith(ticket_id):
+            return httpx.Response(
+                200,
+                json={"previous_status": "executing_benchmark"},
+            )
+        if request.url.path.endswith("/transition"):
+            return httpx.Response(409, json={"detail": "cannot resume"})
+        if request.url.path.endswith("/user-reply"):
+            return httpx.Response(200, json={"status": "recorded"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request),
+    ) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await _reply_to_guidance(
+                client,
+                "http://state-store",
+                {"Authorization": "Bearer service-token"},
+                {"ticket_id": ticket_id, "message": "approved"},
+            )
+
+    paths = [call[1] for call in calls]
+    reply_index = next(
+        i for i, path in enumerate(paths) if path.endswith("/user-reply")
+    )
+    transition_index = next(
+        i for i, path in enumerate(paths) if path.endswith("/transition")
+    )
+    assert reply_index < transition_index
+    assert calls[reply_index][2] == {"message": "approved"}
+
+
+async def test_failed_guidance_comment_does_not_emit_reply_event() -> None:
+    import httpx
+
+    from agents.chat.tools import _reply_to_guidance
+
+    ticket_id = "PERF-GUIDANCE-1"
+    calls: list[str] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/approvals"):
+            return httpx.Response(200, json={"approvals": []})
+        if request.method == "GET" and request.url.path.endswith(ticket_id):
+            return httpx.Response(200, json={"comments": [], "status_trail": []})
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(503, json={"detail": "store unavailable"})
+        if request.url.path.endswith("/user-reply"):
+            return httpx.Response(200, json={"status": "recorded"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request),
+    ) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await _reply_to_guidance(
+                client,
+                "http://state-store",
+                {"Authorization": "Bearer service-token"},
+                {"ticket_id": ticket_id, "message": "please continue"},
+            )
+
+    assert calls[-1].endswith("/comments")
+    assert all(not path.endswith("/user-reply") for path in calls)
