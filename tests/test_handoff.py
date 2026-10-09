@@ -195,11 +195,71 @@ class TestProvisioningToBenchmark:
             "custom_fields": {
                 "provisioning_complete": True,
                 "hosts_provisioned": ["10.0.0.1"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": [],
+                },
                 "harness_name": "crucible",
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "Harness verification passed.",
+                },
             }
         }
         ok, reason = check_handoff("executing_benchmark", ticket)
         assert ok
+
+    def test_provisioning_without_verification_is_rejected(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.1"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": [],
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+        assert "verification" in reason.lower()
+
+    def test_provisioning_with_blank_host_is_rejected(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "hosts_provisioned": [""],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": [],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "Harness verification passed.",
+                },
+            }
+        }
+        ok, _reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+
+    def test_provisioning_host_must_be_assigned(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["192.0.2.25"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": [],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "Harness verification passed.",
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+        assert "do not match assigned_hardware_ips" in reason
 
     def test_provisioning_not_complete(self):
         ticket = {
