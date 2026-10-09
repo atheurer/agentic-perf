@@ -107,6 +107,34 @@ def _write_flash_diagnostics(
         )
 
 
+def _format_exception_chain(exc: BaseException) -> str:
+    """Recursively unwrap exception chains and ExceptionGroups.
+
+    FlashError wraps ExceptionGroup whose str() hides
+    sub-exceptions.  This produces a flat, readable summary
+    of the full chain.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        e = queue.pop(0)
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        parts.append(f"{type(e).__name__}: {e}")
+        # Unwrap ExceptionGroup sub-exceptions
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                queue.append(sub)
+        # Follow the cause/context chain
+        if e.__cause__ is not None:
+            queue.append(e.__cause__)
+        elif e.__context__ is not None:
+            queue.append(e.__context__)
+    return "; ".join(parts)
+
+
 def _redact_flash_detail(
     ticket_id: str,
     detail: str,
@@ -513,7 +541,7 @@ async def _run_provision_steps(
         result.flash_duration_s = time.monotonic() - t0
         # Use repr() for ExceptionGroup/TaskGroup so sub-exception
         # messages are visible in diagnostics, not just the group label.
-        safe_exc = _redact_flash_detail(ticket_id, repr(exc))
+        safe_exc = _redact_flash_detail(ticket_id, _format_exception_chain(exc))
         diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {safe_exc}")
         logger.error(
             "[platform] Flash failed for %s (%s) after %.0fs: %s",
@@ -532,7 +560,7 @@ async def _run_provision_steps(
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
             retry_duration = time.monotonic() - t0
-            safe_exc2 = _redact_flash_detail(ticket_id, repr(exc2))
+            safe_exc2 = _redact_flash_detail(ticket_id, _format_exception_chain(exc2))
             diag.append(f"Flash retry failed ({retry_duration:.0f}s): {safe_exc2}")
             logger.error(
                 "[platform] Flash retry failed for %s (%s) after %.0fs: %s",
