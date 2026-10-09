@@ -146,6 +146,17 @@ class TestNormalizeDirectives:
         normalized, applied, unrecognized = normalize_directives(directives)
         assert normalized["reboot_method"] == "cold"
 
+    @pytest.mark.parametrize(
+        "key", ["reboot_type", "reboot_mode", "boot_type", "boot_mode", "restart_type"]
+    )
+    def test_generic_reboot_method_boolean_is_omitted_and_reported(self, key):
+        normalized, applied, unrecognized = normalize_directives({key: True})
+        assert "reboot_method" not in normalized
+        assert applied == []
+        assert len(unrecognized) == 1
+        assert f"'{key}'" in unrecognized[0]
+        assert "True" in unrecognized[0]
+
     def test_boolean_cold_reboot_false_reported(self):
         directives = {"cold_reboot": False, "harness": "boot-time"}
         normalized, applied, unrecognized = normalize_directives(directives)

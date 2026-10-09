@@ -282,7 +282,15 @@ def normalize_directives(
             # Handle value semantics for special cases
             if canonical == "reboot_method" and key != "reboot_method":
                 if isinstance(value, bool) and value:
-                    value = _infer_reboot_method(key)
+                    inferred = _infer_reboot_method(key)
+                    if inferred is None:
+                        unrecognized.append(
+                            f"Invalid value for '{key}' ({value!r}) — "
+                            "expected a method string or a boolean key naming "
+                            "cold, warm, or ssh"
+                        )
+                        continue
+                    value = inferred
                 elif isinstance(value, bool) and not value:
                     applied.append(f"'{key}'=false skipped (no reboot method to infer)")
                     continue
@@ -331,7 +339,7 @@ def normalize_directives(
     return normalized, applied, unrecognized
 
 
-def _infer_reboot_method(key: str) -> str:
+def _infer_reboot_method(key: str) -> str | None:
     """Infer reboot method from boolean-style key names."""
     key_lower = key.lower()
     if "cold" in key_lower:
@@ -340,7 +348,7 @@ def _infer_reboot_method(key: str) -> str:
         return "warm"
     if "ssh" in key_lower:
         return "ssh"
-    return "cold"
+    return None
 
 
 def format_normalization_report(
