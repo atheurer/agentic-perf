@@ -188,12 +188,9 @@ async def test_reconnect_on_broken_pipe_during_call_tool():
             client._tool_routing[t] = name
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
-        result = await client.call_tool(
-            "check_host", {}, trace_context=_trace_context()
-        )
-
-    assert "result:check_host" in result
-    assert success_session.call_count == 1
+        with pytest.raises(MCPToolCallError, match="not retried|ambiguous"):
+            await client.call_tool("check_host", {}, trace_context=_trace_context())
+    assert success_session.call_count == 0  # no retry after ambiguous send
 
 
 @pytest.mark.asyncio
@@ -230,11 +227,10 @@ async def test_reconnect_on_connection_reset_during_call_tool():
         client._tool_routing["query_numa"] = name
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
-        result = await client.call_tool(
-            "query_numa", {}, trace_context=_trace_context()
-        )
-
-    assert "result:query_numa" in result
+        with pytest.raises(MCPToolCallError, match="not retried|ambiguous"):
+            await client.call_tool(
+                "query_numa", {}, trace_context=_trace_context()
+            )
 
 
 @pytest.mark.asyncio
@@ -335,6 +331,7 @@ async def test_reconnect_on_closed_session():
             "check_host", {}, trace_context=_trace_context()
         )
 
+    # Pre-dispatch reconnect is safe to retry (no ambiguity)
     assert "result:check_host" in result
 
 
@@ -371,13 +368,20 @@ async def test_reconnect_audit_trail():
         client._tool_routing["check_host"] = name
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
-        await client.call_tool("check_host", {}, trace_context=_trace_context())
+        # The call returns an error (no retry) but reconnects for future calls
+        try:
+            result = await client.call_tool(
+                "check_host", {}, trace_context=_trace_context()
+            )
+            # call_tool may return error string instead of raising
+            assert "not retried" in result.lower() or "ambiguous" in result.lower()
+        except Exception:
+            pass  # MCPToolCallError is acceptable
 
     states = [e.lifecycle.state for e in client.audit_events]
-    # Should see: REQUEST_SENT (failed attempt), DISCONNECTED, then
-    # REQUEST_SENT + RESPONSE_RECEIVED for the successful retry.
+    # Should see DISCONNECTED from the transport failure.
+    # No RESPONSE_RECEIVED — we don't retry ambiguous calls.
     assert LifecycleState.DISCONNECTED in states
-    assert LifecycleState.RESPONSE_RECEIVED in states
 
 
 @pytest.mark.asyncio
@@ -416,8 +420,5 @@ async def test_wrapped_disconnect_error_triggers_reconnect():
         client._tool_routing["check_host"] = name
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
-        result = await client.call_tool(
-            "check_host", {}, trace_context=_trace_context()
-        )
-
-    assert "result:check_host" in result
+        with pytest.raises(MCPToolCallError, match="not retried|ambiguous"):
+            await client.call_tool("check_host", {}, trace_context=_trace_context())

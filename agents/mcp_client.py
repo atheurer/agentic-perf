@@ -121,13 +121,25 @@ def _is_disconnect_error(exc: BaseException) -> bool:
 
 @dataclass
 class _ConnectParams:
-    """Immutable snapshot of the arguments needed to re-establish a connection."""
+    """Immutable snapshot of the arguments needed to re-establish a connection.
+
+    The env dict may contain credentials. __repr__ is overridden
+    to prevent accidental exposure in logs or crash dumps.
+    """
 
     command: str
     args: list[str]
     env: dict[str, str]
     ticket_id: str | None
     agent_id: str | None
+
+    def __repr__(self) -> str:
+        return (
+            f"_ConnectParams(command={self.command!r}, "
+            f"args={self.args!r}, env=<{len(self.env)} vars>, "
+            f"ticket_id={self.ticket_id!r}, "
+            f"agent_id={self.agent_id!r})"
+        )
 
 
 @dataclass
@@ -1036,21 +1048,22 @@ class AgentMCPClient:
                     conn.name,
                     name,
                 )
-                if await self._reconnect_server(conn):
-                    new_conn = self._servers.get(conn.name)
-                    if new_conn is not None and new_conn.session is not None:
-                        return await self._dispatch_mcp_request(
-                            new_conn,
-                            name,
-                            arguments,
-                            context,
-                            audit_state=audit_state,
-                        )
-                # Reconnect failed — fall through to terminal error.
-                message = (
-                    f"MCP server {conn.name!r} disconnected and "
-                    f"reconnection failed: {exc}"
-                )
+                # Reconnect for future calls, but do NOT retry
+                # this call — the previous request state is
+                # ambiguous (AMBIGUOUS_AFTER_SEND) and retrying
+                # non-idempotent tools could duplicate side effects.
+                reconnected = await self._reconnect_server(conn)
+                if reconnected:
+                    message = (
+                        f"MCP server {conn.name!r} disconnected during "
+                        f"tool {name!r}. Reconnected for future calls, "
+                        f"but this call was not retried (ambiguous state)."
+                    )
+                else:
+                    message = (
+                        f"MCP server {conn.name!r} disconnected and "
+                        f"reconnection failed: {exc}"
+                    )
                 terminal_recorded = self._record_boundary(
                     conn,
                     LifecycleState.FAILED,
