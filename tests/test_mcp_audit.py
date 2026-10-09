@@ -1555,6 +1555,70 @@ async def test_overlapping_disconnects_keep_startup_blocked_until_both_finish(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_queued_disconnect_reopens_after_group_teardown(monkeypatch):
+    second_waiting_for_lock = asyncio.Event()
+    allow_second_lock_acquire = asyncio.Event()
+    first_teardown_finished = asyncio.Event()
+    allow_first_disconnect_to_return = asyncio.Event()
+
+    class _SecondAcquireGate:
+        def __init__(self):
+            self._lock = asyncio.Lock()
+            self._acquire_count = 0
+
+        async def __aenter__(self):
+            self._acquire_count += 1
+            if self._acquire_count == 2:
+                second_waiting_for_lock.set()
+                await allow_second_lock_acquire.wait()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_args):
+            self._lock.release()
+
+    client = AgentMCPClient()
+    monkeypatch.setattr(client, "_disconnect_lock", _SecondAcquireGate())
+    original_disconnect_impl = client._disconnect_impl
+
+    async def _pause_after_teardown():
+        result = await original_disconnect_impl()
+        first_teardown_finished.set()
+        await allow_first_disconnect_to_return.wait()
+        return result
+
+    monkeypatch.setattr(client, "_disconnect_impl", _pause_after_teardown)
+    first_disconnect = asyncio.create_task(client.disconnect())
+    second_disconnect = None
+    try:
+        await asyncio.wait_for(first_teardown_finished.wait(), timeout=1)
+        second_disconnect = asyncio.create_task(client.disconnect())
+        await asyncio.wait_for(second_waiting_for_lock.wait(), timeout=1)
+
+        allow_first_disconnect_to_return.set()
+        await asyncio.wait_for(first_disconnect, timeout=1)
+        assert client._disconnect_requests == 1
+        assert client._closing
+
+        second_disconnect.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second_disconnect
+
+        assert client._disconnect_requests == 0
+        assert not client._closing
+        assert not client._disconnect_group_completed
+    finally:
+        allow_first_disconnect_to_return.set()
+        if second_disconnect is not None and not second_disconnect.done():
+            second_disconnect.cancel()
+        await asyncio.gather(
+            first_disconnect,
+            *([second_disconnect] if second_disconnect is not None else []),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_client_cancellation_during_connect_cleans_up_task():
     entered = asyncio.Event()
     release = asyncio.Event()

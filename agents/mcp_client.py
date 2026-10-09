@@ -211,6 +211,7 @@ class AgentMCPClient:
         self._lifecycle_lock = asyncio.Lock()
         self._disconnect_lock = asyncio.Lock()
         self._disconnect_requests = 0
+        self._disconnect_group_completed = False
         self._closing = False
         self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
         self._connection_startup_tasks: set[asyncio.Task[None]] = set()
@@ -1758,6 +1759,8 @@ class AgentMCPClient:
 
     async def disconnect(self) -> None:
         async with self._lifecycle_lock:
+            if self._disconnect_requests == 0:
+                self._disconnect_group_completed = False
             self._disconnect_requests += 1
             self._closing = True
 
@@ -1770,9 +1773,13 @@ class AgentMCPClient:
                 raise close_error
         finally:
             async with self._lifecycle_lock:
+                if completed:
+                    self._disconnect_group_completed = True
                 self._disconnect_requests -= 1
-                if completed and self._disconnect_requests == 0:
-                    self._closing = False
+                if self._disconnect_requests == 0:
+                    if self._disconnect_group_completed:
+                        self._closing = False
+                    self._disconnect_group_completed = False
 
     async def _disconnect_impl(self) -> TraceDeliveryError | None:
         async with self._lifecycle_lock:
