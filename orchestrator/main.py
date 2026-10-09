@@ -72,7 +72,9 @@ def _directives_for_triage(
     """Keep invalid sample counts out of triage and benchmark inputs."""
     result = dict(directives)
     if any(
-        note.startswith("Invalid value for 'sample_count'") for note in unrecognized
+        note.startswith("Invalid value for '")
+        and "expected an integer greater than zero for 'sample_count'" in note
+        for note in unrecognized
     ):
         result.pop("sample_count", None)
     return result

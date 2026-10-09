@@ -41,11 +41,57 @@ def test_invalid_sample_counts_are_removed_from_triage_payload(
     triage_directives = _directives_for_triage(normalized, unrecognized)
 
     if expected is None:
-        assert normalized["sample_count"] == value
+        assert "sample_count" not in normalized
         assert "sample_count" not in triage_directives
         assert any("expected an integer" in note for note in unrecognized)
     else:
         assert triage_directives["sample_count"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["sample_count", "reboot_count"])
+async def test_invalid_sample_count_is_omitted_from_persisted_triage_directives(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    import orchestrator.main as main
+    from providers.skills import boot_time  # noqa: F401
+
+    raw_directives = {"power_off_delay_seconds": 5, key: 0}
+    persisted_directives = {}
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            persisted_directives.update(json["fields"]["directives"])
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            self.comment = json["body"]
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+
+    triage_directives, ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-invalid-count", raw_directives, events, {}
+    )
+
+    assert ready is True
+    assert persisted_directives == {"power_off_delay": 5}
+    assert triage_directives == persisted_directives
+    assert "sample_count" not in persisted_directives
+    event_payload = events.emit.call_args.args[3]
+    warning = event_payload["unrecognized"][0]
+    assert f"'{key}'" in warning
+    assert "0" in warning
+    assert "expected an integer" in warning
+    assert f"'{key}'" in client.comment
 
 
 @pytest.mark.asyncio

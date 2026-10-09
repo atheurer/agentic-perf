@@ -168,26 +168,39 @@ class TestNormalizeDirectives:
         assert any("converted to an integer" in note for note in applied)
         assert unrecognized == []
 
-    def test_sample_count_boolean_is_preserved_and_reported(self):
+    def test_sample_count_boolean_is_omitted_and_reported(self):
         normalized, applied, unrecognized = normalize_directives({"sample_count": True})
-        assert normalized["sample_count"] is True
+        assert "sample_count" not in normalized
         assert applied == []
-        assert any("expected an integer" in note for note in unrecognized)
+        assert any(
+            "'sample_count'" in note
+            and "True" in note
+            and "expected an integer" in note
+            for note in unrecognized
+        )
 
-    def test_sample_count_fraction_is_preserved_and_reported(self):
+    def test_sample_count_fraction_is_omitted_and_reported(self):
         normalized, applied, unrecognized = normalize_directives({"sample_count": 2.5})
-        assert normalized["sample_count"] == 2.5
+        assert "sample_count" not in normalized
         assert applied == []
-        assert any("expected an integer" in note for note in unrecognized)
+        assert any(
+            "'sample_count'" in note and "2.5" in note and "expected an integer" in note
+            for note in unrecognized
+        )
 
     @pytest.mark.parametrize("value", [True, 2.5, 0, -1, "0", "-2"])
     def test_non_positive_or_non_integral_sample_counts_are_reported(self, value):
         normalized, applied, unrecognized = normalize_directives(
             {"sample_count": value}
         )
-        assert normalized["sample_count"] == value
+        assert "sample_count" not in normalized
         assert applied == []
-        assert any("expected an integer" in note for note in unrecognized)
+        assert any(
+            "'sample_count'" in note
+            and repr(value) in note
+            and "expected an integer" in note
+            for note in unrecognized
+        )
 
     def test_positive_integral_sample_count_number_is_accepted(self):
         normalized, applied, unrecognized = normalize_directives({"sample_count": 2.0})
@@ -195,11 +208,28 @@ class TestNormalizeDirectives:
         assert any("converted to an integer" in note for note in applied)
         assert unrecognized == []
 
-    def test_invalid_sample_count_alias_is_preserved_and_reported(self):
+    def test_invalid_sample_count_alias_is_omitted_and_reported(self):
         normalized, applied, unrecognized = normalize_directives({"reboot_count": 0})
-        assert normalized["sample_count"] == 0
-        assert any("alias" in note for note in applied)
-        assert any("expected an integer" in note for note in unrecognized)
+        assert "sample_count" not in normalized
+        assert applied == []
+        assert any(
+            "'reboot_count'" in note and "0" in note and "expected an integer" in note
+            for note in unrecognized
+        )
+
+    def test_invalid_duplicate_does_not_replace_valid_sample_count(self):
+        normalized, _applied, unrecognized = normalize_directives(
+            {"sample_count": 3, "reboot_count": 0}
+        )
+        assert normalized["sample_count"] == 3
+        assert any("'reboot_count'" in note for note in unrecognized)
+
+    def test_valid_sample_count_after_invalid_value_is_kept(self):
+        normalized, _applied, unrecognized = normalize_directives(
+            {"sample_count": 0, "reboot_count": 3}
+        )
+        assert normalized["sample_count"] == 3
+        assert any("'sample_count'" in note and "0" in note for note in unrecognized)
 
     def test_millisecond_duration_converts_to_seconds(self):
         normalized, applied, unrecognized = normalize_directives(

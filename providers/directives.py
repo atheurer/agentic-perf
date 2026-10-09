@@ -264,7 +264,6 @@ def normalize_directives(
     for key, value in directives.items():
         canonical, reason = normalize_key(key)
         conversion_note = None
-        value_error = None
 
         if reason and key.endswith(("_ms", "_millisecond", "_milliseconds")):
             converted = _convert_milliseconds(value)
@@ -291,9 +290,11 @@ def normalize_directives(
                 original_value = value
                 converted = _coerce_sample_count(value)
                 if converted is None:
-                    value_error = (
-                        "Invalid value for 'sample_count' — expected an integer"
+                    unrecognized.append(
+                        f"Invalid value for '{key}' ({original_value!r}) — "
+                        "expected an integer greater than zero for 'sample_count'"
                     )
+                    continue
                 else:
                     value = converted
                     if type(original_value) is not int:
@@ -315,8 +316,6 @@ def normalize_directives(
             if conversion_note:
                 applied.append(conversion_note)
                 logger.info("[directives] %s", conversion_note)
-            if value_error:
-                unrecognized.append(value_error)
         else:
             suggestions = get_close_matches(key, recognized, n=3, cutoff=0.5)
             if suggestions:
