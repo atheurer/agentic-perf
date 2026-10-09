@@ -827,6 +827,14 @@ class ResourceAgent(AgentBase):
         fields = ticket.get("custom_fields", {})
         directives = fields.get("directives", {})
 
+        async def pause_teardown(message: str) -> None:
+            if ticket.get("status") != "awaiting_customer_guidance":
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=message,
+                )
+
         skip_teardown = directives.get("skip_teardown")
         if skip_teardown is None:
             # Ticket did not express a preference; fall back to
@@ -868,11 +876,19 @@ class ResourceAgent(AgentBase):
                 host_cleanup,
             )
             if not teardown_confirmed:
+                await pause_teardown(
+                    "Resource teardown could not confirm release; allocation "
+                    "details were retained for manual reconciliation."
+                )
                 return
         else:
             if host_cleanup == "required":
                 await self._run_host_cleanup(ticket_id, fields)
             if not await self._terminate_all(ticket_id, fields):
+                await pause_teardown(
+                    "Resource teardown could not confirm release; allocation "
+                    "details were retained for manual reconciliation."
+                )
                 return
 
         # Clear the transient flag

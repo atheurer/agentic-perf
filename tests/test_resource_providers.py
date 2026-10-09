@@ -2362,6 +2362,40 @@ class TestProviderCorrectAutoReservation:
 
 class TestTeardownDispatch:
     @pytest.mark.asyncio
+    async def test_unconfirmed_teardown_pauses_and_preserves_allocation(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_teardown",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-old",
+                "resource_provider_metadata": {"instance_ids": ["i-old"]},
+                "directives": {"skip_teardown": False, "host_cleanup": "optional"},
+            },
+        }
+        agent = TestProviderCorrectAutoReservation._make_agent(
+            ticket, lambda _name, _args: "{}"
+        )
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "skipped"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        await agent._run_teardown("PERF-TEST")
+
+        old_provider.terminate.assert_awaited_once_with(
+            "i-old", {"instance_ids": ["i-old"]}
+        )
+        agent._client.patch.assert_not_awaited()
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == ("awaiting_customer_guidance")
+
+    @pytest.mark.asyncio
     async def test_legacy_quads_fields_detected(self):
         """Teardown should infer 'quads' provider from legacy quads_assignment_id."""
         from agents.resource.agent import ResourceAgent
