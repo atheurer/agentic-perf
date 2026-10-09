@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("platform-agent")
 
-# Module-level state — lazily initialized
+# Module-level state — lazily initialized. PlatformAgent launches this server
+# as a fresh stdio subprocess for each ticket, so this state is process-local
+# and does not leak between tickets.
 _ticket: dict[str, Any] = {}
 _initialized = False
 
@@ -36,6 +38,7 @@ _initialized = False
 # calls with a different image_variant are rejected immediately because
 # the root cause is the environment, not the OS image.
 _last_infra_error: str | None = None
+_last_infra_variant: str | None = None
 
 
 async def _ensure_init():
@@ -82,11 +85,11 @@ async def provision_platform(
     prov = provider or cf.get("resource_provider", "")
 
     if prov == "jumpstarter":
-        # Block speculative variant retries after infrastructure errors.
+        # Block speculative variant changes after infrastructure errors.
         # If the previous attempt failed due to infrastructure (TaskGroup,
-        # U-Boot timeout, connection error), trying a different image
-        # variant will not help — fail immediately.
-        if _last_infra_error and image_variant:
+        # U-Boot timeout, connection error), changing the image variant will
+        # not help — fail immediately.
+        if _last_infra_error and image_variant != (_last_infra_variant or ""):
             return json.dumps(
                 {
                     "success": False,
@@ -216,15 +219,17 @@ async def _provision_jumpstarter(
     result = await provision_jumpstarter(**provision_kwargs)
 
     # Track infrastructure failures to block speculative variant retries.
-    global _last_infra_error
+    global _last_infra_error, _last_infra_variant
     if result.infrastructure_error:
         # Capture a short summary for the rejection message.
         _last_infra_error = next(
             (d for d in result.diagnostics if "INFRASTRUCTURE_ERROR" in d),
             "infrastructure failure (see diagnostics)",
         )
+        _last_infra_variant = image_variant
     else:
         _last_infra_error = None
+        _last_infra_variant = None
 
     return json.dumps(
         {

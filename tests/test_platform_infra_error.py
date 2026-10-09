@@ -108,6 +108,7 @@ class TestVariantRetryBlocking:
         import agents.platform.server as srv
 
         srv._last_infra_error = None
+        srv._last_infra_variant = None
         srv._initialized = True
         srv._ticket = {
             "id": "T-TEST",
@@ -127,6 +128,7 @@ class TestVariantRetryBlocking:
         }
         yield
         srv._last_infra_error = None
+        srv._last_infra_variant = None
 
     @pytest.mark.asyncio
     async def test_variant_blocked_after_infra_error(self):
@@ -143,6 +145,39 @@ class TestVariantRetryBlocking:
         assert result["infrastructure_error"] is True
         assert "infrastructure" in result["error"].lower()
         assert "image variant" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_only_changed_variant_is_blocked_after_infra_error(self):
+        """Repeating the same variant is allowed; changing it is rejected."""
+        import agents.platform.server as srv
+
+        infra_result = ProvisionResult(
+            success=False,
+            infrastructure_error=True,
+            diagnostics=["INFRASTRUCTURE_ERROR: test environment failure"],
+        )
+
+        with patch(
+            "providers.resource.jumpstarter_provision.provision_jumpstarter",
+            new_callable=AsyncMock,
+            return_value=infra_result,
+        ) as mock_provision:
+            first_json = await srv.provision_platform(image_variant="ps-regular")
+            same_variant_json = await srv.provision_platform(image_variant="ps-regular")
+            changed_variant_json = await srv.provision_platform(image_variant="qa")
+            default_variant_json = await srv.provision_platform(image_variant="")
+
+        first = json.loads(first_json)
+        same_variant = json.loads(same_variant_json)
+        changed_variant = json.loads(changed_variant_json)
+        default_variant = json.loads(default_variant_json)
+        assert first["infrastructure_error"] is True
+        assert same_variant["infrastructure_error"] is True
+        assert changed_variant["infrastructure_error"] is True
+        assert "changing the image variant" in changed_variant["error"].lower()
+        assert default_variant["infrastructure_error"] is True
+        assert "changing the image variant" in default_variant["error"].lower()
+        assert mock_provision.await_count == 2
 
     @pytest.mark.asyncio
     async def test_no_variant_allowed_after_infra_error(self):

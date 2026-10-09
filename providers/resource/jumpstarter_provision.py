@@ -34,9 +34,9 @@ _TCP_TIMEOUT = 30
 _SSH_TIMEOUT = 30
 
 
-# Exception types that indicate infrastructure failures (not image problems).
-# When a flash fails with one of these, retrying with a different image variant
-# will not help — the error is in the environment, not the artifact.
+# Error details that indicate infrastructure failures (not image problems).
+# Retrying a failed provision with a different image variant will not help —
+# the error is in the environment, not the artifact.
 _INFRASTRUCTURE_ERROR_PATTERNS = (
     "failed to get u-boot prompt",
     "connection refused",
@@ -50,6 +50,11 @@ _INFRASTRUCTURE_ERROR_PATTERNS = (
     "lease expired",
     "exporter disconnected",
 )
+_INFRASTRUCTURE_ERROR_DIAGNOSTIC = (
+    "INFRASTRUCTURE_ERROR: This failure is caused by the "
+    "test environment (not the OS image). Retrying with "
+    "a different image variant will not help."
+)
 
 
 def is_infrastructure_error(exc: BaseException) -> bool:
@@ -57,8 +62,8 @@ def is_infrastructure_error(exc: BaseException) -> bool:
 
     Infrastructure errors are failures in the test environment (network,
     board firmware, gRPC tunnel, lease management) rather than problems
-    with the OS image being flashed.  Retrying with a different image
-    variant will not fix them.
+    with the OS image. Retrying with a different image variant will not fix
+    them.
     """
     # ExceptionGroup / TaskGroup wrappers are always infrastructure.
     if isinstance(exc, (ExceptionGroup, BaseExceptionGroup)):
@@ -585,11 +590,7 @@ async def _run_provision_steps(
             )
             if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
                 result.infrastructure_error = True
-                diag.append(
-                    "INFRASTRUCTURE_ERROR: This failure is caused by the "
-                    "test environment (not the OS image). Retrying with "
-                    "a different image variant will not help."
-                )
+                diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process
             # the tool result.
@@ -614,11 +615,13 @@ async def _run_provision_steps(
 
     # ── Step 4: Discover IP ──────────────────────────
     ip = ""
+    address_errors: list[BaseException] = []
     try:
         addr = await to_thread.run_sync(client.tcp.address)
         ip = _parse_exporter_address(addr)
         diag.append(f"IP discovered: {ip}")
     except Exception as exc:
+        address_errors.append(exc)
         diag.append(f"TCP address failed: {exc}")
         # The exporter may have temporarily disconnected
         # during reboot. Retry with backoff — the gRPC
@@ -642,10 +645,14 @@ async def _run_provision_steps(
                 diag.append(f"IP discovered on retry {attempt + 1}: {ip}")
                 break
             except Exception as exc2:
+                address_errors.append(exc2)
                 diag.append(f"Retry {attempt + 1} failed: {exc2}")
 
     if not ip:
         diag.append("IP discovery failed")
+        if any(is_infrastructure_error(exc) for exc in address_errors):
+            result.infrastructure_error = True
+            diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
         result.diagnostics = diag
         return result
 
@@ -664,6 +671,7 @@ async def _run_provision_steps(
     import socket as _socket
 
     ssh_reachable = False
+    ssh_connect_errors: list[BaseException] = []
     for attempt in range(6):
         try:
             s = _socket.create_connection((ip, 22), timeout=10)
@@ -671,7 +679,8 @@ async def _run_provision_steps(
             ssh_reachable = True
             diag.append(f"SSH port 22 reachable on {ip} (attempt {attempt + 1})")
             break
-        except (OSError, ConnectionRefusedError):
+        except (OSError, ConnectionRefusedError) as exc:
+            ssh_connect_errors.append(exc)
             if attempt < 5:
                 await asyncio.sleep(10)
 
@@ -682,6 +691,9 @@ async def _run_provision_steps(
             f" with no network, wrong IP, or a corrupt"
             f" image. Check serial output for boot errors."
         )
+        if any(is_infrastructure_error(exc) for exc in ssh_connect_errors):
+            result.infrastructure_error = True
+            diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
         result.diagnostics = diag
         return result
 
@@ -718,6 +730,9 @@ async def _run_provision_steps(
                     f"(exit={ssh_result.return_code}): "
                     f"{stderr[:200]}"
                 )
+                if is_infrastructure_error(RuntimeError(str(stderr))):
+                    result.infrastructure_error = True
+                    diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
                 result.diagnostics = diag
                 return result
             diag.append("SSH key injected")
@@ -731,14 +746,19 @@ async def _run_provision_steps(
             )
             stdout = getattr(verify, "stdout", "")
             if "SSH_OK" not in str(stdout):
-                diag.append(
-                    f"SSH verification failed: {getattr(verify, 'stderr', '')[:200]}"
-                )
+                stderr = getattr(verify, "stderr", "")
+                diag.append(f"SSH verification failed: {stderr[:200]}")
+                if is_infrastructure_error(RuntimeError(str(stderr))):
+                    result.infrastructure_error = True
+                    diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
                 result.diagnostics = diag
                 return result
             diag.append("SSH verified")
         except Exception as exc:
             diag.append(f"SSH key injection error: {exc}")
+            if is_infrastructure_error(exc):
+                result.infrastructure_error = True
+                diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
             result.diagnostics = diag
             return result
 
