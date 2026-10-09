@@ -102,6 +102,80 @@ def _safe_redirect_url(current_url: str, location: str) -> str | None:
     return None
 
 
+def _normalize_server_url(
+    base_url: str,
+    image_version: str,
+    release: str,
+) -> str:
+    """Strip path overlap from a server URL.
+
+    Users or LLMs may provide the full release URL, a version
+    path, or a path with /info/ or /EBBR/ appended instead of
+    just the server root.  This function strips any trailing
+    path components that would be duplicated when the resolver
+    constructs the manifest URL.
+
+    Examples::
+
+        # Full release path → server root
+        https://server/AutoSD-10/monthly/build123
+        → https://server
+
+        # Version path → server root
+        https://server/AutoSD-10
+        → https://server
+
+        # With info/EBBR suffix → server root
+        https://server/AutoSD-10/monthly/build123/EBBR/
+        → https://server
+
+        # Server root → unchanged
+        https://server
+        → https://server
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(base_url)
+    path = parts.path.rstrip("/")
+    if not path:
+        return base_url
+
+    # Split path into segments and find where the image_version
+    # appears.  Everything from that segment onward is the
+    # version/release path that the resolver will re-add.
+    segments = [s for s in path.split("/") if s]
+    try:
+        version_idx = None
+        for i, seg in enumerate(segments):
+            if seg == image_version:
+                version_idx = i
+                break
+        if version_idx is not None:
+            # Keep only segments before the version
+            kept = segments[:version_idx]
+            new_path = "/" + "/".join(kept) if kept else ""
+            result = urlunsplit((parts.scheme, parts.netloc, new_path, "", ""))
+            if result != base_url.rstrip("/"):
+                logger.info(
+                    "[images] Normalized server URL: %s → %s",
+                    base_url,
+                    result,
+                )
+            return result
+    except (ValueError, IndexError):
+        pass
+
+    # Also strip known non-server suffixes like /info/ or
+    # /EBBR/ even without a version match.
+    _STRIP_SUFFIXES = ("/info", "/EBBR")
+    for suffix in _STRIP_SUFFIXES:
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+
+    result = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    return result
+
+
 async def _audited_get_follow_redirects(
     client: AuditedAsyncHTTPClient,
     url: str,
@@ -258,25 +332,12 @@ async def resolve_image_urls(
     """
     base_url = base_url.rstrip("/")
 
-    # Detect and strip path overlap when image_server contains
-    # the version or release path (e.g., a user or LLM provided
-    # the full release URL instead of just the server root).
-    # Without this, the URL gets doubled:
-    #   https://server/AutoSD-10/monthly/.../AutoSD-10/monthly/.../info/...
-    _version_suffix = f"/{image_version}"
-    _release_suffix = f"/{image_version}/{release}"
-    if release and base_url.endswith(_release_suffix):
-        base_url = base_url[: -len(_release_suffix)]
-        logger.info(
-            "[images] Stripped version+release overlap from base_url: %s",
-            base_url,
-        )
-    elif base_url.endswith(_version_suffix):
-        base_url = base_url[: -len(_version_suffix)]
-        logger.info(
-            "[images] Stripped version overlap from base_url: %s",
-            base_url,
-        )
+    # Normalize base_url to a server root.  Users or LLMs may
+    # provide the full release URL, the version path, or a path
+    # with /info/ or /EBBR/ appended.  Strip any path components
+    # that would be duplicated when the resolver constructs the
+    # manifest URL as {base_url}/{image_version}/{release}/info/...
+    base_url = _normalize_server_url(base_url, image_version, release)
 
     monthly_match = _DATED_MONTHLY_RELEASE_RE.fullmatch(release)
     date_qualified_monthly = monthly_match is not None
