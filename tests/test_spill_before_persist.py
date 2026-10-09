@@ -147,6 +147,129 @@ async def test_messages_persisted_after_tool_results(tmp_path):
     assert len(tool_result_messages) >= 1
 
 
+class _BlockedSubmitThenEndLLM(LLMProvider):
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.rejection_persisted = False
+        self.persisted_before_followup: bool | None = None
+        self.followup_messages: list[dict[str, Any]] = []
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        self.call_count += 1
+        if self.call_count == 1:
+            return LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="submit-call-1",
+                        name="submit_result",
+                        input={"result": "partial"},
+                    ),
+                ],
+                stop_reason="tool_use",
+                raw_content=[
+                    {
+                        "type": "tool_use",
+                        "id": "submit-call-1",
+                        "name": "submit_result",
+                        "input": {"result": "partial"},
+                    },
+                ],
+            )
+        self.persisted_before_followup = self.rejection_persisted
+        self.followup_messages = list(messages)
+        return LLMResponse(
+            text="Done.",
+            tool_calls=[],
+            stop_reason="end_turn",
+            raw_content=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejected_submit_result_is_persisted_before_followup_llm_call(tmp_path):
+    llm = _BlockedSubmitThenEndLLM()
+    event_bus = EventBus(log_dir=tmp_path / "logs")
+    agent = _StubAgent(
+        agent_name="test-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=event_bus,
+        max_iterations=5,
+    )
+    agent._client = _mock_http_client()
+    agent._should_block_submit = lambda _ticket_id: "Submission is blocked"
+    saved_messages: list[list[dict[str, Any]]] = []
+
+    async def _capture_save(
+        _ticket_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        required: bool = False,
+    ) -> None:
+        assert required
+        snapshot = list(messages)
+        saved_messages.append(snapshot)
+        llm.rejection_persisted = any(
+            isinstance(message.get("content"), list)
+            and any(
+                item.get("type") == "tool_result"
+                and item.get("tool_use_id") == "submit-call-1"
+                and item.get("content") == "Submission is blocked"
+                and item.get("is_error") is True
+                for item in message["content"]
+                if isinstance(item, dict)
+            )
+            for message in snapshot
+        )
+
+    agent._save_messages = AsyncMock(side_effect=_capture_save)
+
+    await agent.run("PERF-920")
+
+    assert llm.call_count == 2
+    assert llm.persisted_before_followup is True
+    assert saved_messages
+    assert any(
+        isinstance(message.get("content"), list)
+        and any(
+            item.get("type") == "tool_result"
+            and item.get("tool_use_id") == "submit-call-1"
+            for item in message["content"]
+            if isinstance(item, dict)
+        )
+        for message in llm.followup_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_persistence_stops_followup_llm_call(tmp_path):
+    llm = _ToolThenEndLLM()
+    event_bus = EventBus(log_dir=tmp_path / "logs")
+    agent = _StubAgent(
+        agent_name="test-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=event_bus,
+        max_iterations=5,
+    )
+    agent._tool_handlers["fetch_data"] = AsyncMock(return_value='{"status": "ok"}')
+    agent._client = _mock_http_client()
+    agent._client.patch = AsyncMock(side_effect=RuntimeError("state store unavailable"))
+
+    with pytest.raises(RuntimeError, match="state store unavailable"):
+        await agent.run("PERF-920")
+
+    assert llm.call_count == 1
+    agent._client.patch.assert_awaited_once()
+
+
 class _MultiToolLLM(LLMProvider):
     """Returns N tool calls, then end_turn."""
 
