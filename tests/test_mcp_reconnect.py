@@ -190,6 +190,9 @@ async def test_connect_command_snapshots_mutable_args(monkeypatch):
             return False
 
     class _ArgsSession:
+        def __init__(self, *_args):
+            pass
+
         async def __aenter__(self):
             return self
 
@@ -510,6 +513,9 @@ async def test_reconnect_stops_old_transport_holder_before_relaunch(monkeypatch)
             return False
 
     class _HolderSession:
+        def __init__(self, *_args):
+            pass
+
         async def __aenter__(self):
             return self
 
@@ -812,6 +818,9 @@ async def test_pre_send_reconnect_does_not_dispatch_a_removed_tool(monkeypatch):
             return False
 
     class _ReplacementSession:
+        def __init__(self, *_args):
+            pass
+
         async def __aenter__(self):
             return self
 

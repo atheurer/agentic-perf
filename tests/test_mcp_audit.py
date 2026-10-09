@@ -1444,6 +1444,7 @@ async def test_disconnect_cancels_direct_connect_stuck_in_initialize(monkeypatch
             args=["server.py"],
             name="local",
             env={},
+            ticket_id="PERF-1",
         )
     )
     await asyncio.wait_for(initialize_started.wait(), timeout=1)
@@ -1509,11 +1510,12 @@ async def test_disconnect_cancels_direct_connect_stuck_in_list_tools(monkeypatch
             args=["server.py"],
             name="local",
             env={},
+            ticket_id="PERF-1",
         )
     )
     await asyncio.wait_for(list_tools_started.wait(), timeout=1)
     assert connect_task in client._connection_startup_tasks
-    assert client._servers["local"].connected
+    assert "local" not in client._servers
     assert "late_tool" not in client._tool_routing
 
     await asyncio.wait_for(client.disconnect(), timeout=1)
@@ -1550,6 +1552,8 @@ async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch)
     release_first_initialize = asyncio.Event()
     first_list_tools_started = asyncio.Event()
     release_first_list_tools = asyncio.Event()
+    second_list_tools_started = asyncio.Event()
+    release_second_list_tools = asyncio.Event()
     session_count = 0
 
     class _OverlappingSession(_TestClientSession):
@@ -1569,6 +1573,8 @@ async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch)
                 await release_first_list_tools.wait()
                 tool_name = "old_tool"
             else:
+                second_list_tools_started.set()
+                await release_second_list_tools.wait()
                 tool_name = "replacement_tool"
             return SimpleNamespace(tools=[SimpleNamespace(name=tool_name)])
 
@@ -1600,10 +1606,17 @@ async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch)
         release_first_initialize.set()
         await asyncio.wait_for(first_list_tools_started.wait(), timeout=1)
         assert session_count == 1
-        old_connection = client._servers["local"]
+        assert "local" not in client._servers
 
         release_first_list_tools.set()
-        await asyncio.gather(first_startup, second_startup)
+        await first_startup
+        await asyncio.wait_for(second_list_tools_started.wait(), timeout=1)
+        old_connection = client._servers["local"]
+        assert session_count == 2
+        assert client._tool_routing == {"old_tool": "local"}
+
+        release_second_list_tools.set()
+        await second_startup
 
         replacement_connection = client._servers["local"]
         assert replacement_connection is not old_connection
@@ -1619,6 +1632,7 @@ async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch)
     finally:
         release_first_initialize.set()
         release_first_list_tools.set()
+        release_second_list_tools.set()
         startup_tasks = [first_startup]
         if second_startup is not None:
             startup_tasks.append(second_startup)
