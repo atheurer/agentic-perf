@@ -211,6 +211,7 @@ class AgentMCPClient:
         self._closing = False
         self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
         self._connection_startup_tasks: set[asyncio.Task[None]] = set()
+        self._connection_startup_locks: dict[str, asyncio.Lock] = {}
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
         # Jumpstarter connect guards). It may return a string for a local
@@ -496,19 +497,23 @@ class AgentMCPClient:
         async with self._lifecycle_lock:
             if self._closing:
                 raise asyncio.CancelledError()
+            startup_lock = self._connection_startup_locks.setdefault(
+                name, asyncio.Lock()
+            )
             self._connection_startup_tasks.add(task)
 
         try:
-            await self._connect_transport_impl(
-                name,
-                transport_cm,
-                transport=transport,
-                endpoint=endpoint,
-                ticket_id=ticket_id,
-                agent_id=agent_id,
-                subprocess_process_holder=subprocess_process_holder,
-                connect_params=connect_params,
-            )
+            async with startup_lock:
+                await self._connect_transport_impl(
+                    name,
+                    transport_cm,
+                    transport=transport,
+                    endpoint=endpoint,
+                    ticket_id=ticket_id,
+                    agent_id=agent_id,
+                    subprocess_process_holder=subprocess_process_holder,
+                    connect_params=connect_params,
+                )
         finally:
             async with self._lifecycle_lock:
                 self._connection_startup_tasks.discard(task)
@@ -543,8 +548,7 @@ class AgentMCPClient:
             previous._shutdown.set()
             if previous._task is not None:
                 previous._task.cancel()
-                with contextlib.suppress(Exception, BaseException):
-                    await previous._task
+                await asyncio.gather(previous._task, return_exceptions=True)
             self._tool_routing = {
                 tool: server
                 for tool, server in self._tool_routing.items()

@@ -1594,6 +1594,182 @@ async def test_stale_startup_cleanup_preserves_replacement_tool_routes(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch):
+    first_initialize_started = asyncio.Event()
+    release_first_initialize = asyncio.Event()
+    first_list_tools_started = asyncio.Event()
+    release_first_list_tools = asyncio.Event()
+    session_count = 0
+
+    class _OverlappingSession(_TestClientSession):
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+            self.generation = session_count
+
+        async def initialize(self):
+            if self.generation == 1:
+                first_initialize_started.set()
+                await release_first_initialize.wait()
+
+        async def list_tools(self):
+            if self.generation == 1:
+                first_list_tools_started.set()
+                await release_first_list_tools.wait()
+                tool_name = "old_tool"
+            else:
+                tool_name = "replacement_tool"
+            return SimpleNamespace(tools=[SimpleNamespace(name=tool_name)])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _OverlappingSession)
+    client = AgentMCPClient()
+    first_startup = asyncio.create_task(
+        client._connect_transport(
+            "local",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="old-server.py",
+        )
+    )
+    second_startup = None
+    try:
+        await asyncio.wait_for(first_initialize_started.wait(), timeout=1)
+        second_startup = asyncio.create_task(
+            client._connect_transport(
+                "local",
+                _ReadyTransport(),
+                transport="stdio",
+                endpoint="replacement-server.py",
+            )
+        )
+        await asyncio.sleep(0)
+        assert second_startup in client._connection_startup_tasks
+        assert session_count == 1
+
+        release_first_initialize.set()
+        await asyncio.wait_for(first_list_tools_started.wait(), timeout=1)
+        assert session_count == 1
+        old_connection = client._servers["local"]
+
+        release_first_list_tools.set()
+        await asyncio.gather(first_startup, second_startup)
+
+        replacement_connection = client._servers["local"]
+        assert replacement_connection is not old_connection
+        assert replacement_connection.endpoint == "replacement-server.py"
+        assert client._tool_routing == {"replacement_tool": "local"}
+        assert old_connection._task is not None and old_connection._task.done()
+        live_server_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "mcp:local" and not task.done()
+        ]
+        assert live_server_tasks == [replacement_connection._task]
+    finally:
+        release_first_initialize.set()
+        release_first_list_tools.set()
+        startup_tasks = [first_startup]
+        if second_startup is not None:
+            startup_tasks.append(second_startup)
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+        await client.disconnect()
+        orphaned_server_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and task.get_name() == "mcp:local"
+            and not task.done()
+        ]
+        for task in orphaned_server_tasks:
+            task.cancel()
+        if orphaned_server_tasks:
+            await asyncio.gather(*orphaned_server_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancellation_propagates_during_previous_cleanup(monkeypatch):
+    previous_exit_started = asyncio.Event()
+    release_previous_exit = asyncio.Event()
+    replacement_initialize_started = asyncio.Event()
+    release_replacement_initialize = asyncio.Event()
+    session_count = 0
+
+    class _CleanupSession(_TestClientSession):
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+            self.generation = session_count
+
+        async def __aexit__(self, *_):
+            if self.generation == 1 and asyncio.current_task().cancelling():
+                previous_exit_started.set()
+                while not release_previous_exit.is_set():
+                    try:
+                        await release_previous_exit.wait()
+                    except asyncio.CancelledError:
+                        continue
+            return False
+
+        async def initialize(self):
+            if self.generation == 2:
+                replacement_initialize_started.set()
+                await release_replacement_initialize.wait()
+
+        async def list_tools(self):
+            tool_name = "previous_tool" if self.generation == 1 else "replacement_tool"
+            return SimpleNamespace(tools=[SimpleNamespace(name=tool_name)])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _CleanupSession)
+    client = AgentMCPClient()
+    await client._connect_transport(
+        "local",
+        _ReadyTransport(),
+        transport="stdio",
+        endpoint="previous-server.py",
+    )
+    previous_connection = client._servers["local"]
+    replacement_startup = asyncio.create_task(
+        client._connect_transport(
+            "local",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="replacement-server.py",
+        )
+    )
+    await asyncio.wait_for(previous_exit_started.wait(), timeout=1)
+
+    disconnect_task = asyncio.create_task(client.disconnect())
+    try:
+        await asyncio.sleep(0)
+        assert replacement_startup.cancelling() > 0
+        release_previous_exit.set()
+
+        await asyncio.wait_for(disconnect_task, timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await replacement_startup
+
+        assert not replacement_initialize_started.is_set()
+        assert previous_connection._task is not None
+        assert previous_connection._task.done()
+        assert client._servers == {}
+        assert client._tool_routing == {}
+        assert client._connection_startup_tasks == set()
+        assert not any(
+            task.get_name() == "mcp:local" and not task.done()
+            for task in asyncio.all_tasks()
+        )
+    finally:
+        release_previous_exit.set()
+        release_replacement_initialize.set()
+        await asyncio.gather(
+            disconnect_task,
+            replacement_startup,
+            return_exceptions=True,
+        )
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_client_timeout_during_connect_is_audited_as_timed_out():
     entered = asyncio.Event()
     release = asyncio.Event()
