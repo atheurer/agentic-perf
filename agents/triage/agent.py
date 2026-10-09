@@ -1221,6 +1221,17 @@ class TriageAgent(AgentBase):
         if execution_model == EXECUTION_MODEL_DIRECT:
             required_hosts = _filter_direct_required_hosts(required_hosts)
 
+        # Jumpstarter boards are not SSH-accessible before
+        # provisioning.  The triage LLM often puts the board
+        # selector value (e.g. "nxp-s32g-vnp-rdb3-02") into the
+        # required_hosts "host" field, which tells the resource
+        # agent it's a pre-existing machine and to SSH to it.
+        # Strip "host" when board_selector is present — the
+        # resource agent will allocate via jumpstarter instead.
+        if directives.get("board_selector"):
+            for entry in required_hosts:
+                entry.pop("host", None)
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),

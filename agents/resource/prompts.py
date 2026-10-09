@@ -16,11 +16,29 @@ boards that require flashing before SSH is available), skip validate_host.
 Always call submit_resource_result with:
 - assigned_hardware_ips: {controller: <dedicated controller host>, targets: [<endpoint hosts>]}
 - ssh_user and ssh_key_path from the reservation result
-- resource_provider: the provider name ("quads", "aws", "user_provided")
+- resource_provider: the provider name ("quads", "aws", "jumpstarter", "user_provided")
 - resource_reservation_id: from the reservation result (null for user-provided)
 - resource_provider_metadata: from the reservation result (null for user-provided)
 - fresh_host: true for managed providers (hosts need full harness install)
 - lease_expiration: from the reservation result (null if not applicable)
+
+## Jumpstarter Boards
+
+When ticket directives include a `board_selector`, the target is a
+Jumpstarter-managed embedded board (e.g., NXP S32G, Qualcomm SA8775P).
+These boards are NOT SSH-accessible before provisioning — do NOT try
+to resolve their hostnames or validate them with SSH.
+
+For Jumpstarter boards:
+1. Call check_available_resources with provider="jumpstarter" and the
+   board_selector from directives
+2. Call reserve_resources with provider="jumpstarter"
+3. Call submit_resource_result with resource_provider="jumpstarter"
+   and fresh_host=true
+4. Do NOT call validate_host — the board requires flashing first
+
+The provisioning agent handles flashing and boot verification.
+The board's IP address is only known after provisioning completes.
 
 ## Existing Hosts
 
