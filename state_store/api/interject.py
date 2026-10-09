@@ -40,6 +40,9 @@ def interject(
     principal = request.state.principal
     multi_user = getattr(request.app.state, "multi_user", False)
     require_write_access(principal, ticket, multi_user)
+    principal = request.state.principal
+    multi_user = getattr(request.app.state, "multi_user", False)
+    require_write_access(principal, ticket, multi_user)
 
     if ticket.status in TERMINAL_STATUSES:
         return JSONResponse(
@@ -112,13 +115,16 @@ def user_reply(
     store = request.app.state.store
 
     try:
-        store.get_ticket(ticket_id)
+        ticket = store.get_ticket(ticket_id)
     except TicketNotFound:
         return JSONResponse(
             status_code=404,
             content={"detail": f"Ticket {ticket_id} not found"},
         )
 
+    principal = request.state.principal
+    multi_user = getattr(request.app.state, "multi_user", False)
+    require_write_access(principal, ticket, multi_user)
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is not None:
         event_bus.emit(
