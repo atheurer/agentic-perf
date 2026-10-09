@@ -120,6 +120,18 @@ def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]
     return response
 
 
+def _ticket_resource_provider() -> tuple[str | None, bool]:
+    """Return the authoritative managed provider and user-provided-only flag."""
+    custom_fields = _ticket.get("custom_fields", {})
+    directives = custom_fields.get("directives", {})
+    configured = custom_fields.get("resource_provider")
+    directed = directives.get("resource_provider")
+    for candidate in (configured, directed):
+        if candidate and candidate != "user_provided":
+            return str(candidate), False
+    return None, configured == "user_provided" or directed == "user_provided"
+
+
 def _reservation_identity(result: dict[str, Any]) -> str | None:
     """Extract a provider reservation identifier from a result and its metadata."""
     metadata = result.get("provider_metadata")
@@ -251,7 +263,7 @@ async def _persist_unknown_reservation_marker(
     metadata = result.get("provider_metadata")
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     fields: dict[str, Any] = {"resource_reservation_outcome_unknown": True}
-    resolved_provider = result.get("provider") or provider
+    resolved_provider = provider or result.get("provider")
     if resolved_provider:
         fields["resource_provider"] = resolved_provider
     if metadata:
@@ -294,7 +306,7 @@ async def _persist_known_reservation_outcome(
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     fields: dict[str, Any] = {
         "resource_reservation_outcome_unknown": False,
-        "resource_provider": result.get("provider") or provider,
+        "resource_provider": provider,
     }
     if metadata:
         fields["resource_provider_metadata"] = metadata
@@ -695,6 +707,24 @@ async def reserve_resources(
     await _ensure_init()
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
+    expected_provider, user_provided_only = _ticket_resource_provider()
+    if user_provided_only or (expected_provider and provider != expected_provider):
+        expected = expected_provider or "user_provided"
+        result = {
+            "status": "failed",
+            "provider": expected,
+            "provider_mismatch": True,
+            "provider_call_started": False,
+            "error": (
+                f"Ticket is configured for resource provider '{expected}', but "
+                f"reserve_resources was called for '{provider}'."
+            ),
+            "message": (
+                "No provider allocation was attempted. Use the ticket's configured "
+                "provider; for user-provided resources, do not call reserve_resources."
+            ),
+        }
+        return json.dumps(result)
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
     # in the provider regardless of LLM behavior.
@@ -826,6 +856,10 @@ async def reserve_resources(
             ),
             "provider_metadata": dict(_last_reservation.get("provider_metadata") or {}),
         }
+
+    # Provider argument is the selected registry key and remains authoritative
+    # if a provider response includes its own provider field.
+    result["provider"] = provider
 
     # Mark resources as allocated so discovery tools are blocked (#1128).
     # Providers use both error fields and status-only failure results.

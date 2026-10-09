@@ -486,6 +486,96 @@ async def test_status_only_reservation_failure_does_not_set_flag():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("ticket_fields", "requested_provider", "expected_provider"),
+    [
+        ({"resource_provider": "quads"}, "aws", "quads"),
+        ({"directives": {"resource_provider": "quads"}}, "aws", "quads"),
+        ({"resource_provider": "user_provided"}, "aws", "user_provided"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reservation_rejects_ticket_provider_mismatch_before_provider_call(
+    ticket_fields, requested_provider, expected_provider
+):
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": ticket_fields}
+
+    result = json.loads(
+        await srv.reserve_resources(
+            provider=requested_provider,
+            selection={},
+            description="provider mismatch",
+            ticket_id="PERF-TEST",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider"] == expected_provider
+    assert result["provider_mismatch"] is True
+    assert result["provider_call_started"] is False
+    assert "No provider allocation was attempted" in result["message"]
+    mock_registry.get_provider.assert_not_awaited()
+    mock_provider.reserve.assert_not_awaited()
+    assert srv._reservation_uncertain is False
+
+
+@pytest.mark.asyncio
+async def test_reservation_cannot_switch_provider_after_first_allocation():
+    """A second provider would make the ticket's single-provider teardown unsafe."""
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reserve = AsyncMock(
+        return_value={
+            "status": "success",
+            "reservation_id": "i-first",
+            "instance_ids": ["i-first"],
+            "provider_metadata": {"instance_ids": ["i-first"]},
+        }
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
+
+    first = json.loads(
+        await srv.reserve_resources(
+            provider="aws",
+            selection={"instance_type": "m5.xlarge", "count": 1},
+            description="first allocation",
+            ticket_id="PERF-TEST",
+        )
+    )
+    second = json.loads(
+        await srv.reserve_resources(
+            provider="quads",
+            selection={"hostnames": ["host-02"]},
+            description="second provider allocation",
+            ticket_id="PERF-TEST",
+        )
+    )
+
+    assert first["status"] == "success"
+    assert second["provider_mismatch"] is True
+    assert second["provider"] == "aws"
+    assert second["provider_call_started"] is False
+    assert mock_registry.get_provider.await_count == 1
+    mock_provider.reserve.assert_awaited_once()
+    fields = srv._ticket["custom_fields"]
+    assert fields["resource_provider"] == "aws"
+    assert fields["resource_reservation_id"] == "i-first"
+    assert fields["resource_provider_metadata"] == {"instance_ids": ["i-first"]}
+    assert fields["resource_reservation_outcome_unknown"] is False
+
+
 @pytest.mark.asyncio
 async def test_reserve_resources_allowed_after_first_allocation():
     """reserve_resources is NOT blocked by the guardrail (multi-call support)."""

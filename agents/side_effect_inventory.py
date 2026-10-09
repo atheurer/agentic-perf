@@ -197,6 +197,11 @@ INVENTORIED_SIDE_EFFECTS = (
         "_combined_reservation_outcome",
         "cloud_resource",
     ),
+    (
+        "agents/resource/server.py",
+        "_ticket_resource_provider",
+        "cloud_resource",
+    ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"),
     (
         "agents/resource/server.py",
@@ -1574,6 +1579,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_combined_reservation_outcome",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_ticket_resource_provider",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_ticket_resource_provider",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"): (
