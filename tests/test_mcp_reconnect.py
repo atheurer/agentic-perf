@@ -194,7 +194,13 @@ async def test_reconnect_on_broken_pipe_during_call_tool():
     success_session = _FakeSession(tools=[_make_tool("check_host")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         new_conn = _ServerConnection(
             name=name,
@@ -234,7 +240,13 @@ async def test_reconnect_on_connection_reset_during_call_tool():
     success_session = _FakeSession(tools=[_make_tool("query_numa")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         new_conn = _ServerConnection(
             name=name,
@@ -272,7 +284,13 @@ async def test_reconnect_on_mcp_connection_closed_error():
     success_session = _FakeSession(tools=[_make_tool("check_host")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         client._servers[name] = _ServerConnection(
             name=name,
@@ -310,7 +328,13 @@ async def test_reconnect_failure_returns_clear_error_without_logging_details(cap
     )
 
     async def failing_reconnect(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         raise RuntimeError("server echoed --password=secret-value")
 
@@ -378,7 +402,13 @@ async def test_reconnect_on_closed_session():
     success_session = _FakeSession(tools=[_make_tool("check_host")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         new_conn = _ServerConnection(
             name=name,
@@ -443,7 +473,13 @@ async def test_concurrent_calls_share_one_reconnect():
     reconnect_count = 0
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         nonlocal reconnect_count
         reconnect_count += 1
@@ -487,7 +523,13 @@ async def test_reconnect_audit_trail():
     success_session = _FakeSession(tools=[_make_tool("check_host")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         new_conn = _ServerConnection(
             name=name,
@@ -543,7 +585,13 @@ async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
     installed_connections = []
 
     async def install_reconnected_server(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         reconnect_started.set()
         try:
@@ -615,6 +663,95 @@ async def test_reconnect_waiting_when_disconnect_starts_does_not_relaunch():
 
 
 @pytest.mark.asyncio
+async def test_queued_reconnect_skips_connection_replaced_before_lock_acquisition(
+    monkeypatch,
+):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(connect_params=params)
+    old_conn.session = None
+    startup_lock = asyncio.Lock()
+    await startup_lock.acquire()
+    client._connection_startup_locks[old_conn.name] = startup_lock
+    session_count = 0
+    transport_enter_count = 0
+
+    class _CountedReadyTransport:
+        async def __aenter__(self):
+            nonlocal transport_enter_count
+            transport_enter_count += 1
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ReplacementSession:
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[_make_tool("replacement_tool")])
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _CountedReadyTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ReplacementSession)
+
+    public_startup = None
+    reconnect_task = None
+    try:
+        public_startup = asyncio.create_task(
+            client.connect_command(
+                command="public-replacement",
+                args=["server.py"],
+                name=old_conn.name,
+                env={},
+            )
+        )
+        await asyncio.sleep(0)
+        assert public_startup in client._connection_startup_tasks
+
+        reconnect_task = asyncio.create_task(client._reconnect_server(old_conn))
+
+        async def _wait_for_queued_reconnect_child():
+            while len(client._connection_startup_tasks) < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_for_queued_reconnect_child(), timeout=1)
+        startup_lock.release()
+
+        await public_startup
+        assert await reconnect_task is True
+
+        replacement = client._servers[old_conn.name]
+        assert replacement is not old_conn
+        assert replacement.endpoint == "public-replacement"
+        assert replacement.reconnect_generation == old_conn.reconnect_generation + 1
+        assert client._tool_routing == {"replacement_tool": old_conn.name}
+        assert session_count == 1
+        assert transport_enter_count == 1
+    finally:
+        if startup_lock.locked():
+            startup_lock.release()
+        startup_tasks = [
+            task for task in (public_startup, reconnect_task) if task is not None
+        ]
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks, return_exceptions=True)
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_wrapped_disconnect_error_triggers_reconnect():
     """A RuntimeError wrapping a BrokenPipeError triggers reconnect."""
     wrapper = RuntimeError("transport failed")
@@ -633,7 +770,13 @@ async def test_wrapped_disconnect_error_triggers_reconnect():
     success_session = _FakeSession(tools=[_make_tool("check_host")])
 
     async def fake_connect_command(
-        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+        command,
+        args=None,
+        name=None,
+        env=None,
+        ticket_id=None,
+        agent_id=None,
+        **_kwargs,
     ):
         new_conn = _ServerConnection(
             name=name,

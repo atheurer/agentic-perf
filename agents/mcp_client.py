@@ -325,6 +325,8 @@ class AgentMCPClient:
         env: dict[str, str] | None = None,
         ticket_id: str | None = None,
         agent_id: str | None = None,
+        _expected_connection: _ServerConnection | None = None,
+        _expected_generation: int | None = None,
     ) -> None:
         """Connect to an MCP server started by an arbitrary command.
 
@@ -379,6 +381,8 @@ class AgentMCPClient:
             agent_id=agent_id,
             subprocess_process_holder=process_holder,
             connect_params=connect_params,
+            expected_connection=_expected_connection,
+            expected_generation=_expected_generation,
         )
 
     async def connect_sse(
@@ -489,6 +493,8 @@ class AgentMCPClient:
         agent_id: str | None = None,
         subprocess_process_holder: list[Any] | None = None,
         connect_params: _ConnectParams | None = None,
+        expected_connection: _ServerConnection | None = None,
+        expected_generation: int | None = None,
     ) -> None:
         task = asyncio.current_task()
         if task is None:
@@ -504,6 +510,16 @@ class AgentMCPClient:
 
         try:
             async with startup_lock:
+                if expected_connection is not None:
+                    async with self._lifecycle_lock:
+                        if self._closing:
+                            raise asyncio.CancelledError()
+                        current = self._servers.get(name)
+                        if (
+                            current is not expected_connection
+                            or current.reconnect_generation != expected_generation
+                        ):
+                            return
                 await self._connect_transport_impl(
                     name,
                     transport_cm,
@@ -1009,6 +1025,8 @@ class AgentMCPClient:
                         env=params.env,
                         ticket_id=params.ticket_id,
                         agent_id=params.agent_id,
+                        _expected_connection=conn,
+                        _expected_generation=conn.reconnect_generation,
                     ),
                     name=f"mcp-reconnect:{conn.name}",
                 )
@@ -1036,7 +1054,11 @@ class AgentMCPClient:
                 if self._closing:
                     return False
                 new_conn = self._servers.get(conn.name)
-                if new_conn is None or new_conn.session is None:
+                if (
+                    new_conn is None
+                    or not new_conn.connected
+                    or new_conn.session is None
+                ):
                     return False
 
                 logger.info(
