@@ -1226,11 +1226,17 @@ class TriageAgent(AgentBase):
         # selector value (e.g. "nxp-s32g-vnp-rdb3-02") into the
         # required_hosts "host" field, which tells the resource
         # agent it's a pre-existing machine and to SSH to it.
-        # Strip "host" when board_selector is present — the
-        # resource agent will allocate via jumpstarter instead.
+        #
+        # Strip "host" when it looks like a board name copied
+        # from the selector (no dots — not an IP or FQDN).
+        # If the user provides a real IP or FQDN as host, they
+        # have a pre-provisioned board and want to skip flash;
+        # keep it so the resource agent treats it as user-provided.
         if directives.get("board_selector"):
             for entry in required_hosts:
-                entry.pop("host", None)
+                host_val = entry.get("host", "")
+                if host_val and "." not in host_val:
+                    entry.pop("host", None)
 
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
