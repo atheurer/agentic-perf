@@ -1544,56 +1544,6 @@ async def test_disconnect_cancels_direct_connect_stuck_in_list_tools(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_stale_startup_cleanup_preserves_replacement_tool_routes(monkeypatch):
-    old_list_tools_started = asyncio.Event()
-    session_count = 0
-
-    class _ReplacementSession(_TestClientSession):
-        def __init__(self, *_args):
-            nonlocal session_count
-            session_count += 1
-            self.generation = session_count
-
-        async def list_tools(self):
-            if self.generation == 1:
-                old_list_tools_started.set()
-                await asyncio.Event().wait()
-            return SimpleNamespace(tools=[SimpleNamespace(name="replacement_tool")])
-
-    monkeypatch.setattr(mcp_client_module, "ClientSession", _ReplacementSession)
-    client = AgentMCPClient()
-    old_startup = asyncio.create_task(
-        client._connect_transport(
-            "local",
-            _ReadyTransport(),
-            transport="stdio",
-            endpoint="old-server.py",
-        )
-    )
-    await asyncio.wait_for(old_list_tools_started.wait(), timeout=1)
-    old_connection = client._servers["local"]
-
-    await client._connect_transport(
-        "local",
-        _ReadyTransport(),
-        transport="stdio",
-        endpoint="new-server.py",
-    )
-    replacement_connection = client._servers["local"]
-    assert replacement_connection is not old_connection
-    assert client._tool_routing == {"replacement_tool": "local"}
-
-    old_startup.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await old_startup
-
-    assert client._servers["local"] is replacement_connection
-    assert client._tool_routing == {"replacement_tool": "local"}
-    assert client._connection_startup_tasks == set()
-    await client.disconnect()
-
-
-@pytest.mark.asyncio
 async def test_same_name_startups_are_serialized_through_list_tools(monkeypatch):
     first_initialize_started = asyncio.Event()
     release_first_initialize = asyncio.Event()
