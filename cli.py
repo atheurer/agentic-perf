@@ -397,6 +397,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/transition",
             json={"status": "awaiting_teardown", "comment": "User /close command"},
@@ -427,6 +428,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         resumed = _resume_ticket(client, ticket, ticket_id)
         if resumed:
             print(f"Model switched to {cmd_arg} — ticket resumed.")
@@ -453,6 +455,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         resumed = _resume_ticket(client, ticket, ticket_id)
         if resumed:
             print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
