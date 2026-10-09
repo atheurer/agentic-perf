@@ -642,6 +642,7 @@ class TicketStore:
                     "reviewed_by": triggered_by,
                 }
 
+            cleared_stale_fields: list[str] = []
             if new_status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                 if current != TicketStatus.AWAITING_CUSTOMER_GUIDANCE:
                     ticket.previous_status = current
@@ -664,33 +665,35 @@ class TicketStore:
                     )
 
                 # When resuming from HITL guidance back into the
-                # pipeline, clear cached provisioning / resource
-                # fields so that deterministic resolution steps
-                # re-run against whatever the user changed in
-                # directives.  Without this, stale results from
-                # the previous failed attempt persist and agents
-                # flash the wrong image or allocate the wrong
-                # resource.  See #1162.
+                # pipeline, clear cached provisioning results so
+                # deterministic resolution steps re-run against
+                # updated directives. Keep resource allocation
+                # metadata intact: teardown still needs the old
+                # provider identity until an agent confirms release.
+                # See #1162.
                 if (
                     current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
-                    and new_status != TicketStatus.AWAITING_TEARDOWN
-                    and new_status != TicketStatus.CLOSED
+                    and new_status
+                    in {
+                        TicketStatus.TRIAGE_PENDING,
+                        TicketStatus.AWAITING_HARDWARE,
+                        TicketStatus.AWAITING_PROVISION,
+                        TicketStatus.EXECUTING_BENCHMARK,
+                    }
                 ):
                     _STALE_PIPELINE_FIELDS = (
                         "jumpstarter_flash",
-                        "resource_provider_metadata",
                         "platform_ready",
                     )
-                    cleared = []
                     for field in _STALE_PIPELINE_FIELDS:
                         if field in ticket.custom_fields:
                             del ticket.custom_fields[field]
-                            cleared.append(field)
-                    if cleared:
+                            cleared_stale_fields.append(field)
+                    if cleared_stale_fields:
                         self._trace_mutation(
                             ticket_id,
                             "clear_stale_pipeline_fields",
-                            attributes={"cleared_fields": cleared},
+                            attributes={"cleared_fields": cleared_stale_fields},
                         )
 
             old_status = current.value
@@ -719,6 +722,7 @@ class TicketStore:
                     "old_status": old_status,
                     "new_status": new_status.value,
                     "comment": request.comment,
+                    "cleared_stale_fields": cleared_stale_fields,
                 },
             )
             self._trace_mutation(

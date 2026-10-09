@@ -1595,6 +1595,184 @@ class TestProviderCorrectAutoReservation:
         return calls[0].kwargs["json"]["fields"]
 
     @pytest.mark.asyncio
+    async def test_changed_provider_releases_old_allocation_before_new_reserve(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "changed provider",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_reservation_id": "old-lease",
+                "resource_provider_metadata": {
+                    "lease_id": "old-lease",
+                    "selector": "board-type=ride4,enabled=true,pool=open",
+                    "exporter_name": "ride4-01",
+                },
+                "assigned_hardware_ips": {
+                    "controller": "",
+                    "targets": [],
+                },
+                "directives": {
+                    "resource_provider": "aws",
+                    "instance_type": "m5.xlarge",
+                    "count": 1,
+                },
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with(
+            "old-lease",
+            old_metadata,
+        )
+        clearing = agent._client.patch.await_args.kwargs["json"]["fields"]
+        assert clearing["resource_provider"] is None
+        assert clearing["resource_reservation_id"] is None
+        assert clearing["resource_provider_metadata"] == {}
+
+        reserve_calls = []
+
+        metadata_reads = 0
+
+        async def mcp_call(name, arguments):
+            nonlocal metadata_reads
+            if name == "get_accumulated_metadata":
+                metadata_reads += 1
+                if metadata_reads == 1:
+                    return "{}"
+                return json.dumps({"instance_ids": ["i-new"]})
+            if name == "reserve_resources":
+                reserve_calls.append(arguments)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "i-new",
+                        "provider_metadata": {"instance_ids": ["i-new"]},
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent._mcp.call_tool = AsyncMock(side_effect=mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
+
+        assert reserve_calls[0]["provider"] == "aws"
+        assert reserve_calls[0]["selection"] == {
+            "instance_type": "m5.xlarge",
+            "count": 1,
+        }
+        final_fields = agent._client.patch.await_args_list[-1].kwargs["json"]["fields"]
+        assert final_fields["resource_provider"] == "aws"
+        assert final_fields["resource_reservation_id"] == "i-new"
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_old_release_keeps_allocation_and_blocks_retry(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_hardware",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-old",
+                "resource_provider_metadata": {"instance_ids": ["i-old"]},
+                "directives": {"resource_provider": "quads"},
+            },
+        }
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "skipped"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert not await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with(
+            "i-old", {"instance_ids": ["i-old"]}
+        )
+        agent._client.patch.assert_not_awaited()
+        assert ticket["custom_fields"]["resource_reservation_id"] == "i-old"
+        assert ticket["custom_fields"]["resource_provider_metadata"] == {
+            "instance_ids": ["i-old"]
+        }
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == ("awaiting_customer_guidance")
+
+    @pytest.mark.asyncio
+    async def test_changed_jumpstarter_selector_releases_old_lease(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_reservation_id": "old-lease",
+                "resource_provider_metadata": {
+                    "lease_id": "old-lease",
+                    "selector": "board-type=ride4,enabled=true,pool=open",
+                },
+                "directives": {
+                    "resource_provider": "jumpstarter",
+                    "board_selector": "board-type=ride5",
+                },
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        agent._registry.get_provider.assert_awaited_once_with("jumpstarter")
+        old_provider.terminate.assert_awaited_once_with("old-lease", old_metadata)
+        clearing = agent._client.patch.await_args.kwargs["json"]["fields"]
+        assert clearing["resource_reservation_id"] is None
+        assert clearing["resource_provider_metadata"] == {}
+
+    @pytest.mark.asyncio
+    async def test_provider_change_releases_legacy_quads_allocation_too(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-old",
+                "resource_provider_metadata": {"instance_ids": ["i-old"]},
+                "quads_assignment_id": 42,
+                "quads_cloud_name": "cloud01",
+                "directives": {"resource_provider": "jumpstarter"},
+            },
+        }
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        aws = MagicMock()
+        aws.terminate = AsyncMock(return_value={"status": "terminated"})
+        quads = MagicMock()
+        quads.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(
+            side_effect=lambda name: {"aws": aws, "quads": quads}[name]
+        )
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        aws.terminate.assert_awaited_once_with("i-old", {"instance_ids": ["i-old"]})
+        quads.terminate.assert_awaited_once_with(
+            "42", {"assignment_id": 42, "cloud_name": "cloud01"}
+        )
+        clearing = agent._client.patch.await_args.kwargs["json"]["fields"]
+        assert clearing["quads_assignment_id"] is None
+
+    @pytest.mark.asyncio
     async def test_accumulated_unknown_outcome_pauses_without_re_reserving(self):
         ticket = {
             "id": "PERF-TEST",

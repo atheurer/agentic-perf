@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from state_store.audit import AuditLog
 from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
 from state_store.store import TicketStore
 
@@ -53,6 +54,13 @@ def _make_ticket_at_guidance(
             "awaiting_provision",
             "executing_benchmark",
         ],
+        "awaiting_review": [
+            "triage_pending",
+            "awaiting_hardware",
+            "awaiting_provision",
+            "executing_benchmark",
+            "awaiting_review",
+        ],
     }
     _advance_to(store, tid, path_to_status[prior_status])
 
@@ -61,7 +69,12 @@ def _make_ticket_at_guidance(
         tid,
         {
             "jumpstarter_flash": {"image_url": "http://old-image/bad.raw"},
-            "resource_provider_metadata": {"board": "old-board-123"},
+            "resource_provider": "jumpstarter",
+            "resource_reservation_id": "old-lease",
+            "resource_provider_metadata": {
+                "lease_id": "old-lease",
+                "board": "old-board-123",
+            },
             "platform_ready": True,
         },
     )
@@ -90,14 +103,18 @@ class TestStalePipelineFieldClearing:
         ticket = store.get_ticket(tid)
         assert "jumpstarter_flash" not in ticket.custom_fields
 
-    def test_resume_clears_resource_provider_metadata(self, store):
+    def test_resume_preserves_resource_allocation_for_teardown(self, store):
         tid = _make_ticket_at_guidance(store, "awaiting_hardware")
         store.transition_ticket(
             tid,
             TransitionRequest(status=TicketStatus.AWAITING_HARDWARE),
         )
         ticket = store.get_ticket(tid)
-        assert "resource_provider_metadata" not in ticket.custom_fields
+        assert ticket.custom_fields["resource_provider"] == "jumpstarter"
+        assert ticket.custom_fields["resource_reservation_id"] == "old-lease"
+        assert ticket.custom_fields["resource_provider_metadata"]["lease_id"] == (
+            "old-lease"
+        )
 
     def test_resume_clears_platform_ready(self, store):
         tid = _make_ticket_at_guidance(store, "awaiting_hardware")
@@ -117,7 +134,6 @@ class TestStalePipelineFieldClearing:
         ticket = store.get_ticket(tid)
         for field in (
             "jumpstarter_flash",
-            "resource_provider_metadata",
             "platform_ready",
         ):
             assert field not in ticket.custom_fields, (
@@ -144,6 +160,7 @@ class TestStalePipelineFieldClearing:
         ticket = store.get_ticket(tid)
         assert "jumpstarter_flash" not in ticket.custom_fields
         assert "platform_ready" not in ticket.custom_fields
+        assert ticket.custom_fields["resource_reservation_id"] == "old-lease"
 
     def test_abort_does_not_clear_fields(self, store):
         """Transitioning to teardown should not clear stale fields."""
@@ -210,3 +227,35 @@ class TestStalePipelineFieldClearing:
         )
         ticket = store.get_ticket(tid)
         assert "jumpstarter_flash" not in ticket.custom_fields
+
+    def test_resume_to_review_preserves_pipeline_cache(self, store):
+        tid = _make_ticket_at_guidance(store, "awaiting_review")
+        store.transition_ticket(
+            tid,
+            TransitionRequest(status=TicketStatus.AWAITING_REVIEW),
+        )
+        ticket = store.get_ticket(tid)
+        assert "jumpstarter_flash" in ticket.custom_fields
+        assert ticket.custom_fields["platform_ready"] is True
+
+    def test_cleared_field_names_are_in_transition_audit_without_trace_context(
+        self, tmp_path
+    ):
+        audit = AuditLog(path=tmp_path / "audit.jsonl")
+        store = TicketStore(persist_dir=tmp_path / "tickets", audit_log=audit)
+        tid = _make_ticket_at_guidance(store, "awaiting_hardware")
+
+        store.transition_ticket(
+            tid,
+            TransitionRequest(status=TicketStatus.AWAITING_HARDWARE),
+        )
+
+        transition = [
+            entry
+            for entry in audit.read(ticket_id=tid)
+            if entry["mutation"] == "transition_ticket"
+        ][-1]
+        assert transition["data"]["cleared_stale_fields"] == [
+            "jumpstarter_flash",
+            "platform_ready",
+        ]
