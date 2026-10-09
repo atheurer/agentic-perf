@@ -8,8 +8,14 @@ import cli
 
 
 class _FakeClient:
-    def __init__(self, approvals: list[dict[str, str]]):
+    def __init__(
+        self,
+        approvals: list[dict[str, str]],
+        *,
+        previous_status: str | None = "executing_benchmark",
+    ):
         self.approvals = approvals
+        self.previous_status = previous_status
         self.calls: list[tuple[str, str, dict]] = []
 
     def get(self, path: str):
@@ -20,7 +26,7 @@ class _FakeClient:
             200,
             {
                 "status": "awaiting_customer_guidance",
-                "previous_status": "executing_benchmark",
+                "previous_status": self.previous_status,
             },
         )
 
@@ -28,7 +34,13 @@ class _FakeClient:
         self.calls.append(("POST", path, json))
         if path.endswith("/comments"):
             return self._response(200, {"id": "comment-1"})
+        if path.endswith("/user-reply"):
+            return self._response(200, {"status": "recorded"})
         return self._response(200, {"status": "approved"})
+
+    def patch(self, path: str, json: dict):
+        self.calls.append(("PATCH", path, json))
+        return self._response(200, {})
 
     @staticmethod
     def _response(status: int, payload: dict):
@@ -78,10 +90,88 @@ def test_reply_resolves_pending_benchmark_approval(monkeypatch, capsys):
         ("GET", "/api/v1/tickets/PERF-TEST"),
         ("GET", "/api/v1/tickets/PERF-TEST/approvals"),
         ("POST", "/api/v1/tickets/PERF-TEST/comments"),
+        ("POST", "/api/v1/tickets/PERF-TEST/user-reply"),
         ("POST", f"/api/v1/tickets/PERF-TEST/approvals/{approval_id}/resolve"),
         ("POST", "/api/v1/tickets/PERF-TEST/transition"),
     ]
     assert "approved" in capsys.readouterr().out
+
+
+def test_reply_records_event_without_previous_status(monkeypatch, capsys):
+    client = _FakeClient([], previous_status=None)
+    monkeypatch.setattr(cli, "get_client", lambda _args: (client, "http://state-store"))
+
+    cli.cmd_reply(_args("please continue"))
+
+    assert [call[0:2] for call in client.calls] == [
+        ("GET", "/api/v1/tickets/PERF-TEST"),
+        ("POST", "/api/v1/tickets/PERF-TEST/comments"),
+        ("POST", "/api/v1/tickets/PERF-TEST/user-reply"),
+    ]
+    assert "cannot resume automatically" in capsys.readouterr().out
+
+
+def test_abort_reply_records_event_once(monkeypatch, capsys):
+    client = _FakeClient([])
+    monkeypatch.setattr(cli, "get_client", lambda _args: (client, "http://state-store"))
+    args = _args("stop")
+    args.abort = True
+
+    cli.cmd_reply(args)
+
+    assert [call[0:2] for call in client.calls] == [
+        ("GET", "/api/v1/tickets/PERF-TEST"),
+        ("POST", "/api/v1/tickets/PERF-TEST/comments"),
+        ("POST", "/api/v1/tickets/PERF-TEST/user-reply"),
+        ("POST", "/api/v1/tickets/PERF-TEST/abort"),
+    ]
+    assert "ticket aborted" in capsys.readouterr().out
+
+
+def test_slash_reply_commands_emit_one_event_after_comment(monkeypatch, capsys):
+    for message in ("/model gpt-test", "/extend-iterations 3", "/close"):
+        client = _FakeClient([])
+        monkeypatch.setattr(
+            cli,
+            "get_client",
+            lambda _args, current=client: (current, "http://state-store"),
+        )
+
+        cli.cmd_reply(_args(message))
+
+        paths = [call[1] for call in client.calls]
+        comment_index = paths.index("/api/v1/tickets/PERF-TEST/comments")
+        reply_indices = [
+            index
+            for index, path in enumerate(paths)
+            if path == "/api/v1/tickets/PERF-TEST/user-reply"
+        ]
+        assert len(reply_indices) == 1, message
+        assert comment_index < reply_indices[0], message
+        assert all(
+            reply_indices[0] < index
+            for index, path in enumerate(paths)
+            if path.endswith("/transition")
+        ), message
+
+    capsys.readouterr()
+
+
+def test_noncommitting_slash_commands_do_not_emit_reply_event(monkeypatch, capsys):
+    for message in ("/model", "/extend-iterations nope", "/abort", "/unknown"):
+        client = _FakeClient([])
+        monkeypatch.setattr(
+            cli,
+            "get_client",
+            lambda _args, current=client: (current, "http://state-store"),
+        )
+
+        cli.cmd_reply(_args(message))
+
+        assert not any(path.endswith("/user-reply") for _, path, _ in client.calls)
+        assert not any(path.endswith("/comments") for _, path, _ in client.calls)
+
+    capsys.readouterr()
 
 
 def test_reply_does_not_resume_with_ambiguous_approvals(monkeypatch, capsys):

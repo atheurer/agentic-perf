@@ -2631,11 +2631,6 @@ class AgentBase(ABC):
             ticket_id,
             {"pending_interject": None},
         )
-        self._emit(
-            ticket_id,
-            "user_interjection",
-            {"message": message},
-        )
         return message
 
     _HITL_POLL_INTERVAL = 5.0

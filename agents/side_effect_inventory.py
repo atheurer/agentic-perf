@@ -46,6 +46,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/chat/tools.py", "_create_ticket", "mutating_http_state"),
     ("agents/chat/tools.py", "_create_user", "mutating_http_state"),
     ("agents/chat/tools.py", "_emit", "mutating_http_state"),
+    ("agents/chat/tools.py", "_emit_user_reply", "mutating_http_state"),
     ("agents/chat/tools.py", "_reply_to_guidance", "mutating_http_state"),
     ("agents/chat/tools.py", "_rotate_user_token", "mutating_http_state"),
     ("agents/chat/tools.py", "_send_interjection", "mutating_http_state"),
@@ -231,6 +232,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/stub.py", "run", "mutating_http_state"),
     ("agents/synthesis/agent.py", "_handle_completion", "mcp"),
     ("agents/triage/server.py", "get_benchmark_details", "filesystem"),
+    ("cli.py", "_emit_user_reply", "mutating_http_state"),
     ("cli.py", "_handle_cli_slash_command", "mutating_http_state"),
     ("cli.py", "_resume_ticket", "mutating_http_state"),
     ("cli.py", "cmd_abort", "mutating_http_state"),
@@ -545,6 +547,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/groups.py", "remove_member", "mutating_http_state"),
     ("state_store/api/groups.py", "set_group_quota", "mutating_http_state"),
     ("state_store/api/interject.py", "interject", "mutating_http_state"),
+    ("state_store/api/interject.py", "user_reply", "mutating_http_state"),
     ("state_store/api/orchestrator_lease.py", "acquire_lease", "mutating_http_state"),
     ("state_store/api/orchestrator_lease.py", "release_lease", "mutating_http_state"),
     ("state_store/api/orchestrator_lease.py", "renew_lease", "mutating_http_state"),
@@ -605,6 +608,12 @@ INVENTORIED_SIDE_EFFECTS = (
 
 # Exact review disposition for every checked-in boundary.
 INVENTORY_DISPOSITIONS = {
+    ("cli.py", "_emit_user_reply", "mutating_http_state"): (
+        "audited",
+        "orchestration-maintainers",
+        "cli.py:_emit_user_reply",
+        "2027-12-31",
+    ),
     ("agents/analyze/agent.py", "_prefetch_cited_runs", "mcp"): (
         "audited",
         "observability-maintainers",
@@ -855,6 +864,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/chat/tools.py:_emit",
+        "2027-12-31",
+    ),
+    ("agents/chat/tools.py", "_emit_user_reply", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "agents/chat/tools.py:_emit_user_reply",
         "2027-12-31",
     ),
     ("agents/chat/tools.py", "_reply_to_guidance", "mutating_http_state"): (
@@ -3213,6 +3228,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/api/interject.py:interject",
+        "2027-12-31",
+    ),
+    ("state_store/api/interject.py", "user_reply", "mutating_http_state"): (
+        "audited",
+        "state-store-maintainers",
+        "state_store/api/interject.py:user_reply",
         "2027-12-31",
     ),
     ("state_store/api/orchestrator_lease.py", "acquire_lease", "mutating_http_state"): (
