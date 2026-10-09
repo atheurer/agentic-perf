@@ -860,10 +860,38 @@ async def _verify_harness_install_one(
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )
-    verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
+    default_verify_cmd = (
+        f"{path}/bin/burden -h"
+        if harness_name == "zathras"
+        else f"{path}/bin/{harness_name} help"
+    )
+    verify_cmd = provisioning.get("verify_command", default_verify_cmd)
+    zathras_help_command = False
+    if harness_name == "zathras":
+        try:
+            verify_args = shlex.split(verify_cmd)
+        except ValueError:
+            verify_args = []
+        if (
+            len(verify_args) == 2
+            and Path(verify_args[0]).name == "burden"
+            and verify_args[-1] in {"-h", "--usage"}
+        ):
+            zathras_help_command = True
+            # Older organization config used --usage; normalize it to the
+            # documented short help flag while that config is updated.
+            if verify_args[-1] == "--usage":
+                verify_args[-1] = "-h"
+                verify_cmd = shlex.join(verify_args)
 
     result = await _ssh.run(host, verify_cmd)
-    harness_verified = result.exit_code == 0
+    help_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    zathras_help_succeeded = (
+        zathras_help_command
+        and result.exit_code == 1
+        and re.search(r"\busage\b", help_output, re.IGNORECASE) is not None
+    )
+    harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
