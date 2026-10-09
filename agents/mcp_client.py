@@ -557,6 +557,25 @@ class AgentMCPClient:
         """
         previous = self._servers.pop(name, None)
         generation = 0
+        previous_routes: tuple[str, ...] = ()
+        if previous is not None:
+            previous_routes = tuple(
+                tool for tool, server in self._tool_routing.items() if server == name
+            )
+
+        async def _restore_previous_connection() -> None:
+            if previous is None or previous._connect_params is None:
+                return
+            async with self._lifecycle_lock:
+                if self._closing or self._servers.get(name) is not None:
+                    return
+                previous.session = None
+                previous.connected = False
+                self._servers[name] = previous
+                for tool in previous_routes:
+                    if tool not in self._tool_routing:
+                        self._tool_routing[tool] = name
+
         if previous is not None:
             generation = previous.reconnect_generation + 1
             self._record_boundary(previous, LifecycleState.DISCONNECTED)
@@ -564,7 +583,11 @@ class AgentMCPClient:
             previous._shutdown.set()
             if previous._task is not None:
                 previous._task.cancel()
-                await asyncio.gather(previous._task, return_exceptions=True)
+                try:
+                    await asyncio.gather(previous._task, return_exceptions=True)
+                except BaseException:
+                    await _restore_previous_connection()
+                    raise
             self._tool_routing = {
                 tool: server
                 for tool, server in self._tool_routing.items()
@@ -710,9 +733,11 @@ class AgentMCPClient:
                     error=exc,
                 )
             await _cleanup_connection()
+            await _restore_previous_connection()
             raise
         except (Exception, BaseException):
             await _cleanup_connection()
+            await _restore_previous_connection()
             raise
 
         try:
@@ -762,6 +787,7 @@ class AgentMCPClient:
                 error=exc,
             )
             await _cleanup_connection()
+            await _restore_previous_connection()
             raise
         except Exception as exc:
             self._record_boundary(
@@ -772,9 +798,11 @@ class AgentMCPClient:
                 error=exc,
             )
             await _cleanup_connection()
+            await _restore_previous_connection()
             raise
         if conflicting_tool is not None:
             await _cleanup_connection()
+            await _restore_previous_connection()
             raise ValueError(
                 f"Tool {conflicting_tool!r} from server "
                 f"{name!r} conflicts with server "

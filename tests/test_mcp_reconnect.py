@@ -352,6 +352,81 @@ async def test_reconnect_failure_returns_clear_error_without_logging_details(cap
 
 
 @pytest.mark.asyncio
+async def test_failed_reconnect_restores_route_for_a_later_retry(monkeypatch):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(connect_params=params)
+    old_conn.session = None
+    transport_enter_count = 0
+    session_count = 0
+
+    class _RetryTransport:
+        async def __aenter__(self):
+            nonlocal transport_enter_count
+            transport_enter_count += 1
+            if transport_enter_count == 1:
+                raise RuntimeError("temporary reconnect startup failure")
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _RetrySession:
+        def __init__(self, *_args):
+            nonlocal session_count
+            session_count += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[_make_tool("check_host")])
+
+        async def call_tool(self, name, arguments, meta=None):
+            return SimpleNamespace(
+                content=[SimpleNamespace(text="recovered result")],
+                isError=False,
+            )
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _RetryTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _RetrySession)
+
+    try:
+        with pytest.raises(
+            MCPToolCallError, match="session closed before tool dispatch"
+        ):
+            await client.call_tool("check_host", {}, trace_context=_trace_context())
+
+        assert client._servers[old_conn.name] is old_conn
+        assert old_conn.session is None
+        assert old_conn.connected is False
+        assert old_conn._connect_params is params
+        assert client._tool_routing == {"check_host": old_conn.name}
+
+        result = await client.call_tool(
+            "check_host", {}, trace_context=_trace_context()
+        )
+
+        assert result == "recovered result"
+        replacement = client._servers[old_conn.name]
+        assert replacement is not old_conn
+        assert replacement.connected is True
+        assert client._tool_routing == {"check_host": old_conn.name}
+        assert transport_enter_count == 2
+        assert session_count == 1
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_no_reconnect_without_connect_params():
     """Without stored connect params, no reconnect is attempted."""
     failing_session = _FakeSession(
