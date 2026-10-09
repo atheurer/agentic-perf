@@ -91,6 +91,28 @@ class TestInterjectEndpoint:
         assert len(user_comments) == 1
         assert user_comments[0].body == "try a different approach"
 
+    def test_interject_emits_user_interjection_event(
+        self,
+        client,
+        event_bus,
+        active_ticket,
+    ):
+        """POST /interject emits a user_interjection event immediately."""
+        tid = active_ticket.id
+        r = client.post(
+            f"/api/v1/tickets/{tid}/interject",
+            json={"message": "switch to latency mode"},
+        )
+        assert r.status_code == 200
+
+        events = event_bus.get_events(tid, since=0, limit=100)
+        interjection_events = [
+            e for e in events if e.get("event_type") == "user_interjection"
+        ]
+        assert len(interjection_events) == 1
+        assert interjection_events[0]["data"]["message"] == ("switch to latency mode")
+        assert interjection_events[0]["agent"] == "user"
+
     def test_interject_404_unknown_ticket(self, client):
         r = client.post(
             "/api/v1/tickets/PERF-NONEXISTENT/interject",
@@ -157,6 +179,37 @@ class TestInterjectEndpoint:
         )
         ticket = store.get_ticket(tid)
         assert ticket.status.value == "executing_benchmark"
+
+
+class TestUserReplyEndpoint:
+    """Tests for the POST /user-reply endpoint."""
+
+    def test_user_reply_emits_event(
+        self,
+        client,
+        event_bus,
+        active_ticket,
+    ):
+        tid = active_ticket.id
+        r = client.post(
+            f"/api/v1/tickets/{tid}/user-reply",
+            json={"message": "approved, proceed"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "recorded"
+
+        events = event_bus.get_events(tid, since=0, limit=100)
+        reply_events = [e for e in events if e.get("event_type") == "user_reply"]
+        assert len(reply_events) == 1
+        assert reply_events[0]["data"]["message"] == "approved, proceed"
+        assert reply_events[0]["agent"] == "user"
+
+    def test_user_reply_404_unknown_ticket(self, client):
+        r = client.post(
+            "/api/v1/tickets/PERF-NONEXISTENT/user-reply",
+            json={"message": "hello"},
+        )
+        assert r.status_code == 404
 
 
 class TestAgentInterjectPickup:

@@ -37,6 +37,7 @@ EVENT_TYPES = {
     "llm_usage",
     "agent_stopped",
     "user_interjection",
+    "user_reply",
     "escalation",
     "circuit_breaker",
 }

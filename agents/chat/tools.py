@@ -1036,6 +1036,28 @@ async def _start_ticket(
     return json.dumps({"id": ticket_id, "status": "triage_pending"})
 
 
+async def _emit_user_reply(
+    client: httpx.AsyncClient,
+    store_url: str,
+    headers: dict[str, str],
+    ticket_id: str,
+    message: str,
+) -> None:
+    """Emit a user_reply event so the reply appears in the live feed."""
+    try:
+        await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/user-reply",
+            headers=headers,
+            json={"message": message},
+        )
+    except Exception:
+        # Best-effort: the reply itself already succeeded.
+        logger.warning(
+            "Failed to emit user_reply event for %s",
+            ticket_id,
+        )
+
+
 async def _send_interjection(
     client: httpx.AsyncClient,
     store_url: str,
@@ -1177,6 +1199,10 @@ async def _reply_to_guidance(
             json={"status": resume_status},
         )
         r.raise_for_status()
+
+    await _emit_user_reply(client, store_url, headers, ticket_id, message)
+
+    if resume_status:
         return json.dumps(
             {
                 "status": "replied_and_resumed",

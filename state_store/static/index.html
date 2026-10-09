@@ -4098,6 +4098,20 @@ function renderEvent(evt) {
         '<div class="event-text short">' + expandableText(data.body || '', null, 'event-' + evt.seq + '-comment-body') + '</div>' +
       '</div>';
 
+    case 'user_interjection':
+      return '<div class="event" style="border-left:3px solid #7b1fa2;padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#7b1fa2;color:#fff">USER INTERJECTION</span>' +
+        '<span>' + escHtml(data.message || '') + '</span>' +
+      '</div>';
+
+    case 'user_reply':
+      return '<div class="event" style="border-left:3px solid #00695c;padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#00695c;color:#fff">USER REPLY</span>' +
+        '<span>' + escHtml(data.message || '') + '</span>' +
+      '</div>';
+
     default:
       return '<div class="event">' +
         '<span class="event-ts">' + ts + '</span>' +
