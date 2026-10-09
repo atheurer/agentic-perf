@@ -236,6 +236,48 @@ async def test_connect_command_snapshots_mutable_args(monkeypatch):
         await client.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_client_can_connect_again_after_disconnect(monkeypatch):
+    class _ReadyTransport:
+        async def __aenter__(self):
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ReadySession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ReadySession)
+    client = AgentMCPClient()
+
+    await client.connect_command("first-server", name="first", env={})
+    await client.disconnect()
+    assert client._closing is False
+
+    await client.connect_command("second-server", name="second", env={})
+    assert client._servers["second"].connected is True
+    assert client._closing is False
+    await client.disconnect()
+
+
 def _trace_context() -> TraceContext:
     return TraceContext(ticket_id="PERF-TEST", agent_id="test-agent")
 

@@ -1780,6 +1780,7 @@ class AgentMCPClient:
                 self._trace_client.close()
             self._trace_client = None
             self._owns_trace_client = False
+            self._closing = False
             logger.info("MCP client disconnected all servers")
 
 
