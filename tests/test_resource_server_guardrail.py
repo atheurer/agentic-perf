@@ -13,6 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+_REAL_PERSIST_UNKNOWN_MARKER = None
+_REAL_PERSIST_KNOWN_OUTCOME = None
+
 
 def _mock_audited_state_store(monkeypatch):
     import httpx
@@ -52,9 +55,56 @@ def _mock_audited_state_store(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_server_state():
+def _reset_server_state(monkeypatch):
     """Reset the resource server's module-level globals before each test."""
+    global _REAL_PERSIST_UNKNOWN_MARKER, _REAL_PERSIST_KNOWN_OUTCOME
+
     import agents.resource.server as srv
+
+    if _REAL_PERSIST_UNKNOWN_MARKER is None:
+        _REAL_PERSIST_UNKNOWN_MARKER = srv._persist_unknown_reservation_marker
+    if _REAL_PERSIST_KNOWN_OUTCOME is None:
+        _REAL_PERSIST_KNOWN_OUTCOME = srv._persist_known_reservation_outcome
+
+    async def persist_unknown_in_memory(ticket_id, *, provider=None, result=None):
+        fields = srv._ticket.setdefault("custom_fields", {})
+        fields["resource_reservation_outcome_unknown"] = True
+        if provider:
+            fields["resource_provider"] = provider
+        result = result or {}
+        metadata = result.get("provider_metadata")
+        if isinstance(metadata, dict) and metadata:
+            fields["resource_provider_metadata"] = metadata
+        reservation_id = (
+            result.get("reservation_id")
+            or result.get("lease_id")
+            or result.get("assignment_id")
+        )
+        if reservation_id:
+            fields["resource_reservation_id"] = str(reservation_id)
+
+    async def persist_known_in_memory(ticket_id, provider, result):
+        fields = srv._ticket.setdefault("custom_fields", {})
+        fields["resource_reservation_outcome_unknown"] = False
+        fields["resource_provider"] = provider
+        metadata = result.get("provider_metadata")
+        if isinstance(metadata, dict) and metadata:
+            fields["resource_provider_metadata"] = metadata
+        reservation_id = (
+            result.get("reservation_id")
+            or result.get("lease_id")
+            or result.get("assignment_id")
+            or result.get("resource_reservation_id")
+        )
+        if reservation_id:
+            fields["resource_reservation_id"] = str(reservation_id)
+
+    monkeypatch.setattr(
+        srv, "_persist_unknown_reservation_marker", persist_unknown_in_memory
+    )
+    monkeypatch.setattr(
+        srv, "_persist_known_reservation_outcome", persist_known_in_memory
+    )
 
     srv._resources_allocated = False
     srv._reservation_uncertain = False
@@ -134,18 +184,27 @@ async def test_fresh_server_reads_unknown_marker_before_discovery_or_reserve(
         lambda *_args, **_kwargs: configured_registry,
     )
 
-    listed = json.loads(await srv.list_resource_providers())
-    checked = json.loads(await srv.check_available_resources(provider="aws"))
-    reserved = json.loads(
-        await srv.reserve_resources(
+    results = []
+    operations = (
+        srv.list_resource_providers,
+        lambda: srv.check_available_resources(provider="aws"),
+        lambda: srv.reserve_resources(
             provider="aws",
             selection={"instance_type": "m5.xlarge", "count": 1},
             description="must stay blocked",
             ticket_id="PERF-TEST",
-        )
+        ),
     )
+    for operation in operations:
+        # Each operation gets a fresh process view so its own _ensure_init()
+        # must read and enforce the ticket marker before touching providers.
+        srv._initialized = False
+        srv._registry = None
+        srv._reservation_uncertain = False
+        srv._resources_allocated = False
+        results.append(json.loads(await operation()))
 
-    for result in (listed, checked, reserved):
+    for result in results:
         assert result["allocation_unknown"] is True
         assert result["retry_blocked"] is True
     configured_registry.list_configured_providers.assert_not_awaited()
@@ -163,6 +222,9 @@ async def test_unknown_reservation_marker_uses_audited_state_store_patch(monkeyp
     )
 
     requests, events = _mock_audited_state_store(monkeypatch)
+    monkeypatch.setattr(
+        srv, "_persist_unknown_reservation_marker", _REAL_PERSIST_UNKNOWN_MARKER
+    )
     srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
     trace_token = bind_trace_context(
         new_trace_context(ticket_id="PERF-TEST", agent_id="resource-agent")
@@ -187,6 +249,53 @@ async def test_unknown_reservation_marker_uses_audited_state_store_patch(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_known_outcome_clears_marker_with_verified_id_and_metadata(monkeypatch):
+    import agents.resource.server as srv
+    from providers.tracing import (
+        bind_trace_context,
+        new_trace_context,
+        reset_trace_context,
+    )
+
+    requests, _events = _mock_audited_state_store(monkeypatch)
+    monkeypatch.setattr(
+        srv, "_persist_known_reservation_outcome", _REAL_PERSIST_KNOWN_OUTCOME
+    )
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {"resource_reservation_outcome_unknown": True},
+    }
+    result = {
+        "status": "success",
+        "reservation_id": "i-verified",
+        "provider_metadata": {
+            "instance_ids": ["i-verified"],
+            "region": "us-east-1",
+        },
+    }
+    trace_token = bind_trace_context(
+        new_trace_context(ticket_id="PERF-TEST", agent_id="resource-agent")
+    )
+    try:
+        await srv._persist_known_reservation_outcome("PERF-TEST", "aws", result)
+    finally:
+        reset_trace_context(trace_token)
+
+    assert len(requests) == 1
+    fields = json.loads(requests[0].content)["fields"]
+    assert fields == {
+        "resource_reservation_outcome_unknown": False,
+        "resource_provider": "aws",
+        "resource_provider_metadata": {
+            "instance_ids": ["i-verified"],
+            "region": "us-east-1",
+        },
+        "resource_reservation_id": "i-verified",
+    }
+    assert srv._ticket["custom_fields"] == fields
+
+
+@pytest.mark.asyncio
 async def test_cancelled_reservation_persists_marker_before_reraising(monkeypatch):
     import agents.resource.server as srv
     from providers.tracing import (
@@ -196,9 +305,19 @@ async def test_cancelled_reservation_persists_marker_before_reraising(monkeypatc
     )
 
     requests, _events = _mock_audited_state_store(monkeypatch)
+    monkeypatch.setattr(
+        srv, "_persist_unknown_reservation_marker", _REAL_PERSIST_UNKNOWN_MARKER
+    )
     side_effects = []
 
     async def reserve_then_cancel(*_args, **_kwargs):
+        assert len(requests) == 1
+        assert (
+            json.loads(requests[0].content)["fields"][
+                "resource_reservation_outcome_unknown"
+            ]
+            is True
+        )
         side_effects.append("allocation started")
         raise asyncio.CancelledError
 
@@ -233,12 +352,11 @@ async def test_cancelled_reservation_persists_marker_before_reraising(monkeypatc
     assert srv._reservation_uncertain is True
     assert srv._reservation_failures == 1
     assert srv._ticket["custom_fields"]["resource_reservation_outcome_unknown"] is True
-    assert len(requests) == 1
-    assert (
-        json.loads(requests[0].content)["fields"][
-            "resource_reservation_outcome_unknown"
-        ]
+    assert len(requests) == 2
+    assert all(
+        json.loads(request.content)["fields"]["resource_reservation_outcome_unknown"]
         is True
+        for request in requests
     )
     assert retry["allocation_unknown"] is True
     assert retry["retry_blocked"] is True
@@ -527,9 +645,19 @@ class TestReservationFailureTracking:
         )
 
         requests, _events = _mock_audited_state_store(monkeypatch)
+        monkeypatch.setattr(
+            srv, "_persist_unknown_reservation_marker", _REAL_PERSIST_UNKNOWN_MARKER
+        )
         side_effects = []
 
         async def reserve_then_raise(*_args, **_kwargs):
+            assert len(requests) == 1
+            assert (
+                json.loads(requests[0].content)["fields"][
+                    "resource_reservation_outcome_unknown"
+                ]
+                is True
+            )
             side_effects.append("provider allocation started")
             raise RuntimeError("post-allocation SSH setup failed")
 
@@ -571,12 +699,13 @@ class TestReservationFailureTracking:
             srv._ticket["custom_fields"]["resource_reservation_outcome_unknown"] is True
         )
         assert result["marker_persisted"] is True
-        assert len(requests) == 1
-        assert (
-            json.loads(requests[0].content)["fields"][
+        assert len(requests) == 2
+        assert all(
+            json.loads(request.content)["fields"][
                 "resource_reservation_outcome_unknown"
             ]
             is True
+            for request in requests
         )
 
         listing = json.loads(await srv.list_resource_providers())
@@ -598,6 +727,147 @@ class TestReservationFailureTracking:
         assert side_effects == ["provider allocation started"]
         assert metadata["allocation_unknown"] is True
         assert metadata["instance_ids"] == ["i-previous"]
+
+    @pytest.mark.asyncio
+    async def test_failed_response_with_allocation_id_keeps_marker_and_identity(
+        self, monkeypatch
+    ):
+        import agents.resource.server as srv
+        from providers.tracing import (
+            bind_trace_context,
+            new_trace_context,
+            reset_trace_context,
+        )
+
+        requests, _events = _mock_audited_state_store(monkeypatch)
+        monkeypatch.setattr(
+            srv, "_persist_unknown_reservation_marker", _REAL_PERSIST_UNKNOWN_MARKER
+        )
+
+        async def failed_after_allocate(*_args, **_kwargs):
+            return {
+                "status": "failed",
+                "error": "SSH setup failed after launch",
+                "reservation_id": "i-partial",
+                "provider_metadata": {"instance_ids": ["i-partial"]},
+            }
+
+        self._setup_registry(failed_after_allocate)
+        trace_token = bind_trace_context(
+            new_trace_context(ticket_id="PERF-TEST", agent_id="resource-agent")
+        )
+        try:
+            result = json.loads(
+                await srv.reserve_resources(
+                    provider="aws",
+                    selection={"instance_type": "m5.xlarge", "count": 1},
+                    description="failed after allocation",
+                    ticket_id="PERF-TEST",
+                )
+            )
+        finally:
+            reset_trace_context(trace_token)
+
+        assert result["allocation_unknown"] is True
+        assert result["retry_blocked"] is True
+        assert srv._reservation_uncertain is True
+        assert (
+            srv._ticket["custom_fields"]["resource_reservation_outcome_unknown"] is True
+        )
+        assert srv._ticket["custom_fields"]["resource_reservation_id"] == "i-partial"
+        assert srv._ticket["custom_fields"]["resource_provider_metadata"] == {
+            "instance_ids": ["i-partial"]
+        }
+        assert len(requests) == 2
+        assert json.loads(requests[0].content)["fields"] == {
+            "resource_reservation_outcome_unknown": True,
+            "resource_provider": "aws",
+        }
+        assert json.loads(requests[1].content)["fields"] == {
+            "resource_reservation_outcome_unknown": True,
+            "resource_provider": "aws",
+            "resource_provider_metadata": {"instance_ids": ["i-partial"]},
+            "resource_reservation_id": "i-partial",
+        }
+
+    @pytest.mark.asyncio
+    async def test_multi_call_aws_success_persists_cumulative_identity_atomically(
+        self, monkeypatch
+    ):
+        import agents.resource.server as srv
+        from providers.tracing import (
+            bind_trace_context,
+            new_trace_context,
+            reset_trace_context,
+        )
+
+        requests, _events = _mock_audited_state_store(monkeypatch)
+        monkeypatch.setattr(
+            srv, "_persist_unknown_reservation_marker", _REAL_PERSIST_UNKNOWN_MARKER
+        )
+        monkeypatch.setattr(
+            srv, "_persist_known_reservation_outcome", _REAL_PERSIST_KNOWN_OUTCOME
+        )
+        responses = iter(
+            [
+                {
+                    "status": "success",
+                    "reservation_id": "i-first",
+                    "instance_ids": ["i-first"],
+                    "provider_metadata": {
+                        "instance_ids": ["i-first"],
+                        "public_ips": ["198.51.100.1"],
+                    },
+                },
+                {
+                    "status": "success",
+                    "reservation_id": "i-second",
+                    "instance_ids": ["i-second"],
+                    "provider_metadata": {
+                        "instance_ids": ["i-second"],
+                        "public_ips": ["198.51.100.2"],
+                    },
+                },
+            ]
+        )
+        self._setup_registry(lambda *_args, **_kwargs: next(responses))
+        trace_token = bind_trace_context(
+            new_trace_context(ticket_id="PERF-TEST", agent_id="resource-agent")
+        )
+        try:
+            for _ in range(2):
+                result = json.loads(
+                    await srv.reserve_resources(
+                        provider="aws",
+                        selection={"instance_type": "m5.xlarge", "count": 1},
+                        description="multi-call allocation",
+                        ticket_id="PERF-TEST",
+                    )
+                )
+        finally:
+            reset_trace_context(trace_token)
+
+        assert result["reservation_id"] == "i-first,i-second"
+        assert result["provider_metadata"]["instance_ids"] == [
+            "i-first",
+            "i-second",
+        ]
+        assert result["provider_metadata"]["public_ips"] == [
+            "198.51.100.1",
+            "198.51.100.2",
+        ]
+        assert len(requests) == 4
+        final_fields = json.loads(requests[-1].content)["fields"]
+        assert final_fields == {
+            "resource_reservation_outcome_unknown": False,
+            "resource_provider": "aws",
+            "resource_provider_metadata": {
+                "instance_ids": ["i-first", "i-second"],
+                "public_ips": ["198.51.100.1", "198.51.100.2"],
+            },
+            "resource_reservation_id": "i-first,i-second",
+        }
+        assert srv._ticket["custom_fields"] == final_fields
 
     @pytest.mark.asyncio
     async def test_success_without_reservation_identity_is_marked_unknown(
@@ -626,5 +896,9 @@ class TestReservationFailureTracking:
         assert result["allocation_unknown"] is True
         assert result["retry_blocked"] is True
         assert "no verifiable reservation ID" in result["error"]
-        persist.assert_awaited_once_with("PERF-TEST")
+        assert persist.await_count == 2
+        assert all(call.args == ("PERF-TEST",) for call in persist.await_args_list)
+        assert persist.await_args_list[0].kwargs == {"provider": "aws"}
+        assert persist.await_args_list[1].kwargs["provider"] == "aws"
+        assert persist.await_args_list[1].kwargs["result"]["status"] == "unknown"
         assert srv._reservation_uncertain is True

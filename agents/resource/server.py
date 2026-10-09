@@ -120,7 +120,126 @@ def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]
     return response
 
 
-async def _persist_unknown_reservation_marker(ticket_id: str | None) -> None:
+def _reservation_identity(result: dict[str, Any]) -> str | None:
+    """Extract a provider reservation identifier from a result and its metadata."""
+    metadata = result.get("provider_metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    reservation_id = (
+        result.get("resource_reservation_id")
+        or result.get("reservation_id")
+        or result.get("lease_id")
+        or result.get("assignment_id")
+        or metadata.get("reservation_id")
+        or metadata.get("lease_id")
+        or metadata.get("assignment_id")
+    )
+    instance_ids = result.get("instance_ids") or metadata.get("instance_ids")
+    if not reservation_id and isinstance(instance_ids, (list, tuple, set)):
+        reservation_id = ",".join(str(value) for value in instance_ids if value)
+    elif not reservation_id and isinstance(instance_ids, str) and instance_ids.strip():
+        reservation_id = instance_ids.strip()
+    if reservation_id is None or not str(reservation_id).strip():
+        return None
+    return str(reservation_id)
+
+
+def _split_reservation_ids(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        values = [str(item).strip() for item in value if str(item).strip()]
+    elif isinstance(value, str):
+        values = [item.strip() for item in value.split(",") if item.strip()]
+    elif value is None:
+        values = []
+    else:
+        values = [str(value).strip()]
+    return list(dict.fromkeys(values))
+
+
+def _combined_reservation_outcome(
+    provider: str, result: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """Merge known prior identity into the current response for durable state.
+
+    AWS supports a comma-separated reservation ID and instance ID lists, so its
+    multi-call allocations can be persisted as one cleanup identity. The other
+    providers expose a single reservation identity; if two calls return
+    different IDs, preserve both for reconciliation and leave the safety latch
+    set rather than inventing an unsupported composite identifier.
+    """
+    previous = _last_reservation
+    previous_metadata = previous.get("provider_metadata")
+    previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
+    current_metadata = result.get("provider_metadata")
+    current_metadata = current_metadata if isinstance(current_metadata, dict) else {}
+
+    metadata = dict(previous_metadata)
+    for key, value in current_metadata.items():
+        old_value = metadata.get(key)
+        if isinstance(old_value, list) and isinstance(value, list):
+            metadata[key] = list(dict.fromkeys([*old_value, *value]))
+        elif (
+            key == "ip_mapping"
+            and isinstance(old_value, dict)
+            and isinstance(value, dict)
+        ):
+            metadata[key] = {**old_value, **value}
+        else:
+            metadata[key] = value
+
+    combined = dict(result)
+    if metadata:
+        combined["provider_metadata"] = metadata
+
+    previous_id = _reservation_identity(previous)
+    current_id = _reservation_identity(result)
+    if provider == "aws":
+        instance_ids = _split_reservation_ids(
+            previous_metadata.get("instance_ids") or previous.get("instance_ids")
+        )
+        instance_ids.extend(
+            item
+            for item in _split_reservation_ids(
+                current_metadata.get("instance_ids") or result.get("instance_ids")
+            )
+            if item not in instance_ids
+        )
+        if not instance_ids:
+            instance_ids = _split_reservation_ids(previous_id)
+            instance_ids.extend(
+                item
+                for item in _split_reservation_ids(current_id)
+                if item not in instance_ids
+            )
+        if instance_ids:
+            metadata["instance_ids"] = instance_ids
+            combined["instance_ids"] = instance_ids
+            combined["reservation_id"] = ",".join(instance_ids)
+        return combined, True
+
+    if previous_id and current_id and previous_id != current_id:
+        identities = list(
+            dict.fromkeys(
+                [
+                    *_split_reservation_ids(previous_id),
+                    *_split_reservation_ids(current_id),
+                ]
+            )
+        )
+        metadata["reconciliation_reservation_ids"] = identities
+        combined["provider_metadata"] = metadata
+        return combined, False
+
+    if not current_id and previous_id:
+        combined["reservation_id"] = previous_id
+    return combined, True
+
+
+async def _persist_unknown_reservation_marker(
+    ticket_id: str | None,
+    *,
+    provider: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
     """Persist the fail-closed marker through the audited ticket state boundary."""
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "") or _ticket.get("id", "")
     if not ticket_id:
@@ -128,8 +247,21 @@ async def _persist_unknown_reservation_marker(ticket_id: str | None) -> None:
             "Cannot persist an unknown reservation outcome without a ticket ID"
         )
 
+    result = result or {}
+    metadata = result.get("provider_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    fields: dict[str, Any] = {"resource_reservation_outcome_unknown": True}
+    resolved_provider = result.get("provider") or provider
+    if resolved_provider:
+        fields["resource_provider"] = resolved_provider
+    if metadata:
+        fields["resource_provider_metadata"] = metadata
+    reservation_id = _reservation_identity(result)
+    if reservation_id:
+        fields["resource_reservation_id"] = reservation_id
+
     custom_fields = _ticket.setdefault("custom_fields", {})
-    custom_fields["resource_reservation_outcome_unknown"] = True
+    custom_fields.update(fields)
 
     from providers.execution import AuditedAsyncHTTPClient
     from state_store.auth import read_token_from_file
@@ -143,9 +275,52 @@ async def _persist_unknown_reservation_marker(ticket_id: str | None) -> None:
     ) as client:
         response = await client.patch(
             f"/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": {"resource_reservation_outcome_unknown": True}},
+            json={"fields": fields},
         )
         response.raise_for_status()
+
+
+async def _persist_known_reservation_outcome(
+    ticket_id: str | None, provider: str, result: dict[str, Any]
+) -> None:
+    """Clear the latch with verified cleanup identity in the same state write."""
+    ticket_id = ticket_id or os.environ.get("TICKET_ID", "") or _ticket.get("id", "")
+    if not ticket_id:
+        raise RuntimeError(
+            "Cannot persist a resolved reservation outcome without a ticket ID"
+        )
+
+    metadata = result.get("provider_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    fields: dict[str, Any] = {
+        "resource_reservation_outcome_unknown": False,
+        "resource_provider": result.get("provider") or provider,
+    }
+    if metadata:
+        fields["resource_provider_metadata"] = metadata
+
+    reservation_id = _reservation_identity(result)
+    if reservation_id:
+        fields["resource_reservation_id"] = reservation_id
+
+    from providers.execution import AuditedAsyncHTTPClient
+    from state_store.auth import read_token_from_file
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    token = read_token_from_file()
+    async with AuditedAsyncHTTPClient(
+        base_url=store_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10.0,
+    ) as client:
+        response = await client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": fields},
+        )
+        response.raise_for_status()
+
+    custom_fields = _ticket.setdefault("custom_fields", {})
+    custom_fields.update(fields)
 
 
 async def _persist_fleet_exhaustion_marker(ticket_id: str, exhausted: bool) -> None:
@@ -554,6 +729,37 @@ async def reserve_resources(
         logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
+    resources_allocated_before = _resources_allocated
+    _latch_unknown_reservation()
+    try:
+        # This write-ahead latch protects against MCP/process loss during the
+        # provider call. A definitive response clears it atomically with any
+        # reservation identity needed for teardown.
+        await _persist_unknown_reservation_marker(ticket_id, provider=provider)
+    except Exception as exc:
+        logger.exception(
+            "[resource] Could not persist pre-reservation uncertainty marker"
+        )
+        result = _unknown_reservation_response(provider)
+        result["error"] = (
+            "Could not persist the reservation safety marker; provider.reserve "
+            "was not called."
+        )
+        result["message"] = (
+            "No provider allocation was attempted by this call. Confirm provider "
+            "state, clear any stale reservation ID or metadata if the marker was "
+            "saved, and resolve the marker before retrying."
+        )
+        result["marker_persisted"] = False
+        result["provider_call_started"] = False
+        result["provider_metadata"] = dict(
+            _last_reservation.get("provider_metadata") or {}
+        )
+        result["error"] += f" State-store error: {type(exc).__name__}."
+        _last_reservation.clear()
+        _last_reservation.update(result)
+        return json.dumps(result)
+
     try:
         result = await prov.reserve(
             selection, description, duration_hours, ticket_id=ticket_id
@@ -589,7 +795,11 @@ async def reserve_resources(
         _last_reservation.clear()
         _last_reservation.update(cancelled_result)
         try:
-            await asyncio.shield(_persist_unknown_reservation_marker(ticket_id))
+            await asyncio.shield(
+                _persist_unknown_reservation_marker(
+                    ticket_id, provider=provider, result=cancelled_result
+                )
+            )
         except Exception:
             logger.exception(
                 "[resource] Failed to persist cancellation uncertainty marker"
@@ -624,20 +834,66 @@ async def reserve_resources(
     unknown_outcome = result.get("allocation_unknown") is True or str(
         result.get("status", "")
     ).strip().lower() in {"unknown", "uncertain", "indeterminate"}
-    if not unknown_outcome and not reservation_failed(result):
-        has_identity = has_reservation_metadata(provider, result) or (
-            has_reservation_metadata(provider, result.get("provider_metadata"))
+    has_identity = has_reservation_metadata(provider, result) or (
+        has_reservation_metadata(provider, result.get("provider_metadata"))
+    )
+    provider_failed = reservation_failed(result)
+    if not unknown_outcome and provider_failed and has_identity:
+        unknown_outcome = True
+        result["allocation_unknown"] = True
+        result["retry_blocked"] = True
+        result["message"] = (
+            f"{result.get('message', '').strip()} Provider reported failure but "
+            "returned allocation identity; inspect and reconcile before retrying."
+        ).strip()
+    elif not unknown_outcome and not provider_failed and not has_identity:
+        unknown_outcome = True
+        result["status"] = "unknown"
+        result["error"] = (
+            "Provider returned no verifiable reservation ID or allocation metadata."
         )
-        if not has_identity:
+        result["message"] = (
+            "The provider response did not identify the allocation. Do not retry "
+            "or run discovery; inspect provider state before resuming."
+        )
+
+    result, identity_is_combinable = _combined_reservation_outcome(provider, result)
+    if not identity_is_combinable:
+        unknown_outcome = True
+        result["status"] = "unknown"
+        result["allocation_unknown"] = True
+        result["retry_blocked"] = True
+        result["error"] = (
+            "Multiple reservation IDs from this provider cannot be represented "
+            "as one cleanup identity."
+        )
+        result["message"] = (
+            "The provider returned multiple allocations that cannot be safely "
+            "combined for automated teardown. Reconcile every ID in provider "
+            "metadata before clearing the unknown marker."
+        )
+
+    if not unknown_outcome:
+        try:
+            await _persist_known_reservation_outcome(ticket_id, provider, result)
+        except Exception as exc:
+            logger.exception(
+                "[resource] Could not persist definitive reservation outcome"
+            )
             unknown_outcome = True
             result["status"] = "unknown"
+            result["allocation_unknown"] = True
+            result["retry_blocked"] = True
             result["error"] = (
-                "Provider returned no verifiable reservation ID or allocation metadata."
+                f"Could not durably record provider outcome ({type(exc).__name__})."
             )
             result["message"] = (
-                "The provider response did not identify the allocation. Do not "
-                "retry or run discovery; inspect provider state before resuming."
+                "The provider responded, but ticket state could not be safely "
+                "updated. Do not retry or discover; reconcile provider state."
             )
+        else:
+            _reservation_uncertain = False
+            _resources_allocated = resources_allocated_before
     if unknown_outcome:
         _latch_unknown_reservation()
     if not reservation_failed(result):
@@ -669,29 +925,14 @@ async def reserve_resources(
                 "check_available_resources again."
             )
 
-    # Accumulate provider_metadata across multiple reserve calls
-    # (e.g., separate calls for controller and endpoints).
-    prev_meta = _last_reservation.get("provider_metadata", {})
-    if unknown_outcome and not result.get("provider_metadata") and prev_meta:
-        result["provider_metadata"] = dict(prev_meta)
     _last_reservation.clear()
     _last_reservation.update(result)
-    if prev_meta and not unknown_outcome:
-        new_meta = result.get("provider_metadata", {})
-        for key in ("public_ips", "private_ips"):
-            if key in prev_meta:
-                merged = list(prev_meta[key])
-                merged.extend(new_meta.get(key, []))
-                new_meta[key] = merged
-        if "ip_mapping" in prev_meta:
-            merged_map = dict(prev_meta["ip_mapping"])
-            merged_map.update(new_meta.get("ip_mapping", {}))
-            new_meta["ip_mapping"] = merged_map
-        _last_reservation["provider_metadata"] = new_meta
 
     if unknown_outcome:
         try:
-            await _persist_unknown_reservation_marker(ticket_id)
+            await _persist_unknown_reservation_marker(
+                ticket_id, provider=provider, result=result
+            )
             result["marker_persisted"] = True
             _last_reservation["marker_persisted"] = True
         except Exception as exc:
