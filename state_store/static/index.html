@@ -2033,6 +2033,7 @@ function statusBadge(status) {
 
 function ticketOutcome(ticket) {
   var cf = ticket.custom_fields || {};
+  var status = ticket.status || '';
   var verdict = cf.verdict;
   var dedup = cf.dedup_result;
   var synth = cf.synthesis_result;
@@ -2071,8 +2072,9 @@ function ticketOutcome(ticket) {
       escHtml(sOutcome || 'COMPLETE') + '</span>';
   }
 
-  // Evaluation result (pre-synthesis)
-  if (evalR) {
+  // Evaluation result (pre-synthesis) — only show for terminal tickets so
+  // in-progress tickets don't display a stale intermediate result.
+  if (evalR && isTicketTerminal(status)) {
     var eOutcome = String(evalR.decision || '').toUpperCase();
     var eCls = 'inconclusive';
     if (eOutcome === 'CONVERGED') eCls = 'pass';
@@ -2081,16 +2083,16 @@ function ticketOutcome(ticket) {
       escHtml(eOutcome) + '</span>';
   }
 
-  // Analysis-only conclusion
-  if (analysis && analysis.conclusive) {
-    return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
-  }
-  if (analysis && !analysis.conclusive) {
+  // Analysis-only conclusion — only show for terminal tickets to avoid
+  // displaying an intermediate analysis result while later stages run.
+  if (analysis && isTicketTerminal(status)) {
+    if (analysis.conclusive) {
+      return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
+    }
     return '<span class="outcome outcome-inconclusive">NEEDS DATA</span>';
   }
 
   // Aborted / cancelled
-  var status = ticket.status || '';
   if (cf.abort_requested || cf.stop_requested) {
     return '<span class="outcome outcome-abort">ABORTED</span>';
   }

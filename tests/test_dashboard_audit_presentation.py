@@ -168,6 +168,35 @@ def test_dashboard_renders_provider_record_links_safely() -> None:
     assert render("javascript:alert(1)") == "RCA-&lt;42&gt;"
 
 
+def test_ticket_outcome_hides_intermediate_results_while_awaiting_guidance() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function ticketOutcome(ticket)")
+    end = html.index("\n}", start) + 2
+    renderer = html[start:end]
+    script = (
+        "function isTicketTerminal(status) { return status === 'closed'; }\n"
+        + renderer
+        + r"""
+const assert = require('node:assert/strict');
+const ticket = {status: 'awaiting_customer_guidance', custom_fields: {}};
+
+ticket.custom_fields.analysis_result = {conclusive: true};
+assert.equal(
+  ticketOutcome(ticket),
+  '<span class="outcome outcome-none">\u2014</span>'
+);
+
+delete ticket.custom_fields.analysis_result;
+ticket.custom_fields.evaluation_result = {decision: 'CONVERGED'};
+assert.equal(
+  ticketOutcome(ticket),
+  '<span class="outcome outcome-none">\u2014</span>'
+);
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def _detail_layout_css(html: str) -> str:
     start = html.index("/* Detail view: two-panel split layout */")
     end = html.index("details {", start)
