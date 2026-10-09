@@ -714,8 +714,43 @@ class TestProvisionJumpstarterSDK:
             )
 
         assert not r.success
+        assert r.infrastructure_error is False
         assert client.tcp.address.call_count >= 2
         assert client.power.cycle.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_tcp_address_infrastructure_failure_marks_result(self):
+        """Terminal gRPC address failures are reported as infrastructure errors."""
+        from unittest.mock import MagicMock
+
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _run_provision_steps,
+        )
+
+        client = MagicMock()
+        client.storage.flash = MagicMock()
+        client.power.on = MagicMock()
+        client.power.cycle = MagicMock()
+        client.tcp.address = MagicMock(
+            side_effect=RuntimeError("gRPC connection reset")
+        )
+
+        with patch(
+            "providers.resource.jumpstarter_provision.asyncio.sleep",
+            return_value=None,
+        ):
+            result = await _run_provision_steps(
+                client,
+                "https://image.xz",
+                "",
+                ProvisionResult(board_name="test-board"),
+                [],
+            )
+
+        assert not result.success
+        assert result.infrastructure_error is True
+        assert any("INFRASTRUCTURE_ERROR" in item for item in result.diagnostics)
 
     @pytest.mark.asyncio
     async def test_invalid_ip_rejected(self):

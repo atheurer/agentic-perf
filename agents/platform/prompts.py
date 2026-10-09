@@ -40,6 +40,10 @@ Before calling the tool, review the ticket context:
   - "denied" / "forbidden" (permission denied)
   - "not found" (image doesn't exist)
   - "FLASH_FAILED" after retry (hardware issue)
+  - `infrastructure_error: true` in the result — the failure is in the
+    test environment (TaskGroup/ExceptionGroup, U-Boot timeout, gRPC
+    disconnect, connection errors). Changing the image variant will NOT
+    fix infrastructure problems. Report the failure immediately.
 
 ## Important
 
@@ -48,6 +52,9 @@ Before calling the tool, review the ticket context:
 - Do NOT run benchmarks — that is the benchmark agent's job
 - Do NOT modify the flash command unless investigation context
   specifically requires a different image variant
+- NEVER change the image variant to work around an infrastructure
+  error (ExceptionGroup, TaskGroup, U-Boot timeout, connection
+  errors). These are environment problems, not image problems.
 - For non-Jumpstarter providers, the platform is already ready —
   verify and submit immediately
 """

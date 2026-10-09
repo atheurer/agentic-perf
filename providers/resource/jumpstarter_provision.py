@@ -34,6 +34,45 @@ _TCP_TIMEOUT = 30
 _SSH_TIMEOUT = 30
 
 
+# Error details that indicate infrastructure failures (not image problems).
+# Retrying a failed provision with a different image variant will not help —
+# the error is in the environment, not the artifact.
+_INFRASTRUCTURE_ERROR_PATTERNS = (
+    "failed to get u-boot prompt",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "broken pipe",
+    "transport endpoint is not connected",
+    "network is unreachable",
+    "no route to host",
+    "grpc",
+    "lease expired",
+    "exporter disconnected",
+)
+_INFRASTRUCTURE_ERROR_DIAGNOSTIC = (
+    "INFRASTRUCTURE_ERROR: This failure is caused by the "
+    "test environment (not the OS image). Retrying with "
+    "a different image variant will not help."
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like an infrastructure error.
+
+    Infrastructure errors are failures in the test environment (network,
+    board firmware, gRPC tunnel, lease management) rather than problems
+    with the OS image. Retrying with a different image variant will not fix
+    them.
+    """
+    # ExceptionGroup / TaskGroup wrappers are always infrastructure.
+    if isinstance(exc, (ExceptionGroup, BaseExceptionGroup)):
+        return True
+
+    msg = repr(exc).lower()
+    return any(p in msg for p in _INFRASTRUCTURE_ERROR_PATTERNS)
+
+
 @dataclass
 class ProvisionResult:
     """Structured result from deterministic provisioning."""
@@ -47,6 +86,7 @@ class ProvisionResult:
     flash_duration_s: float = 0.0
     boot_duration_s: float = 0.0
     serial_log_path: str = ""
+    infrastructure_error: bool = False
 
 
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
@@ -302,6 +342,13 @@ async def provision_jumpstarter(
             diag.append(f"Provisioning failed: {'; '.join(real_errors)}")
         else:
             diag.append(f"Provisioning exception: {exc}")
+        if is_infrastructure_error(exc):
+            result.infrastructure_error = True
+            diag.append(
+                "INFRASTRUCTURE_ERROR: This failure is caused by the test "
+                "environment (not the OS image). Retrying with a different "
+                "image variant will not help."
+            )
         logger.error(
             "[platform] Provisioning failed: %s",
             exc,
@@ -541,6 +588,9 @@ async def _run_provision_steps(
                 retry_duration,
                 safe_exc2,
             )
+            if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
+                result.infrastructure_error = True
+                diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process
             # the tool result.
@@ -565,11 +615,13 @@ async def _run_provision_steps(
 
     # ── Step 4: Discover IP ──────────────────────────
     ip = ""
+    address_errors: list[BaseException] = []
     try:
         addr = await to_thread.run_sync(client.tcp.address)
         ip = _parse_exporter_address(addr)
         diag.append(f"IP discovered: {ip}")
     except Exception as exc:
+        address_errors.append(exc)
         diag.append(f"TCP address failed: {exc}")
         # The exporter may have temporarily disconnected
         # during reboot. Retry with backoff — the gRPC
@@ -593,10 +645,14 @@ async def _run_provision_steps(
                 diag.append(f"IP discovered on retry {attempt + 1}: {ip}")
                 break
             except Exception as exc2:
+                address_errors.append(exc2)
                 diag.append(f"Retry {attempt + 1} failed: {exc2}")
 
     if not ip:
         diag.append("IP discovery failed")
+        if any(is_infrastructure_error(exc) for exc in address_errors):
+            result.infrastructure_error = True
+            diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
         result.diagnostics = diag
         return result
 
@@ -682,9 +738,8 @@ async def _run_provision_steps(
             )
             stdout = getattr(verify, "stdout", "")
             if "SSH_OK" not in str(stdout):
-                diag.append(
-                    f"SSH verification failed: {getattr(verify, 'stderr', '')[:200]}"
-                )
+                stderr = getattr(verify, "stderr", "")
+                diag.append(f"SSH verification failed: {stderr[:200]}")
                 result.diagnostics = diag
                 return result
             diag.append("SSH verified")
