@@ -655,16 +655,17 @@ class AgentMCPClient:
         task = asyncio.create_task(_hold_connection(), name=f"mcp:{name}")
 
         async def _cleanup_connection() -> None:
-            if self._servers.get(name) is conn:
+            owns_current_connection = self._servers.get(name) is conn
+            if owns_current_connection:
                 if conn.connected:
                     self._record_boundary(conn, LifecycleState.DISCONNECTED)
                     conn.connected = False
                 self._servers.pop(name, None)
-            self._tool_routing = {
-                tool: server
-                for tool, server in self._tool_routing.items()
-                if server != name
-            }
+                self._tool_routing = {
+                    tool: server
+                    for tool, server in self._tool_routing.items()
+                    if server != name
+                }
             conn._shutdown.set()
             if not task.done():
                 task.cancel()
