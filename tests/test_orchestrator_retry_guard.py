@@ -381,8 +381,13 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_path",
+    ["none", "event", "comment", "event_exhausted", "comment_exhausted"],
+)
 async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     monkeypatch: pytest.MonkeyPatch,
+    failure_path: str,
 ) -> None:
     import orchestrator.main as main
     from orchestrator.config import OrchestratorConfig
@@ -417,8 +422,13 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     dispatcher.try_claim.return_value = False
     dispatcher.shutdown = AsyncMock()
     events = MagicMock()
+    if failure_path == "event":
+        events.emit.side_effect = [RuntimeError("event unavailable"), None]
+    elif failure_path == "event_exhausted":
+        events.emit.side_effect = RuntimeError("event unavailable")
     request_contexts = []
     comment_bodies = []
+    comment_statuses = []
 
     class Client:
         async def __aenter__(self):
@@ -437,7 +447,11 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
         async def post(self, url, *, json):
             request_contexts.append(("POST", current_trace_context().ticket_id))
             comment_bodies.append(json["body"])
-            return httpx.Response(200, request=httpx.Request("POST", url))
+            comment_fails = failure_path == "comment" and not comment_statuses
+            comment_fails = comment_fails or failure_path == "comment_exhausted"
+            status_code = 503 if comment_fails else 200
+            comment_statuses.append(status_code)
+            return httpx.Response(status_code, request=httpx.Request("POST", url))
 
     client = Client()
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
@@ -473,7 +487,8 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     async def fetch(_url):
         nonlocal fetch_count
         fetch_count += 1
-        if fetch_count >= 3:
+        required_polls = 5 if failure_path.endswith("_exhausted") else 3
+        if fetch_count >= required_polls:
             third_poll.set()
         return [deepcopy(ticket)]
 
@@ -502,17 +517,37 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     )
     try:
         await asyncio.wait_for(third_poll.wait(), timeout=5)
-        assert request_contexts == [
+        expected_contexts = [
             ("PATCH", "PERF-normalize"),
             ("POST", "PERF-normalize"),
         ]
-        events.emit.assert_called_once()
+        expected_comment_attempts = {
+            "comment": 2,
+            "comment_exhausted": 3,
+        }.get(failure_path, 1)
+        expected_contexts.extend(
+            [("POST", "PERF-normalize") for _ in range(expected_comment_attempts - 1)]
+        )
+        assert request_contexts == expected_contexts
+        expected_event_attempts = {
+            "event": 2,
+            "event_exhausted": 3,
+        }.get(failure_path, 1)
+        assert events.emit.call_count == expected_event_attempts
+        assert len(set(comment_bodies)) == 1
+        expected_comment_statuses = {
+            "comment": [503, 200],
+            "comment_exhausted": [503, 503, 503],
+        }.get(failure_path, [200])
+        assert comment_statuses == expected_comment_statuses
         assert ticket["custom_fields"]["directives"] == {
             "power_off_delay": 5,
             "sample_count": 3,
             "misspelled_directive": "value",
         }
         assert "converted to an integer" in comment_bodies[0]
+        for call in events.emit.call_args_list[1:]:
+            assert events.emit.call_args_list[0].args == call.args
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

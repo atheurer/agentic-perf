@@ -188,6 +188,22 @@ def _convert_milliseconds(value: Any) -> int | float | None:
     return int(seconds) if seconds.is_integer() else seconds
 
 
+def _coerce_sample_count(value: Any) -> int | None:
+    """Accept integer strings and integral numbers without truncation."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
 def normalize_key(key: str) -> tuple[str, str | None]:
     """Normalize a single directive key to its canonical form.
 
@@ -246,6 +262,7 @@ def normalize_directives(
     for key, value in directives.items():
         canonical, reason = normalize_key(key)
         conversion_note = None
+        value_error = None
 
         if reason and key.endswith(("_ms", "_millisecond", "_milliseconds")):
             converted = _convert_milliseconds(value)
@@ -270,11 +287,13 @@ def normalize_directives(
                     continue
             if canonical == "sample_count":
                 original_value = value
-                try:
-                    value = int(value)
-                except (TypeError, ValueError):
-                    pass
+                converted = _coerce_sample_count(value)
+                if converted is None:
+                    value_error = (
+                        "Invalid value for 'sample_count' — expected an integer"
+                    )
                 else:
+                    value = converted
                     if type(original_value) is not int:
                         conversion_note = "'sample_count' value converted to an integer"
 
@@ -294,6 +313,8 @@ def normalize_directives(
             if conversion_note:
                 applied.append(conversion_note)
                 logger.info("[directives] %s", conversion_note)
+            if value_error:
+                unrecognized.append(value_error)
         else:
             suggestions = get_close_matches(key, recognized, n=3, cutoff=0.5)
             if suggestions:

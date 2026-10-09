@@ -148,6 +148,19 @@ class TestNormalizeDirectives:
         normalized, applied, unrecognized = normalize_directives(directives)
         assert normalized["sample_count"] == 25
         assert any("converted to an integer" in note for note in applied)
+        assert unrecognized == []
+
+    def test_sample_count_boolean_is_preserved_and_reported(self):
+        normalized, applied, unrecognized = normalize_directives({"sample_count": True})
+        assert normalized["sample_count"] is True
+        assert applied == []
+        assert any("expected an integer" in note for note in unrecognized)
+
+    def test_sample_count_fraction_is_preserved_and_reported(self):
+        normalized, applied, unrecognized = normalize_directives({"sample_count": 2.5})
+        assert normalized["sample_count"] == 2.5
+        assert applied == []
+        assert any("expected an integer" in note for note in unrecognized)
 
     def test_millisecond_duration_converts_to_seconds(self):
         normalized, applied, unrecognized = normalize_directives(

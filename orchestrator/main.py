@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 # Reasoning models may spend part of this budget on hidden reasoning tokens,
 # and the Responses API requires max_output_tokens to be at least 16.
 MODEL_CHECK_MAX_TOKENS = 1024
+_NORMALIZATION_FEEDBACK_MAX_ATTEMPTS = 3
 
 
 def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
@@ -2599,7 +2600,7 @@ async def _poll_loop_after_lease(
         was_at_capacity = False
         last_trace_sweep = 0.0
         repos_refreshed = False
-        normalization_feedback_fingerprints: dict[str, str] = {}
+        normalization_feedback_deliveries: dict[str, dict[str, Any]] = {}
 
         while True:
             if lease_renew_task is not None and lease_renew_task.done():
@@ -2736,9 +2737,9 @@ async def _poll_loop_after_lease(
                                     # in the same poll cycle.
                                     cf["directives"] = normalized
 
-                                    # Preserve one normalization report per
-                                    # effective directive content, even when a
-                                    # ticket is deferred across many polls.
+                                    # Track event and comment delivery separately
+                                    # so a successful output is not repeated when
+                                    # its sibling output needs another attempt.
                                     fingerprint_payload = json.dumps(
                                         {
                                             "directives": normalized,
@@ -2750,40 +2751,70 @@ async def _poll_loop_after_lease(
                                     fingerprint = hashlib.sha256(
                                         fingerprint_payload.encode()
                                     ).hexdigest()
-                                    report_needed = (
-                                        normalization_feedback_fingerprints.get(tid)
-                                        != fingerprint
+                                    delivery = normalization_feedback_deliveries.get(
+                                        tid
                                     )
-                                    if report_needed:
-                                        normalization_feedback_fingerprints[tid] = (
-                                            fingerprint
+                                    if (
+                                        delivery is None
+                                        or delivery["fingerprint"] != fingerprint
+                                    ):
+                                        comment_body = format_normalization_report(
+                                            applied, unrecognized
+                                        )
+                                        delivery = {
+                                            "fingerprint": fingerprint,
+                                            "event_attempts": 0,
+                                            "event_delivered": False,
+                                            "event_payload": {
+                                                "applied": applied,
+                                                "unrecognized": unrecognized,
+                                            },
+                                            "comment_attempts": 0,
+                                            "comment_delivered": comment_body is None,
+                                            "comment_body": comment_body,
+                                        }
+                                        normalization_feedback_deliveries[tid] = (
+                                            delivery
                                         )
                                         for hint in unrecognized:
                                             logger.warning("[directives] %s", hint)
 
-                                    # Surface to the event feed so
-                                    # normalization actions are visible
-                                    # in the dashboard.
-                                    if report_needed and events is not None:
-                                        events.emit(
-                                            tid,
-                                            "orchestrator",
-                                            "directive_normalization",
-                                            {
-                                                "applied": applied,
-                                                "unrecognized": unrecognized,
-                                            },
-                                        )
+                                    event_needed = (
+                                        events is not None
+                                        and not delivery["event_delivered"]
+                                        and delivery["event_attempts"]
+                                        < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
+                                    )
+                                    if event_needed:
+                                        delivery["event_attempts"] += 1
+                                        try:
+                                            events.emit(
+                                                tid,
+                                                "orchestrator",
+                                                "directive_normalization",
+                                                delivery["event_payload"],
+                                            )
+                                        except Exception:
+                                            logger.warning(
+                                                "Failed to emit directive "
+                                                "normalization event for %s",
+                                                tid,
+                                                exc_info=True,
+                                            )
+                                        else:
+                                            delivery["event_delivered"] = True
 
-                                    report = (
-                                        format_normalization_report(
-                                            applied, unrecognized
-                                        )
-                                        if report_needed
-                                        else None
+                                    report = delivery["comment_body"]
+                                    comment_needed = (
+                                        report is not None
+                                        and not delivery["comment_delivered"]
+                                        and delivery["comment_attempts"]
+                                        < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
                                     )
                                     should_patch = normalized != raw_directives
-                                    if should_patch or report:
+                                    if should_patch or comment_needed:
+                                        if comment_needed:
+                                            delivery["comment_attempts"] += 1
                                         context_token = bind_trace_context(
                                             new_trace_context(
                                                 ticket_id=tid,
@@ -2796,33 +2827,67 @@ async def _poll_loop_after_lease(
                                                 headers=_mutation_headers(None),
                                             ) as client:
                                                 if should_patch:
-                                                    resp = await client.patch(
-                                                        f"{config.state_store_url}"
-                                                        f"/api/v1/tickets/{tid}/fields",
-                                                        json={
-                                                            "fields": {
-                                                                "directives": normalized
-                                                            }
-                                                        },
-                                                    )
-                                                    if resp.status_code >= 400:
+                                                    try:
+                                                        resp = await client.patch(
+                                                            f"{config.state_store_url}"
+                                                            f"/api/v1/tickets/{tid}/fields",
+                                                            json={
+                                                                "fields": {
+                                                                    "directives": normalized
+                                                                }
+                                                            },
+                                                        )
+                                                    except Exception:
                                                         logger.warning(
                                                             "Directive normalization "
-                                                            "PATCH failed for %s: "
-                                                            "HTTP %d",
+                                                            "PATCH raised for %s",
                                                             tid,
-                                                            resp.status_code,
+                                                            exc_info=True,
                                                         )
-                                                if report:
-                                                    await client.post(
-                                                        f"{config.state_store_url}"
-                                                        f"/api/v1/tickets/{tid}"
-                                                        f"/comments",
-                                                        json={
-                                                            "author": "orchestrator",
-                                                            "body": report,
-                                                        },
-                                                    )
+                                                    else:
+                                                        if resp.status_code >= 400:
+                                                            logger.warning(
+                                                                "Directive normalization "
+                                                                "PATCH failed for %s: "
+                                                                "HTTP %d",
+                                                                tid,
+                                                                resp.status_code,
+                                                            )
+                                                if comment_needed:
+                                                    try:
+                                                        comment_response = await client.post(
+                                                            f"{config.state_store_url}"
+                                                            f"/api/v1/tickets/{tid}"
+                                                            f"/comments",
+                                                            json={
+                                                                "author": "orchestrator",
+                                                                "body": report,
+                                                            },
+                                                        )
+                                                    except Exception:
+                                                        logger.warning(
+                                                            "Directive normalization "
+                                                            "comment raised for %s",
+                                                            tid,
+                                                            exc_info=True,
+                                                        )
+                                                    else:
+                                                        if (
+                                                            200
+                                                            <= comment_response.status_code
+                                                            < 300
+                                                        ):
+                                                            delivery[
+                                                                "comment_delivered"
+                                                            ] = True
+                                                        else:
+                                                            logger.warning(
+                                                                "Directive normalization "
+                                                                "comment failed for %s: "
+                                                                "HTTP %d",
+                                                                tid,
+                                                                comment_response.status_code,
+                                                            )
                                         finally:
                                             reset_trace_context(context_token)
                             except Exception:
