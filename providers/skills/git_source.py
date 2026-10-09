@@ -423,7 +423,9 @@ async def prepare_git_source(
 ) -> PreparedGitSource:
     """Prepare an immutable commit tree, using an epoch pin without fetching."""
     config = parse_git_source(source)
-    if pinned_commit is not None and not re.fullmatch(r"[a-f0-9]{40,64}", pinned_commit):
+    if pinned_commit is not None and not re.fullmatch(
+        r"[a-f0-9]{40,64}", pinned_commit
+    ):
         raise GitSourceError(
             "invalid_config", "Pinned organization repository revision is invalid"
         )

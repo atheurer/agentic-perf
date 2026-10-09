@@ -83,7 +83,9 @@ def _bind_provider_attempt(
     """Bind every gateway caller to the provider's trusted ticket attempt."""
     resolver = getattr(provider, "organization_resolver", None)
     if not isinstance(resolver, OrganizationSkillResolver):
-        raise SkillGatewayError("context_unavailable", "Context resolver is unavailable")
+        raise SkillGatewayError(
+            "context_unavailable", "Context resolver is unavailable"
+        )
     attempt_id = (
         resolver.attempt_id
         if resolver.ticket_id == ticket_id and resolver.attempt_id
@@ -164,9 +166,7 @@ def _software_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _project_ref(
-    path: str, revision: str, benchmark_scope: str | None = None
-) -> str:
+def _project_ref(path: str, revision: str, benchmark_scope: str | None = None) -> str:
     ref = _PROJECT_PREFIX + quote(path, safe="/")
     parameters = []
     if benchmark_scope:
@@ -266,7 +266,9 @@ def _project_documents(
     return snapshot, exposed
 
 
-def _project_source_revision(source: Any, documents: list[dict[str, Any]]) -> str | None:
+def _project_source_revision(
+    source: Any, documents: list[dict[str, Any]]
+) -> str | None:
     """Read the revision from a pinned snapshot or a legacy source adapter."""
     if documents:
         revision = documents[0].get("revision")

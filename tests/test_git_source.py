@@ -214,12 +214,7 @@ async def test_pinned_git_source_uses_local_checkout_without_auth_or_fetch(
         "ref": "main",
     }
     config = parse_git_source(source)
-    checkout = (
-        tmp_path
-        / "organization-git"
-        / "checkouts"
-        / f"{config.cache_key}-"
-    )
+    checkout = tmp_path / "organization-git" / "checkouts" / f"{config.cache_key}-"
     repository = tmp_path / "working-repository"
     repository.mkdir()
     subprocess.run(["git", "init", "-q", str(repository)], check=True)

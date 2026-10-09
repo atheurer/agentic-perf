@@ -582,10 +582,10 @@ class OrganizationSkillResolver:
                         )
                         if pinned_source is not None:
                             pinned_commit = pinned_source.get("revision")
-                            if (
-                                pinned_source.get("source_identity")
-                                != git_config.identity
-                                or not isinstance(pinned_commit, str)
+                            if pinned_source.get(
+                                "source_identity"
+                            ) != git_config.identity or not isinstance(
+                                pinned_commit, str
                             ):
                                 raise SkillGatewayError(
                                     "invalid_snapshot",
@@ -614,10 +614,10 @@ class OrganizationSkillResolver:
                             )
                             if alias_pin is not None:
                                 alias_revision = alias_pin.get("revision")
-                                if (
-                                    alias_pin.get("source_identity")
-                                    != alias_config.identity
-                                    or not isinstance(alias_revision, str)
+                                if alias_pin.get(
+                                    "source_identity"
+                                ) != alias_config.identity or not isinstance(
+                                    alias_revision, str
                                 ):
                                     raise SkillGatewayError(
                                         "invalid_snapshot",

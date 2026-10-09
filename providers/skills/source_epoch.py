@@ -81,7 +81,9 @@ class SourceEpoch:
         if not index_path.exists() and not pin_path.exists():
             return set()
         if not index_path.is_file() or not pin_path.is_file():
-            raise SkillGatewayError("invalid_snapshot", "Context epoch index is missing")
+            raise SkillGatewayError(
+                "invalid_snapshot", "Context epoch index is missing"
+            )
         try:
             data = index_path.read_bytes()
             if len(data) > 1024 * 1024:
@@ -217,9 +219,7 @@ class SourceEpoch:
             filesystem.write(f"{self.key}/{pin_name}", pin_bytes)
             sources = self._read_index()
             sources.add(source_id)
-            index_bytes = _canonical(
-                {"schema_version": 1, "sources": sorted(sources)}
-            )
+            index_bytes = _canonical({"schema_version": 1, "sources": sorted(sources)})
             filesystem.write(f"{self.key}/epoch.json", index_bytes)
             filesystem.write(
                 f"{self.key}/epoch.pin.json",

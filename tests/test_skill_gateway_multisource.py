@@ -375,14 +375,18 @@ def test_git_repository_revision_is_shared_across_subjects_and_resume(
         "phase": "benchmark",
     }
 
-    resolver = asyncio.run(OrganizationSkillResolver.from_instance_config_async(**common))
+    resolver = asyncio.run(
+        OrganizationSkillResolver.from_instance_config_async(**common)
+    )
     assert prepared_revisions == [None]
     first = resolver.bootstrap("harness/crucible")
     second = resolver.bootstrap("harness/zathras")
     assert first["sources"][0]["revision"] == revision
     assert second["sources"][0]["revision"] == revision
 
-    resumed = asyncio.run(OrganizationSkillResolver.from_instance_config_async(**common))
+    resumed = asyncio.run(
+        OrganizationSkillResolver.from_instance_config_async(**common)
+    )
     assert prepared_revisions == [None, revision]
     assert resumed.bootstrap("harness/crucible")["sources"][0]["revision"] == revision
     assert resumed.bootstrap("harness/zathras")["sources"][0]["revision"] == revision

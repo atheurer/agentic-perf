@@ -631,9 +631,12 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         assert not task.done()
         provider_factory = dispatcher_options["skill_provider_factory"]
         assert callable(provider_factory)
-        assert main.build_skill_provider_async.await_args_list[0].kwargs[
-            "defer_organization_sources"
-        ] is True
+        assert (
+            main.build_skill_provider_async.await_args_list[0].kwargs[
+                "defer_organization_sources"
+            ]
+            is True
+        )
         await provider_factory("PERF-no-git-ticket", "benchmark")
         assert main.build_skill_provider_async.await_args.kwargs["ticket_id"] == (
             "PERF-no-git-ticket"

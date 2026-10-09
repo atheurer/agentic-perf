@@ -120,11 +120,7 @@ class _Provider:
             else {}
         )
         self.organization_resolver = OrganizationSkillResolver.from_instance_config(
-            {
-                "skill_gateway": {
-                    "organization": organization
-                }
-            },
+            {"skill_gateway": {"organization": organization}},
             snapshot_root=snapshot_root,
             audit_emit=lambda _event: None,
         )
@@ -596,7 +592,9 @@ def test_local_context_capture_rejects_malformed_or_missing_mapped_entries(
         source.capture_snapshot()
 
 
-def test_project_context_binding_change_fails_closed(tmp_path: Path, monkeypatch) -> None:
+def test_project_context_binding_change_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
     project_root = tmp_path / "project"
     _write_project_source(project_root)
     snapshot_root = tmp_path / "pins"
@@ -626,9 +624,7 @@ def test_project_context_binding_change_fails_closed(tmp_path: Path, monkeypatch
 
     other_root = tmp_path / "other-project"
     _write_project_source(other_root)
-    changed_provider = _Provider(
-        None, _write_project_source(other_root), snapshot_root
-    )
+    changed_provider = _Provider(None, _write_project_source(other_root), snapshot_root)
     result = json.loads(
         asyncio.run(
             skill_context_gateway(
