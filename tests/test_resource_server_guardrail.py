@@ -83,10 +83,12 @@ def _reset_server_state(monkeypatch):
         if reservation_id:
             fields["resource_reservation_id"] = str(reservation_id)
 
-    async def persist_known_in_memory(ticket_id, provider, result):
+    async def persist_known_in_memory(
+        ticket_id, provider, result, *, preserve_provider=True
+    ):
         fields = srv._ticket.setdefault("custom_fields", {})
         fields["resource_reservation_outcome_unknown"] = False
-        fields["resource_provider"] = provider
+        fields["resource_provider"] = provider if preserve_provider else None
         metadata = result.get("provider_metadata")
         if isinstance(metadata, dict) and metadata:
             fields["resource_provider_metadata"] = metadata
@@ -291,6 +293,45 @@ async def test_known_outcome_clears_marker_with_verified_id_and_metadata(monkeyp
             "region": "us-east-1",
         },
         "resource_reservation_id": "i-verified",
+    }
+    assert srv._ticket["custom_fields"] == fields
+
+
+@pytest.mark.asyncio
+async def test_failed_no_allocation_clears_temporary_provider_field(monkeypatch):
+    import agents.resource.server as srv
+    from providers.tracing import (
+        bind_trace_context,
+        new_trace_context,
+        reset_trace_context,
+    )
+
+    requests, _events = _mock_audited_state_store(monkeypatch)
+    monkeypatch.setattr(
+        srv, "_persist_known_reservation_outcome", _REAL_PERSIST_KNOWN_OUTCOME
+    )
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {"resource_provider": "quads"},
+    }
+    trace_token = bind_trace_context(
+        new_trace_context(ticket_id="PERF-TEST", agent_id="resource-agent")
+    )
+    try:
+        await srv._persist_known_reservation_outcome(
+            "PERF-TEST",
+            "quads",
+            {"status": "failed", "message": "No capacity"},
+            preserve_provider=False,
+        )
+    finally:
+        reset_trace_context(trace_token)
+
+    assert len(requests) == 1
+    fields = json.loads(requests[0].content)["fields"]
+    assert fields == {
+        "resource_reservation_outcome_unknown": False,
+        "resource_provider": None,
     }
     assert srv._ticket["custom_fields"] == fields
 
@@ -574,6 +615,61 @@ async def test_reservation_cannot_switch_provider_after_first_allocation():
     assert fields["resource_reservation_id"] == "i-first"
     assert fields["resource_provider_metadata"] == {"instance_ids": ["i-first"]}
     assert fields["resource_reservation_outcome_unknown"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_no_allocation_does_not_pin_provider_choice():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    responses = iter(
+        [
+            {
+                "status": "failed",
+                "message": "No capacity",
+                "provider_metadata": {"diagnostic_region": "old-provider"},
+            },
+            {
+                "status": "success",
+                "reservation_id": "i-next",
+                "instance_ids": ["i-next"],
+                "provider_metadata": {"instance_ids": ["i-next"]},
+            },
+        ]
+    )
+    mock_provider.reserve = AsyncMock(side_effect=lambda *_a, **_kw: next(responses))
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
+
+    first = json.loads(
+        await srv.reserve_resources(
+            provider="quads",
+            selection={"hostnames": ["host-01"]},
+            description="no capacity",
+            ticket_id="PERF-TEST",
+        )
+    )
+    assert first["status"] == "failed"
+    assert srv._ticket["custom_fields"]["resource_provider"] is None
+    assert srv._reservation_uncertain is False
+
+    second = json.loads(
+        await srv.reserve_resources(
+            provider="aws",
+            selection={"instance_type": "m5.xlarge", "count": 1},
+            description="try another provider",
+            ticket_id="PERF-TEST",
+        )
+    )
+
+    assert second["status"] == "success"
+    assert second["provider"] == "aws"
+    assert "diagnostic_region" not in second["provider_metadata"]
+    assert srv._ticket["custom_fields"]["resource_provider"] == "aws"
+    assert mock_provider.reserve.await_count == 2
 
 
 @pytest.mark.asyncio

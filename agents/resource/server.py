@@ -179,6 +179,12 @@ def _combined_reservation_outcome(
     set rather than inventing an unsupported composite identifier.
     """
     previous = _last_reservation
+    previous_provider = previous.get("provider")
+    if previous_provider and previous_provider != provider:
+        # A definitive no-allocation failure releases the provider choice. Its
+        # diagnostic metadata must not leak into a later provider's outcome.
+        if _reservation_identity(previous) is None:
+            previous = {}
     previous_metadata = previous.get("provider_metadata")
     previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
     current_metadata = result.get("provider_metadata")
@@ -293,7 +299,11 @@ async def _persist_unknown_reservation_marker(
 
 
 async def _persist_known_reservation_outcome(
-    ticket_id: str | None, provider: str, result: dict[str, Any]
+    ticket_id: str | None,
+    provider: str,
+    result: dict[str, Any],
+    *,
+    preserve_provider: bool = True,
 ) -> None:
     """Clear the latch with verified cleanup identity in the same state write."""
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "") or _ticket.get("id", "")
@@ -306,7 +316,10 @@ async def _persist_known_reservation_outcome(
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     fields: dict[str, Any] = {
         "resource_reservation_outcome_unknown": False,
-        "resource_provider": provider,
+        # A failed no-allocation attempt must not pin a provider that was only
+        # selected by the LLM. Keep configured providers and providers with an
+        # earlier active allocation; clear the write-ahead choice otherwise.
+        "resource_provider": provider if preserve_provider else None,
     }
     if metadata:
         fields["resource_provider_metadata"] = metadata
@@ -909,7 +922,18 @@ async def reserve_resources(
 
     if not unknown_outcome:
         try:
-            await _persist_known_reservation_outcome(ticket_id, provider, result)
+            preserve_provider = not (
+                provider_failed
+                and not has_identity
+                and not resources_allocated_before
+                and expected_provider is None
+            )
+            await _persist_known_reservation_outcome(
+                ticket_id,
+                provider,
+                result,
+                preserve_provider=preserve_provider,
+            )
         except Exception as exc:
             logger.exception(
                 "[resource] Could not persist definitive reservation outcome"
