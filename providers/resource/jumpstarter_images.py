@@ -257,6 +257,27 @@ async def resolve_image_urls(
           combos for this board (for fallback selection)
     """
     base_url = base_url.rstrip("/")
+
+    # Detect and strip path overlap when image_server contains
+    # the version or release path (e.g., a user or LLM provided
+    # the full release URL instead of just the server root).
+    # Without this, the URL gets doubled:
+    #   https://server/AutoSD-10/monthly/.../AutoSD-10/monthly/.../info/...
+    _version_suffix = f"/{image_version}"
+    _release_suffix = f"/{image_version}/{release}"
+    if release and base_url.endswith(_release_suffix):
+        base_url = base_url[: -len(_release_suffix)]
+        logger.info(
+            "[images] Stripped version+release overlap from base_url: %s",
+            base_url,
+        )
+    elif base_url.endswith(_version_suffix):
+        base_url = base_url[: -len(_version_suffix)]
+        logger.info(
+            "[images] Stripped version overlap from base_url: %s",
+            base_url,
+        )
+
     monthly_match = _DATED_MONTHLY_RELEASE_RE.fullmatch(release)
     date_qualified_monthly = monthly_match is not None
 
