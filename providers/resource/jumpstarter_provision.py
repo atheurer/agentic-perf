@@ -671,7 +671,6 @@ async def _run_provision_steps(
     import socket as _socket
 
     ssh_reachable = False
-    ssh_connect_errors: list[BaseException] = []
     for attempt in range(6):
         try:
             s = _socket.create_connection((ip, 22), timeout=10)
@@ -679,8 +678,7 @@ async def _run_provision_steps(
             ssh_reachable = True
             diag.append(f"SSH port 22 reachable on {ip} (attempt {attempt + 1})")
             break
-        except (OSError, ConnectionRefusedError) as exc:
-            ssh_connect_errors.append(exc)
+        except (OSError, ConnectionRefusedError):
             if attempt < 5:
                 await asyncio.sleep(10)
 
@@ -691,9 +689,6 @@ async def _run_provision_steps(
             f" with no network, wrong IP, or a corrupt"
             f" image. Check serial output for boot errors."
         )
-        if any(is_infrastructure_error(exc) for exc in ssh_connect_errors):
-            result.infrastructure_error = True
-            diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
         result.diagnostics = diag
         return result
 
@@ -730,9 +725,6 @@ async def _run_provision_steps(
                     f"(exit={ssh_result.return_code}): "
                     f"{stderr[:200]}"
                 )
-                if is_infrastructure_error(RuntimeError(str(stderr))):
-                    result.infrastructure_error = True
-                    diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
                 result.diagnostics = diag
                 return result
             diag.append("SSH key injected")
@@ -748,17 +740,11 @@ async def _run_provision_steps(
             if "SSH_OK" not in str(stdout):
                 stderr = getattr(verify, "stderr", "")
                 diag.append(f"SSH verification failed: {stderr[:200]}")
-                if is_infrastructure_error(RuntimeError(str(stderr))):
-                    result.infrastructure_error = True
-                    diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
                 result.diagnostics = diag
                 return result
             diag.append("SSH verified")
         except Exception as exc:
             diag.append(f"SSH key injection error: {exc}")
-            if is_infrastructure_error(exc):
-                result.infrastructure_error = True
-                diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
             result.diagnostics = diag
             return result
 

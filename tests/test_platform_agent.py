@@ -836,9 +836,7 @@ class TestProvisionJumpstarterSDK:
             )
 
         assert not r.success
-        assert r.infrastructure_error is True
         assert any("SSH key injection failed" in d for d in r.diagnostics)
-        assert any("INFRASTRUCTURE_ERROR" in d for d in r.diagnostics)
 
 
 class TestSSHValidation:
@@ -882,6 +880,4 @@ class TestSSHValidation:
 
         assert not r.success
         assert r.ip == "10.99.99.99"
-        assert r.infrastructure_error is True
         assert any("unreachable" in d for d in r.diagnostics)
-        assert any("INFRASTRUCTURE_ERROR" in d for d in r.diagnostics)
