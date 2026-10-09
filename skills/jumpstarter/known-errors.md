@@ -161,6 +161,43 @@ a U-Boot prompt error, retry with an extended power-off
 delay (180s) before the next flash attempt. Do not
 immediately retry with the default short delay.
 
+## pexpect EOF During Flash (U-Boot Serial Connection Lost)
+
+**Error:** `pexpect.exceptions.EOF: End Of File (EOF).
+Empty string style platform.` with `searcher_string: 0: b'=>'`
+
+**Cause:** The flash tool connects to the board's serial
+console via a TCP port-forwarded gRPC tunnel.  During
+`reboot_to_console()`, it sends ESC to interrupt U-Boot
+autoboot and waits for the `=>` prompt.  EOF means the
+serial TCP socket closed before the prompt appeared.
+
+This is typically a **transient gRPC tunnel instability**,
+not a board hardware problem.  The board's serial output
+(visible in `serial-capture.log`) usually shows U-Boot
+reaching the autoboot countdown normally.
+
+**Diagnosis:**
+- Check `serial-capture.log` — if U-Boot appears and
+  reaches "Hit any key to stop autoboot", the board
+  is healthy; the issue is the tunnel.
+- Check `flash-diagnostics.json` — the unwrapped
+  exception chain shows the full error path.
+- The `BrokenResourceError` and `InvalidStateError:
+  RPC already finished` messages in pod logs confirm
+  gRPC tunnel drops.
+
+**Fix:** Retry.  Transient gRPC instability usually
+resolves on the next attempt.  If the error persists
+across multiple boards and multiple attempts, escalate
+to the Jumpstarter infrastructure team — the controller
+or exporter networking may be degraded.
+
+**This error is RETRYABLE** — do not treat it as
+unrecoverable.  The flash tool's internal 4 retries may
+not be enough if the gRPC tunnel is consistently
+unstable during that window.
+
 ## ExceptionGroup / TaskGroup Errors
 
 **Error:** `ExceptionGroup: unhandled errors in a TaskGroup

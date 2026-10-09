@@ -504,24 +504,15 @@ async def _run_provision_steps(
     """Execute the deterministic provision steps."""
     # ── Step 1: Flash ────────────────────────────────
     # Ensure the board is in a known power state before
-    # flashing.  After a lease expiry mid-benchmark the
-    # board may be mid-boot or hung — flashing without a
-    # clean power cycle fails with "Failed to get U-Boot
-    # prompt."
-    import asyncio as _asyncio
-
+    # The flash tool (client.storage.flash) does its own
+    # internal power cycle via reboot_to_console().  A
+    # pre-flash power cycle through the same client session
+    # leaves stale serial/port-forward state that causes
+    # the flash tool's pexpect to get EOF on the U-Boot
+    # prompt.  Diagnosed by comparing pod SDK calls (fail)
+    # vs separate jmp shell sessions (succeed) — the latter
+    # get fresh gRPC connections with no carried-over state.
     from anyio import to_thread
-
-    logger.info("[platform] Power cycling %s before flash", result.board_name)
-    try:
-        await to_thread.run_sync(lambda: client.power.off())
-        await _asyncio.sleep(5)
-        await to_thread.run_sync(lambda: client.power.on())
-        await _asyncio.sleep(10)
-        diag.append("Pre-flash power cycle OK")
-    except Exception as exc:
-        diag.append(f"Pre-flash power cycle warning: {exc}")
-        logger.warning("[platform] Pre-flash power cycle failed: %s", exc)
 
     if isinstance(flash_url, dict):
         logger.info(
