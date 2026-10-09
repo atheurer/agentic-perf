@@ -34,13 +34,21 @@ board.
 
 ## Boot Failure Diagnosis via Serial Capture
 
-When `serial_capture: true` is set in ticket directives,
-the platform agent captures serial output during the
-flash→boot→verify sequence. On provisioning failure,
-the last 2000 characters of serial output are included
-in the diagnostics.
+Serial capture during the **benchmark phase** is handled
+by the benchmark agent.  When a Jumpstarter lease is
+active, the benchmark agent runs `j serial pipe` in the
+background, saving output to `serial-capture.log` in the
+run artifact directory.
 
-Common serial output patterns:
+**Note:** Serial capture is NOT available during the
+**flash/provisioning phase**.  The flash tool requires
+exclusive serial port access through the gRPC tunnel;
+a concurrent serial pipe causes pexpect EOF.  Flash
+diagnostics come from `flash-diagnostics.json` and the
+exception chain in the tool result.
+
+Common serial output patterns (from benchmark-phase
+capture):
 
 - **`ApplyOverlay: ufdt apply overlay failed`** — DTB
   overlay incompatibility. The kernel or DTB in the
@@ -52,10 +60,15 @@ Common serial output patterns:
   stage. May indicate a flash failure or power issue.
 - **Output stops at U-Boot** — Kernel failed to load.
   Check image format and partition layout.
+- **`reboot: Power down`** — Sysboot health check
+  failed, board powered itself off (see "Board Powers
+  Off Shortly After Successful Provisioning" below).
 
-Serial logs are saved as artifacts at
-`platform-provision/serial-capture.log` and can be
-downloaded from the ticket's artifact list.
+Serial logs from the benchmark phase are saved as
+artifacts in the run directory (e.g.
+`PERF-XXXX/<run-id>/serial-capture.log`).  Flash-phase
+diagnostics are at
+`PERF-XXXX/platform-provision/flash-diagnostics.json`.
 
 ## Board Powers Off Shortly After Successful Provisioning
 
@@ -86,10 +99,12 @@ sysboot detects the unhealthy initramfs and triggers the
 A/B rollback mechanism. With a fresh flash there is no
 slot B to fall back to, so it powers off.
 
-**Diagnosis:** Check the provisioning serial capture
-(`platform-provision/serial-capture.log`) for
+**Diagnosis:** Check the benchmark-phase serial capture
+(`serial-capture.log` in the run artifact directory) for
 `Initramfs unpacking failed`. If present, the OS image
-is corrupted or incompatible with this board.
+is corrupted or incompatible with this board.  For first-
+boot failures before the benchmark runs, check
+`flash-diagnostics.json` for the exception chain.
 
 **This is NOT an agentic-perf or Jumpstarter issue.** The
 problem is in the OS image build. Report to the image
@@ -160,6 +175,45 @@ boards and Qualcomm SA8775P boards.
 a U-Boot prompt error, retry with an extended power-off
 delay (180s) before the next flash attempt. Do not
 immediately retry with the default short delay.
+
+## pexpect EOF During Flash (U-Boot Serial Connection Lost)
+
+**Error:** `pexpect.exceptions.EOF: End Of File (EOF).
+Empty string style platform.` with `searcher_string: 0: b'=>'`
+
+**Cause:** The flash tool connects to the board's serial
+console via a TCP port-forwarded gRPC tunnel.  During
+`reboot_to_console()`, it sends ESC to interrupt U-Boot
+autoboot and waits for the `=>` prompt.  EOF means the
+serial TCP socket closed before the prompt appeared.
+
+This is typically a **transient gRPC tunnel instability**,
+not a board hardware problem.  When benchmark-phase
+serial capture is available, U-Boot output usually shows
+the autoboot countdown completing normally.
+
+**Diagnosis:**
+- Check `flash-diagnostics.json` for the unwrapped
+  exception chain showing the full error path.
+- If benchmark-phase `serial-capture.log` exists, check
+  whether U-Boot reaches "Hit any key to stop autoboot"
+  — if so, the board is healthy; the issue is the tunnel.
+- Check `flash-diagnostics.json` — the unwrapped
+  exception chain shows the full error path.
+- The `BrokenResourceError` and `InvalidStateError:
+  RPC already finished` messages in pod logs confirm
+  gRPC tunnel drops.
+
+**Fix:** Retry.  Transient gRPC instability usually
+resolves on the next attempt.  If the error persists
+across multiple boards and multiple attempts, escalate
+to the Jumpstarter infrastructure team — the controller
+or exporter networking may be degraded.
+
+**This error is RETRYABLE** — do not treat it as
+unrecoverable.  The flash tool's internal 4 retries may
+not be enough if the gRPC tunnel is consistently
+unstable during that window.
 
 ## ExceptionGroup / TaskGroup Errors
 

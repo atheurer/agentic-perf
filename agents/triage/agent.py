@@ -1221,6 +1221,26 @@ class TriageAgent(AgentBase):
         if execution_model == EXECUTION_MODEL_DIRECT:
             required_hosts = _filter_direct_required_hosts(required_hosts)
 
+        # Jumpstarter boards are not SSH-accessible before
+        # provisioning — strip board names from required_hosts
+        # so the resource agent allocates via jumpstarter instead
+        # of treating them as pre-existing SSH hosts.
+        from providers.resource.jumpstarter import strip_board_selector_hosts
+
+        strip_board_selector_hosts(
+            required_hosts, directives.get("board_selector", "")
+        )
+        # Re-normalize directives before writing.  The orchestrator
+        # normalizes user-submitted directives before triage, but the
+        # triage LLM may produce its own directive keys using the
+        # user's original terminology (e.g. "delay_seconds" instead
+        # of "power_off_delay").  The merge above reintroduces those
+        # raw keys.  Running normalization here ensures the ticket
+        # always has canonical keys regardless of LLM output.
+        from providers.directives import normalize_directives as _norm_dir
+
+        directives, _applied, _unrec = _norm_dir(directives)
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),

@@ -16,7 +16,7 @@ boards that require flashing before SSH is available), skip validate_host.
 Always call submit_resource_result with:
 - assigned_hardware_ips: {controller: <dedicated controller host>, targets: [<endpoint hosts>]}
 - ssh_user and ssh_key_path from the reservation result
-- resource_provider: the provider name ("quads", "aws", "user_provided")
+- resource_provider: the provider name ("quads", "aws", "jumpstarter", "user_provided")
 - resource_reservation_id: from the reservation result (null for user-provided)
 - resource_provider_metadata: from the reservation result (null for user-provided)
 - fresh_host: true for managed providers (hosts need full harness install)

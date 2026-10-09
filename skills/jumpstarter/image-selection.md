@@ -144,3 +144,10 @@ automatically when `run_metadata` is available (webhook
 tickets). For manual tickets, the server is determined by
 `image_version` — `AutoSD-*` uses the AutoSD server,
 `RHIVOS-*` uses the RHIVOS server.
+
+The `image_server` directive should be the **root server URL**
+(e.g., `https://autosd.sig.centos.org/`), not a full release
+path. The resolver appends the version and release path
+automatically. If a user provides a full URL including the
+version and release, the resolver will detect the overlap and
+strip it, but the preferred form is the server root.
