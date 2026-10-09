@@ -92,6 +92,40 @@ def _board_type_selector_key() -> str:
     return "board-type"
 
 
+def strip_board_selector_hosts(
+    required_hosts: list[dict[str, Any]],
+    board_selector: str,
+) -> None:
+    """Remove host entries that match a Jumpstarter board selector.
+
+    The triage LLM often copies the board selector value into
+    required_hosts[].host, which tells the resource agent it is a
+    pre-existing SSH-accessible machine.  Jumpstarter boards are
+    not reachable until after provisioning (flash + boot).
+
+    Only strips host values that match a name extracted from the
+    selector.  Real IPs or FQDNs provided by the user are kept
+    so the resource agent treats them as user-provided.
+
+    Selector formats::
+
+        "name=nxp-s32g-vnp-rdb3-02"          → {"nxp-s32g-vnp-rdb3-02"}
+        "board-type=nxp-s32g-vnp-rdb3"       → {"nxp-s32g-vnp-rdb3"}
+        "name=board-a,board-type=rdb3"       → {"board-a", "rdb3"}
+        "nxp-s32g-vnp-rdb3-02"               → {"nxp-s32g-vnp-rdb3-02"}
+
+    Mutates *required_hosts* in place.
+    """
+    if not board_selector:
+        return
+    board_names = {
+        part.split("=", 1)[-1] for part in board_selector.split(",")
+    }
+    for entry in required_hosts:
+        if entry.get("host", "") in board_names:
+            entry.pop("host", None)
+
+
 class JumpstarterResourceProvider(ResourceProvider):
     """Jumpstarter lab hardware resource provider."""
 

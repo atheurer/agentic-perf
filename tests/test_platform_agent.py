@@ -518,8 +518,9 @@ class TestProvisionJumpstarterSDK:
         assert r.ip == "10.0.0.1"
         assert any("SSH port 22 reachable" in d for d in r.diagnostics)
         client.storage.flash.assert_called_once_with("https://image.xz")
-        # Called twice: pre-flash power cycle + Step 2 power on
-        assert client.power.on.call_count == 2
+        # Called once: Step 2 power on (pre-flash cycle removed —
+        # flash tool does its own internal power cycle)
+        assert client.power.on.call_count == 1
         assert client.ssh.run.call_count == 2  # inject + verify
 
     @pytest.mark.asyncio

@@ -1,7 +1,20 @@
-"""Tests for serial capture during Jumpstarter provisioning."""
+"""Tests for serial capture behavior during Jumpstarter provisioning.
+
+Serial capture during flash/provisioning is intentionally skipped
+because the serial pipe subprocess conflicts with the flash tool's
+pexpect serial connection (causes EOF).  Boot-phase serial capture
+is the benchmark agent's responsibility.
+
+These tests verify:
+- Serial subprocess is NOT started during provisioning (even when requested)
+- Provisioning still succeeds without serial capture
+- Cancellation propagates correctly
+- ProvisionResult dataclass has serial_log_path field
+"""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
 
@@ -22,20 +35,19 @@ class FakeProvisionResult:
 
 
 class TestProvisionSerialCapture:
-    """Test serial capture in the Jumpstarter provision provider."""
+    """Test serial capture is skipped during Jumpstarter provisioning."""
 
     @pytest.mark.asyncio
-    async def test_serial_started_when_enabled(self, tmp_path):
-        """Serial subprocess starts when serial_capture=True."""
+    async def test_serial_not_started_even_when_enabled(self, tmp_path):
+        """Serial subprocess must NOT start during provisioning.
+
+        The flash tool requires exclusive serial port access through
+        the gRPC tunnel.  A concurrent 'j serial pipe' subprocess
+        causes pexpect EOF on the U-Boot prompt.
+        """
         from providers.resource.jumpstarter_provision import (
             provision_jumpstarter,
         )
-
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.terminate = lambda: None
-        mock_proc.wait = AsyncMock()
-        mock_proc.kill = lambda: None
 
         with (
             patch(
@@ -45,7 +57,6 @@ class TestProvisionSerialCapture:
             patch(
                 "asyncio.create_subprocess_exec",
                 new_callable=AsyncMock,
-                return_value=mock_proc,
             ) as mock_exec,
         ):
             result = await provision_jumpstarter(
@@ -56,14 +67,9 @@ class TestProvisionSerialCapture:
                 artifact_dir=str(tmp_path),
             )
 
-            # Verify jmp shell was called with serial pipe
-            mock_exec.assert_called_once()
-            call_args = mock_exec.call_args[0]
-            assert "jmp" in call_args
-            assert "serial" in call_args
-            assert "pipe" in call_args
-            assert "--lease=test-lease-123" in call_args
-            assert result.serial_log_path != ""
+            # Serial subprocess must not be spawned during provisioning
+            mock_exec.assert_not_called()
+            assert result.serial_log_path == ""
 
     @pytest.mark.asyncio
     async def test_serial_not_started_when_disabled(self):
@@ -93,97 +99,8 @@ class TestProvisionSerialCapture:
             assert result.serial_log_path == ""
 
     @pytest.mark.asyncio
-    async def test_serial_diagnostics_on_failure(self, tmp_path):
-        """Serial output included in diagnostics on failure."""
-        from providers.resource.jumpstarter_provision import (
-            provision_jumpstarter,
-        )
-
-        serial_content = (
-            "U-Boot 2024.01\nStarting kernel...\n"
-            "Kernel panic - not syncing: Fatal exception\n"
-        )
-
-        def fake_provision(*args, **kwargs):
-            # Simulate serial output written during provisioning
-            serial_log = tmp_path / "serial-capture.log"
-            serial_log.write_text(serial_content)
-            return FakeProvisionResult(
-                success=False,
-                diagnostics=["Flash failed: timeout"],
-            )
-
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.terminate = lambda: None
-        mock_proc.wait = AsyncMock()
-        mock_proc.kill = lambda: None
-
-        with (
-            patch(
-                "providers.resource.jumpstarter_provision._provision_sync",
-                side_effect=fake_provision,
-            ),
-            patch(
-                "asyncio.create_subprocess_exec",
-                new_callable=AsyncMock,
-                return_value=mock_proc,
-            ),
-        ):
-            result = await provision_jumpstarter(
-                lease_name="test-lease-789",
-                flash_url="http://example.com/image.raw.xz",
-                ssh_public_key="ssh-rsa AAAA",
-                serial_capture=True,
-                artifact_dir=str(tmp_path),
-            )
-
-            assert not result.success
-            serial_diag = [d for d in result.diagnostics if "Serial output" in d]
-            assert len(serial_diag) == 1
-            assert "Kernel panic" in serial_diag[0]
-
-    @pytest.mark.asyncio
-    async def test_serial_cleaned_up_on_exception(self, tmp_path):
-        """Serial subprocess terminated on provisioning exception."""
-        from providers.resource.jumpstarter_provision import (
-            provision_jumpstarter,
-        )
-
-        mock_proc = AsyncMock()
-        mock_proc.pid = 99999
-        mock_proc.terminate = lambda: None
-        mock_proc.wait = AsyncMock()
-        mock_proc.kill = lambda: None
-
-        with (
-            patch(
-                "providers.resource.jumpstarter_provision._provision_sync",
-                side_effect=RuntimeError("unexpected crash"),
-            ),
-            patch(
-                "asyncio.create_subprocess_exec",
-                new_callable=AsyncMock,
-                return_value=mock_proc,
-            ),
-        ):
-            result = await provision_jumpstarter(
-                lease_name="test-lease-crash",
-                flash_url="http://example.com/image.raw.xz",
-                ssh_public_key="ssh-rsa AAAA",
-                serial_capture=True,
-                artifact_dir=str(tmp_path),
-            )
-
-            # Should return a failure, not raise
-            assert not result.success
-            assert any("exception" in d.lower() for d in result.diagnostics)
-
-    @pytest.mark.asyncio
     async def test_provisioning_cancellation_propagates(self):
         """Cancellation must not be converted to a failed provision result."""
-        import asyncio
-
         from providers.resource.jumpstarter_provision import (
             provision_jumpstarter,
         )
@@ -262,7 +179,7 @@ class TestPlatformServerSerialPassthrough:
 
             mock_provision.assert_called_once()
             kwargs = mock_provision.call_args
-            # Check serial params were passed
+            # serial_capture is passed through (provisioning skips it internally)
             assert kwargs.kwargs.get("serial_capture") is True or (
                 len(kwargs.args) > 7 and kwargs.args[7] is True
             )

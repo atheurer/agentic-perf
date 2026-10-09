@@ -1222,30 +1222,14 @@ class TriageAgent(AgentBase):
             required_hosts = _filter_direct_required_hosts(required_hosts)
 
         # Jumpstarter boards are not SSH-accessible before
-        # provisioning.  The triage LLM often puts the board
-        # selector value (e.g. "nxp-s32g-vnp-rdb3-02") into the
-        # required_hosts "host" field, which tells the resource
-        # agent it's a pre-existing machine and to SSH to it.
-        #
-        # Strip "host" only when it matches a name extracted from
-        # the board_selector (e.g. "name=nxp-s32g-vnp-rdb3-02"
-        # → "nxp-s32g-vnp-rdb3-02").  If the user provides a real
-        # IP or FQDN, they have a pre-provisioned board and want
-        # to skip flash; keep it as user-provided.
-        _board_sel = directives.get("board_selector", "")
-        if _board_sel:
-            # Extract board name from selector formats:
-            #   "name=nxp-s32g-vnp-rdb3-02" → "nxp-s32g-vnp-rdb3-02"
-            #   "board-type=nxp-s32g-vnp-rdb3" → "nxp-s32g-vnp-rdb3"
-            #   "nxp-s32g-vnp-rdb3-02" → "nxp-s32g-vnp-rdb3-02"
-            _board_names = {
-                part.split("=", 1)[-1]
-                for part in _board_sel.split(",")
-            }
-            for entry in required_hosts:
-                if entry.get("host", "") in _board_names:
-                    entry.pop("host", None)
+        # provisioning — strip board names from required_hosts
+        # so the resource agent allocates via jumpstarter instead
+        # of treating them as pre-existing SSH hosts.
+        from providers.resource.jumpstarter import strip_board_selector_hosts
 
+        strip_board_selector_hosts(
+            required_hosts, directives.get("board_selector", "")
+        )
         # Re-normalize directives before writing.  The orchestrator
         # normalizes user-submitted directives before triage, but the
         # triage LLM may produce its own directive keys using the

@@ -22,24 +22,6 @@ Always call submit_resource_result with:
 - fresh_host: true for managed providers (hosts need full harness install)
 - lease_expiration: from the reservation result (null if not applicable)
 
-## Jumpstarter Boards
-
-When ticket directives include a `board_selector`, the target is a
-Jumpstarter-managed embedded board (e.g., NXP S32G, Qualcomm SA8775P).
-These boards are NOT SSH-accessible before provisioning — do NOT try
-to resolve their hostnames or validate them with SSH.
-
-For Jumpstarter boards:
-1. Call check_available_resources with provider="jumpstarter" and the
-   board_selector from directives
-2. Call reserve_resources with provider="jumpstarter"
-3. Call submit_resource_result with resource_provider="jumpstarter"
-   and fresh_host=true
-4. Do NOT call validate_host — the board requires flashing first
-
-The provisioning agent handles flashing and boot verification.
-The board's IP address is only known after provisioning completes.
-
 ## Existing Hosts
 
 When required_hosts entries include a `host` field, that is a user-provided
