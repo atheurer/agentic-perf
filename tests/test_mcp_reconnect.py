@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED, ErrorData
 
 from agents.mcp_client import (
     AgentMCPClient,
@@ -57,6 +60,10 @@ class TestIsDisconnectError:
             pass
 
         assert _is_disconnect_error(ClosedResourceError("closed"))
+
+    def test_mcp_connection_closed_error(self):
+        error = McpError(ErrorData(code=CONNECTION_CLOSED, message="Connection closed"))
+        assert _is_disconnect_error(error)
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +235,48 @@ async def test_reconnect_on_connection_reset_during_call_tool():
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
         with pytest.raises(MCPToolCallError, match="not retried|ambiguous"):
-            await client.call_tool(
-                "query_numa", {}, trace_context=_trace_context()
-            )
+            await client.call_tool("query_numa", {}, trace_context=_trace_context())
+
+
+@pytest.mark.asyncio
+async def test_reconnect_on_mcp_connection_closed_error():
+    """The MCP SDK's closed-connection error reconnects for future calls."""
+    failing_session = _FakeSession(
+        tools=[_make_tool("check_host")],
+        call_error=McpError(
+            ErrorData(code=CONNECTION_CLOSED, message="Connection closed")
+        ),
+    )
+    params = _default_connect_params()
+    client, _conn = _make_connected_client(
+        session=failing_session,
+        connect_params=params,
+    )
+    success_session = _FakeSession(tools=[_make_tool("check_host")])
+
+    async def fake_connect_command(
+        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+    ):
+        client._servers[name] = _ServerConnection(
+            name=name,
+            session=success_session,
+            transport="stdio",
+            endpoint=command,
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            connected=True,
+            reconnect_generation=1,
+            _connect_params=params,
+        )
+        client._tool_routing["check_host"] = name
+
+    reconnect = AsyncMock(side_effect=fake_connect_command)
+    with patch.object(client, "connect_command", reconnect):
+        with pytest.raises(MCPToolCallError, match="not retried|ambiguous"):
+            await client.call_tool("check_host", {}, trace_context=_trace_context())
+
+    reconnect.assert_awaited_once()
+    assert success_session.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -333,6 +379,44 @@ async def test_reconnect_on_closed_session():
 
     # Pre-dispatch reconnect is safe to retry (no ambiguity)
     assert "result:check_host" in result
+
+
+@pytest.mark.asyncio
+async def test_concurrent_calls_share_one_reconnect():
+    """Simultaneous calls after a disconnect only relaunch the server once."""
+    params = _default_connect_params()
+    client, conn = _make_connected_client(connect_params=params)
+    conn.session = None
+    success_session = _FakeSession(tools=[_make_tool("check_host")])
+    reconnect_count = 0
+
+    async def fake_connect_command(
+        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+    ):
+        nonlocal reconnect_count
+        reconnect_count += 1
+        await asyncio.sleep(0.01)
+        client._servers[name] = _ServerConnection(
+            name=name,
+            session=success_session,
+            transport="stdio",
+            endpoint=command,
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            connected=True,
+            reconnect_generation=1,
+            _connect_params=params,
+        )
+        client._tool_routing["check_host"] = name
+
+    with patch.object(client, "connect_command", side_effect=fake_connect_command):
+        results = await asyncio.gather(
+            client.call_tool("check_host", {}, trace_context=_trace_context()),
+            client.call_tool("check_host", {}, trace_context=_trace_context()),
+        )
+
+    assert reconnect_count == 1
+    assert all("result:check_host" in result for result in results)
 
 
 @pytest.mark.asyncio

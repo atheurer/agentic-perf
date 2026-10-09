@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED
 
 from agents.mcp_stdio import audited_stdio_client
 from providers.llm.base import ToolDefinition
@@ -106,16 +108,25 @@ _DISCONNECT_ERRORS: tuple[type[BaseException], ...] = (
 
 def _is_disconnect_error(exc: BaseException) -> bool:
     """Return True if *exc* looks like a transport-level disconnection."""
-    if isinstance(exc, _DISCONNECT_ERRORS):
-        return True
-    # anyio / asyncio may wrap the real error; check the chain.
-    cause = exc.__cause__ or exc.__context__
-    if cause is not None and isinstance(cause, _DISCONNECT_ERRORS):
-        return True
-    # ClosedResourceError from anyio is another common wrapper.
-    type_name = type(exc).__name__
-    if type_name in ("ClosedResourceError", "ClosedResourceSendError"):
-        return True
+    # MCP reports an abruptly closed stdio peer as a JSON-RPC error instead
+    # of letting the underlying stream exception escape from call_tool.
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _DISCONNECT_ERRORS):
+            return True
+        if isinstance(current, McpError) and current.error.code == CONNECTION_CLOSED:
+            return True
+        # anyio / asyncio may wrap the real error; inspect the full chain.
+        if type(current).__name__ in {
+            "BrokenResourceError",
+            "ClosedResourceError",
+            "ClosedResourceSendError",
+            "EndOfStream",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
     return False
 
 
@@ -159,6 +170,7 @@ class _ServerConnection:
     _shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     _task: asyncio.Task[None] | None = None
     _connect_params: _ConnectParams | None = None
+    _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class AgentMCPClient:
@@ -902,46 +914,51 @@ class AgentMCPClient:
         not possible — e.g. because the original connection parameters were
         not stored or the subprocess cannot be relaunched.
         """
-        params = conn._connect_params
-        if params is None:
-            logger.warning(
-                "Cannot reconnect MCP server %s: no stored connection parameters",
+        async with conn._reconnect_lock:
+            current = self._servers.get(conn.name)
+            if current is not None and current is not conn:
+                return current.connected and current.session is not None
+
+            params = conn._connect_params
+            if params is None:
+                logger.warning(
+                    "Cannot reconnect MCP server %s: no stored connection parameters",
+                    conn.name,
+                )
+                return False
+
+            logger.info(
+                "Attempting to reconnect MCP server %s (generation %d)",
                 conn.name,
+                conn.reconnect_generation + 1,
             )
-            return False
+            try:
+                await self.connect_command(
+                    command=params.command,
+                    args=params.args,
+                    name=conn.name,
+                    env=params.env,
+                    ticket_id=params.ticket_id,
+                    agent_id=params.agent_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconnect MCP server %s: %s",
+                    conn.name,
+                    exc,
+                )
+                return False
 
-        logger.info(
-            "Attempting to reconnect MCP server %s (generation %d)",
-            conn.name,
-            conn.reconnect_generation + 1,
-        )
-        try:
-            await self.connect_command(
-                command=params.command,
-                args=params.args,
-                name=conn.name,
-                env=params.env,
-                ticket_id=params.ticket_id,
-                agent_id=params.agent_id,
+            new_conn = self._servers.get(conn.name)
+            if new_conn is None or new_conn.session is None:
+                return False
+
+            logger.info(
+                "Successfully reconnected MCP server %s (generation %d)",
+                new_conn.name,
+                new_conn.reconnect_generation,
             )
-        except Exception as exc:
-            logger.warning(
-                "Failed to reconnect MCP server %s: %s",
-                conn.name,
-                exc,
-            )
-            return False
-
-        new_conn = self._servers.get(conn.name)
-        if new_conn is None or new_conn.session is None:
-            return False
-
-        logger.info(
-            "Successfully reconnected MCP server %s (generation %d)",
-            new_conn.name,
-            new_conn.reconnect_generation,
-        )
-        return True
+            return True
 
     async def _dispatch_mcp_request(
         self,
