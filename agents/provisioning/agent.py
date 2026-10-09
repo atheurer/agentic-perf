@@ -631,6 +631,33 @@ class ProvisioningAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
+        # Reject empty or near-empty results that claim success.
+        # The LLM sometimes calls submit_provisioning_result with
+        # an empty object or with provisioning_complete=True but
+        # no hosts — this leaves the ticket stuck (#1012).
+        hosts_list = result.get("hosts_provisioned", [])
+        if result.get("provisioning_complete") and not hosts_list:
+            logger.warning(
+                "[provisioning] %s: rejecting empty provisioning "
+                "result — provisioning_complete=True but no "
+                "hosts_provisioned",
+                ticket_id,
+            )
+            await self._add_comment(
+                ticket_id,
+                "**Provisioning Rejected:** result marked complete "
+                "but no hosts were provisioned. The agent must "
+                "provision at least one host before completing.",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment=(
+                    "Provisioning submitted an empty result. Review and retry or abort."
+                ),
+            )
+            return
+
         # Self-installing harnesses don't need
         # provisioning to install them. If the LLM
         # reports incomplete because install_harness

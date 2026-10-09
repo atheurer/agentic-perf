@@ -165,6 +165,17 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
             f"(harness={harness}, hosts_provisioned={hosts})",
         )
 
+    # Reject when provisioning_complete is True but no hosts
+    # were actually provisioned (#1012). An empty hosts list
+    # means the provisioning agent produced no actionable result.
+    hosts = cf.get("hosts_provisioned", [])
+    if not hosts:
+        return (
+            False,
+            "Provisioning marked complete but hosts_provisioned is empty "
+            "— no actionable provisioning result",
+        )
+
     return True, ""
 
 
