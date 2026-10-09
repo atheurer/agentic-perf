@@ -1464,8 +1464,8 @@ class TestHandleCompletionIPSplit:
         }
 
     @pytest.mark.asyncio
-    async def test_no_mcp_falls_back_to_llm_metadata(self):
-        """Without MCP, uses whatever the LLM passed in provider_metadata."""
+    async def test_no_mcp_rejects_unverified_managed_reservation(self):
+        """LLM metadata cannot prove a managed reservation without MCP."""
         from agents.resource.agent import ResourceAgent
         from providers.llm.base import LLMResponse, ToolCall
 
@@ -1511,6 +1511,10 @@ class TestHandleCompletionIPSplit:
                         },
                         "ssh_user": "root",
                         "resource_provider": "aws",
+                        "resource_reservation_id": "hallucinated-id",
+                        "resource_provider_metadata": {
+                            "instance_ids": ["hallucinated-id"],
+                        },
                     },
                 ),
             ],
@@ -1519,16 +1523,663 @@ class TestHandleCompletionIPSplit:
 
         await agent._handle_completion("PERF-TEST", response)
 
-        patch_calls = agent._client.patch.call_args_list
-        fields_call = [c for c in patch_calls if "/fields" in str(c)]
-        body = fields_call[0].kwargs.get("json", {})
-        fields = body.get("fields", {})
+        agent._client.patch.assert_not_awaited()
+        assert (
+            "Could not verify a aws reservation"
+            in (agent._client.post.await_args.kwargs["json"]["body"])
+        )
 
-        assert fields["assigned_hardware_ips"] == {
-            "controller": "1.1.1.1",
-            "targets": ["2.2.2.2"],
+
+class TestProviderCorrectAutoReservation:
+    @staticmethod
+    def _make_agent(ticket, mcp_call):
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._mcp = AsyncMock()
+        agent._mcp.call_tool = AsyncMock(side_effect=mcp_call)
+        agent._client = AsyncMock()
+        ticket_response = AsyncMock(
+            status_code=200,
+            json=lambda: ticket,
+            raise_for_status=lambda: None,
+        )
+        agent._client.get = AsyncMock(return_value=ticket_response)
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        return agent
+
+    @staticmethod
+    def _response(provider):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        return LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {"controller": "", "targets": []},
+                        "ssh_user": "root",
+                        "resource_provider": provider,
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+    @staticmethod
+    def _fields(agent):
+        calls = [
+            call
+            for call in agent._client.patch.call_args_list
+            if "/fields" in str(call)
+        ]
+        assert len(calls) == 1
+        return calls[0].kwargs["json"]["fields"]
+
+    @pytest.mark.asyncio
+    async def test_accumulated_unknown_outcome_pauses_without_re_reserving(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "unknown provider result",
+            "custom_fields": {"resource_provider": "jumpstarter"},
         }
-        assert "ssh_hardware_ips" not in fields
+        calls = []
+
+        async def mcp_call(name, _arguments):
+            calls.append(name)
+            if name == "get_accumulated_metadata":
+                return json.dumps(
+                    {
+                        "lease_id": "known-lease",
+                        "allocation_unknown": True,
+                        "retry_blocked": True,
+                    }
+                )
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        response = self._response("jumpstarter")
+        response.tool_calls[0].input["assigned_hardware_ips"] = {
+            "controller": "untrusted.example.com",
+            "targets": [],
+        }
+        await agent._handle_completion("PERF-TEST", response)
+
+        assert calls == ["get_accumulated_metadata"]
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "known-lease"
+        assert fields["resource_provider_metadata"] == {"lease_id": "known-lease"}
+        assert fields["resource_reservation_outcome_unknown"] is True
+        assert "assigned_hardware_ips" not in fields
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_unknown_auto_reservation_result_does_not_retry(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "unknown provider result",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "board_selector": "board-type=ride4",
+            },
+        }
+        calls = []
+
+        async def mcp_call(name, _arguments):
+            calls.append(name)
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                return json.dumps(
+                    {
+                        "status": "unknown",
+                        "allocation_unknown": True,
+                        "retry_blocked": True,
+                        "error": "provider outcome unknown",
+                        "message": "Manual provider reconciliation required.",
+                    }
+                )
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
+
+        assert calls.count("reserve_resources") == 1
+        fields = self._fields(agent)
+        assert fields["resource_reservation_outcome_unknown"] is True
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_with_unknown_marker_never_connects_resource_mcp(
+        self, monkeypatch
+    ):
+        from agents.resource import agent as resource_agent_module
+
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "executing_resource_agent",
+            "custom_fields": {"resource_reservation_outcome_unknown": True},
+        }
+
+        async def unexpected_mcp_call(*_args):
+            raise AssertionError("unknown reservation marker must gate MCP startup")
+
+        agent = self._make_agent(ticket, unexpected_mcp_call)
+        mcp_constructor = MagicMock(side_effect=AssertionError("MCP must stay closed"))
+        monkeypatch.setattr(resource_agent_module, "AgentMCPClient", mcp_constructor)
+
+        await agent.run("PERF-TEST")
+
+        mcp_constructor.assert_not_called()
+        agent._client.patch.assert_not_awaited()
+        post_payloads = [
+            call.kwargs.get("json", {}) for call in agent._client.post.call_args_list
+        ]
+        comments = [
+            payload.get("body", "") for payload in post_payloads if payload.get("body")
+        ]
+        assert any(
+            "if none is active, clear stale reservation id and provider metadata"
+            in comment.lower()
+            for comment in comments
+        )
+        transitions = [payload for payload in post_payloads if "status" in payload]
+        assert len(transitions) == 1
+        assert transitions[0]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_host_assignment_failure_saves_reservation_and_pauses(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "test reservation",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "required_hosts": [
+                    {"roles": ["controller"]},
+                    {"roles": ["target"]},
+                ],
+                "instance_specs": [
+                    {"instance_type": "m6i.large", "count": 1, "role": "controller"},
+                    {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                ],
+            },
+        }
+        reserve_calls = []
+
+        async def mcp_call(name, arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                reserve_calls.append(arguments)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "i-controller,i-target",
+                        "provider_metadata": {
+                            "instance_ids": ["i-controller", "i-target"]
+                        },
+                        "hosts": ["10.0.0.11"],
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        response = self._response("aws")
+        response.tool_calls[0].input["assigned_hardware_ips"] = {
+            "controller": "attacker.example.com",
+            "targets": ["untrusted.example.com"],
+        }
+        await agent._handle_completion("PERF-TEST", response)
+
+        assert len(reserve_calls) == 1
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "i-controller,i-target"
+        assert fields["resource_provider_metadata"]["instance_ids"] == [
+            "i-controller",
+            "i-target",
+        ]
+        assert fields["assigned_hardware_ips"] == {"controller": "", "targets": []}
+        assert fields["ssh_hardware_ips"] == {"controller": "", "targets": []}
+        assert "untrusted.example.com" not in json.dumps(fields)
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+        assert "preparing_platform" not in str(transitions[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "custom_fields",
+        [
+            {"resource_provider": "aws"},
+            {"directives": {"resource_provider": "aws"}},
+        ],
+    )
+    async def test_ticket_managed_provider_cannot_be_overridden_by_user_provided(
+        self, custom_fields
+    ):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "managed reservation required",
+            "custom_fields": custom_fields,
+        }
+
+        async def unused_mcp_call(_name, _arguments):
+            raise AssertionError("managed reservation should fail closed without MCP")
+
+        agent = self._make_agent(ticket, unused_mcp_call)
+        agent._mcp = None
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_resource_result",
+                    input={
+                        "assigned_hardware_ips": {
+                            "controller": "1.1.1.1",
+                            "targets": [],
+                        },
+                        "ssh_user": "root",
+                        "resource_provider": "user_provided",
+                        "resource_reservation_id": "forged-id",
+                        "resource_provider_metadata": {"instance_ids": ["i-forged"]},
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        agent._client.patch.assert_not_awaited()
+        assert (
+            "Could not verify a aws reservation"
+            in (agent._client.post.await_args.kwargs["json"]["body"])
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_fleet_iteration_reserves_new_board_not_stale_lease(self):
+        from providers.fleet import next_iteration_fields
+
+        previous_fields = {
+            "resource_provider": "jumpstarter",
+            "resource_reservation_id": "old-lease",
+            "resource_provider_metadata": {"lease_id": "old-lease"},
+            "board_selector": "board-type=ride4",
+            "assigned_hardware_ips": {"controller": "old-board", "targets": []},
+        }
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "fleet iteration",
+            "custom_fields": {
+                **previous_fields,
+                **next_iteration_fields(previous_fields),
+            },
+        }
+        reserve_calls = []
+
+        async def mcp_call(name, arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                reserve_calls.append(arguments)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "reservation_id": "new-lease",
+                        "lease_id": "new-lease",
+                        "provider_metadata": {
+                            "lease_id": "new-lease",
+                            "board_target": "ride4",
+                        },
+                    }
+                )
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("jumpstarter"))
+
+        assert len(reserve_calls) == 1
+        assert (
+            reserve_calls[0]["selection"]["jumpstarter_selector"] == "board-type=ride4"
+        )
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == "new-lease"
+        assert fields["resource_provider_metadata"]["lease_id"] == "new-lease"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "metadata", "expected_id"),
+        [
+            ("aws", {"instance_ids": ["i-123"]}, "i-123"),
+            ("quads", {"assignment_id": 42}, "42"),
+        ],
+    )
+    async def test_provider_metadata_prevents_second_reservation(
+        self, provider, metadata, expected_id
+    ):
+        ticket = {"id": "PERF-TEST", "summary": "test", "custom_fields": {}}
+
+        async def mcp_call(name, _arguments):
+            if name == "get_accumulated_metadata":
+                return json.dumps(metadata)
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response(provider))
+
+        assert not any(
+            call.args[0] == "reserve_resources"
+            for call in agent._mcp.call_tool.await_args_list
+        )
+        assert self._fields(agent)["resource_reservation_id"] == expected_id
+
+    @pytest.mark.parametrize(
+        ("provider", "ticket_fields", "expected"),
+        [
+            (
+                "aws",
+                {
+                    "required_hosts": [
+                        {"roles": ["controller"]},
+                        {"roles": ["target"]},
+                    ],
+                    "instance_specs": [
+                        {
+                            "instance_type": "m6i.large",
+                            "count": 1,
+                            "role": "controller",
+                        },
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                    ],
+                },
+                {
+                    "instance_specs": [
+                        {
+                            "instance_type": "m6i.large",
+                            "count": 1,
+                            "role": "controller",
+                        },
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                    ]
+                },
+            ),
+            (
+                "quads",
+                {
+                    "required_hosts": [
+                        {"roles": ["controller"]},
+                        {"roles": ["target"]},
+                    ],
+                    "hostnames": ["host-a", "host-b"],
+                },
+                {"hostnames": ["host-a", "host-b"]},
+            ),
+            ("psap-cc", {"cluster_id": "cluster-7"}, {"cluster_id": "cluster-7"}),
+            (
+                "jumpstarter",
+                {"board_selector": "board-type=ride4"},
+                {
+                    "board_selector": "board-type=ride4",
+                    "jumpstarter_selector": "board-type=ride4",
+                },
+            ),
+        ],
+    )
+    def test_selection_uses_complete_explicit_provider_inputs(
+        self, provider, ticket_fields, expected
+    ):
+        from agents.resource.agent import _auto_reservation_selection
+
+        assert (
+            _auto_reservation_selection(provider, {"custom_fields": ticket_fields})
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("provider", "ticket_fields", "message"),
+        [
+            ("aws", {"required_hosts": [{"roles": ["controller"]}]}, "AWS fallback"),
+            ("quads", {"required_hosts": [{"roles": ["controller"]}]}, "hostnames"),
+            ("psap-cc", {}, "cluster_id"),
+            ("jumpstarter", {}, "board_selector"),
+        ],
+    )
+    def test_incomplete_provider_selection_fails_closed(
+        self, provider, ticket_fields, message
+    ):
+        from agents.resource.agent import _auto_reservation_selection
+
+        with pytest.raises(ValueError, match=message):
+            _auto_reservation_selection(provider, {"custom_fields": ticket_fields})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "provider",
+            "ticket_fields",
+            "reserve_result",
+            "expected_selection",
+            "expected_id",
+            "expected_hardware",
+            "fresh_host",
+        ),
+        [
+            (
+                "aws",
+                {
+                    "required_hosts": [
+                        {"roles": ["controller"]},
+                        {"roles": ["target"]},
+                    ],
+                    "instance_specs": [
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                        {
+                            "instance_type": "m6i.large",
+                            "count": 1,
+                            "role": "controller",
+                        },
+                    ],
+                },
+                {
+                    "status": "success",
+                    "reservation_id": "i-target,i-controller",
+                    "provider_metadata": {"instance_ids": ["i-target", "i-controller"]},
+                    "hosts": ["10.0.0.2", "10.0.0.1"],
+                },
+                {
+                    "instance_specs": [
+                        {"instance_type": "c6i.large", "count": 1, "role": "target"},
+                        {
+                            "instance_type": "m6i.large",
+                            "count": 1,
+                            "role": "controller",
+                        },
+                    ]
+                },
+                "i-target,i-controller",
+                {"controller": "10.0.0.1", "targets": ["10.0.0.2"]},
+                True,
+            ),
+            (
+                "quads",
+                {
+                    "required_hosts": [
+                        {"roles": ["controller"]},
+                        {"roles": ["target"]},
+                    ],
+                    "hostnames": ["host-a", "host-b"],
+                },
+                {
+                    "status": "success",
+                    "reservation_id": 73,
+                    "provider_metadata": {"assignment_id": 73},
+                    "hosts": ["host-a", "host-b"],
+                },
+                {"hostnames": ["host-a", "host-b"]},
+                "73",
+                {"controller": "host-a", "targets": ["host-b"]},
+                True,
+            ),
+            (
+                "psap-cc",
+                {"cluster_id": "cluster-7"},
+                {
+                    "status": "success",
+                    "reservation_id": "psap-101",
+                    "provider_metadata": {
+                        "cluster_id": "cluster-7",
+                        "reservation_id": "psap-101",
+                    },
+                    "hosts": [],
+                },
+                {"cluster_id": "cluster-7"},
+                "psap-101",
+                {"controller": "", "targets": []},
+                False,
+            ),
+        ],
+    )
+    async def test_auto_reservation_persists_id_and_maps_hosts(
+        self,
+        provider,
+        ticket_fields,
+        reserve_result,
+        expected_selection,
+        expected_id,
+        expected_hardware,
+        fresh_host,
+    ):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "test reservation",
+            "custom_fields": ticket_fields,
+        }
+        calls = []
+
+        async def mcp_call(name, arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                calls.append(arguments)
+                return json.dumps(reserve_result)
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        response = self._response(provider)
+        if provider == "psap-cc":
+            response.tool_calls[0].input["fresh_host"] = True
+        await agent._handle_completion("PERF-TEST", response)
+
+        assert len(calls) == 1
+        assert calls[0]["selection"] == expected_selection
+        fields = self._fields(agent)
+        assert fields["resource_reservation_id"] == expected_id
+        assert fields.get("fresh_host", False) is fresh_host
+        assert fields["assigned_hardware_ips"] == expected_hardware
+        if provider == "quads":
+            assert (
+                fields["quads_assignment_id"]
+                == reserve_result["provider_metadata"]["assignment_id"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_status_only_provider_failure_does_not_complete_allocation(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "test reservation",
+            "custom_fields": {"cluster_id": "cluster-7"},
+        }
+
+        async def mcp_call(name, _arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "reserve_resources":
+                return json.dumps(
+                    {"status": "failed", "message": "cluster unavailable"}
+                )
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("psap-cc"))
+
+        agent._client.patch.assert_not_awaited()
+        assert (
+            "cluster unavailable"
+            in agent._client.post.await_args.kwargs["json"]["body"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_managed_selection_is_rejected_before_reserve(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "summary": "test reservation",
+            "custom_fields": {"required_hosts": [{"roles": ["controller"]}]},
+        }
+
+        async def mcp_call(name, _arguments):
+            if name == "get_accumulated_metadata":
+                return "{}"
+            if name == "get_host_inventory":
+                return "{}"
+            raise AssertionError(f"unexpected MCP call {name}")
+
+        agent = self._make_agent(ticket, mcp_call)
+        await agent._handle_completion("PERF-TEST", self._response("aws"))
+
+        agent._client.patch.assert_not_awaited()
+        assert not any(
+            call.args[0] == "reserve_resources"
+            for call in agent._mcp.call_tool.await_args_list
+        )
+        assert (
+            "instance_specs or an explicit instance_type"
+            in (agent._client.post.await_args.kwargs["json"]["body"])
+        )
 
 
 class TestTeardownDispatch:

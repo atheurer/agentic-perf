@@ -130,6 +130,12 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/provisioning/server.py", "open_firewall_port", "ssh"),
     ("agents/provisioning/server.py", "validate_platform_contract", "ssh"),
     ("agents/resource/agent.py", "<module>", "cloud_resource"),
+    (
+        "agents/resource/agent.py",
+        "_assigned_hardware_from_reservation",
+        "cloud_resource",
+    ),
+    ("agents/resource/agent.py", "_auto_reservation_selection", "cloud_resource"),
     ("agents/resource/agent.py", "__init__", "cloud_resource"),
     ("agents/resource/agent.py", "_build_messages", "cloud_resource"),
     ("agents/resource/agent.py", "_check_fleet_exhaustion", "cloud_resource"),
@@ -138,6 +144,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/agent.py", "_request_human_input", "cloud_resource"),
     ("agents/resource/agent.py", "_handle_completion", "mcp"),
     ("agents/resource/agent.py", "_match_to_provider_ip", "cloud_resource"),
+    ("agents/resource/agent.py", "_reservation_id_from_metadata", "cloud_resource"),
     ("agents/resource/agent.py", "_run_host_cleanup", "cloud_resource"),
     ("agents/resource/agent.py", "_run_selective_teardown", "cloud_resource"),
     ("agents/resource/agent.py", "_run_teardown", "cloud_resource"),
@@ -155,6 +162,46 @@ INVENTORIED_SIDE_EFFECTS = (
         "mutating_http_state",
     ),
     ("agents/resource/server.py", "_persist_fleet_exhaustion_marker", "cloud_resource"),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "mutating_http_state",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_known_reservation_outcome",
+        "mutating_http_state",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_known_reservation_outcome",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/server.py",
+        "_reservation_identity",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/server.py",
+        "_split_reservation_ids",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/server.py",
+        "_combined_reservation_outcome",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/server.py",
+        "_ticket_resource_provider",
+        "cloud_resource",
+    ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"),
     (
         "agents/resource/server.py",
@@ -258,6 +305,9 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/quads.py", "_login", "mutating_http_state"),
     ("providers/quota.py", "__init__", "filesystem"),
     ("providers/quota.py", "read_window", "filesystem"),
+    ("providers/resource/base.py", "<module>", "cloud_resource"),
+    ("providers/resource/base.py", "has_reservation_metadata", "cloud_resource"),
+    ("providers/resource/base.py", "reservation_failed", "cloud_resource"),
     ("providers/resource/aws.py", "<module>", "cloud_resource"),
     ("providers/resource/aws.py", "__init__", "cloud_resource"),
     ("providers/resource/aws.py", "_build_specs", "cloud_resource"),
@@ -1329,6 +1379,22 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/agent.py:_do_request_clarification",
         "2027-12-31",
     ),
+    (
+        "agents/resource/agent.py",
+        "_assigned_hardware_from_reservation",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_assigned_hardware_from_reservation",
+        "2027-12-31",
+    ),
+    ("agents/resource/agent.py", "_auto_reservation_selection", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_auto_reservation_selection",
+        "2027-12-31",
+    ),
     ("agents/resource/agent.py", "_request_human_input", "cloud_resource"): (
         "audited",
         "observability-maintainers",
@@ -1351,6 +1417,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/agent.py:_match_to_provider_ip",
+        "2027-12-31",
+    ),
+    ("agents/resource/agent.py", "_reservation_id_from_metadata", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_reservation_id_from_metadata",
         "2027-12-31",
     ),
     ("agents/resource/agent.py", "_run_host_cleanup", "cloud_resource"): (
@@ -1437,6 +1509,86 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_persist_fleet_exhaustion_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_unknown_reservation_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_unknown_reservation_marker",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_unknown_reservation_marker",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_known_reservation_outcome",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_known_reservation_outcome",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_persist_known_reservation_outcome",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_persist_known_reservation_outcome",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_reservation_identity",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_reservation_identity",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_split_reservation_ids",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_split_reservation_ids",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_combined_reservation_outcome",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_combined_reservation_outcome",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_ticket_resource_provider",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_ticket_resource_provider",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "_is_confirmed_fleet_exhaustion", "cloud_resource"): (
@@ -2035,6 +2187,24 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/quota.py:read_window",
+        "2027-12-31",
+    ),
+    ("providers/resource/base.py", "<module>", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/base.py:<module>",
+        "2027-12-31",
+    ),
+    ("providers/resource/base.py", "has_reservation_metadata", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/base.py:has_reservation_metadata",
+        "2027-12-31",
+    ),
+    ("providers/resource/base.py", "reservation_failed", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/base.py:reservation_failed",
         "2027-12-31",
     ),
     ("providers/resource/aws.py", "<module>", "cloud_resource"): (

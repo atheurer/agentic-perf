@@ -534,6 +534,12 @@ class TestNextIterationFields:
             "platform_board": "board-01",
             "platform_ip": "10.0.0.1",
             "assigned_hardware_ips": {"targets": ["10.0.0.1"]},
+            "ssh_hardware_ips": {"targets": ["192.0.2.1"]},
+            "resource_reservation_id": "old-lease",
+            "resource_provider_metadata": {"lease_id": "old-lease"},
+            "quads_assignment_id": 42,
+            "quads_cloud_name": "cloud-old",
+            "fresh_host": True,
             "run_id": "run-abc",
             "benchmark_status": "completed",
             "benchmark_notes": "all good",
@@ -551,6 +557,12 @@ class TestNextIterationFields:
         # All benchmark/platform fields should be reset to empty/null
         assert fields["platform_board"] == ""
         assert fields["assigned_hardware_ips"] == {}
+        assert fields["ssh_hardware_ips"] == {}
+        assert fields["resource_reservation_id"] is None
+        assert fields["resource_provider_metadata"] == {}
+        assert fields["quads_assignment_id"] is None
+        assert fields["quads_cloud_name"] == ""
+        assert fields["fresh_host"] is False
         assert fields["run_id"] == ""
         assert fields["benchmark_status"] is None
         assert fields["benchmark_notes"] == ""

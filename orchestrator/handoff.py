@@ -197,8 +197,27 @@ def _check_awaiting_review(ticket: dict[str, Any]) -> tuple[bool, str]:
 def _check_evaluating_convergence(
     ticket: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Validate benchmark execution before convergence evaluation."""
+    """Validate benchmark execution before convergence evaluation.
+
+    Fleet investigations may reach evaluating_convergence from the
+    fleet coordinator after exhausting all boards — some iterations
+    may have failed at resource or provisioning stages without ever
+    running a benchmark.  When fleet_exhausted is set, the fleet
+    coordinator has already determined the fleet state and the
+    evaluate agent must be allowed to run.
+    """
     cf = ticket.get("custom_fields", {})
+
+    # Only a current, explicitly enabled fleet investigation with a
+    # confirmed hard/soft exhaustion result bypasses the benchmark gate.
+    fleet = cf.get("fleet_investigation", {})
+    exhaustion = fleet.get("fleet_exhausted")
+    confirmed_exhaustion = isinstance(exhaustion, dict) and (
+        exhaustion.get("hard") is True or exhaustion.get("soft") is True
+    )
+    if fleet.get("enabled") is True and confirmed_exhaustion:
+        return True, ""
+
     benchmark_status = cf.get("benchmark_status")
     run_id = cf.get("run_id")
 
