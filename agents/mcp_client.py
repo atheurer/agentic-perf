@@ -92,6 +92,44 @@ class _MCPDispatchAuditState:
     terminal_recorded: bool = False
 
 
+# Exception types that indicate an MCP subprocess or network transport has
+# disconnected.  When one of these is raised during ``call_tool`` / session
+# interaction we attempt an automatic reconnect instead of failing immediately.
+_DISCONNECT_ERRORS: tuple[type[BaseException], ...] = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    EOFError,
+)
+
+
+def _is_disconnect_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transport-level disconnection."""
+    if isinstance(exc, _DISCONNECT_ERRORS):
+        return True
+    # anyio / asyncio may wrap the real error; check the chain.
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and isinstance(cause, _DISCONNECT_ERRORS):
+        return True
+    # ClosedResourceError from anyio is another common wrapper.
+    type_name = type(exc).__name__
+    if type_name in ("ClosedResourceError", "ClosedResourceSendError"):
+        return True
+    return False
+
+
+@dataclass
+class _ConnectParams:
+    """Immutable snapshot of the arguments needed to re-establish a connection."""
+
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    ticket_id: str | None
+    agent_id: str | None
+
+
 @dataclass
 class _ServerConnection:
     name: str
@@ -108,6 +146,7 @@ class _ServerConnection:
     connected: bool = False
     _shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     _task: asyncio.Task[None] | None = None
+    _connect_params: _ConnectParams | None = None
 
 
 class AgentMCPClient:
@@ -285,6 +324,13 @@ class AgentMCPClient:
             if stdio_client is not _SDK_STDIO_CLIENT
             else audited_stdio_client(params, process_holder.append)
         )
+        connect_params = _ConnectParams(
+            command=command,
+            args=args or [],
+            env=merged_env,
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+        )
         await self._connect_transport(
             name,
             transport_cm,
@@ -293,6 +339,7 @@ class AgentMCPClient:
             ticket_id=ticket_id,
             agent_id=agent_id,
             subprocess_process_holder=process_holder,
+            connect_params=connect_params,
         )
 
     async def connect_sse(
@@ -402,6 +449,7 @@ class AgentMCPClient:
         ticket_id: str | None = None,
         agent_id: str | None = None,
         subprocess_process_holder: list[Any] | None = None,
+        connect_params: _ConnectParams | None = None,
     ) -> None:
         """Shared connection logic for all transports.
 
@@ -446,6 +494,7 @@ class AgentMCPClient:
                 "pending" if transport == "stdio" else "not_applicable"
             ),
             _shutdown=shutdown,
+            _connect_params=connect_params,
         )
         self._record_boundary(conn, LifecycleState.CONNECTING)
         startup_terminal_recorded = False
@@ -830,6 +879,58 @@ class AgentMCPClient:
             audit_state=audit_state,
         )
 
+    async def _reconnect_server(
+        self,
+        conn: _ServerConnection,
+    ) -> bool:
+        """Attempt to re-establish a broken stdio subprocess connection.
+
+        Returns True if reconnection succeeded and the server's tools are
+        available again.  Returns False (never raises) if reconnection is
+        not possible — e.g. because the original connection parameters were
+        not stored or the subprocess cannot be relaunched.
+        """
+        params = conn._connect_params
+        if params is None:
+            logger.warning(
+                "Cannot reconnect MCP server %s: no stored connection parameters",
+                conn.name,
+            )
+            return False
+
+        logger.info(
+            "Attempting to reconnect MCP server %s (generation %d)",
+            conn.name,
+            conn.reconnect_generation + 1,
+        )
+        try:
+            await self.connect_command(
+                command=params.command,
+                args=params.args,
+                name=conn.name,
+                env=params.env,
+                ticket_id=params.ticket_id,
+                agent_id=params.agent_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to reconnect MCP server %s: %s",
+                conn.name,
+                exc,
+            )
+            return False
+
+        new_conn = self._servers.get(conn.name)
+        if new_conn is None or new_conn.session is None:
+            return False
+
+        logger.info(
+            "Successfully reconnected MCP server %s (generation %d)",
+            new_conn.name,
+            new_conn.reconnect_generation,
+        )
+        return True
+
     async def _dispatch_mcp_request(
         self,
         conn: _ServerConnection,
@@ -839,6 +940,24 @@ class AgentMCPClient:
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
         if conn.session is None:
+            # Attempt reconnect if we have stored connection parameters.
+            if conn._connect_params is not None:
+                logger.warning(
+                    "MCP session closed for %s before tool %s; attempting reconnect",
+                    conn.name,
+                    name,
+                )
+                if await self._reconnect_server(conn):
+                    new_conn = self._servers.get(conn.name)
+                    if new_conn is not None and new_conn.session is not None:
+                        return await self._dispatch_mcp_request(
+                            new_conn,
+                            name,
+                            arguments,
+                            context,
+                            audit_state=audit_state,
+                        )
+
             error = RuntimeError("MCP session closed before tool dispatch")
             terminal_recorded = self._record_boundary(
                 conn,
@@ -900,6 +1019,61 @@ class AgentMCPClient:
                 setattr(exc, "mcp_audit_recorded", True)
             raise
         except Exception as exc:
+            # Detect transport-level disconnection and attempt reconnect
+            # before reporting a terminal failure.
+            if _is_disconnect_error(exc) and conn._connect_params is not None:
+                self._record_boundary(
+                    conn,
+                    LifecycleState.DISCONNECTED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.FAILURE,
+                    retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
+                    error=exc,
+                )
+                logger.warning(
+                    "MCP server %s disconnected during tool %s; attempting reconnect",
+                    conn.name,
+                    name,
+                )
+                if await self._reconnect_server(conn):
+                    new_conn = self._servers.get(conn.name)
+                    if new_conn is not None and new_conn.session is not None:
+                        return await self._dispatch_mcp_request(
+                            new_conn,
+                            name,
+                            arguments,
+                            context,
+                            audit_state=audit_state,
+                        )
+                # Reconnect failed — fall through to terminal error.
+                message = (
+                    f"MCP server {conn.name!r} disconnected and "
+                    f"reconnection failed: {exc}"
+                )
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    LifecycleState.FAILED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.FAILURE,
+                    retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
+                    error=message,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                return MCPHookResult(
+                    content=self._redact_client_message(
+                        conn,
+                        context,
+                        message,
+                    ),
+                    is_error=True,
+                    request_sent=True,
+                    retry_classification="ambiguous_after_send",
+                    audit_recorded=terminal_recorded,
+                )
+
             terminal_recorded = self._record_boundary(
                 conn,
                 LifecycleState.FAILED,
