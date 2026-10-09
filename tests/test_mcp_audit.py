@@ -1317,6 +1317,176 @@ class _TestClientSession:
 
 
 @pytest.mark.asyncio
+async def test_reused_client_resumes_injected_trace_recording(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(name="test_tool")])
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(content=[SimpleNamespace(text="ok")], isError=False)
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    recorder = SimpleNamespace(record=MagicMock(), close=MagicMock())
+    client = AgentMCPClient(trace_client=recorder)
+
+    await client.disconnect()
+    recorder.record.assert_not_called()
+    assert client._trace_client is None
+
+    await client.connect_command(
+        command="python",
+        args=["server.py"],
+        name="local",
+        ticket_id="PERF-1",
+    )
+    await client.call_tool("test_tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert client._trace_client is recorder
+    assert recorder.record.call_count >= 4
+    recorder.close.assert_not_called()
+    await client.disconnect()
+    recorder.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reused_client_recreates_owned_trace_recording(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(name="test_tool")])
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(content=[SimpleNamespace(text="ok")], isError=False)
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setenv("STATE_STORE_URL", "https://state-store.invalid")
+    recorders = []
+
+    def _make_recorder(url, token):
+        recorder = SimpleNamespace(record=MagicMock(), close=MagicMock())
+        recorders.append((url, token, recorder))
+        return recorder
+
+    monkeypatch.setattr(mcp_client_module, "TraceClient", _make_recorder)
+    client = AgentMCPClient()
+    first_recorder = client._trace_client
+
+    await client.disconnect()
+
+    assert first_recorder is recorders[0][2]
+    first_recorder.close.assert_called_once_with()
+    assert client._trace_client is None
+
+    await client.connect_command(
+        command="python",
+        args=["server.py"],
+        name="local",
+        ticket_id="PERF-1",
+    )
+    await client.call_tool("test_tool", {}, TraceContext(ticket_id="PERF-1"))
+
+    assert len(recorders) == 2
+    assert recorders[1][:2] == (
+        "https://state-store.invalid",
+        "test-token",
+    )
+    assert client._trace_client is recorders[1][2]
+    assert recorders[1][2].record.call_count >= 4
+    await client.disconnect()
+    recorders[1][2].close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_disconnects_keep_startup_blocked_until_both_finish(
+    monkeypatch,
+):
+    first_disconnect_started = asyncio.Event()
+    release_first_disconnect = asyncio.Event()
+    second_disconnect_finished = asyncio.Event()
+    release_second_disconnect = asyncio.Event()
+
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    client = AgentMCPClient()
+    original_disconnect_impl = client._disconnect_impl
+    disconnect_impl_calls = 0
+
+    async def _gated_disconnect_impl():
+        nonlocal disconnect_impl_calls
+        disconnect_impl_calls += 1
+        if disconnect_impl_calls == 1:
+            first_disconnect_started.set()
+            await release_first_disconnect.wait()
+            await original_disconnect_impl()
+        else:
+            await original_disconnect_impl()
+            second_disconnect_finished.set()
+            await release_second_disconnect.wait()
+
+    monkeypatch.setattr(client, "_disconnect_impl", _gated_disconnect_impl)
+    first_disconnect = asyncio.create_task(client.disconnect())
+    second_disconnect = None
+    try:
+        await asyncio.wait_for(first_disconnect_started.wait(), timeout=1)
+        second_disconnect = asyncio.create_task(client.disconnect())
+
+        async def _wait_for_two_disconnects():
+            while client._disconnect_requests != 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_for_two_disconnects(), timeout=1)
+        release_first_disconnect.set()
+        await asyncio.wait_for(second_disconnect_finished.wait(), timeout=1)
+        assert client._closing
+
+        with pytest.raises(asyncio.CancelledError):
+            await client._connect_transport(
+                "late",
+                _ReadyTransport(),
+                transport="stdio",
+                endpoint="late-server.py",
+            )
+        assert client._servers == {}
+        assert client._tool_routing == {}
+
+        release_second_disconnect.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_disconnect, second_disconnect), timeout=1
+        )
+        assert not client._closing
+        assert client._disconnect_requests == 0
+
+        await client._connect_transport(
+            "after-disconnects",
+            _ReadyTransport(),
+            transport="stdio",
+            endpoint="server.py",
+        )
+        assert "after-disconnects" in client._servers
+    finally:
+        release_first_disconnect.set()
+        release_second_disconnect.set()
+        tasks = [first_disconnect]
+        if second_disconnect is not None:
+            tasks.append(second_disconnect)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_client_cancellation_during_connect_cleans_up_task():
     entered = asyncio.Event()
     release = asyncio.Event()

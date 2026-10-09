@@ -209,6 +209,8 @@ class AgentMCPClient:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._disconnect_lock = asyncio.Lock()
+        self._disconnect_requests = 0
         self._closing = False
         self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
         self._connection_startup_tasks: set[asyncio.Task[None]] = set()
@@ -224,17 +226,27 @@ class AgentMCPClient:
         self.post_call_hook: Any = None
         self.audit_events: list[TraceEventV1] = []
         self._audit_hook = audit_hook
+        self._injected_trace_client = trace_client
         self._trace_client = trace_client
         self._owns_trace_client = False
-        if self._trace_client is None:
-            token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
-            url = os.environ.get("STATE_STORE_URL", "")
-            if token and url:
-                self._trace_client = TraceClient(url, token)
-                self._owns_trace_client = True
+        self._ensure_trace_client()
         from agents.fencing import current_fence_context
 
         self._fence_context = current_fence_context()
+
+    def _ensure_trace_client(self) -> None:
+        """Attach the configured recorder when the client is in use."""
+        if self._trace_client is not None:
+            return
+        if self._injected_trace_client is not None:
+            self._trace_client = self._injected_trace_client
+            self._owns_trace_client = False
+            return
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        url = os.environ.get("STATE_STORE_URL", "")
+        if token and url:
+            self._trace_client = TraceClient(url, token)
+            self._owns_trace_client = True
 
     async def connect(
         self,
@@ -506,6 +518,7 @@ class AgentMCPClient:
         async with self._lifecycle_lock:
             if self._closing:
                 raise asyncio.CancelledError()
+            self._ensure_trace_client()
             startup_lock = self._connection_startup_locks.setdefault(
                 name, asyncio.Lock()
             )
@@ -1745,6 +1758,22 @@ class AgentMCPClient:
 
     async def disconnect(self) -> None:
         async with self._lifecycle_lock:
+            self._disconnect_requests += 1
+            self._closing = True
+
+        completed = False
+        try:
+            async with self._disconnect_lock:
+                await self._disconnect_impl()
+            completed = True
+        finally:
+            async with self._lifecycle_lock:
+                self._disconnect_requests -= 1
+                if completed and self._disconnect_requests == 0:
+                    self._closing = False
+
+    async def _disconnect_impl(self) -> None:
+        async with self._lifecycle_lock:
             self._closing = True
             startup_tasks = tuple(
                 self._reconnect_startup_tasks | self._connection_startup_tasks
@@ -1780,7 +1809,6 @@ class AgentMCPClient:
                 self._trace_client.close()
             self._trace_client = None
             self._owns_trace_client = False
-            self._closing = False
             logger.info("MCP client disconnected all servers")
 
 
