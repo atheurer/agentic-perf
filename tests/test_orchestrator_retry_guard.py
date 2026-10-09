@@ -21,6 +21,272 @@ from orchestrator.retry_guard import (
 )
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("sample_count", True, None),
+        ("reboot_count", 0, None),
+        ("sample_count", 2.0, 2),
+        ("reboot_count", "3", 3),
+    ],
+)
+def test_invalid_sample_counts_are_removed_from_triage_payload(
+    key: str, value: object, expected: int | None
+) -> None:
+    from orchestrator.main import _directives_for_triage
+    from providers.directives import normalize_directives
+    from providers.skills import boot_time  # noqa: F401
+
+    normalized, _applied, unrecognized = normalize_directives({key: value})
+    triage_directives = _directives_for_triage(normalized, unrecognized)
+
+    if expected is None:
+        assert "sample_count" not in normalized
+        assert "sample_count" not in triage_directives
+        assert any("expected an integer" in note for note in unrecognized)
+    else:
+        assert triage_directives["sample_count"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["sample_count", "reboot_count"])
+async def test_invalid_sample_count_is_omitted_from_persisted_triage_directives(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    import orchestrator.main as main
+    from providers.skills import boot_time  # noqa: F401
+
+    raw_directives = {"power_off_delay_seconds": 5, key: 0}
+    persisted_directives = {}
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            persisted_directives.update(json["fields"]["directives"])
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            self.comment = json["body"]
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+
+    triage_directives, ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-invalid-count", raw_directives, events, {}
+    )
+
+    assert ready is True
+    assert persisted_directives == {"power_off_delay": 5}
+    assert triage_directives == persisted_directives
+    assert "sample_count" not in persisted_directives
+    event_payload = events.emit.call_args.args[3]
+    warning = event_payload["unrecognized"][0]
+    assert f"'{key}'" in warning
+    assert "0" in warning
+    assert "expected an integer" in warning
+    assert f"'{key}'" in client.comment
+
+
+@pytest.mark.asyncio
+async def test_integral_float_sample_count_is_patched_as_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+
+    patch_payloads = []
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    triage_directives, ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-float-count", {"sample_count": 1.0}, events, {}
+    )
+
+    assert ready is True
+    assert patch_payloads == [{"sample_count": 1}]
+    assert type(triage_directives["sample_count"]) is int
+
+
+@pytest.mark.asyncio
+async def test_boolean_sample_count_does_not_confirm_prior_integer_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+    from providers.skills import boot_time  # noqa: F401
+
+    patch_payloads = []
+    delivery_states = {}
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    first_directives, first_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-bool-count",
+        {"reboot_count": 1},
+        events,
+        delivery_states,
+    )
+    next_directives, next_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-bool-count",
+        {"sample_count": True},
+        events,
+        delivery_states,
+    )
+
+    assert first_ready is True
+    assert first_directives == {"sample_count": 1}
+    assert next_ready is True
+    assert next_directives == {}
+    assert patch_payloads == [{"sample_count": 1}, {}]
+    invalid_warning = events.emit.call_args.args[3]["unrecognized"][0]
+    assert "'sample_count'" in invalid_warning
+    assert "True" in invalid_warning
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_directive_patch_waits_for_canonical_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+    from providers.execution import AmbiguousHTTPReplayError
+
+    raw = {"power_off_delay_seconds": 5, "unknown_option": "keep"}
+    canonical = {"power_off_delay": 5, "unknown_option": "keep"}
+    delivery_states = {}
+    events = MagicMock()
+
+    class Client:
+        patch_calls = 0
+        post_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            self.patch_calls += 1
+            raise AmbiguousHTTPReplayError(
+                "response lost", request=httpx.Request("PATCH", url)
+            )
+
+        async def post(self, url, *, json):
+            self.post_calls += 1
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+
+    first_directives, first_ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-ambiguous", raw, events, delivery_states
+    )
+    assert first_directives == {}
+    assert first_ready is False
+    events.emit.assert_not_called()
+    assert client.post_calls == 0
+
+    next_directives, next_ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-ambiguous", canonical, events, delivery_states
+    )
+    assert next_ready is True
+    assert next_directives == canonical
+    assert client.patch_calls == 1
+    assert client.post_calls == 1
+    events.emit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_changed_alias_source_gets_a_new_normalization_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+
+    delivery_states = {}
+    events = MagicMock()
+    patch_payloads = []
+    comment_bodies = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            comment_bodies.append(json["body"])
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    canonical = {"power_off_delay": 5}
+
+    first, first_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-alias-change",
+        {"power_off_delay_seconds": 5},
+        events,
+        delivery_states,
+    )
+    second, second_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-alias-change",
+        {"power_off_delay_s": 5},
+        events,
+        delivery_states,
+    )
+
+    assert first_ready is True and second_ready is True
+    assert first == second == canonical
+    assert patch_payloads == [canonical, canonical]
+    assert len(comment_bodies) == 2
+    assert "power_off_delay_seconds" in comment_bodies[0]
+    assert "power_off_delay_s" in comment_bodies[1]
+    assert events.emit.call_count == 2
+    assert (
+        events.emit.call_args_list[0].args[3] != events.emit.call_args_list[1].args[3]
+    )
+
+
 def test_handoff_backoff_is_exponential_and_bounded() -> None:
     custom_fields: dict = {}
     delays = []
@@ -378,6 +644,239 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_path",
+    [
+        "none",
+        "event",
+        "comment_response",
+        "comment_pre_send",
+        "comment_pre_send_exhausted",
+        "comment_ambiguous",
+        "event_exhausted",
+        "patch_response",
+        "patch_ambiguous",
+    ],
+)
+async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_path: str,
+) -> None:
+    import orchestrator.main as main
+    from orchestrator.config import OrchestratorConfig
+    from providers.execution import AmbiguousHTTPReplayError
+    from providers.tracing import (
+        bind_trace_context,
+        current_trace_context,
+        new_trace_context,
+        reset_trace_context,
+    )
+
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    config = OrchestratorConfig(
+        state_store_url="http://store", raw_config={"llm": {"provider": "mock"}}
+    )
+    config.poll_interval = 0.01
+    config.stale_task_timeout = 0
+    ticket = {
+        "id": "PERF-normalize",
+        "status": "triage_pending",
+        "custom_fields": {
+            "directives": {
+                "power_off_delay_seconds": 5,
+                "sample_count": "3",
+                "misspelled_directive": "value",
+            }
+        },
+    }
+    dispatcher = MagicMock()
+    dispatcher.active_tasks.return_value = []
+    dispatcher.is_active.return_value = False
+    dispatcher.try_claim.return_value = False
+    dispatcher.shutdown = AsyncMock()
+    events = MagicMock()
+    if failure_path == "event":
+        events.emit.side_effect = [RuntimeError("event unavailable"), None]
+    elif failure_path == "event_exhausted":
+        events.emit.side_effect = RuntimeError("event unavailable")
+    request_contexts = []
+    comment_bodies = []
+    comment_statuses = []
+    patch_statuses = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            request_contexts.append(("PATCH", current_trace_context().ticket_id))
+            if failure_path == "patch_response":
+                patch_statuses.append(503)
+                return httpx.Response(503, request=httpx.Request("PATCH", url))
+            if failure_path == "patch_ambiguous" and not patch_statuses:
+                patch_statuses.append("ambiguous")
+                ticket["custom_fields"]["directives"] = deepcopy(
+                    json["fields"]["directives"]
+                )
+                raise AmbiguousHTTPReplayError(
+                    "after send", request=httpx.Request("PATCH", url)
+                )
+            patch_statuses.append(200)
+            ticket["custom_fields"]["directives"] = deepcopy(
+                json["fields"]["directives"]
+            )
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            request_contexts.append(("POST", current_trace_context().ticket_id))
+            comment_bodies.append(json["body"])
+            request = httpx.Request("POST", url)
+            if failure_path == "comment_pre_send" and not comment_statuses:
+                comment_statuses.append("connect_error")
+                raise httpx.ConnectError("connection failed", request=request)
+            if failure_path == "comment_pre_send_exhausted":
+                comment_statuses.append("connect_error")
+                raise httpx.ConnectError("connection failed", request=request)
+            if failure_path == "comment_ambiguous":
+                comment_statuses.append("ambiguous")
+                raise AmbiguousHTTPReplayError("after send", request=request)
+            status_code = 503 if failure_path == "comment_response" else 200
+            comment_statuses.append(status_code)
+            return httpx.Response(status_code, request=httpx.Request("POST", url))
+
+    client = Client()
+    monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
+    monkeypatch.setattr(main, "RepoCache", lambda: object())
+    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
+    monkeypatch.setattr(
+        main,
+        "_make_llm_provider",
+        lambda _config: SimpleNamespace(
+            default_timeout=None, reasoning_effort=None, max_tokens=None
+        ),
+    )
+    monkeypatch.setattr(main, "_make_llm_factory", lambda _config: object())
+    monkeypatch.setattr(main, "_validate_models", AsyncMock())
+    monkeypatch.setattr(main, "EventBus", lambda **_kwargs: events)
+    monkeypatch.setattr(
+        main, "record_orchestrator_status", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(main, "_process_stop_requests", AsyncMock())
+    monkeypatch.setattr(main, "_sweep_orphaned_leases", AsyncMock())
+    monkeypatch.setattr(main, "_sweep_trace_spools", lambda: None)
+    monkeypatch.setattr(main, "check_handoff", lambda *_args: (True, ""))
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+    telemetry = ModuleType("providers.telemetry")
+    telemetry.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry)
+    monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
+
+    third_poll = asyncio.Event()
+    fetch_count = 0
+
+    async def fetch(_url):
+        nonlocal fetch_count
+        fetch_count += 1
+        required_polls = (
+            5
+            if failure_path.endswith("_exhausted") or failure_path == "patch_response"
+            else 3
+        )
+        if fetch_count >= required_polls:
+            third_poll.set()
+        return [deepcopy(ticket)]
+
+    monkeypatch.setattr(main, "fetch_all_tickets", fetch)
+    lease = SimpleNamespace(
+        session_id=uuid4(),
+        epoch=None,
+        ttl_seconds=config.leader_lease_ttl_seconds,
+        confirmed_deadline=(
+            asyncio.get_running_loop().time() + config.leader_lease_ttl_seconds
+        ),
+    )
+
+    async def acquire():
+        lease.epoch = 7
+
+    lease.acquire = acquire
+    lease.renew = AsyncMock()
+    lease.release = AsyncMock()
+    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    previous_context = current_trace_context()
+    control_context = new_trace_context(ticket_id="control", agent_id="orchestrator")
+    control_token = bind_trace_context(control_context)
+    task = asyncio.create_task(
+        main._poll_loop_after_lease(config, lease, main._LeaseLossGate(), lease_state)
+    )
+    try:
+        await asyncio.wait_for(third_poll.wait(), timeout=5)
+        patch_failed = failure_path == "patch_response"
+        expected_patches = 5 if patch_failed else 1
+        expected_comment_attempts = {
+            "comment_pre_send": 2,
+            "comment_pre_send_exhausted": 3,
+            "comment_ambiguous": 1,
+            "comment_response": 1,
+        }.get(failure_path, 0 if patch_failed else 1)
+        expected_contexts = [("PATCH", "PERF-normalize")] * expected_patches
+        if not patch_failed:
+            expected_contexts.append(("POST", "PERF-normalize"))
+            expected_contexts.extend(
+                [
+                    ("POST", "PERF-normalize")
+                    for _ in range(expected_comment_attempts - 1)
+                ]
+            )
+        assert request_contexts == expected_contexts
+        expected_event_attempts = {
+            "event": 2,
+            "event_exhausted": 3,
+        }.get(failure_path, 0 if patch_failed else 1)
+        assert events.emit.call_count == expected_event_attempts
+        assert len(set(comment_bodies)) <= 1
+        expected_comment_statuses = {
+            "comment_response": [503],
+            "comment_pre_send": ["connect_error", 200],
+            "comment_pre_send_exhausted": [
+                "connect_error",
+                "connect_error",
+                "connect_error",
+            ],
+            "comment_ambiguous": ["ambiguous"],
+        }.get(failure_path, [] if patch_failed else [200])
+        assert comment_statuses == expected_comment_statuses
+        if patch_failed:
+            assert ticket["custom_fields"]["directives"] == {
+                "power_off_delay_seconds": 5,
+                "sample_count": "3",
+                "misspelled_directive": "value",
+            }
+            dispatcher.try_claim.assert_not_called()
+        else:
+            assert ticket["custom_fields"]["directives"] == {
+                "power_off_delay": 5,
+                "sample_count": 3,
+                "misspelled_directive": "value",
+            }
+            assert "converted to an integer" in comment_bodies[0]
+        for call in events.emit.call_args_list[1:]:
+            assert events.emit.call_args_list[0].args == call.args
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        reset_trace_context(control_token)
+
+    assert current_trace_context() == previous_context
 
 
 @pytest.mark.asyncio

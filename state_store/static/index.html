@@ -4034,6 +4034,22 @@ function renderEvent(evt) {
         '<span>' + escHtml(data.error || 'Unknown error') + '</span>' +
       '</div>';
 
+    case 'directive_normalization':
+      var normApplied = (data.applied || []).map(function(a) {
+        return '<li>' + escHtml(a) + '</li>';
+      }).join('');
+      var normUnrecognized = (data.unrecognized || []).map(function(u) {
+        return '<li>' + escHtml(u) + '</li>';
+      }).join('');
+      return '<div class="event" style="border-left:3px solid var(--accent);padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:var(--accent);color:#fff">DIRECTIVES</span>' +
+        '<div style="margin-top:4px;font-size:12px">' +
+          (normApplied ? '<div><strong>Normalized:</strong><ul style="margin:2px 0 4px 16px;padding:0">' + normApplied + '</ul></div>' : '') +
+          (normUnrecognized ? '<div><strong>Unrecognized:</strong><ul style="margin:2px 0 0 16px;padding:0">' + normUnrecognized + '</ul></div>' : '') +
+        '</div>' +
+      '</div>';
+
     case 'anomaly_detected':
       var aSev = (data.severity || 'medium').toUpperCase();
       var aColor = aSev === 'CRITICAL' ? '#d32f2f' : (aSev === 'HIGH' ? '#e65100' : 'var(--accent)');

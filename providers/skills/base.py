@@ -101,3 +101,15 @@ class SkillProvider(ABC):
         self, run_file: dict[str, Any], harness: str | None = None
     ) -> dict[str, Any]:
         return {"valid": True, "errors": []}
+
+    def get_directive_schema(self) -> dict[str, Any]:
+        """Return recognized directives and aliases for this harness.
+
+        Returns a dict with:
+          recognized: set of canonical directive key names
+          aliases: dict mapping variant names to canonical keys
+
+        The default returns empty sets.  Harness providers
+        override this to declare their directive vocabulary.
+        """
+        return {"recognized": set(), "aliases": {}}

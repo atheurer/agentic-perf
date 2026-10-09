@@ -123,6 +123,54 @@ as hard failures and missing packages as installable warnings. Keep
 availability checks deterministic and provider-backed; do not claim a cloud,
 cluster, board, or tool is available merely because it is documented.
 
+## Directive schema
+
+Users submit ticket directives using variable terminology — different
+key names for the same concept (e.g., `reboot_count` vs `sample_count`).
+The directive normalization framework maps these to canonical forms
+before any agent processes them.
+
+Each harness declares its recognized directive keys and aliases via
+`get_directive_schema()` on its skill provider:
+
+```python
+def get_directive_schema(self) -> dict[str, Any]:
+    return {
+        "recognized": {"sample_count", "reboot_method", "power_off_delay"},
+        "aliases": {
+            "reboot_count": "sample_count",
+            "reboot_type": "reboot_method",
+        },
+    }
+```
+
+The orchestrator calls `collect_from_providers(skills)` at startup to
+assemble the full registry from all providers.
+
+Standalone harnesses without a full skill provider (e.g., boot-time)
+create a module under `providers/skills/` and call
+`register_directives()` at module load:
+
+```python
+# providers/skills/boot_time.py
+from providers.directives import register_directives
+
+register_directives(
+    recognized={"sample_count", "reboot_method"},
+    aliases={"reboot_count": "sample_count"},
+)
+```
+
+The orchestrator imports this module at startup to trigger registration.
+
+Unrecognized keys are preserved but flagged with fuzzy-match suggestions
+so users get feedback instead of silent failures. The normalization
+framework also applies generic rules:
+
+- Suffix stripping: `power_off_delay_seconds` → `power_off_delay`
+- Prefix stripping: `jumpstarter_power_off_delay` → `power_off_delay`
+- Value inference: `cold_reboot=true` → `reboot_method=cold`
+
 ## Registration and synchronization
 
 Import and register the provider in `orchestrator/main.py` (the current

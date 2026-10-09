@@ -5253,13 +5253,16 @@ async def execute_boot_time_test(
 
     if reboot_method:
         response["reboot_method"] = reboot_method
-        # Flag mismatch: cold boot requested but SSH reboot used
-        boot_type = (
-            _ticket.get("custom_fields", {}).get("directives", {}).get("boot_type", "")
-            if _ticket
-            else ""
+        # Flag mismatch: cold boot requested but SSH reboot used.
+        # Check both canonical (reboot_method) and legacy (boot_type)
+        # directive keys for the user's requested reboot method.
+        _directives = (
+            _ticket.get("custom_fields", {}).get("directives", {}) if _ticket else {}
         )
-        if boot_type == "cold" and reboot_method == "ssh":
+        requested_method = _directives.get("reboot_method", "") or _directives.get(
+            "boot_type", ""
+        )
+        if requested_method == "cold" and reboot_method == "ssh":
             response["reboot_method_mismatch"] = (
                 "Cold boot requested but script used SSH "
                 "reboots. Jumpstarter power control flags "

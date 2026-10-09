@@ -295,6 +295,15 @@ class CrucibleCatalogSkillProvider(SkillProvider):
             "use controller-sourced context and the benchmark agent"
         )
 
+    def get_directive_schema(self) -> dict[str, Any]:
+        return {
+            "recognized": {
+                "workflow_name",
+                "workflow_source",
+            },
+            "aliases": {},
+        }
+
 
 class CrucibleContextGateway:
     """Source-aware Crucible catalog and context gateway.
